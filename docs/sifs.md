@@ -91,6 +91,21 @@ SIFS is POSIX-like, with deliberate distributed-system differences:
 - Reading an object with an open recovery conflict fails with `ESTALE` until
   the conflict is resolved.
 - A path locked by an in-progress cross-shard move returns a retryable error.
+- Unix FUSE mounts support distributed whole-file shared and exclusive POSIX
+  advisory locks. Partial byte ranges are rejected with `EOPNOTSUPP`; a lock
+  that loses its authority epoch or expires poisons its associated handles and
+  is reported as an I/O failure. A mount supports at most two distinct live or
+  pending lock keys; further acquisitions fail with `ENOLCK`. Blocking lock
+  waits are bounded by durable cancellation and leases, although the current
+  `fuser` dependency does not expose kernel `FUSE_INTERRUPT` requests, so a
+  signal cannot yet cancel an individual `F_SETLKW` wait immediately.
+- FUSE writes publish to the canonical DFS path before returning; `flush` and
+  close therefore have no private byte buffer to publish and remain
+  non-durability barriers. `O_DSYNC` and `O_SYNC` writes invoke the file-data
+  and full-file barriers respectively. Explicit `fsync`, `fdatasync`, and
+  directory `fsync` require the current metadata authority and a
+  recovery-capable quorum certificate; they fail rather than weakening
+  durability when quorum is unavailable.
 - Timestamps originate on individual nodes, so cross-node ordering is subject
   to clock skew.
 

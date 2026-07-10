@@ -192,6 +192,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNetworkMessage::MetadataJournalBatch(DfsMetadataJournalBatchCommand {
                 request_id,
                 source_node_id: Some(self.node_id.clone()),
+                verify_prefix_only: false,
+                prefix_probe: None,
                 batch: batch.clone(),
             }),
         )?;
@@ -203,6 +205,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         shard_id: &str,
     ) -> Result<Vec<DfsMetadataReplicationOutcome>, DfsError> {
+        self.pending_metadata_replications
+            .retain(|_, pending| pending.created_at.elapsed() < std::time::Duration::from_secs(60));
         let Some(control_plane) = self.control_plane.as_mut() else {
             return Ok(Vec::new());
         };
@@ -278,6 +282,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     target_node_id: target_node_id.clone(),
                     shard_id: shard_id.clone(),
                     next_after_sequence,
+                    verify_prefix_only: false,
+                    created_at: std::time::Instant::now(),
                 },
             );
             let sent = self.send_dfs_message_if_routable(
@@ -285,6 +291,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DfsNetworkMessage::MetadataJournalBatch(DfsMetadataJournalBatchCommand {
                     request_id: request_id.clone(),
                     source_node_id: Some(self.node_id.clone()),
+                    verify_prefix_only: false,
+                    prefix_probe: None,
                     batch,
                 }),
             )?;

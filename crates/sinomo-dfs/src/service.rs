@@ -866,6 +866,8 @@ mod tests {
         let command = DfsMetadataJournalBatchCommand {
             request_id: "req-journal-1".to_string(),
             source_node_id: None,
+            verify_prefix_only: false,
+            prefix_probe: None,
             batch: DfsMetadataJournalBatch {
                 shard_id: DfsMetadataShardId::new("shard-local"),
                 entries: Vec::new(),
@@ -902,6 +904,8 @@ mod tests {
             request_id: "req-snapshot-1".to_string(),
             source_node_id: sinomo_core::node::NodeId::from_legacy_named("node_snapshot_source")
                 .expect("source node"),
+            file_system_id: None,
+            authority_epoch: None,
             shard_id: DfsMetadataShardId::new("shard-snapshot-local"),
             next_after_sequence: 7,
             snapshot,

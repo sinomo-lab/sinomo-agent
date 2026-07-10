@@ -7,6 +7,10 @@
 
 #[cfg(test)]
 use crate::DfsReplicationPolicy;
+use crate::advisory_lock::{
+    DfsAdvisoryLockApplyResult, DfsAdvisoryLockCommand, DfsAdvisoryLockStateRecord,
+    DfsAdvisoryLockTransitionContext, transition_advisory_lock_state,
+};
 #[cfg(test)]
 use crate::control_plane::DfsMetadataShardConfig;
 use crate::metadata_api::DfsMetadataBackend;
@@ -206,6 +210,51 @@ impl LocalSobjMetadataBackend {
         &self.shard_id
     }
 
+    /// Install an exact lock aggregate while migrating an object's metadata
+    /// family between local shards.
+    ///
+    /// Normal lock callers must use `apply_advisory_lock_command`; this path
+    /// exists only so a path-based shard move cannot silently drop live lock
+    /// state or its fencing history.
+    pub(crate) fn install_advisory_lock_state_for_migration(
+        &mut self,
+        state: &DfsAdvisoryLockStateRecord,
+    ) -> Result<Option<DfsMetadataJournalEntry>> {
+        let _lock = self.begin_metadata_write()?;
+        let (state, source_fingerprint) =
+            crate::advisory_lock::prepare_advisory_lock_state_for_migration(state)
+                .map_err(|source| MetadataBackendError::AdvisoryLock(source.to_string()))?;
+        let object = self.tables.objects.get(&state.object_id).ok_or_else(|| {
+            MetadataBackendError::UnknownObject {
+                object_id: state.object_id.clone(),
+            }
+        })?;
+        if object.file_system_id != state.file_system_id {
+            return Err(MetadataBackendError::AdvisoryLock(format!(
+                "migrated lock state for {}/{} does not match target object filesystem {}",
+                state.file_system_id, state.object_id, object.file_system_id
+            )));
+        }
+        if let Some(existing) = self.tables.advisory_lock_states.get(&state.object_id) {
+            if existing == &state
+                || existing
+                    .migration_source_fingerprints
+                    .contains(&source_fingerprint)
+            {
+                return Ok(None);
+            }
+            return Err(MetadataBackendError::AdvisoryLock(format!(
+                "target shard {} has conflicting advisory-lock state for object {}",
+                self.shard_id.0, state.object_id
+            )));
+        }
+        self.write_journal_entry_and_apply_table_ops_unlocked(
+            DfsMetadataMutation::put_advisory_lock_state(&state),
+            vec![DfsMetadataTableOp::PutAdvisoryLockState { state }],
+        )
+        .map(Some)
+    }
+
     /// Persist and materialize a replicated journal batch from a metadata peer.
     ///
     /// Entries whose replay cursor is already past their sequence are skipped.
@@ -293,9 +342,42 @@ impl LocalSobjMetadataBackend {
         snapshot: DfsMetadataTableSnapshot,
     ) -> Result<bool> {
         let _lock = self.begin_metadata_write()?;
+        if snapshot.materialized_through_sequence != Some(replayed_through_sequence) {
+            return Err(MetadataBackendError::Serde(format!(
+                "replicated metadata snapshot embedded sequence {:?} does not match install sequence {replayed_through_sequence}",
+                snapshot.materialized_through_sequence
+            )));
+        }
+        let acknowledged_floor =
+            metadata_cursor::metadata_prefix_ack_floor(&self.root, &source_shard_id)?;
+        if let Some(floor) = acknowledged_floor.as_ref() {
+            if replayed_through_sequence < floor.journal_sequence {
+                return Err(MetadataBackendError::Serde(format!(
+                    "replicated metadata snapshot sequence {replayed_through_sequence} would roll shard {} behind locally acknowledged checkpoint {}",
+                    source_shard_id.0, floor.journal_sequence
+                )));
+            }
+            if replayed_through_sequence == floor.journal_sequence {
+                let fingerprint = dfs_metadata_table_snapshot_state_fingerprint(&snapshot)
+                    .map_err(|source| {
+                        MetadataBackendError::Serde(format!(
+                            "encode replicated metadata snapshot acknowledgement check: {source}"
+                        ))
+                    })?;
+                if fingerprint != floor.state_fingerprint {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "replicated metadata snapshot conflicts with locally acknowledged checkpoint for shard {} sequence {replayed_through_sequence}",
+                        source_shard_id.0
+                    )));
+                }
+            }
+        }
         let tables = metadata_tables_from_table_snapshot(snapshot, "replicated metadata snapshot")?;
         let archived_existing = archive_metadata_backend_state(&self.root)?;
         create_dir_all(self.root.join("records"))?;
+        if let Some(floor) = acknowledged_floor.as_ref() {
+            metadata_cursor::put_metadata_prefix_ack_floor(&self.root, floor)?;
+        }
         create_dir_all(self.root.join("journal").join("segments"))?;
         self.tables = tables;
         self.table_log_offset = 0;
@@ -703,6 +785,47 @@ impl LocalSobjMetadataBackend {
                 }
                 Ok(true)
             }
+            DfsMetadataMutation::PutAdvisoryLockState {
+                file_system_id,
+                object_id,
+                state,
+            } => {
+                let state =
+                    required_replay_payload(entry, "put-advisory-lock-state", state.as_ref())?;
+                if state.file_system_id != *file_system_id || state.object_id != *object_id {
+                    return Err(MetadataBackendError::AdvisoryLock(format!(
+                        "journal scope {file_system_id}/{object_id} does not match payload scope {}/{}",
+                        state.file_system_id, state.object_id
+                    )));
+                }
+                let object = self.get_object(object_id)?.ok_or_else(|| {
+                    MetadataBackendError::UnknownObject {
+                        object_id: object_id.clone(),
+                    }
+                })?;
+                if object.file_system_id != *file_system_id {
+                    return Err(MetadataBackendError::AdvisoryLock(format!(
+                        "journal lock state for {file_system_id}/{object_id} does not match object filesystem {}",
+                        object.file_system_id
+                    )));
+                }
+                if self
+                    .tables
+                    .advisory_lock_states
+                    .get(object_id)
+                    .is_some_and(|existing| existing == state)
+                {
+                    return Ok(false);
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::PutAdvisoryLockState {
+                        state: state.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
             DfsMetadataMutation::ApplyNamespaceTransaction {
                 transaction_id,
                 transaction,
@@ -718,6 +841,24 @@ impl LocalSobjMetadataBackend {
                     return Ok(false);
                 }
                 self.plan_namespace_transaction_table_ops(&normalized, table_ops, rollback)?;
+                Ok(true)
+            }
+            DfsMetadataMutation::PutNamespaceJob { job_id, job, .. } => {
+                let job = required_replay_payload(entry, "put-namespace-job", job.as_ref())?;
+                if job.job_id != *job_id {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "journal namespace job id {job_id} does not match payload {}",
+                        job.job_id
+                    )));
+                }
+                if self.tables.namespace_jobs.get(job_id) == Some(job) {
+                    return Ok(false);
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::PutNamespaceJob { job: job.clone() },
+                    table_ops,
+                    rollback,
+                );
                 Ok(true)
             }
         }
@@ -1018,12 +1159,26 @@ impl LocalSobjMetadataBackend {
                     }]
                 }
             }
+            DfsMetadataMutation::PutAdvisoryLockState { state, .. } => {
+                let Some(state) = state.as_ref() else {
+                    return Ok(());
+                };
+                vec![DfsMetadataTableOp::PutAdvisoryLockState {
+                    state: state.clone(),
+                }]
+            }
             DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } => {
                 let Some(transaction) = transaction.as_ref() else {
                     return Ok(());
                 };
                 let transaction = normalized_namespace_transaction(transaction);
                 namespace_transaction_table_ops(&self.tables, &transaction)
+            }
+            DfsMetadataMutation::PutNamespaceJob { job, .. } => {
+                let Some(job) = job.as_ref() else {
+                    return Ok(());
+                };
+                vec![DfsMetadataTableOp::PutNamespaceJob { job: job.clone() }]
             }
         };
         self.append_and_apply_table_ops(entry.sequence, table_ops)
@@ -1247,6 +1402,75 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     fn get_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsObjectMetadata>> {
         let tables = self.current_tables_snapshot()?;
         Ok(tables.objects.get(object_id).cloned())
+    }
+
+    fn get_advisory_lock_state(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+    ) -> Result<Option<DfsAdvisoryLockStateRecord>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables
+            .advisory_lock_states
+            .get(object_id)
+            .filter(|state| state.file_system_id == *file_system_id)
+            .cloned())
+    }
+
+    fn apply_advisory_lock_command(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        context: DfsAdvisoryLockTransitionContext,
+        command: &DfsAdvisoryLockCommand,
+    ) -> Result<DfsAdvisoryLockApplyResult> {
+        let _lock = self.begin_metadata_write()?;
+        let object = self.tables.objects.get(object_id).ok_or_else(|| {
+            MetadataBackendError::UnknownObject {
+                object_id: object_id.clone(),
+            }
+        })?;
+        if object.file_system_id != *file_system_id {
+            return Err(MetadataBackendError::AdvisoryLock(format!(
+                "object {object_id} belongs to filesystem {}, not {file_system_id}",
+                object.file_system_id
+            )));
+        }
+        let transition = transition_advisory_lock_state(
+            self.tables.advisory_lock_states.get(object_id),
+            file_system_id,
+            object_id,
+            context,
+            command,
+        )
+        .map_err(|error| MetadataBackendError::AdvisoryLock(error.to_string()))?;
+        let journal_entry = if transition.changed {
+            Some(self.write_journal_entry_and_apply_table_ops_unlocked(
+                DfsMetadataMutation::put_advisory_lock_state(&transition.state),
+                vec![DfsMetadataTableOp::PutAdvisoryLockState {
+                    state: transition.state,
+                }],
+            )?)
+        } else {
+            None
+        };
+        let durable_through_sequence = journal_entry
+            .as_ref()
+            .map(|entry| entry.sequence)
+            .unwrap_or_else(|| self.journal_last_sequence());
+        Ok(DfsAdvisoryLockApplyResult {
+            outcome: transition.outcome,
+            shard_id: self.shard_id.clone(),
+            durable_through_sequence,
+            journal_entry,
+        })
+    }
+
+    fn install_advisory_lock_state_for_migration(
+        &mut self,
+        state: &DfsAdvisoryLockStateRecord,
+    ) -> Result<Option<DfsMetadataJournalEntry>> {
+        LocalSobjMetadataBackend::install_advisory_lock_state_for_migration(self, state)
     }
 
     fn get_object_by_path(
@@ -1991,10 +2215,11 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
 
     fn put_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {
         let _lock = self.begin_metadata_write()?;
-        self.append_and_apply_table_ops(
-            self.next_sequence.saturating_sub(1).max(1),
+        self.write_journal_entry_and_apply_table_ops_unlocked(
+            DfsMetadataMutation::put_namespace_job(job),
             vec![DfsMetadataTableOp::PutNamespaceJob { job: job.clone() }],
         )
+        .map(drop)
     }
 
     fn get_namespace_transaction(
@@ -2194,6 +2419,18 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             shard_id,
             next_after_sequence,
         )
+    }
+
+    fn metadata_prefix_ack_floor(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<DfsMetadataPrefixAckFloor>> {
+        metadata_cursor::metadata_prefix_ack_floor(&self.root, shard_id)
+    }
+
+    fn put_metadata_prefix_ack_floor(&mut self, floor: &DfsMetadataPrefixAckFloor) -> Result<()> {
+        let _lock = self.begin_metadata_write()?;
+        metadata_cursor::put_metadata_prefix_ack_floor(&self.root, floor)
     }
 
     fn metadata_shard_statuses(&self) -> Result<Vec<DfsMetadataShardStatus>> {
@@ -2407,7 +2644,10 @@ mod tests {
     use crate::metadata_keys::{
         dentry_key, key_segment, normalize_path, path_hash, path_record_for_object,
     };
-    use crate::{DfsMetadataShardAssignment, DfsObjectKind};
+    use crate::{
+        DfsAdvisoryLockMode, DfsAdvisoryLockOutcome, DfsAdvisoryLockRequestId,
+        DfsAdvisoryLockSessionId, DfsMetadataShardAssignment, DfsObjectKind,
+    };
     use sinomo_core::DfsObjectPolicy;
     use std::time::Duration;
 
@@ -3163,6 +3403,7 @@ mod tests {
                 file_system_id: file_system.file_system_id.clone(),
                 objects: vec![object.clone()],
                 versions: Vec::new(),
+                advisory_lock_states: Vec::new(),
                 created_at: OffsetDateTime::UNIX_EPOCH,
             })
             .expect("namespace transaction");
@@ -3760,6 +4001,7 @@ mod tests {
                 file_system_id: file_system.file_system_id.clone(),
                 objects: vec![moved],
                 versions: Vec::new(),
+                advisory_lock_states: Vec::new(),
                 created_at: OffsetDateTime::now_utc(),
             })
             .expect_err("target shard journal failure should reject namespace move");
@@ -3915,6 +4157,7 @@ mod tests {
             status: DfsConflictStatus::Open,
             detected_at: OffsetDateTime::UNIX_EPOCH,
         };
+        let mut expected_lock_state;
         {
             let mut root_only = LocalShardedMetadataBackend::new(
                 &root,
@@ -3927,7 +4170,31 @@ mod tests {
             root_only.put_receipt(&receipt).expect("receipt");
             root_only.put_intent(&intent).expect("intent");
             root_only.put_conflict(&conflict).expect("conflict");
+            root_only
+                .apply_advisory_lock_command(
+                    &object.file_system_id,
+                    &object.object_id,
+                    DfsAdvisoryLockTransitionContext {
+                        authority_epoch: 1,
+                        now_unix_nanos: 1,
+                        lease_duration_nanos: 100,
+                        max_clock_skew_nanos: 0,
+                    },
+                    &DfsAdvisoryLockCommand::Acquire {
+                        request_id: DfsAdvisoryLockRequestId::new("migration-lock"),
+                        session_id: DfsAdvisoryLockSessionId::new("migration-session"),
+                        mode: DfsAdvisoryLockMode::Exclusive,
+                        blocking: false,
+                        process_id: None,
+                    },
+                )
+                .expect("lock state");
+            expected_lock_state = root_only
+                .get_advisory_lock_state(&object.file_system_id, &object.object_id)
+                .expect("lock state")
+                .expect("lock aggregate");
         }
+        expected_lock_state.authority_rebind_required = true;
 
         let mut backend = LocalShardedMetadataBackend::new(
             &root,
@@ -3986,6 +4253,13 @@ mod tests {
                 .get_conflict(&object.object_id, &conflict.conflict_id)
                 .expect("migrated conflict"),
             Some(conflict)
+        );
+        assert_eq!(
+            backend
+                .get_advisory_lock_state(&object.file_system_id, &object.object_id)
+                .expect("migrated lock state"),
+            Some(expected_lock_state),
+            "same-node shard migration must preserve the object lock aggregate"
         );
         assert_eq!(
             backend
@@ -5987,6 +6261,7 @@ mod tests {
             file_system_id: file_system_id(),
             objects: vec![transaction_object],
             versions: Vec::new(),
+            advisory_lock_states: Vec::new(),
             created_at: OffsetDateTime::UNIX_EPOCH,
         };
         backend
@@ -8545,6 +8820,7 @@ mod tests {
             file_system_id: file_system_id(),
             objects: vec![source.clone(), destination.clone()],
             versions: Vec::new(),
+            advisory_lock_states: Vec::new(),
             created_at: OffsetDateTime::UNIX_EPOCH,
         };
         backend
@@ -8603,6 +8879,7 @@ mod tests {
             file_system_id: file_system_id(),
             objects: vec![source, destination],
             versions: Vec::new(),
+            advisory_lock_states: Vec::new(),
             created_at: OffsetDateTime::UNIX_EPOCH,
         };
         backend
@@ -8722,6 +8999,7 @@ mod tests {
                 file_system_id: object.file_system_id.clone(),
                 objects: vec![object.clone()],
                 versions: vec![version_record.clone()],
+                advisory_lock_states: Vec::new(),
                 created_at: OffsetDateTime::UNIX_EPOCH,
             })
             .expect("transaction");
@@ -8990,6 +9268,158 @@ mod tests {
                 .expect("reopened receipts")
                 .len(),
             2
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn advisory_lock_state_is_journaled_idempotent_and_replica_replayable() {
+        let leader_root = temp_root("advisory_lock_state_leader");
+        let follower_root = temp_root("advisory_lock_state_follower");
+        let snapshot_root = temp_root("advisory_lock_state_snapshot");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut leader =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &leader_root).expect("leader");
+        leader.put_file_system(&file_system()).expect("filesystem");
+        let object = object(version("lock-v1"));
+        leader.put_object(&object).expect("object");
+        let command = DfsAdvisoryLockCommand::Acquire {
+            request_id: DfsAdvisoryLockRequestId::new("acquire-a"),
+            session_id: DfsAdvisoryLockSessionId::new("session-a"),
+            mode: DfsAdvisoryLockMode::Exclusive,
+            blocking: false,
+            process_id: Some(42),
+        };
+        let context = DfsAdvisoryLockTransitionContext {
+            authority_epoch: 3,
+            now_unix_nanos: 100,
+            lease_duration_nanos: 1_000,
+            max_clock_skew_nanos: 0,
+        };
+        let applied = leader
+            .apply_advisory_lock_command(
+                &object.file_system_id,
+                &object.object_id,
+                context,
+                &command,
+            )
+            .expect("acquire");
+        assert_eq!(applied.shard_id, shard_id);
+        assert_eq!(applied.durable_through_sequence, 3);
+        assert!(applied.journal_entry.is_some());
+        assert!(matches!(
+            &applied.outcome,
+            DfsAdvisoryLockOutcome::Acquired { .. }
+        ));
+
+        let retry = leader
+            .apply_advisory_lock_command(
+                &object.file_system_id,
+                &object.object_id,
+                context,
+                &command,
+            )
+            .expect("idempotent retry");
+        assert_eq!(retry.outcome, applied.outcome);
+        assert!(retry.journal_entry.is_none());
+        assert_eq!(retry.durable_through_sequence, 3);
+
+        let expected_state = leader
+            .get_advisory_lock_state(&object.file_system_id, &object.object_id)
+            .expect("state")
+            .expect("lock aggregate");
+        drop(leader);
+        let leader =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &leader_root).expect("reopen leader");
+        assert_eq!(
+            leader
+                .get_advisory_lock_state(&object.file_system_id, &object.object_id)
+                .expect("reopened state"),
+            Some(expected_state.clone())
+        );
+
+        let mut follower =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &follower_root).expect("follower");
+        let batch = leader
+            .journal_batch_since_limited(0, 16, usize::MAX)
+            .expect("journal batch")
+            .expect("non-empty journal batch");
+        follower.apply_journal_batch(&batch).expect("replay");
+        assert_eq!(
+            follower
+                .get_advisory_lock_state(&object.file_system_id, &object.object_id)
+                .expect("follower state"),
+            Some(expected_state)
+        );
+
+        let mut snapshot_replica =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &snapshot_root).expect("snapshot");
+        snapshot_replica
+            .replace_with_replicated_snapshot(
+                shard_id,
+                leader.journal_last_sequence(),
+                leader.export_table_snapshot(),
+            )
+            .expect("install snapshot");
+        assert_eq!(
+            snapshot_replica
+                .get_advisory_lock_state(&object.file_system_id, &object.object_id)
+                .expect("snapshot state"),
+            follower
+                .get_advisory_lock_state(&object.file_system_id, &object.object_id)
+                .expect("follower state")
+        );
+
+        cleanup(&leader_root);
+        cleanup(&follower_root);
+        cleanup(&snapshot_root);
+    }
+
+    #[test]
+    fn sharded_backend_routes_lock_aggregate_with_the_stable_object() {
+        let root = temp_root("sharded_backend_routes_lock_aggregate");
+        let configs = vec![
+            shard_config("root", DfsMetadataShardAssignment::Root),
+            shard_config(
+                "projects",
+                DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/projects".to_string(),
+                },
+            ),
+        ];
+        let mut backend = LocalShardedMetadataBackend::new(&root, configs).expect("sharded");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        let mut project = object(version("project-lock-v1"));
+        project.object_id =
+            DfsObjectId::from_legacy_named("project_lock_object").expect("project object id");
+        project.path = "/projects/repo/readme.md".to_string();
+        backend.put_object(&project).expect("project object");
+        let applied = backend
+            .apply_advisory_lock_command(
+                &project.file_system_id,
+                &project.object_id,
+                DfsAdvisoryLockTransitionContext {
+                    authority_epoch: 1,
+                    now_unix_nanos: 1,
+                    lease_duration_nanos: 10,
+                    max_clock_skew_nanos: 0,
+                },
+                &DfsAdvisoryLockCommand::Acquire {
+                    request_id: DfsAdvisoryLockRequestId::new("project-acquire"),
+                    session_id: DfsAdvisoryLockSessionId::new("project-session"),
+                    mode: DfsAdvisoryLockMode::Shared,
+                    blocking: false,
+                    process_id: None,
+                },
+            )
+            .expect("project lock");
+        assert_eq!(applied.shard_id, DfsMetadataShardId::new("projects"));
+        assert!(
+            backend
+                .get_advisory_lock_state(&project.file_system_id, &project.object_id)
+                .expect("routed lock state")
+                .is_some()
         );
 
         cleanup(&root);

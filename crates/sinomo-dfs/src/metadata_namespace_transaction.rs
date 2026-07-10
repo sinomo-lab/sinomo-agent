@@ -22,6 +22,7 @@ pub(crate) fn validate_namespace_transaction_preconditions(
     tables: &DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
 ) -> Result<()> {
+    validate_advisory_lock_state_preconditions(tables, transaction)?;
     let mut scratch = tables.clone();
     for op in plan_namespace_transaction_table_ops(tables, transaction) {
         scratch.apply(op);
@@ -77,6 +78,15 @@ pub(crate) fn plan_namespace_transaction_table_ops(
             },
         );
     }
+    for state in &transaction.advisory_lock_states {
+        apply_planned_op(
+            &mut scratch,
+            &mut table_ops,
+            DfsMetadataTableOp::PutAdvisoryLockState {
+                state: state.clone(),
+            },
+        );
+    }
     table_ops
 }
 
@@ -100,6 +110,11 @@ fn plan_single_object_namespace_transaction_table_ops(
     for version in &transaction.versions {
         table_ops.push(DfsMetadataTableOp::PutVersion {
             version: normalized_version_record(version),
+        });
+    }
+    for state in &transaction.advisory_lock_states {
+        table_ops.push(DfsMetadataTableOp::PutAdvisoryLockState {
+            state: state.clone(),
         });
     }
     table_ops
@@ -154,7 +169,70 @@ pub(crate) fn plan_namespace_transaction_recovery_table_ops(
             );
         }
     }
+    for state in &transaction.advisory_lock_states {
+        if !scratch.advisory_lock_states.contains_key(&state.object_id) {
+            apply_planned_op(
+                &mut scratch,
+                &mut table_ops,
+                DfsMetadataTableOp::PutAdvisoryLockState {
+                    state: state.clone(),
+                },
+            );
+        }
+    }
     table_ops
+}
+
+fn validate_advisory_lock_state_preconditions(
+    tables: &DfsMetadataTables,
+    transaction: &DfsNamespaceTransaction,
+) -> Result<()> {
+    let transaction_object_ids = transaction
+        .objects
+        .iter()
+        .map(|object| object.object_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::new();
+    for state in &transaction.advisory_lock_states {
+        if state.file_system_id != transaction.file_system_id {
+            return Err(MetadataBackendError::AdvisoryLock(format!(
+                "namespace transaction {} contains lock state for filesystem {}",
+                transaction.transaction_id, state.file_system_id
+            )));
+        }
+        if !seen.insert(state.object_id.clone()) {
+            return Err(MetadataBackendError::AdvisoryLock(format!(
+                "namespace transaction {} repeats lock state for object {}",
+                transaction.transaction_id, state.object_id
+            )));
+        }
+        if !transaction_object_ids.contains(&state.object_id)
+            && !tables.objects.contains_key(&state.object_id)
+        {
+            return Err(MetadataBackendError::UnknownObject {
+                object_id: state.object_id.clone(),
+            });
+        }
+        if let Some(existing) = tables.advisory_lock_states.get(&state.object_id)
+            && existing != state
+        {
+            let reclaims_tombstoned_object = tables
+                .objects
+                .get(&state.object_id)
+                .is_some_and(|object| object.kind == crate::DfsObjectKind::Tombstone)
+                && transaction.objects.iter().any(|object| {
+                    object.object_id == state.object_id
+                        && object.kind != crate::DfsObjectKind::Tombstone
+                });
+            if !reclaims_tombstoned_object {
+                return Err(MetadataBackendError::AdvisoryLock(format!(
+                    "namespace transaction {} conflicts with advisory-lock state for object {}",
+                    transaction.transaction_id, state.object_id
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn object_path_has_external_owner(
@@ -246,7 +324,7 @@ mod tests {
     use super::*;
     use crate::metadata_keys::{dentry_key, path_record_for_object};
     use crate::metadata_records::{DfsInodeRecord, DfsObjectVersionRecord};
-    use crate::{DfsFileSystemId, DfsVersion};
+    use crate::{DfsAdvisoryLockStateRecord, DfsFileSystemId, DfsVersion};
     use sinomo_core::DfsObjectPolicy;
     use sinomo_core::node::NodeId;
     use time::OffsetDateTime;
@@ -323,6 +401,7 @@ mod tests {
             file_system_id: file_system_id(),
             objects: vec![live.clone(), tombstone.clone()],
             versions: vec![version_record(&live)],
+            advisory_lock_states: Vec::new(),
             created_at: OffsetDateTime::UNIX_EPOCH,
         };
 
@@ -379,6 +458,7 @@ mod tests {
             file_system_id: file_system_id(),
             objects: vec![recovering.clone()],
             versions: Vec::new(),
+            advisory_lock_states: Vec::new(),
             created_at: OffsetDateTime::UNIX_EPOCH,
         };
 
@@ -395,5 +475,85 @@ mod tests {
                 .dentries
                 .contains_key(&dentry_key(&path_record_for_object(&existing)))
         );
+    }
+
+    #[test]
+    fn transaction_plan_installs_object_before_its_lock_aggregate() {
+        let object = object(
+            object_id("obj_namespace_lock_move"),
+            "/moved/locked.txt",
+            DfsObjectKind::File,
+        );
+        let mut state = DfsAdvisoryLockStateRecord::empty(
+            object.file_system_id.clone(),
+            object.object_id.clone(),
+            7,
+        );
+        state.authority_rebind_required = true;
+        let transaction = DfsNamespaceTransaction {
+            transaction_id: "txn_namespace_lock_move".to_string(),
+            file_system_id: object.file_system_id.clone(),
+            objects: vec![object.clone()],
+            versions: Vec::new(),
+            advisory_lock_states: vec![state.clone()],
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+
+        validate_namespace_transaction_preconditions(&DfsMetadataTables::default(), &transaction)
+            .expect("lock migration transaction");
+        let ops = plan_namespace_transaction_table_ops(&DfsMetadataTables::default(), &transaction);
+        let object_position = ops
+            .iter()
+            .position(|op| matches!(op, DfsMetadataTableOp::PutObject { object: candidate } if candidate.object_id == object.object_id))
+            .expect("object op");
+        let state_position = ops
+            .iter()
+            .position(|op| matches!(op, DfsMetadataTableOp::PutAdvisoryLockState { state: candidate } if candidate == &state))
+            .expect("lock state op");
+        assert!(object_position < state_position);
+    }
+
+    #[test]
+    fn migration_can_supersede_lock_orphan_for_a_tombstoned_object() {
+        let mut moved_back = object(
+            object_id("obj_namespace_lock_move_back"),
+            "/returned/locked.txt",
+            DfsObjectKind::File,
+        );
+        let mut tombstone = moved_back.clone();
+        tombstone.kind = DfsObjectKind::Tombstone;
+        tombstone.path = "/departed/locked.txt".to_string();
+        let mut stale_state = DfsAdvisoryLockStateRecord::empty(
+            moved_back.file_system_id.clone(),
+            moved_back.object_id.clone(),
+            3,
+        );
+        stale_state.authority_rebind_required = true;
+        let mut current_state = stale_state.clone();
+        current_state.authority_epoch = 9;
+
+        let mut tables = DfsMetadataTables::default();
+        tables
+            .objects
+            .insert(tombstone.object_id.clone(), tombstone);
+        tables
+            .advisory_lock_states
+            .insert(stale_state.object_id.clone(), stale_state);
+        moved_back.kind = DfsObjectKind::File;
+        let transaction = DfsNamespaceTransaction {
+            transaction_id: "txn_namespace_lock_move_back".to_string(),
+            file_system_id: moved_back.file_system_id.clone(),
+            objects: vec![moved_back],
+            versions: Vec::new(),
+            advisory_lock_states: vec![current_state.clone()],
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+
+        validate_namespace_transaction_preconditions(&tables, &transaction)
+            .expect("tombstoned shard may accept the returning lock aggregate");
+        let ops = plan_namespace_transaction_table_ops(&tables, &transaction);
+        assert!(ops.iter().any(
+            |op| matches!(op, DfsMetadataTableOp::PutAdvisoryLockState { state } if state == &current_state)
+        ));
     }
 }

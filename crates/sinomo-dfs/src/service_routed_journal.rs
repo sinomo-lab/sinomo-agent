@@ -119,6 +119,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 shard_id: shard_id.clone(),
                 next_after_sequence,
                 applied_entries: 0,
+                verified_prefix_only: false,
                 result: DfsMetadataJournalBatchResult::Rejected { reason },
             }),
         )?;

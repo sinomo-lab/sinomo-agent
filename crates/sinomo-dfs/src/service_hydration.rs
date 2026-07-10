@@ -157,7 +157,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         self.mark_replayed_intent_as_rejected(&intent_record)?;
                         continue;
                     }
-                    Err(DfsDistributedError::DuplicateIntentId { .. }) => {
+                    Err(
+                        DfsDistributedError::DuplicateIntentId { .. }
+                        | DfsDistributedError::DuplicateIntent { .. },
+                    ) => {
                         if matches!(intent_record.status, DfsWriteIntentStatus::Committed)
                             && self
                                 .current_read_object_metadata(&intent_record.object_id)
@@ -534,6 +537,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 };
                 self.metadata.add_conflict(conflict.clone());
             }
+            // Advisory locks are consumed directly from the authoritative
+            // metadata backend; namespace jobs likewise have no legacy
+            // in-memory mirror.
+            DfsMetadataMutation::PutAdvisoryLockState { .. }
+            | DfsMetadataMutation::PutNamespaceJob { .. } => {}
             DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } => {
                 let Some(transaction) = transaction.as_ref() else {
                     self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
@@ -657,6 +665,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     self.metadata.remove_conflict(object_id, conflict_id);
                 }
             }
+            DfsMetadataMutation::PutAdvisoryLockState { .. }
+            | DfsMetadataMutation::PutNamespaceJob { .. } => {}
             DfsMetadataMutation::ApplyNamespaceTransaction { transaction_id, .. } => {
                 let transaction = self
                     .metadata_backend
@@ -800,7 +810,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.mark_replayed_intent_as_rejected(intent_record)?;
                 return Ok(());
             }
-            Err(DfsDistributedError::DuplicateIntentId { .. }) => {
+            Err(
+                DfsDistributedError::DuplicateIntentId { .. }
+                | DfsDistributedError::DuplicateIntent { .. },
+            ) => {
                 if self
                     .coordinator
                     .intent(&intent_record.intent_id)

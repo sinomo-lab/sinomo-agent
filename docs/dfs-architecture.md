@@ -287,12 +287,13 @@ The synchronization barriers are:
 | `fsync(file)` | The same prefix plus file-integrity metadata is durable. It does not make the parent directory entry durable. |
 | `fsync(directory)` | Namespace changes captured by the call, such as create, rename, and unlink entries, are durably certified. |
 
-Every sync request has a durable idempotency id and immutable payload. A lost
-reply is `outcome-unknown`, not a definite failure. Retrying the same id and
-payload returns the stored canonical result; reusing the id with another
-payload is rejected. A successful sync is never rolled back by primary change.
-An in-flight sync fenced before canonical certification becomes terminal and
-cannot later commit under its stale epoch.
+The formal target assigns every sync request a durable idempotency id and
+immutable payload. The current Rust barrier is deliberately narrower: its
+captured target and restart-unique metadata probe are immutable, but
+caller-selected sync ids and outcome-unknown replay records remain future
+work. A lost reply must therefore be retried by recapturing the current
+stable-object target, not by assuming that a pathname or cached per-handle
+version is still the same prefix.
 
 Obsolete locks and abandoned internal reservations must not create protocol
 deadlock. Multi-shard reservations use deterministic acquisition order,
@@ -301,12 +302,73 @@ current epoch, and terminal jobs release their effective reservations. Eventual
 completion still assumes eventual logical-time advancement, a stable quorum, a
 validated source for committed content, and fair recovery scheduling.
 
-The Quint slices for advisory locks, sync barriers, and partition recovery are
-currently **target-hardening contracts**. The FUSE adapter does not yet expose
-distributed advisory-lock callbacks, and its current `flush`, `release`, and
-`fsync` paths share one commit operation while `fdatasync` is not distinguished.
-Those implementation gaps must be closed before the formal contract is claimed
-as current POSIX conformance.
+The Rust DFS now implements the first bounded refinement of the advisory-lock
+and sync slices. Whole-file `F_GETLK`, `F_SETLK`, and `F_SETLKW` route to the
+stable object's metadata primary; lock aggregates are journaled, replicated to
+metadata quorum, epoch-fenced, leased, renewed by mounted clients, and moved
+atomically with a cross-shard object adoption. Blocking waits run outside the
+FUSE dispatch lane, and exact close/cancel transitions plus finite leases keep
+abandoned waiters from becoming protocol deadlocks. Partial byte ranges remain
+unsupported, and a conflicting blocking shared-to-exclusive conversion returns
+`EDEADLK` instead of creating a conversion cycle.
+
+Lock sessions and request ids are scoped to the authenticated requesting node;
+one node cannot close or cancel another node's grant by replaying an observed
+identifier. Clients consume an authority-reported relative lease budget using a
+local monotonic clock. On authority change, the new primary also waits the old
+deadline plus a configured five-minute maximum inter-node clock-skew bound.
+Strong renewable locks therefore require clocks to stay within that bound.
+The current FUSE refinement caps each mount at two distinct held or pending
+locks and uses ten-second coordination calls, leaving renewal headroom behind a
+foreground durability barrier; a third independent lock returns `ENOLCK`.
+Mutating lock requests retain their durable idempotency outcome without a
+bounded eviction window so an arbitrarily delayed exact retry cannot resurrect
+an acquisition. Read-only `F_GETLK` queries do not grow that history. A
+monotone per-session acknowledgement watermark is required before the retained
+history can be compacted safely. The current `fuser` API drops
+`FUSE_INTERRUPT`, so mount shutdown, close/cancel, and finite wait leases bound
+blocking requests, but signal-driven cancellation of one `F_SETLKW` call is
+not yet available.
+When a locked object moves between metadata shards, the destination installs
+the rebinding-marked lock aggregate with the object, syncs it to metadata
+quorum, and returns an exact typed digest receipt before the source may evict.
+Peers that predate lock-state adoption cannot return that receipt, so a rolling
+upgrade fails the move safely; an exact retry can repair an object that the old
+peer adopted before it understood the lock aggregate.
+
+FUSE writes now publish through the canonical DFS write path before the write
+reply, eliminating per-handle dirty-buffer visibility races during lock
+handoff. `flush` and `release` therefore perform close/lock cleanup but do not
+claim durability. `O_DSYNC` and `O_SYNC` writes invoke the file-data and
+full-file barriers respectively. File `fsync`, file `fdatasync`, and directory
+`fsync` capture immutable
+targets and route distinct operations to the metadata authority. A successful
+file result validates the exact version/hash on every desired content replica,
+collects a fresh acknowledgement of the complete canonical materialized
+metadata checkpoint at the exact journal head from a metadata majority,
+intersects that recovery set with the content holders, publishes an epoch-bound
+durable metadata-head watermark through cluster Raft, and only then returns.
+The checkpoint probe has a restart-unique identity and carries an empty journal
+batch, so a delayed reply cannot satisfy another attempt and a rolling-upgrade
+peer cannot skip its replay cursor. A persisted replication cursor alone is
+never a sync acknowledgement. Each replica also persists a monotonic,
+fingerprint-bound checkpoint floor before acknowledging the probe; delayed
+snapshot repair is rejected below that floor or at an equal sequence with a
+different state. The current `fdatasync` physical barrier is
+deliberately as strong as `fsync` because essential and ancillary file metadata
+share one journal transaction.
+
+This is not yet a full refinement of the combined partition model. Rust takes
+the conservative path when quorum is unavailable: new grants, renewals, and
+sync completion fail or wait rather than using the model's complete-holder
+permit. Explicit caller-selected durable sync ids, byte-range locks,
+application-level wait-cycle detection, open-unlinked lifetime, and directory
+open-handle identity remain target hardening. FUSE data I/O now targets the
+stable object id and fails closed if the pathname has been replaced; it does
+not yet retain an unlinked inode after the last name disappears. The initial exact
+metadata-checkpoint proof also hashes the complete shard snapshot on each
+participant; replacing this bounded correctness-first path with a cached
+incremental or Merkle commitment is future scale hardening.
 
 ## Reads and Caches
 

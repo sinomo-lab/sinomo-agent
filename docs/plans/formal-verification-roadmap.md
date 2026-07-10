@@ -86,12 +86,13 @@ stranding durable jobs with path reservations held.
    counts.
 6. **Authority handoff.** Prove that the old primary becomes quiescent and the
    new primary eventually rediscovers and schedules committed repair work.
-7. **POSIX conformance.** Replay finite namespace, link, cross-shard, and
-   visibility scenarios against the Rust DFS service. Add conformance gates for
-   distributed advisory locks and distinct `fsync`/`fdatasync`/directory-sync
-   behavior before reclassifying those models from target hardening. Then
-   deepen directory, by-id lookup, open-handle rename/unlink, byte-range locks,
-   application wait-cycle detection, and aborted-move reservation release.
+7. **POSIX conformance.** The first Rust gate now includes persistent
+   whole-file distributed advisory locks and distinct
+   `fsync`/`fdatasync`/directory-sync routing with quorum head certificates.
+   Add end-to-end partition traces and durable sync-id replay before promoting
+   the combined model beyond target hardening. Then deepen directory, by-id
+   lookup, open-handle rename/unlink, byte-range locks, application wait-cycle
+   detection, and aborted-move reservation release.
 8. **Local-first DFS extension (deferred).** Do not add provisional branches or
    reconciliation to the canonical model until the authority permit, lock-loss,
    sync durability, and partition-recovery contracts have corresponding Rust

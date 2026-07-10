@@ -594,11 +594,21 @@ contract for a bounded whole-file advisory-lock manager:
 
 These are advisory rather than mandatory locks. The slice assumes cooperating
 clients and weakly fair logical-time ticks after renewal becomes unavailable.
-It does not yet model wall-clock drift/renewal RPC timing, byte ranges, multiple
-objects, process-associated `fcntl` close semantics, or arbitrary
-application-created wait cycles. The production FUSE adapter does not currently
-expose the distributed lock callbacks, so this is not a current-behavior
-refinement.
+It does not yet model concrete wall-clock drift/renewal RPC timing, byte ranges,
+multiple objects, or arbitrary application-created wait cycles. The production FUSE
+adapter now refines the bounded whole-file surface with distributed `getlk` and
+`setlk`, asynchronous blocking waiters, exact tokens, close/cancel cleanup,
+lease renewal, persisted FIFO state, metadata-quorum acknowledgement, and an
+epoch warm-up fence. It deliberately rejects partial ranges and reports a
+conflicting blocking lock conversion as `EDEADLK`; those restrictions keep it a
+bounded refinement rather than full POSIX record-lock conformance.
+
+The concrete lease mapping states its additional timing assumptions explicitly:
+clients convert an authority-reported remaining duration into a monotonic local
+deadline, authority changes add a five-minute maximum clock-skew fence, mounted
+coordination RPCs are bounded to ten seconds, and a mount accepts at most two
+distinct live or pending lock keys. Exceeding the mount bound returns `ENOLCK`;
+exceeding the clock-skew assumption invalidates the refinement claim.
 
 The `dfs_posix_fsync_safety.safety` invariant separates returned, visible,
 receipt-durable, metadata-certified, and canonical file prefixes:
@@ -621,13 +631,22 @@ receipt-durable, metadata-certified, and canonical file prefixes:
 - committed syncs survive authority change and repair copies only certified
   canonical data.
 
-The bounded receipt policy is two of three nodes. Concrete WAL flushes, device
-barriers, torn writes, directory handles, and open-file-description behavior
-across rename/unlink are outside this slice. The full-depth recovery regression
+The bounded receipt policy is two of three nodes. Concrete device-specific
+barriers, torn writes, and open-file-description behavior across rename/unlink
+are outside this slice. The full-depth recovery regression
 uses data holders N2/N3 and metadata prepare voters N1/N2 and asserts their N2
-intersection explicitly. Current FUSE `flush`, `release`, and `fsync` all call
-the same handle commit path and ignore the `datasync` distinction, so this model
-is also target hardening.
+intersection explicitly. Rust now freezes exact file and directory targets,
+validates the desired content receipts, and obtains fresh proofs of the
+complete canonical materialized checkpoint at the exact journal head rather
+than reusing stored replication cursors. It publishes an epoch-bound quorum
+head before `fsync`, `fdatasync`, or directory `fsync` returns. Each probe uses
+a restart-unique identity and an empty rolling-upgrade-safe journal batch. FUSE
+`flush` and `release` remain visibility/close operations. `fdatasync` has a
+distinct API kind but currently uses the stronger full-file physical metadata
+barrier. Durable caller-selected sync ids and stored outcome-unknown responses
+remain target hardening. The Rust checkpoint proof currently hashes the full
+materialized shard state; an incremental authenticated checkpoint is a future
+performance refinement, not a weaker fallback.
 
 The `dfs_posix_partitioned_operation_safety.safety` invariant abstracts the
 combined authority, lock, and sync contract around the requested partition

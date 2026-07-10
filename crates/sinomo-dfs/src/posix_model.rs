@@ -8,6 +8,7 @@ use crate::{
     DfsConflictReadView, DfsError, DfsFileSystemId, DfsObjectId, DfsObjectKind,
     DfsReplicationPolicy, DfsVersion,
 };
+use serde::{Deserialize, Serialize};
 use sinomo_core::DfsObjectPolicy;
 use sinomo_core::node::NodeId;
 use thiserror::Error;
@@ -129,6 +130,59 @@ pub struct DfsWriteOptions {
     pub replica_candidates: Vec<NodeId>,
     pub wait_for_commit: bool,
     pub foreground_replica_repair: bool,
+}
+
+/// Durability barrier requested through the POSIX DFS surface.
+///
+/// `FileData` is the `fdatasync(2)` contract. The current metadata layout
+/// journals essential and ancillary file metadata atomically, so its physical
+/// barrier is intentionally as strong as `File` for now while the distinction
+/// remains explicit at the API boundary. `Directory` certifies namespace
+/// mutations and never claims file-content durability.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsPosixSyncKind {
+    FileData,
+    File,
+    Directory,
+}
+
+impl DfsPosixSyncKind {
+    pub const fn is_file(self) -> bool {
+        matches!(self, Self::FileData | Self::File)
+    }
+}
+
+/// Immutable file prefix captured before a file sync begins.
+///
+/// The stable object id keeps the target meaningful across a rename. The
+/// version and content hash prevent a retry from silently certifying different
+/// bytes under the same request payload.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsPosixFileSyncTarget {
+    pub kind: DfsPosixSyncKind,
+    pub file_system_id: DfsFileSystemId,
+    pub object_id: DfsObjectId,
+    pub path: String,
+    pub version: DfsVersion,
+    pub content_hash: String,
+}
+
+/// Immutable directory generation captured before a directory sync begins.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsPosixDirectorySyncTarget {
+    pub file_system_id: DfsFileSystemId,
+    pub object_id: DfsObjectId,
+    pub path: String,
+    pub version: DfsVersion,
+}
+
+/// Durable content evidence checked before a file sync can certify metadata.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsPosixFileSyncEvidence {
+    pub intent_id: String,
+    pub required_receipts: usize,
+    pub receipt_node_ids: Vec<NodeId>,
 }
 
 impl DfsWriteOptions {

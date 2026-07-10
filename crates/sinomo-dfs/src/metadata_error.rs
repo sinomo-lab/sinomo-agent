@@ -21,6 +21,8 @@ pub enum MetadataBackendError {
     UnknownFileSystem { file_system_id: DfsFileSystemId },
     #[error("object not found: {object_id}")]
     UnknownObject { object_id: DfsObjectId },
+    #[error("invalid advisory-lock transition: {0}")]
+    AdvisoryLock(String),
     #[error(
         "metadata transaction conflict for object {object_id}: expected {expected}, current {current}"
     )]

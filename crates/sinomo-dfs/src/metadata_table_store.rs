@@ -382,6 +382,7 @@ pub(crate) fn metadata_tables_snapshot(
         receipts: tables.receipts.values().cloned().collect(),
         intents: tables.intents.values().cloned().collect(),
         conflicts: tables.conflicts.values().cloned().collect(),
+        advisory_lock_states: tables.advisory_lock_states.values().cloned().collect(),
         visible_commits: tables
             .visible_commits
             .iter()
@@ -442,6 +443,9 @@ fn metadata_tables_from_snapshot(snapshot: DfsMetadataTableSnapshotTables) -> Df
     }
     for conflict in snapshot.conflicts {
         tables.apply(DfsMetadataTableOp::PutConflict { conflict });
+    }
+    for state in snapshot.advisory_lock_states {
+        tables.apply(DfsMetadataTableOp::PutAdvisoryLockState { state });
     }
     for visible_commit in snapshot.visible_commits {
         tables.apply(DfsMetadataTableOp::PutVisibleCommit {
@@ -597,6 +601,13 @@ pub(crate) fn metadata_table_snapshot_ops(tables: &DfsMetadataTables) -> Vec<Dfs
             .values()
             .cloned()
             .map(|conflict| DfsMetadataTableOp::PutConflict { conflict }),
+    );
+    ops.extend(
+        tables
+            .advisory_lock_states
+            .values()
+            .cloned()
+            .map(|state| DfsMetadataTableOp::PutAdvisoryLockState { state }),
     );
     ops.extend(
         tables

@@ -7,6 +7,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sinomo_core::node::NodeId;
 
+use crate::advisory_lock::{
+    DfsAdvisoryLockApplyResult, DfsAdvisoryLockCommand, DfsAdvisoryLockStateRecord,
+    DfsAdvisoryLockTransitionContext,
+};
 use crate::intent::write_intent_status_is_active;
 use crate::metadata_error::Result;
 use crate::metadata_hardlink::{object_is_hardlink_to_target, sort_hardlinks_by_path};
@@ -71,6 +75,35 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
 
     /// Fetch an object record by object id.
     fn get_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsObjectMetadata>>;
+
+    /// Fetch the durable whole-file advisory-lock aggregate for an object.
+    fn get_advisory_lock_state(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+    ) -> Result<Option<DfsAdvisoryLockStateRecord>>;
+
+    /// Apply one advisory-lock command as a single journaled state transition.
+    ///
+    /// Synchronous distributed callers must replicate the result's shard
+    /// through `durable_through_sequence` before acknowledging success.
+    fn apply_advisory_lock_command(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        context: DfsAdvisoryLockTransitionContext,
+        command: &DfsAdvisoryLockCommand,
+    ) -> Result<DfsAdvisoryLockApplyResult>;
+
+    /// Install an exact aggregate as part of a serialized object-shard move.
+    ///
+    /// This is not a lock-operation API. The destination must install the
+    /// object first, reject a conflicting aggregate, and epoch-fence/warm the
+    /// copied state before issuing any new grant.
+    fn install_advisory_lock_state_for_migration(
+        &mut self,
+        state: &DfsAdvisoryLockStateRecord,
+    ) -> Result<Option<DfsMetadataJournalEntry>>;
 
     /// Fetch the visible object at a normalized filesystem path.
     fn get_object_by_path(
@@ -1028,6 +1061,21 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         _shard_id: &DfsMetadataShardId,
         _next_after_sequence: u64,
     ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Return the replica-local exact-checkpoint floor persisted before a
+    /// successful prefix acknowledgement.
+    fn metadata_prefix_ack_floor(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<DfsMetadataPrefixAckFloor>> {
+        Ok(None)
+    }
+
+    /// Persist a monotonic exact-checkpoint floor before acknowledging the
+    /// corresponding prefix probe.
+    fn put_metadata_prefix_ack_floor(&mut self, _floor: &DfsMetadataPrefixAckFloor) -> Result<()> {
         Ok(())
     }
 

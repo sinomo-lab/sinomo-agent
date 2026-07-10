@@ -10,11 +10,13 @@ mod attrs;
 mod cross_shard;
 mod jobs;
 mod links;
+pub(crate) mod locks;
 mod metadata;
 mod namespace_ops;
 mod query;
 mod read;
 mod routing;
+pub(crate) mod sync;
 
 use crate::dfs_now_unix_nanos as now_unix_nanos;
 use crate::namespace::next_version;
@@ -686,6 +688,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 file_system_id: sifs_file_system_id(),
                 objects: objects.clone(),
                 versions,
+                advisory_lock_states: Vec::new(),
                 created_at: time::OffsetDateTime::now_utc(),
             };
             if let Some(primary) = metadata_primary {
@@ -1398,6 +1401,43 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         bytes: &[u8],
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        self.posix_write_file_at_expected_object(path, None, offset, bytes, options)
+    }
+
+    /// Write through a stable opened-object identity. The expected id is
+    /// checked after path resolution and before any intent or content side
+    /// effect, so unlink/recreate cannot redirect an old descriptor's write
+    /// into the replacement file.
+    pub fn posix_write_file_at_for_object(
+        &mut self,
+        object_id: &DfsObjectId,
+        offset: u64,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
+        let object = self
+            .current_read_object_metadata(object_id)
+            .map_err(DfsPosixError::from)?;
+        if object.kind == DfsObjectKind::Tombstone {
+            return Err(DfsPosixError::NotFound { path: object.path });
+        }
+        self.posix_write_file_at_expected_object(
+            &object.path,
+            Some(object_id),
+            offset,
+            bytes,
+            options,
+        )
+    }
+
+    fn posix_write_file_at_expected_object(
+        &mut self,
+        path: &str,
+        expected_object_id: Option<&DfsObjectId>,
+        offset: u64,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
         let path = self.resolve_posix_path_distributed(&path, true)?;
         if requires_directory {
@@ -1417,6 +1457,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Err(DfsPosixError::NotFound { path });
         }
         let object = self.resolve_hardlink_target(&object)?;
+        if expected_object_id.is_some_and(|expected| expected != &object.object_id) {
+            return Err(DfsPosixError::NotFound { path });
+        }
         if object.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory { path });
         }
@@ -1572,6 +1615,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         len: u64,
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        self.posix_truncate_file_expected_object(path, None, len, options)
+    }
+
+    /// Truncate through a stable opened-object identity, rejecting a path
+    /// replacement before any write intent is created.
+    pub fn posix_truncate_file_for_object(
+        &mut self,
+        object_id: &DfsObjectId,
+        len: u64,
+        options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
+        let object = self
+            .current_read_object_metadata(object_id)
+            .map_err(DfsPosixError::from)?;
+        if object.kind == DfsObjectKind::Tombstone {
+            return Err(DfsPosixError::NotFound { path: object.path });
+        }
+        self.posix_truncate_file_expected_object(&object.path, Some(object_id), len, options)
+    }
+
+    fn posix_truncate_file_expected_object(
+        &mut self,
+        path: &str,
+        expected_object_id: Option<&DfsObjectId>,
+        len: u64,
+        options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
         let path = self.resolve_posix_path_distributed(&path, true)?;
         if requires_directory {
@@ -1591,6 +1661,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Err(DfsPosixError::NotFound { path });
         }
         let object = self.resolve_hardlink_target(&object)?;
+        if expected_object_id.is_some_and(|expected| expected != &object.object_id) {
+            return Err(DfsPosixError::NotFound { path });
+        }
         if object.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory { path });
         }

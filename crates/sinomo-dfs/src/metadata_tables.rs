@@ -11,6 +11,7 @@ use std::sync::Arc;
 use sinomo_core::node::NodeId;
 use time::OffsetDateTime;
 
+use crate::advisory_lock::DfsAdvisoryLockStateRecord;
 use crate::metadata_keys::{
     dentry_key, intent_key, normalize_path, write_intent_scan_key, write_intent_target_key,
 };
@@ -43,6 +44,7 @@ pub(crate) struct DfsMetadataTables {
     pub(crate) intent_order: BTreeMap<(OffsetDateTime, String, DfsObjectId), (DfsObjectId, String)>,
     pub(crate) intent_targets: BTreeMap<(DfsObjectId, DfsVersion, String), (DfsObjectId, String)>,
     pub(crate) conflicts: BTreeMap<(DfsObjectId, String), DfsConflictRecord>,
+    pub(crate) advisory_lock_states: BTreeMap<DfsObjectId, DfsAdvisoryLockStateRecord>,
     pub(crate) visible_commits: BTreeMap<(DfsObjectId, DfsVersion), DfsVisibleVersionCommitRecord>,
     pub(crate) namespace_transactions: BTreeMap<String, DfsNamespaceTransaction>,
     pub(crate) namespace_jobs: BTreeMap<String, DfsNamespaceJobRecord>,
@@ -108,6 +110,7 @@ impl DfsMetadataTables {
             || !self.receipts.is_empty()
             || !self.intents.is_empty()
             || !self.conflicts.is_empty()
+            || !self.advisory_lock_states.is_empty()
             || !self.namespace_transactions.is_empty()
             || !self.namespace_jobs.is_empty()
             || !self.compacted_tombstones.is_empty()
@@ -261,6 +264,10 @@ impl DfsMetadataTables {
                     conflict,
                 );
             }
+            DfsMetadataTableOp::PutAdvisoryLockState { state } => {
+                self.advisory_lock_states
+                    .insert(state.object_id.clone(), state);
+            }
             DfsMetadataTableOp::RemoveConflict {
                 object_id,
                 conflict_id,
@@ -412,6 +419,7 @@ pub(crate) struct DfsMetadataTableRollback {
     receipts: BTreeMap<(DfsObjectId, DfsVersion, NodeId), Option<DfsReplicaReceiptRecord>>,
     intents: BTreeMap<(DfsObjectId, String), Option<DfsWriteIntentRecord>>,
     conflicts: BTreeMap<(DfsObjectId, String), Option<DfsConflictRecord>>,
+    advisory_lock_states: BTreeMap<DfsObjectId, Option<DfsAdvisoryLockStateRecord>>,
     visible_commits: BTreeMap<(DfsObjectId, DfsVersion), Option<DfsVisibleVersionCommitRecord>>,
     namespace_transactions: BTreeMap<String, Option<DfsNamespaceTransaction>>,
     namespace_jobs: BTreeMap<String, Option<DfsNamespaceJobRecord>>,
@@ -550,6 +558,11 @@ impl DfsMetadataTableRollback {
                 &tables.conflicts,
                 (conflict.object_id.clone(), conflict.conflict_id.clone()),
             ),
+            DfsMetadataTableOp::PutAdvisoryLockState { state } => record_rollback_value(
+                &mut self.advisory_lock_states,
+                &tables.advisory_lock_states,
+                state.object_id.clone(),
+            ),
             DfsMetadataTableOp::RemoveConflict {
                 object_id,
                 conflict_id,
@@ -598,6 +611,7 @@ impl DfsMetadataTableRollback {
         rollback_map(&mut tables.intents, self.intents);
         tables.rebuild_intent_indexes();
         rollback_map(&mut tables.conflicts, self.conflicts);
+        rollback_map(&mut tables.advisory_lock_states, self.advisory_lock_states);
         rollback_map(&mut tables.visible_commits, self.visible_commits);
         rollback_map(
             &mut tables.namespace_transactions,

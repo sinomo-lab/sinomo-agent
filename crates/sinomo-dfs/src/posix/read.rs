@@ -570,6 +570,46 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
+    /// Read through a stable opened-object identity. A removed object fails
+    /// instead of resolving the descriptor's old pathname to a replacement.
+    /// Full open-unlinked lifetime is intentionally deferred; this method is
+    /// the fail-closed boundary until orphan retention is implemented.
+    pub fn posix_read_file_for_object(&mut self, object_id: &DfsObjectId) -> Result<Vec<u8>> {
+        let object = self
+            .current_read_object_metadata(object_id)
+            .map_err(DfsPosixError::from)?;
+        if object.kind == DfsObjectKind::Tombstone {
+            return Err(DfsPosixError::NotFound { path: object.path });
+        }
+        let path = object.path.clone();
+        let (_, object) = self.posix_file_content_object(path.clone(), object)?;
+        match self.read_object_metadata_or_fetch_remote_without_cache(&object)? {
+            NetworkedDfsReadOutcome::Found {
+                data: DfsReadData { bytes, .. },
+                ..
+            } => {
+                if self.is_local_metadata_primary_for_object(&object)? {
+                    let mut current = self
+                        .object_by_id(&object.object_id)?
+                        .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+                    if current.kind == DfsObjectKind::Tombstone {
+                        return Err(DfsPosixError::NotFound { path });
+                    }
+                    current.accessed_at_unix_nanos = now_unix_nanos();
+                    current.version = next_version(&current.version);
+                    self.add_object_metadata(current)?;
+                }
+                Ok(bytes)
+            }
+            NetworkedDfsReadOutcome::PendingReplication { .. }
+            | NetworkedDfsReadOutcome::NotConfirmed { .. }
+            | NetworkedDfsReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
+            NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
+                Err(read_conflict_error(path, conflicts))
+            }
+        }
+    }
+
     pub(super) fn read_current_object_or_fetch_remote(
         &mut self,
         object_id: &DfsObjectId,

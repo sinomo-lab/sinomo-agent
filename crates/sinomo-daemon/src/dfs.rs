@@ -1502,6 +1502,8 @@ mod tests {
             DfsMetadataJournalBatchCommand {
                 request_id: "dfs_meta_req_1".to_string(),
                 source_node_id: Some(node_id.clone()),
+                verify_prefix_only: false,
+                prefix_probe: None,
                 batch,
             },
         )
@@ -1546,6 +1548,8 @@ mod tests {
             DfsMetadataJournalBatchCommand {
                 request_id: "dfs_meta_req_safe".to_string(),
                 source_node_id: Some(node_id.clone()),
+                verify_prefix_only: false,
+                prefix_probe: None,
                 batch,
             },
         )
@@ -1640,6 +1644,8 @@ mod tests {
             DfsMetadataJournalBatchCommand {
                 request_id: "dfs_meta_req_stale_source".to_string(),
                 source_node_id: Some(stale.clone()),
+                verify_prefix_only: false,
+                prefix_probe: None,
                 batch,
             },
         )
@@ -2342,6 +2348,7 @@ mod tests {
                     shard_id: command.batch.shard_id.clone(),
                     next_after_sequence: command.batch.next_after_sequence,
                     applied_entries: command.batch.entries.len(),
+                    verified_prefix_only: command.verify_prefix_only,
                     result: DfsMetadataJournalBatchResult::Applied,
                 })
             });
@@ -2483,6 +2490,7 @@ mod tests {
                     shard_id: command.batch.shard_id.clone(),
                     next_after_sequence: command.batch.next_after_sequence,
                     applied_entries: command.batch.entries.len(),
+                    verified_prefix_only: command.verify_prefix_only,
                     result: DfsMetadataJournalBatchResult::Applied,
                 })
             });
@@ -2621,6 +2629,7 @@ mod tests {
                     shard_id: command.batch.shard_id.clone(),
                     next_after_sequence: command.batch.next_after_sequence,
                     applied_entries: command.batch.entries.len(),
+                    verified_prefix_only: command.verify_prefix_only,
                     result: DfsMetadataJournalBatchResult::Applied,
                 })
             });
@@ -2751,6 +2760,7 @@ mod tests {
                     shard_id: command.batch.shard_id.clone(),
                     next_after_sequence: command.batch.next_after_sequence + 1,
                     applied_entries: command.batch.entries.len(),
+                    verified_prefix_only: command.verify_prefix_only,
                     result: DfsMetadataJournalBatchResult::Applied,
                 })
             });
@@ -2863,6 +2873,7 @@ mod tests {
                     shard_id: command.batch.shard_id.clone(),
                     next_after_sequence: command.batch.next_after_sequence,
                     applied_entries: 0,
+                    verified_prefix_only: false,
                     result: DfsMetadataJournalBatchResult::Rejected {
                         reason: "replica already has a conflicting journal entry".to_string(),
                     },
@@ -2969,6 +2980,7 @@ mod tests {
                     shard_id: command.batch.shard_id.clone(),
                     next_after_sequence: command.batch.next_after_sequence,
                     applied_entries: 0,
+                    verified_prefix_only: false,
                     result: DfsMetadataJournalBatchResult::Rejected {
                         reason: format!(
                             "metadata journal sequence {} already exists with a different entry while replaying shard root",

@@ -11,6 +11,7 @@ use sinomo_core::node::NodeId;
 use std::time::Duration;
 use time::OffsetDateTime;
 
+use crate::advisory_lock::DfsAdvisoryLockStateRecord;
 use crate::metadata_api::DfsMetadataBackend;
 use crate::metadata_keys::{normalize_node_locations, object_inode_id};
 use crate::{
@@ -58,6 +59,17 @@ pub struct DfsMetadataReplicaLagStatus {
 pub struct DfsMetadataReplayCursorStatus {
     pub source_shard_id: DfsMetadataShardId,
     pub replayed_through_sequence: u64,
+}
+
+/// Replica-local durable floor established before acknowledging an exact
+/// metadata checkpoint probe. Snapshot repair may not move the shard below
+/// this sequence or install different state at the same sequence, even if the
+/// cluster watermark publication for that probe is still in flight.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataPrefixAckFloor {
+    pub shard_id: DfsMetadataShardId,
+    pub journal_sequence: u64,
+    pub state_fingerprint: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -325,12 +337,24 @@ pub enum DfsMetadataMutation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conflict: Option<DfsConflictRecord>,
     },
+    PutAdvisoryLockState {
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<DfsAdvisoryLockStateRecord>,
+    },
     ApplyNamespaceTransaction {
         file_system_id: DfsFileSystemId,
         transaction_id: String,
         object_count: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transaction: Option<DfsNamespaceTransaction>,
+    },
+    PutNamespaceJob {
+        file_system_id: DfsFileSystemId,
+        job_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job: Option<DfsNamespaceJobRecord>,
     },
 }
 
@@ -380,6 +404,22 @@ impl DfsMetadataMutation {
         }
     }
 
+    pub(crate) fn put_advisory_lock_state(state: &DfsAdvisoryLockStateRecord) -> Self {
+        Self::PutAdvisoryLockState {
+            file_system_id: state.file_system_id.clone(),
+            object_id: state.object_id.clone(),
+            state: Some(state.clone()),
+        }
+    }
+
+    pub(crate) fn put_namespace_job(job: &DfsNamespaceJobRecord) -> Self {
+        Self::PutNamespaceJob {
+            file_system_id: job.file_system_id.clone(),
+            job_id: job.job_id.clone(),
+            job: Some(job.clone()),
+        }
+    }
+
     pub(crate) fn commit_visible_version(commit: &DfsVisibleVersionCommitRecord) -> Self {
         Self::CommitVisibleVersion {
             file_system_id: commit.committed_object.file_system_id.clone(),
@@ -423,6 +463,9 @@ pub struct DfsNamespaceTransaction {
     pub objects: Vec<DfsObjectMetadata>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub versions: Vec<DfsObjectVersionRecord>,
+    /// Exact lock aggregates installed atomically with migrated objects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advisory_lock_states: Vec<DfsAdvisoryLockStateRecord>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
@@ -875,6 +918,17 @@ pub struct DfsMetadataTableSnapshot {
     pub(crate) ops: Vec<DfsMetadataTableOp>,
 }
 
+/// Return a content-addressed identity for one complete materialized shard
+/// checkpoint. The materialization sequence is intentionally part of the
+/// digest: a durability proof is for the exact state at one exact journal
+/// head, not merely for a set of currently equivalent namespace records.
+pub(crate) fn dfs_metadata_table_snapshot_state_fingerprint(
+    snapshot: &DfsMetadataTableSnapshot,
+) -> Result<String, serde_json::Error> {
+    let encoded = serde_json::to_vec(snapshot)?;
+    Ok(format!("blake3:{}", blake3::hash(&encoded).to_hex()))
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub(crate) struct DfsMetadataTableSnapshotTables {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -903,6 +957,8 @@ pub(crate) struct DfsMetadataTableSnapshotTables {
     pub(crate) intents: Vec<DfsWriteIntentRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) conflicts: Vec<DfsConflictRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) advisory_lock_states: Vec<DfsAdvisoryLockStateRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) visible_commits: Vec<DfsVisibleCommitSnapshotRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1008,6 +1064,9 @@ pub(crate) enum DfsMetadataTableOp {
     PutConflict {
         conflict: DfsConflictRecord,
     },
+    PutAdvisoryLockState {
+        state: DfsAdvisoryLockStateRecord,
+    },
     RemoveConflict {
         object_id: DfsObjectId,
         conflict_id: String,
@@ -1092,7 +1151,9 @@ pub(crate) fn metadata_journal_batch_file_system_id(
             | DfsMetadataMutation::PutIntent { file_system_id, .. }
             | DfsMetadataMutation::CommitVisibleVersion { file_system_id, .. }
             | DfsMetadataMutation::PutConflict { file_system_id, .. }
-            | DfsMetadataMutation::ApplyNamespaceTransaction { file_system_id, .. } => {
+            | DfsMetadataMutation::PutAdvisoryLockState { file_system_id, .. }
+            | DfsMetadataMutation::ApplyNamespaceTransaction { file_system_id, .. }
+            | DfsMetadataMutation::PutNamespaceJob { file_system_id, .. } => {
                 Some(file_system_id.clone())
             }
         })
@@ -1155,6 +1216,9 @@ pub(crate) fn normalized_namespace_transaction(
     }
     for version in &mut transaction.versions {
         normalize_node_locations(&mut version.locations);
+    }
+    for state in &mut transaction.advisory_lock_states {
+        state.authority_rebind_required = true;
     }
     transaction
 }

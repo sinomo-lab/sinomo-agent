@@ -22,7 +22,7 @@ use crate::{
     DfsObjectKind, DfsObjectMetadata, NetworkedDfsService,
 };
 
-fn namespace_job_kind_is_cross_shard(kind: &DfsNamespaceJobKind) -> bool {
+pub(super) fn namespace_job_kind_is_cross_shard(kind: &DfsNamespaceJobKind) -> bool {
     matches!(
         kind,
         DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
@@ -292,6 +292,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let Some(backend) = self.metadata_backend.as_mut() {
             backend.put_namespace_job(job)?;
         }
+        if namespace_job_kind_is_cross_shard(&job.kind) {
+            // The locally durable running record is already an authority
+            // reservation. Install its transient fast-path guard before the
+            // quorum checkpoint: if the checkpoint or the first destination
+            // RPC fails, concurrent writes must still observe the parked saga.
+            if job.status == DfsNamespaceJobStatus::Running {
+                self.lock_cross_shard_namespace_path(&job.file_system_id, &job.root_path);
+            }
+            let mut checkpoint_object =
+                self.lookup_metadata_path_raw(&job.file_system_id, &job.root_path)?;
+            if checkpoint_object.is_none()
+                && let Some(target_path) = job.target_path.as_ref()
+            {
+                checkpoint_object =
+                    self.lookup_metadata_path_raw(&job.file_system_id, target_path)?;
+            }
+            let checkpoint_object = checkpoint_object.ok_or_else(|| {
+                DfsPosixError::Dfs(crate::DfsError::Metadata {
+                    message: format!(
+                        "cross-shard job {} has no source-side object for a durable checkpoint",
+                        job.job_id
+                    ),
+                })
+            })?;
+            let target = self
+                .capture_metadata_quorum_sync_target(&checkpoint_object)
+                .map_err(DfsPosixError::from)?;
+            self.sync_metadata_shard_to_quorum(&target, crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT)
+                .map_err(DfsPosixError::from)?;
+        }
         Ok(())
     }
 
@@ -471,6 +501,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     file_system_id: promoted.file_system_id.clone(),
                     objects: vec![old_path_tombstone, alias_tombstone, promoted],
                     versions: Vec::new(),
+                    advisory_lock_states: Vec::new(),
                     created_at: time::OffsetDateTime::now_utc(),
                 })?;
                 continue;
@@ -833,6 +864,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             file_system_id: source.file_system_id.clone(),
             objects: transaction_objects,
             versions: Vec::new(),
+            advisory_lock_states: Vec::new(),
             created_at: time::OffsetDateTime::now_utc(),
         })?;
         Ok(())
@@ -878,6 +910,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             file_system_id: moved.file_system_id.clone(),
             objects: vec![moved],
             versions: Vec::new(),
+            advisory_lock_states: Vec::new(),
             created_at: time::OffsetDateTime::now_utc(),
         })?;
         Ok(true)

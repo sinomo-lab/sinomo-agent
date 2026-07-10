@@ -4,13 +4,14 @@
 //! mechanics of copying an object's durable metadata family between shard
 //! backends and leaving an eviction tombstone in the source shard.
 
+use crate::advisory_lock::DfsAdvisoryLockStateRecord;
 use crate::metadata_api::DfsMetadataBackend;
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_pages::collect_metadata_pages;
 use crate::metadata_receipt::receipt_for_replica_from_backend;
 use crate::metadata_records::{
-    DfsConflictRecord, DfsMetadataShardId, DfsObjectVersionRecord, DfsReplicaReceiptRecord,
-    DfsWriteIntentRecord,
+    DfsConflictRecord, DfsMetadataShardId, DfsNamespaceTransaction, DfsObjectVersionRecord,
+    DfsReplicaReceiptRecord, DfsWriteIntentRecord,
 };
 use crate::{DfsFileSystem, DfsObjectId, DfsObjectKind, DfsObjectMetadata};
 
@@ -21,6 +22,7 @@ pub(crate) struct DfsObjectShardMigrationBundle {
     pub(crate) receipts: Vec<DfsReplicaReceiptRecord>,
     pub(crate) intents: Vec<DfsWriteIntentRecord>,
     pub(crate) conflicts: Vec<DfsConflictRecord>,
+    pub(crate) advisory_lock_state: Option<DfsAdvisoryLockStateRecord>,
 }
 
 #[derive(Clone, Debug)]
@@ -29,6 +31,7 @@ pub(crate) struct DfsObjectMetadataFamily {
     pub(crate) receipts: Vec<DfsReplicaReceiptRecord>,
     pub(crate) intents: Vec<DfsWriteIntentRecord>,
     pub(crate) conflicts: Vec<DfsConflictRecord>,
+    pub(crate) advisory_lock_state: Option<DfsAdvisoryLockStateRecord>,
 }
 
 pub(crate) fn collect_object_shard_migration_bundle<B: DfsMetadataBackend + ?Sized>(
@@ -49,6 +52,7 @@ pub(crate) fn collect_object_shard_migration_bundle<B: DfsMetadataBackend + ?Siz
         receipts: family.receipts,
         intents: family.intents,
         conflicts: family.conflicts,
+        advisory_lock_state: family.advisory_lock_state,
     })
 }
 
@@ -89,11 +93,17 @@ pub(crate) fn collect_object_metadata_family<B: DfsMetadataBackend + ?Sized>(
         let page = source.conflicts_for_object_page(object_id, cursor, page_size)?;
         Ok((page.conflicts, page.next_cursor))
     })?;
+    let advisory_lock_state = source
+        .get_object(object_id)?
+        .map(|object| source.get_advisory_lock_state(&object.file_system_id, object_id))
+        .transpose()?
+        .flatten();
     Ok(DfsObjectMetadataFamily {
         versions,
         receipts,
         intents,
         conflicts,
+        advisory_lock_state,
     })
 }
 
@@ -187,11 +197,28 @@ pub(crate) fn install_object_shard_migration_bundle<B: DfsMetadataBackend + ?Siz
                 target_shard_id.0, bundle.object.object_id
             )));
         }
-        Some(_) => {}
-        None => {
-            target.put_object(&bundle.object)?;
-        }
+        Some(_) | None => {}
     }
+    let advisory_lock_states = bundle
+        .advisory_lock_state
+        .iter()
+        .cloned()
+        .map(|mut state| {
+            state.authority_rebind_required = true;
+            state
+        })
+        .collect();
+    target.apply_namespace_transaction(&DfsNamespaceTransaction {
+        transaction_id: format!(
+            "migrate-object:{}:{}",
+            bundle.object.object_id, target_shard_id.0
+        ),
+        file_system_id: bundle.object.file_system_id.clone(),
+        objects: vec![bundle.object.clone()],
+        versions: Vec::new(),
+        advisory_lock_states,
+        created_at: time::OffsetDateTime::UNIX_EPOCH,
+    })?;
     Ok(())
 }
 
