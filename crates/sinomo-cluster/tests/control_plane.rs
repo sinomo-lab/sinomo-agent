@@ -2231,7 +2231,14 @@ fn async_daemon_rpc_client_rejects_legacy_wrapped_response() {
         .await
         .expect_err("legacy wrapped response");
         server.await.expect("server");
-        assert!(matches!(error, NetworkError::Serialization { .. }));
+        assert!(matches!(
+            error,
+            NetworkError::DeliveryFailed {
+                delivery_state: sinomo_network::NetworkDeliveryState::PossiblyApplied,
+                detail,
+                ..
+            } if detail.contains("serialization")
+        ));
     });
 }
 
@@ -9829,11 +9836,11 @@ fn cluster_control_plane_timeouts_derive_driver_options() {
         ClusterControlPlaneTimeouts {
             max_raft_append_attempts: DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_MAX_ATTEMPTS,
             raft_append_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT,
-            rpc_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_RPC_TIMEOUT,
+            rpc_timeout: DEFAULT_NETWORK_TIMEOUT,
             membership_rpc_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
             raft_campaign_jitter_max: DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_CAMPAIGN_JITTER_MAX,
-            tcp_command_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_TCP_COMMAND_TIMEOUT,
-            iroh_command_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT,
+            tcp_command_timeout: DEFAULT_NETWORK_TIMEOUT,
+            iroh_command_timeout: DEFAULT_NETWORK_TIMEOUT,
             tcp_foreground_attempt_timeout:
                 DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
             public_foreground_attempt_timeout:
@@ -34022,18 +34029,32 @@ mod route_cache_tests {
         let target_endpoint = state.members[1].endpoints[0].clone();
         let bridge_endpoint = state.members[2].endpoints[0].clone();
         mark_local_endpoints_healthy(&paths, &state, &[target_endpoint, bridge_endpoint]);
+        let bridge_to_target = connectivity_record_from_source(
+            &state.cluster_id,
+            &bridge,
+            &state.members[1].endpoints[0],
+            ClusterConnectivityState::Healthy,
+            Some(1),
+        );
+        sinomo_network::write_local_cluster_connectivity_records(
+            &paths,
+            &bridge,
+            std::slice::from_ref(&bridge_to_target),
+        )
+        .expect("write bridge target connectivity");
         let runtime = tokio::runtime::Handle::current();
         let mut host = RecordingTargetHost::new([
             SendOutcome::Error("direct edge failed"),
             SendOutcome::Response("bridge-ok"),
         ]);
         let mut client = ClusterObjectRpcClient::routed(&mut host, &runtime, &paths);
+        let request = request().with_response_retry_safe();
 
         let rpc_response = client
             .call_target(
                 &state,
                 &target,
-                &request(),
+                &request,
                 ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_only(Duration::from_secs(
                     5,
                 ))),
@@ -34047,7 +34068,7 @@ mod route_cache_tests {
         );
         assert_eq!(host.sent.len(), 2);
         assert_eq!(host.sent[0].0.node_id, target);
-        assert_eq!(host.sent[0].1.route, request().route);
+        assert_eq!(host.sent[0].1.route, request.route);
         assert_eq!(host.sent[1].0.node_id, bridge);
         let retried_envelope = RelayEnvelope::from_request(&host.sent[1].1).expect("envelope");
         assert_eq!(retried_envelope.target_node_id, target);
@@ -34081,12 +34102,13 @@ mod route_cache_tests {
             SendOutcome::Response("target-ok"),
         ]);
         let mut client = ClusterObjectRpcClient::routed(&mut host, &runtime, &paths);
+        let request = request().with_response_retry_safe();
 
         let rpc_response = client
             .call_target(
                 &state,
                 &target,
-                &request(),
+                &request,
                 ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_only(Duration::from_secs(
                     15,
                 ))),
@@ -34106,8 +34128,8 @@ mod route_cache_tests {
             .connect_timeout
             .expect("first endpoint budget");
         assert!(
-            first_budget <= Duration::from_millis(2_100)
-                && first_budget >= Duration::from_millis(1_500),
+            first_budget <= Duration::from_millis(1_400)
+                && first_budget >= Duration::from_millis(1_100),
             "unverified first endpoint budget should be capped tightly: {first_budget:?}"
         );
         let second_budget = host.sent[1]
@@ -34144,12 +34166,13 @@ mod route_cache_tests {
             SendOutcome::ResponseFrom("target-ok", target.clone()),
         ]);
         let mut client = ClusterObjectRpcClient::routed(&mut host, &runtime, &paths);
+        let request = request().with_response_retry_safe();
 
         let rpc_response = client
             .call_target(
                 &state,
                 &target,
-                &request(),
+                &request,
                 ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_only(Duration::from_secs(
                     5,
                 ))),

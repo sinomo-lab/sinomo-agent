@@ -42,8 +42,6 @@ use crate::{
     read_dfs_metadata_replication_suppression_snapshot, sifs_file_system_id,
 };
 
-pub const DEFAULT_DFS_METADATA_REPLICATION_TIMEOUT: Duration = Duration::from_secs(3);
-pub const DEFAULT_DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
 
 pub fn publish_cluster_dfs_metadata_journal(
@@ -225,7 +223,9 @@ fn refresh_cluster_dfs_kv_snapshot_with_peer_transport_for_state(
                 .call_object_rpc(
                     target_node_id,
                     &request,
-                    DfsObjectRpcSendOptions::new(timeout).with_observe_connectivity(false),
+                    DfsObjectRpcSendOptions::default()
+                        .with_overall_timeout(timeout)
+                        .with_observe_connectivity(false),
                 )
                 .map_err(|source| NetworkError::Io {
                     operation: "DFS cluster KV snapshot refresh".to_string(),
@@ -261,8 +261,8 @@ impl Default for DfsMetadataJournalReplicationOptions {
             batch_entry_limit: DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
             batch_byte_limit: DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
             max_batches_per_target: DEFAULT_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET,
-            attempt_timeout: DEFAULT_DFS_METADATA_REPLICATION_TIMEOUT,
-            target_timeout: DEFAULT_DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT,
+            attempt_timeout: sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            target_timeout: sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
         }
     }
 }
@@ -287,8 +287,14 @@ mod replication_budget_tests {
     #[test]
     fn metadata_replication_defaults_bound_attempt_and_target_time() {
         let options = DfsMetadataJournalReplicationOptions::default();
-        assert_eq!(options.attempt_timeout, Duration::from_secs(3));
-        assert_eq!(options.target_timeout, Duration::from_secs(5));
+        assert_eq!(
+            options.attempt_timeout,
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT
+        );
+        assert_eq!(
+            options.target_timeout,
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT
+        );
     }
 
     #[test]
@@ -2718,7 +2724,7 @@ pub type AsyncDfsMetadataSnapshotInstallSender = Arc<
 pub(crate) fn async_dfs_metadata_journal_batch_sender_from_peer_transport(
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
 ) -> AsyncDfsMetadataJournalBatchSender {
-    Arc::new(move |target_node_id, command, connect_timeout| {
+    Arc::new(move |target_node_id, command, operation_timeout| {
         let peer_transport = Arc::clone(&peer_transport);
         Box::pin(async move {
             let request = dfs_metadata_journal_batch_rpc_request(command)
@@ -2727,7 +2733,7 @@ pub(crate) fn async_dfs_metadata_journal_batch_sender_from_peer_transport(
                 .call_object_rpc_async(
                     target_node_id,
                     &request,
-                    DfsObjectRpcSendOptions::new(connect_timeout),
+                    DfsObjectRpcSendOptions::default().with_overall_timeout(operation_timeout),
                 )
                 .await
                 .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
@@ -2740,7 +2746,7 @@ pub(crate) fn async_dfs_metadata_journal_batch_sender_from_peer_transport(
 pub(crate) fn async_dfs_metadata_snapshot_install_sender_from_peer_transport(
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
 ) -> AsyncDfsMetadataSnapshotInstallSender {
-    Arc::new(move |target_node_id, command, connect_timeout| {
+    Arc::new(move |target_node_id, command, operation_timeout| {
         let peer_transport = Arc::clone(&peer_transport);
         Box::pin(async move {
             let request = dfs_metadata_snapshot_install_rpc_request(command)
@@ -2749,7 +2755,7 @@ pub(crate) fn async_dfs_metadata_snapshot_install_sender_from_peer_transport(
                 .call_object_rpc_async(
                     target_node_id,
                     &request,
-                    DfsObjectRpcSendOptions::new(connect_timeout),
+                    DfsObjectRpcSendOptions::default().with_overall_timeout(operation_timeout),
                 )
                 .await
                 .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
@@ -2762,14 +2768,14 @@ pub(crate) fn async_dfs_metadata_snapshot_install_sender_from_peer_transport(
 pub(crate) fn dfs_metadata_journal_batch_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsMetadataJournalBatchSender {
-    Arc::new(move |target_node_id, command, connect_timeout| {
+    Arc::new(move |target_node_id, command, operation_timeout| {
         let request = dfs_metadata_journal_batch_rpc_request(command)
             .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
         let response = peer_transport
             .call_object_rpc(
                 target_node_id,
                 &request,
-                DfsObjectRpcSendOptions::new(connect_timeout),
+                DfsObjectRpcSendOptions::default().with_overall_timeout(operation_timeout),
             )
             .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
         decode_dfs_metadata_journal_batch_rpc_response(&response)
@@ -2780,14 +2786,14 @@ pub(crate) fn dfs_metadata_journal_batch_sender_from_peer_transport(
 pub(crate) fn dfs_metadata_snapshot_install_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsMetadataSnapshotInstallSender {
-    Arc::new(move |target_node_id, command, connect_timeout| {
+    Arc::new(move |target_node_id, command, operation_timeout| {
         let request = dfs_metadata_snapshot_install_rpc_request(command)
             .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
         let response = peer_transport
             .call_object_rpc(
                 target_node_id,
                 &request,
-                DfsObjectRpcSendOptions::new(connect_timeout),
+                DfsObjectRpcSendOptions::default().with_overall_timeout(operation_timeout),
             )
             .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
         decode_dfs_metadata_snapshot_install_rpc_response(&response)

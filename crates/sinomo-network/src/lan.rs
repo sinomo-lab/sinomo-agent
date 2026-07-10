@@ -15,6 +15,8 @@ pub const PUBLIC_IP_DISCOVERY_EMPTY_CACHE_TTL: Duration = Duration::from_secs(30
 pub const PUBLIC_IP_DISCOVERY_DEFERRED_CACHE_TTL: Duration = Duration::from_secs(30);
 pub const MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES: usize = 8;
 pub(crate) const MAX_PUBLIC_IP_DISCOVERY_RESPONSE_BYTES: u64 = 16 * 1024;
+// Public-address discovery is optional startup/maintenance work. Keep each
+// external service phase short so it cannot delay normal cluster networking.
 const PUBLIC_IP_DISCOVERY_IO_TIMEOUT: Duration = Duration::from_millis(750);
 static DEFAULT_LAN_IP_DISCOVERY_CACHE: LazyLock<Mutex<Option<LocalIpDiscoveryCacheEntry>>> =
     LazyLock::new(|| Mutex::new(None));

@@ -297,7 +297,7 @@ impl DaemonSifsVfsBackend {
     pub fn new(address: String) -> Self {
         Self {
             address,
-            timeout: Duration::from_secs(5),
+            timeout: sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
         }
     }
 

@@ -10,8 +10,8 @@ use sinomo_core::node::NodeId;
 use std::sync::Arc;
 
 use crate::{
-    AsyncDfsPeerTransport, DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT, DfsControlPlaneKvClient, DfsError,
-    DfsMessageSender, DfsNodeTransport, DfsPeerTransport, LocalContentStore, NetworkedDfsService,
+    AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsError, DfsMessageSender, DfsNodeTransport,
+    DfsPeerTransport, LocalContentStore, NetworkedDfsService,
     open_cluster_aware_dfs_metadata_backend,
 };
 
@@ -37,7 +37,7 @@ pub(crate) fn open_cluster_dfs_service_with_message_sender(
         DfsNodeTransport::with_message_sender_for_nodes(
             local_node_id,
             peer_node_ids,
-            DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
             message_sender,
         ),
         content,
@@ -62,7 +62,7 @@ pub(crate) fn open_cluster_dfs_service_with_message_sender_lazy(
         DfsNodeTransport::with_message_sender_for_nodes(
             local_node_id,
             peer_node_ids,
-            DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
             message_sender,
         ),
         content,
@@ -88,7 +88,7 @@ pub(crate) fn open_cluster_dfs_service_with_peer_transports_for_nodes(
         DfsNodeTransport::with_peer_transports_for_nodes(
             local_node_id,
             peer_node_ids,
-            DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
             peer_transport,
             async_peer_transport,
         ),

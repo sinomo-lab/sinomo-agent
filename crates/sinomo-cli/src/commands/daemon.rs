@@ -680,8 +680,19 @@ impl cluster::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
         request: &network::ObjectRpcRequest,
         timeout: Duration,
     ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
-        daemon_send_daemon_rpc_to_endpoint(endpoint, request, timeout)
-            .map_err(|error| cli_daemon_rpc_network_error("cluster endpoint object rpc", error))
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| network::NetworkError::Io {
+                operation: "cli daemon endpoint object rpc runtime".to_string(),
+                detail: error.to_string(),
+            })?;
+        let mut host = CliSignedEndpointRpcHost::new(None, "cli endpoint rpc signing");
+        let options = network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout);
+        let mut client = network::ClusterObjectRpcClient::endpoint_only(&mut host);
+        let result = runtime.block_on(client.call_endpoint(endpoint, request, options));
+        runtime.shutdown_timeout(Duration::from_millis(250));
+        result
     }
 
     fn call_node_object_rpc(
@@ -708,9 +719,7 @@ impl cluster::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
             Some(state.cluster_id.clone()),
             "cli endpoint rpc signing",
         );
-        let options = network::ClusterObjectRpcOptions::new(
-            network::DaemonRpcTimeouts::connect_and_idle(timeout),
-        );
+        let options = network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout);
         let mut client =
             network::ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
         let result = runtime.block_on(client.call_target(state, target_node_id, request, options));
@@ -720,17 +729,15 @@ impl cluster::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
 }
 
 fn cli_cluster_control_plane_timeouts() -> cluster::ClusterControlPlaneTimeouts {
+    let defaults = cluster::ClusterControlPlaneTimeouts::default_daemon_transport();
     cluster::ClusterControlPlaneTimeouts {
+        // CLI mutations use a smaller attempt count and total latency budget
+        // than daemon background convergence, but share its transport policy.
         max_raft_append_attempts: 3,
         raft_append_timeout: Duration::from_secs(10),
-        rpc_timeout: Duration::from_secs(5),
         membership_rpc_timeout: Duration::from_secs(10),
         raft_campaign_jitter_max: Duration::ZERO,
-        tcp_command_timeout: Duration::from_secs(8),
-        iroh_command_timeout: Duration::from_secs(6),
-        tcp_foreground_attempt_timeout: Duration::from_secs(2),
-        public_foreground_attempt_timeout: Duration::from_secs(5),
-        iroh_foreground_attempt_timeout: Duration::from_secs(3),
+        ..defaults
     }
 }
 

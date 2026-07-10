@@ -4,8 +4,6 @@ use crate::kv_local_store::locked_kv_state_authority_id_async;
 use sinomo_base::ClusterBootstrapState;
 use sinomo_kv::{ClusterKvTxnCommitResult, KvTxn};
 use sinomo_network::ClusterPaths;
-use sinomo_network::DaemonRpcTimeouts;
-use sinomo_network::NetworkError;
 use sinomo_network::{
     ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector,
     cluster_node_blocks_leader_preference, cluster_node_blocks_leader_preference_async,
@@ -13,6 +11,7 @@ use sinomo_network::{
 use sinomo_network::{
     ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterSignedObjectRpcAsyncHost,
 };
+use sinomo_network::{NetworkDeliveryState, NetworkError};
 use sinomo_network::{ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_node::NodeId;
 use std::time::{Duration, Instant};
@@ -112,7 +111,12 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
             host,
         ) {
             Ok(response) => return Ok(Some(response)),
-            Err(error) => failures.push(format!("node {target} failed: {error}")),
+            Err(error) => {
+                failures.push(format!("node {target} failed: {error}"));
+                if !cluster_kv_forward_error_allows_next_authority(&error) {
+                    return Err(error);
+                }
+            }
         }
     }
 
@@ -150,17 +154,23 @@ fn forward_cluster_kv_txn_to_state_authority_node_with_host(
     let snapshot_timeout = timeout
         .saturating_sub(started.elapsed())
         .max(Duration::from_millis(1));
-    let snapshot_payload = sinomo_kv::cluster_kv_snapshot_rpc_payload().map_err(kv_err)?;
+    let snapshot_payload = sinomo_kv::cluster_kv_snapshot_rpc_payload()
+        .map_err(kv_err)
+        .map_err(|error| cluster_kv_forward_post_commit_error("build snapshot request", error))?;
     let snapshot_request = ObjectRpcRequest::from_encoded_body(
         snapshot_payload.route,
         snapshot_payload.category,
         snapshot_payload.body,
     );
-    let snapshot_response =
-        host.call_node_object_rpc(state, target_node_id, &snapshot_request, snapshot_timeout)?;
-    snapshot_response.error_detail()?;
-    let snapshot =
-        sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&snapshot_response.body).map_err(kv_err)?;
+    let snapshot_response = host
+        .call_node_object_rpc(state, target_node_id, &snapshot_request, snapshot_timeout)
+        .map_err(|error| cluster_kv_forward_post_commit_error("fetch snapshot", error))?;
+    snapshot_response
+        .error_detail()
+        .map_err(|error| cluster_kv_forward_post_commit_error("fetch snapshot", error))?;
+    let snapshot = sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&snapshot_response.body)
+        .map_err(kv_err)
+        .map_err(|error| cluster_kv_forward_post_commit_error("decode snapshot", error))?;
     Ok(ClusterKvTxnCommitResult {
         snapshot,
         txn_response: Some(txn_response),
@@ -238,7 +248,12 @@ where
         .await
         {
             Ok(response) => return Ok(Some(response)),
-            Err(error) => failures.push(format!("node {target} failed: {error}")),
+            Err(error) => {
+                failures.push(format!("node {target} failed: {error}"));
+                if !cluster_kv_forward_error_allows_next_authority(&error) {
+                    return Err(error);
+                }
+            }
         }
     }
 
@@ -271,6 +286,24 @@ fn prefer_known_state_authority_node(targets: &mut Vec<NodeId>, authority_id: &N
     *targets = preferred;
 }
 
+fn cluster_kv_forward_error_allows_next_authority(error: &NetworkError) -> bool {
+    error.delivery_state() == Some(NetworkDeliveryState::DefinitelyNotSent)
+}
+
+fn cluster_kv_forward_post_commit_error(
+    stage: &str,
+    error: impl std::fmt::Display,
+) -> NetworkError {
+    // A valid transaction response means the authority may already have
+    // committed the mutation. Snapshot recovery must never cause the whole
+    // transaction to be sent to another authority.
+    NetworkError::delivery_failed(
+        format!("complete forwarded cluster KV transaction during {stage}"),
+        NetworkDeliveryState::PossiblyApplied,
+        error.to_string(),
+    )
+}
+
 async fn forward_cluster_kv_txn_to_state_authority_node_async_with_host<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
@@ -296,7 +329,7 @@ where
             state,
             target_node_id,
             &txn_request,
-            ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(timeout)),
+            ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
         )
         .await?;
     txn_response.error_detail()?;
@@ -306,23 +339,30 @@ where
     let snapshot_timeout = timeout
         .saturating_sub(started.elapsed())
         .max(Duration::from_millis(1));
-    let snapshot_payload = sinomo_kv::cluster_kv_snapshot_rpc_payload().map_err(kv_err)?;
+    let snapshot_payload = sinomo_kv::cluster_kv_snapshot_rpc_payload()
+        .map_err(kv_err)
+        .map_err(|error| cluster_kv_forward_post_commit_error("build snapshot request", error))?;
     let snapshot_request = ObjectRpcRequest::from_encoded_body(
         snapshot_payload.route,
         snapshot_payload.category,
         snapshot_payload.body,
-    );
+    )
+    .with_response_retry_safe();
     let snapshot_response = client
         .call_target(
             state,
             target_node_id,
             &snapshot_request,
-            ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(snapshot_timeout)),
+            ClusterObjectRpcOptions::default().with_overall_timeout(snapshot_timeout),
         )
-        .await?;
-    snapshot_response.error_detail()?;
-    let snapshot =
-        sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&snapshot_response.body).map_err(kv_err)?;
+        .await
+        .map_err(|error| cluster_kv_forward_post_commit_error("fetch snapshot", error))?;
+    snapshot_response
+        .error_detail()
+        .map_err(|error| cluster_kv_forward_post_commit_error("fetch snapshot", error))?;
+    let snapshot = sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&snapshot_response.body)
+        .map_err(kv_err)
+        .map_err(|error| cluster_kv_forward_post_commit_error("decode snapshot", error))?;
     Ok(ClusterKvTxnCommitResult {
         snapshot,
         txn_response: Some(txn_response),
@@ -335,6 +375,77 @@ mod tests {
     use sinomo_base::{CapabilityName, ClusterMemberRecord, ClusterMemberState};
     use sinomo_node::{ClusterId, DAEMON_MAIN_RUN_CAPABILITY};
     use time::OffsetDateTime;
+
+    #[test]
+    fn kv_forward_does_not_try_another_authority_after_ambiguous_delivery() {
+        let ambiguous = NetworkError::outcome_unknown(
+            "cluster KV transaction",
+            None,
+            "response was not observed",
+        );
+        let not_sent = NetworkError::delivery_failed(
+            "cluster KV transaction",
+            NetworkDeliveryState::DefinitelyNotSent,
+            "connect failed",
+        );
+
+        assert!(!cluster_kv_forward_error_allows_next_authority(&ambiguous));
+        assert!(cluster_kv_forward_error_allows_next_authority(&not_sent));
+        assert!(!cluster_kv_forward_error_allows_next_authority(
+            &NetworkError::Io {
+                operation: "legacy KV forward host".to_string(),
+                detail: "delivery state unavailable".to_string(),
+            }
+        ));
+        assert!(!cluster_kv_forward_error_allows_next_authority(
+            &NetworkError::ObjectRpc {
+                route: "/cluster/kv/txn".to_string(),
+                detail: "authority returned a definitive application error".to_string(),
+            }
+        ));
+    }
+
+    struct SnapshotFailureAfterCommitHost {
+        calls: usize,
+    }
+
+    impl ClusterKvTxnForwardHost for SnapshotFailureAfterCommitHost {
+        fn known_kv_state_authority_id(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+        ) -> Result<Option<NodeId>, NetworkError> {
+            Ok(None)
+        }
+
+        fn call_node_object_rpc(
+            &mut self,
+            _state: &ClusterBootstrapState,
+            _target_node_id: &NodeId,
+            request: &ObjectRpcRequest,
+            _timeout: Duration,
+        ) -> Result<ObjectRpcResponse, NetworkError> {
+            self.calls = self.calls.saturating_add(1);
+            if request.route == sinomo_kv::CLUSTER_KV_TXN_ROUTE {
+                let payload =
+                    sinomo_kv::cluster_kv_txn_response_rpc_payload(&sinomo_kv::KvTxnResponse {
+                        succeeded: true,
+                        revision: sinomo_kv::KvRevision(1),
+                        responses: Vec::new(),
+                    })
+                    .expect("transaction response payload");
+                return Ok(ObjectRpcResponse::from_encoded_body(
+                    payload.route,
+                    payload.body,
+                ));
+            }
+            Err(NetworkError::delivery_failed(
+                "fetch snapshot",
+                NetworkDeliveryState::DefinitelyNotSent,
+                "snapshot endpoint unavailable",
+            ))
+        }
+    }
 
     struct RecordingForwardHost {
         known_authority: Option<NodeId>,
@@ -358,10 +469,11 @@ mod tests {
             _timeout: Duration,
         ) -> Result<ObjectRpcResponse, NetworkError> {
             self.calls = self.calls.saturating_add(1);
-            Err(NetworkError::Io {
-                operation: "test forward".to_string(),
-                detail: "forward attempted".to_string(),
-            })
+            Err(NetworkError::delivery_failed(
+                "test forward",
+                NetworkDeliveryState::DefinitelyNotSent,
+                "forward attempted",
+            ))
         }
     }
 
@@ -426,6 +538,29 @@ mod tests {
             tcp_command_timeout: Duration::from_secs(1),
             iroh_command_timeout: Duration::from_secs(1),
         }
+    }
+
+    #[test]
+    fn kv_forward_snapshot_failure_after_txn_response_is_possibly_applied() {
+        let (_root, state) = forward_test_state(false);
+        let target = state.members[1].node_id.clone();
+        let mut host = SnapshotFailureAfterCommitHost { calls: 0 };
+
+        let error = forward_cluster_kv_txn_to_state_authority_node_with_host(
+            &state,
+            &target,
+            &test_txn(),
+            Duration::from_secs(1),
+            &mut host,
+        )
+        .expect_err("snapshot failure must not look like an uncommitted transaction");
+
+        assert_eq!(host.calls, 2);
+        assert_eq!(
+            error.delivery_state(),
+            Some(NetworkDeliveryState::PossiblyApplied)
+        );
+        assert!(!cluster_kv_forward_error_allows_next_authority(&error));
     }
 
     #[test]

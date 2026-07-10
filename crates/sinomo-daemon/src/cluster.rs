@@ -1956,10 +1956,8 @@ pub(crate) async fn forward_cluster_invite_challenge_to_cluster_state_authority_
                 &state,
                 &target.node_id,
                 &rpc_request,
-                sinomo_core::network::ClusterObjectRpcOptions::new(
-                    sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
-                        sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
-                    ),
+                sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(
+                    sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
                 ),
             )
             .await
@@ -2007,10 +2005,8 @@ pub(crate) async fn forward_cluster_invite_challenge_to_cluster_state_authority_
                 .call_endpoint(
                     endpoint,
                     &rpc_request,
-                    sinomo_core::network::ClusterObjectRpcOptions::new(
-                        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
-                            sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
-                        ),
+                    sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(
+                        sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
                     ),
                 )
                 .await
@@ -2071,7 +2067,7 @@ fn call_node_object_rpc_on_runtime(
     state: &ClusterBootstrapState,
     target_node_id: &NodeId,
     rpc_request: &sinomo_core::network::ObjectRpcRequest,
-    timeouts: sinomo_core::network::DaemonRpcTimeouts,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
     let paths = cluster_paths_from_env().ok_or_else(|| DaemonError::Network {
@@ -2083,12 +2079,7 @@ fn call_node_object_rpc_on_runtime(
         sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, runtime, &paths);
     block_on_cluster_network_future_on_owner_runtime(
         runtime,
-        client.call_target(
-            state,
-            target_node_id,
-            rpc_request,
-            sinomo_core::network::ClusterObjectRpcOptions::new(timeouts),
-        ),
+        client.call_target(state, target_node_id, rpc_request, options),
     )
     .map_err(DaemonError::from)
 }
@@ -3689,9 +3680,8 @@ async fn fetch_peer_connectivity_records_from_endpoint_async(
             .call_endpoint(
                 &endpoint,
                 &request,
-                sinomo_core::network::ClusterObjectRpcOptions::new(
-                    sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
-                ),
+                sinomo_core::network::ClusterObjectRpcOptions::default()
+                    .with_overall_timeout(timeout),
             )
             .await;
         let response = match response {
@@ -3914,7 +3904,6 @@ async fn fetch_daemon_status_from_endpoint_direct_async(
         crate::DAEMON_RPC_CATEGORY,
         &(),
     )?;
-    let timeouts = sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout);
     let runtime = tokio::runtime::Handle::current();
     let mut host = DaemonSignedObjectRpcAsyncHost::direct_only(&runtime);
     let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
@@ -3922,7 +3911,9 @@ async fn fetch_daemon_status_from_endpoint_direct_async(
         .call_endpoint(
             endpoint,
             &request,
-            sinomo_core::network::ClusterObjectRpcOptions::new(timeouts),
+            // Status probing owns this semantic operation deadline; transport
+            // phase timeouts remain separate inside sinomo-network.
+            sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
         )
         .await
         .map_err(DaemonError::from)?;
@@ -4640,9 +4631,7 @@ async fn call_member_object_rpc_target_async(
             state,
             &member.node_id,
             request,
-            sinomo_core::network::ClusterObjectRpcOptions::new(
-                sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
-            ),
+            sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
         )
         .await
     {
@@ -4861,27 +4850,16 @@ pub(crate) fn initialize_local_cluster_on_runtime(
 
 /// Default TTL for daemon-issued cluster invites.
 const DAEMON_CLUSTER_CONTROL_INVITE_TTL_SECONDS: i64 = 24 * 60 * 60;
-/// Per-introducer TCP budget for a daemon-mediated join attempt.
+/// End-to-end per-introducer budget for a daemon-mediated join attempt.
 const DAEMON_CLUSTER_CONTROL_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
-/// Per-introducer iroh budget for a daemon-mediated join attempt.
+/// End-to-end per-introducer Iroh budget for a daemon-mediated join attempt.
 const DAEMON_CLUSTER_CONTROL_IROH_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
-/// Idle floor for cluster-control endpoint/node RPCs: the remote may relay a
-/// join registration to a voter or run its own quorum commit before sending
-/// the first response byte. Matches the pre-refactor CLI's
-/// `CLUSTER_JOIN_RPC_IDLE_TIMEOUT` (30s) so daemon-mediated joins keep the
-/// budget the direct path had.
-const DAEMON_CLUSTER_CONTROL_RPC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Timeouts for one cluster-control RPC: `timeout` bounds the connect, while
-/// the idle budget never drops below
-/// [`DAEMON_CLUSTER_CONTROL_RPC_IDLE_TIMEOUT`].
-fn daemon_cluster_control_rpc_timeouts(
+/// Network phases use the common five-second transport/no-progress limit;
+/// `timeout` remains the semantic end-to-end budget for this attempt.
+fn daemon_cluster_control_rpc_options(
     timeout: Duration,
-) -> sinomo_core::network::DaemonRpcTimeouts {
-    sinomo_core::network::DaemonRpcTimeouts {
-        connect_timeout: Some(timeout),
-        idle_timeout: Some(timeout.max(DAEMON_CLUSTER_CONTROL_RPC_IDLE_TIMEOUT)),
-    }
+) -> sinomo_core::network::ClusterObjectRpcOptions {
+    sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout)
 }
 
 /// Hostname-derived default display name for the local node.
@@ -5805,9 +5783,7 @@ async fn send_cluster_raft_append_routed_async(
             &request.state,
             target_node_id,
             &rpc_request,
-            sinomo_core::network::ClusterObjectRpcOptions::new(
-                sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
-            ),
+            sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
         )
         .await?;
     decode_routed_cluster_raft_append_response(&response)
@@ -5849,9 +5825,7 @@ async fn send_cluster_raft_vote_routed_async(
             &request.state,
             target_node_id,
             &rpc_request,
-            sinomo_core::network::ClusterObjectRpcOptions::new(
-                sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
-            ),
+            sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
         )
         .await?;
     decode_routed_cluster_raft_vote_response(&response)
@@ -6083,10 +6057,10 @@ impl sinomo_core::cluster::ClusterControlPlaneTransport for DaemonClusterControl
         request: &ObjectRpcRequest,
         timeout: Duration,
     ) -> Result<ObjectRpcResponse, sinomo_core::network::NetworkError> {
-        let result = crate::client::send_daemon_rpc_to_endpoint_with_timeouts_on_runtime(
+        let result = crate::client::send_daemon_rpc_to_endpoint_with_options_on_runtime(
             endpoint,
             request,
-            daemon_cluster_control_rpc_timeouts(timeout),
+            daemon_cluster_control_rpc_options(timeout),
             self.rpc_mode.runtime(),
         );
         result.map_err(|error| daemon_host_network_error("cluster endpoint object rpc", error))
@@ -6103,7 +6077,7 @@ impl sinomo_core::cluster::ClusterControlPlaneTransport for DaemonClusterControl
             state,
             target_node_id,
             request,
-            daemon_cluster_control_rpc_timeouts(timeout),
+            daemon_cluster_control_rpc_options(timeout),
             self.rpc_mode.runtime(),
         )
         .map_err(|error| daemon_host_network_error("cluster node rpc", error))
@@ -6230,9 +6204,8 @@ impl sinomo_core::cluster::ClusterStateAuthorityReachabilityAsyncHost
                     state,
                     target_node_id,
                     &request,
-                    sinomo_core::network::ClusterObjectRpcOptions::new(
-                        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
-                    ),
+                    sinomo_core::network::ClusterObjectRpcOptions::default()
+                        .with_overall_timeout(timeout),
                 )
                 .await
                 .and_then(|response| {
@@ -6563,9 +6536,8 @@ impl sinomo_core::cluster::ClusterKvCommittedFanoutAsyncHost
                     state,
                     target_node_id,
                     &rpc_request,
-                    sinomo_core::network::ClusterObjectRpcOptions::new(
-                        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
-                    ),
+                    sinomo_core::network::ClusterObjectRpcOptions::default()
+                        .with_overall_timeout(timeout),
                 )
                 .await?;
             response.error_detail()?;
@@ -7227,9 +7199,6 @@ fn commit_cluster_kv_txn_with_quorum_response_with_forwarding_on_runtime(
     Ok((result.snapshot, result.txn_response))
 }
 
-/// Per-hop timeout for a relayed cluster RPC. Healthy LAN/container hops answer quickly;
-/// long no-progress waits let background relays occupy foreground route capacity.
-const DAEMON_CLUSTER_RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Handle a `CLUSTER_RELAY_ROUTE` request. Runs the pure routing decision, then either
 /// delivers the wrapped request locally (when this node is the target) by re-injecting it
 /// through the daemon's own control port, or forwards it one hop closer to the target over
@@ -7265,9 +7234,7 @@ pub(crate) async fn handle_daemon_cluster_relay_request_on_runtime(
         &local_node_id,
         request,
         sinomo_core::network::ClusterRelayOptions::new(
-            sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
-                DAEMON_CLUSTER_RELAY_CONNECT_TIMEOUT,
-            ),
+            sinomo_core::network::DaemonRpcTimeouts::default(),
         ),
         &mut host,
     )
@@ -7299,9 +7266,7 @@ pub(crate) async fn handle_daemon_cluster_relay_stream_forward_on_runtime(
         &local_node_id,
         request,
         sinomo_core::network::ClusterRelayOptions::new(
-            sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
-                DAEMON_CLUSTER_RELAY_CONNECT_TIMEOUT,
-            ),
+            sinomo_core::network::DaemonRpcTimeouts::default(),
         ),
         &mut host,
     )
@@ -7313,7 +7278,7 @@ pub(crate) async fn handle_daemon_cluster_relay_stream_forward_on_runtime(
             .write_rpc_response(
                 stream_address,
                 &response,
-                sinomo_core::network::ObjectFrameIoOptions::none(),
+                sinomo_core::network::ObjectFrameIoOptions::default(),
             )
             .await
             .map_err(DaemonError::from),
@@ -7364,9 +7329,7 @@ pub(crate) async fn handle_daemon_cluster_relay_stream_collect_on_runtime(
                     &local_node_id,
                     &request,
                     sinomo_core::network::ClusterRelayOptions::new(
-                        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
-                            DAEMON_CLUSTER_RELAY_CONNECT_TIMEOUT,
-                        ),
+                        sinomo_core::network::DaemonRpcTimeouts::default(),
                     ),
                     &mut host,
                 )
@@ -7501,9 +7464,7 @@ impl sinomo_core::network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost
         Box::pin(async move {
             let started = Instant::now();
             let result =
-                send_cluster_relay_request_to_next_hop_async(&endpoint, &request, timeouts)
-                    .await
-                    .map_err(|error| daemon_host_network_error("cluster relay", error));
+                send_cluster_relay_request_to_next_hop_async(&endpoint, &request, timeouts).await;
             match &result {
                 Ok(_) => {
                     let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -7516,8 +7477,8 @@ impl sinomo_core::network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost
                     )
                     .await;
                 }
-                Err(sinomo_core::network::NetworkError::Io { .. }) => {
-                    remember_relay_endpoint_command_connectivity_async(
+                Err(sinomo_core::network::NetworkError::AuthDenied) => {
+                    remember_relay_endpoint_command_connectivity_without_failure_grace_async(
                         paths,
                         runtime,
                         endpoint,
@@ -7526,8 +7487,11 @@ impl sinomo_core::network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost
                     )
                     .await;
                 }
-                Err(sinomo_core::network::NetworkError::AuthDenied) => {
-                    remember_relay_endpoint_command_connectivity_without_failure_grace_async(
+                Err(error)
+                    if matches!(error, sinomo_core::network::NetworkError::Io { .. })
+                        || error.delivery_state().is_some() =>
+                {
+                    remember_relay_endpoint_command_connectivity_async(
                         paths,
                         runtime,
                         endpoint,
@@ -7556,8 +7520,7 @@ impl sinomo_core::network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost
             let started = Instant::now();
             let result =
                 send_cluster_relay_target_request_to_next_hop_async(&endpoint, &request, timeouts)
-                    .await
-                    .map_err(|error| daemon_host_network_error("cluster relay target", error));
+                    .await;
             match &result {
                 Ok(_) => {
                     let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -7570,8 +7533,8 @@ impl sinomo_core::network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost
                     )
                     .await;
                 }
-                Err(sinomo_core::network::NetworkError::Io { .. }) => {
-                    remember_relay_endpoint_command_connectivity_async(
+                Err(sinomo_core::network::NetworkError::AuthDenied) => {
+                    remember_relay_endpoint_command_connectivity_without_failure_grace_async(
                         paths,
                         runtime,
                         endpoint,
@@ -7580,8 +7543,11 @@ impl sinomo_core::network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost
                     )
                     .await;
                 }
-                Err(sinomo_core::network::NetworkError::AuthDenied) => {
-                    remember_relay_endpoint_command_connectivity_without_failure_grace_async(
+                Err(error)
+                    if matches!(error, sinomo_core::network::NetworkError::Io { .. })
+                        || error.delivery_state().is_some() =>
+                {
+                    remember_relay_endpoint_command_connectivity_async(
                         paths,
                         runtime,
                         endpoint,
@@ -7648,7 +7614,7 @@ impl sinomo_core::network::ClusterRelayStreamForwardAsyncHost
                 }
                 Ok(ClusterRelayStreamForwardResult::StreamStartedThenFailed(error)) => Ok(
                     sinomo_core::network::ClusterRelayStreamSendOutcome::StreamStartedThenFailed(
-                        daemon_host_network_error("cluster relay stream", error),
+                        error,
                     ),
                 ),
                 Err(error) => {
@@ -7660,7 +7626,7 @@ impl sinomo_core::network::ClusterRelayStreamForwardAsyncHost
                         None,
                     )
                     .await;
-                    Err(daemon_host_network_error("cluster relay stream", error))
+                    Err(error)
                 }
             }
         })
@@ -7719,10 +7685,7 @@ impl sinomo_core::network::ClusterRelayStreamForwardAsyncHost
                         None,
                     )
                     .await;
-                    Err(daemon_host_network_error(
-                        "cluster relay stream collect",
-                        error,
-                    ))
+                    Err(error)
                 }
             }
         })
@@ -7789,35 +7752,33 @@ async fn send_cluster_relay_request_to_next_hop_async(
     endpoint: &ClusterEndpointRecord,
     request: &sinomo_core::network::ObjectRpcRequest,
     timeouts: sinomo_core::network::DaemonRpcTimeouts,
-) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
+) -> Result<sinomo_core::network::ObjectRpcResponse, sinomo_core::network::NetworkError> {
     let runtime = tokio::runtime::Handle::current();
     let mut host = DaemonSignedObjectRpcAsyncHost::direct_only(&runtime);
     let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
     client
-        .call_endpoint(
+        .call_endpoint_response(
             endpoint,
             request,
             sinomo_core::network::ClusterObjectRpcOptions::new(timeouts),
         )
         .await
-        .map_err(DaemonError::from)
 }
 
 async fn send_cluster_relay_target_request_to_next_hop_async(
     endpoint: &ClusterEndpointRecord,
     request: &sinomo_core::network::ObjectRpcRequest,
     timeouts: sinomo_core::network::DaemonRpcTimeouts,
-) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
+) -> Result<sinomo_core::network::ObjectRpcResponse, sinomo_core::network::NetworkError> {
     let mut host = DaemonClusterRelayPresignedObjectRpcHost;
     let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
     client
-        .call_endpoint(
+        .call_endpoint_response(
             endpoint,
             request,
             sinomo_core::network::ClusterObjectRpcOptions::new(timeouts),
         )
         .await
-        .map_err(DaemonError::from)
 }
 
 struct DaemonClusterRelayPresignedObjectRpcHost;
@@ -7830,13 +7791,13 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost
         request: &'a sinomo_core::network::ObjectRpcRequest,
     ) -> sinomo_core::network::ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
         Box::pin(async move {
-            request
-                .auth
-                .clone()
-                .ok_or_else(|| sinomo_core::network::NetworkError::Io {
-                    operation: "cluster relay target signing".to_string(),
-                    detail: "relayed target request is missing origin auth".to_string(),
-                })
+            request.auth.clone().ok_or_else(|| {
+                sinomo_core::network::NetworkError::delivery_failed(
+                    "cluster relay target signing",
+                    sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                    "relayed target request is missing origin auth",
+                )
+            })
         })
     }
 }
@@ -7844,7 +7805,7 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost
 enum ClusterRelayStreamForwardResult {
     Forwarded,
     RoutingError(sinomo_core::network::ObjectRpcResponse),
-    StreamStartedThenFailed(DaemonError),
+    StreamStartedThenFailed(sinomo_core::network::NetworkError),
 }
 
 enum ClusterRelayStreamCollectResult {
@@ -7858,17 +7819,16 @@ async fn send_cluster_relay_request_to_next_hop_streaming_collect_async(
     timeouts: sinomo_core::network::DaemonRpcTimeouts,
     runtime: &tokio::runtime::Handle,
     paths: &DaemonPaths,
-) -> Result<ClusterRelayStreamCollectResult, DaemonError> {
+) -> Result<ClusterRelayStreamCollectResult, sinomo_core::network::NetworkError> {
     let mut host = DaemonSignedObjectRpcAsyncHost::new(runtime, true).with_paths(paths);
     let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
     let response = client
-        .call_endpoint(
+        .call_endpoint_response(
             endpoint,
             &request,
             sinomo_core::network::ClusterObjectRpcOptions::new(timeouts),
         )
-        .await
-        .map_err(DaemonError::from)?;
+        .await?;
     if sinomo_core::network::relay_response_is_routing_error(&response) {
         return Ok(ClusterRelayStreamCollectResult::RoutingError(response));
     }
@@ -7882,7 +7842,7 @@ async fn send_cluster_relay_request_to_next_hop_streaming_async(
     paths: &DaemonPaths,
     stream: &mut sinomo_core::network::AsyncDaemonControlStream,
     stream_address: &str,
-) -> Result<ClusterRelayStreamForwardResult, DaemonError> {
+) -> Result<ClusterRelayStreamForwardResult, sinomo_core::network::NetworkError> {
     let runtime = tokio::runtime::Handle::current();
     let mut host = DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_paths(paths);
     match sinomo_core::network::forward_signed_streamed_daemon_rpc_to_cluster_endpoint_with_host_async(
@@ -7894,8 +7854,7 @@ async fn send_cluster_relay_request_to_next_hop_streaming_async(
         stream_address,
         crate::control::DAEMON_COMMAND_MAX_BYTES,
     )
-    .await
-    .map_err(DaemonError::from)?
+    .await?
     {
         sinomo_core::network::ClusterRelayStreamSendOutcome::Forwarded => {
             Ok(ClusterRelayStreamForwardResult::Forwarded)
@@ -7904,7 +7863,7 @@ async fn send_cluster_relay_request_to_next_hop_streaming_async(
             Ok(ClusterRelayStreamForwardResult::RoutingError(response))
         }
         sinomo_core::network::ClusterRelayStreamSendOutcome::StreamStartedThenFailed(error) => Ok(
-            ClusterRelayStreamForwardResult::StreamStartedThenFailed(DaemonError::from(error)),
+            ClusterRelayStreamForwardResult::StreamStartedThenFailed(error),
         ),
     }
 }
@@ -15943,7 +15902,7 @@ mod tests {
             cluster_state_authority_reachability_options().routed_node_command_timeout(
                 sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT
             ),
-            sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_TCP_COMMAND_TIMEOUT
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT
         );
     }
 

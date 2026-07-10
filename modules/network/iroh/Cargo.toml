@@ -35,3 +35,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 sinomo-testdir = { path = "../../../crates/sinomo-testdir" }
+tokio = { workspace = true, features = ["test-util"] }

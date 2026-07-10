@@ -31,8 +31,6 @@ use sinomo_rollout::{
 };
 use std::time::{Duration, Instant};
 
-const OBJECT_RPC_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-
 fn object_rpc_request_from_kv_payload(
     payload: sinomo_core::kv::ClusterKvRpcPayload,
 ) -> ObjectRpcRequest {
@@ -245,7 +243,7 @@ pub fn send_daemon_rpc_stream(
     block_on_daemon_client_stream(send_daemon_rpc_stream_async(
         address,
         request,
-        sinomo_core::network::DaemonRpcTimeouts::connect_only(timeout),
+        sinomo_core::network::DaemonRpcTimeouts::default().with_connect_timeout(Some(timeout)),
         &mut on_response,
     ))
 }
@@ -338,17 +336,36 @@ pub fn send_daemon_rpc_to_endpoint_with_timeouts(
     output
 }
 
-pub(crate) fn send_daemon_rpc_to_endpoint_with_timeouts_on_runtime(
+pub(crate) fn send_daemon_rpc_to_endpoint_with_options_on_runtime(
     endpoint: &ClusterEndpointRecord,
     request: &ObjectRpcRequest,
-    timeouts: sinomo_core::network::DaemonRpcTimeouts,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
     let runtime_for_future = runtime.clone();
     block_on_daemon_client_on_owner_runtime(
         runtime,
-        send_daemon_rpc_to_endpoint_async(endpoint, request, timeouts, &runtime_for_future),
+        send_daemon_rpc_to_endpoint_with_options_async(
+            endpoint,
+            request,
+            options,
+            &runtime_for_future,
+        ),
     )
+}
+
+async fn send_daemon_rpc_to_endpoint_with_options_async(
+    endpoint: &ClusterEndpointRecord,
+    request: &ObjectRpcRequest,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
+    let mut host = DaemonSignedObjectRpcAsyncHost::new(runtime, true);
+    let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
+    client
+        .call_endpoint(endpoint, request, options)
+        .await
+        .map_err(DaemonError::from)
 }
 
 pub async fn send_daemon_rpc_to_endpoint_async(
@@ -382,7 +399,7 @@ async fn send_daemon_rpc_to_endpoint_async_with_connectivity_observation(
 async fn send_daemon_rpc_to_target_async_with_connectivity_observation(
     target_node_id: &NodeId,
     request: &ObjectRpcRequest,
-    timeouts: sinomo_core::network::DaemonRpcTimeouts,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
     runtime: &tokio::runtime::Handle,
     observe_connectivity: bool,
 ) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
@@ -396,12 +413,7 @@ async fn send_daemon_rpc_to_target_async_with_connectivity_observation(
     let mut client =
         sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, runtime, &paths);
     client
-        .call_target(
-            &state,
-            target_node_id,
-            request,
-            sinomo_core::network::ClusterObjectRpcOptions::new(timeouts),
-        )
+        .call_target(&state, target_node_id, request, options)
         .await
         .map_err(DaemonError::from)
 }
@@ -410,7 +422,7 @@ async fn send_daemon_rpc_to_target_async_with_daemon_paths_and_connectivity_obse
     daemon_paths: &DaemonPaths,
     target_node_id: &NodeId,
     request: &ObjectRpcRequest,
-    timeouts: sinomo_core::network::DaemonRpcTimeouts,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
     runtime: &tokio::runtime::Handle,
     observe_connectivity: bool,
 ) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
@@ -422,12 +434,7 @@ async fn send_daemon_rpc_to_target_async_with_daemon_paths_and_connectivity_obse
     let mut client =
         sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, runtime, &paths);
     client
-        .call_target(
-            &state,
-            target_node_id,
-            request,
-            sinomo_core::network::ClusterObjectRpcOptions::new(timeouts),
-        )
+        .call_target(&state, target_node_id, request, options)
         .await
         .map_err(DaemonError::from)
 }
@@ -873,7 +880,7 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonSignedObjec
             {
                 result
             } else {
-                sinomo_core::network::send_daemon_rpc_to_cluster_endpoint_async(
+                sinomo_core::network::send_daemon_rpc_response_to_cluster_endpoint_async(
                     endpoint,
                     Some(auth),
                     request,
@@ -881,7 +888,8 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonSignedObjec
                 )
                 .await
             };
-            let observation = daemon_signed_endpoint_rpc_observation(result.as_ref(), started);
+            let observation =
+                daemon_signed_endpoint_object_rpc_observation(result.as_ref(), started);
             let _ = self
                 .observe_signed_endpoint_rpc_async(endpoint, observation)
                 .await;
@@ -928,7 +936,7 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonSignedObjec
                     )
                 })
             } else {
-                sinomo_core::network::send_daemon_rpc_stream_response_to_cluster_endpoint_async(
+                sinomo_core::network::send_daemon_rpc_stream_response_frame_to_cluster_endpoint_async(
                     endpoint,
                     Some(auth),
                     request,
@@ -936,7 +944,8 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonSignedObjec
                 )
                 .await
             };
-            let observation = daemon_signed_endpoint_rpc_observation(result.as_ref(), started);
+            let observation =
+                daemon_signed_endpoint_stream_response_observation(result.as_ref(), started);
             let _ = self
                 .observe_signed_endpoint_rpc_async(endpoint, observation)
                 .await;
@@ -1061,11 +1070,19 @@ fn daemon_rpc_connectivity_observation(
     }
 }
 
-fn daemon_signed_endpoint_rpc_observation<T>(
-    result: Result<&T, &sinomo_core::network::NetworkError>,
+fn daemon_signed_endpoint_object_rpc_observation(
+    result: Result<&sinomo_core::network::ObjectRpcResponse, &sinomo_core::network::NetworkError>,
     started: Instant,
 ) -> sinomo_core::network::ClusterSignedObjectRpcObservation {
     match result {
+        Ok(response)
+            if matches!(
+                response.error_detail(),
+                Err(sinomo_core::network::NetworkError::AuthDenied)
+            ) =>
+        {
+            sinomo_core::network::ClusterSignedObjectRpcObservation::auth_denied()
+        }
         Ok(_) => sinomo_core::network::ClusterSignedObjectRpcObservation::success(Some(
             daemon_signed_endpoint_rpc_elapsed_latency_ms(started),
         )),
@@ -1073,6 +1090,21 @@ fn daemon_signed_endpoint_rpc_observation<T>(
             sinomo_core::network::ClusterSignedObjectRpcObservation::auth_denied()
         }
         Err(_) => sinomo_core::network::ClusterSignedObjectRpcObservation::io_failure(),
+    }
+}
+
+fn daemon_signed_endpoint_stream_response_observation(
+    result: Result<
+        &sinomo_core::network::ObjectRpcStreamResponse,
+        &sinomo_core::network::NetworkError,
+    >,
+    started: Instant,
+) -> sinomo_core::network::ClusterSignedObjectRpcObservation {
+    match result {
+        Ok(response) => {
+            daemon_signed_endpoint_object_rpc_observation(Ok(&response.response), started)
+        }
+        Err(error) => daemon_signed_endpoint_object_rpc_observation(Err(error), started),
     }
 }
 
@@ -1234,7 +1266,8 @@ pub async fn send_dfs_metadata_journal_batch_to_endpoint_async(
     send_daemon_rpc_request_to_endpoint_with_decoder_async(
         endpoint,
         &rpc_request,
-        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(connect_timeout),
+        sinomo_core::network::DaemonRpcTimeouts::default()
+            .with_connect_timeout(Some(connect_timeout)),
         runtime,
         |response| sinomo_dfs::decode_dfs_metadata_journal_batch_rpc_response(response),
     )
@@ -1251,7 +1284,8 @@ pub async fn send_dfs_metadata_snapshot_install_to_endpoint_async(
     send_daemon_rpc_request_to_endpoint_with_decoder_async(
         endpoint,
         &rpc_request,
-        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(connect_timeout),
+        sinomo_core::network::DaemonRpcTimeouts::default()
+            .with_connect_timeout(Some(connect_timeout)),
         runtime,
         |response| sinomo_dfs::decode_dfs_metadata_snapshot_install_rpc_response(response),
     )
@@ -1278,11 +1312,25 @@ pub fn send_object_rpc_to_target_with_timeouts(
     timeouts: sinomo_core::network::DaemonRpcTimeouts,
     observe_connectivity: bool,
 ) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
+    send_object_rpc_to_target_with_options(
+        target_node_id,
+        request,
+        sinomo_core::network::ClusterObjectRpcOptions::new(timeouts),
+        observe_connectivity,
+    )
+}
+
+pub fn send_object_rpc_to_target_with_options(
+    target_node_id: &NodeId,
+    request: &ObjectRpcRequest,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+    observe_connectivity: bool,
+) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        return send_object_rpc_to_target_with_timeouts_on_runtime(
+        return send_object_rpc_to_target_with_options_on_runtime(
             target_node_id,
             request,
-            timeouts,
+            options,
             &handle,
             observe_connectivity,
         );
@@ -1294,10 +1342,10 @@ pub fn send_object_rpc_to_target_with_timeouts(
             address: "daemon client runtime".to_string(),
             detail: source.to_string(),
         })?;
-    let result = send_object_rpc_to_target_with_timeouts_on_runtime(
+    let result = send_object_rpc_to_target_with_options_on_runtime(
         target_node_id,
         request,
-        timeouts,
+        options,
         runtime.handle(),
         observe_connectivity,
     );
@@ -1305,11 +1353,11 @@ pub fn send_object_rpc_to_target_with_timeouts(
     result
 }
 
-pub(crate) fn send_object_rpc_to_target_on_runtime_with_daemon_paths(
+pub(crate) fn send_object_rpc_to_target_on_runtime_with_daemon_paths_and_options(
     daemon_paths: &DaemonPaths,
     target_node_id: &NodeId,
     request: &ObjectRpcRequest,
-    connect_timeout: Duration,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
     runtime: &tokio::runtime::Handle,
     observe_connectivity: bool,
 ) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
@@ -1322,7 +1370,7 @@ pub(crate) fn send_object_rpc_to_target_on_runtime_with_daemon_paths(
             &daemon_paths,
             &target_node_id,
             &request,
-            object_rpc_transfer_timeouts(connect_timeout),
+            options,
             &runtime_for_future,
             observe_connectivity,
         )
@@ -1330,10 +1378,10 @@ pub(crate) fn send_object_rpc_to_target_on_runtime_with_daemon_paths(
     })
 }
 
-pub(crate) fn send_object_rpc_to_target_with_timeouts_on_runtime(
+pub(crate) fn send_object_rpc_to_target_with_options_on_runtime(
     target_node_id: &NodeId,
     request: &ObjectRpcRequest,
-    timeouts: sinomo_core::network::DaemonRpcTimeouts,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
     runtime: &tokio::runtime::Handle,
     observe_connectivity: bool,
 ) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
@@ -1344,7 +1392,7 @@ pub(crate) fn send_object_rpc_to_target_with_timeouts_on_runtime(
         send_daemon_rpc_to_target_async_with_connectivity_observation(
             &target_node_id,
             &request,
-            timeouts,
+            options,
             &runtime_for_future,
             observe_connectivity,
         )
@@ -1359,10 +1407,29 @@ pub async fn send_object_rpc_to_target_async(
     runtime: &tokio::runtime::Handle,
     observe_connectivity: bool,
 ) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
+    send_object_rpc_to_target_async_with_options(
+        target_node_id,
+        request,
+        sinomo_core::network::ClusterObjectRpcOptions::new(object_rpc_transfer_timeouts(
+            connect_timeout,
+        )),
+        runtime,
+        observe_connectivity,
+    )
+    .await
+}
+
+pub async fn send_object_rpc_to_target_async_with_options(
+    target_node_id: &NodeId,
+    request: &ObjectRpcRequest,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+    runtime: &tokio::runtime::Handle,
+    observe_connectivity: bool,
+) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
     send_daemon_rpc_to_target_async_with_connectivity_observation(
         target_node_id,
         request,
-        object_rpc_transfer_timeouts(connect_timeout),
+        options,
         runtime,
         observe_connectivity,
     )
@@ -1377,11 +1444,32 @@ pub(crate) async fn send_object_rpc_to_target_async_with_daemon_paths(
     runtime: &tokio::runtime::Handle,
     observe_connectivity: bool,
 ) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
+    send_object_rpc_to_target_async_with_daemon_paths_and_options(
+        daemon_paths,
+        target_node_id,
+        request,
+        sinomo_core::network::ClusterObjectRpcOptions::new(object_rpc_transfer_timeouts(
+            connect_timeout,
+        )),
+        runtime,
+        observe_connectivity,
+    )
+    .await
+}
+
+pub(crate) async fn send_object_rpc_to_target_async_with_daemon_paths_and_options(
+    daemon_paths: &DaemonPaths,
+    target_node_id: &NodeId,
+    request: &ObjectRpcRequest,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+    runtime: &tokio::runtime::Handle,
+    observe_connectivity: bool,
+) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
     send_daemon_rpc_to_target_async_with_daemon_paths_and_connectivity_observation(
         daemon_paths,
         target_node_id,
         request,
-        object_rpc_transfer_timeouts(connect_timeout),
+        options,
         runtime,
         observe_connectivity,
     )
@@ -1391,15 +1479,17 @@ pub(crate) async fn send_object_rpc_to_target_async_with_daemon_paths(
 pub(crate) fn object_rpc_transfer_timeouts(
     connect_timeout: Duration,
 ) -> sinomo_core::network::DaemonRpcTimeouts {
-    sinomo_core::network::DaemonRpcTimeouts::connect_only(connect_timeout)
-        .with_idle_timeout(Some(OBJECT_RPC_TRANSFER_IDLE_TIMEOUT))
+    // Transfer duration is unbounded while bytes keep moving. Only connection
+    // setup is caller-configurable; every no-progress period uses the network
+    // layer's common idle limit.
+    sinomo_core::network::DaemonRpcTimeouts::default().with_connect_timeout(Some(connect_timeout))
 }
 
 #[cfg(test)]
 pub(crate) fn object_rpc_forward_control_timeouts(
     connect_timeout: Duration,
 ) -> sinomo_core::network::DaemonRpcTimeouts {
-    object_rpc_transfer_timeouts(connect_timeout).with_idle_timeout(Some(connect_timeout))
+    object_rpc_transfer_timeouts(connect_timeout)
 }
 
 pub fn fetch_daemon_status_from_address(
@@ -1775,11 +1865,14 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn object_rpc_transfer_timeouts_keep_transfer_idle_separate_from_connect_budget() {
+    fn object_rpc_transfer_timeouts_use_default_no_progress_limit() {
         let timeouts = super::object_rpc_transfer_timeouts(Duration::from_secs(60));
 
         assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(60)));
-        assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(300)));
+        assert_eq!(
+            timeouts.idle_timeout,
+            Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        );
     }
 
     #[test]
@@ -2079,7 +2172,10 @@ mod tests {
         let timeouts = super::object_rpc_forward_control_timeouts(Duration::from_secs(60));
 
         assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(60)));
-        assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(60)));
+        assert_eq!(
+            timeouts.idle_timeout,
+            Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        );
     }
 
     #[test]
@@ -2363,20 +2459,27 @@ mod tests {
         let started = std::time::Instant::now();
         let response =
             sinomo_core::network::ObjectRpcResponse::encode_body("/test", &()).expect("response");
-        let success = super::daemon_signed_endpoint_rpc_observation(Ok(&response), started);
+        let success = super::daemon_signed_endpoint_object_rpc_observation(Ok(&response), started);
         assert!(success.is_success());
 
-        let auth_denied = super::daemon_signed_endpoint_rpc_observation::<
-            sinomo_core::network::ObjectRpcResponse,
-        >(
+        let auth_denied = super::daemon_signed_endpoint_object_rpc_observation(
             Err(&sinomo_core::network::NetworkError::AuthDenied),
             std::time::Instant::now(),
         );
         assert!(auth_denied.is_auth_denied());
 
-        let io = super::daemon_signed_endpoint_rpc_observation::<
-            sinomo_core::network::ObjectRpcResponse,
-        >(
+        let auth_denied_response = sinomo_core::network::ObjectRpcResponse::encode_error(
+            "/test",
+            "network authorization was denied",
+        )
+        .expect("auth error response");
+        let auth_denied_frame = super::daemon_signed_endpoint_object_rpc_observation(
+            Ok(&auth_denied_response),
+            std::time::Instant::now(),
+        );
+        assert!(auth_denied_frame.is_auth_denied());
+
+        let io = super::daemon_signed_endpoint_object_rpc_observation(
             Err(&sinomo_core::network::NetworkError::Io {
                 operation: "connect".to_string(),
                 detail: "refused".to_string(),

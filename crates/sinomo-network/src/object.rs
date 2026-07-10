@@ -1,4 +1,4 @@
-use crate::error::NetworkError;
+use crate::error::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase};
 use crate::io_observer;
 use sinomo_object::{BorrowedDocumentBuilder, LengthMode, serde_ext};
 use std::collections::HashMap;
@@ -16,6 +16,10 @@ pub const OBJECT_STREAM_DEFAULT_CHUNK_BYTES: usize = 1024 * 1024;
 pub const OBJECT_STREAM_MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 pub const OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL: u32 = u32::MAX;
 pub const DAEMON_CONTROL_RPC_MAX_FRAME_BYTES: usize = usize::MAX;
+/// Default limit for establishing a network path and for each period without
+/// stream I/O progress. This is a per-phase/per-progress limit, not a total
+/// operation deadline.
+pub const DEFAULT_NETWORK_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY: &str =
     "sinomo.daemon-control.reuse-stream";
 pub(crate) const DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE: &str = "1";
@@ -30,8 +34,10 @@ const DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES: usize = 8;
 /// Timeout policy for daemon object-RPC transport.
 ///
 /// Connect/open timeouts bound cases where no usable transport can be established.
-/// Idle timeouts are optional transfer-progress limits. Callers that do not pass an
-/// idle timeout get normal async frame I/O with no application-level body deadline.
+/// Idle timeouts are optional transfer-progress limits and restart after each
+/// successful read or write. `Default` applies [`DEFAULT_NETWORK_TIMEOUT`] to
+/// both phases; use `none()` only when a surrounding absolute deadline is
+/// already enforced or for a deliberately long-lived server-side stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DaemonRpcTimeouts {
     pub connect_timeout: Option<Duration>,
@@ -80,13 +86,19 @@ impl DaemonRpcTimeouts {
 
 impl Default for DaemonRpcTimeouts {
     fn default() -> Self {
-        Self::none()
+        Self::connect_and_idle(DEFAULT_NETWORK_TIMEOUT)
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ObjectFrameIoOptions {
     pub idle_timeout: Option<Duration>,
+}
+
+impl Default for ObjectFrameIoOptions {
+    fn default() -> Self {
+        Self::idle_timeout(DEFAULT_NETWORK_TIMEOUT)
+    }
 }
 
 impl ObjectFrameIoOptions {
@@ -422,6 +434,15 @@ impl ObjectRpcStreamResponse {
         Self { response, body }
     }
 
+    /// Attaches the absolute deadline for the whole RPC call to the response
+    /// body. A body keeps the earliest deadline when multiple layers attach one.
+    pub fn with_deadline(self, deadline: Option<tokio::time::Instant>) -> Self {
+        Self {
+            response: self.response,
+            body: self.body.with_deadline(deadline),
+        }
+    }
+
     pub async fn collect_body_to_vec(mut self) -> Result<crate::ObjectRpcResponse, NetworkError> {
         let body = self.body.collect_to_vec().await?;
         self.response.body = body;
@@ -443,10 +464,69 @@ pub enum ObjectRpcStreamBody {
         options: RawByteStreamChunkOptions,
         total_read: u64,
     },
+    Deadline {
+        body: Box<ObjectRpcStreamBody>,
+        deadline: tokio::time::Instant,
+    },
 }
 
 impl ObjectRpcStreamBody {
+    /// Attaches an absolute whole-call deadline without changing the existing
+    /// per-chunk idle timeout. The earlier timeout wins while reading.
+    pub fn with_deadline(self, deadline: Option<tokio::time::Instant>) -> Self {
+        let Some(deadline) = deadline else {
+            return self;
+        };
+        match self {
+            ObjectRpcStreamBody::Deadline {
+                body,
+                deadline: existing,
+            } => ObjectRpcStreamBody::Deadline {
+                body,
+                deadline: existing.min(deadline),
+            },
+            body => ObjectRpcStreamBody::Deadline {
+                body: Box::new(body),
+                deadline,
+            },
+        }
+    }
+
     pub async fn read_next_chunk(&mut self) -> Result<Option<Vec<u8>>, NetworkError> {
+        let (body, deadline) = self.unwrapped_body_and_deadline();
+        let Some(deadline) = deadline else {
+            return body.read_next_chunk_without_deadline().await;
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(object_rpc_stream_overall_timeout(remaining));
+        }
+        match tokio::time::timeout_at(deadline, body.read_next_chunk_without_deadline()).await {
+            Ok(result) => result,
+            Err(_) => Err(object_rpc_stream_overall_timeout(remaining)),
+        }
+    }
+
+    fn unwrapped_body_and_deadline(
+        &mut self,
+    ) -> (&mut ObjectRpcStreamBody, Option<tokio::time::Instant>) {
+        let mut body = self;
+        let mut earliest: Option<tokio::time::Instant> = None;
+        loop {
+            match body {
+                ObjectRpcStreamBody::Deadline {
+                    body: inner,
+                    deadline,
+                } => {
+                    earliest = Some(earliest.map_or(*deadline, |current| current.min(*deadline)));
+                    body = inner.as_mut();
+                }
+                _ => return (body, earliest),
+            }
+        }
+    }
+
+    async fn read_next_chunk_without_deadline(&mut self) -> Result<Option<Vec<u8>>, NetworkError> {
         match self {
             ObjectRpcStreamBody::Empty => Ok(None),
             ObjectRpcStreamBody::Buffered {
@@ -494,6 +574,9 @@ impl ObjectRpcStreamBody {
                     checked_object_stream_total(*total_read, bytes.len(), options.max_total_bytes)?;
                 Ok(Some(bytes))
             }
+            ObjectRpcStreamBody::Deadline { .. } => {
+                unreachable!("stream deadline wrappers are removed before reading")
+            }
         }
     }
 
@@ -507,11 +590,101 @@ impl ObjectRpcStreamBody {
     }
 }
 
+fn object_rpc_stream_overall_timeout(timeout: Duration) -> NetworkError {
+    NetworkError::timeout(
+        "read object rpc stream body",
+        NetworkTimeoutPhase::Overall,
+        timeout,
+        NetworkDeliveryState::PossiblyApplied,
+    )
+}
+
 const ASYNC_DAEMON_CONTROL_STREAM_POOL_MAX_IDLE_PER_ADDRESS: usize = 64;
 
 static ASYNC_DAEMON_CONTROL_STREAM_POOL: LazyLock<
     Mutex<HashMap<String, Vec<AsyncDaemonControlStream>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonRequestDispatch {
+    DefinitelyNotSent,
+    PossiblySent,
+}
+
+#[derive(Debug)]
+struct DaemonControlAttemptError {
+    source: NetworkError,
+    dispatch: DaemonRequestDispatch,
+}
+
+impl DaemonControlAttemptError {
+    fn after_request_write(source: NetworkError) -> Self {
+        Self {
+            source,
+            dispatch: DaemonRequestDispatch::PossiblySent,
+        }
+    }
+
+    fn into_source(self) -> NetworkError {
+        let delivery_state = match self.dispatch {
+            DaemonRequestDispatch::DefinitelyNotSent => NetworkDeliveryState::DefinitelyNotSent,
+            DaemonRequestDispatch::PossiblySent => NetworkDeliveryState::PossiblyApplied,
+        };
+        network_error_with_delivery_state(
+            self.source,
+            "send daemon control request",
+            delivery_state,
+        )
+    }
+}
+
+struct DaemonRequestWriteTracker<'a> {
+    stream: &'a mut tokio::net::TcpStream,
+    wrote_bytes: bool,
+}
+
+impl DaemonRequestWriteTracker<'_> {
+    fn dispatch(&self) -> DaemonRequestDispatch {
+        if self.wrote_bytes {
+            DaemonRequestDispatch::PossiblySent
+        } else {
+            DaemonRequestDispatch::DefinitelyNotSent
+        }
+    }
+}
+
+impl AsyncWrite for DaemonRequestWriteTracker<'_> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut *this.stream).poll_write(cx, buf) {
+            std::task::Poll::Ready(Ok(written)) => {
+                // Once the local socket accepts any byte, the peer may have
+                // received enough of this request to act on it.
+                this.wrote_bytes |= written != 0;
+                std::task::Poll::Ready(Ok(written))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.get_mut().stream).poll_shutdown(cx)
+    }
+}
 
 impl AsyncDaemonControlStream {
     pub fn new(stream: tokio::net::TcpStream) -> Self {
@@ -530,32 +703,45 @@ impl AsyncDaemonControlStream {
     }
 
     pub async fn connect(address: &str) -> Result<Self, NetworkError> {
-        Self::connect_with_options(address, DaemonRpcTimeouts::none()).await
+        Self::connect_with_options(address, DaemonRpcTimeouts::default()).await
     }
 
     pub async fn connect_with_options(
         address: &str,
         timeouts: DaemonRpcTimeouts,
     ) -> Result<Self, NetworkError> {
+        let operation = format!("connect async daemon control stream {address}");
         let connect = tokio::net::TcpStream::connect(address);
         let stream = if let Some(timeout) = timeouts.connect_timeout {
-            tokio::time::timeout(timeout, connect)
-                .await
-                .map_err(|_| NetworkError::Io {
-                    operation: format!("connect async daemon control stream {address}"),
-                    detail: daemon_control_timeout_detail(timeout),
-                })?
+            tokio::time::timeout(timeout, connect).await.map_err(|_| {
+                NetworkError::timeout(
+                    operation.clone(),
+                    NetworkTimeoutPhase::Connect,
+                    timeout,
+                    NetworkDeliveryState::DefinitelyNotSent,
+                )
+            })?
         } else {
             connect.await
         }
-        .map_err(|source| NetworkError::Io {
-            operation: format!("connect async daemon control stream {address}"),
-            detail: source.to_string(),
+        .map_err(|source| {
+            NetworkError::delivery_failed(
+                &operation,
+                NetworkDeliveryState::DefinitelyNotSent,
+                source.to_string(),
+            )
         })?;
         configure_daemon_control_tcp_stream(
             &stream,
             &format!("connected daemon control stream {address}"),
-        )?;
+        )
+        .map_err(|error| {
+            network_error_with_delivery_state(
+                error,
+                "configure async daemon control stream",
+                NetworkDeliveryState::DefinitelyNotSent,
+            )
+        })?;
         Ok(Self::new(stream))
     }
 
@@ -566,6 +752,27 @@ impl AsyncDaemonControlStream {
         options: ObjectFrameIoOptions,
     ) -> Result<(), NetworkError> {
         self.write_frame(address, request, options).await
+    }
+
+    async fn write_request_tracking_dispatch(
+        &mut self,
+        address: &str,
+        request: &DaemonControlRequest,
+        options: ObjectFrameIoOptions,
+    ) -> Result<(), DaemonControlAttemptError> {
+        let mut writer = DaemonRequestWriteTracker {
+            stream: &mut self.stream,
+            wrote_bytes: false,
+        };
+        let result = write_object_frame_async(&mut writer, request, options).await;
+        let dispatch = writer.dispatch();
+        result.map_err(|error| DaemonControlAttemptError {
+            source: map_daemon_control_frame_error(
+                error,
+                format!("write async daemon control stream {address}"),
+            ),
+            dispatch,
+        })
     }
 
     pub async fn write_response(
@@ -719,6 +926,7 @@ pub(crate) async fn send_daemon_control_request_async(
         &mut stream,
     )
     .await
+    .map_err(DaemonControlAttemptError::into_source)
 }
 
 pub async fn send_daemon_control_rpc_request_async(
@@ -751,11 +959,14 @@ pub async fn send_daemon_control_rpc_request_stream_response_async(
     let mut stream = AsyncDaemonControlStream::connect_with_options(address, timeouts).await?;
     let frame_options = ObjectFrameIoOptions::none().with_idle_timeout(timeouts.idle_timeout);
     stream
-        .write_request(address, request, frame_options)
-        .await?;
+        .write_request_tracking_dispatch(address, request, frame_options)
+        .await
+        .map_err(DaemonControlAttemptError::into_source)?;
     let response = stream
         .read_rpc_response(address, max_response_bytes, frame_options)
-        .await?;
+        .await
+        .map_err(DaemonControlAttemptError::after_request_write)
+        .map_err(DaemonControlAttemptError::into_source)?;
     let body_options = RawByteStreamChunkOptions {
         chunk_bytes: OBJECT_STREAM_MAX_CHUNK_BYTES,
         max_total_bytes: u64::try_from(max_response_bytes).ok(),
@@ -793,6 +1004,7 @@ pub(crate) async fn send_daemon_control_rpc_request_raw_response_async(
         &mut stream,
     )
     .await
+    .map_err(DaemonControlAttemptError::into_source)
 }
 
 async fn send_reusable_daemon_control_request_async(
@@ -821,7 +1033,7 @@ async fn send_reusable_daemon_control_request_async(
             return_pooled_daemon_control_stream(address, stream);
             Ok(response)
         }
-        Err(_) if reused => {
+        Err(error) if reused && reused_stream_failure_is_retry_safe(request, error.dispatch) => {
             let mut stream =
                 AsyncDaemonControlStream::connect_with_options(address, timeouts).await?;
             let response = send_daemon_control_request_on_stream_async(
@@ -831,11 +1043,12 @@ async fn send_reusable_daemon_control_request_async(
                 max_response_bytes,
                 &mut stream,
             )
-            .await?;
+            .await
+            .map_err(DaemonControlAttemptError::into_source)?;
             return_pooled_daemon_control_stream(address, stream);
             Ok(response)
         }
-        Err(error) => Err(error),
+        Err(error) => Err(error.into_source()),
     }
 }
 
@@ -865,7 +1078,7 @@ async fn send_reusable_daemon_control_rpc_request_raw_response_async(
             return_pooled_daemon_control_stream(address, stream);
             Ok(response)
         }
-        Err(_) if reused => {
+        Err(error) if reused && reused_stream_failure_is_retry_safe(request, error.dispatch) => {
             let mut stream =
                 AsyncDaemonControlStream::connect_with_options(address, timeouts).await?;
             let response = send_daemon_control_rpc_request_raw_response_on_stream_async(
@@ -875,11 +1088,12 @@ async fn send_reusable_daemon_control_rpc_request_raw_response_async(
                 max_response_bytes,
                 &mut stream,
             )
-            .await?;
+            .await
+            .map_err(DaemonControlAttemptError::into_source)?;
             return_pooled_daemon_control_stream(address, stream);
             Ok(response)
         }
-        Err(error) => Err(error),
+        Err(error) => Err(error.into_source()),
     }
 }
 
@@ -889,14 +1103,15 @@ async fn send_daemon_control_request_on_stream_async(
     timeouts: DaemonRpcTimeouts,
     max_response_bytes: usize,
     stream: &mut AsyncDaemonControlStream,
-) -> Result<DaemonControlResponse, NetworkError> {
+) -> Result<DaemonControlResponse, DaemonControlAttemptError> {
     let frame_options = ObjectFrameIoOptions::none().with_idle_timeout(timeouts.idle_timeout);
     stream
-        .write_request(address, request, frame_options)
+        .write_request_tracking_dispatch(address, request, frame_options)
         .await?;
     stream
         .read_response(address, max_response_bytes, frame_options)
         .await
+        .map_err(DaemonControlAttemptError::after_request_write)
 }
 
 async fn send_daemon_control_rpc_request_raw_response_on_stream_async(
@@ -905,14 +1120,15 @@ async fn send_daemon_control_rpc_request_raw_response_on_stream_async(
     timeouts: DaemonRpcTimeouts,
     max_response_bytes: usize,
     stream: &mut AsyncDaemonControlStream,
-) -> Result<crate::ObjectRpcResponse, NetworkError> {
+) -> Result<crate::ObjectRpcResponse, DaemonControlAttemptError> {
     let frame_options = ObjectFrameIoOptions::none().with_idle_timeout(timeouts.idle_timeout);
     stream
-        .write_request(address, request, frame_options)
+        .write_request_tracking_dispatch(address, request, frame_options)
         .await?;
     let mut response = stream
         .read_rpc_response(address, max_response_bytes, frame_options)
-        .await?;
+        .await
+        .map_err(DaemonControlAttemptError::after_request_write)?;
     if object_rpc_response_has_streamed_daemon_body(&response) {
         let max_total_bytes = u64::try_from(max_response_bytes).ok();
         let mut body = Vec::new();
@@ -931,10 +1147,23 @@ async fn send_daemon_control_rpc_request_raw_response_on_stream_async(
                 error,
                 format!("read async daemon control stream {address}"),
             )
-        })?;
+        })
+        .map_err(DaemonControlAttemptError::after_request_write)?;
         response.body = body;
     }
     Ok(response)
+}
+
+fn reused_stream_failure_is_retry_safe(
+    request: &DaemonControlRequest,
+    dispatch: DaemonRequestDispatch,
+) -> bool {
+    // Replacing a stale pooled socket is unconditionally safe only before this
+    // request made write progress. An unsigned local request may opt into an
+    // ambiguous redispatch. A signed request must return to the route layer so
+    // the retry gets a fresh daemon-auth nonce.
+    dispatch == DaemonRequestDispatch::DefinitelyNotSent
+        || (request.auth.is_none() && request.is_response_retry_safe())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1131,14 +1360,28 @@ fn return_pooled_daemon_control_stream(address: &str, stream: AsyncDaemonControl
     }
 }
 
-fn daemon_control_timeout_detail(timeout: Duration) -> String {
-    format!("timed out after {}ms", timeout.as_millis())
-}
-
 fn map_daemon_control_frame_error(error: NetworkError, operation: String) -> NetworkError {
     match error {
         NetworkError::Io { detail, .. } => NetworkError::Io { operation, detail },
         other => other,
+    }
+}
+
+fn network_error_with_delivery_state(
+    error: NetworkError,
+    fallback_operation: &str,
+    delivery_state: NetworkDeliveryState,
+) -> NetworkError {
+    if error.delivery_state().is_some() {
+        return error;
+    }
+    match error {
+        NetworkError::Io { operation, detail } => {
+            NetworkError::delivery_failed(operation, delivery_state, detail)
+        }
+        error => {
+            NetworkError::delivery_failed(fallback_operation, delivery_state, error.to_string())
+        }
     }
 }
 
@@ -1735,7 +1978,7 @@ impl Default for RawByteStreamChunkOptions {
         Self {
             chunk_bytes: OBJECT_STREAM_DEFAULT_CHUNK_BYTES,
             max_total_bytes: None,
-            idle_timeout: None,
+            idle_timeout: Some(DEFAULT_NETWORK_TIMEOUT),
         }
     }
 }
@@ -2174,20 +2417,21 @@ fn object_frame_eof_detail(part: &str, read: usize, expected: usize) -> String {
 #[cfg(test)]
 mod serde_bytes_tests {
     use super::{
-        AsyncDaemonControlListener, DaemonRpcTimeouts, ObjectFrameIoOptions,
-        ObjectRpcRequestStreamMode, ObjectRpcResponseStreamMode, RawByteStreamChunkOptions,
+        AsyncDaemonControlListener, AsyncDaemonControlStream, DaemonRpcTimeouts,
+        ObjectFrameIoOptions, ObjectRpcRequestStreamMode, ObjectRpcResponseStreamMode,
+        ObjectRpcStreamBody, ObjectRpcStreamResponse, RawByteStreamChunkOptions,
         SINOMO_NETWORK_OBJECT_VERSION, SinomoObjectCodec, decode_single_object_frame_from_slice,
         encode_borrowed_object_frame_to_vec, encode_object_frame_to_vec,
         forward_raw_byte_stream_chunks_async, object_rpc_request_accepts_streamed_daemon_response,
         object_rpc_request_expects_raw_daemon_response, object_rpc_request_reuses_daemon_stream,
         object_rpc_request_stream_mode, object_rpc_response_stream_mode, read_object_frame_async,
         read_object_frame_blocking, read_raw_byte_stream_chunks_to_vec_async,
-        send_daemon_control_request_async, set_object_rpc_request_stream_mode,
-        set_object_rpc_response_stream_mode, write_all_async_frame,
-        write_borrowed_object_frame_async, write_object_frame_blocking,
+        send_daemon_control_request_async, send_daemon_control_rpc_request_stream_response_async,
+        set_object_rpc_request_stream_mode, set_object_rpc_response_stream_mode,
+        write_all_async_frame, write_borrowed_object_frame_async, write_object_frame_blocking,
         write_raw_byte_stream_chunk_async,
     };
-    use crate::error::NetworkError;
+    use crate::error::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase};
     use serde::{Deserialize, Serialize};
     use sinomo_object::{BorrowedDocumentBuilder, DocumentView, LengthMode};
     use std::io::Cursor;
@@ -2534,6 +2778,24 @@ mod serde_bytes_tests {
     }
 
     #[test]
+    fn network_timeout_defaults_are_shared_and_finite() {
+        assert_eq!(
+            DaemonRpcTimeouts::default(),
+            DaemonRpcTimeouts::connect_and_idle(super::DEFAULT_NETWORK_TIMEOUT)
+        );
+        assert_eq!(
+            ObjectFrameIoOptions::default().idle_timeout,
+            Some(super::DEFAULT_NETWORK_TIMEOUT)
+        );
+        assert_eq!(
+            RawByteStreamChunkOptions::default().idle_timeout,
+            Some(super::DEFAULT_NETWORK_TIMEOUT)
+        );
+        assert_eq!(DaemonRpcTimeouts::none().connect_timeout, None);
+        assert_eq!(DaemonRpcTimeouts::none().idle_timeout, None);
+    }
+
+    #[test]
     fn object_frame_byte_budget_releases_in_flight_permits() {
         let budget = super::ObjectFrameByteBudget::fixed(10);
         let first = budget.try_acquire(6).expect("first frame budget");
@@ -2824,6 +3086,206 @@ mod serde_bytes_tests {
         server.await.expect("server task");
     }
 
+    async fn exercise_ambiguous_reused_stream_failure(
+        stream_mode: ObjectRpcRequestStreamMode,
+        response_retry_safe: bool,
+    ) -> (Result<crate::ObjectRpcResponse, NetworkError>, bool) {
+        let listener = AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("listener address");
+        let route = format!("/test/reused-stream-retry/{stream_mode:?}/{response_retry_safe}");
+        let server_route = route.clone();
+        let server = tokio::spawn(async move {
+            let frame_options = ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1));
+            let mut stream = listener.accept().await.expect("accept initial stream");
+            let first_request = stream
+                .read_request("listener", 1024, frame_options)
+                .await
+                .expect("first request");
+            assert_eq!(first_request.route, server_route);
+            let first_response =
+                crate::ObjectRpcResponse::encode_body(&first_request.route, &"first".to_string())
+                    .expect("first response");
+            stream
+                .write_rpc_response("listener", &first_response, frame_options)
+                .await
+                .expect("write first response");
+
+            let second_request = stream
+                .read_request("listener", 1024, frame_options)
+                .await
+                .expect("second request");
+            assert_eq!(second_request.route, server_route);
+            drop(stream);
+
+            let mut retry_stream =
+                match tokio::time::timeout(Duration::from_millis(250), listener.accept()).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => panic!("accept retry stream: {error}"),
+                    Err(_) => return false,
+                };
+            let retry_request = retry_stream
+                .read_request("listener", 1024, frame_options)
+                .await
+                .expect("retry request");
+            assert_eq!(retry_request.route, server_route);
+            let retry_response =
+                crate::ObjectRpcResponse::encode_body(&retry_request.route, &"retried".to_string())
+                    .expect("retry response");
+            retry_stream
+                .write_rpc_response("listener", &retry_response, frame_options)
+                .await
+                .expect("write retry response");
+            true
+        });
+
+        let mut request = crate::ObjectRpcRequest::from_encoded_body(route, "test", Vec::new());
+        set_object_rpc_request_stream_mode(&mut request, stream_mode);
+        if response_retry_safe {
+            request = request.with_response_retry_safe();
+        }
+
+        let first = super::send_daemon_control_rpc_request_async(
+            &address,
+            &request,
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
+            1024,
+        )
+        .await
+        .expect("first response");
+        assert_eq!(first.decode_body::<String>().expect("first body"), "first");
+        let second = super::send_daemon_control_rpc_request_async(
+            &address,
+            &request,
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
+            1024,
+        )
+        .await;
+        let retried = server.await.expect("server task");
+        (second, retried)
+    }
+
+    #[test]
+    fn reused_stream_retry_safety_requires_opt_in_after_dispatch() {
+        let request =
+            crate::ObjectRpcRequest::from_encoded_body("/test/retry-safety", "test", Vec::new());
+        assert!(super::reused_stream_failure_is_retry_safe(
+            &request,
+            super::DaemonRequestDispatch::DefinitelyNotSent,
+        ));
+        assert!(!super::reused_stream_failure_is_retry_safe(
+            &request,
+            super::DaemonRequestDispatch::PossiblySent,
+        ));
+
+        let request = request.with_response_retry_safe();
+        assert!(super::reused_stream_failure_is_retry_safe(
+            &request,
+            super::DaemonRequestDispatch::PossiblySent,
+        ));
+        assert!(!super::reused_stream_failure_is_retry_safe(
+            &request.with_auth(vec![1, 2, 3]),
+            super::DaemonRequestDispatch::PossiblySent,
+        ));
+    }
+
+    #[test]
+    fn daemon_attempt_error_exposes_dispatch_certainty_and_preserves_typed_state() {
+        for (dispatch, expected) in [
+            (
+                super::DaemonRequestDispatch::DefinitelyNotSent,
+                NetworkDeliveryState::DefinitelyNotSent,
+            ),
+            (
+                super::DaemonRequestDispatch::PossiblySent,
+                NetworkDeliveryState::PossiblyApplied,
+            ),
+        ] {
+            let error = super::DaemonControlAttemptError {
+                source: NetworkError::Io {
+                    operation: "test daemon request".to_string(),
+                    detail: "failed".to_string(),
+                },
+                dispatch,
+            }
+            .into_source();
+            assert!(matches!(
+                error,
+                NetworkError::DeliveryFailed {
+                    delivery_state,
+                    ..
+                } if delivery_state == expected
+            ));
+        }
+
+        let typed = NetworkError::timeout(
+            "test typed timeout",
+            NetworkTimeoutPhase::Idle,
+            Duration::from_millis(10),
+            NetworkDeliveryState::PossiblyApplied,
+        );
+        let mapped = super::DaemonControlAttemptError {
+            source: typed.clone(),
+            dispatch: super::DaemonRequestDispatch::DefinitelyNotSent,
+        }
+        .into_source();
+        assert_eq!(mapped, typed);
+    }
+
+    #[tokio::test]
+    async fn daemon_connect_socket_error_is_definitely_not_sent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        drop(listener);
+
+        let error = AsyncDaemonControlStream::connect_with_options(
+            &address.to_string(),
+            DaemonRpcTimeouts::connect_only(Duration::from_secs(1)),
+        )
+        .await
+        .expect_err("closed listener should reject connect");
+        assert!(matches!(
+            error,
+            NetworkError::DeliveryFailed {
+                delivery_state: NetworkDeliveryState::DefinitelyNotSent,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reused_stream_does_not_redispatch_ambiguous_request_without_opt_in() {
+        for stream_mode in [
+            ObjectRpcRequestStreamMode::ReuseDaemonStream,
+            ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
+        ] {
+            let (response, retried) =
+                exercise_ambiguous_reused_stream_failure(stream_mode, false).await;
+            assert!(response.is_err(), "{stream_mode:?} should remain failed");
+            assert!(!retried, "{stream_mode:?} should not be redispatched");
+        }
+    }
+
+    #[tokio::test]
+    async fn reused_stream_redispatches_ambiguous_request_with_explicit_opt_in() {
+        for stream_mode in [
+            ObjectRpcRequestStreamMode::ReuseDaemonStream,
+            ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
+        ] {
+            let (response, retried) =
+                exercise_ambiguous_reused_stream_failure(stream_mode, true).await;
+            let response = response.expect("retry-safe response");
+            assert_eq!(
+                response.decode_body::<String>().expect("retry body"),
+                "retried"
+            );
+            assert!(retried, "{stream_mode:?} should be redispatched");
+        }
+    }
+
     #[tokio::test]
     async fn reusable_daemon_control_request_reuses_ping_route_stream() {
         let listener = AsyncDaemonControlListener::bind("127.0.0.1:0")
@@ -3104,6 +3566,116 @@ mod serde_bytes_tests {
         .expect("streamed response");
 
         assert_eq!(response.body, b"onetwo");
+        server.await.expect("server task");
+    }
+
+    fn assert_possibly_applied_overall_stream_timeout(error: NetworkError) {
+        match error {
+            NetworkError::Timeout {
+                operation,
+                phase,
+                delivery_state,
+                ..
+            } => {
+                assert_eq!(operation, "read object rpc stream body");
+                assert_eq!(phase, NetworkTimeoutPhase::Overall);
+                assert_eq!(delivery_state, NetworkDeliveryState::PossiblyApplied);
+            }
+            other => panic!("expected typed overall stream timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_stream_deadline_rejects_buffered_and_empty_body_reads() {
+        let options = RawByteStreamChunkOptions {
+            chunk_bytes: 4,
+            max_total_bytes: Some(1024),
+            idle_timeout: Some(Duration::from_secs(1)),
+        };
+        let expired = tokio::time::Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("expired deadline");
+        let mut response = crate::ObjectRpcResponse::from_encoded_body(
+            "/test/buffered-deadline",
+            b"body".to_vec(),
+        );
+        set_object_rpc_response_stream_mode(
+            &mut response,
+            ObjectRpcResponseStreamMode::RawStreamedDaemonBody,
+        );
+        let mut response = ObjectRpcStreamResponse::from_buffered_response(response, options)
+            .with_deadline(Some(expired));
+        let error = response
+            .body
+            .read_next_chunk()
+            .await
+            .expect_err("expired buffered body deadline");
+        assert_possibly_applied_overall_stream_timeout(error);
+
+        let mut empty = ObjectRpcStreamBody::Empty.with_deadline(Some(expired));
+        let error = empty
+            .read_next_chunk()
+            .await
+            .expect_err("expired empty body deadline");
+        assert_possibly_applied_overall_stream_timeout(error);
+    }
+
+    #[tokio::test]
+    async fn raw_stream_body_deadline_bounds_subsequent_chunk_read() {
+        let listener = AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("listener address");
+        let server = tokio::spawn(async move {
+            let frame_options = ObjectFrameIoOptions::idle_timeout(Duration::from_secs(2));
+            let mut stream = listener.accept().await.expect("accept");
+            stream
+                .read_request("listener", 1024, frame_options)
+                .await
+                .expect("request");
+            let mut response =
+                crate::ObjectRpcResponse::from_encoded_body("/test/body-deadline", Vec::new());
+            set_object_rpc_response_stream_mode(
+                &mut response,
+                ObjectRpcResponseStreamMode::RawStreamedDaemonBody,
+            );
+            stream
+                .write_rpc_response("listener", &response, frame_options)
+                .await
+                .expect("response");
+            stream
+                .write_raw_byte_stream_chunk("listener", b"first", frame_options)
+                .await
+                .expect("first chunk");
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        });
+        let request =
+            crate::ObjectRpcRequest::from_encoded_body("/test/body-deadline", "test", Vec::new());
+        let mut response = send_daemon_control_rpc_request_stream_response_async(
+            &address,
+            &request,
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(2)),
+            1024,
+        )
+        .await
+        .expect("stream response")
+        .with_deadline(Some(
+            tokio::time::Instant::now() + Duration::from_millis(150),
+        ));
+
+        let first = response
+            .body
+            .read_next_chunk()
+            .await
+            .expect("first chunk read")
+            .expect("first chunk");
+        assert_eq!(first, b"first");
+        let error = response
+            .body
+            .read_next_chunk()
+            .await
+            .expect_err("whole-call deadline should beat idle timeout");
+        assert_possibly_applied_overall_stream_timeout(error);
         server.await.expect("server task");
     }
 

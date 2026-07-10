@@ -249,7 +249,7 @@ fn process_dfs_message_command_for_test(
         local_node_id,
         Vec::new(),
         message_sender,
-        DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
     );
     let mut service = NetworkedDfsService::new(transport, content);
     if let Some(control_plane) = control_plane {
@@ -1346,7 +1346,7 @@ fn served_message_transport_sends_nested_return_node_requests_synchronously() {
         primary.clone(),
         vec![requester.clone()],
         sender,
-        DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
     );
     let served = test_dfs_lookup_routed_message(&requester, &primary, 1, "/services/served");
     transport
@@ -1411,7 +1411,7 @@ fn served_message_transport_returns_response_frames_inline() {
         primary.clone(),
         vec![requester.clone()],
         sender,
-        DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
     );
     let served = test_dfs_lookup_routed_message(&requester, &primary, 3, "/services/served");
     transport
@@ -1564,7 +1564,7 @@ fn routed_namespace_sync_drains_limited_response_backlog() {
         primary.clone(),
         vec![writer.clone()],
         primary_sender,
-        DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
     );
     let primary_backend = LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("services"),
@@ -1824,7 +1824,7 @@ fn dfs_peer_transport_adapters_delegate_all_routes() {
             request_id: "protocol-1".to_string(),
             routed_message,
         },
-        Duration::from_secs(1),
+        DfsObjectRpcSendOptions::new(Duration::from_secs(1)),
     )
     .expect("message send");
 
@@ -1887,7 +1887,12 @@ fn dfs_direct_read_peer_transport_adapters_observe_connectivity() {
     let peer = Arc::new(RecordingPeerTransport::default());
     let peer_transport: Arc<dyn DfsPeerTransport> = peer.clone();
     let direct_sender = dfs_direct_read_sender_from_peer_transport(peer_transport);
-    direct_sender(&remote, &request, Duration::from_secs(1)).expect("direct read send");
+    direct_sender(
+        &remote,
+        &request,
+        DfsObjectRpcSendOptions::new(Duration::from_secs(1)),
+    )
+    .expect("direct read send");
     assert_eq!(
         peer.options.lock().expect("options").as_slice(),
         &[(DFS_DIRECT_READ_ROUTE.to_string(), true)]
@@ -1902,7 +1907,14 @@ fn dfs_direct_read_peer_transport_adapters_observe_connectivity() {
         .build()
         .expect("runtime");
     runtime
-        .block_on(async { async_direct_sender(&remote, &request, Duration::from_secs(1)).await })
+        .block_on(async {
+            async_direct_sender(
+                &remote,
+                &request,
+                DfsObjectRpcSendOptions::new(Duration::from_secs(1)),
+            )
+            .await
+        })
         .expect("async direct read send");
     assert_eq!(
         async_peer.options.lock().expect("options").as_slice(),
@@ -15514,7 +15526,7 @@ fn process_incoming_prunes_expired_pending_remote_reads() {
             window_end_chunk_index: None,
             target_node_id: owner,
             next_retry_at: Instant::now()
-                - DFS_CHUNK_TRANSFER_IDLE_TIMEOUT
+                - DFS_CHUNK_TRANSFER_STALE_AFTER
                 - Duration::from_millis(1),
             cache_response: true,
         },
@@ -15596,7 +15608,7 @@ fn process_incoming_accepts_queued_remote_read_response_before_expiry_prune() {
             window_end_chunk_index: None,
             target_node_id: owner.clone(),
             next_retry_at: Instant::now()
-                - DFS_CHUNK_TRANSFER_IDLE_TIMEOUT
+                - DFS_CHUNK_TRANSFER_STALE_AFTER
                 - Duration::from_millis(1),
             cache_response: true,
         },
@@ -16608,7 +16620,7 @@ fn idle_chunk_transfer_pruning_releases_request_state() {
         network.add_node(owner.clone()),
         LocalContentStore::new(root.join("content")).expect("content"),
     );
-    let stale_at = Instant::now() - DFS_CHUNK_TRANSFER_IDLE_TIMEOUT - Duration::from_secs(1);
+    let stale_at = Instant::now() - DFS_CHUNK_TRANSFER_STALE_AFTER - Duration::from_secs(1);
 
     let read_request_id = "dfs_net_req_prune_read".to_string();
     dfs.pending_reads.insert(
@@ -16830,7 +16842,7 @@ fn retry_pending_repairs_prunes_idle_reads_without_distributed_writes() {
     );
     dfs.repair_retry_tick = 17;
     let request_id = "dfs_net_req_retry_prune_read".to_string();
-    let stale_at = Instant::now() - DFS_CHUNK_TRANSFER_IDLE_TIMEOUT - Duration::from_secs(1);
+    let stale_at = Instant::now() - DFS_CHUNK_TRANSFER_STALE_AFTER - Duration::from_secs(1);
     dfs.pending_reads.insert(
         request_id.clone(),
         PendingNetworkedRead {

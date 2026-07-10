@@ -1779,18 +1779,11 @@ fn send_join_rpc(
 ) -> Result<network::ObjectRpcResponse, CliError> {
     match endpoint.transport {
         ClusterTransportKind::Iroh => send_join_endpoint_rpc(endpoint, request, timeout),
-        // Join RPCs must carry an idle deadline, not just a connect timeout:
-        // an introducer that accepts the stream and never answers otherwise
-        // hangs the one-shot join forever. The idle budget is generous because
-        // a healthy introducer may legitimately relay the registration to a
-        // voter across bridges.
         _ => crate::daemon_send_daemon_rpc_with_timeouts(
             &endpoint.address,
             request,
-            sinomo_runtime::network::DaemonRpcTimeouts {
-                connect_timeout: Some(timeout),
-                idle_timeout: Some(CLUSTER_JOIN_RPC_IDLE_TIMEOUT),
-            },
+            sinomo_runtime::network::DaemonRpcTimeouts::default()
+                .with_connect_timeout(Some(timeout)),
         )
         .map_err(Into::into),
     }
@@ -1801,7 +1794,6 @@ fn send_join_endpoint_rpc(
     request: &network::ObjectRpcRequest,
     timeout: Duration,
 ) -> Result<network::ObjectRpcResponse, CliError> {
-    let timeouts = network::DaemonRpcTimeouts::connect_and_idle(timeout);
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         return if matches!(
             handle.runtime_flavor(),
@@ -1809,7 +1801,7 @@ fn send_join_endpoint_rpc(
         ) {
             let runtime = handle.clone();
             tokio::task::block_in_place(|| {
-                runtime.block_on(send_join_endpoint_rpc_async(endpoint, request, timeouts))
+                runtime.block_on(send_join_endpoint_rpc_async(endpoint, request, timeout))
             })
             .map_err(CliError::from)
         } else {
@@ -1827,7 +1819,7 @@ fn send_join_endpoint_rpc(
             detail: source.to_string(),
         })?;
     let output = runtime
-        .block_on(send_join_endpoint_rpc_async(endpoint, request, timeouts))
+        .block_on(send_join_endpoint_rpc_async(endpoint, request, timeout))
         .map_err(CliError::from);
     runtime.shutdown_timeout(Duration::from_millis(250));
     output
@@ -1836,22 +1828,13 @@ fn send_join_endpoint_rpc(
 async fn send_join_endpoint_rpc_async(
     endpoint: &ClusterEndpointRecord,
     request: &network::ObjectRpcRequest,
-    timeouts: network::DaemonRpcTimeouts,
+    timeout: Duration,
 ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
     let mut host = CliSignedEndpointRpcHost::new(None, "cluster join endpoint rpc signing");
     let mut client = network::ClusterObjectRpcClient::endpoint_only(&mut host);
-    client
-        .call_endpoint(
-            endpoint,
-            request,
-            network::ClusterObjectRpcOptions::new(timeouts),
-        )
-        .await
+    let options = network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout);
+    client.call_endpoint(endpoint, request, options).await
 }
-
-/// Idle deadline for join challenge/registration streams; covers a
-/// bridge-relayed registration round-trip while still bounding a silent peer.
-const CLUSTER_JOIN_RPC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) fn parse_cluster_join_invite_argument(raw: &str) -> Result<ClusterJoinInvite, CliError> {
     decode_cluster_join_invite(&cluster_join_invite_argument_uri(raw)?).map_err(Into::into)
@@ -2705,7 +2688,9 @@ pub(crate) fn refresh_cluster_kv_from_local_daemon_for_data_dir(
 }
 
 fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), CliError> {
-    struct CliClusterKvSnapshotRefreshHost;
+    struct CliClusterKvSnapshotRefreshHost {
+        paths: ClusterPaths,
+    }
 
     impl cluster::ClusterKvSnapshotRefreshHost for CliClusterKvSnapshotRefreshHost {
         fn known_kv_state_authority_id(
@@ -2718,21 +2703,32 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
 
         fn call_node_object_rpc(
             &mut self,
-            _state: &ClusterBootstrapState,
+            state: &ClusterBootstrapState,
             target_node_id: &NodeId,
             request: &network::ObjectRpcRequest,
             timeout: Duration,
         ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
-            daemon_send_object_rpc_to_target_with_timeouts(
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|source| network::NetworkError::Io {
+                    operation: "cluster kv snapshot refresh runtime".to_string(),
+                    detail: source.to_string(),
+                })?;
+            let mut host = CliSignedEndpointRpcHost::new(
+                Some(state.cluster_id.clone()),
+                "cluster kv snapshot refresh signing",
+            );
+            let mut client =
+                network::ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &self.paths);
+            let result = runtime.block_on(client.call_target(
+                state,
                 target_node_id,
                 request,
-                network::DaemonRpcTimeouts::connect_and_idle(timeout),
-                false,
-            )
-            .map_err(|source| network::NetworkError::Io {
-                operation: "cluster kv snapshot refresh".to_string(),
-                detail: source.to_string(),
-            })
+                network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
+            ));
+            runtime.shutdown_timeout(Duration::from_millis(250));
+            result
         }
 
         fn restore_cluster_kv_from_snapshot_if_newer(
@@ -2761,7 +2757,9 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
         &state,
         cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
             .kv_snapshot_refresh_options(),
-        &mut CliClusterKvSnapshotRefreshHost,
+        &mut CliClusterKvSnapshotRefreshHost {
+            paths: paths.clone(),
+        },
     ) {
         Ok(_) | Err(network::NetworkError::ClusterReadOnly { .. }) => Ok(()),
         Err(network::NetworkError::Io { .. }) => Ok(()),

@@ -18,7 +18,8 @@ pub(crate) const PUBLIC_ENDPOINT_REACHABILITY_POSITIVE_CACHE_TTL: Duration =
 pub const PUBLIC_ENDPOINT_REACHABILITY_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(10);
 pub const MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES: usize = 128;
 
-/// How long to wait when probing this node's own public endpoint for reachability.
+/// Opportunistic endpoint-advertisement probes use a shorter budget than RPCs
+/// so an unreachable public address cannot delay the maintenance loop.
 const PUBLIC_ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 
 static PUBLIC_ENDPOINT_REACHABILITY_CACHE: LazyLock<Mutex<PublicEndpointReachabilityCache>> =

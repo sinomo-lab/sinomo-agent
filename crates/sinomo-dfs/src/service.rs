@@ -107,7 +107,7 @@ fn dfs_service_route_concurrency_limit(route: &str) -> usize {
 
 fn dfs_service_route_timeout(route: &str) -> Option<Duration> {
     if route == DFS_STATUS_ROUTE {
-        Some(Duration::from_secs(5))
+        Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
     } else {
         None
     }

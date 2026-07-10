@@ -32,8 +32,6 @@ pub struct OpenedMountedSifsService {
     pub replica_candidates: Vec<DfsNodeId>,
 }
 
-const MOUNTED_SIFS_CLUSTER_KV_TXN_TIMEOUT: Duration = Duration::from_secs(5);
-
 pub fn open_mounted_sifs_service(
     data_dir: Option<PathBuf>,
 ) -> Result<OpenedMountedSifsService, DfsError> {
@@ -187,18 +185,18 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
             data_dir: self.data_dir.clone(),
             runtime: runtime.handle().clone(),
         };
-        let options = sinomo_core::network::ClusterObjectRpcOptions::new(
-            sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
-                MOUNTED_SIFS_CLUSTER_KV_TXN_TIMEOUT,
-            ),
-        );
         let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(
             &mut host,
             runtime.handle(),
             &self.cluster_paths,
         );
         let response_result = runtime
-            .block_on(client.call_target(&state, &state.local_node_id, &request, options))
+            .block_on(client.call_target(
+                &state,
+                &state.local_node_id,
+                &request,
+                sinomo_core::network::ClusterObjectRpcOptions::default(),
+            ))
             .and_then(|response| {
                 response.error_detail()?;
                 Ok(response)
@@ -251,11 +249,7 @@ impl MountedSifsPeerTransport {
                 &state,
                 target_node_id,
                 request,
-                sinomo_core::network::ClusterObjectRpcOptions::new(
-                    sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
-                        options.connect_timeout,
-                    ),
-                ),
+                options.cluster_rpc_options(),
             )
             .await?;
         response.error_detail()?;
@@ -284,11 +278,7 @@ impl MountedSifsPeerTransport {
                 &state,
                 target_node_id,
                 request,
-                sinomo_core::network::ClusterObjectRpcOptions::new(
-                    sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
-                        options.connect_timeout,
-                    ),
-                ),
+                options.cluster_rpc_options(),
             )
             .await
     }

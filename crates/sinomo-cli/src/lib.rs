@@ -317,14 +317,12 @@ impl cluster::ClusterStateAuthorityReachabilityHost for CliClusterStateAuthority
 
 fn cli_cluster_state_authority_reachability_options()
 -> cluster::ClusterStateAuthorityReachabilityOptions {
-    cluster::ClusterStateAuthorityReachabilityOptions {
-        timeout: Duration::from_secs(5),
-        tcp_command_timeout: Duration::from_secs(5),
-        iroh_command_timeout: Duration::from_secs(3),
-        tcp_foreground_attempt_timeout: Duration::from_secs(1),
-        public_foreground_attempt_timeout: Duration::from_secs(4),
-        iroh_foreground_attempt_timeout: Duration::from_millis(1500),
-    }
+    let mut options = cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+        .state_authority_reachability_options();
+    // CLI quorum checks are foreground diagnostics, so keep their total
+    // operation budget short while sharing the daemon transport policy.
+    options.timeout = network::DEFAULT_NETWORK_TIMEOUT;
+    options
 }
 
 fn cluster_has_local_quorum(paths: &ClusterPaths, state: &ClusterBootstrapState) -> bool {

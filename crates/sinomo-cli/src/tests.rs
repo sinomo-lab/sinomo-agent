@@ -11406,9 +11406,10 @@ fn daemon_rollout_timeout_covers_windows_shadow_handoff() {
 fn remote_build_rollout_timeout_does_not_idle_timeout_slow_builds() {
     let timeouts = super::remote_build_rollout_timeouts();
     assert_eq!(timeouts.idle_timeout, None);
-    assert!(
-        timeouts.connect_timeout >= Some(super::remote_build_rollout_connect_timeout()),
-        "remote build connect timeout should preserve the configured connection budget"
+    assert_eq!(
+        timeouts.connect_timeout,
+        Some(sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT),
+        "remote builds should retain the network default connect timeout"
     );
 }
 

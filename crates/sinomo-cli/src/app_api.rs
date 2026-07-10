@@ -3821,7 +3821,7 @@ impl SifsBrowser {
     pub fn open_daemon(address: impl Into<String>) -> Result<Self, String> {
         let backend = RemoteSifsBrowser {
             address: address.into(),
-            timeout: Duration::from_secs(30),
+            timeout: sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
             runtime: None,
         };
         Self::open_remote_backend(backend)
@@ -3833,7 +3833,7 @@ impl SifsBrowser {
     ) -> Result<Self, String> {
         let backend = RemoteSifsBrowser {
             address: address.into(),
-            timeout: Duration::from_secs(30),
+            timeout: sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
             runtime: Some(runtime.clone()),
         };
         Self::open_remote_backend(backend)

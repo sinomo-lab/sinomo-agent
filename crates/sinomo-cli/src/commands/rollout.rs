@@ -2484,11 +2484,10 @@ fn send_daemon_rollout_build_direct(
 }
 
 pub(crate) fn remote_build_rollout_timeouts() -> network::DaemonRpcTimeouts {
-    network::DaemonRpcTimeouts::connect_only(remote_build_rollout_connect_timeout())
-}
-
-pub(crate) fn remote_build_rollout_connect_timeout() -> Duration {
-    Duration::from_secs(15 * 60)
+    // A remote build may legitimately produce no RPC frames while cargo is
+    // running. Keep the ordinary 5-second connect limit, but explicitly opt
+    // this application-level operation out of stream no-progress policing.
+    network::DaemonRpcTimeouts::default().with_idle_timeout(None)
 }
 
 pub(crate) fn local_rollout_wait_timeout() -> Duration {

@@ -5,8 +5,9 @@ use sinomo_core::network::{
     AsyncDaemonControlStream, CLUSTER_TCP_TUNNEL_OPEN_ROUTE, CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
     CLUSTER_TCP_TUNNEL_RPC_CATEGORY, ClusterEndpointSelectionPurpose,
     ClusterRelayStreamSendOutcome, ClusterTcpTunnelFrame, ClusterTcpTunnelOpenRequest,
-    ClusterTcpTunnelOpenResponse, DaemonRpcTimeouts, NetworkError, ObjectFrameIoOptions,
-    ObjectRpcRequest, ObjectRpcResponse, read_object_frame_async, write_object_frame_async,
+    ClusterTcpTunnelOpenResponse, DaemonRpcTimeouts, NetworkDeliveryState, NetworkError,
+    NetworkTimeoutPhase, ObjectFrameIoOptions, ObjectRpcRequest, ObjectRpcResponse,
+    read_object_frame_async, write_object_frame_async,
 };
 use sinomo_core::node::NodeId;
 use sinomo_core::{
@@ -23,7 +24,11 @@ use tokio::sync::{mpsc, oneshot};
 
 const TCP_TUNNEL_CHANNEL_CAPACITY: usize = 128;
 const TCP_TUNNEL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
+// Tunnel setup is an opportunistic fast path. Fail quickly so the route layer
+// can use the ordinary direct endpoint within its five-second network budget.
 const TCP_TUNNEL_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
+// Real endpoints reserve most of their attempt for direct fallback when a
+// cached tunnel is stale; synthetic tunnel-only endpoints do not use this cap.
 const TCP_TUNNEL_REAL_ENDPOINT_RPC_TIMEOUT: Duration = Duration::from_millis(750);
 const TCP_TUNNEL_REAL_ENDPOINT_MIN_DIRECT_FALLBACK_BUDGET: Duration = Duration::from_millis(500);
 const TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX: &str =
@@ -202,7 +207,12 @@ impl TcpTunnelHandle {
                 Ok(result) => result,
                 Err(_) => {
                     self.pending.lock().await.remove(&id);
-                    return Err(tcp_tunnel_timeout_error("send tcp tunnel request", timeout));
+                    return Err(tcp_tunnel_timeout_error(
+                        "send tcp tunnel request",
+                        timeout,
+                        NetworkTimeoutPhase::Write,
+                        NetworkDeliveryState::DefinitelyNotSent,
+                    ));
                 }
             }
         } else {
@@ -210,10 +220,11 @@ impl TcpTunnelHandle {
         };
         if send_result.is_err() {
             self.pending.lock().await.remove(&id);
-            return Err(NetworkError::Io {
-                operation: "send tcp tunnel request".to_string(),
-                detail: "tunnel writer is closed".to_string(),
-            });
+            return Err(NetworkError::delivery_failed(
+                "send tcp tunnel request",
+                NetworkDeliveryState::DefinitelyNotSent,
+                "tunnel writer is closed",
+            ));
         }
         let wait = rx;
         let result = if let Some(timeout) = timeouts.idle_timeout.or(timeouts.connect_timeout) {
@@ -224,6 +235,8 @@ impl TcpTunnelHandle {
                     return Err(tcp_tunnel_timeout_error(
                         "read tcp tunnel response",
                         timeout,
+                        NetworkTimeoutPhase::FirstByte,
+                        NetworkDeliveryState::PossiblyApplied,
                     ));
                 }
             }
@@ -234,10 +247,11 @@ impl TcpTunnelHandle {
             Ok(response) => response,
             Err(_) => {
                 self.pending.lock().await.remove(&id);
-                Err(NetworkError::Io {
-                    operation: "read tcp tunnel response".to_string(),
-                    detail: "tunnel reader is closed".to_string(),
-                })
+                Err(NetworkError::delivery_failed(
+                    "read tcp tunnel response",
+                    NetworkDeliveryState::PossiblyApplied,
+                    "tunnel reader is closed",
+                ))
             }
         }
     }
@@ -266,7 +280,12 @@ impl TcpTunnelHandle {
                 Ok(result) => result,
                 Err(_) => {
                     self.pending.lock().await.remove(&id);
-                    return Err(tcp_tunnel_timeout_error("send tcp tunnel request", timeout));
+                    return Err(tcp_tunnel_timeout_error(
+                        "send tcp tunnel request",
+                        timeout,
+                        NetworkTimeoutPhase::Write,
+                        NetworkDeliveryState::DefinitelyNotSent,
+                    ));
                 }
             }
         } else {
@@ -274,10 +293,11 @@ impl TcpTunnelHandle {
         };
         if send_result.is_err() {
             self.pending.lock().await.remove(&id);
-            return Err(NetworkError::Io {
-                operation: "send tcp tunnel request".to_string(),
-                detail: "tunnel writer is closed".to_string(),
-            });
+            return Err(NetworkError::delivery_failed(
+                "send tcp tunnel request",
+                NetworkDeliveryState::DefinitelyNotSent,
+                "tunnel writer is closed",
+            ));
         }
 
         let frame_options = ObjectFrameIoOptions::none().with_idle_timeout(timeouts.idle_timeout);
@@ -290,7 +310,12 @@ impl TcpTunnelHandle {
                     Ok(event) => event,
                     Err(_) => {
                         self.pending.lock().await.remove(&id);
-                        let error = tcp_tunnel_timeout_error("read tcp tunnel stream", timeout);
+                        let error = tcp_tunnel_timeout_error(
+                            "read tcp tunnel stream",
+                            timeout,
+                            NetworkTimeoutPhase::Idle,
+                            NetworkDeliveryState::PossiblyApplied,
+                        );
                         return if response_started {
                             Ok(ClusterRelayStreamSendOutcome::StreamStartedThenFailed(
                                 error,
@@ -482,7 +507,7 @@ pub(crate) async fn accept_tcp_tunnel_connection_async(
         )
         .map_err(DaemonError::from)?;
         stream
-            .write_response(&stream_address, &response, ObjectFrameIoOptions::none())
+            .write_response(&stream_address, &response, ObjectFrameIoOptions::default())
             .await
             .map_err(DaemonError::from)?;
         return Ok(());
@@ -499,7 +524,7 @@ pub(crate) async fn accept_tcp_tunnel_connection_async(
     .map_err(DaemonError::from)?;
     crate::service_adapter::mark_daemon_rpc_response_responder(&paths, &mut response);
     stream
-        .write_response(&stream_address, &response, ObjectFrameIoOptions::none())
+        .write_response(&stream_address, &response, ObjectFrameIoOptions::default())
         .await
         .map_err(DaemonError::from)?;
     let connectivity_endpoint = tcp_tunnel_connectivity_context(&paths, &peer_node_id);
@@ -543,7 +568,9 @@ pub(crate) async fn send_signed_endpoint_rpc_via_tcp_tunnel(
         if let Some(handle) = TCP_TUNNELS.get(&endpoint.node_id) {
             return match send_over_tcp_tunnel_handle(handle, signed, tunnel_timeouts).await {
                 Ok(response) => Some(Ok(response)),
-                Err(error) => {
+                Err(error)
+                    if error.delivery_state() == Some(NetworkDeliveryState::DefinitelyNotSent) =>
+                {
                     tracing::debug!(
                         "tcp tunnel send to {} ({}) failed on a real endpoint; falling back to direct tcp: {error}",
                         endpoint.node_id,
@@ -551,6 +578,7 @@ pub(crate) async fn send_signed_endpoint_rpc_via_tcp_tunnel(
                     );
                     None
                 }
+                Err(error) => Some(Err(error)),
             };
         }
         match connect_tcp_tunnel_to_endpoint_for_rpc(endpoint, runtime, paths, tunnel_timeouts)
@@ -559,7 +587,10 @@ pub(crate) async fn send_signed_endpoint_rpc_via_tcp_tunnel(
             Ok(handle) => {
                 return match send_over_tcp_tunnel_handle(handle, signed, tunnel_timeouts).await {
                     Ok(response) => Some(Ok(response)),
-                    Err(error) => {
+                    Err(error)
+                        if error.delivery_state()
+                            == Some(NetworkDeliveryState::DefinitelyNotSent) =>
+                    {
                         tracing::debug!(
                             "tcp tunnel send to {} ({}) failed after open on a real endpoint; falling back to direct tcp: {error}",
                             endpoint.node_id,
@@ -567,6 +598,7 @@ pub(crate) async fn send_signed_endpoint_rpc_via_tcp_tunnel(
                         );
                         None
                     }
+                    Err(error) => Some(Err(error)),
                 };
             }
             Err(error) => {
@@ -601,13 +633,14 @@ pub(crate) async fn send_signed_endpoint_rpc_via_tcp_tunnel(
         )
         .await;
     }
-    Some(Err(NetworkError::Io {
-        operation: "send tcp tunnel request".to_string(),
-        detail: format!(
+    Some(Err(NetworkError::delivery_failed(
+        "send tcp tunnel request",
+        NetworkDeliveryState::DefinitelyNotSent,
+        format!(
             "no persistent tcp tunnel to {} ({})",
             endpoint.node_id, endpoint.address
         ),
-    }))
+    )))
 }
 
 fn tcp_tunnel_real_endpoint_rpc_timeouts(timeouts: DaemonRpcTimeouts) -> DaemonRpcTimeouts {
@@ -732,13 +765,14 @@ pub(crate) async fn forward_signed_endpoint_rpc_via_tcp_tunnel(
         )
         .await;
     }
-    Some(Err(NetworkError::Io {
-        operation: "send tcp tunnel stream request".to_string(),
-        detail: format!(
+    Some(Err(NetworkError::delivery_failed(
+        "send tcp tunnel stream request",
+        NetworkDeliveryState::DefinitelyNotSent,
+        format!(
             "no persistent tcp tunnel to {} ({})",
             endpoint.node_id, endpoint.address
         ),
-    }))
+    )))
 }
 
 fn tcp_tunnel_connectivity_context(
@@ -846,9 +880,10 @@ async fn send_over_tcp_tunnel_handle(
     match send_over_tcp_tunnel_handle_once(handle.clone(), request.clone(), timeouts).await {
         Ok(response) => Ok(response),
         Err(error) => {
-            if let Some(current) = TCP_TUNNELS
-                .get(&handle.peer_node_id)
-                .filter(|current| !Arc::ptr_eq(current, &handle))
+            if error.delivery_state() == Some(NetworkDeliveryState::DefinitelyNotSent)
+                && let Some(current) = TCP_TUNNELS
+                    .get(&handle.peer_node_id)
+                    .filter(|current| !Arc::ptr_eq(current, &handle))
             {
                 tracing::debug!(
                     "retrying tcp tunnel request to {} on replacement tunnel after stale handle failed: {error}",
@@ -898,9 +933,10 @@ async fn forward_stream_over_tcp_tunnel_handle(
     {
         Ok(outcome) => Ok(outcome),
         Err(error) => {
-            if let Some(current) = TCP_TUNNELS
-                .get(&handle.peer_node_id)
-                .filter(|current| !Arc::ptr_eq(current, &handle))
+            if error.delivery_state() == Some(NetworkDeliveryState::DefinitelyNotSent)
+                && let Some(current) = TCP_TUNNELS
+                    .get(&handle.peer_node_id)
+                    .filter(|current| !Arc::ptr_eq(current, &handle))
             {
                 tracing::debug!(
                     "retrying tcp tunnel stream request to {} on replacement tunnel after stale handle failed: {error}",
@@ -964,6 +1000,10 @@ fn tcp_tunnel_request_error_should_evict(error: &NetworkError) -> bool {
             }
             _ => true,
         },
+        NetworkError::Timeout {
+            phase: NetworkTimeoutPhase::FirstByte | NetworkTimeoutPhase::Idle,
+            ..
+        } => false,
         _ => true,
     }
 }
@@ -1196,13 +1236,13 @@ async fn connect_tcp_tunnel_to_endpoint_after_lock(
     .await?;
     let request = signed_tcp_tunnel_open_request(runtime, paths).await?;
     stream
-        .write_request(&endpoint.address, &request, ObjectFrameIoOptions::none())
+        .write_request(&endpoint.address, &request, ObjectFrameIoOptions::default())
         .await?;
     let response = stream
         .read_response(
             &endpoint.address,
             sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
-            ObjectFrameIoOptions::none(),
+            ObjectFrameIoOptions::default(),
         )
         .await?;
     response.error_detail()?;
@@ -1335,7 +1375,7 @@ fn spawn_tcp_tunnel(
                 &ClusterTcpTunnelFrame::Close {
                     detail: "duplicate tunnel ignored; existing tunnel is active".to_string(),
                 },
-                ObjectFrameIoOptions::none(),
+                ObjectFrameIoOptions::default(),
             )
             .await;
         });
@@ -1359,7 +1399,7 @@ async fn tcp_tunnel_writer_loop(
 ) {
     while let Some(frame) = rx.recv().await {
         let close = matches!(frame, ClusterTcpTunnelFrame::Close { .. });
-        if write_object_frame_async(&mut write_half, &frame, ObjectFrameIoOptions::none())
+        if write_object_frame_async(&mut write_half, &frame, ObjectFrameIoOptions::default())
             .await
             .is_err()
         {
@@ -1383,6 +1423,9 @@ async fn tcp_tunnel_reader_loop(
 ) {
     let mut mark_unreachable_on_exit = false;
     loop {
+        // This reader waits between independent multiplexed requests, so an
+        // idle connection is healthy. Each active request carries its own
+        // 5-second connect/no-progress policy and operation deadline.
         let frame = read_object_frame_async::<_, ClusterTcpTunnelFrame>(
             &mut read_half,
             sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
@@ -1680,11 +1723,13 @@ fn daemon_paths_from_env() -> Option<DaemonPaths> {
     Some(DaemonPaths::new(&data_dir))
 }
 
-fn tcp_tunnel_timeout_error(operation: &str, timeout: Duration) -> NetworkError {
-    NetworkError::Io {
-        operation: operation.to_string(),
-        detail: format!("timed out after {}ms", timeout.as_millis()),
-    }
+fn tcp_tunnel_timeout_error(
+    operation: &str,
+    timeout: Duration,
+    phase: NetworkTimeoutPhase,
+    delivery_state: NetworkDeliveryState,
+) -> NetworkError {
+    NetworkError::timeout(operation, phase, timeout, delivery_state)
 }
 
 #[cfg(test)]
@@ -1779,8 +1824,13 @@ mod tests {
         .await;
 
         match result {
-            Some(Err(NetworkError::Io { operation, detail })) => {
+            Some(Err(NetworkError::DeliveryFailed {
+                operation,
+                delivery_state,
+                detail,
+            })) => {
                 assert_eq!(operation, "send tcp tunnel request");
+                assert_eq!(delivery_state, NetworkDeliveryState::DefinitelyNotSent);
                 assert!(detail.contains("no persistent tcp tunnel"));
             }
             other => panic!("expected synthetic tunnel endpoint error, got {other:?}"),
@@ -1870,7 +1920,11 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(NetworkError::Io { operation, .. }) if operation == "send tcp tunnel request"
+            Err(NetworkError::Timeout {
+                phase: NetworkTimeoutPhase::Write,
+                delivery_state: NetworkDeliveryState::DefinitelyNotSent,
+                ..
+            })
         ));
         assert!(handle.pending.lock().await.is_empty());
     }
@@ -1889,7 +1943,11 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(NetworkError::Io { operation, .. }) if operation == "read tcp tunnel response"
+            Err(NetworkError::Timeout {
+                phase: NetworkTimeoutPhase::FirstByte,
+                delivery_state: NetworkDeliveryState::PossiblyApplied,
+                ..
+            })
         ));
         assert!(handle.pending.lock().await.is_empty());
     }
@@ -1933,7 +1991,11 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(NetworkError::Io { operation, .. }) if operation == "read tcp tunnel response"
+            Err(NetworkError::Timeout {
+                phase: NetworkTimeoutPhase::FirstByte,
+                delivery_state: NetworkDeliveryState::PossiblyApplied,
+                ..
+            })
         ));
         assert!(Arc::ptr_eq(
             &TCP_TUNNELS.get(&node_id).expect("tunnel retained"),
@@ -2145,8 +2207,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_tunnel_real_lan_endpoint_falls_back_when_existing_tunnel_times_out() {
-        let (tx, _rx) = mpsc::channel(1);
+    async fn tcp_tunnel_real_lan_endpoint_returns_signed_ambiguous_retry_to_route_layer() {
+        let (tx, mut rx) = mpsc::channel(1);
         let node_name = "tcp_tunnel_real_lan_existing_timeout_fallback";
         let node_id = NodeId::from_legacy_named(node_name).expect("test node id");
         let handle = test_tunnel_handle(node_name, tx);
@@ -2168,13 +2230,41 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_none());
+        assert!(matches!(
+            result,
+            Some(Err(NetworkError::Timeout {
+                delivery_state: NetworkDeliveryState::PossiblyApplied,
+                ..
+            }))
+        ));
         assert!(Arc::ptr_eq(
             &TCP_TUNNELS.get(&node_id).expect("tunnel retained"),
             &handle
         ));
         assert!(handle.pending.lock().await.is_empty());
         assert!(!handle.clean_shutdown.load(Ordering::Relaxed));
+        let _ = rx.recv().await.expect("first ambiguous tunnel request");
+
+        let retry_safe_result = send_signed_endpoint_rpc_via_tcp_tunnel(
+            &endpoint,
+            b"auth",
+            &test_rpc_request().with_response_retry_safe(),
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(1)),
+            &tokio::runtime::Handle::current(),
+            None,
+        )
+        .await;
+        assert!(matches!(
+            retry_safe_result,
+            Some(Err(NetworkError::Timeout {
+                delivery_state: NetworkDeliveryState::PossiblyApplied,
+                ..
+            }))
+        ));
+        let _ = rx
+            .recv()
+            .await
+            .expect("retry-safe ambiguous tunnel request");
 
         TCP_TUNNELS.remove(&node_id);
     }

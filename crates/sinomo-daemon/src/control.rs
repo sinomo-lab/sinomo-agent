@@ -1802,7 +1802,7 @@ async fn read_daemon_control_frame_async(
         .read_request(
             address,
             DAEMON_COMMAND_MAX_BYTES,
-            sinomo_core::network::ObjectFrameIoOptions::none(),
+            sinomo_core::network::ObjectFrameIoOptions::default(),
         )
         .await
         .map_err(DaemonError::from)
@@ -1817,7 +1817,7 @@ async fn write_daemon_rpc_response_frame_async(
         .write_response(
             address,
             &response,
-            sinomo_core::network::ObjectFrameIoOptions::none(),
+            sinomo_core::network::ObjectFrameIoOptions::default(),
         )
         .await
         .map_err(DaemonError::from)
