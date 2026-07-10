@@ -15,6 +15,8 @@ use time::format_description::well_known::Rfc3339;
 
 pub const DAEMON_AUTH_PROTOCOL: &str = "sinomo.daemon-auth.v1";
 
+const DAEMON_RPC_REQUEST_DIGEST_DOMAIN: &[u8] = b"sinomo.daemon-rpc-request\0";
+
 static DAEMON_SIGNING_IDENTITIES: OnceLock<Mutex<HashMap<PathBuf, CachedDaemonSigningIdentity>>> =
     OnceLock::new();
 static DAEMON_AUTH_NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -99,10 +101,31 @@ pub fn sign_daemon_rpc_request_digest_from_data_dir(
     )
 }
 
+/// Digests the RPC body and its sender-controlled metadata for daemon authentication.
+///
+/// The historical name remains part of the public API, but the digest deliberately
+/// binds the complete request metadata map so routing retries cannot alter delivery
+/// identity or retry-safety declarations after signing.
 pub fn daemon_rpc_body_sha256(request: &ObjectRpcRequest) -> Vec<u8> {
-    digest::digest(&digest::SHA256, &request.body)
-        .as_ref()
-        .to_vec()
+    let mut digest = digest::Context::new(&digest::SHA256);
+    digest.update(DAEMON_RPC_REQUEST_DIGEST_DOMAIN);
+    daemon_rpc_digest_update_bytes(&mut digest, &request.body);
+    daemon_rpc_digest_update_len(&mut digest, request.metadata.len());
+    for (key, value) in &request.metadata {
+        daemon_rpc_digest_update_bytes(&mut digest, key.as_bytes());
+        daemon_rpc_digest_update_bytes(&mut digest, value.as_bytes());
+    }
+    digest.finish().as_ref().to_vec()
+}
+
+fn daemon_rpc_digest_update_bytes(digest: &mut digest::Context, bytes: &[u8]) {
+    daemon_rpc_digest_update_len(digest, bytes.len());
+    digest.update(bytes);
+}
+
+fn daemon_rpc_digest_update_len(digest: &mut digest::Context, len: usize) {
+    let len = u64::try_from(len).expect("daemon RPC auth input length must fit in u64");
+    digest.update(&len.to_be_bytes());
 }
 
 fn sign_daemon_rpc_request_from_data_dir_with_body_sha256(
@@ -287,6 +310,99 @@ mod tests {
                 assert!(seen.insert(value), "duplicate daemon auth nonce suffix");
             }
         }
+    }
+
+    #[test]
+    fn daemon_rpc_request_digest_binds_all_sender_metadata() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-daemon-auth-metadata-binding");
+        let data_dir = SinomoDataDir::new(root.path());
+        let request = ObjectRpcRequest::from_encoded_body(
+            "/test/daemon-auth",
+            "test",
+            b"request-body".to_vec(),
+        )
+        .with_operation_id("operation-1")
+        .with_response_retry_safe()
+        .with_metadata("sinomo-test-metadata", "value-1");
+        let auth = sign_daemon_rpc_request_from_data_dir(&data_dir, &request)
+            .expect("sign metadata-bearing request");
+        let envelope: SignedDaemonCommand = SinomoObjectCodec::default()
+            .decode(&auth)
+            .expect("decode signed request");
+        let signed_digest = envelope
+            .rpc_body_sha256
+            .expect("signed request must carry its digest");
+        assert_eq!(signed_digest, daemon_rpc_body_sha256(&request));
+
+        let mut changed_operation_id = request.clone();
+        changed_operation_id.metadata.insert(
+            crate::rpc::OBJECT_RPC_OPERATION_ID_METADATA_KEY.to_string(),
+            "operation-2".to_string(),
+        );
+        assert_ne!(
+            signed_digest,
+            daemon_rpc_body_sha256(&changed_operation_id),
+            "changing the operation ID must invalidate the request digest"
+        );
+
+        let mut changed_retry_safety = request.clone();
+        changed_retry_safety.metadata.insert(
+            crate::rpc::OBJECT_RPC_RESPONSE_RETRY_SAFE_METADATA_KEY.to_string(),
+            "false".to_string(),
+        );
+        assert_ne!(
+            signed_digest,
+            daemon_rpc_body_sha256(&changed_retry_safety),
+            "changing retry safety must invalidate the request digest"
+        );
+
+        let mut changed_other_metadata = request;
+        changed_other_metadata
+            .metadata
+            .insert("sinomo-test-metadata".to_string(), "value-2".to_string());
+        assert_ne!(
+            signed_digest,
+            daemon_rpc_body_sha256(&changed_other_metadata),
+            "changing any sender metadata must invalidate the request digest"
+        );
+    }
+
+    #[test]
+    fn daemon_rpc_request_digest_is_independent_of_metadata_insertion_order() {
+        let request_a =
+            ObjectRpcRequest::from_encoded_body("/test/daemon-auth", "test", vec![1, 2, 3])
+                .with_metadata("alpha", "one")
+                .with_metadata("beta", "two");
+        let request_b =
+            ObjectRpcRequest::from_encoded_body("/test/daemon-auth", "test", vec![1, 2, 3])
+                .with_metadata("beta", "two")
+                .with_metadata("alpha", "one");
+
+        assert_eq!(
+            daemon_rpc_body_sha256(&request_a),
+            daemon_rpc_body_sha256(&request_b)
+        );
+    }
+
+    #[test]
+    fn daemon_rpc_request_digest_length_prefixes_metadata_fields() {
+        let request_a = ObjectRpcRequest::from_encoded_body(
+            "/test/daemon-auth",
+            "test",
+            b"request-body".to_vec(),
+        )
+        .with_metadata("a", "bc");
+        let request_b = ObjectRpcRequest::from_encoded_body(
+            "/test/daemon-auth",
+            "test",
+            b"request-body".to_vec(),
+        )
+        .with_metadata("ab", "c");
+
+        assert_ne!(
+            daemon_rpc_body_sha256(&request_a),
+            daemon_rpc_body_sha256(&request_b)
+        );
     }
 
     #[test]

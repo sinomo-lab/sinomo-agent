@@ -590,10 +590,16 @@ pub struct InboundObjectRpcMessage {
 #[cfg(any(test, feature = "test-support"))]
 pub type AsyncNetworkTransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AsyncNetworkSendOptions {
     timeout: Option<Duration>,
     nonblocking: bool,
+}
+
+impl Default for AsyncNetworkSendOptions {
+    fn default() -> Self {
+        Self::timeout(crate::DEFAULT_NETWORK_TIMEOUT)
+    }
 }
 
 impl AsyncNetworkSendOptions {
@@ -624,6 +630,29 @@ impl AsyncNetworkSendOptions {
 
     pub const fn is_nonblocking(self) -> bool {
         self.nonblocking
+    }
+}
+
+#[cfg(test)]
+mod async_network_send_options_tests {
+    use super::*;
+
+    #[test]
+    fn default_send_is_bounded_and_unbounded_modes_are_explicit() {
+        let bounded = AsyncNetworkSendOptions::default();
+        assert_eq!(
+            bounded.timeout_duration(),
+            Some(crate::DEFAULT_NETWORK_TIMEOUT)
+        );
+        assert!(!bounded.is_nonblocking());
+
+        let unbounded = AsyncNetworkSendOptions::from_timeout(None);
+        assert_eq!(unbounded.timeout_duration(), None);
+        assert!(!unbounded.is_nonblocking());
+
+        let nonblocking = AsyncNetworkSendOptions::nonblocking();
+        assert_eq!(nonblocking.timeout_duration(), None);
+        assert!(nonblocking.is_nonblocking());
     }
 }
 

@@ -230,11 +230,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let page = self.child_objects_for_sifs_dir_page(path, after, max_entries)?;
         for object in page.objects {
             let object_path = normalize_posix_path(&object.path)?;
-            let listed_object_id = object.object_id.clone();
-            let Some(object) = self.lookup_sifs_path(&object_path)? else {
-                continue;
-            };
-            if object.kind == DfsObjectKind::Tombstone || object.object_id != listed_object_id {
+            if object.kind == DfsObjectKind::Tombstone {
                 continue;
             }
             let target = self.resolve_hardlink_target(&object)?;

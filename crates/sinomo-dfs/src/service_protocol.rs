@@ -299,7 +299,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .filter_map(|(request_id, pending)| {
                 let prune_after = pending
                     .next_retry_at
-                    .checked_add(DFS_CHUNK_TRANSFER_IDLE_TIMEOUT)
+                    .checked_add(DFS_CHUNK_TRANSFER_STALE_AFTER)
                     .unwrap_or(pending.next_retry_at);
                 (prune_after <= now).then_some(request_id.clone())
             })

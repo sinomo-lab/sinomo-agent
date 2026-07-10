@@ -148,7 +148,7 @@ impl DaemonServiceRegistryHook {
     }
 }
 
-pub use api::{DAEMON_API_DEFAULT_TIMEOUT, DAEMON_API_PROBE_TIMEOUT, DaemonApiClient};
+pub use api::{DAEMON_API_PROBE_TIMEOUT, DaemonApiClient};
 pub use auth::{
     AuthenticatedDaemonCommand, DaemonSignerAuthority, SignedDaemonCommand,
     authenticate_daemon_control_request, authorize_authenticated_daemon_command,
@@ -162,8 +162,8 @@ pub(crate) use client::{
     fetch_cluster_kv_snapshot_from_endpoint_on_runtime,
     fetch_daemon_status_from_endpoint_on_runtime, send_cluster_member_publish_async,
     send_cluster_raft_append_on_runtime, send_cluster_raft_vote_on_runtime,
-    send_object_rpc_to_target_async_with_daemon_paths,
-    send_object_rpc_to_target_on_runtime_with_daemon_paths,
+    send_object_rpc_to_target_async_with_daemon_paths_and_options,
+    send_object_rpc_to_target_on_runtime_with_daemon_paths_and_options,
 };
 pub use client::{
     RemoteConfigClient, fetch_daemon_status_from_address, fetch_daemon_status_from_endpoint,
@@ -183,7 +183,8 @@ pub use client::{
     send_daemon_rpc_with_timeouts, send_daemon_shutdown_request,
     send_dfs_metadata_journal_batch_to_endpoint_async,
     send_dfs_metadata_snapshot_install_to_endpoint_async, send_object_rpc_to_target,
-    send_object_rpc_to_target_async, send_object_rpc_to_target_with_timeouts,
+    send_object_rpc_to_target_async, send_object_rpc_to_target_async_with_options,
+    send_object_rpc_to_target_with_options, send_object_rpc_to_target_with_timeouts,
 };
 pub use cluster::commit_cluster_kv_txn_with_quorum;
 pub use control::{

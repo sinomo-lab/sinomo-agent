@@ -164,11 +164,17 @@ async fn forward_object_rpc_from_daemon_control(
     payload: crate::DaemonObjectRpcForwardRequest,
     runtime: &tokio::runtime::Handle,
 ) -> Result<ObjectRpcResponse, ServiceError> {
-    crate::client::send_object_rpc_to_target_async_with_daemon_paths(
+    let transport_timeouts = sinomo_core::network::DaemonRpcTimeouts::default()
+        .with_connect_timeout(Some(Duration::from_millis(payload.connect_timeout_millis)));
+    let mut options = sinomo_core::network::ClusterObjectRpcOptions::new(transport_timeouts);
+    if let Some(overall_timeout_millis) = payload.overall_timeout_millis {
+        options = options.with_overall_timeout(Duration::from_millis(overall_timeout_millis));
+    }
+    crate::client::send_object_rpc_to_target_async_with_daemon_paths_and_options(
         paths,
         &payload.target_node_id,
         &payload.request,
-        Duration::from_millis(payload.connect_timeout_millis),
+        options,
         runtime,
         payload.observe_connectivity,
     )
@@ -4530,7 +4536,7 @@ async fn dispatch_stream_via_registry_async(
         .write_rpc_response(
             stream_address,
             &stream_response.response,
-            sinomo_core::network::ObjectFrameIoOptions::none(),
+            sinomo_core::network::ObjectFrameIoOptions::default(),
         )
         .await
         .map_err(DaemonError::from)?;
@@ -4610,7 +4616,7 @@ async fn write_object_rpc_stream_chunks(
                 .write_raw_byte_stream_chunk(
                     stream_address,
                     &chunk.buffer[..chunk.read],
-                    sinomo_core::network::ObjectFrameIoOptions::none(),
+                    sinomo_core::network::ObjectFrameIoOptions::default(),
                 )
                 .await
                 .map_err(DaemonError::from)?;
@@ -4841,7 +4847,7 @@ async fn write_async_daemon_rpc_response_frame(
         .write_response(
             stream_address,
             &response,
-            sinomo_core::network::ObjectFrameIoOptions::none(),
+            sinomo_core::network::ObjectFrameIoOptions::default(),
         )
         .await
         .map_err(DaemonError::from)

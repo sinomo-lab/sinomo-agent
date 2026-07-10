@@ -73,6 +73,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
         self.metadata = DfsMetadataStore::new();
         self.tombstones_by_metadata_path.clear();
+        self.transient_metadata_object_ids.clear();
         self.coordinator = DistributedEventualCoordinator::new();
         self.pending_writes.clear();
         self.pending_reads.clear();
@@ -747,6 +748,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         mut object: DfsObjectMetadata,
     ) -> Result<(), DfsError> {
         normalize_current_locations(&mut object.current_locations);
+        self.transient_metadata_object_ids.remove(&object.object_id);
         if !self
             .metadata
             .filesystems

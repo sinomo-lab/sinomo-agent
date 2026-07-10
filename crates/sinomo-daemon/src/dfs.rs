@@ -1,7 +1,8 @@
 use crate::control::DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL;
 use crate::{
-    DaemonError, DaemonPaths, DaemonRunOptions, send_object_rpc_to_target_async_with_daemon_paths,
-    send_object_rpc_to_target_on_runtime_with_daemon_paths,
+    DaemonError, DaemonPaths, DaemonRunOptions,
+    send_object_rpc_to_target_async_with_daemon_paths_and_options,
+    send_object_rpc_to_target_on_runtime_with_daemon_paths_and_options,
 };
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
@@ -413,7 +414,7 @@ pub(crate) fn daemon_dfs_node_transport(
     DfsNodeTransport::with_peer_transports_for_nodes(
         local_node_id,
         peer_node_ids,
-        sinomo_dfs::DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
         sync_peer_transport,
         async_peer_transport,
     )
@@ -430,7 +431,7 @@ pub(crate) fn daemon_dfs_node_transport_on_runtime(
     DfsNodeTransport::with_peer_transports_for_nodes(
         local_node_id,
         peer_node_ids,
-        sinomo_dfs::DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
         peer_transport,
         async_peer_transport,
     )
@@ -489,11 +490,11 @@ impl DfsPeerTransport for DaemonDfsBlockingPeerTransport {
         request: &sinomo_core::network::ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> Result<sinomo_core::network::ObjectRpcResponse, DfsPeerTransportError> {
-        send_object_rpc_to_target_on_runtime_with_daemon_paths(
+        send_object_rpc_to_target_on_runtime_with_daemon_paths_and_options(
             &self.paths,
             target_node_id,
             request,
-            options.connect_timeout,
+            options.cluster_rpc_options(),
             &self.runtime,
             options.observe_connectivity,
         )
@@ -514,11 +515,11 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsAsyncPeerTransport {
         let runtime = self.runtime.clone();
         let paths = self.paths.clone();
         Box::pin(async move {
-            send_object_rpc_to_target_async_with_daemon_paths(
+            send_object_rpc_to_target_async_with_daemon_paths_and_options(
                 &paths,
                 target_node_id,
                 request,
-                options.connect_timeout,
+                options.cluster_rpc_options(),
                 &runtime,
                 options.observe_connectivity,
             )
@@ -742,7 +743,7 @@ fn open_daemon_dfs_message_service_lane(
         local_node_id.clone(),
         peer_node_ids,
         daemon_dfs_blocking_peer_transport_on_runtime(data_dir, runtime),
-        sinomo_dfs::DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
     );
     let service = NetworkedDfsService::new(transport, content);
     // Message lanes hydrate only the filesystem catalog and durable mutation

@@ -44,3 +44,4 @@ sinomo-storage = { path = "../sinomo-storage" }
 [dev-dependencies]
 sinomo-kv = { path = "../sinomo-kv", features = ["test-support"] }
 sinomo-testdir = { path = "../sinomo-testdir" }
+tokio = { workspace = true, features = ["test-util"] }

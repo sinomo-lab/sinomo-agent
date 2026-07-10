@@ -18,7 +18,7 @@ use crate::{
     AsyncDfsMetadataNodeTransport, AsyncDfsPeerTransport, ContentStoreGcOptions,
     ContentStoreGcReport, ContentStoreScrubReport, ContentStoreStagingGcOptions,
     ContentStoreStagingGcReport, ContentStoreVersionGcOptions, ContentStoreVersionGcReport,
-    DFS_CHUNK_TRANSFER_IDLE_TIMEOUT, DfsControlPlaneKvClient, DfsError, DfsFileSystemId,
+    DFS_CHUNK_TRANSFER_STALE_AFTER, DfsControlPlaneKvClient, DfsError, DfsFileSystemId,
     DfsMessageSender, DfsMessageTransport, DfsMetadataBackend, DfsMetadataJournalBatchSender,
     DfsMetadataJournalPublisherHost, DfsMetadataJournalReplicationOptions,
     DfsMetadataJournalReplicationReport, DfsMetadataJournalReplicationTransport,
@@ -786,7 +786,7 @@ impl Default for DfsMaintenanceRunOptions {
             anti_entropy_max_issues: DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_ISSUES,
             repair_metadata: true,
             cleanup_stale_staging: true,
-            stale_staging_min_age: DFS_CHUNK_TRANSFER_IDLE_TIMEOUT,
+            stale_staging_min_age: DFS_CHUNK_TRANSFER_STALE_AFTER,
         }
     }
 }

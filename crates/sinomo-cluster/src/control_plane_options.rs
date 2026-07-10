@@ -5,6 +5,7 @@ use crate::kv_snapshot::ClusterKvSnapshotRefreshOptions;
 use crate::state_authority_reachability::ClusterStateAuthorityReachabilityOptions;
 use sinomo_base::{ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterTransportKind};
 use sinomo_kv::{ClusterKvRaftLeaderElectionOptions, ClusterRaftAppendRequest};
+use sinomo_network::DEFAULT_NETWORK_TIMEOUT;
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,16 +127,18 @@ impl ClusterKvTxnQuorumOptions {
 }
 
 pub const DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_MAX_ATTEMPTS: usize = 32;
-pub const DEFAULT_CLUSTER_CONTROL_PLANE_RPC_TIMEOUT: Duration = Duration::from_millis(750);
+/// End-to-end budget for selecting and reaching a membership authority.
 pub const DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT: Duration = Duration::from_secs(15);
-pub const DEFAULT_CLUSTER_CONTROL_PLANE_TCP_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
-pub const DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+// Foreground attempts deliberately use shorter topology-specific caps so one
+// degraded endpoint cannot consume the operation deadline before alternatives
+// are tried. These are route-fallback budgets, not transport idle defaults.
 pub const DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT: Duration =
     Duration::from_secs(1);
 pub const DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT: Duration =
     Duration::from_secs(4);
 pub const DEFAULT_CLUSTER_CONTROL_PLANE_IROH_FOREGROUND_ATTEMPT_TIMEOUT: Duration =
     Duration::from_millis(1500);
+/// End-to-end quorum/replication budget, shared by all endpoint attempts.
 pub const DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_CAMPAIGN_JITTER_MAX: Duration =
     Duration::from_millis(750);
@@ -159,11 +162,11 @@ impl ClusterControlPlaneTimeouts {
         Self {
             max_raft_append_attempts: DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_MAX_ATTEMPTS,
             raft_append_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT,
-            rpc_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_RPC_TIMEOUT,
+            rpc_timeout: DEFAULT_NETWORK_TIMEOUT,
             membership_rpc_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
             raft_campaign_jitter_max: DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_CAMPAIGN_JITTER_MAX,
-            tcp_command_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_TCP_COMMAND_TIMEOUT,
-            iroh_command_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT,
+            tcp_command_timeout: DEFAULT_NETWORK_TIMEOUT,
+            iroh_command_timeout: DEFAULT_NETWORK_TIMEOUT,
             tcp_foreground_attempt_timeout:
                 DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
             public_foreground_attempt_timeout:
@@ -261,5 +264,30 @@ impl ClusterControlPlaneTimeouts {
             public_foreground_attempt_timeout: self.public_foreground_attempt_timeout,
             iroh_foreground_attempt_timeout: self.iroh_foreground_attempt_timeout,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_control_plane_uses_network_timeout_for_rpc_phases() {
+        let timeouts = ClusterControlPlaneTimeouts::default_daemon_transport();
+
+        assert_eq!(timeouts.rpc_timeout, DEFAULT_NETWORK_TIMEOUT);
+        assert_eq!(timeouts.tcp_command_timeout, DEFAULT_NETWORK_TIMEOUT);
+        assert_eq!(timeouts.iroh_command_timeout, DEFAULT_NETWORK_TIMEOUT);
+        assert!(timeouts.membership_rpc_timeout > DEFAULT_NETWORK_TIMEOUT);
+        assert!(timeouts.raft_append_timeout > DEFAULT_NETWORK_TIMEOUT);
+    }
+
+    #[test]
+    fn foreground_attempt_caps_remain_shorter_for_route_fallback() {
+        let timeouts = ClusterControlPlaneTimeouts::default_daemon_transport();
+
+        assert!(timeouts.tcp_foreground_attempt_timeout < DEFAULT_NETWORK_TIMEOUT);
+        assert!(timeouts.public_foreground_attempt_timeout < DEFAULT_NETWORK_TIMEOUT);
+        assert!(timeouts.iroh_foreground_attempt_timeout < DEFAULT_NETWORK_TIMEOUT);
     }
 }

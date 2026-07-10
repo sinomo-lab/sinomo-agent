@@ -4,9 +4,10 @@
 //!
 //! The module-ABI dial works on whole frames: the caller supplies the encoded
 //! request frame and receives the raw response frame bytes. Retry semantics
-//! match the former in-crate client: connection-establishment failures always
-//! retry (bounded), post-accept failures retry only for retry-safe requests
-//! whose response read failed on a peer close.
+//! match the canonical route client: connection-establishment failures retry
+//! within one aggregate connect deadline. Once any request bytes may have been
+//! accepted, the attempt returns to the route layer so a retry can be freshly
+//! signed instead of reusing a consumed daemon-auth nonce.
 
 use crate::frames::{IrohProxyByteBudget, read_proxy_frame_async, write_all_frame_async};
 use crate::proxy::{IROH_ROAMING_PROTOCOL, sinomo_iroh_endpoint_builder};
@@ -15,7 +16,7 @@ use crate::{
     endpoint::{IrohEndpointRecord, iroh_endpoint_record_from_address},
 };
 use sinomo_core::network::{
-    CLUSTER_HEALTH_ROUTE, DaemonControlRequest, DaemonRpcTimeouts, NetworkError,
+    DaemonRpcTimeouts, NetworkDeliveryState, NetworkError, NetworkTimeoutPhase,
     OBJECT_STREAM_MAX_CHUNK_BYTES, ObjectRpcResponse, ObjectRpcResponseStreamMode,
     RawByteStreamChunkOptions, decode_single_object_frame_from_slice, encode_object_frame_to_vec,
     object_rpc_response_stream_mode, read_raw_byte_stream_chunks_to_vec_async,
@@ -44,6 +45,34 @@ struct CachedIrohConnection {
     connection: iroh::endpoint::Connection,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct IrohConnectDeadline {
+    expires_at: Option<tokio::time::Instant>,
+    timeout: Option<Duration>,
+}
+
+impl IrohConnectDeadline {
+    fn new(timeout: Option<Duration>) -> Self {
+        Self {
+            expires_at: timeout.map(|timeout| tokio::time::Instant::now() + timeout),
+            timeout,
+        }
+    }
+
+    fn remaining(&self) -> Result<Option<Duration>, NetworkError> {
+        let Some(expires_at) = self.expires_at else {
+            return Ok(None);
+        };
+        let remaining = expires_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(iroh_daemon_command_timeout_error(
+                self.timeout.unwrap_or_default(),
+            ));
+        }
+        Ok(Some(remaining))
+    }
+}
+
 impl IrohDaemonDialer {
     pub fn new() -> Self {
         Self::default()
@@ -63,11 +92,7 @@ impl IrohDaemonDialer {
         )?;
         let remote_addr = iroh_endpoint_addr_from_record(&record)?;
         let cache_key = iroh_daemon_connection_cache_key(&record);
-        // Retry-safety needs the typed route; an undecodable frame is treated as
-        // not retry-safe after the request may have been accepted.
-        let request: Option<DaemonControlRequest> =
-            decode_single_object_frame_from_slice(request_frame, IROH_DAEMON_COMMAND_MAX_BYTES)
-                .ok();
+        let connect_deadline = IrohConnectDeadline::new(timeouts.connect_timeout);
         let mut attempt = 0_usize;
         loop {
             attempt += 1;
@@ -78,19 +103,19 @@ impl IrohDaemonDialer {
                 remote_addr.clone(),
                 request_frame,
                 timeouts,
+                connect_deadline,
             )
             .await
             {
                 Ok(response) => return Ok(response),
                 Err(error) => {
-                    let retry =
-                        iroh_daemon_control_attempt_should_retry(request.as_ref(), &error, attempt);
+                    let retry = iroh_daemon_control_attempt_should_retry(&error, attempt);
                     let error = error.into_network_error();
                     if !retry {
                         return Err(error);
                     }
-                    let Some(delay) =
-                        iroh_daemon_rpc_retry_delay_with_budget(attempt, timeouts.connect_timeout)
+                    let remaining = connect_deadline.remaining()?;
+                    let Some(delay) = iroh_daemon_rpc_retry_delay_with_budget(attempt, remaining)
                     else {
                         return Err(error);
                     };
@@ -113,8 +138,11 @@ impl IrohDaemonDialer {
         }
     }
 
-    async fn endpoint(&self, timeouts: DaemonRpcTimeouts) -> Result<iroh::Endpoint, NetworkError> {
-        let mut guard = self.endpoint.lock().await;
+    async fn endpoint(
+        &self,
+        deadline: IrohConnectDeadline,
+    ) -> Result<iroh::Endpoint, NetworkError> {
+        let mut guard = iroh_mutex_lock_before_connect_deadline(&self.endpoint, deadline).await?;
         if let Some(endpoint) = guard.as_ref()
             && !endpoint.is_closed()
         {
@@ -127,7 +155,7 @@ impl IrohDaemonDialer {
                 .await
                 .map_err(|source| source.to_string())
         };
-        let endpoint = if let Some(connect_timeout) = timeouts.connect_timeout {
+        let endpoint = if let Some(connect_timeout) = deadline.remaining()? {
             match tokio::time::timeout(connect_timeout, bind).await {
                 Ok(Ok(endpoint)) => endpoint,
                 Ok(Err(source)) => {
@@ -149,7 +177,7 @@ impl IrohDaemonDialer {
                 }
             }
         };
-        if let Some(connect_timeout) = timeouts.connect_timeout {
+        if let Some(connect_timeout) = deadline.remaining()? {
             let online_timeout = connect_timeout.min(Duration::from_millis(1000));
             let _ = tokio::time::timeout(online_timeout, endpoint.online()).await;
         }
@@ -162,16 +190,19 @@ impl IrohDaemonDialer {
         cache_key: &str,
         _address: &str,
         remote_addr: iroh::EndpointAddr,
-        timeouts: DaemonRpcTimeouts,
+        deadline: IrohConnectDeadline,
     ) -> Result<iroh::endpoint::Connection, NetworkError> {
-        let mut connections = self.connections.lock().await;
-        if let Some(cached) = connections.get(cache_key) {
-            return Ok(cached.connection.clone());
+        {
+            let connections =
+                iroh_mutex_lock_before_connect_deadline(&self.connections, deadline).await?;
+            if let Some(cached) = connections.get(cache_key) {
+                return Ok(cached.connection.clone());
+            }
         }
 
-        let endpoint = self.endpoint(timeouts).await?;
+        let endpoint = self.endpoint(deadline).await?;
         let connect = endpoint.connect(remote_addr, IROH_ROAMING_PROTOCOL.as_bytes());
-        let connection = if let Some(connect_timeout) = timeouts.connect_timeout {
+        let connection = if let Some(connect_timeout) = deadline.remaining()? {
             match tokio::time::timeout(connect_timeout, connect).await {
                 Ok(Ok(connection)) => connection,
                 Ok(Err(source)) => {
@@ -193,6 +224,13 @@ impl IrohDaemonDialer {
                 }
             }
         };
+        let mut connections =
+            iroh_mutex_lock_before_connect_deadline(&self.connections, deadline).await?;
+        if let Some(cached) = connections.get(cache_key) {
+            // Another request connected while this one was in flight. Reuse
+            // the installed connection and let the duplicate close on drop.
+            return Ok(cached.connection.clone());
+        }
         connections.insert(
             cache_key.to_string(),
             CachedIrohConnection {
@@ -207,6 +245,21 @@ impl IrohDaemonDialer {
         if let Some(cached) = removed {
             cached.connection.close(0_u8.into(), reason);
         }
+    }
+}
+
+async fn iroh_mutex_lock_before_connect_deadline<'a, T>(
+    mutex: &'a tokio::sync::Mutex<T>,
+    deadline: IrohConnectDeadline,
+) -> Result<tokio::sync::MutexGuard<'a, T>, NetworkError> {
+    let Some(expires_at) = deadline.expires_at else {
+        return Ok(mutex.lock().await);
+    };
+    match tokio::time::timeout_at(expires_at, mutex.lock()).await {
+        Ok(guard) => Ok(guard),
+        Err(_) => Err(iroh_daemon_command_timeout_error(
+            deadline.timeout.unwrap_or_default(),
+        )),
     }
 }
 
@@ -233,14 +286,18 @@ async fn dial_iroh_daemon_control_frame_attempt_async(
     remote_addr: iroh::EndpointAddr,
     request_frame: &[u8],
     timeouts: DaemonRpcTimeouts,
+    connect_deadline: IrohConnectDeadline,
 ) -> Result<Vec<u8>, IrohDaemonControlAttemptError> {
     let connection = dialer
-        .connection(cache_key, address, remote_addr, timeouts)
+        .connection(cache_key, address, remote_addr, connect_deadline)
         .await
         .map_err(IrohDaemonControlAttemptError::BeforeRequestAccepted)?;
 
     let open = connection.open_bi();
-    let (mut send, mut recv) = if let Some(connect_timeout) = timeouts.connect_timeout {
+    let (mut send, mut recv) = if let Some(connect_timeout) = connect_deadline
+        .remaining()
+        .map_err(IrohDaemonControlAttemptError::BeforeRequestAccepted)?
+    {
         match tokio::time::timeout(connect_timeout, open).await {
             Ok(Ok(streams)) => streams,
             Ok(Err(source)) => {
@@ -386,52 +443,42 @@ enum IrohDaemonControlAttemptError {
 impl IrohDaemonControlAttemptError {
     fn into_network_error(self) -> NetworkError {
         match self {
-            Self::BeforeRequestAccepted(error) | Self::AfterRequestAccepted(error) => error,
+            Self::BeforeRequestAccepted(error) => {
+                iroh_error_with_delivery_state(error, NetworkDeliveryState::DefinitelyNotSent)
+            }
+            Self::AfterRequestAccepted(error) => {
+                iroh_error_with_delivery_state(error, NetworkDeliveryState::PossiblyApplied)
+            }
         }
     }
 }
 
 fn iroh_daemon_control_attempt_should_retry(
-    request: Option<&DaemonControlRequest>,
     error: &IrohDaemonControlAttemptError,
     attempt: usize,
 ) -> bool {
     if attempt >= IROH_DAEMON_RPC_MAX_ATTEMPTS {
         return false;
     }
-    match error {
-        IrohDaemonControlAttemptError::BeforeRequestAccepted(_) => true,
-        IrohDaemonControlAttemptError::AfterRequestAccepted(error) => {
-            request.is_some_and(|request| {
-                iroh_daemon_control_request_allows_response_retry(request)
-                    && iroh_daemon_response_error_is_retryable(error)
-            })
-        }
-    }
-}
-
-fn iroh_daemon_control_request_allows_response_retry(request: &DaemonControlRequest) -> bool {
-    if request.is_response_retry_safe() {
-        return true;
-    }
-    // Read-only cluster KV routes are retry-safe over the proxy. Route names
-    // are string contracts owned by sinomo-kv; spelled out here so the module
-    // does not link the KV crate for an allowlist (mirrors the former
-    // in-crate client).
-    matches!(
-        request.route.as_str(),
-        CLUSTER_HEALTH_ROUTE | "/cluster/kv/range-prefix" | "/cluster/kv/snapshot"
-    )
-}
-
-fn iroh_daemon_response_error_is_retryable(error: &NetworkError) -> bool {
     matches!(
         error,
-        NetworkError::Io { operation, detail }
-            if operation == "read iroh daemon response"
-                && (detail.starts_with("peer closed before object frame")
-                    || detail.starts_with("peer closed during object frame"))
+        IrohDaemonControlAttemptError::BeforeRequestAccepted(_)
     )
+}
+
+fn iroh_error_with_delivery_state(
+    error: NetworkError,
+    delivery_state: NetworkDeliveryState,
+) -> NetworkError {
+    if error.delivery_state().is_some() {
+        error
+    } else {
+        NetworkError::delivery_failed(
+            "send iroh daemon command",
+            delivery_state,
+            error.to_string(),
+        )
+    }
 }
 
 fn iroh_daemon_response_frame_error(error: NetworkError) -> NetworkError {
@@ -464,10 +511,12 @@ fn iroh_daemon_rpc_retry_delay_with_budget(
 }
 
 fn iroh_daemon_command_timeout_error(timeout: Duration) -> NetworkError {
-    NetworkError::Io {
-        operation: "send iroh daemon command".to_string(),
-        detail: format!("timed out after {}ms", timeout.as_millis()),
-    }
+    NetworkError::timeout(
+        "send iroh daemon command",
+        NetworkTimeoutPhase::Connect,
+        timeout,
+        NetworkDeliveryState::DefinitelyNotSent,
+    )
 }
 
 /// Reconstructs an `iroh::EndpointAddr` from the transport-neutral record
@@ -506,52 +555,91 @@ pub(crate) fn iroh_endpoint_addr_from_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::network::ObjectRpcRequest;
 
     #[test]
-    fn response_retry_is_limited_to_idempotent_routes() {
-        let retry_safe = ObjectRpcRequest::encode_body("/test/retry-safe", "test", &())
-            .expect("retry-safe request")
-            .with_response_retry_safe();
-        assert!(iroh_daemon_control_request_allows_response_retry(
-            &retry_safe
-        ));
+    fn attempt_retry_is_limited_to_pre_accept_failures() {
+        let before_accept =
+            IrohDaemonControlAttemptError::BeforeRequestAccepted(NetworkError::Io {
+                operation: "connect iroh endpoint".to_string(),
+                detail: "connect failed".to_string(),
+            });
+        assert!(iroh_daemon_control_attempt_should_retry(&before_accept, 1));
 
-        let range = ObjectRpcRequest::encode_body("/cluster/kv/range-prefix", "cluster.kv", &())
-            .expect("range request");
-        assert!(iroh_daemon_control_request_allows_response_retry(&range));
-
-        for route in ["/test/mutate", "/test/finalize", "/test/build"] {
-            let request = ObjectRpcRequest::encode_body(route, "test", &()).expect("rpc request");
-            assert!(
-                !iroh_daemon_control_request_allows_response_retry(&request),
-                "{route} should not be retried after the remote may have accepted the request"
-            );
-        }
+        let after_accept = IrohDaemonControlAttemptError::AfterRequestAccepted(NetworkError::Io {
+            operation: "read iroh daemon response".to_string(),
+            detail: "peer closed before object frame length (4 bytes expected)".to_string(),
+        });
+        assert!(!iroh_daemon_control_attempt_should_retry(&after_accept, 1));
+        assert!(!iroh_daemon_control_attempt_should_retry(&before_accept, 3));
     }
 
     #[test]
-    fn response_retry_classifier_matches_remote_close_only() {
-        assert!(iroh_daemon_response_error_is_retryable(&NetworkError::Io {
+    fn attempt_error_exposes_delivery_certainty() {
+        let before = IrohDaemonControlAttemptError::BeforeRequestAccepted(NetworkError::Io {
+            operation: "connect iroh endpoint".to_string(),
+            detail: "connect failed".to_string(),
+        })
+        .into_network_error();
+        assert_eq!(
+            before.delivery_state(),
+            Some(NetworkDeliveryState::DefinitelyNotSent)
+        );
+
+        let after = IrohDaemonControlAttemptError::AfterRequestAccepted(NetworkError::Io {
             operation: "read iroh daemon response".to_string(),
-            detail: "peer closed before object frame length (4 bytes expected)".to_string(),
-        }));
-        assert!(iroh_daemon_response_error_is_retryable(&NetworkError::Io {
-            operation: "read iroh daemon response".to_string(),
-            detail: "peer closed during object frame body: read 3 of 8 bytes".to_string(),
-        }));
-        assert!(!iroh_daemon_response_error_is_retryable(
-            &NetworkError::Io {
-                operation: "read iroh daemon response".to_string(),
-                detail: "timed out after 1000ms".to_string(),
+            detail: "peer closed".to_string(),
+        })
+        .into_network_error();
+        assert_eq!(
+            after.delivery_state(),
+            Some(NetworkDeliveryState::PossiblyApplied)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_deadline_tracks_one_aggregate_budget() {
+        let deadline = IrohConnectDeadline::new(Some(Duration::from_secs(5)));
+        assert_eq!(deadline.remaining(), Ok(Some(Duration::from_secs(5))));
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert_eq!(deadline.remaining(), Ok(Some(Duration::from_secs(2))));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(matches!(
+            deadline.remaining(),
+            Err(NetworkError::Timeout {
+                phase: NetworkTimeoutPhase::Connect,
+                delivery_state: NetworkDeliveryState::DefinitelyNotSent,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_deadline_bounds_mutex_queueing() {
+        let mutex = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let held = mutex.lock().await;
+        let waiting = mutex.clone();
+        let deadline = IrohConnectDeadline::new(Some(Duration::from_secs(5)));
+        let task = tokio::spawn(async move {
+            let _guard = iroh_mutex_lock_before_connect_deadline(&waiting, deadline).await?;
+            Ok::<(), NetworkError>(())
+        });
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let error = task
+            .await
+            .expect("mutex wait task")
+            .expect_err("queued lock acquisition must respect the connect deadline");
+
+        assert!(matches!(
+            error,
+            NetworkError::Timeout {
+                phase: NetworkTimeoutPhase::Connect,
+                delivery_state: NetworkDeliveryState::DefinitelyNotSent,
+                ..
             }
         ));
-        assert!(!iroh_daemon_response_error_is_retryable(
-            &NetworkError::Io {
-                operation: "connect iroh endpoint".to_string(),
-                detail: "peer closed before object frame length (4 bytes expected)".to_string(),
-            }
-        ));
+        drop(held);
     }
 
     #[tokio::test]

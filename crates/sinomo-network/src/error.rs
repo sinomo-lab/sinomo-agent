@@ -21,6 +21,31 @@ fn parse_network_fallible_vec_resource_exhaustion(detail: &str) -> Option<(Strin
     Some((operation.to_string(), requested_bytes.parse().ok()?))
 }
 
+/// The point at which a bounded network operation ran out of time.
+///
+/// This is deliberately transport-oriented. Service execution deadlines and
+/// domain retry state remain owned by the crate that defines the operation.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum NetworkTimeoutPhase {
+    Route,
+    Signing,
+    Connect,
+    Write,
+    FirstByte,
+    Idle,
+    Overall,
+}
+
+/// What the transport can prove about a failed request's delivery.
+///
+/// `PossiblyApplied` must be treated conservatively: the peer may have handled
+/// the request even though its response was not observed.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum NetworkDeliveryState {
+    DefinitelyNotSent,
+    PossiblyApplied,
+}
+
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
 pub enum NetworkError {
     #[error("network authorization was denied")]
@@ -142,6 +167,38 @@ pub enum NetworkError {
     Json { path: String, detail: String },
     #[error("cluster storage I/O error at {path}: {detail}")]
     StorageIo { path: String, detail: String },
+    #[error(
+        "network timeout during {operation} in {phase:?} after {timeout:?} ({delivery_state:?})"
+    )]
+    Timeout {
+        operation: String,
+        phase: NetworkTimeoutPhase,
+        timeout: std::time::Duration,
+        delivery_state: NetworkDeliveryState,
+    },
+    #[error(
+        "network outcome is unknown during {operation} for operation id {operation_id:?}: {detail}"
+    )]
+    OutcomeUnknown {
+        operation: String,
+        operation_id: Option<String>,
+        detail: String,
+    },
+    #[error(
+        "network retries exhausted during {operation} after {attempts} attempts ({delivery_state:?}): {detail}"
+    )]
+    RetryExhausted {
+        operation: String,
+        attempts: usize,
+        delivery_state: NetworkDeliveryState,
+        detail: String,
+    },
+    #[error("network delivery failed during {operation} ({delivery_state:?}): {detail}")]
+    DeliveryFailed {
+        operation: String,
+        delivery_state: NetworkDeliveryState,
+        detail: String,
+    },
     #[error("network I/O error during {operation}: {detail}")]
     Io { operation: String, detail: String },
     #[error(transparent)]
@@ -151,6 +208,58 @@ pub enum NetworkError {
 }
 
 impl NetworkError {
+    pub fn timeout(
+        operation: impl Into<String>,
+        phase: NetworkTimeoutPhase,
+        timeout: std::time::Duration,
+        delivery_state: NetworkDeliveryState,
+    ) -> Self {
+        Self::Timeout {
+            operation: operation.into(),
+            phase,
+            timeout,
+            delivery_state,
+        }
+    }
+
+    pub fn outcome_unknown(
+        operation: impl Into<String>,
+        operation_id: Option<&str>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::OutcomeUnknown {
+            operation: operation.into(),
+            operation_id: operation_id.map(str::to_string),
+            detail: detail.into(),
+        }
+    }
+
+    pub fn delivery_failed(
+        operation: impl Into<String>,
+        delivery_state: NetworkDeliveryState,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::DeliveryFailed {
+            operation: operation.into(),
+            delivery_state,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn delivery_state(&self) -> Option<NetworkDeliveryState> {
+        match self {
+            Self::Timeout { delivery_state, .. }
+            | Self::RetryExhausted { delivery_state, .. }
+            | Self::DeliveryFailed { delivery_state, .. } => Some(*delivery_state),
+            Self::OutcomeUnknown { .. } => Some(NetworkDeliveryState::PossiblyApplied),
+            _ => None,
+        }
+    }
+
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Self::Timeout { .. })
+    }
+
     /// Wraps a cluster-state/store error (KV, directory backends) for
     /// transport through the networking error type.
     pub fn directory(detail: impl std::fmt::Display) -> Self {

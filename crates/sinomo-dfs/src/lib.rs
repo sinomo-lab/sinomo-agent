@@ -270,14 +270,13 @@ pub(crate) use metadata_records::{
 pub use metadata_replication::{
     AsyncDfsMetadataJournalBatchSender, AsyncDfsMetadataJournalReplicationTransport,
     AsyncDfsMetadataNodeTransport, AsyncDfsMetadataSnapshotInstallSender,
-    DEFAULT_DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT,
     DEFAULT_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET,
-    DEFAULT_DFS_METADATA_REPLICATION_TIMEOUT, DFS_METADATA_REPLICATION_MAX_NODE_ROUTES_PER_TARGET,
-    DfsMetadataJournalBatchSender, DfsMetadataJournalPublisherHost,
-    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationOutcome,
-    DfsMetadataJournalReplicationReport, DfsMetadataJournalReplicationTransport,
-    DfsMetadataJournalReplicationTransportError, DfsMetadataJournalReplicationTransportFuture,
-    DfsMetadataNodeTransport, DfsMetadataPeerTransportError, DfsMetadataPublishScheduleOptions,
+    DFS_METADATA_REPLICATION_MAX_NODE_ROUTES_PER_TARGET, DfsMetadataJournalBatchSender,
+    DfsMetadataJournalPublisherHost, DfsMetadataJournalReplicationOptions,
+    DfsMetadataJournalReplicationOutcome, DfsMetadataJournalReplicationReport,
+    DfsMetadataJournalReplicationTransport, DfsMetadataJournalReplicationTransportError,
+    DfsMetadataJournalReplicationTransportFuture, DfsMetadataNodeTransport,
+    DfsMetadataPeerTransportError, DfsMetadataPublishScheduleOptions,
     DfsMetadataPublishScheduleStart, DfsMetadataPublishScheduler, DfsMetadataReplicaShardContext,
     DfsMetadataSnapshotInstallSender, LocalDfsMetadataJournalPublisherHost,
     cluster_dfs_metadata_replica_shard_context, dfs_events_should_publish_metadata,
@@ -348,9 +347,8 @@ pub(crate) use node_transport::{
     dfs_direct_read_sender_from_peer_transport,
 };
 pub use node_transport::{
-    AsyncDfsPeerTransport, DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT, DfsNodeServedMessageTransport,
-    DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
-    DfsPeerTransportFuture,
+    AsyncDfsPeerTransport, DfsNodeServedMessageTransport, DfsNodeTransport,
+    DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError, DfsPeerTransportFuture,
 };
 pub(crate) use node_transport::{DfsMessageSender, dfs_message_sender_from_peer_transport};
 #[cfg(test)]
@@ -428,7 +426,7 @@ pub(crate) use routes::{
 };
 pub(crate) use service_content::object_content_identity;
 pub(crate) use service_outbound::read_small_blob_from_reader;
-pub(crate) use service_repair::DFS_CHUNK_TRANSFER_IDLE_TIMEOUT;
+pub(crate) use service_repair::DFS_CHUNK_TRANSFER_STALE_AFTER;
 pub use service_sync::{
     DEFAULT_DFS_POSIX_SYNC_TIMEOUT, DfsMetadataQuorumSyncCertificate,
     DfsMetadataQuorumSyncProgress, DfsMetadataQuorumSyncTarget, dfs_metadata_replica_quorum_size,

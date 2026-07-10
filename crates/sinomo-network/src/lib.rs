@@ -114,7 +114,7 @@ pub use endpoint_selector::{
     cluster_sync_targets, cluster_sync_targets_with_connectivity,
     prefer_bounded_daemon_command_targets,
 };
-pub use error::NetworkError;
+pub use error::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase};
 pub use fallible_serde::{
     deserialize_bytes, deserialize_bytes_with_operation, deserialize_vec, serialize_bytes,
     serialize_optional_bytes,
@@ -188,14 +188,14 @@ pub use object::read_object_frame_async;
 pub use object::write_object_frame_async;
 pub use object::{
     AsyncDaemonControlListener, AsyncDaemonControlStream, DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
-    DaemonControlRequest, DaemonControlResponse, DaemonRpcTimeouts, OBJECT_STREAM_MAX_CHUNK_BYTES,
-    ObjectFrameIoOptions, ObjectRpcRequestStreamMode, ObjectRpcResponseStreamMode,
-    ObjectRpcStreamBody, ObjectRpcStreamResponse, RawByteStreamChunkOptions, SinomoObjectCodec,
-    forward_raw_byte_stream_chunks_async, object_rpc_request_stream_mode,
-    object_rpc_response_stream_mode, read_raw_byte_stream_chunks_to_vec_async,
-    send_daemon_control_rpc_request_async, send_daemon_control_rpc_request_stream_response_async,
-    set_object_rpc_request_stream_mode, set_object_rpc_response_stream_mode,
-    write_borrowed_object_frame_async,
+    DEFAULT_NETWORK_TIMEOUT, DaemonControlRequest, DaemonControlResponse, DaemonRpcTimeouts,
+    OBJECT_STREAM_MAX_CHUNK_BYTES, ObjectFrameIoOptions, ObjectRpcRequestStreamMode,
+    ObjectRpcResponseStreamMode, ObjectRpcStreamBody, ObjectRpcStreamResponse,
+    RawByteStreamChunkOptions, SinomoObjectCodec, forward_raw_byte_stream_chunks_async,
+    object_rpc_request_stream_mode, object_rpc_response_stream_mode,
+    read_raw_byte_stream_chunks_to_vec_async, send_daemon_control_rpc_request_async,
+    send_daemon_control_rpc_request_stream_response_async, set_object_rpc_request_stream_mode,
+    set_object_rpc_response_stream_mode, write_borrowed_object_frame_async,
 };
 pub(crate) use object::{
     DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY, DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE,
@@ -216,6 +216,8 @@ pub use peer::{
     InProcessTransport,
 };
 pub use roaming::{
+    send_daemon_rpc_response_to_cluster_endpoint_async,
+    send_daemon_rpc_stream_response_frame_to_cluster_endpoint_async,
     send_daemon_rpc_stream_response_to_cluster_endpoint_async,
     send_daemon_rpc_to_cluster_endpoint_async,
 };
@@ -617,7 +619,6 @@ pub use roaming::WebRtcSignalingEnvelope;
 #[cfg(any(test, feature = "test-support"))]
 pub use roaming::configure_daemon_control_stream_idle_timeout;
 #[cfg(any(test, feature = "test-support"))]
-pub use route::CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX;
 #[cfg(any(test, feature = "test-support"))]
 pub use route::ClusterDeliveryFailedEdges;
 #[cfg(any(test, feature = "test-support"))]

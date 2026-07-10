@@ -2610,7 +2610,7 @@ fn open_evolution_sifs_service(
         DfsNodeTransport::with_peer_transports_for_nodes(
             local_node_id,
             peer_node_ids,
-            sinomo_runtime::dfs::DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+            sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
             sync_peer_transport,
             async_peer_transport,
         ),
@@ -2659,10 +2659,10 @@ impl DfsPeerTransport for EvolutionSifsPeerTransport {
         request: &network::ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> Result<network::ObjectRpcResponse, DfsPeerTransportError> {
-        sinomo_runtime::daemon::send_object_rpc_to_target(
+        sinomo_runtime::daemon::send_object_rpc_to_target_with_options(
             target_node_id,
             request,
-            options.connect_timeout,
+            options.cluster_rpc_options(),
             options.observe_connectivity,
         )
         .map_err(|error| DfsPeerTransportError::new(error.to_string()))

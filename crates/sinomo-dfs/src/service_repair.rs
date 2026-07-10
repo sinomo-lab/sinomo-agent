@@ -20,7 +20,10 @@ use crate::transfer::{
 };
 use crate::*;
 
-pub(crate) const DFS_CHUNK_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Logical DFS transfer records are retained across many independently bounded
+/// network requests. This is a stale-state horizon, not a socket or stream idle
+/// timeout; active network I/O uses `sinomo-network`'s five-second policy.
+pub(crate) const DFS_CHUNK_TRANSFER_STALE_AFTER: Duration = Duration::from_secs(60);
 /// How long a primary keeps an unanswered routed-write response obligation
 /// before assuming the requester gave up.
 const DFS_REMOTE_WRITE_RESPONSE_TTL: Duration = Duration::from_secs(60);
@@ -1105,14 +1108,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let now = Instant::now();
         self.incoming_blob_transfers.retain(|_, transfer| {
-            now.duration_since(transfer.last_updated_at()) <= DFS_CHUNK_TRANSFER_IDLE_TIMEOUT
+            now.duration_since(transfer.last_updated_at()) <= DFS_CHUNK_TRANSFER_STALE_AFTER
         });
         self.incoming_patch_transfers.retain(|_, transfer| {
-            now.duration_since(transfer.last_updated_at()) <= DFS_CHUNK_TRANSFER_IDLE_TIMEOUT
+            now.duration_since(transfer.last_updated_at()) <= DFS_CHUNK_TRANSFER_STALE_AFTER
         });
         self.incoming_read_transfers.retain(|request_id, transfer| {
             let keep =
-                now.duration_since(transfer.last_updated_at()) <= DFS_CHUNK_TRANSFER_IDLE_TIMEOUT;
+                now.duration_since(transfer.last_updated_at()) <= DFS_CHUNK_TRANSFER_STALE_AFTER;
             if !keep {
                 self.pending_reads.remove(request_id);
             }
@@ -1121,7 +1124,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.incoming_read_memory_transfers
             .retain(|request_id, transfer| {
                 let keep = now.duration_since(transfer.last_updated_at())
-                    <= DFS_CHUNK_TRANSFER_IDLE_TIMEOUT;
+                    <= DFS_CHUNK_TRANSFER_STALE_AFTER;
                 if !keep {
                     self.pending_reads.remove(request_id);
                 }
@@ -1132,7 +1135,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.incoming_fetch_transfers
             .retain(|request_id, transfer| {
                 let keep = now.duration_since(transfer.last_updated_at())
-                    <= DFS_CHUNK_TRANSFER_IDLE_TIMEOUT;
+                    <= DFS_CHUNK_TRANSFER_STALE_AFTER;
                 if !keep {
                     expired_fetches.push(request_id.clone());
                 }

@@ -1125,7 +1125,7 @@ fn open_sifs_service_with_hydration(
         DfsNodeTransport::with_peer_transports_for_nodes(
             local_node_id,
             peer_node_ids,
-            sinomo_runtime::dfs::DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+            sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
             sync_peer_transport,
             async_peer_transport,
         ),
@@ -1429,10 +1429,10 @@ impl AsyncDfsPeerTransport for SifsDfsPeerTransport {
                 return result;
             }
 
-            sinomo_runtime::daemon::send_object_rpc_to_target_async(
+            sinomo_runtime::daemon::send_object_rpc_to_target_async_with_options(
                 &target_node_id,
                 &request,
-                options.connect_timeout,
+                options.cluster_rpc_options(),
                 &handle,
                 options.observe_connectivity,
             )
@@ -1462,10 +1462,10 @@ fn sifs_send_dfs_object_rpc(
         ) {
             return tokio::task::block_in_place(|| {
                 handle.block_on(async {
-                    sinomo_runtime::daemon::send_object_rpc_to_target_async(
+                    sinomo_runtime::daemon::send_object_rpc_to_target_async_with_options(
                         target_node_id,
                         request,
-                        options.connect_timeout,
+                        options.cluster_rpc_options(),
                         &handle,
                         options.observe_connectivity,
                     )
@@ -1481,10 +1481,10 @@ fn sifs_send_dfs_object_rpc(
     rpc_runtime
         .runtime
         .block_on(async {
-            sinomo_runtime::daemon::send_object_rpc_to_target_async(
+            sinomo_runtime::daemon::send_object_rpc_to_target_async_with_options(
                 target_node_id,
                 request,
-                options.connect_timeout,
+                options.cluster_rpc_options(),
                 rpc_runtime.runtime.handle(),
                 options.observe_connectivity,
             )
@@ -1509,12 +1509,7 @@ fn sifs_send_dfs_object_rpc_via_daemon(
     };
     Some(
         client
-            .dfs_object_rpc_to_target(
-                target_node_id,
-                request,
-                options.connect_timeout,
-                options.observe_connectivity,
-            )
+            .dfs_object_rpc_to_target_with_options(target_node_id, request, options)
             .map_err(|error| DfsPeerTransportError::new(error.to_string())),
     )
 }

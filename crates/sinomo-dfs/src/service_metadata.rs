@@ -44,6 +44,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn add_object_metadata(&mut self, object: DfsObjectMetadata) -> Result<(), DfsError> {
         self.clear_metadata_lookup_cache();
         self.put_visible_object_in_metadata_backend(&object)?;
+        self.transient_metadata_object_ids.remove(&object.object_id);
         self.coordinator.set_committed_version(
             object.file_system_id.clone(),
             object.object_id.clone(),
@@ -135,6 +136,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         for (_, records) in grouped {
             for (object, _) in records {
+                self.transient_metadata_object_ids.remove(&object.object_id);
                 self.coordinator.set_committed_version(
                     object.file_system_id.clone(),
                     object.object_id.clone(),
@@ -150,11 +152,34 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn add_transient_object_metadata(
         &mut self,
-        object: DfsObjectMetadata,
+        mut object: DfsObjectMetadata,
     ) -> Result<(), DfsError> {
         self.clear_metadata_lookup_cache();
+        normalize_current_locations(&mut object.current_locations);
+        let object_id = object.object_id.clone();
+        let backend_object = self
+            .metadata_backend
+            .as_ref()
+            // This lookup only classifies pagination overlays. A backend read
+            // failure must not turn an already committed write into a
+            // caller-visible error; treating it as absent conservatively keeps
+            // the in-memory namespace object visible until a later durable
+            // observation clears the transient marker.
+            .and_then(|backend| backend.get_object(&object_id).ok().flatten());
+        let changes_namespace_view = backend_object.as_ref().is_none_or(|backend_object| {
+            backend_object.file_system_id != object.file_system_id
+                || backend_object.path != object.path
+                || backend_object.kind != object.kind
+        });
         self.track_metadata_tombstone(&object);
         let result = self.metadata.add_object(object);
+        if result.is_ok() {
+            if changes_namespace_view {
+                self.transient_metadata_object_ids.insert(object_id);
+            } else {
+                self.transient_metadata_object_ids.remove(&object_id);
+            }
+        }
         self.clear_metadata_lookup_cache();
         result
     }
@@ -199,6 +224,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn remove_transient_object_metadata(&mut self, object_id: &DfsObjectId) {
         self.clear_metadata_lookup_cache();
+        self.transient_metadata_object_ids.remove(object_id);
         self.metadata.remove_object(object_id);
         self.clear_metadata_lookup_cache();
     }

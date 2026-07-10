@@ -209,20 +209,42 @@ pub async fn send_daemon_rpc_to_cluster_endpoint_async(
     request: &crate::ObjectRpcRequest,
     timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    let control_request = daemon_rpc_control_request(auth, request);
-    let response = if crate::object_rpc_request_expects_raw_daemon_response(request) {
-        send_daemon_control_rpc_request_raw_response_to_cluster_endpoint_async(
-            endpoint,
-            &control_request,
-            timeouts,
-        )
-        .await?
-    } else {
-        send_daemon_control_request_to_cluster_endpoint_async(endpoint, &control_request, timeouts)
-            .await?
-    };
+    let response =
+        send_daemon_rpc_response_to_cluster_endpoint_async(endpoint, auth, request, timeouts)
+            .await?;
     response.error_detail()?;
     Ok(response)
+}
+
+/// Send a daemon RPC while preserving a received application error frame.
+///
+/// Routed delivery uses this form so a valid peer response terminates transport
+/// retry. Public endpoint callers retain the historical behavior of decoding
+/// application errors into `NetworkError`.
+pub async fn send_daemon_rpc_response_to_cluster_endpoint_async(
+    endpoint: &ClusterEndpointRecord,
+    auth: Option<&[u8]>,
+    request: &crate::ObjectRpcRequest,
+    timeouts: DaemonRpcTimeouts,
+) -> Result<crate::ObjectRpcResponse, NetworkError> {
+    let control_request = daemon_rpc_control_request(auth, request);
+    Ok(
+        if crate::object_rpc_request_expects_raw_daemon_response(request) {
+            send_daemon_control_rpc_request_raw_response_to_cluster_endpoint_async(
+                endpoint,
+                &control_request,
+                timeouts,
+            )
+            .await?
+        } else {
+            send_daemon_control_request_to_cluster_endpoint_async(
+                endpoint,
+                &control_request,
+                timeouts,
+            )
+            .await?
+        },
+    )
 }
 
 pub async fn send_daemon_rpc_stream_response_to_cluster_endpoint_async(
@@ -231,15 +253,27 @@ pub async fn send_daemon_rpc_stream_response_to_cluster_endpoint_async(
     request: &crate::ObjectRpcRequest,
     timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::ObjectRpcStreamResponse, NetworkError> {
-    let control_request = daemon_rpc_control_request(auth, request);
-    let response = send_daemon_control_rpc_request_stream_response_to_cluster_endpoint_async(
-        endpoint,
-        &control_request,
-        timeouts,
+    let response = send_daemon_rpc_stream_response_frame_to_cluster_endpoint_async(
+        endpoint, auth, request, timeouts,
     )
     .await?;
     response.response.error_detail()?;
     Ok(response)
+}
+
+pub async fn send_daemon_rpc_stream_response_frame_to_cluster_endpoint_async(
+    endpoint: &ClusterEndpointRecord,
+    auth: Option<&[u8]>,
+    request: &crate::ObjectRpcRequest,
+    timeouts: DaemonRpcTimeouts,
+) -> Result<crate::ObjectRpcStreamResponse, NetworkError> {
+    let control_request = daemon_rpc_control_request(auth, request);
+    send_daemon_control_rpc_request_stream_response_to_cluster_endpoint_async(
+        endpoint,
+        &control_request,
+        timeouts,
+    )
+    .await
 }
 
 fn daemon_rpc_control_request(

@@ -45,10 +45,13 @@ impl ClusterStateAuthorityReachabilityOptions {
     }
 
     pub fn routed_node_attempt_timeout(&self, remaining: Duration) -> Duration {
+        // Node routing may try multiple transports internally. Keep the whole routed probe
+        // within the most conservative foreground slice so one voter cannot monopolize the
+        // shared quorum deadline while the transport layer works through its fallbacks.
         let attempt_cap = self
             .tcp_foreground_attempt_timeout
-            .max(self.public_foreground_attempt_timeout)
-            .max(self.iroh_foreground_attempt_timeout);
+            .min(self.public_foreground_attempt_timeout)
+            .min(self.iroh_foreground_attempt_timeout);
         self.routed_node_command_timeout(remaining.min(attempt_cap))
     }
 }

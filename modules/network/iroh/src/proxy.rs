@@ -18,7 +18,7 @@ use crate::{
 };
 use fs2::FileExt;
 use sinomo_core::network::{
-    ClusterPaths, DaemonControlRequest, DaemonRpcTimeouts, NetworkError,
+    ClusterPaths, DEFAULT_NETWORK_TIMEOUT, DaemonControlRequest, DaemonRpcTimeouts, NetworkError,
     OBJECT_STREAM_MAX_CHUNK_BYTES, ObjectRpcResponse, ObjectRpcResponseStreamMode,
     RawByteStreamChunkOptions, decode_single_object_frame_from_slice, encode_object_frame_to_vec,
     forward_raw_byte_stream_chunks_async, object_rpc_response_stream_mode, read_object_file,
@@ -35,7 +35,6 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 pub const IROH_ROAMING_PROTOCOL: &str = "sinomo.iroh-roaming.v1";
-const IROH_DAEMON_ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
 const SINOMO_IROH_RELAY_URLS_ENV: &str = "SINOMO_IROH_RELAY_URLS";
 const IROH_DAEMON_PROXY_RESTART_BACKOFF_MIN: Duration = Duration::from_secs(5);
 const IROH_DAEMON_PROXY_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(300);
@@ -47,7 +46,8 @@ const IROH_SECRET_KEY_LOCK_RETRY_MAX: Duration = Duration::from_millis(40);
 pub const IROH_DAEMON_PROXY_ERROR_ROUTE: &str = "/iroh-daemon-proxy/error";
 const IROH_DAEMON_PROXY_MAX_CONNECTIONS: usize = 64;
 const IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS: usize = 128;
-const IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT: Duration = Duration::from_secs(30);
+// This is a lifecycle timeout for an otherwise healthy pooled Iroh
+// connection, not a no-progress timeout for an active RPC stream.
 const IROH_DAEMON_PROXY_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const SINOMO_DEFAULT_IROH_RELAY_URLS: &[&str] = &[
     "https://use1-1.relay.n0.iroh-canary.iroh.link./",
@@ -330,7 +330,7 @@ where
         writer,
         &frame,
         "write iroh daemon proxy frame",
-        Some(IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT),
+        Some(DEFAULT_NETWORK_TIMEOUT),
     )
     .await
 }
@@ -541,7 +541,7 @@ impl IrohDaemonProxy {
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(true);
         let mut supervisor = self.supervisor;
-        if tokio::time::timeout(Duration::from_secs(10), &mut supervisor)
+        if tokio::time::timeout(DEFAULT_NETWORK_TIMEOUT, &mut supervisor)
             .await
             .is_err()
         {
@@ -734,7 +734,7 @@ async fn run_iroh_daemon_proxy(
         }
     };
     let endpoint = IrohEndpointCloseGuard::new(runtime.clone(), endpoint);
-    let _ = tokio::time::timeout(IROH_DAEMON_ONLINE_TIMEOUT, endpoint.endpoint().online()).await;
+    let _ = tokio::time::timeout(DEFAULT_NETWORK_TIMEOUT, endpoint.endpoint().online()).await;
     let record = iroh_endpoint_record_from_addr(
         &config.cluster_id,
         &config.node_id,
@@ -878,7 +878,7 @@ async fn run_iroh_daemon_proxy(
                         &mut recv,
                         &command_byte_budget,
                         "command request",
-                        Some(IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT),
+                        Some(DEFAULT_NETWORK_TIMEOUT),
                     )
                     .await
                     {
@@ -906,7 +906,7 @@ async fn run_iroh_daemon_proxy(
                     let response_result = forward_daemon_control_payload_async(
                         &daemon_address,
                         &request,
-                        DaemonRpcTimeouts::connect_only(IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT),
+                        DaemonRpcTimeouts::default(),
                         &forward_budget,
                     )
                     .await;
@@ -935,7 +935,7 @@ async fn run_iroh_daemon_proxy(
                         &mut send,
                         &forwarded.response_frame,
                         "write iroh daemon proxy frame",
-                        Some(IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT),
+                        Some(DEFAULT_NETWORK_TIMEOUT),
                     )
                     .await
                     .is_err()
@@ -950,7 +950,7 @@ async fn run_iroh_daemon_proxy(
                             RawByteStreamChunkOptions {
                                 chunk_bytes: OBJECT_STREAM_MAX_CHUNK_BYTES,
                                 max_total_bytes: u64::try_from(IROH_DAEMON_COMMAND_MAX_BYTES).ok(),
-                                idle_timeout: Some(IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT),
+                                idle_timeout: Some(DEFAULT_NETWORK_TIMEOUT),
                             },
                         )
                         .await

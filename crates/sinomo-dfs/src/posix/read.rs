@@ -49,6 +49,26 @@ enum PosixBulkReadPlan {
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    fn with_posix_remote_read_deadline<R>(
+        &mut self,
+        operation: impl FnOnce(&mut Self, Instant) -> Result<R>,
+    ) -> Result<R> {
+        let requested_deadline = Instant::now() + POSIX_REMOTE_READ_TIMEOUT;
+        let previous_deadline = self
+            .transport
+            .set_operation_deadline(Some(requested_deadline));
+        let effective_deadline = previous_deadline
+            .filter(|existing| *existing < requested_deadline)
+            .unwrap_or(requested_deadline);
+        if effective_deadline != requested_deadline {
+            self.transport
+                .set_operation_deadline(Some(effective_deadline));
+        }
+        let result = operation(self, effective_deadline);
+        self.transport.set_operation_deadline(previous_deadline);
+        result
+    }
+
     fn posix_file_content_object(
         &self,
         path: String,
@@ -411,6 +431,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         source_node_id: &NodeId,
         pending_reads: &[PosixPendingBulkRead],
     ) -> Result<Vec<DfsBulkReadItemResponse>> {
+        self.with_posix_remote_read_deadline(|service, deadline| {
+            service.request_posix_bulk_read_from_source_with_deadline(
+                source_node_id,
+                pending_reads,
+                deadline,
+            )
+        })
+    }
+
+    fn request_posix_bulk_read_from_source_with_deadline(
+        &mut self,
+        source_node_id: &NodeId,
+        pending_reads: &[PosixPendingBulkRead],
+        deadline: Instant,
+    ) -> Result<Vec<DfsBulkReadItemResponse>> {
         let request_id = format!("dfs_bulk_read_batch_{}", EventId::generate());
         let request = DfsBulkReadRequest {
             request_id: request_id.clone(),
@@ -434,7 +469,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }));
         }
 
-        let deadline = Instant::now() + POSIX_REMOTE_READ_TIMEOUT;
         let mut idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
         loop {
             self.check_cancelled("bulk read wait")?;
@@ -614,6 +648,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         object_id: &DfsObjectId,
     ) -> Result<NetworkedDfsReadOutcome> {
+        self.with_posix_remote_read_deadline(|service, deadline| {
+            service.read_current_object_or_fetch_remote_with_deadline(object_id, deadline)
+        })
+    }
+
+    fn read_current_object_or_fetch_remote_with_deadline(
+        &mut self,
+        object_id: &DfsObjectId,
+        deadline: Instant,
+    ) -> Result<NetworkedDfsReadOutcome> {
         let initial = self.read_local_object_with_state(object_id, false)?;
         if !matches!(initial, NetworkedDfsReadOutcome::PendingReplication { .. }) {
             return Ok(initial);
@@ -622,7 +666,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if requested.is_empty() {
             return Ok(initial);
         }
-        let deadline = Instant::now() + POSIX_REMOTE_READ_TIMEOUT;
         let mut idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
         loop {
             self.check_cancelled("remote object read wait")?;
@@ -678,6 +721,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         object: &DfsObjectMetadata,
     ) -> Result<NetworkedDfsReadOutcome> {
+        self.with_posix_remote_read_deadline(|service, deadline| {
+            service
+                .read_object_metadata_or_fetch_remote_without_cache_with_deadline(object, deadline)
+        })
+    }
+
+    fn read_object_metadata_or_fetch_remote_without_cache_with_deadline(
+        &mut self,
+        object: &DfsObjectMetadata,
+        deadline: Instant,
+    ) -> Result<NetworkedDfsReadOutcome> {
         let mut object = self.current_read_object_metadata_or_path_object(object)?;
         let initial = self.read_object_metadata_local_if_current_location(&object)?;
         if !matches!(initial, NetworkedDfsReadOutcome::PendingReplication { .. }) {
@@ -687,7 +741,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if requested.is_empty() {
             return Ok(initial);
         }
-        let deadline = Instant::now() + POSIX_REMOTE_READ_TIMEOUT;
         let mut idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
         loop {
             self.check_cancelled("remote metadata read wait")?;

@@ -97,6 +97,7 @@ pub struct NetworkedDfsService<T> {
     pub(crate) node_id: NodeId,
     pub(crate) metadata: DfsMetadataStore,
     pub(crate) tombstones_by_metadata_path: BTreeMap<(DfsFileSystemId, String), DfsObjectMetadata>,
+    pub(crate) transient_metadata_object_ids: BTreeSet<DfsObjectId>,
     pub(crate) content: LocalContentStore,
     pub(crate) coordinator: DistributedEventualCoordinator,
     pub(crate) control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
