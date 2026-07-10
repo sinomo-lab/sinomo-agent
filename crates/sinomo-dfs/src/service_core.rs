@@ -50,6 +50,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             node_id,
             metadata,
             tombstones_by_metadata_path: BTreeMap::new(),
+            transient_metadata_object_ids: BTreeSet::new(),
             content,
             coordinator: DistributedEventualCoordinator::new(),
             control_plane: None,

@@ -23047,6 +23047,225 @@ fn sifs_posix_rename_directory_bounded_job_resumes_after_reopen() {
 }
 
 #[test]
+fn sifs_posix_rename_directory_batches_child_moves_per_job_batch() {
+    let root = temp_root("sifs-posix-rename-dir-batched-children");
+    let node_id = NodeId::from_legacy_named("node_sifs_rename_dir_batch").expect("node");
+    let old_dir = "/services/sandbox/instances/sandbox_rename_batch/work/old";
+    let new_dir = "/services/sandbox/instances/sandbox_rename_batch/work/new";
+    let max_steps = 4;
+    let child_count = 10usize;
+
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.posix_mkdir_all(old_dir).expect("mkdir old dir");
+    let mut old_paths = Vec::new();
+    let mut new_paths = Vec::new();
+    let mut child_object_ids = BTreeSet::new();
+    for index in 0..child_count {
+        let old_path = format!("{old_dir}/file-{index:02}.txt");
+        let new_path = format!("{new_dir}/file-{index:02}.txt");
+        dfs.posix_write_file(
+            &old_path,
+            old_path.as_bytes(),
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write child");
+        child_object_ids.insert(dfs.posix_stat(&old_path).expect("child stat").object_id);
+        old_paths.push(old_path);
+        new_paths.push(new_path);
+    }
+    let journal_after_sequence = dfs
+        .metadata_backend()
+        .expect("metadata backend")
+        .journal_since(0)
+        .expect("journal before rename")
+        .last()
+        .map(|entry| entry.sequence)
+        .unwrap_or(0);
+
+    let mut job = dfs
+        .posix_rename_directory_bounded(old_dir, new_dir, max_steps)
+        .expect("first bounded rename batch");
+    while job.status != DfsNamespaceJobStatus::Completed {
+        job = dfs
+            .posix_resume_namespace_job_bounded(&job.job_id, max_steps)
+            .expect("resume bounded rename batch");
+    }
+
+    let journal = dfs
+        .metadata_backend()
+        .expect("metadata backend")
+        .journal_since(journal_after_sequence)
+        .expect("rename journal");
+    let child_move_transactions = journal
+        .iter()
+        .filter_map(|entry| match &entry.mutation {
+            DfsMetadataMutation::ApplyNamespaceTransaction {
+                transaction_id,
+                transaction: Some(transaction),
+                ..
+            } if transaction_id.starts_with("namespace_rename-child-batch_") => Some(transaction),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        child_move_transactions.len() < child_count,
+        "bounded rename should journal child moves per job batch, not per child"
+    );
+    assert!(
+        child_move_transactions
+            .iter()
+            .any(|transaction| transaction.objects.len() > 1),
+        "at least one bounded batch should contain multiple child moves"
+    );
+    assert!(
+        child_move_transactions
+            .iter()
+            .all(|transaction| transaction.objects.len() <= max_steps),
+        "a child-move transaction must remain bounded by the job step budget"
+    );
+    let journaled_child_object_ids = child_move_transactions
+        .iter()
+        .flat_map(|transaction| transaction.objects.iter())
+        .map(|object| object.object_id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(journaled_child_object_ids, child_object_ids);
+    assert_eq!(
+        child_move_transactions
+            .iter()
+            .map(|transaction| transaction.objects.len())
+            .sum::<usize>(),
+        child_count,
+        "each child should be journaled exactly once"
+    );
+    assert!(job.processed_object_count >= child_count as u64);
+    for (old_path, new_path) in old_paths.iter().zip(new_paths.iter()) {
+        assert!(matches!(
+            dfs.posix_stat(old_path),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+        assert_eq!(
+            dfs.posix_read_file(new_path).expect("moved child"),
+            old_path.as_bytes()
+        );
+    }
+
+    drop(dfs);
+    let reopened = networked_sifs_with_backend(&root, node_id);
+    for new_path in &new_paths {
+        assert_eq!(
+            reopened.posix_stat(new_path).expect("reopened child").kind,
+            DfsObjectKind::File
+        );
+    }
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sifs_posix_rename_directory_caps_child_move_transactions_above_step_budget() {
+    let root = temp_root("sifs-posix-rename-dir-capped-children");
+    let node_id = NodeId::from_legacy_named("node_sifs_rename_dir_cap").expect("node");
+    let old_dir = "/services/sandbox/instances/sandbox_rename_cap/work/old";
+    let new_dir = "/services/sandbox/instances/sandbox_rename_cap/work/new";
+    let transaction_cap = crate::posix::POSIX_RENAME_MOVE_TRANSACTION_MAX_OBJECTS;
+    let child_count = transaction_cap + 1;
+    let max_steps = transaction_cap * 2;
+
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.posix_mkdir_all(old_dir).expect("mkdir old dir");
+    let children = (0..child_count)
+        .map(|index| {
+            let mut object = file_metadata(node_id.clone());
+            object.object_id = DfsObjectId::from_legacy_named(format!("obj_rename_cap_{index:04}"))
+                .expect("object id");
+            object.path = format!("{old_dir}/file-{index:04}.txt");
+            object
+        })
+        .collect::<Vec<_>>();
+    let child_object_ids = children
+        .iter()
+        .map(|object| object.object_id.clone())
+        .collect::<BTreeSet<_>>();
+    dfs.add_object_metadata_batch(children)
+        .expect("populate child metadata");
+    let journal_after_sequence = dfs
+        .metadata_backend()
+        .expect("metadata backend")
+        .journal_since(0)
+        .expect("journal before rename")
+        .last()
+        .map(|entry| entry.sequence)
+        .unwrap_or(0);
+
+    let job = dfs
+        .posix_rename_directory_bounded(old_dir, new_dir, max_steps)
+        .expect("oversized bounded rename batch");
+    assert_eq!(job.status, DfsNamespaceJobStatus::Completed);
+
+    let journal = dfs
+        .metadata_backend()
+        .expect("metadata backend")
+        .journal_since(journal_after_sequence)
+        .expect("rename journal");
+    let child_move_transactions = journal
+        .iter()
+        .filter_map(|entry| match &entry.mutation {
+            DfsMetadataMutation::ApplyNamespaceTransaction {
+                transaction_id,
+                transaction: Some(transaction),
+                ..
+            } if transaction_id.starts_with("namespace_rename-child-batch_") => Some(transaction),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        child_move_transactions.len(),
+        2,
+        "one child over the cap should require exactly two transactions"
+    );
+    assert_eq!(
+        child_move_transactions
+            .iter()
+            .map(|transaction| transaction.objects.len())
+            .max(),
+        Some(transaction_cap)
+    );
+    assert!(
+        child_move_transactions
+            .iter()
+            .all(|transaction| transaction.objects.len() <= transaction_cap),
+        "the caller's step budget must not enlarge durable transactions"
+    );
+    let journaled_child_object_ids = child_move_transactions
+        .iter()
+        .flat_map(|transaction| transaction.objects.iter())
+        .map(|object| object.object_id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(journaled_child_object_ids, child_object_ids);
+    assert_eq!(
+        child_move_transactions
+            .iter()
+            .map(|transaction| transaction.objects.len())
+            .sum::<usize>(),
+        child_count
+    );
+    assert_eq!(
+        dfs.posix_stat(&format!("{new_dir}/file-0000.txt"))
+            .expect("first moved child")
+            .kind,
+        DfsObjectKind::File
+    );
+    assert_eq!(
+        dfs.posix_stat(&format!("{new_dir}/file-{:04}.txt", child_count - 1))
+            .expect("last moved child")
+            .kind,
+        DfsObjectKind::File
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn sifs_posix_rename_directory_does_not_resurrect_deleted_children() {
     let root = temp_root("sifs-posix-rename-dir-deleted-child");
     let node_id = NodeId::from_legacy_named("node_sifs_rename_dir_deleted_child").expect("node");
@@ -24874,6 +25093,12 @@ fn sifs_posix_list_dir_page_walks_large_directory_incrementally() {
             .posix_list_dir_page(dir_path, cursor.as_ref(), 2)
             .expect("list page");
         assert!(page.entries.len() <= 2);
+        if let Some(next_cursor) = page.next_cursor.as_ref() {
+            assert!(
+                next_cursor.dentry.is_some(),
+                "overlay-free backend pages must preserve the bounded dentry cursor"
+            );
+        }
         names.extend(page.entries.into_iter().map(|entry| entry.name));
         pages = pages.saturating_add(1);
         let Some(next_cursor) = page.next_cursor else {
@@ -24910,6 +25135,180 @@ fn sifs_posix_list_dir_page_walks_large_directory_incrementally() {
             "file-4.txt"
         ]
     );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sifs_posix_list_dir_page_preserves_transient_overlays_across_pages() {
+    let root = temp_root("sifs-posix-list-page-transient-overlays");
+    let node_id = NodeId::from_legacy_named("node_sifs_list_page_overlays").expect("node");
+    let dir_path = "/services/sandbox/instances/sandbox_list_page_overlays/work";
+
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.posix_mkdir_all(dir_path).expect("mkdir");
+    let mut persisted = Vec::new();
+    for index in 0..5 {
+        persisted.push(
+            dfs.posix_write_file(
+                &format!("{dir_path}/file-{index}.txt"),
+                b"content",
+                DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+            )
+            .expect("write"),
+        );
+    }
+
+    let durable_object = dfs
+        .metadata()
+        .object(&persisted[0].object_id)
+        .expect("durable object metadata")
+        .clone();
+    dfs.add_transient_object_metadata(durable_object)
+        .expect("identical durable metadata observation");
+    assert!(
+        !dfs.transient_metadata_object_ids
+            .contains(&persisted[0].object_id),
+        "an observation identical to the durable namespace must not become a pagination overlay"
+    );
+    assert!(
+        dfs.transient_metadata_object_ids.is_empty(),
+        "objects already identical to durable backend state must not force overlay pagination"
+    );
+
+    let mut tombstone = dfs
+        .metadata()
+        .object(&persisted[2].object_id)
+        .expect("persisted object metadata")
+        .clone();
+    tombstone.kind = DfsObjectKind::Tombstone;
+    tombstone.version = DfsVersion::generate();
+    tombstone.content_hash = None;
+    tombstone.content_size_bytes = None;
+    dfs.add_transient_object_metadata(tombstone)
+        .expect("transient tombstone");
+
+    let mut transient = file_metadata(node_id);
+    transient.file_system_id = sifs_file_system_id();
+    transient.object_id =
+        DfsObjectId::from_legacy_named("obj_sifs_list_transient_child").expect("object id");
+    transient.path = format!("{dir_path}/memory-only.txt");
+    transient.version = DfsVersion::generate();
+    transient.content_hash = None;
+    transient.content_size_bytes = Some(0);
+    dfs.add_transient_object_metadata(transient)
+        .expect("memory-only child");
+
+    let mut cursor = None;
+    let mut names = Vec::new();
+    let mut pages = 0usize;
+    loop {
+        let page = dfs
+            .posix_list_dir_page(dir_path, cursor.as_ref(), 2)
+            .expect("overlay list page");
+        assert!(page.entries.len() <= 2);
+        if let Some(next_cursor) = page.next_cursor.as_ref() {
+            assert!(
+                next_cursor.dentry.is_none() && next_cursor.shard_id.is_none(),
+                "overlay pages must retain their path-ordered cursor across page boundaries"
+            );
+        }
+        names.extend(page.entries.into_iter().map(|entry| entry.name));
+        pages = pages.saturating_add(1);
+        let Some(next_cursor) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "file-0.txt",
+            "file-1.txt",
+            "file-3.txt",
+            "file-4.txt",
+            "memory-only.txt",
+        ]
+    );
+    assert_eq!(pages, 3);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sifs_posix_list_dir_page_prefers_newer_durable_child_over_stale_memory_tombstone() {
+    let root = temp_root("sifs-posix-list-page-stale-memory-tombstone");
+    let node_id = NodeId::from_legacy_named("node_sifs_list_page_stale_tombstone").expect("node");
+    let dir_path = "/services/sandbox/instances/sandbox_list_page_stale_tombstone/work";
+
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.posix_mkdir_all(dir_path).expect("mkdir");
+    let mut persisted = Vec::new();
+    for index in 0..3 {
+        persisted.push(
+            dfs.posix_write_file(
+                &format!("{dir_path}/file-{index}.txt"),
+                b"content",
+                DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+            )
+            .expect("write"),
+        );
+    }
+
+    let mut stale_tombstone = dfs
+        .metadata()
+        .object(&persisted[1].object_id)
+        .expect("persisted object metadata")
+        .clone();
+    stale_tombstone.kind = DfsObjectKind::Tombstone;
+    stale_tombstone.version = DfsVersion::generate();
+    stale_tombstone.content_hash = None;
+    stale_tombstone.content_size_bytes = None;
+    dfs.track_metadata_tombstone(&stale_tombstone);
+
+    let mut durable_live = stale_tombstone.clone();
+    durable_live.kind = DfsObjectKind::File;
+    durable_live.version = DfsVersion::generate();
+    durable_live.content_hash = Some(content_hash(b"newer durable live child"));
+    durable_live.content_size_bytes = Some(b"newer durable live child".len() as u64);
+    LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+        .expect("durable live metadata backend")
+        .put_object(&durable_live)
+        .expect("newer durable live child");
+
+    assert!(
+        dfs.transient_metadata_object_ids.is_empty(),
+        "a stale observed tombstone is not an active transient namespace overlay"
+    );
+    let mut cursor = None;
+    let mut entries = Vec::new();
+    loop {
+        let page = dfs
+            .posix_list_dir_page(dir_path, cursor.as_ref(), 1)
+            .expect("list page");
+        assert!(page.entries.len() <= 1);
+        if let Some(next_cursor) = page.next_cursor.as_ref() {
+            assert!(
+                next_cursor.dentry.is_some(),
+                "stale non-transient tombstones must retain bounded backend pagination"
+            );
+        }
+        entries.extend(page.entries);
+        let Some(next_cursor) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    assert_eq!(entries.len(), 3);
+    let durable_entry = entries
+        .iter()
+        .find(|entry| entry.path == durable_live.path)
+        .expect("newer durable child must suppress the stale in-memory tombstone");
+    assert_eq!(durable_entry.kind, DfsObjectKind::File);
+    assert_eq!(durable_entry.object_id, durable_live.object_id);
 
     std::fs::remove_dir_all(root).ok();
 }

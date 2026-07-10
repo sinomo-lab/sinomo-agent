@@ -151,38 +151,59 @@ pub fn handle_dfs_direct_read_rpc_request(
     data_dir: &SinomoDataDir,
     request: ObjectRpcRequest,
 ) -> Result<ObjectRpcResponse, DfsError> {
-    if request.route != DFS_DIRECT_READ_ROUTE {
-        return Err(DfsError::Network {
-            message: format!("unknown DFS direct read route {}", request.route),
-        });
-    }
-    let request: DfsDirectReadRequest = request.decode_body().map_err(DfsError::from_network)?;
-    let response = serve_dfs_direct_read_request(data_dir, request)?;
-    dfs_direct_read_rpc_response(response).map_err(DfsError::from_network)
+    let request = decode_dfs_direct_read_rpc_request(request)?;
+    ensure_dfs_direct_read_root_layout(data_dir)?;
+    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+    encode_served_dfs_direct_read_response(serve_dfs_direct_read_request(&content, request)?)
+}
+
+pub(crate) fn handle_dfs_direct_read_rpc_request_with_initialized_content_store(
+    content: &LocalContentStore,
+    request: ObjectRpcRequest,
+) -> Result<ObjectRpcResponse, DfsError> {
+    let request = decode_dfs_direct_read_rpc_request(request)?;
+    encode_served_dfs_direct_read_response(serve_dfs_direct_read_request(content, request)?)
 }
 
 pub fn handle_dfs_direct_read_stream_rpc_request(
     data_dir: &SinomoDataDir,
     request: ObjectRpcRequest,
 ) -> Result<DfsDirectReadStreamResponse, DfsError> {
+    let request = decode_dfs_direct_read_rpc_request(request)?;
+    ensure_dfs_direct_read_root_layout(data_dir)?;
+    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+    serve_dfs_direct_read_stream_request(&content, request)
+}
+
+pub(crate) fn handle_dfs_direct_read_stream_rpc_request_with_initialized_content_store(
+    content: &LocalContentStore,
+    request: ObjectRpcRequest,
+) -> Result<DfsDirectReadStreamResponse, DfsError> {
+    let request = decode_dfs_direct_read_rpc_request(request)?;
+    serve_dfs_direct_read_stream_request(content, request)
+}
+
+fn decode_dfs_direct_read_rpc_request(
+    request: ObjectRpcRequest,
+) -> Result<DfsDirectReadRequest, DfsError> {
     if request.route != DFS_DIRECT_READ_ROUTE {
         return Err(DfsError::Network {
             message: format!("unknown DFS direct read route {}", request.route),
         });
     }
-    let request: DfsDirectReadRequest = request.decode_body().map_err(DfsError::from_network)?;
-    serve_dfs_direct_read_stream_request(data_dir, request)
+    request.decode_body().map_err(DfsError::from_network)
+}
+
+fn encode_served_dfs_direct_read_response(
+    response: DfsReadResponse,
+) -> Result<ObjectRpcResponse, DfsError> {
+    dfs_direct_read_rpc_response(response).map_err(DfsError::from_network)
 }
 
 fn serve_dfs_direct_read_request(
-    data_dir: &SinomoDataDir,
+    content: &LocalContentStore,
     request: DfsDirectReadRequest,
 ) -> Result<DfsReadResponse, DfsError> {
-    data_dir
-        .ensure_root_layout()
-        .map_err(|source| DfsError::Metadata {
-            message: source.to_string(),
-        })?;
     let object_id = request.object_id.clone();
     let result = if request.content_size_bytes > DFS_DIRECT_REMOTE_READ_MAX_BYTES {
         DfsReadResult::Rejected {
@@ -192,9 +213,8 @@ fn serve_dfs_direct_read_request(
             ),
         }
     } else {
-        let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
         match read_blob_for_direct_read_rpc_response(
-            &content,
+            content,
             &request.content_hash,
             request.content_size_bytes,
         )? {
@@ -215,14 +235,9 @@ fn serve_dfs_direct_read_request(
 }
 
 fn serve_dfs_direct_read_stream_request(
-    data_dir: &SinomoDataDir,
+    content: &LocalContentStore,
     request: DfsDirectReadRequest,
 ) -> Result<DfsDirectReadStreamResponse, DfsError> {
-    data_dir
-        .ensure_root_layout()
-        .map_err(|source| DfsError::Metadata {
-            message: source.to_string(),
-        })?;
     if request.content_size_bytes > DFS_DIRECT_REMOTE_READ_MAX_BYTES {
         let response = DfsReadResponse {
             request_id: request.request_id,
@@ -239,7 +254,6 @@ fn serve_dfs_direct_read_stream_request(
             reader: None,
         });
     }
-    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
     let reader = match content.open_blob_stream(&request.content_hash) {
         Ok(reader) => reader,
         Err(_) => {
@@ -298,6 +312,14 @@ fn serve_dfs_direct_read_stream_request(
         response,
         reader: Some(reader),
     })
+}
+
+fn ensure_dfs_direct_read_root_layout(data_dir: &SinomoDataDir) -> Result<(), DfsError> {
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| DfsError::Metadata {
+            message: source.to_string(),
+        })
 }
 
 fn read_blob_for_direct_read_rpc_response(

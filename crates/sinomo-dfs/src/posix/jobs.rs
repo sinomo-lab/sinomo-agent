@@ -6,9 +6,12 @@
 
 use super::{
     POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE, POSIX_RECURSIVE_CLEAR_JOB_BATCH_STEPS,
-    POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE, namespace_job_id, now_unix_nanos,
+    POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE, POSIX_RENAME_MOVE_TRANSACTION_MAX_OBJECTS,
+    POSIX_RENAME_MOVE_TRANSACTION_MAX_PATH_BYTES, namespace_job_id, now_unix_nanos,
 };
-use crate::namespace::{namespace_transaction_id_for_path, next_version};
+use crate::namespace::{
+    namespace_transaction_id_for_batch, namespace_transaction_id_for_path, next_version,
+};
 use crate::posix_model::{
     DfsNamespaceJobFailure, DfsNamespaceJobMaintenanceReport, DfsPosixError, Result,
 };
@@ -617,8 +620,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let source_prefix = subtree_prefix(&source_root);
         let target_prefix = subtree_prefix(&target_root);
         let mut steps = 0usize;
+        // Child moves are grouped into fixed-size durable transactions within
+        // the bounded job batch. Each move commits before the updated frames
+        // are persisted, so a crash in between safely replays the old frame:
+        // already-moved objects no longer appear below the source path and are
+        // skipped by id/path checks.
+        let mut pending_moves = Vec::new();
         while steps < max_steps {
             let Some(frame) = job.pending_frames.pop() else {
+                self.flush_rename_directory_job_move_batches(&mut job, &mut pending_moves, true)?;
                 self.touch_parent_directory_modified(&source_root)?;
                 if parent_posix_path(&source_root) != parent_posix_path(&target_root) {
                     self.touch_parent_directory_modified(&target_root)?;
@@ -687,9 +697,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         if current_path != object_path {
                             continue;
                         }
-                        if self.move_object_for_rename_job(&current, &target_child_path)? {
-                            job.processed_object_count =
-                                job.processed_object_count.saturating_add(1);
+                        if let Some(moved) =
+                            self.prepare_object_for_rename_job(&current, &target_child_path)?
+                        {
+                            pending_moves.push(moved);
+                            self.flush_rename_directory_job_move_batches(
+                                &mut job,
+                                &mut pending_moves,
+                                false,
+                            )?;
                         }
                     }
                     if let Some(next_cursor) = page.next_cursor {
@@ -726,12 +742,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     target_path,
                 } => {
                     steps = steps.saturating_add(1);
-                    if self.complete_rename_directory_job(
+                    if let Some(moved) = self.prepare_completed_rename_directory_job(
                         &source_object_id,
                         &source_path,
                         &target_path,
                     )? {
-                        job.processed_object_count = job.processed_object_count.saturating_add(1);
+                        pending_moves.push(moved);
+                        self.flush_rename_directory_job_move_batches(
+                            &mut job,
+                            &mut pending_moves,
+                            false,
+                        )?;
                     }
                 }
                 DfsNamespaceJobFrame::ScanDirectory { .. }
@@ -749,6 +770,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
         }
+        self.flush_rename_directory_job_move_batches(&mut job, &mut pending_moves, true)?;
         job.updated_at = time::OffsetDateTime::now_utc();
         self.persist_namespace_job(&job)?;
         Ok(job)
@@ -838,48 +860,132 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    fn complete_rename_directory_job(
-        &mut self,
+    fn prepare_completed_rename_directory_job(
+        &self,
         source_object_id: &DfsObjectId,
         source_path: &str,
         target_path: &str,
-    ) -> Result<bool> {
+    ) -> Result<Option<DfsObjectMetadata>> {
         let Some(current) = self.object_by_id(source_object_id)? else {
-            return Ok(false);
+            return Ok(None);
         };
         if current.kind == DfsObjectKind::Tombstone {
-            return Ok(false);
+            return Ok(None);
         }
         if current.kind != DfsObjectKind::Directory {
             return Err(DfsPosixError::NotDirectory {
                 path: source_path.to_string(),
             });
         }
-        self.move_object_for_rename_job(&current, target_path)
+        self.prepare_object_for_rename_job(&current, target_path)
     }
 
-    fn move_object_for_rename_job(
-        &mut self,
+    fn prepare_object_for_rename_job(
+        &self,
         object: &DfsObjectMetadata,
         target_path: &str,
-    ) -> Result<bool> {
+    ) -> Result<Option<DfsObjectMetadata>> {
         let current_path = normalize_posix_path(&object.path)?;
         if current_path == target_path {
-            return Ok(false);
+            return Ok(None);
         }
         let mut moved = object.clone();
         moved.path = target_path.to_string();
+        Ok(Some(moved))
+    }
+
+    fn apply_rename_directory_job_move_batch(
+        &mut self,
+        file_system_id: &crate::DfsFileSystemId,
+        moved_objects: Vec<DfsObjectMetadata>,
+    ) -> Result<u64> {
+        if moved_objects.is_empty() {
+            return Ok(0);
+        }
+        let moved_count = moved_objects.len() as u64;
         self.apply_namespace_transaction(DfsNamespaceTransaction {
-            transaction_id: namespace_transaction_id_for_path(
-                "rename-child",
-                &moved.object_id,
-                &moved.path,
+            transaction_id: namespace_transaction_id_for_batch(
+                "rename-child-batch",
+                file_system_id,
+                &moved_objects,
+                &[],
             ),
-            file_system_id: moved.file_system_id.clone(),
-            objects: vec![moved],
+            file_system_id: file_system_id.clone(),
+            objects: moved_objects,
             versions: Vec::new(),
             created_at: time::OffsetDateTime::now_utc(),
         })?;
-        Ok(true)
+        Ok(moved_count)
+    }
+
+    fn flush_rename_directory_job_move_batches(
+        &mut self,
+        job: &mut DfsNamespaceJobRecord,
+        pending_moves: &mut Vec<DfsObjectMetadata>,
+        flush_partial: bool,
+    ) -> Result<()> {
+        loop {
+            let batch_len = rename_directory_job_move_batch_len(
+                pending_moves.iter().map(|object| object.path.as_str()),
+            );
+            if batch_len == 0
+                || (!flush_partial
+                    && batch_len == pending_moves.len()
+                    && batch_len < POSIX_RENAME_MOVE_TRANSACTION_MAX_OBJECTS)
+            {
+                break;
+            }
+            let remaining = pending_moves.split_off(batch_len);
+            let moved = self.apply_rename_directory_job_move_batch(
+                &job.file_system_id,
+                std::mem::replace(pending_moves, remaining),
+            )?;
+            job.processed_object_count = job.processed_object_count.saturating_add(moved);
+        }
+        Ok(())
+    }
+}
+
+fn rename_directory_job_move_batch_len<'a>(paths: impl IntoIterator<Item = &'a str>) -> usize {
+    let mut count = 0usize;
+    let mut path_bytes = 0usize;
+    for path in paths
+        .into_iter()
+        .take(POSIX_RENAME_MOVE_TRANSACTION_MAX_OBJECTS)
+    {
+        let next_path_bytes = path.len();
+        if count > 0
+            && path_bytes.saturating_add(next_path_bytes)
+                > POSIX_RENAME_MOVE_TRANSACTION_MAX_PATH_BYTES
+        {
+            break;
+        }
+        count = count.saturating_add(1);
+        path_bytes = path_bytes.saturating_add(next_path_bytes);
+    }
+    count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rename_move_batch_len_caps_aggregate_path_bytes_but_allows_one_oversized_path() {
+        let more_than_half = POSIX_RENAME_MOVE_TRANSACTION_MAX_PATH_BYTES / 2 + 1;
+        let first = "a".repeat(more_than_half);
+        let second = "b".repeat(more_than_half);
+        assert_eq!(
+            rename_directory_job_move_batch_len([first.as_str(), second.as_str()]),
+            1
+        );
+
+        let oversized = "x".repeat(POSIX_RENAME_MOVE_TRANSACTION_MAX_PATH_BYTES + 1);
+        assert_eq!(
+            rename_directory_job_move_batch_len([oversized.as_str(), "/next"]),
+            1,
+            "an oversized first object remains a valid one-object batch"
+        );
+        assert_eq!(rename_directory_job_move_batch_len([oversized.as_str()]), 1);
     }
 }

@@ -754,11 +754,37 @@ impl LocalContentStore {
         &self,
         object_id: &str,
         version: &str,
-        reader: R,
+        mut reader: R,
         capture_limit_bytes: usize,
     ) -> Result<(ContentManifest, Option<Vec<u8>>)> {
         let internal_capture_limit =
             capture_limit_bytes.max(PACKED_BLOB_SMALL_LIMIT_BYTES as usize);
+
+        // Keep small reader-backed writes in memory. The old path created,
+        // wrote, fsynced, and removed a temporary file before writing the same
+        // bytes into the packed-blob store. Small POSIX files are common and
+        // already fit within the bounded capture budget, so probe one byte past
+        // that budget and spill only when the input is actually larger.
+        let probe_limit = u64::try_from(internal_capture_limit)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let mut buffered = Vec::new();
+        (&mut reader)
+            .take(probe_limit)
+            .read_to_end(&mut buffered)
+            .map_err(|source| ContentStoreError::Io {
+                path: self.root.join("blob-tmp").join("streamed-object-version"),
+                source,
+            })?;
+        if buffered.len() <= internal_capture_limit {
+            let size_bytes = buffered.len() as u64;
+            let manifest = self.write_object_version(object_id, version, &buffered)?;
+            let captured =
+                capture_limit_includes_size(capture_limit_bytes, size_bytes).then_some(buffered);
+            return Ok((manifest, captured));
+        }
+
+        let reader = std::io::Cursor::new(buffered).chain(reader);
         let mut streamed =
             self.write_streamed_object_version_file(reader, internal_capture_limit)?;
         if streamed.size_bytes <= PACKED_BLOB_SMALL_LIMIT_BYTES {
@@ -4370,6 +4396,29 @@ mod tests {
             "streaming writes must not leave temporary staging files"
         );
         assert_eq!(store.stats().expect("stats").staging_bytes, 0);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn put_small_object_version_from_reader_skips_temporary_blob_file() {
+        let root = temp_root("put_small_object_version_from_reader_skips_temporary_blob_file");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let bytes = b"small reader-backed DFS object";
+
+        let manifest = store
+            .put_object_version_from_reader("object-small-reader", "v1", bytes.as_slice())
+            .expect("put small object version from reader");
+
+        assert_eq!(manifest.size_bytes, bytes.len() as u64);
+        assert_eq!(
+            store.read_blob(&manifest.content_hash).expect("read blob"),
+            bytes
+        );
+        assert!(
+            !root.join("blob-tmp").exists(),
+            "small reader-backed writes must stay within the bounded memory fast path"
+        );
 
         cleanup(&root);
     }

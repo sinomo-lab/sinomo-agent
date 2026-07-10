@@ -20,6 +20,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::direct_read::{
+    handle_dfs_direct_read_rpc_request_with_initialized_content_store,
+    handle_dfs_direct_read_stream_rpc_request_with_initialized_content_store,
+};
 use crate::local_state::open_cluster_aware_dfs_metadata_backend_for_inspection;
 use crate::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_PLANE_SERVICE_ROUTES, DFS_DIRECT_READ_ROUTE,
@@ -29,10 +33,9 @@ use crate::{
     DfsMessageResponse, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
     DfsMetadataJournalBatchResponse, DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand,
     DfsMetadataSnapshotInstallResponse, DfsOperatorInspector, DfsOperatorStatus, DfsSmokeReport,
-    decode_dfs_message_rpc_request, default_dfs_metadata_root, default_dfs_metadata_shards_root,
-    dfs_module_surfaces, dfs_route_is_message_data_plane,
-    ensure_default_cluster_aware_dfs_expose_config, handle_dfs_direct_read_rpc_request,
-    handle_dfs_direct_read_stream_rpc_request, inspect_cluster_aware_dfs_status,
+    LocalContentStore, decode_dfs_message_rpc_request, default_dfs_metadata_root,
+    default_dfs_metadata_shards_root, dfs_module_surfaces, dfs_route_is_message_data_plane,
+    ensure_default_cluster_aware_dfs_expose_config, inspect_cluster_aware_dfs_status,
     metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
     resolve_dfs_conflicts, sifs_file_system_id, use_dfs_conflict_version,
 };
@@ -150,11 +153,42 @@ pub type DfsDataPlaneHostFuture<'a, T> =
 #[derive(Clone)]
 pub struct DfsDataPlaneService {
     host: Arc<dyn DfsDataPlaneHost>,
+    content_stores: Arc<
+        std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, Arc<LocalContentStore>>>,
+    >,
 }
 
 impl DfsDataPlaneService {
     pub fn new(host: Arc<dyn DfsDataPlaneHost>) -> Self {
-        Self { host }
+        Self {
+            host,
+            content_stores: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+        }
+    }
+
+    fn content_store_for(
+        &self,
+        data_dir: &SinomoDataDir,
+    ) -> Result<Arc<LocalContentStore>, ServiceError> {
+        let content_root = data_dir.dfs_dir().join("content");
+        let mut stores = self.content_stores.lock().map_err(|_| {
+            ServiceError::Service("DFS data-plane content-store cache is poisoned".to_string())
+        })?;
+        if let Some(store) = stores.get(&content_root) {
+            return Ok(Arc::clone(store));
+        }
+        data_dir.ensure_root_layout().map_err(service_error)?;
+        let store = Arc::new(LocalContentStore::new(&content_root).map_err(service_error)?);
+        stores.insert(content_root, Arc::clone(&store));
+        Ok(store)
+    }
+
+    #[cfg(test)]
+    fn cached_content_store_count(&self) -> usize {
+        self.content_stores
+            .lock()
+            .expect("DFS data-plane content-store cache")
+            .len()
     }
 }
 
@@ -262,22 +296,30 @@ impl Service for DfsDataPlaneService {
     }
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
-        let host = Arc::clone(&self.host);
+        let service = self.clone();
         Box::pin(async move {
             let response = match request.route.as_str() {
                 DFS_SMOKE_ROUTE => {
                     let _: () = request.decode_body()?;
-                    let report = host.run_smoke().await.map_err(service_error)?;
+                    let report = service.host.run_smoke().await.map_err(service_error)?;
                     ObjectRpcResponse::encode_body(DFS_SMOKE_ROUTE, &report)?
                 }
                 route if dfs_route_is_message_data_plane(route) => {
                     let command = decode_dfs_message_rpc_request(&request)?;
-                    let message_response =
-                        host.handle_message(command).await.map_err(service_error)?;
+                    let message_response = service
+                        .host
+                        .handle_message(command)
+                        .await
+                        .map_err(service_error)?;
                     ObjectRpcResponse::encode_body(route, &message_response)?
                 }
-                DFS_DIRECT_READ_ROUTE => handle_dfs_direct_read_rpc_request(&ctx.data_dir, request)
-                    .map_err(service_error)?,
+                DFS_DIRECT_READ_ROUTE => {
+                    let content = service.content_store_for(&ctx.data_dir)?;
+                    handle_dfs_direct_read_rpc_request_with_initialized_content_store(
+                        &content, request,
+                    )
+                    .map_err(service_error)?
+                }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
             };
             ctx.respond(response)?;
@@ -296,8 +338,13 @@ impl Service for DfsDataPlaneService {
         {
             return None;
         }
+        let service = self.clone();
         Some(Box::pin(async move {
-            let stream_response = handle_dfs_direct_read_stream_rpc_request(&ctx.data_dir, request)
+            let content = service.content_store_for(&ctx.data_dir)?;
+            let stream_response =
+                handle_dfs_direct_read_stream_rpc_request_with_initialized_content_store(
+                    &content, request,
+                )
                 .map_err(service_error)?;
             Ok(ServiceStreamResponse {
                 response: stream_response.response,
@@ -630,6 +677,24 @@ mod tests {
         (disposition, response)
     }
 
+    async fn dispatch_stream_local(
+        registry: &ServiceRegistry,
+        data_dir: Arc<SinomoDataDir>,
+        request: ObjectRpcRequest,
+    ) -> ServiceStreamResponse {
+        let ctx = ServiceContext {
+            data_dir,
+            cluster: None,
+            signer: ServiceSigner::Local,
+            sink: Box::new(VecSink::default()),
+        };
+        registry
+            .dispatch_stream_direct(ctx, request)
+            .expect("stream dispatch future")
+            .await
+            .expect("stream dispatch")
+    }
+
     #[test]
     fn dfs_service_route_metadata_matches_module_surfaces() {
         let registry = register_data_plane_services(
@@ -679,6 +744,63 @@ mod tests {
                     .map(|timeout| timeout.as_millis().min(u128::from(u64::MAX)) as u64)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn dfs_direct_read_service_reuses_initialized_content_store() {
+        let (_root, data_dir) = temp_data_dir();
+        data_dir.ensure_root_layout().expect("root layout");
+        let object_id = DfsObjectId::generate();
+        let version = DfsVersion::generate();
+        let bytes = (0..(crate::DFS_BLOB_INLINE_LIMIT_BYTES + 16 * 1024))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let content =
+            LocalContentStore::new(data_dir.dfs_dir().join("content")).expect("content store");
+        let manifest = content
+            .put_object_version(object_id.as_str(), version.as_str(), &bytes)
+            .expect("put object version");
+        let direct_read = crate::DfsDirectReadRequest {
+            request_id: "service-direct-read-cache".to_string(),
+            object_id,
+            version,
+            content_hash: manifest.content_hash,
+            content_size_bytes: bytes.len() as u64,
+        };
+        let service = DfsDataPlaneService::new(Arc::new(StubDfsDataPlaneHost::default()));
+        let cache_probe = service.clone();
+        let registry = ServiceRegistry::builder().register(service).build();
+
+        let first_request =
+            crate::dfs_direct_read_rpc_request(&direct_read).expect("first request");
+        let mut first = dispatch_stream_local(&registry, data_dir.clone(), first_request).await;
+        let mut first_bytes = Vec::new();
+        std::io::Read::read_to_end(
+            first.reader.as_mut().expect("first stream reader"),
+            &mut first_bytes,
+        )
+        .expect("read first stream");
+        assert_eq!(first_bytes, bytes);
+        assert_eq!(cache_probe.cached_content_store_count(), 1);
+        let first_cached = cache_probe
+            .content_store_for(&data_dir)
+            .expect("first cached content store");
+
+        let second_request =
+            crate::dfs_direct_read_rpc_request(&direct_read).expect("second request");
+        let mut second = dispatch_stream_local(&registry, data_dir.clone(), second_request).await;
+        let mut second_bytes = Vec::new();
+        std::io::Read::read_to_end(
+            second.reader.as_mut().expect("second stream reader"),
+            &mut second_bytes,
+        )
+        .expect("read second stream");
+        assert_eq!(second_bytes, bytes);
+        assert_eq!(cache_probe.cached_content_store_count(), 1);
+        let second_cached = cache_probe
+            .content_store_for(&data_dir)
+            .expect("second cached content store");
+        assert!(Arc::ptr_eq(&first_cached, &second_cached));
     }
 
     #[tokio::test]
