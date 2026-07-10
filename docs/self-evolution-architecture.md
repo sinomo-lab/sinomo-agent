@@ -29,7 +29,8 @@ candidate, verification, and evidence lifecycle for another project.
 - Make every mutation scoped, replayable, inspectable, and reversible.
 - Let models propose and implement changes, but never grant them direct
   authority over the live runtime.
-- Prefer R3 sandboxed modules as the first autonomous mutation target.
+- Prefer the evolution R3 sandboxed-module class as the first autonomous
+  mutation target.
 - Preserve R0/R1 continuity with standby, handoff, checkpoints, and rollback
   before any trusted-runtime mutation can activate.
 - Treat evaluation evidence, policy, provenance, and node-local loader checks as
@@ -44,12 +45,19 @@ candidate, verification, and evidence lifecycle for another project.
 - No assumption that a public benchmark is sufficient evidence for real
   improvement.
 
-## Trust Rings
+## Evolution Risk Rings
 
-Self-evolution is constrained by trust rings. Lower rings have more continuity
-responsibility and therefore require stronger gates.
+Self-evolution uses the `TrustRing` domain model to classify mutation risk and
+required containment. This is distinct from the Cargo dependency rings in
+package metadata. Evolution R0 through R2 align conceptually with the
+foundation, trusted runtime, and trusted services, but they are not dependency
+tags. Evolution R3 through R5 classify artifacts, disposable workspaces, and
+model providers and have no Cargo dependency meaning.
 
-| Ring | Contents | Mutation Rule |
+Lower evolution rings have more continuity responsibility and therefore
+require stronger gates.
+
+| Evolution ring | Contents | Mutation Rule |
 |---|---|---|
 | R0 continuity root | event envelope, ID contracts, artifact verifier, policy verifier, rollback loader, emergency stop | Mutate only through dual-root or equivalent standby handoff with strongest continuity gates. |
 | R1 trusted runtime | node supervisor, event store, DFS metadata, sandbox host, rollout controller | Mutate through standby execution, state handoff, health checks, activation checkpoints, and rollback checkpoints. |
@@ -87,6 +95,25 @@ Core responsibilities:
 - Register approved artifacts with provenance.
 - Roll out by module and node under local policy.
 - Convert failures into rollback, new replay cases, and future opportunities.
+
+## Campaign Proposals
+
+A long-horizon campaign groups repeated evolution jobs under one human-provided
+objective. The campaign owns staged acceptance targets, a near-term task
+backlog, resource and reserve policy, approval checkpoints, and an auditable
+decision history. It can redirect work toward a prerequisite when evidence
+shows that the prerequisite blocks the original objective.
+
+Phase zero is proposal-only. It persists an inspectable campaign bundle with the
+interpreted objective, assumptions, non-goals, stages, metrics, tasks, budget
+preview, and approval state without dispatching implementation agents or
+activating candidates. When policy requires human approval, scheduled execution
+cannot begin until that checkpoint is recorded.
+
+After approval, each concrete iteration still uses the normal scoped job,
+candidate bundle, evaluation, policy, registry, rollout, and rollback lifecycle.
+Campaign scheduling chooses what to try next; it does not weaken the evidence or
+authority required to ship a change.
 
 ## Lifecycle
 
@@ -198,9 +225,11 @@ The manifest is part of the signed artifact. A candidate cannot grant itself new
 powers by editing code; capability changes are explicit manifest changes and
 must pass policy.
 
-R3 modules should use Wasm components where possible. The first boundary may use
-JSON for unstable payloads, but stable contracts should move toward typed WIT
-records.
+The capsule lifecycle is backend-neutral. Sandboxed processes, native modules,
+declarative resources, and Wasm components may all participate when they meet
+the same manifest, capability, evaluation, and rollback contracts. Wasm and
+typed WIT interfaces are preferred when their portability and isolation fit the
+module, but they are not a requirement for every evolution R3 boundary.
 
 ## Evaluation
 
@@ -264,10 +293,10 @@ Policy outputs include:
 
 Default posture:
 
-- R0/R1 changes need continuity-specific gates and standby handoff.
-- R2 changes need strong evaluation and canary rollback.
-- R3 changes may auto-promote only when scorecards, manifests, capabilities, and
-  rollout telemetry stay inside policy.
+- Evolution R0/R1 changes need continuity-specific gates and standby handoff.
+- Evolution R2 changes need strong evaluation and canary rollback.
+- Evolution R3 changes may auto-promote only when scorecards, manifests,
+  capabilities, and rollout telemetry stay inside policy.
 - New filesystem, network, process, secret, or device capability requests need
   extra evidence.
 - Changes touching policy, registry trust, artifact verification, rollback, or

@@ -1,11 +1,15 @@
 # R0/R1 Crate Boundary Refactor Plan
 
-Status: in progress (2026-07-01). Stage A landed; this revision incorporates the
-adversarial design review (cycle evidence in endpoint_selector/route/
-control_plane_driver, kv<->cluster partition errors, dylib loader and staging
-gaps).
+Status: completed and retained as an implementation record. Last reviewed
+2026-07-09.
 
-This plan reorganizes the workspace crate boundary so that the trust-ring cut in
+The facade migration flag is enabled and the workspace boundary test enforces
+the resulting dependency graph. Stage descriptions below record the sequencing
+and design reasoning at the time of the refactor; they are not an active task
+list. Current rules live in [AGENTS.md](../../AGENTS.md) and the
+[architecture overview](../architecture.md).
+
+This plan reorganized the workspace crate boundary so that the trust-ring cut in
 `docs/architecture.md` matches the crate graph precisely, turns `sinomo-network`
 into a pure networking library with a runtime network-module system, and makes
 the daemon the single cluster operator for CLI and app.

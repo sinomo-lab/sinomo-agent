@@ -449,8 +449,9 @@ Self-evolution should target the narrowest natural unit:
 - Wasm component only when dynamic procedural isolation is worth the runtime
   cost.
 
-R3 does not mean Wasm. R3 means lower blast radius and stronger containment.
-The backend is a separate architectural decision.
+Evolution target ring R3 does not mean Wasm and is not a Cargo dependency-ring
+tag. It means lower blast radius and stronger containment. The backend is a
+separate architectural decision.
 
 Every self-evolution candidate still needs evidence before activation:
 manifest validation, capability review, tests, replay, scorecard, provenance,

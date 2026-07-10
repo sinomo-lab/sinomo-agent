@@ -1,10 +1,14 @@
 # SIFS
 
-SIFS, the Sinomo File System, is the root filesystem for a Sinomo cluster. Many cluster operations depend on paths in SIFS for node-local files, shared user state, service state, artifacts, and future operational workspaces.
+SIFS is the default filesystem exposed by a Sinomo cluster. Users and services
+share one namespace while each subtree retains an explicit ownership and
+replication policy. Node-local files, shared user workspaces, service state, and
+artifacts therefore remain distinguishable even when they are accessed through
+the same filesystem.
 
-From `sinomo-dfs`'s perspective, SIFS is intentionally not a special storage engine. It is the default filesystem that the cluster exposes. The DFS layer stores and routes SIFS metadata, content, receipts, repair state, and conflicts using the same object, metadata-shard, content-store, and policy mechanisms used by any other DFS filesystem.
-
-What makes SIFS special is its role and its predefined layout.
+SIFS is a named DFS configuration, not a separate storage engine. The
+[DFS architecture](dfs-architecture.md) defines its metadata, content,
+consistency, and repair behavior.
 
 ## Default Layout
 
@@ -61,16 +65,35 @@ SIFS configuration and DFS service discovery are compact cluster control-plane r
 
 Per-path metadata, object metadata, object versions, write intents, replica receipts, conflicts, and content manifests do not live in KV. They are managed by DFS metadata shards and node-local DFS content stores.
 
-## Implementation Notes
+## Access and Compatibility
 
-`crates/sinomo-dfs/src/namespace.rs` defines the SIFS bootstrap layout and subtree policies.
+SIFS is available through the DFS path API and platform filesystem adapters.
+The public mount command is:
 
-`crates/sinomo-dfs/src/local_owned.rs` defines the local-owned node file exposure at `/sinomo/nodes/<node_id>/files`.
+```sh
+sinomo dfs mount <mount-point> [--root <sifs-path>]
+```
 
-`crates/sinomo-dfs/src/posix.rs` exposes SIFS through a POSIX-like path API for mkdir, paginated list, stat, read, streaming read, write, write-at, rename, and unlink operations. Large recursive clears and directory renames are durable bounded namespace jobs so they can resume after daemon or process restart.
+Unix uses FUSE where supported. Windows uses the Cloud Files integration. Both
+adapters preserve the same SIFS namespace and policy model.
 
-In a cluster, both content writes and namespace mutations route to the configured metadata-shard primary when invoked on a non-primary node; the primary's response replays its journal so the caller reads its own write immediately, and POSIX error semantics survive the routing.
+Content writes and namespace mutations route to the responsible metadata-shard
+primary. Successful responses carry enough metadata progress for the caller to
+read its own write. Large recursive clears, directory renames, and cross-shard
+changes run as bounded durable jobs so they can resume after restart.
 
-Deliberate POSIX deviations: `.` and `..` components resolve lexically before symlink resolution (invisible under FUSE, which pre-resolves them; visible to direct API callers); read-triggered atime updates are skipped on non-primary nodes (`noatime`-style) to keep replica journals aligned; reads of an object with an open replication conflict fail with `ESTALE` until the conflict is resolved; mutations of a path participating in an in-flight cross-shard move fail with `EAGAIN` and should be retried; and timestamps come from per-node wall clocks, so cross-node mtime ordering is subject to clock skew.
+SIFS is POSIX-like, with deliberate distributed-system differences:
 
-`crates/sinomo-dfs-fuse` adapts that POSIX-like SIFS API to a host FUSE mount. It is an application-level crate with target gating: Unix builds enable the FUSE backend by default, while unsupported platforms compile only the stub API. Windows exposes SIFS through the Cloud Files API via the trusted native-dylib module at `modules/dfs/cloud-files`, which is built and activated by default on Windows install/rollout paths. The CLI entry point is `sinomo dfs mount <mount-point> [--root <sifs-path>]`; on Unix the mount point is a FUSE mount, and on Windows it is a Cloud Files sync root.
+- `.` and `..` are resolved lexically before symlink resolution for direct API
+  callers.
+- Read-triggered access-time updates may be skipped on replicas to preserve
+  journal authority.
+- Reading an object with an open recovery conflict fails with `ESTALE` until
+  the conflict is resolved.
+- A path locked by an in-progress cross-shard move returns a retryable error.
+- Timestamps originate on individual nodes, so cross-node ordering is subject
+  to clock skew.
+
+Normal quorum-backed operation does not create divergent visible versions. Any
+future split-cluster recovery mode must define explicit conflict and
+reconciliation behavior before it can be enabled.

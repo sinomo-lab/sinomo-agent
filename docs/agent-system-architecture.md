@@ -39,41 +39,17 @@ inference, and provider error categories.
 
 ## Crate Boundaries
 
-The main implementation lives in `crates/sinomo-agent`.
+| Owner | Responsibility |
+|---|---|
+| `sinomo-agent` | Packages, sessions, context assembly, tool orchestration, compaction, cancellation, and live control. |
+| `sinomo-lm` | Provider adapters, protocol rendering, stream normalization, context-window inference, and provider error classification. |
+| `sinomo-daemon` | Hosting agent service routes through application-supplied hooks without depending on R2 behavior. |
+| Network and sandbox crates | Routed execution and cancellable isolation used by tools. |
+| `sinomo-cli` and `sinomo-app` | User interaction and runtime-control clients. |
+| Benchmark modules | Optional model-quality and compaction evaluation. |
 
-Important exported surfaces:
-
-- `Agent`, `AgentSession`, `AgentRun`, `AgentItem`, and `AgentTranscript`;
-- `AgentDefinition`, `AgentPackageDefinition`, `AgentPackageProvenance`, and
-  `AgentCatalog`;
-- `AgentConfig`, `AgentLoopInput`, `AgentOutputFormat`, and `TurnContext`;
-- `ContextAssembler`, `ContextBlock`, `ContextFrame`, `ContextDelta`,
-  `ContextAssemblyReport`, and `ContextBudgetEstimate`;
-- `AgentCompactor` and `AgentCompactionSummary`;
-- `AgentToolRegistry`, `AgentToolOrchestrator`, `AgentToolSurface`,
-  `ToolAvailability`, `AgentToolEvidence`, and `AgentToolPairIntegrity`;
-- `SkillCatalog`, `SkillCatalogEntry`, `SkillCatalogSifsStore`,
-  `SkillActivationRecord`, and `SkillConflictRecord`;
-- `AgentSessionStore`, `FileAgentSessionStore`, `AgentTraceStore`, and
-  `FileAgentTraceStore`;
-- `AgentSessionControlPlane`, `AgentSessionRuntime`,
-  `AgentRuntimeService`, `AgentRuntimeControlService`,
-  `AgentRuntimeControlHost`, and `AgentRuntimeControlRegistry`;
-- `run_local_agent_readiness_gate` and the CLI-facing readiness report types.
-
-Supporting crates:
-
-- `sinomo-lm` owns provider adapters, protocol rendering, provider-neutral
-  stream events, tool-call collection, context-window inference, and provider
-  error classification.
-- `sinomo-cli` exposes `sinomo agent ...` commands, `sinomo test run ...`,
-  daemon registration hooks, and local/readiness test cases.
-- `sinomo-daemon` hosts service routes without depending on R2 agent code
-  directly; application registration supplies the agent service hooks.
-- `sinomo-network`, `sinomo-sandbox`, and `sinomo-sandbox-wasix-host` provide
-  object-RPC routing and cancellable sandbox execution used by agent tools.
-- `modules/benchmark/sinomo-benchmarks` owns optional benchmark and eval
-  harnesses, including compaction quality scenarios.
+Public Rust types are documented in source and Rustdoc. This document focuses
+on ownership and behavior that must remain stable across those types.
 
 ## Agent Packages
 
@@ -133,24 +109,9 @@ caps do not become sticky: switching from a capped package back to an unbounded
 package clears package-derived caps, while caller-provided explicit caps survive
 package swaps and JSON persistence.
 
-CLI package commands:
-
-```sh
-sinomo agent inspect [agent-id] [--json]
-sinomo agent validate [agent-id|--file <path>] [--json]
-sinomo agent export [agent-id] [--output <path>]
-sinomo agent import <path> [--json]
-```
-
-CLI skill commands:
-
-```sh
-sinomo skill list [--all] [--json]
-sinomo skill show <skill-id> [--version <version>] [--text|--json]
-sinomo skill import <path-or-dir> [--id <skill-id>] [--version <version>] [--no-activate] [--json]
-sinomo skill export <skill-id> [--version <version>] [--output <path>] [--json]
-sinomo skill activate <skill-id> [--version <version>] [--scope <scope>] [--json]
-```
+The CLI can inspect, validate, import, and export agent packages, and can list,
+inspect, import, export, and activate skills. Use `sinomo agent help` and
+`sinomo skill help` for the current command surface.
 
 Community skill import treats the Markdown `SKILL.md` as the ground-truth body.
 Common frontmatter keys such as `name`, `description`, and
@@ -258,209 +219,88 @@ projections are bounded.
 
 ## Storage and Evidence
 
-`AgentSessionStore` is the reloadable session-state boundary.
-`FileAgentSessionStore` writes:
+Session storage has three distinct products:
 
-- `events/agent/sessions/<session>/snapshot.json`;
-- `events/agent/sessions/<session>/events.jsonl`;
-- `events/agent/sessions/<session>/items.jsonl`;
-- `events/agent/sessions/<session>/projections.jsonl`.
+- a canonical resume snapshot;
+- append-only session items and context projections for audit;
+- traces and full tool evidence for diagnosis and replay.
 
-The snapshot is the canonical resume projection. Item and projection streams are
-append-only audit trails.
-
-`AgentTraceStore` is the append-only observability boundary.
-`FileAgentTraceStore` writes run boundaries, context reports, model events,
-typed context frames and deltas, transcript items, tool outcomes, compactions,
-and emitted runtime events under `events/agent/traces/<session>.jsonl`.
-
-Full command and tool evidence can be written under
-`events/agent/evidence/<session>/...`. `LocalWorkspaceAgentConfig` wires local
-evidence roots and optional SIFS-backed evidence mounts into workspace tools.
-
-`sinomo-agent::register_storage_paths` registers `events/agent` as the R2-owned
-agent storage subtree.
+Model-visible output may be bounded or redacted, while durable evidence retains
+the complete command outcome and artifact references allowed by policy. Local
+storage and optional SIFS-backed evidence use the same ownership contract, and
+the agent subsystem registers its entire durable subtree through the shared
+storage registry.
 
 ## Tool Surface and Progressive Disclosure
 
-The primary availability surface is `AgentToolSurface`. Compatibility aliases
-for older `AgentPolicyBundle` and policy naming remain loadable for persisted
-data, but new code should use tool-surface and availability terminology.
+The tool planner combines registry and module descriptors, package declarations,
+visibility, allow and deny policy, capabilities, and the current registry
+generation. Only the planned surface is callable in a model turn.
 
-The tool planner combines:
+Large tool catalogs are progressively disclosed through search, description,
+and invocation bridges. Hidden tools cannot be called by guessing a name, and a
+stale call from an older registry generation fails with typed evidence. Every
+visible local tool must have an executor; advertising a tool never grants the
+capabilities needed to run it.
 
-- registry descriptors;
-- module-projected tools;
-- package-declared tools;
-- visible toolsets;
-- explicit allow and deny lists;
-- declared tool capabilities;
-- registry generation.
-
-Visible local tools must have executors. Planned visible tools without executors
-produce typed model-visible failures. Stale or hallucinated tool calls that are
-not planned for the current generation also produce typed model-visible
-failures with registry-generation and visible-toolset evidence.
-
-The coding package's visible bridge tools are:
-
-- `tool_search`;
-- `tool_describe`;
-- `tool_call`;
-- `skill_search`;
-- `skill_describe`;
-- `skill_activate`.
-
-Hidden tools such as `git_diff` can be discovered and invoked through these
-bridges. Direct guessed calls to hidden tools are blocked.
-
-`skill_search` and `skill_describe` disclose package-declared skills and module
-embedded skills. `skill_activate` currently returns an explicit host-runtime
-activation contract unless an embedding runtime attaches an activation executor.
+Skill discovery follows the same rule. Package and module skills can be
+described without loading every skill body into prompt context, and activation
+remains a host-runtime operation rather than a prompt-side authority.
 
 ## Workspace Tools
 
-The local workspace registry includes file, search, patch, version-control,
-command, and user-input tools.
+The workspace surface covers bounded file discovery and reads, targeted and
+whole-file editing, structured patching, version-control inspection, command
+execution, and user input. Its architecture is defined by behavior rather than
+individual tool names:
 
-Important behavior:
-
-- `read_file`, `list_files`, and `search` bound model-visible output.
-- `edit_file` is the provider-neutral targeted source-editing tool. It accepts
-  structured exact text replacement inputs, requires one match by default, and
-  can explicitly replace all matches when requested.
-- `write_file` is the provider-neutral whole-file creation/replacement tool.
-  Existing files require `overwrite=true`; missing parent directories require
-  `create_parents=true`.
-- `apply_patch` remains available as an advanced/provider-specific source
-  editing tool and supports raw patch text plus structured small-edit forms such
-  as exact replacement and one-based range replacement. It is not the
-  provider-neutral default model-visible editing surface. OpenAI deliberation
-  and evolution agents expose it by default because the OpenAI tool adapter has
-  a custom grammar path for this tool.
-- `changed_files` and `git_diff` are version-control helpers. `git_diff` is
-  normally hidden behind progressive disclosure and preserves durable full-diff
-  artifacts while returning a bounded preview.
-- `run_command` preserves stdout, stderr, exit status, duration, timeout state,
-  availability, execution evidence, and artifact refs across success, failure,
-  and timeout paths.
-- Large command output can be mirrored to SIFS-backed artifact refs while the
-  model-visible turn sees only bounded output and redacted artifact availability.
-- Model-visible tool results omit local and SIFS artifact URI values while
-  durable evidence keeps the exact refs.
-
-The coding-state reducer classifies validation outcomes, including missing
-commands, missing dependencies, environment blockers, terminal validation
-blockers, and patch-relevant failures. A narrow patch can finish as
-environment-blocked when remaining validation is blocked by missing setup rather
-than by patch evidence.
+- Reads and previews are bounded before entering model context.
+- Destructive or ambiguous writes require explicit intent.
+- Version-control and command tools preserve full durable evidence even when
+  the model sees only a compact preview.
+- Timeouts, cancellation, unavailable commands, and nonzero exits remain typed
+  outcomes rather than being flattened into text.
+- Local and SIFS artifact locations may be redacted from model-visible output
+  while remaining available to authorized runtime components.
+- Validation distinguishes patch failures from missing dependencies or other
+  environment blockers.
 
 ## Runtime Services and Live Control
 
-`AgentSessionControlPlane` serializes active-turn state, task snapshots, task
-progress summaries, result refs, terminal statuses, and buffered events through
-`AgentSessionControlSnapshot`.
+The control plane exposes read-only inspection separately from live steering,
+follow-up, interrupt, and resume operations. A daemon may always expose durable
+session metadata; only the process that owns a live runtime can attach the
+control operations that mutate it.
 
-Read-only object-RPC routes:
+Resume reports distinguish a live attachment, persisted metadata without live
+handles, and a missing session. Persisted state does not pretend to restore
+subprocess or model-stream handles after a process restart. A host may implement
+deeper task reattachment, but that capability remains explicit.
 
-- `/agent/session/inspect`;
-- `/agent/session/progress`;
-- `/agent/session/terminal-results`.
-
-Runtime-control object-RPC routes:
-
-- `/agent/session/steer`;
-- `/agent/session/follow-up`;
-- `/agent/session/interrupt`;
-- `/agent/session/resume`.
-
-The default daemon registration exposes the read-only routes. A process that
-owns live runtimes can register `AgentRuntimeControlService` with an
-`AgentRuntimeControlHost`. `AgentRuntimeControlRegistry` is the reusable host for
-live `AgentSessionRuntime` handles.
-
-Resume responses include `runtime_attached` and a typed reattach report:
-
-- `live_runtime_attached` when the host still owns the live runtime;
-- `persisted_metadata_only` when session/control metadata exists but live
-  handles cannot be restored;
-- `missing` when neither live runtime nor persisted metadata exists.
-
-True in-flight task reattachment across process restart remains a host-owned
-mechanism. The implemented route reports that limitation explicitly instead of
-pretending persisted metadata can restore process handles.
-
-The app chat worker and app-started in-process daemon share an
-`AgentRuntimeControlRegistry`, so GUI calls can steer, queue follow-ups,
-interrupt, and inspect active model sessions backing chats owned by the app
-process.
+CLI, GUI, and cluster callers use the same typed service boundary. Chat UI state
+never becomes the owner of the underlying model session.
 
 ## Cancellation
 
-Cancellation is explicit across local and remote work.
+Cancellation is explicit and follows one operation identity across registries,
+subprocesses, sandboxes, gateways, object RPC, and cancel-aware modules. A
+caller can cancel before execution or while work is active. Once cancellation
+is accepted, a later transport or worker error is classified as cancellation
+rather than an unrelated failure.
 
-Implemented cancellation paths:
-
-- registry-level cancellation before non-command tool execution;
-- active version-control helper subprocess cancellation;
-- active sandbox/container cancellation;
-- host-provided gateway task cancellation;
-- remote object-RPC cancellation by operation id;
-- daemon sandbox cancellation routes;
-- native-dylib module cancellation routes for cancel-aware modules.
-
-Remote object-RPC tools stamp a `sinomo-operation-id` on run requests and send
-`ObjectRpcCancelRequest` to a configured cancel route with
-`sinomo-cancels-operation-id`. If a remote run returns an error after accepted
-cancellation, the agent classifies the outcome as cancelled rather than as an
-ordinary failure.
-
-Live-cluster test cases cover sandbox cancel route availability, active sandbox
-cancellation, native-dylib cancel route availability, and active cancel-aware
-module cancellation when the required fixtures are installed.
+Components that cannot stop active work must report that limitation. They must
+not acknowledge cancellation and continue producing authoritative side effects.
 
 ## Readiness Gates
 
 `sinomo agent readiness [--json]` runs the deterministic local readiness gate.
-It validates:
+It covers package and catalog validation, provider-boundary behavior, context
+budgets, progressive disclosure, tool evidence, cancellation, compaction,
+session resume, and live-control semantics.
 
-- built-in package metadata and package JSON round trips;
-- file-backed package save/load/import/catalog merge behavior;
-- malformed package rejection;
-- unbounded continuous-agent runtime defaults and explicit cap persistence;
-- prompt decomposition and provider-boundary delegation to `sinomo-lm`;
-- tool-surface compatibility aliases;
-- visible local tools having executors;
-- tool and skill progressive disclosure;
-- hidden-tool guarding and stale tool-call rejection;
-- task/workspace/placement run-context provenance;
-- prompt-reference, instruction-file, context-attachment, async-update, read-file,
-  tool-call input, and aggregate tool-result bounding;
-- `git_diff` hidden disclosure and durable full-diff evidence;
-- local, sandbox, gateway, and remote cancellation;
-- JSON decision parsing, text fallback, malformed-output repair, native tool
-  normalization, provider error classification, model metrics, and
-  `AgentToolPairIntegrity`;
-- deterministic compaction projection invariants;
-- session snapshot resume;
-- read-only runtime routes and runtime-control routes;
-- live steer/follow-up queueing, live interrupt, live resume, persisted-only
-  resume fallback, and missing-metadata resume fallback;
-- coding-state validation classification;
-- command evidence preservation, SIFS-backed command evidence, and
-  model-visible evidence redaction.
-
-Live-cluster agent tests are registered through the normal `sinomo test` harness:
-
-```sh
-sinomo test run cluster.agent.runtime-routes --require-cluster
-sinomo test run cluster.agent.runtime-persisted-session-routes --require-cluster
-sinomo test run cluster.agent.sandbox-cancel-route --require-cluster
-sinomo test run cluster.agent.sandbox-active-cancel --require-cluster
-sinomo test run cluster.agent.module-native-dylib-cancel-route --require-cluster
-sinomo test run cluster.agent.module-native-dylib-active-cancel --require-cluster
-sinomo test run --tag agent-readiness --require-cluster
-```
+Cluster-dependent checks run through the normal `sinomo test` harness under the
+`agent-readiness` tag. Exact cases belong in the test registry rather than this
+architecture document.
 
 Skipped selected cases are reported as `skipped` in text and JSON output. The
 suite command can still exit successfully when a live prerequisite is absent, so
@@ -479,36 +319,18 @@ readiness:
 - tool-surface availability constraints survive the projection;
 - session snapshots can resume after compaction.
 
-Model quality is eval work, not ordinary Rust unit testing. The optional
-benchmark module owns the live/model harness:
-
-```sh
-python3 modules/benchmark/sinomo-benchmarks/agent/run_compaction_eval.py --mode plan
-python3 modules/benchmark/sinomo-benchmarks/agent/run_compaction_eval.py --mode fixture --summary-out benchmark-results/agent-compaction/fixture-summary.json
-python3 modules/benchmark/sinomo-benchmarks/agent/run_compaction_eval.py --mode run --provider codex --model gpt-5.2-codex
-```
-
-The checked-in scenarios cover long-session resume, explicit constraint
-retention, coding continuation after compaction, and live-cluster operations
-after compaction. Fixture mode validates harness structure without invoking a
-model. Live/model results are research and eval evidence; local readiness remains responsible only for deterministic projection and persistence invariants.
+Model quality is eval work, not an ordinary Rust unit test. The optional
+benchmark module covers long-session resume, constraint retention, coding
+continuation, and cluster work after compaction. Live/model results are eval
+evidence; local readiness remains responsible for deterministic projection and
+persistence invariants.
 
 ## Skills
 
-Deterministic fake-model coverage in `sinomo-agent` verifies progressive
-disclosure from active catalog skills and `skill_update` writeback. Live/model
-quality is covered by the optional benchmark module:
-
-```sh
-python3 modules/benchmark/sinomo-benchmarks/agent/run_skill_eval.py --mode plan
-python3 modules/benchmark/sinomo-benchmarks/agent/run_skill_eval.py --mode fixture --summary-out benchmark-results/agent-skill/fixture-summary.json
-python3 modules/benchmark/sinomo-benchmarks/agent/run_skill_eval.py --mode run --provider codex --model gpt-5.5
-```
-
-The checked-in live scenarios seed benchmark-only active skills into a temporary
-`SINOMO_DATA_DIR`. One task can only be answered by reading hidden `SKILL.md`
-text through skill disclosure tools; another requires persisting a revealed
-shortcut with `skill_update` and then using it in a fresh follow-up run.
+Deterministic coverage verifies progressive disclosure and skill writeback.
+The optional benchmark module evaluates whether a model can discover required
+skill text and use a newly persisted skill in a later turn. Benchmark fixtures
+use an isolated data directory and do not modify the active catalog.
 
 ## Model and Local Runtime
 

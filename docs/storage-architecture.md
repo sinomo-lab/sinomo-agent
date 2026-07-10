@@ -1,28 +1,107 @@
-# Sinomo Storage
+# Sinomo Storage Architecture
 
-`sinomo-storage` defines the shared registry interface for files inside the Sinomo data directory. It does not own the complete Sinomo data-dir catalog. Each crate that reads or writes durable files registers its own paths, including the module, trust ring, relative path, encoding, and object schema when the file is a Sinomo Object document.
+This document defines how Sinomo records ownership and format expectations for
+files in the local data directory. It describes the storage contract, not a
+catalogue of every current path.
 
-The storage crate exposes the vocabulary and mechanics:
+## Purpose
 
-- `StorageLayout` is an inspectable snapshot of registered files and escape subtrees.
-- `StorageRegistry` wraps a layout for runtime registration and deregistration.
-- `StorageFileContract` describes an exact file path.
-- `StorageEscapePath` describes an intentionally open subtree.
+Every durable local file must have an owning subsystem. The storage registry
+makes that ownership inspectable so diagnostics and agents can answer:
 
-Downstream crates expose `register_storage_paths(&mut StorageLayout)` functions. The runtime facade composes the R1 catalog from those owner-crate functions instead of asking `sinomo-storage` to know every subsystem path. Application commands can extend that composed layout with higher-ring registrations before verification; for example, install-time verification adds the self-evolution storage subtree from `sinomo-evolution`.
+- which subsystem owns a path;
+- which trust ring may read or write it;
+- whether the path is an exact contract or an intentionally open subtree;
+- which encoding and object schema apply;
+- whether an unrecognized file is expected or requires investigation.
 
-The default storage rule is binary first. Internal state should use `sinomo-object` or another binary format. Human-readable text is reserved for files people are expected to inspect or edit directly, for CLI/service display, or for artifacts intended for human or agent review. External-system files may use the format required by that system.
+`sinomo-storage` owns this vocabulary and the registry mechanics. It does not
+own the complete data-directory layout.
 
-Layouts may include escape paths for intentionally open subtrees. For example, `workspace/` can be declared as an escape path when it may contain arbitrary user files. Escape paths must include a reason so agents and diagnostics can explain why detailed file ownership stops at that directory. Escape registration still belongs next to the subsystem that owns or exposes that subtree.
+## Ownership
 
-Human and external configuration subtrees are also explicit escapes. Shared Sinomo-managed configuration lives under `configs/` as human-readable `sinomo-config` JSON documents. The older `config/` subtree remains a legacy local-configuration location during migration. Language-model provider accounts, defaults, and API keys live in the account list stored by `lm.providers` and, for clustered nodes, cluster KV at `/config/lm/providers`; provider-level `lm.credentials.<provider>` config keys are retired. `providers/` remains only as a legacy provider credential source, and `configs/lm/credentials/<provider>.json` remains private node-local token/auth storage for device-login providers and migration helpers rather than a shared config catalog entry. DFS local exposure config now defaults to `configs/dfs/expose.json` and reads legacy `config/dfs-expose.sobj` or `config/dfs-expose.json` for migration. Rollout telemetry gates and self-evolution defaults likewise use shared config documents under `configs/rollout/telemetry/gates.json` and `configs/evolution/config.json`. Registry trust records are security/provenance state, not `sinomo-config` settings.
+The crate that creates or interprets durable state registers its own paths.
+Lower-ring layout is composed first, then trusted runtime and application
+layers add their contracts through the appropriate facade. This preserves the
+trust-ring dependency direction while producing one inspectable layout.
 
-Dynamic DFS roots are registered by `sinomo-dfs` as escapes at the subtree level. That registration covers content-addressed blob/object storage, metadata table snapshots and logs, metadata journals, the default `dfs/metadata/root` shard, shard-index records, metadata-replication cursors, operator records, pin records, and local-owned `files/`.
+Registration stays next to the owning subsystem. A central crate must not need
+to understand every daemon, DFS, agent, provider, or evolution file in order to
+validate the layout.
 
-Higher-ring agent artifacts are tracked at subtree boundaries by their owning crate. `sinomo-evolution` registers `evolution/` as an R2 escape because it stores campaign/job JSON, logs, and candidate workspaces intended for agent and operator inspection.
+An exact file contract records a relative path, owner, encoding, and schema when
+applicable. An escape path declares an open subtree whose children cannot be
+enumerated in advance, such as a user workspace or content-addressed store.
+Every escape requires a reason and an owner; it is not a blanket exemption from
+inspection.
 
-Storage contracts are meant to be machine-readable. Agents should be able to ask which module owns a path, which files a module may touch, which paths are untracked by design, and which Sinomo Object schema version applies to a binary file.
+## Format Policy
 
-`sinomo-storage` also exposes verification APIs. A caller can verify an explicit set of relative paths or walk a data directory and receive a report split into covered files and unregistered files. A path is covered only when it exactly matches a registered file contract or falls under an explicit escape path.
+Internal runtime state is binary-first. SOBJ documents and packed binary logs
+provide schema-aware, bounded formats for state that people are not expected to
+edit directly.
 
-The runtime facade exposes the composed runtime layout as `sinomo_runtime::storage`, so application-layer commands can verify layouts without depending directly on lower-level crate internals. `sinomo install` uses this as an install diagnostic: after writing installed binaries, managed source, and boot entries, it walks the data directory and warns if any file is not covered by the composed contract. Storage coverage problems are node health issues, not startup blockers. `sinomo cluster doctor` reports the same unregistered-path condition as a warning so operators can clean it up without preventing an otherwise usable node from running. Boot entries written under a test or local startup directory are covered by the `startup/` escape path because their exact format is owned by the local OS integration rather than a Sinomo Object schema.
+Human-readable formats are appropriate for:
+
+- user-managed configuration;
+- CLI or service output;
+- logs, reports, and benchmark artifacts intended for review;
+- external tools that require a specific text format;
+- workspace content owned by users or agents.
+
+The choice between binary and text follows the file's audience and contract,
+not convenience in one call site. Secrets remain node-local and private even
+when their transport or provider requires JSON.
+
+## Layout Categories
+
+The local data directory contains several kinds of state with different
+ownership rules:
+
+| Category | Contract |
+|---|---|
+| Runtime identity and daemon state | Exact files or tightly owned daemon subtrees. |
+| Human-managed configuration | Explicit configuration documents under the shared config hierarchy. |
+| Credentials and tokens | Node-local private files owned by the provider or authentication subsystem. |
+| DFS metadata and content | Owned dynamic subtrees registered by DFS. |
+| Workspaces and exposed files | Reasoned escape paths because contents are intentionally arbitrary. |
+| Evolution jobs and review artifacts | Higher-ring subtrees intended for operator and agent inspection. |
+| Installed binaries and managed source | Install and rollout-owned paths with explicit lifecycle rules. |
+
+Cluster-wide configuration belongs in cluster KV or a shared configuration
+document according to the owning subsystem. A local file must not quietly become
+an alternate source of authority for distributed settings.
+
+## Verification
+
+Verification can check an explicit set of paths or walk a data directory. A
+path is covered only when it matches an exact file contract or falls under a
+registered escape path. The report separates covered and unregistered files so
+operators can investigate drift without losing access to an otherwise usable
+node.
+
+Install and cluster diagnostics use the composed runtime layout. Unregistered
+paths are health warnings rather than automatic deletion targets or startup
+blockers. The owning subsystem decides whether a legacy path may be migrated;
+the registry only reports coverage and schema expectations.
+
+Storage verification does not validate domain semantics. A covered Raft log,
+DFS manifest, or provider credential can still be corrupt or unauthorized; the
+owning subsystem performs those checks.
+
+## Invariants
+
+1. Each durable path has one clear owner.
+2. Higher-ring registration does not create lower-ring dependencies.
+3. Escape paths are narrow, documented, and owned.
+4. Internal binary documents declare their schema or encoding contract.
+5. Human-editable configuration is distinguishable from generated runtime
+   state.
+6. Unregistered files are reported, never silently adopted or deleted.
+7. Local storage cannot override cluster authority without an explicit
+   subsystem rule.
+
+The [architecture overview](architecture.md#state-and-data) explains how local
+storage relates to cluster KV, events, memory, and DFS. The
+[SIFS document](sifs.md) describes the cluster filesystem rather than the local
+data-directory registry.

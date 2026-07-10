@@ -1,5 +1,7 @@
 # Reactive Cluster KV/Raft Improvement Plan
 
+Status: proposed follow-up work. Last reviewed 2026-07-09.
+
 ## Context
 
 Sinomo's intended cluster shape is reactive and passive. A cluster may be made of
@@ -28,8 +30,10 @@ and operational recovery.
 
 3. Keep ownership boundaries.
    `sinomo-kv` owns KV semantics and Raft safety decisions. `sinomo-network`
-   owns topology, routing, endpoint selection, and transport. The daemon binds
-   them together with identity, authorization, runtime, and process ownership.
+   owns topology, routing, endpoint selection, and transport. `sinomo-cluster`
+   owns the transport-coupled Raft and membership drivers and is the only R0
+   bridge between them. The daemon hosts that stack and supplies process
+   identity, authorization, runtime scheduling, and local persistence.
 
 4. Prefer bounded convergence over background churn.
    A node that wakes should quickly discover current leadership, catch up its
