@@ -12,34 +12,37 @@ module network_delivery_retry_safety {
     }
 
 
-  def deliveredResponsesAreCached: bool =
-    responseDelivered implies replayCache.contains(KeyA)
+  def attemptedOperationsAreStable: bool = all {
+    primaryAttemptOperationId == None or primaryAttemptOperationId == operationId,
+    fallbackAttemptOperationId == None or fallbackAttemptOperationId == operationId,
+  }
 
 
-  def duplicateReplayDoesNotRedispatch: bool =
+  def attemptsCarryFreshEndpointAuthentication: bool = all {
+    attemptedEndpoints.contains(PrimaryEndpoint)
+      iff primaryAttemptNonce == Some(PrimaryAttemptNonce),
+    attemptedEndpoints.contains(FallbackEndpoint)
+      iff fallbackAttemptNonce == Some(FallbackAttemptNonce),
     all {
-      dispatchCount <= 1,
-      duplicateReplayObserved implies all {
-        replayCache.contains(KeyA),
-        dispatchCount == 1,
-      },
+      primaryAttemptNonce != None,
+      fallbackAttemptNonce != None,
+    } implies primaryAttemptNonce != fallbackAttemptNonce,
+  }
+
+
+  def multipleDispatchesKeepOperationButRefreshAuthentication: bool =
+    dispatchCount > 1 implies all {
+      primaryAttemptOperationId == operationId,
+      fallbackAttemptOperationId == operationId,
+      primaryAttemptNonce != fallbackAttemptNonce,
     }
 
 
-  def attemptKeysAreStable: bool =
-    match primaryAttemptKey {
-      | Some(primaryKey) =>
-          match fallbackAttemptKey {
-            | Some(fallbackKey) => primaryKey == fallbackKey
-            | None => true
-          }
-      | None => fallbackAttemptKey == None
-    }
-
-
-  def attemptsUseOriginalDeliveryKey: bool = all {
-    primaryAttemptKey == None or primaryAttemptKey == deliveryKey,
-    fallbackAttemptKey == None or fallbackAttemptKey == deliveryKey,
+  /// This is an endpoint-attempt bound, not an at-most-once domain-effect claim.
+  /// A primary timeout followed by a fallback attempt reaches dispatchCount = 2.
+  def dispatchesMatchEndpointAttempts: bool = all {
+    dispatchCount == attemptedEndpoints.size(),
+    dispatchCount <= Endpoints.size(),
   }
 
 
@@ -109,7 +112,6 @@ module network_delivery_retry_safety {
     } implies all {
       phase == Failed,
       not(responseDelivered),
-      replayCache.size() == 0,
     }
 
 
@@ -120,12 +122,35 @@ module network_delivery_retry_safety {
     }
 
 
+  /// Witness: the preferred endpoint carries the request's operation identity
+  /// and a per-attempt authentication nonce.
+  def witnessPrimaryAttemptIdentityAndNonce: bool = all {
+    lastDecision == PrimaryAttempted,
+    attemptedEndpoints.contains(PrimaryEndpoint),
+    primaryAttemptOperationId == operationId,
+    primaryAttemptNonce == Some(PrimaryAttemptNonce),
+  }
+
+
+  /// Witness: retry can dispatch the same domain operation twice, while the
+  /// authentication nonce is fresh for the fallback endpoint.
+  def witnessFallbackRetryStableOperationFreshNonce: bool = all {
+    lastDecision == FallbackAttempted,
+    dispatchCount == 2,
+    primaryAttemptOperationId == operationId,
+    fallbackAttemptOperationId == operationId,
+    primaryAttemptNonce == Some(PrimaryAttemptNonce),
+    fallbackAttemptNonce == Some(FallbackAttemptNonce),
+    primaryAttemptNonce != fallbackAttemptNonce,
+  }
+
+
   def safety: bool = all {
     responseRequiresSuccessfulAttempt,
-    deliveredResponsesAreCached,
-    duplicateReplayDoesNotRedispatch,
-    attemptKeysAreStable,
-    attemptsUseOriginalDeliveryKey,
+    attemptedOperationsAreStable,
+    attemptsCarryFreshEndpointAuthentication,
+    multipleDispatchesKeepOperationButRefreshAuthentication,
+    dispatchesMatchEndpointAttempts,
     failedEndpointsWereAttempted,
     identityMismatchEndpointsAreSuppressed,
     suppressedEndpointsWereAttempted,

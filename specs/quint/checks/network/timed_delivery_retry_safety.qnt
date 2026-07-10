@@ -7,12 +7,51 @@ module network_timed_delivery_retry_safety {
 
   def timeAndDeadlineAreBounded: bool = all {
     validTick(retryNow),
-    validTick(deadlineAt),
-    deadlineAt == RequestDeadlineTicks,
+    validScheduledTick(deadlineAt),
+    match requestStartedAt {
+      | Some(startedAt) => all {
+          validTick(startedAt),
+          startedAt <= deadlineAt,
+          deadlineAt == requestDeadlineAt(startedAt),
+          deadlineAt - startedAt == RequestDeadlineTicks,
+        }
+      | None => all {
+          phase == RetryIdle,
+          deadlineAt == 0,
+        }
+    },
   }
 
+  /// Regression guard: neither idle ticks nor preparation latency may move the
+  /// deadline origin back to model initialization.
+  def requestDeadlineUsesRequestStart: bool =
+    match requestStartedAt {
+      | Some(startedAt) => deadlineAt == durationEndAt(startedAt, RequestDeadlineTicks)
+      | None => true
+    }
+
   def attemptsReferToPreparedRequest: bool =
-    attemptedEndpoints.size() > 0 implies deliveryKey == Some(StableDeliveryKey)
+    attemptedEndpoints.size() > 0 implies deliveryKey == Some(StableOperationId)
+
+  /// Regression guard: a fallback response cannot already be due before that
+  /// fallback attempt has started.
+  def responsesUseTheirAttemptStart: bool =
+    attemptedEndpoints.forall(endpoint =>
+      match attemptStartedAt.get(endpoint) {
+        | Some(startedAt) => all {
+            validTick(startedAt),
+            startedAt < deadlineAt,
+            PacketDelayChoices.contains(responseDelay.get(endpoint)),
+            validScheduledTick(responseDueAt.get(endpoint)),
+            responseDueAt.get(endpoint) == durationEndAt(
+              startedAt,
+              responseDelay.get(endpoint)
+            ),
+            startedAt <= responseDueAt.get(endpoint),
+          }
+        | None => false
+      }
+    )
 
   def attemptTimeoutNeverExtendsDeadline: bool =
     match currentAttemptTimeoutAt {
@@ -26,7 +65,7 @@ module network_timed_delivery_retry_safety {
       | None => true
     }
 
-  def attemptsUseStableDeliveryKey: bool = all {
+  def attemptsUseStableOperationId: bool = all {
     primaryAttemptKey == None or primaryAttemptKey == deliveryKey,
     fallbackAttemptKey == None or fallbackAttemptKey == deliveryKey,
   }
@@ -65,6 +104,10 @@ module network_timed_delivery_retry_safety {
                   endpointOutcome.get(endpoint) == EndpointResponds,
                   responseDueAt.get(endpoint) <= doneAt,
                   attemptedEndpoints.contains(endpoint),
+                  match attemptStartedAt.get(endpoint) {
+                    | Some(startedAt) => startedAt <= doneAt
+                    | None => false
+                  },
                 }
               | None => false
             }
@@ -108,23 +151,43 @@ module network_timed_delivery_retry_safety {
       endpointOutcome.get(endpoint) == EndpointIdentityMismatch
     )
 
-  def deliveredResponsesAreCached: bool =
-    phase == RetryDelivered implies replayCache.contains(StableDeliveryKey)
+  def observedDuplicateResponsesWereAttempted: bool =
+    duplicateResponses.subseteq(attemptedEndpoints)
 
-  def duplicateReplayDoesNotRedispatch: bool = all {
-    dispatchCount <= 1,
-    retryLastDecision == DuplicateReplayObserved implies all {
-      replayCache.contains(StableDeliveryKey),
-      dispatchCount == 1,
-    },
+  /// Named witnesses are exercised by the formal harness to keep important
+  /// success and failure branches from becoming vacuous.
+  def witnessPrimaryDelivery: bool = all {
+    phase == RetryDelivered,
+    acceptedEndpoint == Some(TimedPrimary),
   }
+
+  def witnessFallbackDelivery: bool = all {
+    phase == RetryDelivered,
+    acceptedEndpoint == Some(TimedFallback),
+  }
+
+  def witnessTimeoutFailure: bool = all {
+    phase == RetryFailed,
+    timedOutEndpoints.size() > 0,
+    terminalError == Some(TimedAllEndpointsFailed),
+  }
+
+  def witnessDeadlineFailure: bool = all {
+    phase == RetryFailed,
+    terminalError == Some(TimedDeadlineExpired),
+  }
+
+  def witnessLateResponse: bool =
+    lateResponses.size() > 0
 
   def safety: bool = all {
     timeAndDeadlineAreBounded,
+    requestDeadlineUsesRequestStart,
     attemptsReferToPreparedRequest,
+    responsesUseTheirAttemptStart,
     attemptTimeoutNeverExtendsDeadline,
     acceptedAttemptTimeoutNeverExtendsDeadline,
-    attemptsUseStableDeliveryKey,
+    attemptsUseStableOperationId,
     attemptNoncesAreDistinct,
     deliveredBeforeDeadlineAndAttemptTimeout,
     acceptedResponseWasDueAndSuccessful,
@@ -134,7 +197,6 @@ module network_timed_delivery_retry_safety {
     primaryFailureWithFallbackDoesNotTerminallyFailEarly,
     failedAndSuppressedEndpointsWereAttempted,
     suppressedEndpointsAreIdentityMismatches,
-    deliveredResponsesAreCached,
-    duplicateReplayDoesNotRedispatch,
+    observedDuplicateResponsesWereAttempted,
   }
 }

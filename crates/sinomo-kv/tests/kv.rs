@@ -115,6 +115,75 @@ mod tests {
     }
 
     #[test]
+    fn cluster_kv_raft_config_transition_matches_bounded_model_cases() {
+        let cluster_id = Id::from_legacy_named("cluster_config_transition_model").expect("cluster");
+        let voter_a = NodeId::from_legacy_named("node_config_transition_a").expect("voter a");
+        let voter_b = NodeId::from_legacy_named("node_config_transition_b").expect("voter b");
+        let voter_c = NodeId::from_legacy_named("node_config_transition_c").expect("voter c");
+        let config = |voters: Vec<NodeId>, learners: Vec<NodeId>, non_voting: Vec<NodeId>| {
+            ClusterKvRaftConfigRecord {
+                cluster_id: cluster_id.clone(),
+                term: 3,
+                kv_revision: 9,
+                voters,
+                learners,
+                non_voting,
+                updated_at: OffsetDateTime::now_utc(),
+            }
+        };
+
+        let learner_base = config(vec![voter_a.clone()], vec![voter_b.clone()], Vec::new());
+        let learner_promoted = config(
+            vec![voter_a.clone(), voter_b.clone()],
+            Vec::new(),
+            Vec::new(),
+        );
+        validate_cluster_kv_raft_config_transition(&learner_base, &learner_promoted)
+            .expect("committed learner promotion");
+
+        let non_voting_base = config(vec![voter_a.clone()], Vec::new(), vec![voter_b.clone()]);
+        validate_cluster_kv_raft_config_transition(&non_voting_base, &learner_promoted)
+            .expect("committed non-voting promotion");
+
+        let direct_base = config(vec![voter_a.clone()], Vec::new(), Vec::new());
+        assert!(
+            validate_cluster_kv_raft_config_transition(&direct_base, &learner_promoted).is_err(),
+            "a new voter must first be committed as learner or non-voting"
+        );
+
+        let two_additions_base = config(
+            vec![voter_a.clone()],
+            vec![voter_b.clone()],
+            vec![voter_c.clone()],
+        );
+        let two_additions = config(
+            vec![voter_a.clone(), voter_b.clone(), voter_c.clone()],
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(
+            validate_cluster_kv_raft_config_transition(&two_additions_base, &two_additions)
+                .is_err(),
+            "one committed config change may add at most one voter"
+        );
+
+        let three_voters = config(
+            vec![voter_a.clone(), voter_b.clone(), voter_c],
+            Vec::new(),
+            Vec::new(),
+        );
+        let two_voters = config(vec![voter_a.clone(), voter_b], Vec::new(), Vec::new());
+        validate_cluster_kv_raft_config_transition(&three_voters, &two_voters)
+            .expect("three-to-two voter shrink retains old and new quorum overlap");
+
+        let one_voter = config(vec![voter_a], Vec::new(), Vec::new());
+        assert!(
+            validate_cluster_kv_raft_config_transition(&two_voters, &one_voter).is_err(),
+            "two-to-one voter shrink loses the old quorum overlap"
+        );
+    }
+
+    #[test]
     fn cluster_kv_rpc_payloads_encode_storage_owned_bodies() {
         let snapshot_payload = cluster_kv_snapshot_rpc_payload().expect("snapshot rpc payload");
         assert_eq!(snapshot_payload.route, CLUSTER_KV_SNAPSHOT_ROUTE);

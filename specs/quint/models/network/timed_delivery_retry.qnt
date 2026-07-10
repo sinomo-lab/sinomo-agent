@@ -3,21 +3,21 @@
 /// This layer models the caller-visible retry loop around a global request
 /// deadline and per-attempt timeout. It intentionally consumes endpoint choice
 /// and route validity as lower-layer facts; the focus here is timing, fallback,
-/// late response rejection, stable delivery identity, and distinct transport
+/// late response rejection, stable operation identity, and distinct transport
 /// attempt identity.
+///
+/// Evidence class: current-behavior refinement of deadline/attempt decisions
+/// over an abstract logical clock and abstract endpoint outcomes.
 module network_timed_delivery_retry {
   import common.* from "../../lib/common"
   import network_time.* from "../../lib/network_time"
   import delivery_contract.* from "../../contracts/network/delivery_contract"
 
-  type TimedEndpoint = TimedPrimary | TimedFallback
   type EndpointOutcome =
     | EndpointResponds
     | EndpointDrops
     | EndpointSlow
     | EndpointIdentityMismatch
-  type TimedDeliveryKey = StableDeliveryKey | OtherDeliveryKey
-  type TimedAttemptNonce = PrimaryAttemptNonce | FallbackAttemptNonce
   type RetryPhase =
     | RetryIdle
     | RetryPrepared
@@ -36,14 +36,14 @@ module network_timed_delivery_retry {
     | IdentityMismatchObserved
     | LateResponseIgnored
     | DeadlineExpiredBeforeAttempt
-    | DuplicateReplayObserved
+    | DuplicateResponseObserved
     | RetryStuttered
 
-  pure val TimedEndpoints: Set[TimedEndpoint] = Set(TimedPrimary, TimedFallback)
   pure val EndpointOutcomes: Set[EndpointOutcome] =
     Set(EndpointResponds, EndpointDrops, EndpointSlow, EndpointIdentityMismatch)
 
   var retryNow: int
+  var requestStartedAt: Option[int]
   var deadlineAt: int
   var phase: RetryPhase
   var hasFallback: bool
@@ -53,19 +53,19 @@ module network_timed_delivery_retry {
   var failedEndpoints: Set[TimedEndpoint]
   var suppressedEndpoints: Set[TimedEndpoint]
   var lateResponses: Set[TimedEndpoint]
+  var duplicateResponses: Set[TimedEndpoint]
   var currentEndpoint: Option[TimedEndpoint]
-  var attemptStartedAt: Option[int]
+  var attemptStartedAt: TimedEndpoint -> Option[int]
   var currentAttemptTimeoutAt: Option[int]
+  var responseDelay: TimedEndpoint -> int
   var responseDueAt: TimedEndpoint -> int
-  var deliveryKey: Option[TimedDeliveryKey]
-  var primaryAttemptKey: Option[TimedDeliveryKey]
-  var fallbackAttemptKey: Option[TimedDeliveryKey]
+  var deliveryKey: Option[TimedOperationId]
+  var primaryAttemptKey: Option[TimedOperationId]
+  var fallbackAttemptKey: Option[TimedOperationId]
   var attemptNonce: TimedEndpoint -> Option[TimedAttemptNonce]
   var acceptedEndpoint: Option[TimedEndpoint]
   var deliveredAt: Option[int]
   var acceptedAttemptTimeoutAt: Option[int]
-  var replayCache: Set[TimedDeliveryKey]
-  var dispatchCount: int
   var terminalError: Option[TimedDeliveryError]
   var retryLastDecision: RetryDecision
 
@@ -75,14 +75,14 @@ module network_timed_delivery_retry {
   pure val zeroResponseDueAt: TimedEndpoint -> int =
     TimedEndpoints.mapBy(_ => 0)
 
+  pure val zeroResponseDelay: TimedEndpoint -> int =
+    TimedEndpoints.mapBy(_ => 0)
+
   pure val emptyNonce: TimedEndpoint -> Option[TimedAttemptNonce] =
     TimedEndpoints.mapBy(_ => None)
 
-  pure def nonceFor(endpoint: TimedEndpoint): TimedAttemptNonce =
-    match endpoint {
-      | TimedPrimary => PrimaryAttemptNonce
-      | TimedFallback => FallbackAttemptNonce
-    }
+  pure val emptyAttemptStart: TimedEndpoint -> Option[int] =
+    TimedEndpoints.mapBy(_ => None)
 
   def canAcceptCurrentResponse(endpoint: TimedEndpoint): bool =
     all {
@@ -107,7 +107,8 @@ module network_timed_delivery_retry {
 
   action init = all {
     retryNow' = 0,
-    deadlineAt' = RequestDeadlineTicks,
+    requestStartedAt' = None,
+    deadlineAt' = 0,
     phase' = RetryIdle,
     hasFallback' = false,
     endpointOutcome' = defaultOutcomes,
@@ -116,9 +117,11 @@ module network_timed_delivery_retry {
     failedEndpoints' = Set(),
     suppressedEndpoints' = Set(),
     lateResponses' = Set(),
+    duplicateResponses' = Set(),
     currentEndpoint' = None,
-    attemptStartedAt' = None,
+    attemptStartedAt' = emptyAttemptStart,
     currentAttemptTimeoutAt' = None,
+    responseDelay' = zeroResponseDelay,
     responseDueAt' = zeroResponseDueAt,
     deliveryKey' = None,
     primaryAttemptKey' = None,
@@ -127,8 +130,6 @@ module network_timed_delivery_retry {
     acceptedEndpoint' = None,
     deliveredAt' = None,
     acceptedAttemptTimeoutAt' = None,
-    replayCache' = Set(),
-    dispatchCount' = 0,
     terminalError' = None,
     retryLastDecision' = RetryNoDecision,
   }
@@ -136,6 +137,7 @@ module network_timed_delivery_retry {
   action tick: bool = all {
     retryNow < MaxNetworkTick,
     retryNow' = tickNext(retryNow),
+    requestStartedAt' = requestStartedAt,
     deadlineAt' = deadlineAt,
     phase' = phase,
     hasFallback' = hasFallback,
@@ -145,9 +147,11 @@ module network_timed_delivery_retry {
     failedEndpoints' = failedEndpoints,
     suppressedEndpoints' = suppressedEndpoints,
     lateResponses' = lateResponses,
+    duplicateResponses' = duplicateResponses,
     currentEndpoint' = currentEndpoint,
     attemptStartedAt' = attemptStartedAt,
     currentAttemptTimeoutAt' = currentAttemptTimeoutAt,
+    responseDelay' = responseDelay,
     responseDueAt' = responseDueAt,
     deliveryKey' = deliveryKey,
     primaryAttemptKey' = primaryAttemptKey,
@@ -156,8 +160,6 @@ module network_timed_delivery_retry {
     acceptedEndpoint' = acceptedEndpoint,
     deliveredAt' = deliveredAt,
     acceptedAttemptTimeoutAt' = acceptedAttemptTimeoutAt,
-    replayCache' = replayCache,
-    dispatchCount' = dispatchCount,
     terminalError' = terminalError,
     retryLastDecision' = RetryTicked,
   }
@@ -170,10 +172,14 @@ module network_timed_delivery_retry {
     fallbackDelay: int
   ): bool = all {
     phase == RetryIdle,
+    requestDeadlineFits(retryNow),
+    EndpointOutcomes.contains(primaryOutcome),
+    EndpointOutcomes.contains(fallbackOutcome),
     PacketDelayChoices.contains(primaryDelay),
     PacketDelayChoices.contains(fallbackDelay),
     retryNow' = retryNow,
-    deadlineAt' = RequestDeadlineTicks,
+    requestStartedAt' = Some(retryNow),
+    deadlineAt' = requestDeadlineAt(retryNow),
     phase' = RetryPrepared,
     hasFallback' = fallbackConfigured,
     endpointOutcome' =
@@ -185,26 +191,26 @@ module network_timed_delivery_retry {
     failedEndpoints' = Set(),
     suppressedEndpoints' = Set(),
     lateResponses' = Set(),
+    duplicateResponses' = Set(),
     currentEndpoint' = None,
-    attemptStartedAt' = None,
+    attemptStartedAt' = emptyAttemptStart,
     currentAttemptTimeoutAt' = None,
-    responseDueAt' =
+    responseDelay' =
       TimedEndpoints.mapBy(endpoint =>
         if (endpoint == TimedPrimary) {
-          boundedAdd(retryNow, primaryDelay)
+          primaryDelay
         } else {
-          boundedAdd(retryNow, fallbackDelay)
+          fallbackDelay
         }
       ),
-    deliveryKey' = Some(StableDeliveryKey),
+    responseDueAt' = zeroResponseDueAt,
+    deliveryKey' = Some(StableOperationId),
     primaryAttemptKey' = None,
     fallbackAttemptKey' = None,
     attemptNonce' = emptyNonce,
     acceptedEndpoint' = None,
     deliveredAt' = None,
     acceptedAttemptTimeoutAt' = None,
-    replayCache' = Set(),
-    dispatchCount' = 0,
     terminalError' = None,
     retryLastDecision' = RequestPrepared,
   }
@@ -218,6 +224,7 @@ module network_timed_delivery_retry {
       not(attemptedEndpoints.contains(endpoint)),
       not(suppressedEndpoints.contains(endpoint)),
       retryNow' = retryNow,
+      requestStartedAt' = requestStartedAt,
       deadlineAt' = deadlineAt,
       phase' = RetryAttempting,
       hasFallback' = hasFallback,
@@ -227,10 +234,15 @@ module network_timed_delivery_retry {
       failedEndpoints' = failedEndpoints,
       suppressedEndpoints' = suppressedEndpoints,
       lateResponses' = lateResponses,
+      duplicateResponses' = duplicateResponses,
       currentEndpoint' = Some(endpoint),
-      attemptStartedAt' = Some(retryNow),
+      attemptStartedAt' = attemptStartedAt.set(endpoint, Some(retryNow)),
       currentAttemptTimeoutAt' = Some(attemptTimeoutAt(retryNow, deadlineAt)),
-      responseDueAt' = responseDueAt,
+      responseDelay' = responseDelay,
+      responseDueAt' = responseDueAt.set(
+        endpoint,
+        durationEndAt(retryNow, responseDelay.get(endpoint))
+      ),
       deliveryKey' = deliveryKey,
       primaryAttemptKey' =
         if (endpoint == TimedPrimary) { deliveryKey } else { primaryAttemptKey },
@@ -240,8 +252,6 @@ module network_timed_delivery_retry {
       acceptedEndpoint' = acceptedEndpoint,
       deliveredAt' = deliveredAt,
       acceptedAttemptTimeoutAt' = acceptedAttemptTimeoutAt,
-      replayCache' = replayCache,
-      dispatchCount' = dispatchCount,
       terminalError' = terminalError,
       retryLastDecision' =
         if (endpoint == TimedPrimary) { PrimaryStarted } else { FallbackStarted },
@@ -251,6 +261,7 @@ module network_timed_delivery_retry {
   action acceptResponse(endpoint: TimedEndpoint): bool = all {
     canAcceptCurrentResponse(endpoint),
     retryNow' = retryNow,
+    requestStartedAt' = requestStartedAt,
     deadlineAt' = deadlineAt,
     phase' = RetryDelivered,
     hasFallback' = hasFallback,
@@ -260,9 +271,11 @@ module network_timed_delivery_retry {
     failedEndpoints' = failedEndpoints,
     suppressedEndpoints' = suppressedEndpoints,
     lateResponses' = lateResponses,
+    duplicateResponses' = duplicateResponses,
     currentEndpoint' = None,
     attemptStartedAt' = attemptStartedAt,
     currentAttemptTimeoutAt' = currentAttemptTimeoutAt,
+    responseDelay' = responseDelay,
     responseDueAt' = responseDueAt,
     deliveryKey' = deliveryKey,
     primaryAttemptKey' = primaryAttemptKey,
@@ -271,8 +284,6 @@ module network_timed_delivery_retry {
     acceptedEndpoint' = Some(endpoint),
     deliveredAt' = Some(retryNow),
     acceptedAttemptTimeoutAt' = currentAttemptTimeoutAt,
-    replayCache' = replayCache.union(Set(StableDeliveryKey)),
-    dispatchCount' = dispatchCount + 1,
     terminalError' = None,
     retryLastDecision' = ResponseAccepted,
   }
@@ -288,6 +299,7 @@ module network_timed_delivery_retry {
         | None => false
       },
       retryNow' = retryNow,
+      requestStartedAt' = requestStartedAt,
       deadlineAt' = deadlineAt,
       phase' = if (canFallback) { RetryPrimaryTimedOut } else { RetryFailed },
       hasFallback' = hasFallback,
@@ -297,9 +309,11 @@ module network_timed_delivery_retry {
       failedEndpoints' = failedEndpoints.union(Set(endpoint)),
       suppressedEndpoints' = suppressedEndpoints,
       lateResponses' = lateResponses,
+      duplicateResponses' = duplicateResponses,
       currentEndpoint' = None,
       attemptStartedAt' = attemptStartedAt,
       currentAttemptTimeoutAt' = None,
+      responseDelay' = responseDelay,
       responseDueAt' = responseDueAt,
       deliveryKey' = deliveryKey,
       primaryAttemptKey' = primaryAttemptKey,
@@ -308,8 +322,6 @@ module network_timed_delivery_retry {
       acceptedEndpoint' = acceptedEndpoint,
       deliveredAt' = deliveredAt,
       acceptedAttemptTimeoutAt' = acceptedAttemptTimeoutAt,
-      replayCache' = replayCache,
-      dispatchCount' = dispatchCount,
       terminalError' =
         if (canFallback) {
           None
@@ -329,6 +341,7 @@ module network_timed_delivery_retry {
       currentEndpoint == Some(endpoint),
       endpointOutcome.get(endpoint) == EndpointIdentityMismatch,
       retryNow' = retryNow,
+      requestStartedAt' = requestStartedAt,
       deadlineAt' = deadlineAt,
       phase' = if (canFallback) { RetryPrimaryTimedOut } else { RetryFailed },
       hasFallback' = hasFallback,
@@ -338,9 +351,11 @@ module network_timed_delivery_retry {
       failedEndpoints' = failedEndpoints.union(Set(endpoint)),
       suppressedEndpoints' = suppressedEndpoints.union(Set(endpoint)),
       lateResponses' = lateResponses,
+      duplicateResponses' = duplicateResponses,
       currentEndpoint' = None,
       attemptStartedAt' = attemptStartedAt,
       currentAttemptTimeoutAt' = None,
+      responseDelay' = responseDelay,
       responseDueAt' = responseDueAt,
       deliveryKey' = deliveryKey,
       primaryAttemptKey' = primaryAttemptKey,
@@ -349,8 +364,6 @@ module network_timed_delivery_retry {
       acceptedEndpoint' = acceptedEndpoint,
       deliveredAt' = deliveredAt,
       acceptedAttemptTimeoutAt' = acceptedAttemptTimeoutAt,
-      replayCache' = replayCache,
-      dispatchCount' = dispatchCount,
       terminalError' = if (canFallback) { None } else { Some(TimedAllEndpointsFailed) },
       retryLastDecision' = IdentityMismatchObserved,
     }
@@ -377,6 +390,7 @@ module network_timed_delivery_retry {
         currentAttemptExpired,
       },
       retryNow' = retryNow,
+      requestStartedAt' = requestStartedAt,
       deadlineAt' = deadlineAt,
       phase' = phase,
       hasFallback' = hasFallback,
@@ -386,9 +400,11 @@ module network_timed_delivery_retry {
       failedEndpoints' = failedEndpoints,
       suppressedEndpoints' = suppressedEndpoints,
       lateResponses' = lateResponses.union(Set(endpoint)),
+      duplicateResponses' = duplicateResponses,
       currentEndpoint' = currentEndpoint,
       attemptStartedAt' = attemptStartedAt,
       currentAttemptTimeoutAt' = currentAttemptTimeoutAt,
+      responseDelay' = responseDelay,
       responseDueAt' = responseDueAt,
       deliveryKey' = deliveryKey,
       primaryAttemptKey' = primaryAttemptKey,
@@ -397,8 +413,6 @@ module network_timed_delivery_retry {
       acceptedEndpoint' = acceptedEndpoint,
       deliveredAt' = deliveredAt,
       acceptedAttemptTimeoutAt' = acceptedAttemptTimeoutAt,
-      replayCache' = replayCache,
-      dispatchCount' = dispatchCount,
       terminalError' = terminalError,
       retryLastDecision' = LateResponseIgnored,
     }
@@ -411,6 +425,7 @@ module network_timed_delivery_retry {
     },
     terminalDeadlineAllowed(retryNow, deadlineAt),
     retryNow' = retryNow,
+    requestStartedAt' = requestStartedAt,
     deadlineAt' = deadlineAt,
     phase' = RetryFailed,
     hasFallback' = hasFallback,
@@ -420,9 +435,11 @@ module network_timed_delivery_retry {
     failedEndpoints' = failedEndpoints,
     suppressedEndpoints' = suppressedEndpoints,
     lateResponses' = lateResponses,
+    duplicateResponses' = duplicateResponses,
     currentEndpoint' = None,
     attemptStartedAt' = attemptStartedAt,
     currentAttemptTimeoutAt' = currentAttemptTimeoutAt,
+    responseDelay' = responseDelay,
     responseDueAt' = responseDueAt,
     deliveryKey' = deliveryKey,
     primaryAttemptKey' = primaryAttemptKey,
@@ -431,16 +448,17 @@ module network_timed_delivery_retry {
     acceptedEndpoint' = acceptedEndpoint,
     deliveredAt' = deliveredAt,
     acceptedAttemptTimeoutAt' = acceptedAttemptTimeoutAt,
-    replayCache' = replayCache,
-    dispatchCount' = dispatchCount,
     terminalError' = Some(TimedDeadlineExpired),
     retryLastDecision' = DeadlineExpiredBeforeAttempt,
   }
 
-  action duplicateReplay: bool = all {
+  /// Generic object RPC may deliver duplicates. Recording that observation
+  /// does not claim a universal replay cache or at-most-once domain effect.
+  action observeDuplicateResponse(endpoint: TimedEndpoint): bool = all {
     phase == RetryDelivered,
-    replayCache.contains(StableDeliveryKey),
+    attemptedEndpoints.contains(endpoint),
     retryNow' = retryNow,
+    requestStartedAt' = requestStartedAt,
     deadlineAt' = deadlineAt,
     phase' = phase,
     hasFallback' = hasFallback,
@@ -450,9 +468,11 @@ module network_timed_delivery_retry {
     failedEndpoints' = failedEndpoints,
     suppressedEndpoints' = suppressedEndpoints,
     lateResponses' = lateResponses,
+    duplicateResponses' = duplicateResponses.union(Set(endpoint)),
     currentEndpoint' = currentEndpoint,
     attemptStartedAt' = attemptStartedAt,
     currentAttemptTimeoutAt' = currentAttemptTimeoutAt,
+    responseDelay' = responseDelay,
     responseDueAt' = responseDueAt,
     deliveryKey' = deliveryKey,
     primaryAttemptKey' = primaryAttemptKey,
@@ -461,14 +481,13 @@ module network_timed_delivery_retry {
     acceptedEndpoint' = acceptedEndpoint,
     deliveredAt' = deliveredAt,
     acceptedAttemptTimeoutAt' = acceptedAttemptTimeoutAt,
-    replayCache' = replayCache,
-    dispatchCount' = dispatchCount,
     terminalError' = terminalError,
-    retryLastDecision' = DuplicateReplayObserved,
+    retryLastDecision' = DuplicateResponseObserved,
   }
 
   action stutter: bool = all {
     retryNow' = retryNow,
+    requestStartedAt' = requestStartedAt,
     deadlineAt' = deadlineAt,
     phase' = phase,
     hasFallback' = hasFallback,
@@ -478,9 +497,11 @@ module network_timed_delivery_retry {
     failedEndpoints' = failedEndpoints,
     suppressedEndpoints' = suppressedEndpoints,
     lateResponses' = lateResponses,
+    duplicateResponses' = duplicateResponses,
     currentEndpoint' = currentEndpoint,
     attemptStartedAt' = attemptStartedAt,
     currentAttemptTimeoutAt' = currentAttemptTimeoutAt,
+    responseDelay' = responseDelay,
     responseDueAt' = responseDueAt,
     deliveryKey' = deliveryKey,
     primaryAttemptKey' = primaryAttemptKey,
@@ -489,8 +510,6 @@ module network_timed_delivery_retry {
     acceptedEndpoint' = acceptedEndpoint,
     deliveredAt' = deliveredAt,
     acceptedAttemptTimeoutAt' = acceptedAttemptTimeoutAt,
-    replayCache' = replayCache,
-    dispatchCount' = dispatchCount,
     terminalError' = terminalError,
     retryLastDecision' = RetryStuttered,
   }
@@ -523,7 +542,10 @@ module network_timed_delivery_retry {
       }
     },
     expireBeforeAttempt,
-    duplicateReplay,
+    {
+      nondet endpoint = oneOf(TimedEndpoints)
+      observeDuplicateResponse(endpoint)
+    },
     stutter,
   }
 }

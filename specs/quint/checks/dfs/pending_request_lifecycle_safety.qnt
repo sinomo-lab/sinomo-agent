@@ -52,8 +52,83 @@ module dfs_pending_request_lifecycle_safety {
     )
 
 
-  def noWrongRequestSettles: bool =
-    wrongSettles == Set()
+  def readIdentityErrorsAreRealMismatches: bool =
+    readIdentityErrors.forall(error =>
+      error.actualSource != error.expectedSource
+        or error.actualObject != error.expectedObject
+    )
+
+
+  def readIdentityErrorsAreIssuedAndDiscarded: bool =
+    readIdentityErrors.forall(error => all {
+      issued.contains(error.requestId),
+      discarded.contains(error.requestId),
+    })
+
+
+  def terminalWrongObjectReadResponsesDoNotSettle: bool =
+    readIdentityErrors.forall(error =>
+      if (error.actualSource == error.expectedSource
+        and error.actualObject != error.expectedObject) {
+        all {
+          not(settled.contains(error.requestId)),
+          not(isSome(pendingReads.get(error.requestId))),
+        }
+      } else {
+        true
+      }
+    )
+
+
+  def readResponseObservationsAreConsistent: bool =
+    match lastObservation {
+      | ReadSettled(requestId) => all {
+          settled.contains(requestId),
+          not(isSome(pendingReads.get(requestId))),
+        }
+      | ReadUnknownDiscarded(requestId) =>
+          discarded.contains(requestId)
+      | ReadWrongSourceDiscarded(requestId) => all {
+          discarded.contains(requestId),
+          isSome(pendingReads.get(requestId)),
+          not(settled.contains(requestId)),
+        }
+      | ReadWrongObjectRejected(requestId) => all {
+          discarded.contains(requestId),
+          not(isSome(pendingReads.get(requestId))),
+          not(settled.contains(requestId)),
+        }
+      | _ => true
+    }
+
+
+  /// Coverage witnesses are intentionally not part of `safety`; the runner
+  /// reports whether exploration reached each response disposition.
+  def successfulReadSettlementWitness: bool =
+    match lastObservation {
+      | ReadSettled(_) => true
+      | _ => false
+    }
+
+
+  def wrongSourceDiscardWithPendingWitness: bool =
+    match lastObservation {
+      | ReadWrongSourceDiscarded(requestId) => all {
+          isSome(pendingReads.get(requestId)),
+          not(settled.contains(requestId)),
+        }
+      | _ => false
+    }
+
+
+  def wrongObjectTerminalRejectionWitness: bool =
+    match lastObservation {
+      | ReadWrongObjectRejected(requestId) => all {
+          not(isSome(pendingReads.get(requestId))),
+          not(settled.contains(requestId)),
+        }
+      | _ => false
+    }
 
 
   def discardedRequestIdsAreIssuedOrUntracked: bool =
@@ -68,7 +143,10 @@ module dfs_pending_request_lifecycle_safety {
     stageInflightRequestIdsAreUniqueByReplica,
     repairInflightRequestIdsAreUniqueByReplica,
     routedWriteTerminalCacheIsNotActive,
-    noWrongRequestSettles,
+    readIdentityErrorsAreRealMismatches,
+    readIdentityErrorsAreIssuedAndDiscarded,
+    terminalWrongObjectReadResponsesDoNotSettle,
+    readResponseObservationsAreConsistent,
     discardedRequestIdsAreIssuedOrUntracked,
   }
 }

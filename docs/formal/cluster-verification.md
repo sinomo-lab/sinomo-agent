@@ -20,8 +20,8 @@ modules:
   own state variables, helper projections, `init`, `step`, and domain actions.
   They intentionally do not define the executable `safety` invariant.
 - `specs/quint/contracts/` contains reusable guarantee predicates consumed by
-  higher layers. Today this includes the full-system integration guarantees
-  over the shared system model.
+  higher layers. This includes timed delivery predicates and the full-system
+  integration guarantees over the shared system model.
 - `specs/quint/checks/` contains invariant suites. Each check imports one model
   plus the shared vocabulary it needs, defines the invariant predicates, and
   exposes the `safety` entrypoint used by `quint run` and `quint verify`.
@@ -31,17 +31,21 @@ modules:
 
 The model inventory is split by subsystem:
 
-- `models/kv/raft_kv.qnt` models the first Raft/KV slice: leader election, node
-  online/offline transitions, catch-up, leader proposals, quorum commit, and
-  KV-state replay from the committed log. Its invariant entrypoint is
-  `checks/kv/raft_kv_safety.qnt`.
+- `models/kv/raft_kv.qnt` models the compact Raft/KV committed-prefix slice:
+  leader election, node online/offline transitions, catch-up, leader proposals,
+  quorum commit, and KV-state replay. `models/kv/raft_protocol.qnt` complements
+  it with bounded per-node term, vote, log, replication, commit, and durable
+  restart state. Their invariant entrypoints live under `checks/kv/`.
 - `models/network/` contains the base network mechanism, endpoint selection,
-  route planning, delivery retry, endpoint attempt-budget, timed transport, and
-  timed delivery-retry models. Matching invariant entrypoints live under
-  `checks/network/`, and `scenarios/network/timed_delivery_smoke.qnt` composes
+  route planning, routing-table cache invalidation, delivery retry, endpoint
+  attempt-budget, timed transport, and timed delivery-retry models. Matching
+  invariant entrypoints live under `checks/network/`, and
+  `scenarios/network/timed_delivery_smoke.qnt` composes
   the timed transport and retry layers for randomized exploration.
-- `models/membership/` contains standalone membership authority and the
-  membership/KV bridge over the abstract committed-prefix contract. Matching
+- `models/membership/` contains standalone membership authority, the
+  membership/KV bridge over the abstract committed-prefix contract, and a
+  focused Raft configuration-transition slice for promotion, safe voter-set
+  shrink, quorum acknowledgements, and health/config separation. Matching
   invariant entrypoints live under `checks/membership/`.
 - `models/system/base.qnt` defines the shared integration vocabulary for
   membership, endpoint identity, connectivity observations, route selection,
@@ -52,11 +56,11 @@ The model inventory is split by subsystem:
 - `models/dfs/` contains the DFS slices: metadata authority, authority routing,
   read freshness, routed namespace freshness, POSIX namespace/link/cross-shard
   behavior, metadata primary failover, namespace transaction publication,
-  sharded namespace routing, metadata journal source validation, repair
-  authorization, replication policy, no-conflict serialization, pending request
-  lifecycle, repair content validation, chunked transfer, lost-authority repair
-  suppression, and local content anti-entropy. Matching invariant entrypoints
-  live under `checks/dfs/`.
+  sharded namespace routing, namespace-command replay and cancellation,
+  metadata journal source validation, repair authorization, replication policy,
+  no-conflict serialization, pending request lifecycle, repair content
+  validation, chunked transfer, lost-authority repair suppression, and local
+  content anti-entropy. Matching invariant entrypoints live under `checks/dfs/`.
 
 This maps to the repository boundary documented in
 `docs/clustering-architecture.md` and `docs/network-architecture.md`:
@@ -64,6 +68,25 @@ This maps to the repository boundary documented in
 owns transport and routing mechanism without depending on cluster policy, and
 `sinomo-cluster` bridges them by moving consensus and membership traffic over
 network routes backed by authoritative cluster state.
+
+### Evidence status
+
+Every model must be read as one of three evidence classes:
+
+- **Current-behavior refinement** mirrors a production decision surface and
+  should have table- or trace-driven Rust conformance tests.
+- **Abstract contract** deliberately hides lower-layer mechanics and proves
+  only the named boundary. For example, `raft_kv` is a committed-prefix/KV
+  refinement, not a proof of concrete RequestVote, AppendEntries, WAL, or
+  snapshot behavior.
+- **Target hardening** states behavior that the implementation does not yet
+  enforce. The catch-up certificate required by the membership promotion model
+  is currently in this class.
+
+Passing a bounded check proves none of the omitted mechanics. New and existing
+models should say which class they belong to, and target-hardening checks must
+not be described as current implementation conformance until the corresponding
+Rust gate exists.
 
 ## What The Models Check
 
@@ -87,6 +110,33 @@ The model already caught one useful bug during drafting: an offline node was
 allowed to come online without catch-up, then accept a later committed entry
 without the earlier prefix. The Rust in-process cluster catches up a node when
 `set_node_online(..., true)` is called, so the spec now models that behavior.
+
+The `raft_protocol_safety.safety` invariant checks the deeper three-voter
+protocol slice:
+
+- each voter grants at most one candidate per term and candidates with stale
+  logs are rejected;
+- a recorded leader has a quorum and there is at most one leader per term;
+- equal entry terms at an index imply matching log prefixes;
+- AppendEntries prev-log mismatch backs up `nextIndex`, while an accepted
+  conflicting entry truncates the follower's uncommitted suffix;
+- commit requires quorum acknowledgements for a current-term entry, and every
+  per-node committed prefix agrees with the canonical committed prefix;
+- a later-term leader contains every earlier committed entry;
+- each applied state machine equals replay of its committed local prefix;
+- higher-term observations force candidate/leader stepdown; and
+- crash/restart preserves durable term, vote, and log state.
+
+This maps to `RaftRequestVoteRequest`, `RaftAppendEntriesRequest`,
+`ClusterKvRaftStore::request_vote`, the AppendEntries preparation/application
+path, `build_append_entries_request_from_next_index`, quorum replication and
+commit helpers, and the persisted hard-state/log load path in `sinomo-kv`.
+Three documented reachable protocol cuts expose divergent suffix repair and
+leader-change safety without requiring every setup transition in the same
+trace. All ten branch witnesses are exercised by deterministic randomized
+coverage. This is a finite current-behavior refinement over abstract transport
+and persistence actions, not a proof of the byte-level WAL or network RPC
+implementation.
 
 The `network_safety.safety` invariant combines these properties:
 
@@ -145,12 +195,37 @@ This maps to `ClusterDeliveryRouteGraph`, `cluster_delivery_route_candidates`,
 direct target endpoint can remain as a high-cost last-resort fallback, but
 identity-mismatch evidence and unreachable relay edges are excluded.
 
+The `network_route_cache_safety.safety` invariant refines the production
+routing-table cache boundary:
+
+- reuse requires equality of the cluster-state mark, committed directory
+  version, local-connectivity file mark and content generation, and enabled
+  module-dialer snapshot;
+- an unknown directory version disables both reuse and publication;
+- the cached table's cluster and local-node identities must still match the
+  caller;
+- a table is not reused at or after its earliest connectivity expiry;
+- committed membership removal changes the directory mark before an old target
+  plan can be reused;
+- endpoint identity mismatch eagerly invalidates the cache; and
+- a table built while its before/after validity mark changes is discarded.
+
+This maps to `ClusterDeliveryRoutingTableCacheMark`,
+`cluster_delivery_route_plan_from_cached_routing_table`,
+`cluster_delivery_routing_table_cache_mark`, the before/after build check in
+`cluster_delivery_route_plan_from_routing_table_async`, and
+`record_cluster_delivery_endpoint_identity_mismatch`. Named witnesses keep each
+mark input, identity check, expiry path, membership removal, and build race
+reachable. The slice proves safe reuse, not cache hit rate, eviction policy, or
+fresh-route construction after a miss.
+
 The `network_delivery_retry_safety.safety` invariant combines these properties:
 
 - a delivered response requires a successful endpoint attempt;
-- delivered responses are entered in the replay cache;
-- duplicate delivery-key replay does not redispatch the inner request;
-- primary and fallback attempts use the original stable delivery key;
+- primary and fallback attempts preserve the caller's stable operation identity;
+- each endpoint attempt uses a fresh authentication nonce;
+- retry may dispatch the same domain operation more than once, but the number of
+  dispatches remains bounded by the endpoint attempts;
 - failed and suppressed endpoints were attempted;
 - identity-mismatch endpoint failures are suppressed and recorded as
   identity-mismatch feedback;
@@ -163,9 +238,10 @@ The `network_delivery_retry_safety.safety` invariant combines these properties:
 This maps to the target/relay send retry paths in `route.rs`, including
 `ClusterDeliveryFailedEdges`, `record_cluster_delivery_endpoint_identity_mismatch`,
 the per-endpoint attempt loop, and `RelayEnvelope`'s stable inner request. It
-models duplicate suppression as a replay-cache contract at the delivery-key
-level; concrete daemon-auth nonce handling stays in Rust tests because each
-endpoint attempt still needs a fresh transport nonce.
+does not claim generic network-level exactly-once delivery: generic object RPC
+may duplicate a side-effecting request. Domain protocols such as DFS and KV must
+enforce idempotency with the stable operation identity, while every concrete
+endpoint attempt receives fresh transport authentication.
 
 The `network_timed_transport_safety.safety` invariant combines these
 properties:
@@ -187,7 +263,10 @@ The `network_timed_delivery_retry_safety.safety` invariant combines these
 properties:
 
 - request time and global deadline stay inside the bounded logical clock;
+- the request deadline is derived from the request start rather than model
+  initialization;
 - endpoint attempts require a prepared stable delivery key;
+- each response due time is derived from that endpoint's attempt start;
 - per-attempt timeout and accepted-attempt timeout never extend the global
   deadline;
 - primary and fallback attempts reuse the original stable delivery key while
@@ -202,11 +281,14 @@ properties:
 - `TimedAllEndpointsFailed` cannot skip a usable fallback while time remains;
 - failed, timed-out, and suppressed endpoints were attempted;
 - identity-mismatch endpoint failures suppress the endpoint;
-- duplicate replay does not redispatch the already completed request.
+- observed duplicate responses refer to an attempted endpoint without creating
+  a generic exactly-once guarantee.
 
 These timed models are still finite and safety-oriented. They model bounded
 logical time, packet loss, delay, duplication, per-attempt timeout, late
-responses, and fallback behavior; they do not yet prove unbounded real-time
+responses, and fallback behavior. The timed smoke scenario couples attempt
+start to packet creation, advances both clocks together, and requires packet
+delivery before a response decision. It does not yet prove unbounded real-time
 fairness or scheduler progress.
 
 The full-system smoke model is intentionally different from the focused proof
@@ -264,6 +346,27 @@ set for randomized exploration. `stepCore` covers the join-to-voter lifecycle
 for symbolic verification. TLC is used for this finite refinement-style check
 because Apalache struggles with the function-valued replay formulas in this
 module.
+
+The `raft_config_transition_safety.safety` invariant isolates the production
+Raft configuration validator from the broader membership lifecycle:
+
+- adding a voter requires that node to be a committed learner or non-voting
+  member, and at most one voter may be added per transition;
+- removing voters requires the retained set to satisfy both the old and new
+  quorum sizes, rejecting the unsafe two-voter-to-one-voter transition;
+- committing a valid proposal still requires acknowledgements from a quorum of
+  the current configuration;
+- health observations do not mutate the committed Raft configuration;
+- focused initial cases cover learner and non-voting promotion, valid
+  three-to-two shrink, invalid direct/multiple additions, and insufficient
+  acknowledgement.
+
+This maps to `validate_cluster_kv_raft_config_transition` and separates a
+current-behavior configuration proof from the target catch-up certificate in
+the broader membership model. The Rust table test
+`cluster_kv_raft_config_transition_matches_bounded_model_cases` covers the same
+learner/non-voting promotion, direct and multiple addition rejection, and
+three-to-two versus two-to-one shrink cases.
 
 The `dfs_metadata_safety.safety` invariant combines these properties:
 
@@ -468,7 +571,12 @@ The `dfs_pending_request_lifecycle_safety.safety` invariant combines these prope
 - routed-write terminal result cache entries are not active requests;
 - a request id has at most one active owner across the modeled maps;
 - stage and repair request ids are unique by target replica;
-- no response can settle the wrong request;
+- a read response settles only when request id, expected source, and object
+  identity all match;
+- a wrong-source response is discarded while the original read remains pending;
+- a wrong-object response from the expected source is terminally rejected and
+  cannot enter the successful settled set;
+- read identity failures retain expected and actual source/object audit facts;
 - discarded response ids stay within the finite request-id universe.
 
 This maps to `NetworkedDfsService::next_request_id`,
@@ -483,6 +591,32 @@ may remain in `pending_routed_writes` as terminal cached results for
 `write_outcome`; they are not active pending requests. It does not prove
 eventual progress, wall-clock timeout fairness, chunk assembly correctness, or
 full transfer-window accounting.
+
+The `dfs_namespace_command_replay_safety.safety` invariant refines the
+primary-side namespace replay cache and requester cancellation boundary:
+
+- the replay key is the transport requester plus the complete
+  `DfsNamespaceCommand`, not request id alone;
+- an exact resident retry returns the original captured response without
+  executing another namespace effect;
+- changing the operation payload while retaining the request id is a new
+  command and executes normally;
+- cache insertion is FIFO bounded (two entries in the model, corresponding to
+  the production 32-entry `VecDeque`);
+- exact retry after FIFO eviction or process restart may execute the mutation
+  again, so the cache is not a durable exactly-once guarantee;
+- cancellation removes the requester-side wait but cannot retract a command
+  already sent to the metadata primary; and
+- a cancelled call retried with a fresh request id is a new replay key.
+
+This maps to `NetworkedDfsService::handle_namespace_request`,
+`served_namespace_replays`, `settle_routed_namespace_op_inner`, process-local
+service-state initialization, and fresh request-id allocation. Named witnesses
+make both the protected exact-retry path and the eviction, restart, changed
+payload, and cancellation limitations executable. The existing Rust regression
+`served_namespace_exact_retry_replays_completed_rename` covers the resident
+exact-retry case; durable domain idempotency after cache loss remains a separate
+hardening problem.
 
 The `dfs_repair_content_validation_safety.safety` invariant combines these properties:
 
@@ -614,32 +748,68 @@ or that repeated lifecycle maintenance will eventually revisit every page.
 
 ## Running
 
-Fast local check:
+The formal toolchain is pinned to Quint 0.32.0 and Apalache 0.56.1. The checker
+rejects another Quint version unless an intentional compatibility audit sets
+`QUINT_ALLOW_VERSION_MISMATCH=1`. Symbolic runs are serialized through a local
+lock because Apalache normally uses `localhost:8822`.
+
+Use the smallest mode that answers the current question:
 
 ```bash
-bash scripts/formal/check-quint.sh
+# All typechecks, focused runs, smoke scenarios, and symbolic checks.
+bash scripts/formal/check-quint.sh all
+
+# Typechecks, runs, smoke scenarios, and the faster symbolic tier.
+bash scripts/formal/check-quint.sh fast
+
+bash scripts/formal/check-quint.sh typecheck
+bash scripts/formal/check-quint.sh run
+bash scripts/formal/check-quint.sh smoke
+bash scripts/formal/check-quint.sh verify-fast
+bash scripts/formal/check-quint.sh verify-full
 ```
 
-Whole-system randomized smoke exploration:
+Focused cases live in one registry inside `check-quint.sh`. The harness fails if
+that registry omits a `checks/**/*_safety.qnt` file. Select one or more cases
+without editing the script:
+
+```bash
+QUINT_CASE_FILTER=network-timed-delivery,dfs-pending-requests \
+  bash scripts/formal/check-quint.sh verify-full
+```
+
+Randomized runs use a fixed seed by default. Important branches expose named
+witness predicates; coverage mode raises the sample count and fails if any
+registered witness is not reached:
+
+```bash
+QUINT_CASE_FILTER=raft-protocol,network-route-cache,network-delivery,network-attempt-budget,network-timed-delivery,membership-raft-config,dfs-pending-requests,dfs-namespace-command-replay \
+  QUINT_COVERAGE_MAX_SAMPLES=5000 \
+  bash scripts/formal/check-quint.sh coverage
+```
+
+Per-command timeouts default to 300 seconds and can be changed with
+`QUINT_CASE_TIMEOUT_SECONDS`. Failed CI jobs retain `_apalache-out/`. The
+checked-in `.gitlab-ci.yml` runs typechecking, deterministic smoke exploration,
+witness coverage, and focused symbolic checks on relevant changes; scheduled
+pipelines run the full symbolic tier.
+
+For deeper whole-system randomized exploration, use:
 
 ```bash
 bash scripts/formal/run-quint-smoke.sh
-```
-
-`check-quint.sh` runs the full-system smoke model with a lighter default of 80
-steps and 500 samples. `run-quint-smoke.sh` is the deeper local explorer; it
-defaults to 160 steps and 5000 samples. Override either path with
-`QUINT_SYSTEM_SMOKE_RUN_MAX_STEPS` and `QUINT_SYSTEM_SMOKE_RUN_MAX_SAMPLES`.
-To reproduce a found trace, pass the reported seed:
-
-```bash
 QUINT_SYSTEM_SMOKE_SEED=0x58c1421ebe0d1421 bash scripts/formal/run-quint-smoke.sh
 ```
+
+`run-quint-smoke.sh` defaults to 160 steps and 5000 samples. Override it with
+`QUINT_SYSTEM_SMOKE_RUN_MAX_STEPS` and `QUINT_SYSTEM_SMOKE_RUN_MAX_SAMPLES`.
 
 The checker is equivalent to these command classes:
 
 ```bash
-find specs/quint -name '*.qnt' -print0 | sort -z | xargs -0 -n1 quint typecheck
+while IFS= read -r -d '' file; do
+  timeout --foreground 300s quint typecheck "$file"
+done < <(find specs/quint -name '*.qnt' -print0 | sort -z)
 
 quint run specs/quint/checks/kv/raft_kv_safety.qnt --main=raft_kv_safety --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
 quint run specs/quint/checks/network/route_planning_safety.qnt --main=network_route_planning_safety --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
@@ -650,7 +820,7 @@ quint run specs/quint/scenarios/system/smoke.qnt --main=system_smoke --invariant
 
 quint verify specs/quint/checks/kv/raft_kv_safety.qnt --main=raft_kv_safety --invariant=safety --max-steps=5 --verbosity=1
 quint verify specs/quint/checks/network/route_planning_safety.qnt --main=network_route_planning_safety --invariant=safety --max-steps=4 --verbosity=1
-quint verify specs/quint/checks/network/timed_delivery_retry_safety.qnt --main=network_timed_delivery_retry_safety --invariant=safety --max-steps=4 --verbosity=1
+quint verify specs/quint/checks/network/timed_delivery_retry_safety.qnt --main=network_timed_delivery_retry_safety --invariant=safety --max-steps=7 --verbosity=1
 quint verify specs/quint/checks/dfs/posix_namespace_safety.qnt --main=dfs_posix_namespace_safety --invariant=safety --max-steps=2 --verbosity=1
 ```
 
@@ -663,17 +833,27 @@ The default symbolic bound is deliberately modest. On this checkout,
 the Raft, network, DFS metadata, and DFS routing specs use
 `QUINT_VERIFY_MAX_STEPS`, defaulting to 5. DFS routing can also be overridden
 with `QUINT_DFS_ROUTING_VERIFY_MAX_STEPS`; its 5-step symbolic check passed on
-this checkout but took about 53-81 seconds in local runs. The network endpoint
+this checkout but took about 53-81 seconds in local runs. The deeper per-node
+Raft slice uses `QUINT_RAFT_PROTOCOL_VERIFY_MAX_STEPS`,
+defaulting to 1 for routine initialization-state proof while fixed-seed witness
+coverage exercises ten-step protocol traces. Its 1-step Apalache check passed in
+about 53 seconds; a 3-step attempt was interrupted after about 230 seconds and
+is not claimed as a pass. Scheduled CI raises this slice to 2 steps under a
+900-second per-command timeout. The network endpoint
 selection spec uses `QUINT_NETWORK_ENDPOINT_VERIFY_MAX_STEPS`, defaulting to 4;
 its 4-step symbolic check passed in about 10 seconds. The network route
 planning spec uses `QUINT_NETWORK_ROUTE_VERIFY_MAX_STEPS`, defaulting to 4; its
-4-step symbolic check passed in about 5 seconds. The network delivery retry spec
+4-step symbolic check passed in about 5 seconds. The network route-cache spec
+uses `QUINT_NETWORK_ROUTE_CACHE_VERIFY_MAX_STEPS`, defaulting to 4; its 4-step
+symbolic check passed in about 14 seconds. The network delivery retry spec
 uses `QUINT_NETWORK_DELIVERY_VERIFY_MAX_STEPS`, defaulting to 5; its isolated
 6-step symbolic check passed in about 6 seconds. The network attempt-budget spec
 uses `QUINT_NETWORK_ATTEMPT_BUDGET_VERIFY_MAX_STEPS`, defaulting to 3. The
 timed transport and timed delivery-retry specs use
 `QUINT_NETWORK_TIMED_TRANSPORT_VERIFY_MAX_STEPS` and
-`QUINT_NETWORK_TIMED_DELIVERY_VERIFY_MAX_STEPS`, each defaulting to 4. The
+`QUINT_NETWORK_TIMED_DELIVERY_VERIFY_MAX_STEPS`, defaulting to 5 and 7,
+respectively. These bounds reach packet delivery and fallback paths; named
+witnesses independently guard randomized reachability. The
 timed network smoke scenario uses `QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_STEPS` and
 `QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_SAMPLES`, defaulting to 80 and 500. The
 read-freshness, routed namespace-freshness, and metadata-primary failover specs
@@ -723,39 +903,43 @@ normal script path instead of symbolically verified as a routine gate; a
 5-step symbolic smoke check has passed locally, but the useful signal is the
 broader random exploration and seed-based replay.
 
+The namespace-command replay slice uses
+`QUINT_DFS_NAMESPACE_REPLAY_VERIFY_MAX_STEPS`, defaulting to 5; its 5-step
+Apalache check passed, while a fixed-seed 5,000-trace run reached all six
+resident-replay and cache-loss/cancellation witnesses.
+
 Use larger bounds for local audit runs, not as a routine CI gate:
 
 ```bash
-QUINT_VERIFY_MAX_STEPS=8 QUINT_NETWORK_ENDPOINT_VERIFY_MAX_STEPS=5 QUINT_NETWORK_ROUTE_VERIFY_MAX_STEPS=5 QUINT_NETWORK_DELIVERY_VERIFY_MAX_STEPS=6 QUINT_NETWORK_ATTEMPT_BUDGET_VERIFY_MAX_STEPS=4 QUINT_NETWORK_TIMED_TRANSPORT_VERIFY_MAX_STEPS=5 QUINT_NETWORK_TIMED_DELIVERY_VERIFY_MAX_STEPS=5 QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_STEPS=160 QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_SAMPLES=5000 QUINT_SYSTEM_SMOKE_RUN_MAX_STEPS=240 QUINT_SYSTEM_SMOKE_RUN_MAX_SAMPLES=10000 QUINT_DFS_ROUTING_VERIFY_MAX_STEPS=6 QUINT_DFS_READ_FRESHNESS_VERIFY_MAX_STEPS=4 QUINT_DFS_ROUTED_NAMESPACE_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_NAMESPACE_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_LINKS_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_CROSS_SHARD_VERIFY_MAX_STEPS=3 QUINT_DFS_POSIX_READ_WRITE_VERIFY_MAX_STEPS=2 QUINT_DFS_PRIMARY_FAILOVER_VERIFY_MAX_STEPS=4 QUINT_DFS_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_SHARDED_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_JOURNAL_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_VERIFY_MAX_STEPS=6 QUINT_DFS_REPLICATION_VERIFY_MAX_STEPS=6 QUINT_DFS_NO_CONFLICT_VERIFY_MAX_STEPS=6 QUINT_DFS_PENDING_VERIFY_MAX_STEPS=4 QUINT_DFS_REPAIR_CONTENT_VERIFY_MAX_STEPS=6 QUINT_DFS_CHUNKED_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_LOST_AUTHORITY_VERIFY_MAX_STEPS=5 QUINT_DFS_ANTI_ENTROPY_VERIFY_MAX_STEPS=6 QUINT_MEMBERSHIP_VERIFY_MAX_STEPS=5 QUINT_MEMBERSHIP_KV_VERIFY_MAX_STEPS=5 bash scripts/formal/check-quint.sh
+QUINT_VERIFY_MAX_STEPS=8 QUINT_RAFT_PROTOCOL_VERIFY_MAX_STEPS=2 QUINT_NETWORK_ENDPOINT_VERIFY_MAX_STEPS=5 QUINT_NETWORK_ROUTE_VERIFY_MAX_STEPS=5 QUINT_NETWORK_ROUTE_CACHE_VERIFY_MAX_STEPS=5 QUINT_NETWORK_DELIVERY_VERIFY_MAX_STEPS=6 QUINT_NETWORK_ATTEMPT_BUDGET_VERIFY_MAX_STEPS=4 QUINT_NETWORK_TIMED_TRANSPORT_VERIFY_MAX_STEPS=6 QUINT_NETWORK_TIMED_DELIVERY_VERIFY_MAX_STEPS=8 QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_STEPS=160 QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_SAMPLES=5000 QUINT_SYSTEM_SMOKE_RUN_MAX_STEPS=240 QUINT_SYSTEM_SMOKE_RUN_MAX_SAMPLES=10000 QUINT_DFS_ROUTING_VERIFY_MAX_STEPS=6 QUINT_DFS_READ_FRESHNESS_VERIFY_MAX_STEPS=4 QUINT_DFS_ROUTED_NAMESPACE_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_NAMESPACE_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_LINKS_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_CROSS_SHARD_VERIFY_MAX_STEPS=3 QUINT_DFS_POSIX_READ_WRITE_VERIFY_MAX_STEPS=2 QUINT_DFS_PRIMARY_FAILOVER_VERIFY_MAX_STEPS=4 QUINT_DFS_NAMESPACE_REPLAY_VERIFY_MAX_STEPS=6 QUINT_DFS_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_SHARDED_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_JOURNAL_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_VERIFY_MAX_STEPS=6 QUINT_DFS_REPLICATION_VERIFY_MAX_STEPS=6 QUINT_DFS_NO_CONFLICT_VERIFY_MAX_STEPS=6 QUINT_DFS_PENDING_VERIFY_MAX_STEPS=4 QUINT_DFS_REPAIR_CONTENT_VERIFY_MAX_STEPS=6 QUINT_DFS_CHUNKED_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_LOST_AUTHORITY_VERIFY_MAX_STEPS=5 QUINT_DFS_ANTI_ENTROPY_VERIFY_MAX_STEPS=6 QUINT_MEMBERSHIP_VERIFY_MAX_STEPS=5 QUINT_MEMBERSHIP_KV_VERIFY_MAX_STEPS=5 QUINT_MEMBERSHIP_RAFT_CONFIG_VERIFY_MAX_STEPS=5 bash scripts/formal/check-quint.sh all
 ```
 
 ## Current Abstractions
 
 This slice does not yet model:
 
-- per-node durable hard-state fields such as `current_term`, `voted_for`, and
-  `leader_id`;
-- rejected append entries, follower log truncation, or concrete Raft RPCs over
-  the network abstraction;
-- WAL and snapshot restore;
+- byte-level WAL durability, snapshot restore, torn writes, or persistence
+  failures beneath the abstract durable term/vote/log restart action;
+- concrete Raft RPC frames, transport loss/reordering, and retry over the
+  network abstraction;
 - watches, leases, compare-and-swap transactions, and revision histories;
 - concrete invite cryptography, certificate validation, and role-policy checks;
 - concrete Raft config-change RPCs over the network abstraction;
 - cluster leave and migration quarantine/import behavior;
 - full-system smoke internals beyond the current abstract integration surface:
-  real directory snapshots, concrete route-cache generations, raw transport
-  frames, stream payloads, full KV log replay, and concrete DFS object-store
-  contents;
-- route-table cache invalidation, live `ClusterDirectory` read failures during
-  an in-flight delivery, raw streamed response retry budgets, concrete transport
-  nonce entropy, unbounded wall-clock fairness, and dynamic module
-  enable/disable races;
+  real directory snapshots, composition with the focused route-cache model, raw
+  transport frames, stream payloads, full KV log replay, and concrete DFS
+  object-store contents;
+- live `ClusterDirectory` read failures during an in-flight delivery, raw
+  streamed response retry budgets, concrete transport nonce entropy, unbounded
+  wall-clock fairness, and dynamic module enable/disable races;
 - directory fragments, local-owned owner routing, owner-inclusion replica-set
-  normalization, cross-primary repair handoff progress, router-local recovery
-  after sharded namespace index write failures, chunked patch offset/base
-  semantics, read-memory assembly details, distributed anti-entropy repair
-  scheduling progress, wall-clock timeout fairness, and future split-cluster
-  conflict recovery.
+  normalization, durable namespace-command idempotency across cache eviction or
+  restart, cross-primary repair handoff progress, router-local recovery after
+  sharded namespace index write failures, chunked patch offset/base semantics,
+  read-memory assembly details, distributed anti-entropy repair scheduling
+  progress, wall-clock timeout fairness, and future split-cluster conflict
+  recovery.
 
 Future models should remain layered instead of expanding one state machine.
 The active verification backlog is maintained in the

@@ -13,6 +13,9 @@
 /// while active, a response can settle only the matching tracked request, late
 /// or mismatched responses are discarded, and terminal/timeout transitions stop
 /// being active.
+///
+/// Evidence class: current-behavior refinement of the pending-map ownership and
+/// response identity checks. Progress and wall-clock fairness are omitted.
 module dfs_pending_request_lifecycle {
   import common.* from "../../lib/common"
 
@@ -20,11 +23,29 @@ module dfs_pending_request_lifecycle {
   type DfsObject = ObjA | ObjB
   type IntentId = IntentA | IntentB
   type RoutedState = RoutedActive | RoutedTerminal
-  type Observation = NoObservation | Settled(RequestId) | Discarded(RequestId) | TimedOut(RequestId)
+  type Observation =
+    | NoObservation
+    | Settled(RequestId)
+    | Discarded(RequestId)
+    | ReadSettled(RequestId)
+    | ReadUnknownDiscarded(RequestId)
+    | ReadWrongSourceDiscarded(RequestId)
+    | ReadWrongObjectRejected(RequestId)
+    | TimedOut(RequestId)
 
   type PendingEndpoint = {
     source: Node,
     object: DfsObject,
+  }
+
+  /// Audit record for a response that carried a known request id but did not
+  /// match the source/object identity captured when the read was issued.
+  type ReadIdentityError = {
+    requestId: RequestId,
+    expectedSource: Node,
+    actualSource: Node,
+    expectedObject: DfsObject,
+    actualObject: DfsObject,
   }
 
   type PendingRoutedWrite = {
@@ -52,7 +73,7 @@ module dfs_pending_request_lifecycle {
   var repairInflight: Node -> Option[RequestId]
   var settled: Set[RequestId]
   var discarded: Set[RequestId]
-  var wrongSettles: Set[RequestId]
+  var readIdentityErrors: Set[ReadIdentityError]
   var lastObservation: Observation
 
   pure val emptyEndpointMap: RequestId -> Option[PendingEndpoint] =
@@ -117,7 +138,7 @@ module dfs_pending_request_lifecycle {
     repairInflight' = emptyNodeRequestMap,
     settled' = Set(),
     discarded' = Set(),
-    wrongSettles' = Set(),
+    readIdentityErrors' = Set(),
     lastObservation' = NoObservation,
   }
 
@@ -135,7 +156,7 @@ module dfs_pending_request_lifecycle {
     repairInflight' = repairInflight,
     settled' = settled,
     discarded' = discarded,
-    wrongSettles' = wrongSettles,
+    readIdentityErrors' = readIdentityErrors,
     lastObservation' = NoObservation,
   }
 
@@ -154,7 +175,7 @@ module dfs_pending_request_lifecycle {
     repairInflight' = repairInflight,
     settled' = settled,
     discarded' = discarded,
-    wrongSettles' = wrongSettles,
+    readIdentityErrors' = readIdentityErrors,
     lastObservation' = NoObservation,
   }
 
@@ -172,7 +193,7 @@ module dfs_pending_request_lifecycle {
     repairInflight' = repairInflight,
     settled' = settled,
     discarded' = discarded,
-    wrongSettles' = wrongSettles,
+    readIdentityErrors' = readIdentityErrors,
     lastObservation' = NoObservation,
   }
 
@@ -197,7 +218,7 @@ module dfs_pending_request_lifecycle {
     repairInflight' = repairInflight,
     settled' = settled,
     discarded' = discarded,
-    wrongSettles' = wrongSettles,
+    readIdentityErrors' = readIdentityErrors,
     lastObservation' = NoObservation,
   }
 
@@ -213,7 +234,7 @@ module dfs_pending_request_lifecycle {
     repairInflight' = repairInflight,
     settled' = settled,
     discarded' = discarded,
-    wrongSettles' = wrongSettles,
+    readIdentityErrors' = readIdentityErrors,
     lastObservation' = NoObservation,
   }
 
@@ -229,7 +250,7 @@ module dfs_pending_request_lifecycle {
     repairInflight' = repairInflight.set(replica, Some(requestId)),
     settled' = settled,
     discarded' = discarded,
-    wrongSettles' = wrongSettles,
+    readIdentityErrors' = readIdentityErrors,
     lastObservation' = NoObservation,
   }
 
@@ -238,11 +259,13 @@ module dfs_pending_request_lifecycle {
       source: N1,
       object: ObjA,
     })
-    if (isSome(pendingReads.get(requestId)) and source == pending.source) {
+    if (isSome(pendingReads.get(requestId))
+      and source == pending.source
+      and object == pending.object) {
       all {
         pendingReads' = pendingReads.set(requestId, None),
         settled' = settled.union(Set(requestId)),
-        lastObservation' = Settled(requestId),
+        lastObservation' = ReadSettled(requestId),
         issued' = issued,
         pendingRoutedWrites' = pendingRoutedWrites,
         pendingNamespaces' = pendingNamespaces,
@@ -250,13 +273,30 @@ module dfs_pending_request_lifecycle {
         stageInflight' = stageInflight,
         repairInflight' = repairInflight,
         discarded' = discarded,
-        wrongSettles' = wrongSettles,
+        readIdentityErrors' = readIdentityErrors,
       }
     } else {
       all {
-        pendingReads' = pendingReads,
+        // The Rust handler keeps a request pending after a wrong-source
+        // response. Once the expected source responds with the wrong object,
+        // it terminally rejects that attempt and lets read planning fall back.
+        pendingReads' =
+          if (isSome(pendingReads.get(requestId))
+            and source == pending.source
+            and object != pending.object) {
+            pendingReads.set(requestId, None)
+          } else {
+            pendingReads
+          },
         discarded' = discarded.union(Set(requestId)),
-        lastObservation' = Discarded(requestId),
+        lastObservation' =
+          if (not(isSome(pendingReads.get(requestId)))) {
+            ReadUnknownDiscarded(requestId)
+          } else if (source != pending.source) {
+            ReadWrongSourceDiscarded(requestId)
+          } else {
+            ReadWrongObjectRejected(requestId)
+          },
         issued' = issued,
         pendingRoutedWrites' = pendingRoutedWrites,
         pendingNamespaces' = pendingNamespaces,
@@ -264,7 +304,19 @@ module dfs_pending_request_lifecycle {
         stageInflight' = stageInflight,
         repairInflight' = repairInflight,
         settled' = settled,
-        wrongSettles' = wrongSettles,
+        readIdentityErrors' =
+          if (isSome(pendingReads.get(requestId))
+            and (source != pending.source or object != pending.object)) {
+            readIdentityErrors.union(Set({
+              requestId: requestId,
+              expectedSource: pending.source,
+              actualSource: source,
+              expectedObject: pending.object,
+              actualObject: object,
+            }))
+          } else {
+            readIdentityErrors
+          },
       }
     }
   }
@@ -288,7 +340,7 @@ module dfs_pending_request_lifecycle {
               stageInflight' = stageInflight,
               repairInflight' = repairInflight,
               discarded' = discarded,
-              wrongSettles' = wrongSettles,
+              readIdentityErrors' = readIdentityErrors,
             }
           } else {
             all {
@@ -302,7 +354,7 @@ module dfs_pending_request_lifecycle {
               stageInflight' = stageInflight,
               repairInflight' = repairInflight,
               settled' = settled,
-              wrongSettles' = wrongSettles,
+              readIdentityErrors' = readIdentityErrors,
             }
           }
       | None => all {
@@ -316,7 +368,7 @@ module dfs_pending_request_lifecycle {
           stageInflight' = stageInflight,
           repairInflight' = repairInflight,
           settled' = settled,
-          wrongSettles' = wrongSettles,
+          readIdentityErrors' = readIdentityErrors,
         }
     }
 
@@ -339,7 +391,7 @@ module dfs_pending_request_lifecycle {
         stageInflight' = stageInflight,
         repairInflight' = repairInflight,
         discarded' = discarded,
-        wrongSettles' = wrongSettles,
+        readIdentityErrors' = readIdentityErrors,
       }
     } else {
       all {
@@ -353,7 +405,7 @@ module dfs_pending_request_lifecycle {
         stageInflight' = stageInflight,
         repairInflight' = repairInflight,
         settled' = settled,
-        wrongSettles' = wrongSettles,
+        readIdentityErrors' = readIdentityErrors,
       }
     }
   }
@@ -371,7 +423,7 @@ module dfs_pending_request_lifecycle {
           stageInflight' = stageInflight,
           repairInflight' = repairInflight,
           discarded' = discarded,
-          wrongSettles' = wrongSettles,
+          readIdentityErrors' = readIdentityErrors,
         }
       | None => all {
           pendingRemoteWriteResponses' = pendingRemoteWriteResponses,
@@ -384,7 +436,7 @@ module dfs_pending_request_lifecycle {
           repairInflight' = repairInflight,
           settled' = settled,
           discarded' = discarded,
-          wrongSettles' = wrongSettles,
+          readIdentityErrors' = readIdentityErrors,
         }
     }
 
@@ -401,7 +453,7 @@ module dfs_pending_request_lifecycle {
         pendingRemoteWriteResponses' = pendingRemoteWriteResponses,
         repairInflight' = repairInflight,
         discarded' = discarded,
-        wrongSettles' = wrongSettles,
+        readIdentityErrors' = readIdentityErrors,
       }
     } else {
       all {
@@ -415,7 +467,7 @@ module dfs_pending_request_lifecycle {
         pendingRemoteWriteResponses' = pendingRemoteWriteResponses,
         repairInflight' = repairInflight,
         settled' = settled,
-        wrongSettles' = wrongSettles,
+        readIdentityErrors' = readIdentityErrors,
       }
     }
 
@@ -432,7 +484,7 @@ module dfs_pending_request_lifecycle {
         pendingRemoteWriteResponses' = pendingRemoteWriteResponses,
         stageInflight' = stageInflight,
         discarded' = discarded,
-        wrongSettles' = wrongSettles,
+        readIdentityErrors' = readIdentityErrors,
       }
     } else {
       all {
@@ -446,7 +498,7 @@ module dfs_pending_request_lifecycle {
         pendingRemoteWriteResponses' = pendingRemoteWriteResponses,
         stageInflight' = stageInflight,
         settled' = settled,
-        wrongSettles' = wrongSettles,
+        readIdentityErrors' = readIdentityErrors,
       }
     }
 
@@ -488,9 +540,23 @@ module dfs_pending_request_lifecycle {
     ),
     settled' = settled,
     discarded' = discarded,
-    wrongSettles' = wrongSettles,
+    readIdentityErrors' = readIdentityErrors,
     issued' = issued,
     lastObservation' = TimedOut(requestId),
+  }
+
+  action stutter: bool = all {
+    issued' = issued,
+    pendingReads' = pendingReads,
+    pendingRoutedWrites' = pendingRoutedWrites,
+    pendingNamespaces' = pendingNamespaces,
+    pendingRemoteWriteResponses' = pendingRemoteWriteResponses,
+    stageInflight' = stageInflight,
+    repairInflight' = repairInflight,
+    settled' = settled,
+    discarded' = discarded,
+    readIdentityErrors' = readIdentityErrors,
+    lastObservation' = lastObservation,
   }
 
   action step = any {
