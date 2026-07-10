@@ -2171,8 +2171,8 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         dfs_message_rpc_request(&namespace_command).expect("namespace message request");
     assert_eq!(namespace_request.route, DFS_DATA_NAMESPACE_ROUTE);
     assert!(
-        !namespace_request.uses_full_response_budget(),
-        "DFS namespace message RPCs should preserve normal route fallback budgets"
+        namespace_request.uses_full_response_budget(),
+        "DFS namespace message RPCs need the full verified final-hop response budget"
     );
     let mismatched_route_request = sinomo_core::network::ObjectRpcRequest::encode_body(
         DFS_DATA_WRITE_ROUTE,
@@ -8654,6 +8654,58 @@ fn routed_write_response_tracks_remote_intent_alias() {
 }
 
 #[test]
+fn pending_routed_write_ready_waits_for_final_result_not_remote_intent_alias() {
+    let requester =
+        NodeId::from_legacy_named("node_routed_write_ready_requester").expect("requester");
+    let primary = NodeId::from_legacy_named("node_routed_write_ready_primary").expect("primary");
+    let object_id = DfsObjectId::from_legacy_named("obj_routed_write_ready").expect("object");
+    let version = DfsVersion::from_legacy_named("version_routed_write_ready").expect("version");
+    let root = temp_root("routed-write-ready-final-result");
+    let mut dfs = NetworkedDfsService::new(
+        FailingSendTransport {
+            local_node_id: requester.clone(),
+        },
+        LocalContentStore::new(root.join("content")).expect("content"),
+    );
+    dfs.pending_routed_writes.insert(
+        "dfs_net_req_1".to_string(),
+        PendingRoutedWrite {
+            object_id: object_id.clone(),
+            primary_node_id: primary.clone(),
+            command: test_routed_write_command("dfs_net_req_1", &requester, &object_id),
+            authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
+            remote_intent_id: Some("intent_remote_alias".to_string()),
+            durable_receipts: 1,
+            required_receipts: 2,
+            result: None,
+        },
+    );
+
+    let error = dfs
+        .process_incoming_until_pending_routed_writes_ready(Duration::from_millis(1))
+        .expect_err("remote intent alias alone must not mark a routed write ready");
+    assert!(
+        matches!(error, DfsError::Network { ref message } if message.contains("routed write responses did not arrive")),
+        "unexpected readiness error: {error}"
+    );
+
+    let pending = dfs
+        .pending_routed_writes
+        .get_mut("dfs_net_req_1")
+        .expect("pending routed write");
+    pending.result = Some(Ok(NetworkedDfsWriteOutcome::Committed {
+        intent_id: "intent_remote_alias".to_string(),
+        version,
+        content_hash: "blake3:routed-write-ready".to_string(),
+        repair_jobs: Vec::new(),
+    }));
+    dfs.process_incoming_until_pending_routed_writes_ready(Duration::from_millis(1))
+        .expect("committed routed result should mark the write ready");
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn routed_write_stale_pending_response_does_not_downgrade_completion() {
     let requester =
         NodeId::from_legacy_named("node_routed_write_stale_requester").expect("requester");
@@ -9785,6 +9837,236 @@ fn posix_routed_large_write_sends_manifest_only_request() {
 }
 
 #[test]
+fn posix_remote_primary_deferred_small_write_inlines_payload() {
+    let root = temp_root("posix-remote-primary-deferred-small-inline");
+    let writer =
+        NodeId::from_legacy_named("node_posix_remote_deferred_small_writer").expect("writer");
+    let primary =
+        NodeId::from_legacy_named("node_posix_remote_deferred_small_primary").expect("primary");
+    let file_system = file_system(primary.clone());
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![writer.clone()],
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control_plane.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        control.put_metadata_shard(&shard).expect("metadata shard");
+    });
+
+    let captured_command = Arc::new(Mutex::new(None::<DfsDistributedWriteCommand>));
+    let captured_command_for_sender = Arc::clone(&captured_command);
+    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
+        if let DfsNetworkMessage::DistributedWriteRequest(write_command) =
+            &command.routed_message.message
+        {
+            *captured_command_for_sender.lock().expect("capture") = Some(write_command.clone());
+        }
+        Ok(DfsMessageResponse {
+            request_id: command.request_id.clone(),
+            outbound_messages: Vec::new(),
+        })
+    });
+    let transport = DfsNodeTransport::with_connect_timeout(
+        writer.clone(),
+        vec![primary.clone()],
+        Duration::from_millis(1),
+        sender,
+    );
+    let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
+    let mut dfs = NetworkedDfsService::new(transport, writer_content)
+        .with_control_plane(control_plane)
+        .with_metadata_backend(
+            open_local_sharded_metadata_backend(root.join("metadata"), vec![shard])
+                .expect("metadata backend"),
+        )
+        .expect("attach metadata backend");
+    dfs.add_file_system(file_system.clone())
+        .expect("writer filesystem");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+
+    let path = "/routed-small-deferred-inline.bin";
+    let mut object = file_metadata(primary.clone());
+    object.file_system_id = file_system.file_system_id.clone();
+    object.path = path.to_string();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![writer.clone()];
+    dfs.add_object_metadata(object).expect("writer object");
+
+    let bytes = b"small deferred remote primary write should be inline".to_vec();
+    let expected_hash = content_hash(&bytes);
+    let stat = dfs
+        .posix_write_file(
+            path,
+            &bytes,
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+                replica_candidates: vec![writer.clone(), primary.clone()],
+                wait_for_commit: false,
+                foreground_replica_repair: false,
+            },
+        )
+        .expect("pending routed write returns stat for existing object");
+
+    assert_eq!(stat.content_hash.as_deref(), Some(expected_hash.as_str()));
+    let command = captured_command
+        .lock()
+        .expect("capture")
+        .clone()
+        .expect("captured routed write command");
+    assert_eq!(command.bytes, bytes);
+    assert_eq!(
+        command.content_hash, None,
+        "small remote-primary POSIX writes should not require a follow-up blob fetch"
+    );
+    assert_eq!(command.content_size_bytes, None);
+    assert_eq!(command.desired_replica_nodes, vec![writer, primary]);
+    assert!(
+        command.metadata_journal_after_sequence.is_some(),
+        "deferred POSIX writes need bounded response journal replay when callers publish metadata"
+    );
+    assert!(
+        dfs.flush_detached_transport_sends().is_ok(),
+        "remote-primary POSIX writes must not leave detached sends behind"
+    );
+    assert!(
+        !command.foreground_replica_repair,
+        "deferred publish must preserve nonforeground repair mode"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn posix_remote_primary_nonforeground_wait_write_requests_bounded_response_journal_replay() {
+    let root = temp_root("posix-remote-primary-nonforeground-wait-bounded-replay");
+    let writer =
+        NodeId::from_legacy_named("node_posix_remote_wait_bounded_replay_writer").expect("writer");
+    let primary = NodeId::from_legacy_named("node_posix_remote_wait_bounded_replay_primary")
+        .expect("primary");
+    let file_system = file_system(primary.clone());
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![writer.clone()],
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control_plane.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        control.put_metadata_shard(&shard).expect("metadata shard");
+    });
+
+    let captured_command = Arc::new(Mutex::new(None::<DfsDistributedWriteCommand>));
+    let captured_command_for_sender = Arc::clone(&captured_command);
+    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
+        let mut outbound_messages = Vec::new();
+        if let DfsNetworkMessage::DistributedWriteRequest(write_command) =
+            &command.routed_message.message
+        {
+            *captured_command_for_sender.lock().expect("capture") = Some(write_command.clone());
+            let content_hash = content_hash(&write_command.bytes);
+            outbound_messages.push(build_dfs_routed_message(
+                &command.routed_message.target_node_id,
+                &command.routed_message.source_node_id,
+                command.routed_message.frame_id,
+                command.routed_message.message_id + 1,
+                DfsNetworkMessage::DistributedWriteResponse(DfsDistributedWriteResponse {
+                    request_id: write_command.request_id.clone(),
+                    object_id: write_command.request.object_id.clone(),
+                    result: DfsDistributedWriteResult::Outcome {
+                        outcome: NetworkedDfsWriteOutcome::Committed {
+                            intent_id: "remote-primary-committed".to_string(),
+                            version: write_command.request.target_version.clone(),
+                            content_hash,
+                            repair_jobs: Vec::new(),
+                        },
+                    },
+                    metadata_journal_batches: Vec::new(),
+                }),
+            ));
+        }
+        Ok(DfsMessageResponse {
+            request_id: command.request_id.clone(),
+            outbound_messages,
+        })
+    });
+    let transport = DfsNodeTransport::with_connect_timeout(
+        writer.clone(),
+        vec![primary.clone()],
+        Duration::from_millis(1),
+        sender,
+    );
+    let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
+    let mut dfs = NetworkedDfsService::new(transport, writer_content)
+        .with_control_plane(control_plane)
+        .with_metadata_backend(
+            open_local_sharded_metadata_backend(root.join("metadata"), vec![shard])
+                .expect("metadata backend"),
+        )
+        .expect("attach metadata backend");
+    dfs.add_file_system(file_system.clone())
+        .expect("writer filesystem");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+
+    let path = "/routed-small-wait-nonforeground-inline.bin";
+    let mut object = file_metadata(primary.clone());
+    object.file_system_id = file_system.file_system_id.clone();
+    object.path = path.to_string();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![writer.clone()];
+    dfs.add_object_metadata(object).expect("writer object");
+
+    let bytes = b"small wait remote primary write should not replay journal".to_vec();
+    let expected_hash = content_hash(&bytes);
+    let stat = dfs
+        .posix_write_file(
+            path,
+            &bytes,
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+                replica_candidates: vec![writer.clone(), primary.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .expect("committed routed write returns stat for existing object");
+
+    assert_eq!(stat.content_hash.as_deref(), Some(expected_hash.as_str()));
+    let command = captured_command
+        .lock()
+        .expect("capture")
+        .clone()
+        .expect("captured routed write command");
+    assert_eq!(command.bytes, bytes);
+    assert_eq!(command.desired_replica_nodes, vec![writer, primary]);
+    assert!(
+        !command.foreground_replica_repair,
+        "test should exercise the nonforeground SIFS write mode"
+    );
+    assert!(
+        command.metadata_journal_after_sequence.is_some(),
+        "nonforeground wait-for-commit POSIX writes need bounded response journal replay for fresh readers"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn posix_local_primary_detached_manifest_write_persists_visible_metadata_without_self_rpc() {
     let root = temp_root("posix-local-primary-detached-manifest");
     let local =
@@ -9962,6 +10244,8 @@ fn routed_manifest_write_controls_response_journal_replay() {
     object.current_locations = vec![writer.clone()];
     dfs.add_object_metadata(object.clone())
         .expect("writer object");
+    dfs.local_metadata_journal_cursors
+        .insert(DfsMetadataShardId::new("root"), 42);
 
     dfs.route_distributed_manifest_write_to_metadata_primary(
         DfsWriteRequest {
@@ -10031,9 +10315,10 @@ fn routed_manifest_write_controls_response_journal_replay() {
 
     let commands = captured_commands.lock().expect("capture").clone();
     assert_eq!(commands.len(), 3);
-    assert!(
-        commands[0].metadata_journal_after_sequence.is_some(),
-        "synchronous routed manifest writes must request response journal replay"
+    assert_eq!(
+        commands[0].metadata_journal_after_sequence,
+        Some(42),
+        "synchronous routed manifest writes must request response journal replay from the cached applied cursor"
     );
     assert!(
         commands[1].metadata_journal_after_sequence.is_none(),
@@ -10112,6 +10397,8 @@ fn routed_inline_write_preserves_nonforeground_repair_mode() {
     object.current_locations = vec![writer.clone()];
     dfs.add_object_metadata(object.clone())
         .expect("writer object");
+    dfs.local_metadata_journal_cursors
+        .insert(DfsMetadataShardId::new("root"), 43);
 
     dfs.route_distributed_write_to_metadata_primary(
         DfsWriteRequest {
@@ -10123,20 +10410,201 @@ fn routed_inline_write_preserves_nonforeground_repair_mode() {
         },
         Some(object.version.clone()),
         b"routed-inline-nonforeground".to_vec(),
+        vec![writer.clone(), primary.clone()],
+        DfsReplicationPolicy::new(1, 2).expect("policy"),
+        object.clone(),
+        shard.clone(),
+        true,
+        false,
+        false,
+        true,
+    )
+    .expect("route inline nonforeground write");
+    dfs.route_distributed_write_to_metadata_primary(
+        DfsWriteRequest {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            target_version: DfsVersion::from_legacy_named("version_routed_inline_no_replay")
+                .expect("version"),
+            requesting_node_id: writer.clone(),
+        },
+        Some(object.version.clone()),
+        b"routed-inline-no-replay".to_vec(),
+        vec![writer.clone(), primary.clone()],
+        DfsReplicationPolicy::new(1, 2).expect("policy"),
+        object.clone(),
+        shard.clone(),
+        true,
+        false,
+        false,
+        false,
+    )
+    .expect("route inline write without response journal");
+    dfs.route_distributed_write_to_metadata_primary(
+        DfsWriteRequest {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            target_version: DfsVersion::from_legacy_named("version_routed_inline_detached")
+                .expect("version"),
+            requesting_node_id: writer.clone(),
+        },
+        Some(object.version.clone()),
+        b"routed-inline-detached".to_vec(),
         vec![writer, primary],
         DfsReplicationPolicy::new(1, 2).expect("policy"),
         object,
         shard,
         true,
         false,
+        true,
+        true,
     )
-    .expect("route inline nonforeground write");
+    .expect("route detached inline write");
+
+    assert_eq!(
+        captured_commands.lock().expect("capture").len(),
+        2,
+        "detached inline routed writes should not send synchronously"
+    );
+    dfs.flush_detached_transport_sends()
+        .expect("flush detached inline write");
 
     let commands = captured_commands.lock().expect("capture").clone();
-    assert_eq!(commands.len(), 1);
+    assert_eq!(commands.len(), 3);
     assert!(
         !commands[0].foreground_replica_repair,
         "inline routed writes must preserve nonforeground repair mode"
+    );
+    assert_eq!(
+        commands[0].metadata_journal_after_sequence,
+        Some(43),
+        "synchronous inline routed writes should request response journal replay from the cached applied cursor"
+    );
+    assert!(
+        commands[1].metadata_journal_after_sequence.is_none(),
+        "synchronous inline routed writes may skip response journal replay"
+    );
+    assert!(
+        commands[2].metadata_journal_after_sequence.is_none(),
+        "detached inline routed writes should skip response journal replay"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn routed_write_nonforeground_response_replay_is_one_batch() {
+    let root = temp_root("routed-write-nonforeground-one-batch");
+    let requester =
+        NodeId::from_legacy_named("node_routed_write_one_batch_requester").expect("requester");
+    let primary =
+        NodeId::from_legacy_named("node_routed_write_one_batch_primary").expect("primary");
+    let file_system = file_system(primary.clone());
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![requester.clone()],
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control_plane.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        control.put_metadata_shard(&shard).expect("metadata shard");
+    });
+
+    let responses = Arc::new(Mutex::new(Vec::<DfsDistributedWriteResponse>::new()));
+    let responses_for_sender = Arc::clone(&responses);
+    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
+        if let DfsNetworkMessage::DistributedWriteResponse(response) =
+            &command.routed_message.message
+        {
+            responses_for_sender
+                .lock()
+                .expect("responses")
+                .push(response.clone());
+        }
+        Ok(DfsMessageResponse {
+            request_id: command.request_id.clone(),
+            outbound_messages: Vec::new(),
+        })
+    });
+    let transport = DfsNodeTransport::with_connect_timeout(
+        primary.clone(),
+        vec![requester.clone()],
+        Duration::from_millis(1),
+        sender,
+    );
+    let mut dfs = NetworkedDfsService::new(
+        transport,
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_control_plane(control_plane)
+    .with_metadata_backend(
+        open_local_sharded_metadata_backend(root.join("metadata"), vec![shard])
+            .expect("metadata backend"),
+    )
+    .expect("attach metadata backend");
+    dfs.add_file_system(file_system.clone())
+        .expect("primary filesystem");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+
+    for index in 0..(DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT + 8) {
+        let mut filler = file_metadata(primary.clone());
+        filler.object_id = DfsObjectId::from_legacy_named(format!("obj_one_batch_filler_{index}"))
+            .expect("filler object");
+        filler.file_system_id = file_system.file_system_id.clone();
+        filler.path = format!("/filler-{index:04}.txt");
+        filler.policy = DfsObjectPolicy::ReplicatedEventual;
+        filler.current_locations = vec![primary.clone()];
+        dfs.add_object_metadata(filler).expect("filler metadata");
+    }
+
+    let mut object = file_metadata(primary.clone());
+    object.object_id =
+        DfsObjectId::from_legacy_named("obj_routed_write_one_batch").expect("target object");
+    object.file_system_id = file_system.file_system_id.clone();
+    object.path = "/one-batch-target.txt".to_string();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![requester.clone()];
+    dfs.add_object_metadata(object.clone())
+        .expect("target metadata");
+
+    dfs.handle_distributed_write_request(
+        requester.clone(),
+        DfsDistributedWriteCommand {
+            request_id: "dfs_net_req_one_batch".to_string(),
+            request: DfsWriteRequest {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                target_version: namespace::next_version(&object.version),
+                requesting_node_id: requester.clone(),
+            },
+            expected_base_version: Some(object.version.clone()),
+            metadata_journal_after_sequence: Some(0),
+            bytes: b"bounded nonforeground response replay".to_vec(),
+            content_hash: None,
+            content_size_bytes: None,
+            desired_replica_nodes: vec![requester, primary],
+            policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+            object_metadata: Some(object),
+            touch_parent_on_create: false,
+            foreground_replica_repair: false,
+        },
+    )
+    .expect("serve routed write");
+
+    let responses = responses.lock().expect("responses").clone();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(
+        responses[0].metadata_journal_batches.len(),
+        DFS_ROUTED_WRITE_RESPONSE_JOURNAL_BATCH_LIMIT,
+        "nonforeground routed write responses must not ship a deep catch-up run"
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -29570,6 +30038,82 @@ fn routed_namespace_without_local_replay_omits_response_journal_batches() {
 }
 
 #[test]
+fn sifs_remote_primary_deferred_publish_write_persists_for_fresh_replica_reader() {
+    let cluster = sifs_two_primary_cluster("sifs-remote-primary-deferred-fresh");
+    let SifsTwoPrimaryCluster {
+        root,
+        users_primary_node,
+        services_primary_node,
+        replica_node,
+        services_primary,
+        mut replica,
+        ..
+    } = cluster;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let services_stop = Arc::clone(&stop);
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+
+    let path = "/services/fresh-replica-writer.bin";
+    let options = DfsWriteOptions {
+        policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+        replica_candidates: vec![replica_node.clone(), services_primary_node.clone()],
+        wait_for_commit: false,
+        foreground_replica_repair: false,
+    };
+    let seed = vec![b'A'; 4096];
+    let writer_a = vec![b'B'; 4096];
+    let writer_b = vec![b'C'; 4096];
+
+    replica
+        .posix_write_file(path, &seed, options.clone())
+        .expect("seed remote-primary file");
+    replica
+        .process_incoming_until_pending_routed_writes_ready(Duration::from_secs(1))
+        .expect("seed response replay");
+    replica
+        .posix_write_file(path, &writer_a, options.clone())
+        .expect("first remote-primary overwrite");
+    replica
+        .process_incoming_until_pending_routed_writes_ready(Duration::from_secs(1))
+        .expect("first overwrite response replay");
+    replica
+        .posix_write_file(path, &writer_b, options)
+        .expect("second remote-primary overwrite");
+    replica
+        .process_incoming_until_pending_routed_writes_ready(Duration::from_secs(1))
+        .expect("second overwrite response replay");
+
+    stop.store(true, Ordering::SeqCst);
+    let _services_primary = services_thread.join().expect("services thread");
+    drop(replica);
+
+    let reopened = open_local_sharded_metadata_backend(
+        root.join("replica").join("metadata"),
+        sifs_two_primary_shard_configs(
+            &users_primary_node,
+            &services_primary_node,
+            2,
+            vec![services_primary_node.clone(), replica_node.clone()],
+            vec![users_primary_node.clone(), replica_node],
+        ),
+    )
+    .expect("reopen replica metadata");
+    let stored = reopened
+        .get_object_by_path(&sifs_file_system_id(), path)
+        .expect("fresh metadata lookup")
+        .expect("fresh metadata object");
+    assert_eq!(
+        stored.content_hash.as_deref(),
+        Some(content_hash(&writer_b).as_str()),
+        "fresh replica metadata must persist the committed remote-primary write, not the seed"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn routed_namespace_cursor_snapshot_uses_cached_state_not_backend_status() {
     let mut cluster = sifs_two_primary_cluster("sifs-namespace-cached-cursors");
     let services_shard = DfsMetadataShardId::new("services");
@@ -32035,6 +32579,66 @@ fn sifs_replica_distributed_stat_prefers_primary_tombstone_over_stale_local_hit(
     );
 
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sifs_replica_distributed_read_prefers_primary_over_stale_local_hit() {
+    let mut cluster = sifs_posix_cluster("sifs-replica-read-primary-current");
+    let path = "/users/read-stale-live.txt";
+    let old = b"writer-local stale payload should lose to primary current payload".to_vec();
+    let new = b"primary current payload must win the distributed read".to_vec();
+
+    sifs_cluster_routed_posix_write(&mut cluster, path, &old);
+    assert_eq!(
+        cluster
+            .writer
+            .posix_read_file(path)
+            .expect("writer old read"),
+        old
+    );
+
+    cluster
+        .primary
+        .posix_write_file(
+            path,
+            &new,
+            sifs_cluster_write_options(&cluster.primary_node.clone()),
+        )
+        .expect("primary overwrite");
+    assert_eq!(
+        cluster
+            .primary
+            .posix_read_file(path)
+            .expect("primary new read"),
+        new
+    );
+    assert_eq!(
+        cluster
+            .writer
+            .posix_read_file(path)
+            .expect("writer stale read"),
+        old,
+        "test setup must leave a stale local live entry on the writer"
+    );
+
+    let read = {
+        let primary = &mut cluster.primary;
+        let writer = &mut cluster.writer;
+        sifs_cluster_blocking_distributed_read_with_pump(
+            writer,
+            path,
+            "replica current read prefers primary object",
+            || {
+                primary.process_incoming().expect("primary pump");
+            },
+        )
+    };
+    assert_eq!(
+        read, new,
+        "distributed/current reads must prefer the shard primary over a stale replica-local hit"
+    );
+
+    std::fs::remove_dir_all(&cluster.root).ok();
 }
 
 #[test]

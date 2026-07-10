@@ -5,7 +5,7 @@
 //! writes, routed namespace operations, repair, reads, and metadata exchange
 //! handlers live with their respective service concerns.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sinomo_core::node::NodeId;
 
@@ -20,6 +20,45 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
     ) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
         self.process_incoming_with_options(false)
+    }
+
+    pub fn process_incoming_until_pending_routed_writes_ready(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
+        let pending_request_ids = self
+            .pending_routed_writes
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        if pending_request_ids.is_empty() {
+            return self.process_incoming();
+        }
+        let started = Instant::now();
+        let mut events = Vec::new();
+        loop {
+            events.extend(self.process_incoming()?);
+            if pending_request_ids.iter().all(|request_id| {
+                self.pending_routed_writes
+                    .get(request_id)
+                    .is_none_or(|pending| pending.result.is_some())
+            }) {
+                return Ok(events);
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                return Err(DfsError::Network {
+                    message: format!(
+                        "DFS routed write responses did not arrive within {}ms",
+                        timeout.as_millis()
+                    ),
+                });
+            }
+            let wait = Duration::from_millis(10).min(timeout.saturating_sub(elapsed));
+            self.transport
+                .wait_for_incoming(wait)
+                .map_err(DfsError::from_network)?;
+        }
     }
 
     pub(crate) fn process_incoming_until_quiescent(

@@ -2641,7 +2641,6 @@ where
                         endpoint_attempt_budget,
                         final_hop_attempt_budget,
                         remaining,
-                        final_hop_full_response_budget,
                     )
                 } else {
                     cluster_relay_hop_transport_timeouts(options.timeouts, endpoint_attempt_budget)
@@ -3069,7 +3068,6 @@ where
                         endpoint_attempt_budget,
                         final_hop_attempt_budget,
                         remaining,
-                        final_hop_full_response_budget,
                     )
                 } else {
                     cluster_relay_hop_transport_timeouts(options.timeouts, endpoint_attempt_budget)
@@ -3476,7 +3474,6 @@ fn cluster_target_final_hop_transport_timeouts(
     endpoint_connect_budget: Option<Duration>,
     endpoint_response_budget: Option<Duration>,
     remaining_route_budget: Option<Duration>,
-    use_full_response_budget: bool,
 ) -> DaemonRpcTimeouts {
     let connect_timeout = match (timeouts.connect_timeout, endpoint_connect_budget) {
         (Some(connect_timeout), Some(remaining)) => Some(connect_timeout.min(remaining)),
@@ -3489,7 +3486,7 @@ fn cluster_target_final_hop_transport_timeouts(
         if let Some(remaining) = remaining_route_budget {
             capped = capped.min(remaining);
         }
-        if !use_full_response_budget && let Some(remaining) = endpoint_response_budget {
+        if let Some(remaining) = endpoint_response_budget {
             capped = capped.min(remaining);
         }
         capped
@@ -3594,11 +3591,9 @@ fn cluster_target_verified_direct_endpoint_attempt_preferred(
     remaining_route_budget: Duration,
     endpoints_left: usize,
 ) -> Duration {
-    let fallback_reserve = if endpoints_left > 1 {
-        CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_FALLBACK_RESERVE
-    } else {
-        Duration::ZERO
-    };
+    let fallback_reserve_count = endpoints_left.saturating_sub(1).min(u32::MAX as usize) as u32;
+    let fallback_reserve = CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_FALLBACK_RESERVE
+        .saturating_mul(fallback_reserve_count);
     remaining_route_budget
         .saturating_sub(fallback_reserve)
         .min(CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED)
@@ -5155,7 +5150,6 @@ mod tests {
             Some(Duration::from_secs(2)),
             Some(Duration::from_secs(2)),
             Some(Duration::from_secs(12)),
-            false,
         );
 
         assert_eq!(shaped.connect_timeout, Some(Duration::from_secs(2)));
@@ -5170,7 +5164,6 @@ mod tests {
             Some(Duration::from_secs(2)),
             Some(Duration::from_secs(12)),
             Some(Duration::from_secs(12)),
-            true,
         );
 
         assert_eq!(shaped.connect_timeout, Some(Duration::from_secs(2)));
@@ -5477,10 +5470,7 @@ mod tests {
         )
         .expect("preferred budget");
 
-        assert_eq!(
-            preferred,
-            CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED
-        );
+        assert_eq!(preferred, Duration::from_secs(2));
 
         let unverified = cluster_target_final_hop_attempt_budget(
             Some(Duration::from_secs(4)),
@@ -5500,10 +5490,7 @@ mod tests {
             true,
         )
         .expect("streamed budget");
-        assert_eq!(
-            streamed,
-            CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED
-        );
+        assert_eq!(streamed, Duration::from_secs(2));
 
         let streamed_last_endpoint = cluster_target_final_hop_attempt_budget(
             Some(Duration::from_secs(4)),
@@ -5529,6 +5516,21 @@ mod tests {
         .expect("full response budget");
 
         assert_eq!(budget, split_budget.expect("split budget"));
+    }
+
+    #[test]
+    fn cluster_target_final_hop_attempt_budget_reserves_each_fallback_slot() {
+        let split_budget = Some(Duration::from_millis(750));
+        let budget = cluster_target_final_hop_attempt_budget(
+            Some(Duration::from_secs(3)),
+            4,
+            split_budget,
+            true,
+            true,
+        )
+        .expect("verified budget");
+
+        assert_eq!(budget, Duration::from_millis(1500));
     }
 
     #[test]
@@ -5628,10 +5630,7 @@ mod tests {
             false,
         )
         .expect("verified direct budget");
-        assert_eq!(
-            verified_direct,
-            CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED
-        );
+        assert_eq!(verified_direct, Duration::from_secs(3));
 
         let full_response_last_endpoint = cluster_target_final_hop_attempt_budget(
             Some(Duration::from_secs(5)),
@@ -5642,6 +5641,16 @@ mod tests {
         )
         .expect("last endpoint full response budget");
         assert_eq!(full_response_last_endpoint, Duration::from_secs(5));
+
+        let full_response_verified_direct = cluster_target_final_hop_attempt_budget(
+            Some(Duration::from_secs(5)),
+            5,
+            Some(Duration::from_secs(1)),
+            true,
+            true,
+        )
+        .expect("verified full response budget");
+        assert_eq!(full_response_verified_direct, Duration::from_secs(3));
     }
 
     #[test]
@@ -6406,8 +6415,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_target_rpc_preserves_verified_direct_final_hop_response_budget_for_streamed_request()
-    {
+    fn cluster_target_rpc_reserves_fallback_budget_for_verified_streamed_request() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-target-verified-response-budget");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -6498,7 +6506,7 @@ mod tests {
                     Duration::from_secs(4),
                 )),
             ))
-            .expect("verified direct endpoint should keep the full response budget");
+            .expect("verified direct endpoint should keep a bounded response budget");
 
         assert_eq!(host.target_sends.len(), 1);
         assert_eq!(
@@ -6516,8 +6524,8 @@ mod tests {
         );
         let idle_timeout = host.target_sends[0].2.idle_timeout.expect("idle timeout");
         assert!(
-            idle_timeout > Duration::from_millis(3900) && idle_timeout <= Duration::from_secs(4),
-            "idle timeout should preserve the remaining 4s route budget, got {idle_timeout:?}"
+            idle_timeout >= Duration::from_millis(2400) && idle_timeout <= Duration::from_secs(3),
+            "idle timeout should reserve fallback budget for later endpoints, got {idle_timeout:?}"
         );
     }
 

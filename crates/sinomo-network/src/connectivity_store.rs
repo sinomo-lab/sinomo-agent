@@ -253,6 +253,10 @@ pub fn prune_local_cluster_connectivity_records_for_state(
 
     let removed = existing_records.len().saturating_sub(retained.len());
     if existing_records == retained {
+        let cache_changed = replace_local_cluster_connectivity_cache_records(paths, retained, now)?;
+        if cache_changed {
+            bump_local_cluster_connectivity_content_generation(paths);
+        }
         return Ok(0);
     }
 
@@ -262,18 +266,7 @@ pub fn prune_local_cluster_connectivity_records_for_state(
         write_object_file(&paths.connectivity_local, &retained)?;
     }
 
-    let mut cache =
-        LOCAL_CLUSTER_CONNECTIVITY_RECORDS
-            .lock()
-            .map_err(|error| NetworkError::Io {
-                operation: "lock local cluster connectivity cache".to_string(),
-                detail: error.to_string(),
-            })?;
-    if retained.is_empty() {
-        cache.remove(&paths.root);
-    } else {
-        store_local_cluster_connectivity_cache_entry(&mut cache, paths.root.clone(), retained, now);
-    }
+    let _cache_changed = replace_local_cluster_connectivity_cache_records(paths, retained, now)?;
     bump_local_cluster_connectivity_content_generation(paths);
     Ok(removed)
 }
@@ -459,6 +452,35 @@ fn store_local_cluster_connectivity_cache_entry(
             last_used: local_cluster_connectivity_cache_tick(),
         },
     );
+}
+
+fn replace_local_cluster_connectivity_cache_records(
+    paths: &ClusterPaths,
+    mut records: Vec<ClusterConnectivityRecord>,
+    now: OffsetDateTime,
+) -> Result<bool, NetworkError> {
+    sort_cluster_connectivity_records(&mut records);
+    let mut cache =
+        LOCAL_CLUSTER_CONNECTIVITY_RECORDS
+            .lock()
+            .map_err(|error| NetworkError::Io {
+                operation: "lock local cluster connectivity cache".to_string(),
+                detail: error.to_string(),
+            })?;
+    let changed = match cache.get(&paths.root) {
+        Some(entry) => {
+            let mut cached_records = entry.records.clone();
+            sort_cluster_connectivity_records(&mut cached_records);
+            cached_records != records
+        }
+        None => !records.is_empty(),
+    };
+    if records.is_empty() {
+        cache.remove(&paths.root);
+    } else {
+        store_local_cluster_connectivity_cache_entry(&mut cache, paths.root.clone(), records, now);
+    }
+    Ok(changed)
 }
 
 fn local_cluster_connectivity_persisted_records_stable(
@@ -789,5 +811,97 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert!(records.contains(&current));
         assert!(records.contains(&tunnel));
+    }
+
+    #[test]
+    fn topology_prune_refreshes_stale_in_process_cache_when_disk_is_clean() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-prune-cache");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_connectivity_prune_cache").expect("cluster");
+        let local =
+            NodeId::from_legacy_named("node_connectivity_prune_cache_local").expect("local");
+        let remote =
+            NodeId::from_legacy_named("node_connectivity_prune_cache_remote").expect("remote");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "connectivity prune cache",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &remote,
+            "target:21353".to_string(),
+            10,
+        );
+        let mut remote_member =
+            ClusterMemberRecord::local_non_voting(cluster_id, remote.clone(), "remote", "pk", now);
+        remote_member.endpoints = vec![endpoint.clone()];
+        state.members.push(remote_member);
+
+        let current = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(3),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let dirty_endpoint = ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::derived(
+                "sinomo.test.connectivity.prune.cache-dirty",
+                b"dirty",
+            ),
+            node_id: remote,
+            transport: ClusterTransportKind::LanTcp,
+            address: "stale.example.test:21353".to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 20,
+            last_observed_latency_ms: None,
+        };
+        let dirty = cluster_connectivity_record(
+            &state,
+            &dirty_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some("dirty".to_string()),
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+
+        write_local_cluster_connectivity_record_set(
+            &paths,
+            &local,
+            &[current.clone(), dirty.clone()],
+        )
+        .expect("seed dirty cache");
+        assert!(
+            read_local_cluster_connectivity_records(&paths)
+                .expect("read dirty cache")
+                .contains(&dirty)
+        );
+        write_object_file(&paths.connectivity_local, &vec![current.clone()])
+            .expect("make disk clean without touching cache");
+
+        let removed_count =
+            prune_local_cluster_connectivity_records_for_state(&paths, &state).expect("prune");
+
+        assert_eq!(removed_count, 0);
+        let records =
+            read_local_cluster_connectivity_records(&paths).expect("read pruned connectivity");
+        assert_eq!(records, vec![current]);
     }
 }

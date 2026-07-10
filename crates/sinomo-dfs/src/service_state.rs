@@ -44,6 +44,13 @@ pub const DFS_ROUTED_NAMESPACE_OP_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const DFS_MAX_NESTED_NAMESPACE_COORDINATION_DEPTH: usize = 8;
 /// Journal batches a primary ships in one routed-operation response.
 pub const DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT: usize = 16;
+/// Journal batches a primary ships in one normal routed-write response.
+///
+/// Normal SIFS writes are on the app-visible critical path and must not turn a
+/// commit response into a historical replica catch-up sweep. The batch remains
+/// contiguous from the requester's cursor so replay stays correct; background
+/// replication and explicit sync operations continue catch-up beyond it.
+pub(crate) const DFS_ROUTED_WRITE_RESPONSE_JOURNAL_BATCH_LIMIT: usize = 1;
 /// Journal batches a namespace primary ships in one foreground namespace
 /// response. Namespace mutations also carry synced path objects and can pull
 /// additional journal batches with bounded SyncPath rounds, so keep the first
