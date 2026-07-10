@@ -317,9 +317,9 @@ pub(crate) fn run_with_timeout<T: Send + 'static>(
             "{label} timed out after {}s; the distributed file system (SIFS) may be unavailable",
             timeout.as_secs()
         )),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(format!(
-            "{label}: worker exited before returning a result"
-        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(format!("{label}: worker exited before returning a result"))
+        }
     }
 }
 

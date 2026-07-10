@@ -3172,9 +3172,7 @@ pub fn agent_summaries(data_dir: &SinomoDataDir) -> Vec<AgentSummary> {
 /// forced the fallback to built-ins. The stored catalog lives in SIFS, so this can
 /// be slow or fail while the distributed file system is unhealthy — callers off the
 /// UI thread use the error to surface a degraded-state notice.
-pub fn agent_summaries_with_error(
-    data_dir: &SinomoDataDir,
-) -> (Vec<AgentSummary>, Option<String>) {
+pub fn agent_summaries_with_error(data_dir: &SinomoDataDir) -> (Vec<AgentSummary>, Option<String>) {
     match AgentCatalog::load_from_data_dir(data_dir) {
         Ok(catalog) => (agent_catalog_summaries(&catalog), None),
         Err(error) => (
