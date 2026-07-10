@@ -30,50 +30,19 @@ runtime actions.
 
 ## Literature Drivers
 
-The design is influenced by several agent-memory patterns:
+The design draws on hierarchical context management, episodic and semantic
+memory, reflection, procedural skill libraries, evidence-backed retrieval, and
+long-horizon memory benchmarks. Sinomo adopts the durable patterns while
+avoiding opaque mutable summaries without provenance.
 
-- MemGPT models context as a managed hierarchy and explicitly moves information
-  between short-term context and longer-term stores:
-  <https://arxiv.org/abs/2310.08560>.
-- Generative Agents uses observation memory, retrieval by relevance and
-  importance, reflection, and planning to support believable long-horizon
-  behavior: <https://arxiv.org/abs/2304.03442>.
-- CoALA frames language agents around modular working, episodic, semantic, and
-  procedural memory: <https://arxiv.org/abs/2309.02427>.
-- Reflexion stores verbal lessons from task feedback so future attempts can
-  improve without model fine-tuning: <https://arxiv.org/abs/2303.11366>.
-- Voyager treats successful behaviors as reusable procedural memory through a
-  skill library: <https://arxiv.org/abs/2305.16291>.
-- Retrieval-Augmented Generation keeps knowledge outside model parameters and
-  retrieves explicit evidence into context:
-  <https://arxiv.org/abs/2005.11401>.
-- HippoRAG and A-Mem point toward graph-like, linked, and evolving long-term
-  memory over immutable source records:
-  <https://arxiv.org/abs/2405.14831> and
-  <https://arxiv.org/abs/2502.12110>.
-- Multi-agent shared-memory work highlights leakage, stale propagation,
-  contradiction persistence, and provenance collapse as first-class risks:
-  <https://arxiv.org/abs/2606.24535>.
-- Long-term memory benchmarks such as LongMemEval, LoCoMo, and BEAM motivate
-  explicit coverage for information extraction, multi-session reasoning,
-  knowledge updates, temporal reasoning, abstention, and compression under very
-  long interaction histories:
-  <https://github.com/xiaowu0162/longmemeval>,
-  <https://snap-research.github.io/locomo/>, and
-  <https://github.com/mohammadtavakoli78/BEAM>.
-- Agentic memory benchmarks such as MemoryAgentBench, MemoryArena, and
-  LongMemEval-V2 motivate testing whether prior experience changes later
-  actions, workflow choices, and multi-session task success:
-  <https://github.com/HUST-AI-HYZ/MemoryAgentBench>,
-  <https://arxiv.org/abs/2602.16313>, and
-  <https://github.com/xiaowu0162/LongMemEval-V2>.
-- RAG evaluation work such as RAGAS motivates separating retrieval quality from
-  answer quality through context precision, recall, faithfulness, and answer
-  relevance style measurements:
-  <https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_precision/>.
+The supporting literature and benchmark analysis lives in the research notes:
 
-Sinomo should adopt the durable patterns and avoid the common failure mode where
-"memory" becomes an opaque bag of mutable summaries.
+- [Indexed file memory](research_notes/indexed_file_memory_literature.md)
+- [Long-horizon streaming agents](research_notes/long_horizon_streaming_agent_lit.md)
+- [Channel and multi-agent benchmarks](research_notes/channel_multi_agent_benchmark_literature.md)
+
+Research findings become architectural requirements only when stated in this
+document's principles and invariants.
 
 ## Core Principles
 
@@ -307,24 +276,11 @@ The test layers are deliberately separated:
   against real providers and emit scorecard artifacts without becoming normal
   unit-test gates.
 
-The optional benchmark plan `agent-memory-quality` uses
-`modules/benchmark/sinomo-benchmarks/agent/run_memory_eval.py`. Its checked-in
-scenarios cover information extraction, multi-session reasoning, knowledge
-update supersession, temporal reasoning, scope-boundary abstention, and
-procedural workflow recall. Plan and fixture modes are deterministic:
-
-```bash
-python3 modules/benchmark/sinomo-benchmarks/agent/run_memory_eval.py --mode plan
-python3 modules/benchmark/sinomo-benchmarks/agent/run_memory_eval.py --mode fixture --summary-out benchmark-results/agent-memory/fixture-summary.json
-```
-
-Live runs call the configured Sinomo agent and score marker use, memory ID
-citations, forbidden leakage, source-reference coverage, retrieval recall, and
-cache churn:
-
-```bash
-python3 modules/benchmark/sinomo-benchmarks/agent/run_memory_eval.py --mode run --provider codex --model gpt-5.2-codex --summary-out benchmark-results/agent-memory/summary.json --progress-out benchmark-results/agent-memory/progress.jsonl
-```
+The optional `agent-memory-quality` benchmark plan covers information
+extraction, multi-session reasoning, superseded knowledge, temporal reasoning,
+scope-boundary abstention, and procedural recall. Deterministic fixture mode
+validates the harness; live mode scores retrieval, citations, leakage,
+source-reference coverage, and cache churn against a configured model.
 
 These scorecards are evaluation evidence. They should inform regressions,
 release gates, and architecture work, but they should not replace deterministic

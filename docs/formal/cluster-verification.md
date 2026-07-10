@@ -1,23 +1,13 @@
 # Cluster Formal Verification
 
-This directory starts the executable specification track for Sinomo cluster
-infrastructure. The first models are intentionally small: a three-node
-Raft-backed KV skeleton with one abstract KV cell and a bounded three-entry log,
-an adversarial network layer with directed reachability and an in-flight message
-buffer, network endpoint-selection/route-planning/delivery-retry layers, a
-shared full-system smoke model, a KV-authorized membership layer, a
-membership/KV bridge that uses the lower KV proof as an abstract commit
-contract, a first DFS metadata-authority layer, a DFS authority-routing layer
-for stale shard views, a DFS namespace transaction layer for first visible
-publication, a DFS metadata journal source-validation layer, a DFS repair
-authorization layer, a DFS replication-policy layer for N/W commits plus
-asynchronous repair, a DFS no-conflict layer for normal-operation write
-serialization, a DFS pending request lifecycle layer, a DFS repair
-content-validation layer, a DFS chunked-transfer layer, a DFS repair
-lost-authority suppression layer, and a DFS local content anti-entropy layer,
-plus a sharded DFS namespace transaction router layer. The goal is to verify the
-control-plane safety shape before adding leases, watches, snapshots, broader DFS
-workflows, and rollout.
+This reference explains Sinomo's executable Quint specifications and how to run
+them. The models cover bounded slices of KV/Raft, adversarial networking,
+membership, integrated system guarantees, and DFS metadata and replication.
+
+Each model isolates one safety boundary and exposes guarantees to higher layers.
+The goal is compositional evidence for the control plane, not one exhaustive
+state machine that duplicates the Rust implementation. Future slices are
+tracked in the [formal verification roadmap](../plans/formal-verification-roadmap.md).
 
 ## Current Specs
 
@@ -767,89 +757,6 @@ This slice does not yet model:
   scheduling progress, wall-clock timeout fairness, and future split-cluster
   conflict recovery.
 
-Those should be added as layered modules rather than folded into one large
-state machine. The explicit DFS backlog in the pasted note is now covered by
-focused safety slices; the next useful step is to choose one abstraction above
-and deepen it, likely distributed anti-entropy repair scheduling under fairness
-assumptions, router-local sharded namespace recovery, or patch assembly
-semantics.
-
-## Suggested Next Network Slices
-
-1. **Route-cache invalidation.** Model `ClusterDeliveryRoutingTableCacheMark`,
-   directory-version changes, local connectivity file marks, and module dialer
-   snapshots. Prove that stale cached route plans are not reused after the
-   inputs that affect route validity change.
-2. **Timed retry conformance tests.** Add deterministic Rust tests with virtual
-   time for the finite scenarios in `network_timed_transport` and
-   `network_timed_delivery_retry`: delayed response after deadline, primary
-   timeout plus fallback success, packet drop with pre-drop duplicate, and
-   identity mismatch suppression.
-3. **Purpose-specific endpoint selectors.** Refine `network_endpoint_selection`
-   for rollout, Raft replication, member status, and data-plane selectors. Prove
-   each purpose's special ranking still preserves the shared safety rules.
-4. **Stream and raw-response retry budgets.** Extend `network_delivery_retry`
-   with streamed routes and raw-response capability flags. Prove that fallback
-   attempts cannot silently expand the caller's deadline or send raw streams to
-   transports that cannot carry them.
-
-## Suggested Next System Slices
-
-1. **Projection contracts from focused specs.** Add small projection modules
-   that map proven facts from `membership`, `network_endpoint_selection`,
-   `network_route_planning`, `network_delivery_retry`, and the DFS authority
-   specs into the names consumed by `system_guarantees`. This keeps the shared
-   foundation model full while making the assume/guarantee boundary explicit.
-2. **Directory and route-cache race model.** Extend `system_base` with
-   directory snapshot versions, cache marks, and in-flight route plans. Prove
-   that membership removals, identity mismatch feedback, and endpoint
-   generation changes invalidate active or cached routes before new work is
-   authorized.
-3. **Bug-trace harnesses.** Encode the known fragile Rust networking scenarios
-   as constrained smoke modules over `system_base`, then run both random
-   exploration and fixed-seed replay. This gives us small, durable regression
-   specs without duplicating the lower-layer algorithms.
-
-## Suggested Next DFS Slices
-
-The next verification work should stay layered: each new module should consume
-the current DFS safety facts as assumptions instead of re-modeling routing,
-request ownership, content validation, and lost-authority suppression from
-scratch.
-
-1. **Distributed anti-entropy repair progress under fairness.** Build on
-   `dfs_anti_entropy`, `dfs_replication_policy`, and
-   `dfs_repair_lost_authority` to model repair-job scheduling after stale
-   location pruning. Prove that missing desired replicas eventually either gain
-   durable receipts or remain explicitly suppressed for lost authority.
-2. **Router-local sharded namespace recovery.** Build on
-   `dfs_sharded_namespace_transaction` and add the failure window where the
-   target shard transaction is durable but `write_transaction_object_shard_indexes`
-   fails. Decide whether automatic reopen/recovery should write the missing
-   index and source tombstone, or whether explicit retry is the intended
-   recovery contract.
-3. **Chunked patch offset/base semantics.** Build on `dfs_chunked_transfer` and
-   model the patch-specific commit path:
-   `commit_chunked_object_version_patch_with_*` plus the expected base identity.
-   Prove that a patch response cannot commit against the wrong base version,
-   content hash, offset, or final object hash.
-4. **Read-memory and range-read assembly.** Model `pending_reads`,
-   `incoming_read_memory_transfers`, stale-source rejection, source retry, and
-   range chunk assembly. Prove that a completed read returns bytes matching the
-   current object metadata, and that stale or mismatched read responses cannot
-   populate local metadata.
-5. **Replica placement and owner normalization.** Model
-   `plan_distributed_eventual_replicas`, `normalize_desired_replica_nodes`, and
-   `validate_replication_plan`. Prove that duplicate candidates, missing owner
-   candidates, and policy widening still preserve the N/W contract consumed by
-   `dfs_replication_policy`.
-6. **Cross-primary repair handoff progress.** Use
-   `dfs_repair_lost_authority` as the old-primary side of the proof, then add a
-   new-primary model that can rediscover committed pending work and schedule
-   repair. Prove quiescence on the old primary plus eventual scheduling on the
-   new primary under fairness.
-7. **POSIX refinement and conformance tests.** The first POSIX Quint layer now
-   models namespace, links, cross-shard jobs, and read/write visibility. The next
-   step is finite Rust conformance tests that replay those scenarios against
-   `NetworkedDfsService`, plus deeper models for directory fragments, by-id
-   resolution, and namespace-job lock release under aborted moves.
+Future models should remain layered instead of expanding one state machine.
+The active verification backlog is maintained in the
+[formal verification roadmap](../plans/formal-verification-roadmap.md).

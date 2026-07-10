@@ -3099,7 +3099,7 @@ pub fn propose_evolution_campaign(request: CampaignProposalRequest) -> Evolution
             kind: CampaignDecisionKind::ProposalCreated,
             summary: "Created phase-0 long-horizon campaign proposal without agent execution.".to_string(),
             rationale: "Phase 0 is proposal-only: persist an inspectable campaign bundle with stages, tasks, budgets, and approval state before dispatching implementation agents.".to_string(),
-            evidence_refs: vec!["docs/plans/human-guided-long-horizon-evolution.md#phase-0-campaign-proposal-only".to_string()],
+            evidence_refs: vec!["docs/self-evolution-architecture.md#campaign-proposals".to_string()],
             decided_by: "sinomo.evolution.campaign-planner.phase0".to_string(),
             decided_at: now.clone(),
         }],

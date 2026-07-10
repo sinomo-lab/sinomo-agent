@@ -1,6 +1,11 @@
 # Sinomo System Architecture Proposal
 
-This proposal captures the high-level design intent for Sinomo. The detailed, current architecture lives in [architecture.md](architecture.md). When this proposal and the architecture differ, the architecture is the source of truth.
+Status: historical proposal, superseded by the current architecture.
+
+This proposal captures the early high-level design intent for Sinomo. The
+detailed, current architecture lives in [architecture.md](../architecture.md).
+When this proposal and the architecture differ, the architecture is the source
+of truth.
 
 ## Vision
 
@@ -96,7 +101,7 @@ Sinomo should not rely on one giant context window. The event log provides the r
 Memory writes should be selective. Promote events when they are salient, repeated, unresolved, user-important, linked to task outcomes, or needed for future planning.
 
 The detailed long-horizon memory design is maintained in
-[memory-architecture.md](memory-architecture.md).
+[memory-architecture.md](../memory-architecture.md).
 
 ## Safety Direction
 
@@ -118,4 +123,6 @@ The first useful MVP should prove the event-centric, three-speed runtime on loca
 - one asynchronous deliberation worker,
 - enough observability to replay decisions and inspect traces.
 
-Detailed crate responsibilities, storage choices, distributed synchronization, DFS policy, runtime flows, and implementation phases are maintained in [architecture.md](architecture.md).
+Detailed crate responsibilities, storage choices, distributed synchronization,
+DFS policy, and runtime flows are maintained in
+[architecture.md](../architecture.md).
