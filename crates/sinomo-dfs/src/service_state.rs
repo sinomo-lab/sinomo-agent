@@ -18,9 +18,9 @@ use crate::{
     DfsDistributedWriteCommand, DfsDistributedWriteResult, DfsError, DfsFileSystemId,
     DfsMessageResponse, DfsMetadataBackend, DfsMetadataShardConfig, DfsMetadataShardId,
     DfsMetadataStore, DfsNamespaceCommand, DfsNamespaceResponse, DfsNamespaceResult, DfsObjectId,
-    DfsObjectMetadata, DfsReadData, DfsReadRangeData, DfsReadResult, DfsRepairAttemptRecord,
-    DfsVersion, DistributedEventualCoordinator, DistributedRepairJob, LocalContentStore,
-    ObjectVersionReader,
+    DfsObjectMetadata, DfsPosixCoordinationResult, DfsReadData, DfsReadRangeData, DfsReadResult,
+    DfsRepairAttemptRecord, DfsVersion, DistributedEventualCoordinator, DistributedRepairJob,
+    LocalContentStore, ObjectVersionReader,
 };
 
 pub(crate) const DFS_BLOB_INLINE_LIMIT_BYTES: usize = 1024 * 1024;
@@ -373,6 +373,8 @@ pub(crate) struct PendingMetadataReplication {
     pub(crate) target_node_id: NodeId,
     pub(crate) shard_id: DfsMetadataShardId,
     pub(crate) next_after_sequence: u64,
+    pub(crate) verify_prefix_only: bool,
+    pub(crate) created_at: Instant,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -401,6 +403,7 @@ pub(crate) struct PendingRemoteWriteResponse {
 #[derive(Clone, Debug)]
 pub(crate) struct PendingRoutedNamespaceResult {
     pub(crate) result: DfsNamespaceResult,
+    pub(crate) posix_coordination_result: Option<DfsPosixCoordinationResult>,
     pub(crate) synced_path_object: Option<DfsObjectMetadata>,
     pub(crate) synced_path_objects: Vec<DfsObjectMetadata>,
     pub(crate) journal_batch_limit_reached: bool,
@@ -550,6 +553,7 @@ pub enum NetworkedDfsServiceEvent {
         shard_id: DfsMetadataShardId,
         applied_entries: usize,
         next_after_sequence: u64,
+        verified_prefix_only: bool,
     },
     MetadataJournalBatchRejected {
         request_id: String,

@@ -1,10 +1,15 @@
-/// DFS metadata-shard primary failover eligibility.
+/// DFS metadata-shard local failover-target selection.
 ///
 /// This module refines the abstract primary-change action in `dfs_metadata`.
 /// It models the local decision used during default cluster bootstrap: a node
 /// may target itself as replacement metadata primary only when the configured
 /// primary is unreachable and the local node is a durable replica with local
 /// shard status proving it has replayed metadata.
+///
+/// This decision does not commit a primary or authority epoch and does not
+/// authorize a canonical mutation. The historical `PromoteLocalReplica` label
+/// means "select as the local failover candidate"; a caller must still obtain
+/// the quorum-backed fencing proof modeled by the canonical authority slices.
 module dfs_metadata_primary_failover {
   import common.* from "../../lib/common"
 

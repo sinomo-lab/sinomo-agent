@@ -17,7 +17,8 @@ use crate::namespace::{
 };
 use crate::posix_model::{DfsPosixError, Result};
 use crate::posix_path::{
-    normalize_posix_path, normalize_posix_path_with_trailing_directory, subtree_prefix,
+    normalize_posix_path, normalize_posix_path_with_trailing_directory,
+    posix_path_is_at_or_under_prefix, subtree_prefix,
 };
 use crate::{
     DfsDirectoryPageCursor, DfsError, DfsFileSystemId, DfsMessageTransport, DfsNamespaceJobFrame,
@@ -429,22 +430,63 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         moved: &DfsObjectMetadata,
         source_path: &str,
     ) -> Result<()> {
-        let (versions, receipts, intents, conflicts) =
+        let (versions, receipts, intents, conflicts, advisory_lock_state) =
             self.cross_shard_move_bundle(&moved.object_id)?;
         match self.routed_namespace_primary_for_path(&moved.path)? {
-            Some(primary) => self.route_namespace_operation(
-                primary,
-                DfsNamespaceOperation::AdoptObjectAtPath {
-                    object: moved.clone(),
-                    source_path: source_path.to_string(),
-                    versions,
-                    receipts,
-                    intents,
-                    conflicts,
-                },
-            ),
+            Some(primary) => {
+                if let Some(source_state) = advisory_lock_state.as_ref() {
+                    let (_, state_fingerprint) =
+                        crate::advisory_lock::prepare_advisory_lock_state_for_migration(
+                            source_state,
+                        )
+                        .map_err(|source| {
+                            DfsPosixError::Dfs(DfsError::Serialization {
+                                message: format!(
+                                    "encode advisory-lock migration preparation for {}: {source}",
+                                    moved.object_id
+                                ),
+                            })
+                        })?;
+                    self.route_namespace_operation(
+                        primary.clone(),
+                        DfsNamespaceOperation::AdvisoryLockMigrationPrepare {
+                            path: moved.path.clone(),
+                            source_path: source_path.to_string(),
+                            object_id: moved.object_id.clone(),
+                            state_fingerprint,
+                        },
+                    )?;
+                }
+                self.route_namespace_operation(
+                    primary,
+                    DfsNamespaceOperation::AdoptObjectAtPath {
+                        object: moved.clone(),
+                        source_path: source_path.to_string(),
+                        versions,
+                        receipts,
+                        intents,
+                        conflicts,
+                        advisory_lock_state,
+                    },
+                )
+            }
             None => {
-                self.adopt_object_at_path_local(moved, &versions, &receipts, &intents, &conflicts)
+                self.adopt_object_at_path_local(
+                    moved,
+                    &versions,
+                    &receipts,
+                    &intents,
+                    &conflicts,
+                    advisory_lock_state.as_ref(),
+                )?;
+                if advisory_lock_state.is_some() {
+                    let metadata_target = self.capture_metadata_quorum_sync_target(moved)?;
+                    self.sync_metadata_shard_to_quorum(
+                        &metadata_target,
+                        crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT,
+                    )?;
+                }
+                Ok(())
             }
         }
     }
@@ -610,17 +652,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let file_system_id = job.file_system_id.clone();
         // Snapshot-copied or stale jobs must not run on a node that is no
         // longer the source-side authority.
-        let source_shards = self.namespace_shards_for_path(&file_system_id, &job.root_path)?;
+        let source_shards =
+            self.namespace_shards_for_exact_paths(&file_system_id, [job.root_path.as_str()])?;
         if let Some(shard) = source_shards
             .iter()
             .find(|shard| shard.primary_node_id != self.node_id)
         {
-            let reason = format!(
-                "node {} is not the source metadata primary for shard {}",
-                self.node_id, shard.shard_id
-            );
             self.unlock_cross_shard_namespace_path(&file_system_id, &job.root_path);
-            return self.fail_namespace_job(job, reason);
+            // Replicas retain the running job as a failover reservation, but
+            // must never append a local failure or otherwise advance its
+            // journal. Only the current source-shard primary may drive the
+            // saga; after a certified primary transfer this same copy becomes
+            // executable under the new authority epoch.
+            return Err(DfsPosixError::Dfs(DfsError::StaleOwnerEpoch {
+                file_system_id,
+                local_node_id: self.node_id.clone(),
+                primary_node_id: shard.primary_node_id.clone(),
+                epoch: shard.epoch,
+            }));
         }
         self.lock_cross_shard_namespace_path(&file_system_id, &job.root_path);
         let mut steps = 0usize;
@@ -734,9 +783,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Vec<DfsReplicaReceiptRecord>,
         Vec<crate::DfsWriteIntentRecord>,
         Vec<crate::DfsConflictRecord>,
+        Option<crate::DfsAdvisoryLockStateRecord>,
     )> {
         let Some(backend) = self.metadata_backend.as_ref() else {
-            return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new(), None));
         };
         let family = collect_object_metadata_family(
             backend.as_ref(),
@@ -749,6 +799,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             family.receipts,
             family.intents,
             family.conflicts,
+            family.advisory_lock_state,
         ))
     }
 
@@ -798,6 +849,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 file_system_id: moved_object.file_system_id.clone(),
                 objects: vec![old_path_tombstone],
                 versions: Vec::new(),
+                advisory_lock_states: Vec::new(),
                 created_at: time::OffsetDateTime::now_utc(),
             })?;
         }
@@ -841,17 +893,39 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         receipts: &[DfsReplicaReceiptRecord],
         intents: &[crate::DfsWriteIntentRecord],
         conflicts: &[crate::DfsConflictRecord],
+        advisory_lock_state: Option<&crate::DfsAdvisoryLockStateRecord>,
     ) -> Result<()> {
         let path = normalize_posix_path(&object.path)?;
         let mut transaction_objects = Vec::new();
+        let mut already_adopted = false;
         if let Some(mut destination) = self.lookup_sifs_path(&path)? {
-            if destination.object_id == object.object_id
-                && destination.version == object.version
-                && destination.kind == object.kind
-            {
-                return Ok(());
-            }
-            if destination.kind != DfsObjectKind::Tombstone {
+            if destination.object_id == object.object_id && destination.kind == object.kind {
+                let adopted_version_is_ancestor = if destination.version == object.version {
+                    true
+                } else if let Some(backend) = self.metadata_backend.as_ref() {
+                    backend
+                        .get_version(&object.object_id, &object.version)?
+                        .is_some()
+                } else {
+                    false
+                };
+                if adopted_version_is_ancestor {
+                    // A reply can be lost after adoption and before the
+                    // source observes it. If the destination subsequently
+                    // advances the same object, the migrated version remains
+                    // in its history and proves that this is an exact retry;
+                    // never roll the newer visible object back to the frame.
+                    already_adopted = true;
+                } else {
+                    return Err(DfsPosixError::Conflict {
+                        path: path.clone(),
+                        reason: format!(
+                            "destination object {} at {path} has unrelated version {} while adopting {}",
+                            destination.object_id, destination.version, object.version
+                        ),
+                    });
+                }
+            } else if destination.kind != DfsObjectKind::Tombstone {
                 match (&object.kind, &destination.kind) {
                     // A moved directory may replace an empty directory, like
                     // a local rename over an empty destination directory.
@@ -901,20 +975,50 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 transaction_objects.push(destination);
             }
         }
-        self.ensure_parent_directory(&path)?;
-        transaction_objects.push(object.clone());
-        let visible_version = object_version_record(object, object.content_size_bytes);
-        self.apply_namespace_transaction(DfsNamespaceTransaction {
-            transaction_id: namespace_transaction_id_for_path(
-                "adopt-cross-shard",
-                &object.object_id,
-                &path,
-            ),
-            file_system_id: object.file_system_id.clone(),
-            objects: transaction_objects,
-            versions: vec![visible_version],
-            created_at: time::OffsetDateTime::now_utc(),
-        })?;
+        let rebound_advisory_lock_state = advisory_lock_state
+            .map(crate::advisory_lock::prepare_advisory_lock_state_for_migration)
+            .transpose()
+            .map_err(|source| {
+                DfsPosixError::Dfs(DfsError::Serialization {
+                    message: format!(
+                        "encode migrated advisory-lock state for {}: {source}",
+                        object.object_id
+                    ),
+                })
+            })?
+            .map(|(state, _)| state);
+        if !already_adopted {
+            self.ensure_parent_directory(&path)?;
+            transaction_objects.push(object.clone());
+            let visible_version = object_version_record(object, object.content_size_bytes);
+            self.apply_namespace_transaction(DfsNamespaceTransaction {
+                transaction_id: namespace_transaction_id_for_path(
+                    "adopt-cross-shard",
+                    &object.object_id,
+                    &path,
+                ),
+                file_system_id: object.file_system_id.clone(),
+                objects: transaction_objects,
+                versions: vec![visible_version],
+                advisory_lock_states: rebound_advisory_lock_state.iter().cloned().collect(),
+                created_at: time::OffsetDateTime::now_utc(),
+            })?;
+        } else if let Some(state) = advisory_lock_state {
+            // A rolling-upgrade peer may have adopted the object before it
+            // understood the optional lock aggregate. An exact retry must be
+            // able to repair that partial legacy result before acknowledging
+            // the new capability receipt.
+            self.metadata_backend
+                .as_mut()
+                .ok_or_else(|| {
+                    DfsPosixError::Dfs(DfsError::Metadata {
+                        message:
+                            "lock-bearing cross-shard adoption requires a durable metadata backend"
+                                .to_string(),
+                    })
+                })?
+                .install_advisory_lock_state_for_migration(state)?;
+        }
         if let Some(backend) = self.metadata_backend.as_mut() {
             for version in versions {
                 if backend
@@ -955,7 +1059,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
         }
-        self.touch_parent_directory_if_local_primary(&path)?;
+        if !already_adopted {
+            self.touch_parent_directory_if_local_primary(&path)?;
+        }
         Ok(())
     }
 
@@ -981,6 +1087,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             file_system_id: alias.file_system_id.clone(),
             objects: vec![alias.clone()],
             versions: Vec::new(),
+            advisory_lock_states: Vec::new(),
             created_at: time::OffsetDateTime::now_utc(),
         })?;
         self.touch_parent_directory_if_local_primary(&path)?;
@@ -1056,5 +1163,55 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Ok::<_, DfsPosixError>(page.next_cursor)
         })?;
         Ok(existing_job)
+    }
+
+    /// Reject object-scoped coordination while a durable cross-shard move can
+    /// still copy or evict that object's metadata family. Unlike the in-memory
+    /// path guard, this survives a coordinator restart before job recovery has
+    /// rebuilt its transient lock set.
+    pub(super) fn ensure_no_running_cross_shard_move_for_path(&self, path: &str) -> Result<()> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(());
+        };
+        let path = normalize_posix_path(path)?;
+        let mut blocked = false;
+        try_walk_metadata_pages(|cursor| {
+            let page = backend
+                .list_namespace_jobs_page(cursor, POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE)?;
+            for job in &page.jobs {
+                if job.file_system_id != sifs_file_system_id()
+                    || job.status != DfsNamespaceJobStatus::Running
+                    || !matches!(
+                        job.kind,
+                        DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
+                            | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
+                    )
+                {
+                    continue;
+                }
+                let Ok(root_path) = normalize_posix_path(&job.root_path) else {
+                    continue;
+                };
+                let target_path = job
+                    .target_path
+                    .as_deref()
+                    .and_then(|target| normalize_posix_path(target).ok());
+                if posix_path_is_at_or_under_prefix(&path, &root_path)
+                    || posix_path_is_at_or_under_prefix(&root_path, &path)
+                    || target_path.as_ref().is_some_and(|target_path| {
+                        posix_path_is_at_or_under_prefix(&path, target_path)
+                            || posix_path_is_at_or_under_prefix(target_path, &path)
+                    })
+                {
+                    blocked = true;
+                    return Ok(None);
+                }
+            }
+            Ok::<_, DfsPosixError>(page.next_cursor)
+        })?;
+        if blocked {
+            return Err(DfsPosixError::Dfs(DfsError::Busy { path }));
+        }
+        Ok(())
     }
 }

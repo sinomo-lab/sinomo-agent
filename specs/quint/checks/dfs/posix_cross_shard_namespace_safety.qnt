@@ -27,10 +27,30 @@ module dfs_posix_cross_shard_namespace_safety {
 
 
   def recoverableFailureKeepsExplicitJob: bool =
-    jobPhase == FailedRecoverable implies all {
-      blockedPaths.contains(sourcePath),
-      blockedPaths.contains(destinationPath),
-      isLive(kindAt.get(destinationPath)),
+    {
+      val object = sourceObject(beforeObjectAt, sourcePath)
+      jobPhase == FailedRecoverable implies all {
+        blockedPaths.contains(sourcePath),
+        blockedPaths.contains(destinationPath),
+        kindAt.get(sourcePath) == beforeKindAt.get(sourcePath),
+        objectAt.get(sourcePath) == beforeObjectAt.get(sourcePath),
+        destinationMatchesJob(
+          kindAt,
+          objectAt,
+          jobOp,
+          sourcePath,
+          destinationPath,
+          object
+        ),
+      }
+    }
+
+
+  def exhaustedRetryBudgetCompletesForward: bool =
+    lastDecision == RetryBudgetExhaustedForwarded implies all {
+      jobPhase == Completed,
+      retryCount == MaxRetries,
+      blockedPaths == Set(),
     }
 
 
@@ -79,9 +99,18 @@ module dfs_posix_cross_shard_namespace_safety {
     activeOrRecoverableJobsBlockTouchedPaths,
     failedBeforeDestinationLeavesNoChange,
     recoverableFailureKeepsExplicitJob,
+    exhaustedRetryBudgetCompletesForward,
     completedRenameHasSingleVisiblePath,
     completedHardlinkPreservesSourceAndAlias,
     halfVisibleRenameRequiresRecoverableOrActiveJob,
     retryCountInBounds,
+  }
+
+
+  def witnessExhaustedRetryBudgetForwardCompletion: bool = all {
+    lastDecision == RetryBudgetExhaustedForwarded,
+    jobPhase == Completed,
+    retryCount == MaxRetries,
+    blockedPaths == Set(),
   }
 }

@@ -37,7 +37,9 @@ pub(crate) fn journal_entry_has_replay_payloads(entry: &DfsMetadataJournalEntry)
             ..
         } => committed_object.is_some() && visible_version.is_some(),
         DfsMetadataMutation::PutConflict { conflict, .. } => conflict.is_some(),
+        DfsMetadataMutation::PutAdvisoryLockState { state, .. } => state.is_some(),
         DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } => transaction.is_some(),
+        DfsMetadataMutation::PutNamespaceJob { job, .. } => job.is_some(),
     }
 }
 
@@ -98,6 +100,13 @@ pub(crate) fn hydrate_journal_entry_payload<B: DfsMetadataBackend + ?Sized>(
         } if conflict.is_none() => {
             *conflict = backend.get_conflict(object_id, conflict_id)?;
         }
+        DfsMetadataMutation::PutAdvisoryLockState {
+            file_system_id,
+            object_id,
+            state,
+        } if state.is_none() => {
+            *state = backend.get_advisory_lock_state(file_system_id, object_id)?;
+        }
         DfsMetadataMutation::CommitVisibleVersion {
             object_id,
             committed_version,
@@ -131,6 +140,9 @@ pub(crate) fn hydrate_journal_entry_payload<B: DfsMetadataBackend + ?Sized>(
             ..
         } if transaction.is_none() => {
             *transaction = backend.get_namespace_transaction(transaction_id)?;
+        }
+        DfsMetadataMutation::PutNamespaceJob { job_id, job, .. } if job.is_none() => {
+            *job = backend.get_namespace_job(job_id)?;
         }
         _ => {}
     }

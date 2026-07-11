@@ -66,6 +66,12 @@ pub(crate) fn dfs_namespace_operation_trace_label(
         DfsNamespaceOperation::LookupPath { .. } => "lookup-path",
         DfsNamespaceOperation::LookupPaths { .. } => "lookup-paths",
         DfsNamespaceOperation::ApplyTransaction { .. } => "apply-transaction",
+        DfsNamespaceOperation::AdvisoryLock { .. } => "advisory-lock",
+        DfsNamespaceOperation::FileSync { .. } => "file-sync",
+        DfsNamespaceOperation::DirectorySync { .. } => "directory-sync",
+        DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. } => {
+            "advisory-lock-migration-prepare"
+        }
         DfsNamespaceOperation::AdoptObjectAtPath { .. } => "adopt-object-at-path",
         DfsNamespaceOperation::AdoptHardlinkAlias { .. } => "adopt-hardlink-alias",
     }

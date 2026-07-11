@@ -934,6 +934,7 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
                     file_system_id,
                     objects: Vec::new(),
                     versions: Vec::new(),
+                    advisory_lock_states: Vec::new(),
                     created_at: OffsetDateTime::UNIX_EPOCH,
                 },
             },
@@ -1393,6 +1394,7 @@ fn served_message_transport_sends_nested_return_node_requests_synchronously() {
                     synced_path_object: None,
                     synced_path_objects: Vec::new(),
                     metadata_journal_batches: Vec::new(),
+                    posix_coordination_result: None,
                 }),
             )],
         })
@@ -1487,6 +1489,7 @@ fn served_message_transport_returns_response_frames_inline() {
                     synced_path_object: None,
                     synced_path_objects: Vec::new(),
                     metadata_journal_batches: Vec::new(),
+                    posix_coordination_result: None,
                 }),
             ),
         )
@@ -1795,6 +1798,7 @@ impl DfsPeerTransport for RecordingPeerTransport {
                         shard_id: command.batch.shard_id,
                         next_after_sequence: command.batch.next_after_sequence,
                         applied_entries: command.batch.entries.len(),
+                        verified_prefix_only: command.verify_prefix_only,
                         result: DfsMetadataJournalBatchResult::Applied,
                     },
                 )
@@ -1889,6 +1893,8 @@ fn dfs_peer_transport_adapters_delegate_all_routes() {
         &DfsMetadataJournalBatchCommand {
             request_id: "journal-1".to_string(),
             source_node_id: Some(local.clone()),
+            verify_prefix_only: false,
+            prefix_probe: None,
             batch: DfsMetadataJournalBatch {
                 shard_id: shard_id.clone(),
                 entries: Vec::new(),
@@ -1908,6 +1914,8 @@ fn dfs_peer_transport_adapters_delegate_all_routes() {
         &DfsMetadataSnapshotInstallCommand {
             request_id: "snapshot-1".to_string(),
             source_node_id: local,
+            file_system_id: None,
+            authority_epoch: None,
             shard_id,
             next_after_sequence: 0,
             snapshot,
@@ -2099,6 +2107,8 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
     let journal_command = DfsMetadataJournalBatchCommand {
         request_id: "journal-request".to_string(),
         source_node_id: Some(local.clone()),
+        verify_prefix_only: false,
+        prefix_probe: None,
         batch: DfsMetadataJournalBatch {
             shard_id: shard_id.clone(),
             entries: Vec::new(),
@@ -2124,6 +2134,7 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         shard_id: shard_id.clone(),
         next_after_sequence: 7,
         applied_entries: 0,
+        verified_prefix_only: false,
         result: DfsMetadataJournalBatchResult::Applied,
     };
     let journal_rpc_response = sinomo_core::network::ObjectRpcResponse::encode_body(
@@ -2144,6 +2155,8 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
     let snapshot_command = DfsMetadataSnapshotInstallCommand {
         request_id: "snapshot-request".to_string(),
         source_node_id: local.clone(),
+        file_system_id: None,
+        authority_epoch: None,
         shard_id: shard_id.clone(),
         next_after_sequence: 9,
         snapshot,
@@ -3858,6 +3871,7 @@ impl DfsMetadataJournalReplicationTransport for ApplyingMetadataJournalTransport
             shard_id: command.batch.shard_id.clone(),
             next_after_sequence: command.batch.next_after_sequence,
             applied_entries: command.batch.entries.len(),
+            verified_prefix_only: command.verify_prefix_only,
             result: DfsMetadataJournalBatchResult::Applied,
         })
     }
@@ -3925,6 +3939,7 @@ impl DfsMetadataJournalReplicationTransport for SequenceConflictMetadataJournalT
             shard_id: command.batch.shard_id.clone(),
             next_after_sequence: command.batch.next_after_sequence,
             applied_entries: 0,
+            verified_prefix_only: false,
             result: DfsMetadataJournalBatchResult::Rejected {
                 reason: self.rejection_reason.clone(),
             },
@@ -4939,7 +4954,7 @@ fn maintenance_tick_runs_lifecycle_and_metadata_journal_publish() {
         file_system.file_system_id.clone(),
         &local,
         vec![DfsMetadataShardConfig {
-            file_system_id: file_system.file_system_id,
+            file_system_id: file_system.file_system_id.clone(),
             shard_id: shard_id.0.clone(),
             primary_node_id: local.clone(),
             replica_node_ids: vec![replica.clone()],
@@ -5198,6 +5213,7 @@ fn cluster_maintenance_tick_opens_service_and_publishes_metadata() {
             shard_id: command.batch.shard_id.clone(),
             next_after_sequence: command.batch.next_after_sequence,
             applied_entries: command.batch.entries.len(),
+            verified_prefix_only: command.verify_prefix_only,
             result: DfsMetadataJournalBatchResult::Applied,
         })
     });
@@ -5311,6 +5327,7 @@ fn cluster_smoke_opens_service_and_publishes_metadata() {
                 shard_id: command.batch.shard_id.clone(),
                 next_after_sequence: command.batch.next_after_sequence,
                 applied_entries: command.batch.entries.len(),
+                verified_prefix_only: command.verify_prefix_only,
                 result: DfsMetadataJournalBatchResult::Applied,
             })
         });
@@ -6363,7 +6380,7 @@ fn metadata_replication_cursor_migrates_legacy_json_to_backend() {
 }
 
 #[test]
-fn metadata_shard_primary_transfer_ready_uses_local_replication_cursor() {
+fn metadata_shard_primary_transfer_ready_requires_exact_certified_head() {
     let root = temp_root("metadata-primary-transfer-ready");
     let data_dir = SinomoDataDir::new(root.join("data"));
     data_dir.ensure_root_layout().expect("root layout");
@@ -6395,6 +6412,7 @@ fn metadata_shard_primary_transfer_ready_uses_local_replication_cursor() {
                 ..current.clone()
             },
             &replica,
+            None,
         )
         .expect("already primary")
     );
@@ -6407,6 +6425,7 @@ fn metadata_shard_primary_transfer_ready_uses_local_replication_cursor() {
                 ..current.clone()
             },
             &replica,
+            None,
         )
         .expect("remote primary")
     );
@@ -6416,6 +6435,7 @@ fn metadata_shard_primary_transfer_ready_uses_local_replication_cursor() {
             &local,
             &current,
             &non_replica,
+            None,
         )
         .expect("non replica")
     );
@@ -6437,24 +6457,55 @@ fn metadata_shard_primary_transfer_ready_uses_local_replication_cursor() {
         .expect("shard status")
         .journal_last_sequence;
     assert!(journal_last_sequence > 0);
+    let state_fingerprint = crate::service_sync::metadata_shard_state_fingerprint_at(
+        &backend,
+        &shard_id,
+        journal_last_sequence,
+    )
+    .expect("metadata transfer fingerprint");
 
-    assert!(
-        !metadata_shard_primary_transfer_ready_from_local_backend(
-            &data_dir, &local, &current, &replica,
-        )
-        .expect("cursor behind")
-    );
-
-    backend
-        .put_metadata_replication_cursor(&replica, &shard_id, journal_last_sequence)
-        .expect("replication cursor");
     drop(backend);
 
     assert!(
-        metadata_shard_primary_transfer_ready_from_local_backend(
-            &data_dir, &local, &current, &replica,
+        !metadata_shard_primary_transfer_ready_from_local_backend(
+            &data_dir, &local, &current, &replica, None,
         )
-        .expect("cursor caught up")
+        .expect("missing certified head")
+    );
+    let stale_watermark = DfsMetadataShardHeadWatermark {
+        file_system_id: current.file_system_id.clone(),
+        shard_id: current.shard_id.clone(),
+        primary_node_id: local.clone(),
+        epoch: current.epoch,
+        journal_sequence: journal_last_sequence.saturating_sub(1),
+        state_fingerprint: "blake3:stale".to_string(),
+        acknowledged_node_ids: vec![local.clone(), replica.clone()],
+    };
+    assert!(
+        !metadata_shard_primary_transfer_ready_from_local_backend(
+            &data_dir,
+            &local,
+            &current,
+            &replica,
+            Some(&stale_watermark),
+        )
+        .expect("stale certified head")
+    );
+    let certified_watermark = DfsMetadataShardHeadWatermark {
+        journal_sequence: journal_last_sequence,
+        state_fingerprint,
+        ..stale_watermark
+    };
+
+    assert!(
+        metadata_shard_primary_transfer_ready_from_local_backend(
+            &data_dir,
+            &local,
+            &current,
+            &replica,
+            Some(&certified_watermark),
+        )
+        .expect("exact certified head")
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -6497,6 +6548,7 @@ fn dfs_metadata_publish_gate_tracks_mutating_events() {
             shard_id: DfsMetadataShardId::new("root"),
             applied_entries: 1,
             next_after_sequence: 1,
+            verified_prefix_only: false,
         },
         NetworkedDfsServiceEvent::RemoteWriteServed {
             request_id: "remote_write_rejected".to_string(),
@@ -7004,6 +7056,8 @@ fn metadata_journal_replication_helper_advances_backend_cursor_after_apply() {
         &mut backend,
         &primary,
         &replica,
+        &file_system.file_system_id,
+        1,
         &shard_id,
         0,
         &mut transport,
@@ -7057,6 +7111,8 @@ fn metadata_journal_replication_repairs_sequence_conflict_with_snapshot() {
         &mut backend,
         &primary,
         &replica,
+        &file_system.file_system_id,
+        1,
         &shard_id,
         0,
         &mut transport,
@@ -7112,6 +7168,8 @@ fn metadata_journal_replication_repairs_corrupt_local_journal_with_snapshot() {
         &mut backend,
         &primary,
         &replica,
+        &file_system.file_system_id,
+        1,
         &shard_id,
         0,
         &mut transport,
@@ -7410,6 +7468,7 @@ fn cluster_metadata_journal_publish_reads_cluster_state_and_shards() {
                 shard_id: command.batch.shard_id.clone(),
                 next_after_sequence: command.batch.next_after_sequence,
                 applied_entries: command.batch.entries.len(),
+                verified_prefix_only: command.verify_prefix_only,
                 result: DfsMetadataJournalBatchResult::Applied,
             })
         });
@@ -7672,6 +7731,7 @@ fn async_cluster_metadata_publish_repairs_sequence_conflict_with_snapshot() {
                         shard_id: command.batch.shard_id.clone(),
                         next_after_sequence: command.batch.next_after_sequence,
                         applied_entries: 0,
+                        verified_prefix_only: false,
                         result: DfsMetadataJournalBatchResult::Rejected {
                             reason:
                                 "metadata journal sequence 1 already exists with a different entry"
@@ -7773,6 +7833,8 @@ fn metadata_node_transport_sends_one_target_attempt() {
     let command = DfsMetadataJournalBatchCommand {
         request_id: "meta-node_route-fallback".to_string(),
         source_node_id: None,
+        verify_prefix_only: false,
+        prefix_probe: None,
         batch: DfsMetadataJournalBatch {
             shard_id: DfsMetadataShardId::new("root"),
             entries: Vec::new(),
@@ -7811,6 +7873,7 @@ fn metadata_node_transport_rejects_mismatched_journal_response() {
                     command.batch.next_after_sequence
                 },
                 applied_entries: command.batch.entries.len(),
+                verified_prefix_only: command.verify_prefix_only,
                 result: DfsMetadataJournalBatchResult::Applied,
             })
         });
@@ -7830,6 +7893,8 @@ fn metadata_node_transport_rejects_mismatched_journal_response() {
     let command = DfsMetadataJournalBatchCommand {
         request_id: "meta-node_route-mismatch".to_string(),
         source_node_id: None,
+        verify_prefix_only: false,
+        prefix_probe: None,
         batch: DfsMetadataJournalBatch {
             shard_id: DfsMetadataShardId::new("root"),
             entries: Vec::new(),
@@ -7868,6 +7933,7 @@ fn async_metadata_node_transport_rejects_mismatched_journal_response() {
                         shard_id: command.batch.shard_id.clone(),
                         next_after_sequence: command.batch.next_after_sequence + 1,
                         applied_entries: command.batch.entries.len(),
+                        verified_prefix_only: command.verify_prefix_only,
                         result: DfsMetadataJournalBatchResult::Applied,
                     })
                 })
@@ -7890,6 +7956,8 @@ fn async_metadata_node_transport_rejects_mismatched_journal_response() {
         let command = DfsMetadataJournalBatchCommand {
             request_id: "async-meta-node_route-mismatch".to_string(),
             source_node_id: None,
+            verify_prefix_only: false,
+            prefix_probe: None,
             batch: DfsMetadataJournalBatch {
                 shard_id: DfsMetadataShardId::new("root"),
                 entries: Vec::new(),
@@ -8084,7 +8152,7 @@ fn metadata_journal_batch_processor_rejects_non_primary_source() {
     let context = DfsMetadataReplicaShardContext {
         local_node_id: replica.clone(),
         shard: DfsMetadataShardConfig {
-            file_system_id: file_system.file_system_id,
+            file_system_id: file_system.file_system_id.clone(),
             shard_id: shard_id.0.clone(),
             primary_node_id: primary.clone(),
             replica_node_ids: vec![primary.clone(), replica],
@@ -8100,6 +8168,8 @@ fn metadata_journal_batch_processor_rejects_non_primary_source() {
         DfsMetadataJournalBatchCommand {
             request_id: "request-reject-source".to_string(),
             source_node_id: Some(wrong_source.clone()),
+            verify_prefix_only: false,
+            prefix_probe: None,
             batch: DfsMetadataJournalBatch {
                 shard_id,
                 entries: Vec::new(),
@@ -8114,6 +8184,159 @@ fn metadata_journal_batch_processor_rejects_non_primary_source() {
             if reason.contains(&format!("source {wrong_source}"))
     ));
 
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn metadata_prefix_probe_accepts_only_the_exact_materialized_checkpoint() {
+    let root = temp_root("metadata-prefix-probe-exact-checkpoint");
+    let primary = NodeId::from_legacy_named("node_meta_probe_primary").expect("primary");
+    let replica = NodeId::from_legacy_named("node_meta_probe_replica").expect("replica");
+    let shard_id = DfsMetadataShardId::new("root");
+    let file_system = file_system(primary.clone());
+    let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("metadata"))
+        .expect("metadata backend");
+    backend
+        .put_file_system(&file_system)
+        .expect("filesystem metadata");
+    backend
+        .put_object(&file_metadata(primary.clone()))
+        .expect("object metadata");
+    let journal_sequence = backend.journal_last_sequence();
+    let state_fingerprint = crate::service_sync::metadata_shard_state_fingerprint_at(
+        &backend,
+        &shard_id,
+        journal_sequence,
+    )
+    .expect("checkpoint fingerprint");
+    let context = DfsMetadataReplicaShardContext {
+        local_node_id: replica.clone(),
+        shard: DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: shard_id.0.clone(),
+            primary_node_id: primary.clone(),
+            replica_node_ids: vec![replica],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        },
+    };
+
+    let response = process_dfs_metadata_journal_batch(
+        &mut backend,
+        Some(&context),
+        DfsMetadataJournalBatchCommand {
+            request_id: "request-exact-prefix-probe".to_string(),
+            source_node_id: Some(primary),
+            verify_prefix_only: true,
+            prefix_probe: Some(DfsMetadataPrefixProbe {
+                barrier_id: "barrier-exact-checkpoint".to_string(),
+                file_system_id: Some(file_system.file_system_id.clone()),
+                authority_epoch: Some(1),
+                shard_id: shard_id.clone(),
+                journal_sequence,
+                state_fingerprint,
+            }),
+            batch: DfsMetadataJournalBatch {
+                shard_id,
+                entries: Vec::new(),
+                next_after_sequence: journal_sequence,
+            },
+        },
+    );
+
+    assert_eq!(response.result, DfsMetadataJournalBatchResult::Applied);
+    assert!(response.verified_prefix_only);
+    assert_eq!(response.next_after_sequence, journal_sequence);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn metadata_prefix_probe_rejects_same_head_with_different_state_and_is_legacy_safe() {
+    let root = temp_root("metadata-prefix-probe-state-mismatch");
+    let primary = NodeId::from_legacy_named("node_meta_probe_mismatch_primary").expect("primary");
+    let replica = NodeId::from_legacy_named("node_meta_probe_mismatch_replica").expect("replica");
+    let shard_id = DfsMetadataShardId::new("root");
+    let file_system = file_system(primary.clone());
+    let mut source = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("source"))
+        .expect("source backend");
+    let mut receiver = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("receiver"))
+        .expect("receiver backend");
+    source
+        .put_file_system(&file_system)
+        .expect("source filesystem");
+    receiver
+        .put_file_system(&file_system)
+        .expect("receiver filesystem");
+    let source_object = file_metadata(primary.clone());
+    source.put_object(&source_object).expect("source object");
+    let mut divergent_object = source_object;
+    divergent_object.path = "src/divergent.rs".to_string();
+    receiver
+        .put_object(&divergent_object)
+        .expect("divergent object");
+    let journal_sequence = source.journal_last_sequence();
+    assert_eq!(receiver.journal_last_sequence(), journal_sequence);
+    let state_fingerprint = crate::service_sync::metadata_shard_state_fingerprint_at(
+        &source,
+        &shard_id,
+        journal_sequence,
+    )
+    .expect("source checkpoint fingerprint");
+    let probe_command = DfsMetadataJournalBatchCommand {
+        request_id: "request-mismatched-prefix-probe".to_string(),
+        source_node_id: Some(primary.clone()),
+        verify_prefix_only: true,
+        prefix_probe: Some(DfsMetadataPrefixProbe {
+            barrier_id: "barrier-mismatched-checkpoint".to_string(),
+            file_system_id: Some(file_system.file_system_id.clone()),
+            authority_epoch: Some(1),
+            shard_id: shard_id.clone(),
+            journal_sequence,
+            state_fingerprint,
+        }),
+        batch: DfsMetadataJournalBatch {
+            shard_id: shard_id.clone(),
+            entries: Vec::new(),
+            next_after_sequence: journal_sequence,
+        },
+    };
+    let context = DfsMetadataReplicaShardContext {
+        local_node_id: replica.clone(),
+        shard: DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: shard_id.0.clone(),
+            primary_node_id: primary,
+            replica_node_ids: vec![replica],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        },
+    };
+
+    let response =
+        process_dfs_metadata_journal_batch(&mut receiver, Some(&context), probe_command.clone());
+    assert!(matches!(
+        response.result,
+        DfsMetadataJournalBatchResult::Rejected { ref reason }
+            if reason.contains("state mismatch")
+    ));
+    assert!(!response.verified_prefix_only);
+
+    let mut legacy_receiver = LocalSobjMetadataBackend::new(shard_id, root.join("legacy-receiver"))
+        .expect("legacy receiver backend");
+    legacy_receiver
+        .put_file_system(&file_system)
+        .expect("legacy receiver filesystem");
+    let legacy_head = legacy_receiver.journal_last_sequence();
+    assert!(legacy_head < journal_sequence);
+    assert_eq!(
+        legacy_receiver
+            .apply_journal_batch(&probe_command.batch)
+            .expect("legacy peer applies unknown probe as an empty batch"),
+        0
+    );
+    assert_eq!(legacy_receiver.journal_last_sequence(), legacy_head);
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -8162,6 +8385,8 @@ fn metadata_snapshot_install_processor_replaces_backend_snapshot() {
         DfsMetadataSnapshotInstallCommand {
             request_id: "request-install-snapshot".to_string(),
             source_node_id: primary,
+            file_system_id: Some(context.shard.file_system_id.clone()),
+            authority_epoch: Some(context.shard.epoch),
             shard_id: shard_id.clone(),
             next_after_sequence,
             snapshot,
@@ -8324,6 +8549,7 @@ fn metadata_journal_missing_namespace_transaction_payload_uses_keyed_replay() {
         file_system_id: file_system.file_system_id.clone(),
         objects: vec![touched.clone()],
         versions: Vec::new(),
+        advisory_lock_states: Vec::new(),
         created_at: OffsetDateTime::UNIX_EPOCH,
     };
     let mut entry = backend
@@ -26349,6 +26575,53 @@ fn sifs_cluster_blocking_distributed_read_with_pump(
     })
 }
 
+fn sifs_cluster_writer_call_with_pump<R: Send>(
+    cluster: &mut SifsPosixCluster,
+    what: &str,
+    call: impl FnOnce(&mut NetworkedDfsService<sinomo_core::network::InProcessTransport>) -> R + Send,
+) -> R {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let primary = &mut cluster.primary;
+    let writer = &mut cluster.writer;
+    let observer = &mut cluster.observer;
+    let rejections = &mut cluster.rejections;
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            tx.send(call(writer)).expect("send writer call result");
+        });
+        let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+        loop {
+            for (label, service) in [("primary", &mut *primary), ("observer", &mut *observer)] {
+                for event in service
+                    .process_incoming()
+                    .expect("cluster process_incoming")
+                {
+                    if let NetworkedDfsServiceEvent::MetadataJournalBatchRejected {
+                        reason, ..
+                    } = event
+                    {
+                        rejections.push(format!("{label}: {reason}"));
+                    }
+                }
+            }
+            match rx.try_recv() {
+                Ok(result) => return result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("writer call disconnected while waiting for {what}")
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "writer call did not complete: {what}; journal rejections: {:?}",
+                    rejections
+                );
+            }
+            std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+        }
+    })
+}
+
 fn sifs_cluster_write_options(node_id: &NodeId) -> DfsWriteOptions {
     DfsWriteOptions {
         policy: DfsReplicationPolicy::new(1, 1).expect("cluster write policy"),
@@ -26431,6 +26704,157 @@ fn sifs_cluster_primary_detached_large_write_defers_blob_durability_flush() {
         0
     );
 
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_routes_advisory_locks_and_promotes_fifo_waiters() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-routed-advisory-lock");
+    let path = "/users/distributed-lock.txt";
+    sifs_cluster_routed_posix_write(&mut cluster, path, b"locked bytes");
+
+    let holder_session = DfsAdvisoryLockSessionId::new("holder-session");
+    let holder_command = DfsAdvisoryLockCommand::Acquire {
+        request_id: DfsAdvisoryLockRequestId::new("holder-acquire"),
+        session_id: holder_session.clone(),
+        mode: DfsAdvisoryLockMode::Exclusive,
+        blocking: false,
+        process_id: Some(101),
+    };
+    let path_for_call = path.to_string();
+    let holder_outcome = sifs_cluster_writer_call_with_pump(
+        &mut cluster,
+        "exclusive advisory-lock grant",
+        move |writer| writer.posix_advisory_lock(&path_for_call, holder_command),
+    )
+    .expect("holder lock request");
+    let holder_grant = match holder_outcome {
+        DfsAdvisoryLockOutcome::Acquired { grant } => grant,
+        outcome => panic!("expected holder grant, got {outcome:?}"),
+    };
+
+    let waiter_session = DfsAdvisoryLockSessionId::new("waiter-session");
+    let waiter_command = DfsAdvisoryLockCommand::Acquire {
+        request_id: DfsAdvisoryLockRequestId::new("waiter-acquire"),
+        session_id: waiter_session.clone(),
+        mode: DfsAdvisoryLockMode::Shared,
+        blocking: true,
+        process_id: Some(202),
+    };
+    let path_for_call = path.to_string();
+    let first_waiter_outcome =
+        sifs_cluster_writer_call_with_pump(&mut cluster, "blocking advisory-lock enqueue", {
+            let waiter_command = waiter_command.clone();
+            move |writer| writer.posix_advisory_lock(&path_for_call, waiter_command)
+        })
+        .expect("waiter lock request");
+    assert!(matches!(
+        first_waiter_outcome,
+        DfsAdvisoryLockOutcome::Waiting { position: 1, .. }
+    ));
+
+    let path_for_call = path.to_string();
+    let unlock_outcome = sifs_cluster_writer_call_with_pump(
+        &mut cluster,
+        "exact advisory-lock unlock",
+        move |writer| {
+            writer.posix_advisory_lock(
+                &path_for_call,
+                DfsAdvisoryLockCommand::Unlock {
+                    request_id: DfsAdvisoryLockRequestId::new("holder-unlock"),
+                    token: holder_grant.token,
+                },
+            )
+        },
+    )
+    .expect("holder unlock request");
+    assert_eq!(unlock_outcome, DfsAdvisoryLockOutcome::Unlocked);
+
+    let path_for_call = path.to_string();
+    let promoted_outcome = sifs_cluster_writer_call_with_pump(
+        &mut cluster,
+        "FIFO advisory-lock promotion",
+        move |writer| writer.posix_advisory_lock(&path_for_call, waiter_command),
+    )
+    .expect("promoted waiter request");
+    let promoted_grant = match promoted_outcome {
+        DfsAdvisoryLockOutcome::Acquired { grant } => grant,
+        outcome => panic!("expected promoted grant, got {outcome:?}"),
+    };
+    assert!(
+        promoted_grant
+            .token
+            .session_id
+            .0
+            .ends_with(&waiter_session.0)
+    );
+
+    let path_for_call = path.to_string();
+    let close_outcome = sifs_cluster_writer_call_with_pump(
+        &mut cluster,
+        "advisory-lock close cleanup",
+        move |writer| {
+            writer.posix_advisory_lock(
+                &path_for_call,
+                DfsAdvisoryLockCommand::Close {
+                    request_id: DfsAdvisoryLockRequestId::new("waiter-close"),
+                    session_id: waiter_session,
+                },
+            )
+        },
+    )
+    .expect("waiter close request");
+    assert!(matches!(
+        close_outcome,
+        DfsAdvisoryLockOutcome::Closed {
+            released_grant: true,
+            ..
+        }
+    ));
+
+    assert!(cluster.rejections.is_empty(), "{:?}", cluster.rejections);
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_routes_file_and_directory_sync_certificates() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-routed-posix-sync");
+    let path = "/users/synced-file.txt";
+    sifs_cluster_routed_posix_write(&mut cluster, path, b"durable bytes");
+
+    let path_for_call = path.to_string();
+    let file_certificate = sifs_cluster_writer_call_with_pump(
+        &mut cluster,
+        "routed fdatasync certificate",
+        move |writer| writer.posix_sync_file(&path_for_call, DfsPosixSyncKind::FileData),
+    )
+    .expect("routed file sync");
+    assert_eq!(file_certificate.target.kind, DfsPosixSyncKind::FileData);
+    assert!(
+        file_certificate
+            .metadata_certificate
+            .acknowledged_node_ids
+            .len()
+            >= file_certificate.metadata_certificate.quorum_size
+    );
+    assert!(file_certificate.content_evidence.required_receipts >= 1);
+
+    let directory_certificate = sifs_cluster_writer_call_with_pump(
+        &mut cluster,
+        "routed directory fsync certificate",
+        move |writer| writer.posix_sync_directory(SIFS_USERS_PATH),
+    )
+    .expect("routed directory sync");
+    assert_eq!(directory_certificate.target.path, SIFS_USERS_PATH);
+    assert!(
+        directory_certificate
+            .metadata_certificate
+            .acknowledged_node_ids
+            .len()
+            >= directory_certificate.metadata_certificate.quorum_size
+    );
+
+    assert!(cluster.rejections.is_empty(), "{:?}", cluster.rejections);
     std::fs::remove_dir_all(&cluster.root).ok();
 }
 
@@ -31473,6 +31897,7 @@ fn apply_transaction_shard_selection_lists_control_plane_once_for_bulk_paths() {
         file_system_id: sifs_file_system_id(),
         objects,
         versions,
+        advisory_lock_states: Vec::new(),
         created_at: OffsetDateTime::UNIX_EPOCH,
     };
 
@@ -32920,6 +33345,7 @@ fn late_routed_responses_are_discarded_without_failing_the_event_loop() {
                 synced_path_object: None,
                 synced_path_objects: Vec::new(),
                 metadata_journal_batches: Vec::new(),
+                posix_coordination_result: None,
             },
         )
         .expect("late namespace response must not error");
@@ -33049,6 +33475,7 @@ fn sync_path_response_object_updates_outsider_read_view_without_journal_batches(
                 synced_path_object: Some(object.clone()),
                 synced_path_objects: Vec::new(),
                 metadata_journal_batches: Vec::new(),
+                posix_coordination_result: None,
             },
         )
         .expect("sync response");
@@ -33271,6 +33698,7 @@ fn sifs_cluster_posix_rejects_adoption_from_non_source_primary() {
                     receipts: Vec::new(),
                     intents: Vec::new(),
                     conflicts: Vec::new(),
+                    advisory_lock_state: None,
                 },
             },
         )

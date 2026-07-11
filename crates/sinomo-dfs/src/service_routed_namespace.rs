@@ -46,7 +46,26 @@ fn metadata_path_is_direct_child_of_posix_dir(directory_path: &str, metadata_pat
 fn namespace_operation_should_replay_journal_batches(operation: &DfsNamespaceOperation) -> bool {
     !matches!(
         operation,
-        DfsNamespaceOperation::LookupPath { .. } | DfsNamespaceOperation::LookupPaths { .. }
+        DfsNamespaceOperation::LookupPath { .. }
+            | DfsNamespaceOperation::LookupPaths { .. }
+            | DfsNamespaceOperation::AdvisoryLock { .. }
+            | DfsNamespaceOperation::FileSync { .. }
+            | DfsNamespaceOperation::DirectorySync { .. }
+            | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. }
+    )
+}
+
+fn namespace_operation_requires_fresh_authority(operation: &DfsNamespaceOperation) -> bool {
+    matches!(
+        operation,
+        DfsNamespaceOperation::AdvisoryLock { .. }
+            | DfsNamespaceOperation::FileSync { .. }
+            | DfsNamespaceOperation::DirectorySync { .. }
+            | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. }
+            | DfsNamespaceOperation::AdoptObjectAtPath {
+                advisory_lock_state: Some(_),
+                ..
+            }
     )
 }
 
@@ -265,23 +284,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .transpose()
     }
 
-    /// Serves a namespace mutation routed from a replica. The local node must
-    /// be the metadata-shard primary for every shard the operation touches;
-    /// it executes the operation authoritatively and answers with journal
-    /// catch-up batches so the requester reads its own namespace write.
+    /// Serves a namespace operation routed from a replica. The local node must
+    /// be the metadata-shard primary for every shard the operation touches.
+    /// Lock and explicit sync operations run their typed authority/quorum
+    /// protocol; ordinary mutations retain their existing response-journal
+    /// catch-up path so the requester reads its own write.
     pub(crate) fn handle_namespace_request(
         &mut self,
         requester_node_id: NodeId,
         command: DfsNamespaceCommand,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let request_id = command.request_id.clone();
-        if let Some(replay) = self
-            .served_namespace_replays
-            .iter()
-            .find(|replay| {
-                replay.requester_node_id == requester_node_id && replay.command == command
-            })
-            .cloned()
+        if !namespace_operation_requires_fresh_authority(&command.operation)
+            && let Some(replay) = self
+                .served_namespace_replays
+                .iter()
+                .find(|replay| {
+                    replay.requester_node_id == requester_node_id && replay.command == command
+                })
+                .cloned()
         {
             self.send_dfs_message_if_routable(
                 &requester_node_id,
@@ -307,11 +328,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // The authority the requester should retry against when this node is
         // not the shard primary (the requester routed on a stale shard view).
         let mut authority_redirect: Option<NodeId> = None;
+        let mut posix_coordination_result = None;
         let result = if requester_node_id != command.requesting_node_id {
             DfsNamespaceResult::Rejected {
                 reason: format!(
                     "namespace request requester mismatch: frame source {}, payload requester {}",
                     requester_node_id, command.requesting_node_id
+                ),
+                posix_error: None,
+                current_primary_node_id: None,
+            }
+        } else if let DfsNamespaceOperation::AdvisoryLock { command, .. } = &command.operation
+            && !crate::posix::locks::advisory_lock_command_belongs_to_node(
+                command,
+                &requester_node_id,
+            )
+        {
+            DfsNamespaceResult::Rejected {
+                reason: format!(
+                    "advisory-lock command is not owned by authenticated requester {requester_node_id}"
                 ),
                 posix_error: None,
                 current_primary_node_id: None,
@@ -354,7 +389,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .cloned();
                     let execute_started = Instant::now();
                     let outcome = match (&foreign_shard, &command.operation) {
-                        (None, _) => self.execute_namespace_operation_local(&command.operation),
+                        (None, _) => {
+                            self.execute_posix_coordination_operation_local(&command.operation)
+                        }
                         // Operations spanning another primary's shard run
                         // through the cross-shard coordinator when this node
                         // owns the source side.
@@ -366,6 +403,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 &from,
                                 &to,
                             )
+                            .map(|()| None)
                         }
                         (
                             Some(_),
@@ -381,6 +419,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 &existing_path,
                                 &link_path,
                             )
+                            .map(|()| None)
                         }
                         (Some(shard), _) => {
                             authority_redirect = Some(shard.primary_node_id.clone());
@@ -397,7 +436,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     };
                     trace_execute_ms = execute_started.elapsed().as_millis();
                     match outcome {
-                        Ok(()) => DfsNamespaceResult::Applied,
+                        Ok(coordination_result) => {
+                            posix_coordination_result = coordination_result;
+                            DfsNamespaceResult::Applied
+                        }
                         Err(error) => DfsNamespaceResult::Rejected {
                             current_primary_node_id: authority_redirect
                                 .or_else(|| namespace_rejection_current_primary(&error)),
@@ -457,6 +499,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             synced_path_object,
             synced_path_objects,
             metadata_journal_batches,
+            posix_coordination_result,
         };
         if self.served_namespace_replays.len() >= DFS_SERVED_NAMESPACE_REPLAY_LIMIT {
             self.served_namespace_replays.pop_front();
@@ -498,6 +541,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNamespaceOperation::LookupPath { .. }
                 | DfsNamespaceOperation::LookupPaths { .. }
                 | DfsNamespaceOperation::SyncPath { .. }
+                | DfsNamespaceOperation::AdvisoryLock { .. }
+                | DfsNamespaceOperation::FileSync { .. }
+                | DfsNamespaceOperation::DirectorySync { .. }
         );
         Ok(NetworkedDfsServiceEvent::RemoteNamespaceServed {
             request_id,
@@ -554,6 +600,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 posix_error: None,
                                 current_primary_node_id: None,
                             },
+                            posix_coordination_result: None,
                             synced_path_object: None,
                             synced_path_objects: Vec::new(),
                             journal_batch_limit_reached: false,
@@ -582,6 +629,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         posix_error: None,
                         current_primary_node_id: None,
                     },
+                    posix_coordination_result: None,
                     synced_path_object: None,
                     synced_path_objects: Vec::new(),
                     journal_batch_limit_reached: false,
@@ -607,6 +655,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 posix_error: None,
                                 current_primary_node_id: None,
                             },
+                            posix_coordination_result: None,
                             synced_path_object: None,
                             synced_path_objects: Vec::new(),
                             journal_batch_limit_reached: false,
@@ -626,6 +675,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .expect("pending routed namespace op was validated before metadata replay");
         pending.result = Some(PendingRoutedNamespaceResult {
             result: response.result.clone(),
+            posix_coordination_result: response.posix_coordination_result.clone(),
             synced_path_object: response.synced_path_object.clone(),
             synced_path_objects: response.synced_path_objects.clone(),
             journal_batch_limit_reached: response.metadata_journal_batches.len()

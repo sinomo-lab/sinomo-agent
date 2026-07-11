@@ -59,6 +59,17 @@ requester/command key, exact cached-response replay, FIFO eviction, process
 restart, and requester-local cancellation boundary. It deliberately exposes
 re-execution after cache loss as a remaining durable-idempotency limitation.
 
+Completed 2026-07-10: the canonical POSIX synchronization slices now cover
+whole-file shared/exclusive advisory locks, exact epoch-fenced lock tokens,
+healthy-session lease renewal, partitioned-session expiry, close/crash cleanup,
+file `fsync`, `fdatasync`, directory `fsync`,
+outcome-unknown sync retry, and the partition rule for a lock-holding operation.
+A complete holder may finish only within an unexpired strong permit; otherwise
+the quorum side fences it after the barrier, repairs the certified canonical
+prefix, and proceeds. Deterministic traces cover clean terminal states for both
+outcomes. Cross-shard retry exhaustion now finalizes forward instead of
+stranding durable jobs with path reservations held.
+
 1. **Anti-entropy progress.** Under explicit fairness assumptions, prove that a
    missing desired replica eventually obtains a durable receipt or remains
    visibly suppressed because authority was lost.
@@ -75,6 +86,33 @@ re-execution after cache loss as a remaining durable-idempotency limitation.
    counts.
 6. **Authority handoff.** Prove that the old primary becomes quiescent and the
    new primary eventually rediscovers and schedules committed repair work.
-7. **POSIX conformance.** Replay finite namespace, link, cross-shard, and
-   visibility scenarios against the Rust DFS service, then deepen directory,
-   by-id lookup, and aborted-move lock-release models.
+7. **POSIX conformance.** The first Rust gate now includes persistent
+   whole-file distributed advisory locks and distinct
+   `fsync`/`fdatasync`/directory-sync routing with quorum head certificates.
+   Add end-to-end partition traces and durable sync-id replay before promoting
+   the combined model beyond target hardening. Then deepen directory, by-id
+   lookup, open-handle rename/unlink, byte-range locks, application wait-cycle
+   detection, and aborted-move reservation release.
+8. **Local-first DFS extension.** Completed 2026-07-10 as separate
+   target-hardening slices rather than weakening the canonical model. The
+   regular-file slice covers local write/truncate/fsync, crash recovery,
+   immutable sealing, fresh/stale reconciliation planning, apply/converge/
+   conflict outcomes, a retained symbolic content value, independent quorum and
+   route transitions, frozen reconnect behavior, and full-payload exact retry
+   across a modeled process restart. The namespace slice covers one same-shard
+   create, mkdir, unlink, rmdir, or atomic no-replacement rename using stable
+   parent/object ids and exact entry stamps; its terminal retry is an idempotent
+   stutter, not a
+   payload-keyed replay protocol. A companion slice covers one returned local
+   namespace mutation, directory `fsync`, crash restoration, and durable-only
+   sealing. A shared stuttering projection requires local work to leave
+   authority/journal/object/namespace counters unchanged and accepts a crossing
+   publication only with supplied abstract quorum/current-authority/epoch/plan/
+   durability evidence. Canonical effect/result recording is atomic in the
+   abstraction. It does not yet derive that evidence or atomicity by composing
+   the canonical lock, sync, journal, partition, and no-conflict models. Next
+   add retention receipts for file content and namespace subtrees, POSIX rename replacement,
+   payload-keyed namespace replay, multi-operation dependency graphs,
+   open-handle rename/unlink, cross-shard branches, hardlinks and symlinks,
+   branch gossip, and explicit service-produced merge candidates before Rust
+   implementation claims conformance.

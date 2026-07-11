@@ -47,7 +47,7 @@ fn sifs_dir_direct_child_path(
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
-    pub(super) fn lookup_sifs_path(&self, path: &str) -> Result<Option<DfsObjectMetadata>> {
+    pub(crate) fn lookup_sifs_path(&self, path: &str) -> Result<Option<DfsObjectMetadata>> {
         self.lookup_metadata_path(&sifs_file_system_id(), path)
     }
 

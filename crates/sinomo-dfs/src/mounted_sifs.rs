@@ -6,7 +6,7 @@
 use sinomo_core::ClusterBootstrapState;
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
-use sinomo_core::kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
+use sinomo_core::kv::{KvCompare, KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
     ClusterPaths, NetworkError, ObjectRpcRequest, ObjectRpcResponse, ObjectRpcStreamResponse,
@@ -210,6 +210,33 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
                 detail: source.to_string(),
             }
         })
+    }
+
+    fn linearizable_compare_value(
+        &mut self,
+        key: String,
+        expected_value: Vec<u8>,
+        barrier_key: String,
+    ) -> Result<bool, KvError> {
+        // A fresh write keeps this on the quorum-backed transaction path. A
+        // compare-only transaction could otherwise be satisfied by the
+        // cluster KV semantic no-effect shortcut.
+        let barrier_value =
+            sinomo_core::kv::encode_kv_value(&sinomo_core::Id::generate().to_string())?;
+        Ok(self
+            .txn(KvTxn {
+                compares: vec![KvCompare::ValueEquals {
+                    key,
+                    value: expected_value,
+                }],
+                success: vec![KvOp::Put {
+                    key: barrier_key,
+                    value: barrier_value,
+                    lease_id: None,
+                }],
+                failure: Vec::new(),
+            })?
+            .succeeded)
     }
 }
 

@@ -9,9 +9,9 @@ use sinomo_dfs::{
     DfsDistributedWriteResult, DfsError, DfsFetchBlobResponse, DfsFetchBlobResponseChunk,
     DfsFetchBlobResult, DfsFileSystem, DfsFileSystemId, DfsMessageTransport, DfsMetadataBackend,
     DfsMetadataMutation, DfsMetadataReplicationOutcome, DfsMetadataShardAssignment,
-    DfsMetadataShardConfig, DfsMetadataShardId, DfsNetworkMessage, DfsNodeAdvertisement,
-    DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsObjectVersionRecord, DfsOwnerHandoffOutcome,
-    DfsReadData, DfsReadResponse, DfsReadResponseChunk, DfsReadResult,
+    DfsMetadataShardConfig, DfsMetadataShardHeadWatermark, DfsMetadataShardId, DfsNetworkMessage,
+    DfsNodeAdvertisement, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsObjectVersionRecord,
+    DfsOwnerHandoffOutcome, DfsReadData, DfsReadResponse, DfsReadResponseChunk, DfsReadResult,
     DfsRepairReplicaChunkCommand, DfsRepairReplicaCommand, DfsRepairReplicaResponse,
     DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsRoutedMessage, DfsStageBlobChunkCommand,
     DfsStageBlobCommand, DfsStageBlobResponse, DfsVersion, DfsWriteIntentState,
@@ -12401,17 +12401,18 @@ fn networked_dfs_owner_handoff_requires_latest_content_and_routes_old_owner() {
     let root = temp_root("networked_owner_handoff");
     let network = InProcessNetwork::new();
     let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: owner.clone(),
+        replica_node_ids: vec![candidate.clone()],
+        epoch: 7,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
     control_plane.with_client(|kv| {
         DfsControlPlaneStore::new(kv)
-            .put_metadata_shard(&DfsMetadataShardConfig {
-                file_system_id: file_system_id.clone(),
-                shard_id: "root".to_string(),
-                primary_node_id: owner.clone(),
-                replica_node_ids: vec![candidate.clone()],
-                epoch: 7,
-                assignment: DfsMetadataShardAssignment::Root,
-                default_policy: DfsObjectPolicy::ReplicatedEventual,
-            })
+            .put_metadata_shard(&shard)
             .expect("shard");
     });
     let mut owner_dfs = NetworkedDfsService::new(
@@ -12464,20 +12465,41 @@ fn networked_dfs_owner_handoff_requires_latest_content_and_routes_old_owner() {
     candidate_dfs
         .put_local_object_version(metadata, b"handoff bytes")
         .expect("candidate content");
+    control_plane.with_client(|kv| {
+        assert!(
+            DfsControlPlaneStore::new(kv)
+                .publish_metadata_shard_head_watermark(
+                    &shard,
+                    &DfsMetadataShardHeadWatermark {
+                        file_system_id: file_system_id.clone(),
+                        shard_id: "root".to_string(),
+                        primary_node_id: owner.clone(),
+                        epoch: shard.epoch,
+                        journal_sequence: 1,
+                        state_fingerprint: "blake3:networked-owner-handoff-root-v1".to_string(),
+                        acknowledged_node_ids: vec![owner.clone(), candidate.clone()],
+                    },
+                )
+                .expect("publish handoff watermark")
+        );
+    });
 
     let handoff = candidate_dfs
         .handoff_object_owner(&object_id, "root", 7)
         .expect("handoff");
-    assert!(matches!(
-        handoff,
-        DfsOwnerHandoffOutcome::Transferred {
-            previous_owner_node_id,
-            new_owner_node_id,
-            previous_epoch: 7,
-            new_epoch: 8,
-            ..
-        } if previous_owner_node_id == owner && new_owner_node_id == candidate
-    ));
+    assert!(
+        matches!(
+            &handoff,
+            DfsOwnerHandoffOutcome::Transferred {
+                previous_owner_node_id,
+                new_owner_node_id,
+                previous_epoch: 7,
+                new_epoch: 8,
+                ..
+            } if previous_owner_node_id == &owner && new_owner_node_id == &candidate
+        ),
+        "unexpected owner handoff outcome: {handoff:?}"
+    );
     control_plane.with_client(|kv| {
         let shard = DfsControlPlaneStore::new(kv)
             .get_metadata_shard(&file_system_id, "root")
@@ -12558,17 +12580,18 @@ fn networked_dfs_owner_handoff_uses_backend_current_metadata() {
     let root = temp_root("networked_owner_handoff_backend_current");
     let network = InProcessNetwork::new();
     let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: owner.clone(),
+        replica_node_ids: vec![candidate.clone()],
+        epoch: 11,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
     control_plane.with_client(|kv| {
         DfsControlPlaneStore::new(kv)
-            .put_metadata_shard(&DfsMetadataShardConfig {
-                file_system_id: file_system_id.clone(),
-                shard_id: "root".to_string(),
-                primary_node_id: owner.clone(),
-                replica_node_ids: vec![candidate.clone()],
-                epoch: 11,
-                assignment: DfsMetadataShardAssignment::Root,
-                default_policy: DfsObjectPolicy::ReplicatedEventual,
-            })
+            .put_metadata_shard(&shard)
             .expect("shard");
     });
     let backend_path = root.join("candidate-meta");
@@ -12579,7 +12602,7 @@ fn networked_dfs_owner_handoff_uses_backend_current_metadata() {
         network.add_node(candidate.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("candidate")).expect("candidate store"),
     )
-    .with_control_plane(control_plane)
+    .with_control_plane(control_plane.clone())
     .with_metadata_backend(backend)
     .expect("candidate metadata backend");
     candidate_dfs
@@ -12646,20 +12669,42 @@ fn networked_dfs_owner_handoff_uses_backend_current_metadata() {
             last_modified_by_event_id: None,
         })
         .expect("backend current object");
+    control_plane.with_client(|kv| {
+        assert!(
+            DfsControlPlaneStore::new(kv)
+                .publish_metadata_shard_head_watermark(
+                    &shard,
+                    &DfsMetadataShardHeadWatermark {
+                        file_system_id: file_system_id.clone(),
+                        shard_id: "root".to_string(),
+                        primary_node_id: owner.clone(),
+                        epoch: shard.epoch,
+                        journal_sequence: 1,
+                        state_fingerprint: "blake3:networked-owner-handoff-backend-root-v1"
+                            .to_string(),
+                        acknowledged_node_ids: vec![owner.clone(), candidate.clone()],
+                    },
+                )
+                .expect("publish backend-current handoff watermark")
+        );
+    });
 
     let handoff = candidate_dfs
         .handoff_object_owner(&object_id, "root", 11)
         .expect("handoff");
-    assert!(matches!(
-        handoff,
-        DfsOwnerHandoffOutcome::Transferred {
-            previous_owner_node_id,
-            new_owner_node_id,
-            previous_epoch: 11,
-            new_epoch: 12,
-            ..
-        } if previous_owner_node_id == owner && new_owner_node_id == candidate
-    ));
+    assert!(
+        matches!(
+            &handoff,
+            DfsOwnerHandoffOutcome::Transferred {
+                previous_owner_node_id,
+                new_owner_node_id,
+                previous_epoch: 11,
+                new_epoch: 12,
+                ..
+            } if previous_owner_node_id == &owner && new_owner_node_id == &candidate
+        ),
+        "unexpected backend-current owner handoff outcome: {handoff:?}"
+    );
     let candidate_object = candidate_dfs
         .metadata()
         .object(&object_id)

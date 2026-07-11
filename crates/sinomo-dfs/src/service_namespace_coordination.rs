@@ -6,9 +6,8 @@
 //! dispatcher while preserving a crate-local service API for higher-level DFS
 //! operations.
 
-use std::collections::BTreeSet;
-
 use sinomo_core::node::NodeId;
+use std::collections::BTreeSet;
 
 use crate::*;
 use crate::{posix_model, posix_path};
@@ -25,7 +24,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         requester_node_id: &NodeId,
     ) -> Result<Option<String>, DfsError> {
         let source_path = match operation {
-            DfsNamespaceOperation::AdoptObjectAtPath { source_path, .. }
+            DfsNamespaceOperation::AdvisoryLockMigrationPrepare { source_path, .. }
+            | DfsNamespaceOperation::AdoptObjectAtPath { source_path, .. }
             | DfsNamespaceOperation::AdoptHardlinkAlias { source_path, .. } => source_path,
             _ => return Ok(None),
         };
@@ -68,7 +68,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
         match operation {
             DfsNamespaceOperation::LookupPath { path }
-            | DfsNamespaceOperation::SyncPath { path } => {
+            | DfsNamespaceOperation::SyncPath { path }
+            | DfsNamespaceOperation::AdvisoryLock { path, .. }
+            | DfsNamespaceOperation::FileSync { path, .. }
+            | DfsNamespaceOperation::DirectorySync { path, .. } => {
                 return self.namespace_shards_for_exact_paths(file_system_id, [path.as_str()]);
             }
             DfsNamespaceOperation::LookupPaths { paths } => {
@@ -102,7 +105,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// split-prefix path and its parent are owned by different primaries, using
     /// the broader mutation shard set can make primaries redirect a read-only
     /// request back and forth forever.
-    fn namespace_shards_for_exact_paths<'a>(
+    pub(crate) fn namespace_shards_for_exact_paths<'a>(
         &mut self,
         file_system_id: &DfsFileSystemId,
         paths: impl IntoIterator<Item = &'a str>,
@@ -249,6 +252,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 path: from.to_string(),
             }));
         }
+        // A shard transfer may have committed through the control-plane Raft
+        // store while this service still holds an older local KV view. Refresh
+        // before deciding which side owns the source; otherwise two stale
+        // primaries can redirect a cross-shard rename back and forth.
+        self.refresh_control_plane_latest()?;
+        self.cached_sifs_metadata_shards = None;
         if self.resume_running_cross_shard_namespace_job_for_paths(
             file_system_id,
             from,
@@ -279,6 +288,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 path: existing_path.to_string(),
             }));
         }
+        self.refresh_control_plane_latest()?;
+        self.cached_sifs_metadata_shards = None;
         if self.resume_running_cross_shard_namespace_job_for_paths(
             file_system_id,
             existing_path,
@@ -306,7 +317,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         source_path: &str,
         destination_path: &str,
     ) -> posix_model::Result<Option<NodeId>> {
-        let source_shards = self.namespace_shards_for_path(file_system_id, source_path)?;
+        let source_shards = self.namespace_shards_for_exact_paths(file_system_id, [source_path])?;
         if let Some(shard) = source_shards
             .iter()
             .find(|shard| shard.primary_node_id != self.node_id)

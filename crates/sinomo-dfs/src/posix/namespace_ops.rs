@@ -119,6 +119,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             file_system_id: object.file_system_id.clone(),
             objects: vec![object.clone()],
             versions: Vec::new(),
+            advisory_lock_states: Vec::new(),
             created_at: time::OffsetDateTime::now_utc(),
         })?;
         self.touch_parent_directory_modified(&path)?;
@@ -314,6 +315,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             file_system_id: source.file_system_id.clone(),
             objects: transaction_objects,
             versions: Vec::new(),
+            advisory_lock_states: Vec::new(),
             created_at: time::OffsetDateTime::now_utc(),
         })?;
         self.touch_parent_directory_modified(&from)?;
@@ -358,6 +360,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             file_system_id: object.file_system_id.clone(),
             objects: vec![old_path_tombstone.clone(), alias_tombstone, object],
             versions: Vec::new(),
+            advisory_lock_states: Vec::new(),
             created_at: time::OffsetDateTime::now_utc(),
         })?;
         self.touch_parent_directory_modified(old_path)?;

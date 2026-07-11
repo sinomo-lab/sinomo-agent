@@ -4,11 +4,13 @@ use std::path::{Path, PathBuf};
 
 use sinomo_core::node::NodeId;
 
-use crate::metadata_error::Result;
+use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_io::{read_dir, read_sobj_optional, write_sobj_atomic};
 use crate::metadata_journal::{DfsMetadataJournalHead, DfsMetadataReplayCursor};
 use crate::metadata_keys::key_segment;
-use crate::metadata_records::{DfsMetadataReplayCursorStatus, DfsMetadataShardId};
+use crate::metadata_records::{
+    DfsMetadataPrefixAckFloor, DfsMetadataReplayCursorStatus, DfsMetadataShardId,
+};
 
 const LOCAL_MATERIALIZATION_CURSOR_FLUSH_INTERVAL: u64 = 512;
 
@@ -36,6 +38,15 @@ pub(crate) fn metadata_replication_cursor_path(
     records_root(root)
         .join("metadata-replication-cursors")
         .join(key_segment(target_node_id))
+        .join(format!("{}.sobj", key_segment(&shard_id.0)))
+}
+
+pub(crate) fn metadata_prefix_ack_floor_path(
+    root: &Path,
+    shard_id: &DfsMetadataShardId,
+) -> PathBuf {
+    root.join("coordination")
+        .join("metadata-prefix-ack-floors")
         .join(format!("{}.sobj", key_segment(&shard_id.0)))
 }
 
@@ -219,6 +230,43 @@ pub(crate) fn put_metadata_replication_cursor(
     )
 }
 
+pub(crate) fn metadata_prefix_ack_floor(
+    root: &Path,
+    shard_id: &DfsMetadataShardId,
+) -> Result<Option<DfsMetadataPrefixAckFloor>> {
+    read_sobj_optional(&metadata_prefix_ack_floor_path(root, shard_id))
+}
+
+pub(crate) fn put_metadata_prefix_ack_floor(
+    root: &Path,
+    floor: &DfsMetadataPrefixAckFloor,
+) -> Result<()> {
+    if floor.state_fingerprint.is_empty() {
+        return Err(MetadataBackendError::Serde(format!(
+            "metadata prefix acknowledgement for shard {} has an empty state fingerprint",
+            floor.shard_id.0
+        )));
+    }
+    if let Some(current) = metadata_prefix_ack_floor(root, &floor.shard_id)? {
+        if floor.journal_sequence < current.journal_sequence {
+            return Ok(());
+        }
+        if floor.journal_sequence == current.journal_sequence {
+            if floor.state_fingerprint == current.state_fingerprint {
+                return Ok(());
+            }
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata prefix acknowledgement for shard {} sequence {} conflicts with the durable fingerprint",
+                floor.shard_id.0, floor.journal_sequence
+            )));
+        }
+    }
+    write_sobj_atomic(
+        &metadata_prefix_ack_floor_path(root, &floor.shard_id),
+        floor,
+    )
+}
+
 pub(crate) fn write_journal_head(root: &Path, next_sequence: u64) -> Result<()> {
     write_sobj_atomic(
         &journal_head_path(root),
@@ -266,6 +314,53 @@ mod tests {
         );
 
         cleanup(&root);
+    }
+
+    #[test]
+    fn metadata_prefix_ack_floor_is_durable_monotonic_and_fingerprint_bound() {
+        let root = sinomo_testdir::TestDir::new("sinomo-metadata-prefix-ack-floor");
+        let shard_id = DfsMetadataShardId::new("root");
+        let first = DfsMetadataPrefixAckFloor {
+            shard_id: shard_id.clone(),
+            journal_sequence: 10,
+            state_fingerprint: "blake3:first".to_string(),
+        };
+        put_metadata_prefix_ack_floor(&root, &first).expect("write first floor");
+        put_metadata_prefix_ack_floor(
+            &root,
+            &DfsMetadataPrefixAckFloor {
+                shard_id: shard_id.clone(),
+                journal_sequence: 7,
+                state_fingerprint: "blake3:stale".to_string(),
+            },
+        )
+        .expect("stale floor is ignored");
+        assert_eq!(
+            metadata_prefix_ack_floor(&root, &shard_id).expect("read floor"),
+            Some(first.clone())
+        );
+        assert!(
+            put_metadata_prefix_ack_floor(
+                &root,
+                &DfsMetadataPrefixAckFloor {
+                    shard_id: shard_id.clone(),
+                    journal_sequence: 10,
+                    state_fingerprint: "blake3:conflict".to_string(),
+                },
+            )
+            .is_err(),
+            "equal sequence with different state must not replace an acknowledgement"
+        );
+        let advanced = DfsMetadataPrefixAckFloor {
+            shard_id: shard_id.clone(),
+            journal_sequence: 11,
+            state_fingerprint: "blake3:advanced".to_string(),
+        };
+        put_metadata_prefix_ack_floor(&root, &advanced).expect("advance floor");
+        assert_eq!(
+            metadata_prefix_ack_floor(&root, &shard_id).expect("read advanced floor"),
+            Some(advanced)
+        );
     }
 
     #[test]

@@ -223,6 +223,232 @@ adoption, recovery proceeds forward; it does not roll back an already visible
 destination into an ambiguous state. Authority changes are re-resolved on
 resume, and both sides validate current epochs.
 
+## POSIX Synchronization and Partition Fencing
+
+The canonical DFS synchronization contract distinguishes advisory file locks,
+internal namespace-job reservations, write visibility, and durability. These
+are separate mechanisms:
+
+- a POSIX advisory lock coordinates cooperating sessions on a stable object id;
+- an internal reservation protects a bounded metadata transaction or durable
+  namespace job;
+- neither kind of lock grants metadata authority or counts as a content
+  receipt; and
+- `fsync` is a durability barrier for writes that already returned, not a lock
+  acquisition or an authority transfer.
+
+The first formally modeled advisory-lock surface is deliberately bounded to
+whole-file shared and exclusive locks. Grants carry the metadata-authority
+epoch, a unique grant token, and a finite validity interval. An exact token can
+release its grant. A session that can reach the current authority renews the
+same grant, so logical time alone cannot expire a healthy lock. A session-local
+renewal outage starts the bounded expiry countdown. Close, process/session loss,
+expiry, or a newer authority epoch makes the old grant ineffective. Expiry and
+fencing produce explicit lost-lock outcomes, including terminal errors for
+blocking requests. A stale token cannot release a lock granted in the new
+epoch. The locks remain advisory: clients that bypass the lock protocol are not
+made safe by the existence of a grant.
+
+A partitioned lock holder may finish an already certified canonical operation
+only while all of these remain true:
+
+1. every metadata shard touched by the operation is present at the certified
+   current journal prefix on the holder's component;
+2. all required content is present and hash-validated; and
+3. the operation's strong permit remains valid;
+4. before publication, the combined model consumes an abstract proof token for
+   the configured content-receipt threshold and metadata prepare quorum. The
+   focused sync model verifies that their bounded recovery sets intersect; the
+   atomic publication point then forms the failover-recoverable commit
+   certificate. A direct refinement mapping between the two models remains
+   future work.
+
+Shard or content presence alone never grants authority. With renewable permits,
+the quorum component waits through the old permit's fencing deadline before it
+activates a higher epoch. If the holder lacks any required state, it suspends
+immediately and cannot commit while waiting for that barrier. Once a quorum
+activates the higher epoch, it wins regardless of how many content shards are
+currently reachable on either side. The old lock and reservation are fenced.
+If the winner lacks the latest committed content, it remains in an explicit
+`pending-repair` state and cannot serve stale bytes or accept dependent writes
+until repair validates the canonical object, version, and hash.
+
+This rule permits a complete holder to finish a bounded operation before its
+permit expires without allowing it to race a new quorum authority. Allowing a
+minority holder to commit while a quorum can immediately activate another epoch
+would create two canonical histories and is forbidden.
+
+The synchronization barriers are:
+
+| Operation | Successful-return guarantee |
+|---|---|
+| `write` | The write is visible through the current authority, but may still be volatile across authority loss. |
+| `fdatasync(file)` | All writes returned before the call, plus data-retrieval metadata such as length/extents, meet the configured receipt policy and have a failover-recoverable metadata certificate. |
+| `fsync(file)` | The same prefix plus file-integrity metadata is durable. It does not make the parent directory entry durable. |
+| `fsync(directory)` | Namespace changes captured by the call, such as create, rename, and unlink entries, are durably certified. |
+
+The formal target assigns every sync request a durable idempotency id and
+immutable payload. The current Rust barrier is deliberately narrower: its
+captured target and restart-unique metadata probe are immutable, but
+caller-selected sync ids and outcome-unknown replay records remain future
+work. A lost reply must therefore be retried by recapturing the current
+stable-object target, not by assuming that a pathname or cached per-handle
+version is still the same prefix.
+
+Obsolete locks and abandoned internal reservations must not create protocol
+deadlock. Multi-shard reservations use deterministic acquisition order,
+destination-visible jobs recover forward, expired/fenced locks do not block the
+current epoch, and terminal jobs release their effective reservations. Eventual
+completion still assumes eventual logical-time advancement, a stable quorum, a
+validated source for committed content, and fair recovery scheduling.
+
+The Rust DFS now implements the first bounded refinement of the advisory-lock
+and sync slices. Whole-file `F_GETLK`, `F_SETLK`, and `F_SETLKW` route to the
+stable object's metadata primary; lock aggregates are journaled, replicated to
+metadata quorum, epoch-fenced, leased, renewed by mounted clients, and moved
+atomically with a cross-shard object adoption. Blocking waits run outside the
+FUSE dispatch lane, and exact close/cancel transitions plus finite leases keep
+abandoned waiters from becoming protocol deadlocks. Partial byte ranges remain
+unsupported, and a conflicting blocking shared-to-exclusive conversion returns
+`EDEADLK` instead of creating a conversion cycle.
+
+Lock sessions and request ids are scoped to the authenticated requesting node;
+one node cannot close or cancel another node's grant by replaying an observed
+identifier. Clients consume an authority-reported relative lease budget using a
+local monotonic clock. On authority change, the new primary also waits the old
+deadline plus a configured five-minute maximum inter-node clock-skew bound.
+Strong renewable locks therefore require clocks to stay within that bound.
+The current FUSE refinement caps each mount at two distinct held or pending
+locks and uses ten-second coordination calls, leaving renewal headroom behind a
+foreground durability barrier; a third independent lock returns `ENOLCK`.
+Mutating lock requests retain their durable idempotency outcome without a
+bounded eviction window so an arbitrarily delayed exact retry cannot resurrect
+an acquisition. Read-only `F_GETLK` queries do not grow that history. A
+monotone per-session acknowledgement watermark is required before the retained
+history can be compacted safely. The current `fuser` API drops
+`FUSE_INTERRUPT`, so mount shutdown, close/cancel, and finite wait leases bound
+blocking requests, but signal-driven cancellation of one `F_SETLKW` call is
+not yet available.
+When a locked object moves between metadata shards, the destination installs
+the rebinding-marked lock aggregate with the object, syncs it to metadata
+quorum, and returns an exact typed digest receipt before the source may evict.
+Peers that predate lock-state adoption cannot return that receipt, so a rolling
+upgrade fails the move safely; an exact retry can repair an object that the old
+peer adopted before it understood the lock aggregate.
+
+FUSE writes now publish through the canonical DFS write path before the write
+reply, eliminating per-handle dirty-buffer visibility races during lock
+handoff. `flush` and `release` therefore perform close/lock cleanup but do not
+claim durability. `O_DSYNC` and `O_SYNC` writes invoke the file-data and
+full-file barriers respectively. File `fsync`, file `fdatasync`, and directory
+`fsync` capture immutable
+targets and route distinct operations to the metadata authority. A successful
+file result validates the exact version/hash on every desired content replica,
+collects a fresh acknowledgement of the complete canonical materialized
+metadata checkpoint at the exact journal head from a metadata majority,
+intersects that recovery set with the content holders, publishes an epoch-bound
+durable metadata-head watermark through cluster Raft, and only then returns.
+The checkpoint probe has a restart-unique identity and carries an empty journal
+batch, so a delayed reply cannot satisfy another attempt and a rolling-upgrade
+peer cannot skip its replay cursor. A persisted replication cursor alone is
+never a sync acknowledgement. Each replica also persists a monotonic,
+fingerprint-bound checkpoint floor before acknowledging the probe; delayed
+snapshot repair is rejected below that floor or at an equal sequence with a
+different state. The current `fdatasync` physical barrier is
+deliberately as strong as `fsync` because essential and ancillary file metadata
+share one journal transaction.
+
+This is not yet a full refinement of the combined partition model. Rust takes
+the conservative path when quorum is unavailable: new grants, renewals, and
+sync completion fail or wait rather than using the model's complete-holder
+permit. Explicit caller-selected durable sync ids, byte-range locks,
+application-level wait-cycle detection, open-unlinked lifetime, and directory
+open-handle identity remain target hardening. FUSE data I/O now targets the
+stable object id and fails closed if the pathname has been replaced; it does
+not yet retain an unlinked inode after the last name disappears. The initial exact
+metadata-checkpoint proof also hashes the complete shard snapshot on each
+participant; replacing this bounded correctness-first path with a cached
+incremental or Merkle commitment is future scale hardening.
+
+## Opt-in Local-first Degraded Operation
+
+The target local-first protocol is an extension beside the canonical DFS
+protocol, not a second metadata authority. A service or subtree must opt in
+through previously certified strong metadata. When a client cannot reach the
+current authority, the target permits operations on a durable local branch
+rooted at an exact certified metadata checkpoint. This remains true even when
+a quorum exists elsewhere: the disconnected node cannot observe that quorum,
+and its branch never becomes a second canonical history. The bounded model
+represents certification as a supplied opt-in policy and certified base state;
+it does not derive either from the canonical control plane.
+
+The bounded file slice varies global quorum availability independently from the
+local authority route. Canonical writes and reconciliation stop without quorum,
+while local overlay work remains isolated. If the authority route returns to
+an open branch, a locally synced dirty image seals atomically; an unsynced or
+clean image enters a permanently frozen phase that cannot resume degraded
+mutation after another route flap. The frozen branch may locally sync and seal,
+or a clean branch may close without publishing anything.
+
+The current formal boundary is an assume/guarantee abstraction, represented by
+a compact projection of authority epoch, journal head, object and namespace
+revision counters, visible-authority/head counts, and canonical conflict count.
+Local writes, local durability barriers, crashes, branch sealing,
+reconciliation planning, and local conflict preservation stutter under that
+projection. A non-stuttering publication requires supplied Boolean evidence
+for quorum, current authority, matching epoch and plan head, content policy,
+metadata prepare, and atomic publication. The local-first slices do not yet
+derive that evidence by direct composition with the canonical lock, sync, or
+no-conflict state machines. Subject to those assumed canonical guarantees,
+publication retains one visible authority and head and creates no canonical
+conflict record.
+
+The target protocol gives each branch a durable incarnation, monotonic
+operation identities, an immutable base checkpoint, exact object-version and
+namespace-entry stamps, and a sealed manifest. Offline-created objects use
+globally unique stable ids, and file and directory operations target those ids
+rather than relying on a pathname that may have moved. The bounded file slice
+models one complete reconciliation payload and a local sync generation. A
+companion namespace-durability slice models one returned namespace mutation,
+local directory `fsync`, crash restoration from the exact locally durable
+image, and sealing only after that image is durable. These local barriers do
+not produce a canonical quorum sync certificate; distinct local `fdatasync`
+and full-file `fsync` semantics remain a target protocol concern. A distributed
+advisory-lock token is never converted into a local authority token after loss
+or fencing, but direct lock-state composition is also future work.
+
+The target reconciliation protocol includes applicable, already-converged,
+conflicted, superseded, dependency-blocked, and rejected outcomes. The bounded
+file slice exercises apply, converge, and conflict; the namespace slice adds
+superseded. An applicable operation becomes one canonical metadata
+transaction. In the model, a conflict leaves the quorum winner at the
+canonical path and retains a symbolic file-content value or a set of namespace
+object identities in a disjoint sidecar. It does not yet prove storage
+retention receipts, retained subtree bytes, or post-crash reachability of those
+objects. File reconciliation records are keyed by the full modeled payload, so
+a lost reply can be replayed exactly while changed content, base head, or local
+sync generation is rejected. The abstract publication action atomically stores
+the terminal result record with its canonical effect or conflict sidecar; this
+is an assumed metadata-transaction boundary, not yet a refinement of the Rust
+journal. A modeled process restart clears the transient reply but preserves the
+terminal result and conflict records before replay. The namespace slice proves
+only that retrying its deterministic terminal branch is an idempotent stutter; it
+does not model a payload-keyed retry record. A changed canonical journal head
+invalidates either plan and requires reclassification. Explicit conflict
+resolution is itself a target strong compare-and-swap transaction.
+
+The first bounded Quint slices cover regular-file write, truncate, local sync,
+crash recovery, sealing and reconciliation, plus one same-shard create, mkdir,
+unlink, rmdir, or atomic no-replacement rename with stable parent/object
+identity and exact entry stamps. Rename requires an absent destination; POSIX
+replacement semantics are not modeled. The directory-durability companion is
+separate from namespace reconciliation. The slices exclude hardlinks,
+symlinks, cross-shard local changes, branch gossip, semantic content mergers,
+retention receipts, byte-range locks, and full open-unlinked lifetime. The Rust
+DFS still takes the conservative strong-path behavior described above; the
+local-first slices are target-hardening models, not a claim that degraded
+mutation is implemented end to end.
+
 ## Reads and Caches
 
 Reads prefer the closest valid copy:

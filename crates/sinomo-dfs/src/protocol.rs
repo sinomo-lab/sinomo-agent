@@ -1,8 +1,10 @@
 use crate::{
-    DfsConflictRecord, DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataShardConfig,
-    DfsMetadataShardId, DfsMetadataTableSnapshot, DfsNamespaceTransaction, DfsObjectId,
-    DfsObjectMetadata, DfsObjectVersionRecord, DfsReplicaReceiptRecord, DfsReplicationPolicy,
-    DfsVersion, DfsWriteIntentRecord, NetworkedDfsWriteOutcome,
+    DfsAdvisoryLockCommand, DfsAdvisoryLockOutcome, DfsAdvisoryLockStateRecord, DfsConflictRecord,
+    DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataShardConfig, DfsMetadataShardId,
+    DfsMetadataTableSnapshot, DfsNamespaceTransaction, DfsObjectId, DfsObjectMetadata,
+    DfsObjectVersionRecord, DfsPosixDirectorySyncCertificate, DfsPosixDirectorySyncTarget,
+    DfsPosixFileSyncCertificate, DfsPosixFileSyncTarget, DfsReplicaReceiptRecord,
+    DfsReplicationPolicy, DfsVersion, DfsWriteIntentRecord, NetworkedDfsWriteOutcome,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
@@ -14,6 +16,10 @@ fn is_zero_u32(value: &u32) -> bool {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_advisory_lock_timeout_millis() -> u64 {
+    45_000
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -317,6 +323,38 @@ pub enum DfsNamespaceOperation {
     ApplyTransaction {
         transaction: DfsNamespaceTransaction,
     },
+    /// Whole-file advisory-lock command routed to the metadata authority for
+    /// the stable object. `path` is used only for shard routing and for
+    /// detecting a stale path-to-object observation; lock ownership is scoped
+    /// to `object_id`, so rename and hardlink aliases cannot split a lock.
+    AdvisoryLock {
+        path: String,
+        object_id: DfsObjectId,
+        command: DfsAdvisoryLockCommand,
+        /// Server execution budget, kept below the caller's RPC deadline so
+        /// a canonical outcome can return before transport timeout.
+        #[serde(default = "default_advisory_lock_timeout_millis")]
+        timeout_millis: u64,
+    },
+    /// File durability barrier for an immutable object/version/hash prefix.
+    FileSync {
+        path: String,
+        target: DfsPosixFileSyncTarget,
+    },
+    /// Directory durability barrier for an immutable namespace generation.
+    DirectorySync {
+        path: String,
+        target: DfsPosixDirectorySyncTarget,
+    },
+    /// Non-mutating capability handshake required before a lock-bearing
+    /// cross-shard adoption. Peers that do not understand this variant reject
+    /// it before they can expose a partial destination object.
+    AdvisoryLockMigrationPrepare {
+        path: String,
+        source_path: String,
+        object_id: DfsObjectId,
+        state_fingerprint: String,
+    },
     /// Cross-shard-primary move, sent by the source-shard primary
     /// (coordinator) to the destination-shard primary: atomically validate
     /// the destination and install the moved object record at its new path,
@@ -336,6 +374,11 @@ pub enum DfsNamespaceOperation {
         intents: Vec<DfsWriteIntentRecord>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         conflicts: Vec<DfsConflictRecord>,
+        /// Object-scoped lock state copied atomically with the destination
+        /// record. The destination marks it for epoch rebinding before any
+        /// new grant can be issued.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        advisory_lock_state: Option<DfsAdvisoryLockStateRecord>,
     },
     /// Cross-shard-primary hardlink, sent by the link-target's shard primary
     /// (coordinator) to the link-path's shard primary: atomically validate
@@ -379,6 +422,10 @@ impl DfsNamespaceOperation {
                 .iter()
                 .map(|object| object.path.as_str())
                 .collect(),
+            DfsNamespaceOperation::AdvisoryLock { path, .. }
+            | DfsNamespaceOperation::FileSync { path, .. }
+            | DfsNamespaceOperation::DirectorySync { path, .. }
+            | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { path, .. } => vec![path],
             DfsNamespaceOperation::AdoptObjectAtPath { object, .. } => vec![object.path.as_str()],
             DfsNamespaceOperation::AdoptHardlinkAlias { alias, .. } => vec![alias.path.as_str()],
         }
@@ -400,6 +447,32 @@ pub struct DfsNamespaceResponse {
     /// from the requester's reported cursors.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metadata_journal_batches: Vec<DfsMetadataJournalBatch>,
+    /// Typed result for POSIX coordination operations. Keeping this separate
+    /// from `result` preserves the existing namespace success/error contract
+    /// while allowing lock and durability certificates to cross the same
+    /// metadata-primary RPC path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posix_coordination_result: Option<DfsPosixCoordinationResult>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsPosixCoordinationResult {
+    AdvisoryLock(DfsAdvisoryLockOutcome),
+    /// Capability acknowledgement for a lock-bearing cross-shard adoption.
+    /// An older destination that ignores the optional lock aggregate cannot
+    /// fabricate this exact-state receipt, so the source will not evict.
+    AdvisoryLockMigration {
+        object_id: DfsObjectId,
+        state_fingerprint: String,
+        durable_through_sequence: u64,
+    },
+    AdvisoryLockMigrationPrepared {
+        object_id: DfsObjectId,
+        state_fingerprint: String,
+    },
+    FileSync(DfsPosixFileSyncCertificate),
+    DirectorySync(DfsPosixDirectorySyncCertificate),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -695,7 +768,30 @@ pub struct DfsMetadataJournalBatchCommand {
     pub request_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_node_id: Option<NodeId>,
+    /// Verify that the receiver already has the exact materialized metadata
+    /// state described by `prefix_probe`, without applying `batch`. The batch
+    /// must be empty so an older peer that ignores this flag cannot skip or
+    /// poison its journal replay cursor during a rolling upgrade.
+    #[serde(default)]
+    pub verify_prefix_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_probe: Option<DfsMetadataPrefixProbe>,
     pub batch: DfsMetadataJournalBatch,
+}
+
+/// Restart-unique, exact-state identity used by a fresh metadata durability
+/// acknowledgement. A receiver may acknowledge only when its full
+/// materialized shard snapshot has this fingerprint at this exact head.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataPrefixProbe {
+    pub barrier_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_system_id: Option<DfsFileSystemId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_epoch: Option<u64>,
+    pub shard_id: DfsMetadataShardId,
+    pub journal_sequence: u64,
+    pub state_fingerprint: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -704,6 +800,11 @@ pub struct DfsMetadataJournalBatchResponse {
     pub shard_id: DfsMetadataShardId,
     pub next_after_sequence: u64,
     pub applied_entries: usize,
+    /// True only when the receiver understood and verified an exact
+    /// `verify_prefix_only` probe. This prevents mixed-version peers from
+    /// accidentally satisfying the stronger durability certificate.
+    #[serde(default)]
+    pub verified_prefix_only: bool,
     pub result: DfsMetadataJournalBatchResult,
 }
 
@@ -711,6 +812,10 @@ pub struct DfsMetadataJournalBatchResponse {
 pub struct DfsMetadataSnapshotInstallCommand {
     pub request_id: String,
     pub source_node_id: NodeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_system_id: Option<DfsFileSystemId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_epoch: Option<u64>,
     pub shard_id: DfsMetadataShardId,
     pub next_after_sequence: u64,
     pub snapshot: DfsMetadataTableSnapshot,

@@ -14,8 +14,8 @@ use crate::posix_path::{
 use crate::{
     DFS_ROUTED_NAMESPACE_OP_TIMEOUT, DfsControlPlaneStore, DfsError, DfsMessageTransport,
     DfsMetadataShardConfig, DfsMetadataShardId, DfsNamespaceJobKind, DfsNamespaceOperation,
-    DfsNamespaceResult, DfsObjectKind, DfsObjectMetadata, NetworkedDfsService,
-    PendingRoutedNamespaceResult, sifs_file_system_id,
+    DfsNamespaceResult, DfsObjectKind, DfsObjectMetadata, DfsPosixCoordinationResult,
+    NetworkedDfsService, PendingRoutedNamespaceResult, sifs_file_system_id,
 };
 use sinomo_core::node::NodeId;
 use std::time::{Duration, Instant};
@@ -374,6 +374,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
             match routed.result.clone() {
                 DfsNamespaceResult::Applied => {
+                    validate_advisory_lock_migration_receipt(
+                        &operation,
+                        routed.posix_coordination_result.as_ref(),
+                    )?;
                     self.finish_routed_namespace_catch_up_if_needed(&operation, &routed)?;
                     return Ok(());
                 }
@@ -384,7 +388,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 } => match current_primary_node_id {
                     Some(current) if current == self.node_id => {
                         // Authority moved to this node; execute locally.
-                        return self.execute_namespace_operation_local(&operation);
+                        return self
+                            .execute_posix_coordination_operation_local(&operation)
+                            .map(drop);
                     }
                     Some(current) if current != primary => {
                         primary = self
@@ -396,7 +402,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             )
                             .map_err(DfsPosixError::Dfs)?;
                         if primary == self.node_id {
-                            return self.execute_namespace_operation_local(&operation);
+                            return self
+                                .execute_posix_coordination_operation_local(&operation)
+                                .map(drop);
                         }
                     }
                     _ => return Err(posix_error_for_namespace_rejection(reason, posix_error)),
@@ -468,7 +476,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     current_primary_node_id,
                 } => match current_primary_node_id {
                     Some(current) if current == self.node_id => {
-                        return self.execute_namespace_operation_local(&operation);
+                        return self
+                            .execute_posix_coordination_operation_local(&operation)
+                            .map(drop);
                     }
                     Some(current) if current != primary => {
                         primary = self
@@ -480,7 +490,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             )
                             .map_err(DfsPosixError::Dfs)?;
                         if primary == self.node_id {
-                            return self.execute_namespace_operation_local(&operation);
+                            return self
+                                .execute_posix_coordination_operation_local(&operation)
+                                .map(drop);
                         }
                     }
                     _ => return Err(posix_error_for_namespace_rejection(reason, posix_error)),
@@ -507,7 +519,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(RoutedNamespaceNetworkRecovery::Unchanged);
         };
         if shard.primary_node_id == self.node_id {
-            self.execute_namespace_operation_local(operation)?;
+            self.execute_posix_coordination_operation_local(operation)?;
             return Ok(RoutedNamespaceNetworkRecovery::Completed);
         }
         if shard.primary_node_id != *primary {
@@ -612,17 +624,40 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNamespaceOperation::SyncPath { .. }
             | DfsNamespaceOperation::LookupPath { .. }
             | DfsNamespaceOperation::LookupPaths { .. } => Ok(()),
-            DfsNamespaceOperation::ApplyTransaction { transaction } => self
-                .apply_namespace_transaction(transaction.clone())
-                .map_err(DfsPosixError::from),
+            DfsNamespaceOperation::ApplyTransaction { transaction } => {
+                if !transaction.advisory_lock_states.is_empty() {
+                    return Err(DfsPosixError::Dfs(DfsError::Distributed {
+                        message: "generic namespace transactions may not install advisory-lock state; use the typed migration protocol"
+                            .to_string(),
+                    }));
+                }
+                self.apply_namespace_transaction(transaction.clone())
+                    .map_err(DfsPosixError::from)
+            }
+            DfsNamespaceOperation::AdvisoryLock { .. }
+            | DfsNamespaceOperation::FileSync { .. }
+            | DfsNamespaceOperation::DirectorySync { .. }
+            | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. } => {
+                Err(DfsPosixError::Dfs(DfsError::Distributed {
+                    message: "POSIX coordination operation bypassed its typed executor".to_string(),
+                }))
+            }
             DfsNamespaceOperation::AdoptObjectAtPath {
                 object,
                 versions,
                 receipts,
                 intents,
                 conflicts,
+                advisory_lock_state,
                 source_path: _,
-            } => self.adopt_object_at_path_local(object, versions, receipts, intents, conflicts),
+            } => self.adopt_object_at_path_local(
+                object,
+                versions,
+                receipts,
+                intents,
+                conflicts,
+                advisory_lock_state.as_ref(),
+            ),
             DfsNamespaceOperation::AdoptHardlinkAlias {
                 alias,
                 source_path: _,
@@ -802,6 +837,70 @@ fn namespace_lookup_error_allows_local_replica_fallback(error: &DfsError) -> boo
     )
 }
 
+fn validate_advisory_lock_migration_receipt(
+    operation: &DfsNamespaceOperation,
+    result: Option<&DfsPosixCoordinationResult>,
+) -> Result<()> {
+    if let DfsNamespaceOperation::AdvisoryLockMigrationPrepare {
+        object_id,
+        state_fingerprint,
+        ..
+    } = operation
+    {
+        if matches!(
+            result,
+            Some(DfsPosixCoordinationResult::AdvisoryLockMigrationPrepared {
+                object_id: prepared_object_id,
+                state_fingerprint: prepared_fingerprint,
+            }) if prepared_object_id == object_id && prepared_fingerprint == state_fingerprint
+        ) {
+            return Ok(());
+        }
+        return Err(DfsPosixError::Dfs(DfsError::Distributed {
+            message: format!(
+                "destination does not support exact advisory-lock migration preparation for {object_id}"
+            ),
+        }));
+    }
+    let DfsNamespaceOperation::AdoptObjectAtPath {
+        object,
+        advisory_lock_state: Some(source_state),
+        ..
+    } = operation
+    else {
+        return Ok(());
+    };
+    let (_, expected_fingerprint) =
+        crate::advisory_lock::prepare_advisory_lock_state_for_migration(source_state).map_err(
+            |source| {
+                DfsPosixError::Dfs(DfsError::Serialization {
+                    message: format!(
+                        "encode advisory-lock migration receipt for {}: {source}",
+                        object.object_id
+                    ),
+                })
+            },
+        )?;
+    if matches!(
+        result,
+        Some(DfsPosixCoordinationResult::AdvisoryLockMigration {
+            object_id,
+            state_fingerprint,
+            durable_through_sequence,
+        }) if object_id == &object.object_id
+            && state_fingerprint == &expected_fingerprint
+            && *durable_through_sequence > 0
+    ) {
+        return Ok(());
+    }
+    Err(DfsPosixError::Dfs(DfsError::Distributed {
+        message: format!(
+            "destination did not return an exact quorum-durable advisory-lock migration receipt for {}; retry after every involved metadata authority supports lock-state adoption",
+            object.object_id
+        ),
+    }))
+}
+
 fn namespace_operation_routing_path(operation: &DfsNamespaceOperation) -> Option<&str> {
     match operation {
         DfsNamespaceOperation::Mkdir { path }
@@ -814,7 +913,11 @@ fn namespace_operation_routing_path(operation: &DfsNamespaceOperation) -> Option
         | DfsNamespaceOperation::TouchDirectoryModified { path }
         | DfsNamespaceOperation::ClearDirRecursive { path }
         | DfsNamespaceOperation::SyncPath { path }
-        | DfsNamespaceOperation::LookupPath { path } => Some(path.as_str()),
+        | DfsNamespaceOperation::LookupPath { path }
+        | DfsNamespaceOperation::AdvisoryLock { path, .. }
+        | DfsNamespaceOperation::FileSync { path, .. }
+        | DfsNamespaceOperation::DirectorySync { path, .. } => Some(path.as_str()),
+        DfsNamespaceOperation::AdvisoryLockMigrationPrepare { path, .. } => Some(path.as_str()),
         DfsNamespaceOperation::LookupPaths { paths } => paths.first().map(String::as_str),
         DfsNamespaceOperation::Rename { from, .. } => Some(from.as_str()),
         DfsNamespaceOperation::Hardlink { existing_path, .. } => Some(existing_path.as_str()),
@@ -824,5 +927,46 @@ fn namespace_operation_routing_path(operation: &DfsNamespaceOperation) -> Option
             .map(|object| object.path.as_str()),
         DfsNamespaceOperation::AdoptObjectAtPath { object, .. } => Some(object.path.as_str()),
         DfsNamespaceOperation::AdoptHardlinkAlias { alias, .. } => Some(alias.path.as_str()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DfsAdvisoryLockStateRecord, directory_object};
+
+    #[test]
+    fn lock_bearing_adoption_requires_an_exact_typed_receipt() {
+        let owner = NodeId::from_legacy_named("node_lock_migration_receipt").expect("node");
+        let object = directory_object("/moved", owner);
+        let state = DfsAdvisoryLockStateRecord::empty(
+            object.file_system_id.clone(),
+            object.object_id.clone(),
+            7,
+        );
+        let operation = DfsNamespaceOperation::AdoptObjectAtPath {
+            object: object.clone(),
+            source_path: "/source".to_string(),
+            versions: Vec::new(),
+            receipts: Vec::new(),
+            intents: Vec::new(),
+            conflicts: Vec::new(),
+            advisory_lock_state: Some(state.clone()),
+        };
+        assert!(validate_advisory_lock_migration_receipt(&operation, None).is_err());
+
+        let mut rebound = state;
+        rebound.authority_rebind_required = true;
+        let fingerprint = crate::advisory_lock::advisory_lock_state_fingerprint(&rebound)
+            .expect("state fingerprint");
+        validate_advisory_lock_migration_receipt(
+            &operation,
+            Some(&DfsPosixCoordinationResult::AdvisoryLockMigration {
+                object_id: object.object_id,
+                state_fingerprint: fingerprint,
+                durable_through_sequence: 1,
+            }),
+        )
+        .expect("exact receipt");
     }
 }

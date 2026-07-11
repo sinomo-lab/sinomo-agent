@@ -9,6 +9,10 @@ use std::path::PathBuf;
 
 use sinomo_core::node::NodeId;
 
+use crate::advisory_lock::{
+    DfsAdvisoryLockApplyResult, DfsAdvisoryLockCommand, DfsAdvisoryLockStateRecord,
+    DfsAdvisoryLockTransitionContext, prepare_advisory_lock_state_for_migration,
+};
 use crate::control_plane::{DfsMetadataShardConfig, select_metadata_shard_config_for_path};
 use crate::intent::write_intent_status_is_active;
 use crate::metadata_api::DfsMetadataBackend;
@@ -809,6 +813,39 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             return self.shard_backend(&shard_id)?.get_object(object_id);
         }
         Ok(None)
+    }
+
+    fn get_advisory_lock_state(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+    ) -> Result<Option<DfsAdvisoryLockStateRecord>> {
+        let Some(shard_id) = self.shard_id_for_object(object_id)? else {
+            return Ok(None);
+        };
+        self.shard_backend(&shard_id)?
+            .get_advisory_lock_state(file_system_id, object_id)
+    }
+
+    fn apply_advisory_lock_command(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        context: DfsAdvisoryLockTransitionContext,
+        command: &DfsAdvisoryLockCommand,
+    ) -> Result<DfsAdvisoryLockApplyResult> {
+        let shard_id = self.require_shard_id_for_object(object_id)?;
+        self.shard_backend_mut(&shard_id)?
+            .apply_advisory_lock_command(file_system_id, object_id, context, command)
+    }
+
+    fn install_advisory_lock_state_for_migration(
+        &mut self,
+        state: &DfsAdvisoryLockStateRecord,
+    ) -> Result<Option<DfsMetadataJournalEntry>> {
+        let shard_id = self.require_shard_id_for_object(&state.object_id)?;
+        self.shard_backend_mut(&shard_id)?
+            .install_advisory_lock_state_for_migration(state)
     }
 
     fn get_object_by_path(
@@ -1684,9 +1721,16 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let mut objects_by_shard = BTreeMap::<DfsMetadataShardId, Vec<DfsObjectMetadata>>::new();
         let mut versions_by_shard =
             BTreeMap::<DfsMetadataShardId, Vec<DfsObjectVersionRecord>>::new();
+        let mut advisory_lock_states_by_shard =
+            BTreeMap::<DfsMetadataShardId, Vec<DfsAdvisoryLockStateRecord>>::new();
         let mut object_shards = BTreeMap::<DfsObjectId, DfsMetadataShardId>::new();
         let mut cross_shard_tombstones =
             Vec::<(DfsObjectMetadata, DfsMetadataShardId, DfsMetadataShardId)>::new();
+        let explicit_lock_state_object_ids = transaction
+            .advisory_lock_states
+            .iter()
+            .map(|state| state.object_id.clone())
+            .collect::<BTreeSet<_>>();
         for object in &transaction.objects {
             let object = normalized_object_metadata(object);
             let target_shard_id =
@@ -1695,6 +1739,25 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             if let Some(source_shard_id) = self.indexed_shard_id_for_object(&object.object_id)?
                 && source_shard_id != target_shard_id
             {
+                if !explicit_lock_state_object_ids.contains(&object.object_id)
+                    && let Some(source_state) = self
+                        .shard_backend(&source_shard_id)?
+                        .get_advisory_lock_state(&object.file_system_id, &object.object_id)?
+                {
+                    let (prepared_state, _) = prepare_advisory_lock_state_for_migration(
+                        &source_state,
+                    )
+                    .map_err(|source| {
+                        MetadataBackendError::Serde(format!(
+                            "prepare advisory-lock state for local shard move of {}: {source}",
+                            object.object_id
+                        ))
+                    })?;
+                    advisory_lock_states_by_shard
+                        .entry(target_shard_id.clone())
+                        .or_default()
+                        .push(prepared_state);
+                }
                 cross_shard_tombstones.push((
                     object.clone(),
                     source_shard_id,
@@ -1715,17 +1778,35 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             };
             versions_by_shard.entry(shard_id).or_default().push(version);
         }
+        for state in &transaction.advisory_lock_states {
+            let mut state = state.clone();
+            state.authority_rebind_required = true;
+            let shard_id = if let Some(shard_id) = object_shards.get(&state.object_id) {
+                shard_id.clone()
+            } else {
+                self.require_shard_id_for_object(&state.object_id)?
+            };
+            advisory_lock_states_by_shard
+                .entry(shard_id)
+                .or_default()
+                .push(state);
+        }
         let mut shard_ids = objects_by_shard.keys().cloned().collect::<BTreeSet<_>>();
         shard_ids.extend(versions_by_shard.keys().cloned());
+        shard_ids.extend(advisory_lock_states_by_shard.keys().cloned());
         let mut last_entry = None;
         for shard_id in shard_ids {
             let objects = objects_by_shard.remove(&shard_id).unwrap_or_default();
             let versions = versions_by_shard.remove(&shard_id).unwrap_or_default();
+            let advisory_lock_states = advisory_lock_states_by_shard
+                .remove(&shard_id)
+                .unwrap_or_default();
             let shard_transaction = DfsNamespaceTransaction {
                 transaction_id: format!("{}:{}", transaction.transaction_id, shard_id.0),
                 file_system_id: transaction.file_system_id.clone(),
                 objects,
                 versions,
+                advisory_lock_states,
                 created_at: transaction.created_at,
             };
             let entry = self
@@ -1739,7 +1820,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         }
         last_entry.ok_or_else(|| {
             MetadataBackendError::Serde(format!(
-                "namespace transaction {} did not contain any objects or versions",
+                "namespace transaction {} did not contain any objects, versions, or advisory-lock states",
                 transaction.transaction_id
             ))
         })
@@ -2071,6 +2152,19 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     ) -> Result<()> {
         self.shard_backend_mut(shard_id)?
             .put_metadata_replication_cursor(target_node_id, shard_id, next_after_sequence)
+    }
+
+    fn metadata_prefix_ack_floor(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<DfsMetadataPrefixAckFloor>> {
+        self.shard_backend(shard_id)?
+            .metadata_prefix_ack_floor(shard_id)
+    }
+
+    fn put_metadata_prefix_ack_floor(&mut self, floor: &DfsMetadataPrefixAckFloor) -> Result<()> {
+        self.shard_backend_mut(&floor.shard_id)?
+            .put_metadata_prefix_ack_floor(floor)
     }
 
     fn metadata_shard_statuses(&self) -> Result<Vec<DfsMetadataShardStatus>> {

@@ -1336,6 +1336,7 @@ struct DfsPreparedClusterMetadataJournalPublish {
 #[derive(Clone, Debug)]
 pub(crate) struct DfsPreparedMetadataJournalTargetPublish {
     pub(crate) target_node_id: NodeId,
+    pub(crate) file_system_id: DfsFileSystemId,
     pub(crate) shard_id: DfsMetadataShardId,
     pub(crate) shard_epoch: u64,
     pub(crate) after_sequence: u64,
@@ -1464,6 +1465,7 @@ pub(crate) fn prepare_dfs_metadata_journal_publish_with_host(
                 &mut *backend,
                 local_node_id,
                 target_node_id,
+                shard.file_system_id.clone(),
                 shard_id.clone(),
                 shard.epoch,
                 after_sequence,
@@ -1495,6 +1497,7 @@ fn prepare_dfs_metadata_journal_target_publish(
     backend: &mut dyn DfsMetadataBackend,
     local_node_id: &NodeId,
     target_node_id: NodeId,
+    file_system_id: DfsFileSystemId,
     shard_id: DfsMetadataShardId,
     shard_epoch: u64,
     after_sequence: u64,
@@ -1546,6 +1549,7 @@ fn prepare_dfs_metadata_journal_target_publish(
     Ok(DfsPreparedMetadataJournalTargetPublishResult::Publish {
         target: DfsPreparedMetadataJournalTargetPublish {
             target_node_id,
+            file_system_id,
             shard_id,
             shard_epoch,
             after_sequence,
@@ -1634,6 +1638,7 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
 ) -> Result<(), DfsError> {
     let DfsPreparedMetadataJournalTargetPublish {
         target_node_id,
+        file_system_id,
         shard_id,
         shard_epoch,
         mut after_sequence,
@@ -1718,6 +1723,7 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
                         &target_node_id,
                         &shard_id,
                         shard_epoch,
+                        &file_system_id,
                         after_sequence,
                         reason,
                         transport,
@@ -1766,6 +1772,7 @@ async fn execute_prepared_dfs_metadata_snapshot_repair_async(
     target_node_id: &NodeId,
     shard_id: &DfsMetadataShardId,
     shard_epoch: u64,
+    file_system_id: &DfsFileSystemId,
     after_sequence: u64,
     reason: String,
     transport: &mut dyn AsyncDfsMetadataJournalReplicationTransport,
@@ -1777,6 +1784,8 @@ async fn execute_prepared_dfs_metadata_snapshot_repair_async(
         data_dir.clone(),
         local_node_id.clone(),
         target_node_id.clone(),
+        file_system_id.clone(),
+        shard_epoch,
         shard_id.clone(),
         reason.clone(),
     )
@@ -1861,6 +1870,8 @@ async fn build_local_dfs_metadata_snapshot_install_command_async(
     data_dir: SinomoDataDir,
     local_node_id: NodeId,
     target_node_id: NodeId,
+    file_system_id: DfsFileSystemId,
+    authority_epoch: u64,
     shard_id: DfsMetadataShardId,
     reason: String,
 ) -> Result<DfsMetadataSnapshotInstallCommand, DfsError> {
@@ -1870,6 +1881,8 @@ async fn build_local_dfs_metadata_snapshot_install_command_async(
             &mut backend,
             &local_node_id,
             &target_node_id,
+            &file_system_id,
+            authority_epoch,
             &shard_id,
             reason,
         )
@@ -1944,6 +1957,8 @@ pub fn publish_dfs_metadata_journal_with_host(
                 &mut *backend,
                 local_node_id,
                 &target_node_id,
+                &shard.file_system_id,
+                shard.epoch,
                 &shard_id,
                 after_sequence,
                 transport,
@@ -2001,12 +2016,33 @@ pub fn process_dfs_metadata_journal_batch(
     }
     let shard_id = command.batch.shard_id.clone();
     let next_after_sequence = command.batch.next_after_sequence;
+    if command.verify_prefix_only {
+        return match verify_dfs_metadata_journal_prefix(backend, &command) {
+            Ok(()) => DfsMetadataJournalBatchResponse {
+                request_id: command.request_id,
+                shard_id,
+                next_after_sequence,
+                applied_entries: 0,
+                verified_prefix_only: true,
+                result: DfsMetadataJournalBatchResult::Applied,
+            },
+            Err(reason) => DfsMetadataJournalBatchResponse {
+                request_id: command.request_id,
+                shard_id,
+                next_after_sequence,
+                applied_entries: 0,
+                verified_prefix_only: false,
+                result: DfsMetadataJournalBatchResult::Rejected { reason },
+            },
+        };
+    }
     match backend.apply_journal_batch(&command.batch) {
         Ok(applied_entries) => DfsMetadataJournalBatchResponse {
             request_id: command.request_id,
             shard_id,
             next_after_sequence,
             applied_entries,
+            verified_prefix_only: false,
             result: DfsMetadataJournalBatchResult::Applied,
         },
         Err(error) => DfsMetadataJournalBatchResponse {
@@ -2014,11 +2050,70 @@ pub fn process_dfs_metadata_journal_batch(
             shard_id,
             next_after_sequence,
             applied_entries: 0,
+            verified_prefix_only: false,
             result: DfsMetadataJournalBatchResult::Rejected {
                 reason: error.to_string(),
             },
         },
     }
+}
+
+fn verify_dfs_metadata_journal_prefix(
+    backend: &mut dyn DfsMetadataBackend,
+    command: &DfsMetadataJournalBatchCommand,
+) -> Result<(), String> {
+    let batch = &command.batch;
+    let Some(probe) = command.prefix_probe.as_ref() else {
+        return Err(
+            "metadata journal prefix probe is missing its exact checkpoint identity".to_string(),
+        );
+    };
+    if !batch.entries.is_empty() {
+        return Err(
+            "metadata journal prefix probe must carry an empty rolling-upgrade-safe batch"
+                .to_string(),
+        );
+    }
+    if probe.barrier_id.is_empty()
+        || probe.state_fingerprint.is_empty()
+        || probe.shard_id != batch.shard_id
+        || probe.journal_sequence != batch.next_after_sequence
+    {
+        return Err(format!(
+            "metadata journal prefix probe identity mismatch for shard {} sequence {}",
+            batch.shard_id.0, batch.next_after_sequence
+        ));
+    }
+    let local_fingerprint = crate::service_sync::metadata_shard_state_fingerprint_at(
+        backend,
+        &probe.shard_id,
+        probe.journal_sequence,
+    )
+    .map_err(|error| {
+        format!(
+            "metadata journal prefix probe state mismatch for shard {} sequence {}: {error}",
+            batch.shard_id.0, probe.journal_sequence
+        )
+    })?;
+    if local_fingerprint != probe.state_fingerprint {
+        return Err(format!(
+            "metadata journal prefix probe state mismatch for shard {} sequence {}",
+            batch.shard_id.0, probe.journal_sequence
+        ));
+    }
+    backend
+        .put_metadata_prefix_ack_floor(&crate::DfsMetadataPrefixAckFloor {
+            shard_id: probe.shard_id.clone(),
+            journal_sequence: probe.journal_sequence,
+            state_fingerprint: probe.state_fingerprint.clone(),
+        })
+        .map_err(|error| {
+            format!(
+                "persist metadata prefix acknowledgement floor for shard {} sequence {}: {error}",
+                batch.shard_id.0, probe.journal_sequence
+            )
+        })?;
+    Ok(())
 }
 
 pub fn cluster_dfs_metadata_replica_shard_context(
@@ -2078,6 +2173,27 @@ pub fn process_dfs_metadata_snapshot_install(
     let request_id = command.request_id.clone();
     let shard_id = command.shard_id.clone();
     let next_after_sequence = command.next_after_sequence;
+    match validate_dfs_metadata_snapshot_install_state(backend, &command) {
+        Ok(Some(reason)) => {
+            return DfsMetadataSnapshotInstallResponse {
+                request_id,
+                shard_id,
+                next_after_sequence,
+                result: DfsMetadataSnapshotInstallResult::Rejected { reason },
+            };
+        }
+        Err(error) => {
+            return DfsMetadataSnapshotInstallResponse {
+                request_id,
+                shard_id,
+                next_after_sequence,
+                result: DfsMetadataSnapshotInstallResult::Rejected {
+                    reason: error.to_string(),
+                },
+            };
+        }
+        Ok(None) => {}
+    }
     match backend.replace_with_replicated_snapshot(
         command.shard_id,
         command.next_after_sequence,
@@ -2098,6 +2214,47 @@ pub fn process_dfs_metadata_snapshot_install(
             },
         },
     }
+}
+
+pub(crate) fn validate_dfs_metadata_snapshot_install_state(
+    backend: &dyn DfsMetadataBackend,
+    command: &DfsMetadataSnapshotInstallCommand,
+) -> Result<Option<String>, DfsError> {
+    if command.snapshot.materialized_through_sequence != Some(command.next_after_sequence) {
+        return Ok(Some(format!(
+            "metadata snapshot embedded sequence {:?} does not match install sequence {} for shard {}",
+            command.snapshot.materialized_through_sequence,
+            command.next_after_sequence,
+            command.shard_id.0
+        )));
+    }
+    let Some(floor) = backend.metadata_prefix_ack_floor(&command.shard_id)? else {
+        return Ok(None);
+    };
+    if command.next_after_sequence < floor.journal_sequence {
+        return Ok(Some(format!(
+            "metadata snapshot sequence {} would roll shard {} behind locally acknowledged checkpoint {}",
+            command.next_after_sequence, command.shard_id.0, floor.journal_sequence
+        )));
+    }
+    if command.next_after_sequence == floor.journal_sequence {
+        let fingerprint = crate::metadata_records::dfs_metadata_table_snapshot_state_fingerprint(
+            &command.snapshot,
+        )
+        .map_err(|source| DfsError::Serialization {
+            message: format!(
+                "encode metadata snapshot local acknowledgement check for {}: {source}",
+                command.shard_id.0
+            ),
+        })?;
+        if fingerprint != floor.state_fingerprint {
+            return Ok(Some(format!(
+                "metadata snapshot state does not match locally acknowledged checkpoint for shard {} sequence {}",
+                command.shard_id.0, command.next_after_sequence
+            )));
+        }
+    }
+    Ok(None)
 }
 
 pub fn process_cluster_dfs_metadata_snapshot_install(
@@ -2184,6 +2341,20 @@ pub fn validate_dfs_metadata_journal_batch_source(
             "metadata journal batch has no local shard config".to_string(),
         ));
     }
+    if command.verify_prefix_only
+        && command.prefix_probe.as_ref().is_none_or(|probe| {
+            probe.file_system_id.as_ref() != Some(&context.shard.file_system_id)
+                || probe.authority_epoch != Some(context.shard.epoch)
+        })
+    {
+        return Some(dfs_metadata_journal_rejection_response(
+            command,
+            format!(
+                "metadata journal prefix probe authority does not match shard {} epoch {}",
+                context.shard.shard_id, context.shard.epoch
+            ),
+        ));
+    }
     let Some(source_node_id) = command.source_node_id.as_ref() else {
         return Some(dfs_metadata_journal_rejection_response(
             command,
@@ -2242,6 +2413,14 @@ pub fn validate_dfs_metadata_snapshot_install_source(
             "metadata snapshot install has no local shard config".to_string(),
         ));
     }
+    if command.file_system_id.as_ref() != Some(&context.shard.file_system_id)
+        || command.authority_epoch != Some(context.shard.epoch)
+    {
+        return Some(reject(format!(
+            "metadata snapshot authority identity does not match filesystem {} shard {} epoch {}",
+            context.shard.file_system_id, context.shard.shard_id, context.shard.epoch
+        )));
+    }
     if context.shard.primary_node_id != command.source_node_id {
         return Some(reject(format!(
             "metadata snapshot source {} is not shard {} primary {}",
@@ -2275,6 +2454,7 @@ fn dfs_metadata_journal_rejection_response(
         shard_id: command.batch.shard_id.clone(),
         next_after_sequence: command.batch.next_after_sequence,
         applied_entries: 0,
+        verified_prefix_only: false,
         result: DfsMetadataJournalBatchResult::Rejected { reason },
     }
 }
@@ -2303,6 +2483,8 @@ fn dfs_metadata_journal_batch_command(
             local_node_id, target_node_id, next_after_sequence
         ),
         source_node_id: Some(local_node_id.clone()),
+        verify_prefix_only: false,
+        prefix_probe: None,
         batch,
     }
 }
@@ -2311,6 +2493,8 @@ fn dfs_metadata_snapshot_install_command(
     backend: &mut dyn DfsMetadataBackend,
     local_node_id: &NodeId,
     target_node_id: &NodeId,
+    file_system_id: &DfsFileSystemId,
+    authority_epoch: u64,
     shard_id: &DfsMetadataShardId,
     reason: String,
 ) -> Result<DfsMetadataSnapshotInstallCommand, DfsError> {
@@ -2321,6 +2505,8 @@ fn dfs_metadata_snapshot_install_command(
             local_node_id, target_node_id, next_after_sequence
         ),
         source_node_id: local_node_id.clone(),
+        file_system_id: Some(file_system_id.clone()),
+        authority_epoch: Some(authority_epoch),
         shard_id: shard_id.clone(),
         next_after_sequence,
         snapshot: backend.export_table_snapshot()?,
@@ -2357,6 +2543,8 @@ fn handle_dfs_metadata_journal_batch_response(
     backend: &mut dyn DfsMetadataBackend,
     local_node_id: &NodeId,
     target_node_id: &NodeId,
+    file_system_id: &DfsFileSystemId,
+    authority_epoch: u64,
     shard_id: &DfsMetadataShardId,
     command: &DfsMetadataJournalBatchCommand,
     response: DfsMetadataJournalBatchResponse,
@@ -2397,6 +2585,8 @@ fn handle_dfs_metadata_journal_batch_response(
                     backend,
                     local_node_id,
                     target_node_id,
+                    file_system_id,
+                    authority_epoch,
                     shard_id,
                     reason.clone(),
                 )?;
@@ -2519,6 +2709,8 @@ pub fn replicate_dfs_metadata_shard_to_target(
     backend: &mut dyn DfsMetadataBackend,
     local_node_id: &NodeId,
     target_node_id: &NodeId,
+    file_system_id: &DfsFileSystemId,
+    authority_epoch: u64,
     shard_id: &DfsMetadataShardId,
     mut after_sequence: u64,
     transport: &mut dyn DfsMetadataJournalReplicationTransport,
@@ -2596,6 +2788,8 @@ pub fn replicate_dfs_metadata_shard_to_target(
             backend,
             local_node_id,
             target_node_id,
+            file_system_id,
+            authority_epoch,
             shard_id,
             &command,
             response,
@@ -2683,6 +2877,7 @@ pub(crate) fn metadata_journal_rejection_allows_snapshot_repair(reason: &str) ->
     (reason.contains("metadata journal sequence")
         && reason.contains("already exists with a different entry"))
         || reason.contains("failed to decode segmented journal entry")
+        || (reason.contains("metadata journal prefix probe") && reason.contains("state mismatch"))
 }
 
 pub(crate) fn metadata_replication_rejection_is_topology_mismatch(reason: &str) -> bool {

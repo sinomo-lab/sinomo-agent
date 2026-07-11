@@ -6,6 +6,7 @@
 //! interface is intentionally exported from this crate root so callers do not
 //! couple to the internal module layout.
 
+mod advisory_lock;
 mod cluster_service;
 mod content_store;
 mod control_plane;
@@ -76,6 +77,7 @@ mod service_metadata_exchange;
 mod service_namespace_coordination;
 mod service_outbound;
 mod service_ownership;
+mod service_posix_coordination;
 mod service_protocol;
 mod service_read;
 mod service_read_transfer;
@@ -87,11 +89,20 @@ mod service_routed_namespace;
 mod service_routed_write;
 mod service_stage_transfer;
 mod service_state;
+mod service_sync;
 mod service_trace;
 mod service_write;
 mod smoke;
 mod transfer;
 
+pub use advisory_lock::{
+    DFS_ADVISORY_LOCK_REQUEST_OUTCOME_LIMIT, DfsAdvisoryLockApplyResult, DfsAdvisoryLockCommand,
+    DfsAdvisoryLockConflict, DfsAdvisoryLockGrant, DfsAdvisoryLockMode, DfsAdvisoryLockOutcome,
+    DfsAdvisoryLockRequestId, DfsAdvisoryLockRequestOutcomeRecord, DfsAdvisoryLockSessionId,
+    DfsAdvisoryLockStateRecord, DfsAdvisoryLockToken, DfsAdvisoryLockTransition,
+    DfsAdvisoryLockTransitionContext, DfsAdvisoryLockTransitionError, DfsAdvisoryLockWaiter,
+    transition_advisory_lock_state,
+};
 pub use cluster_service::cluster_dfs_peer_node_ids;
 pub(crate) use cluster_service::{
     object_rpc_request_from_kv_payload, open_cluster_dfs_service_with_message_sender,
@@ -110,8 +121,9 @@ pub use content_store::{
 pub use control_plane::{
     AsyncDfsControlPlaneKvClient, DfsControlPlaneAsyncStore, DfsControlPlaneKvClient,
     DfsControlPlaneKvFuture, DfsControlPlaneStore, DfsFileSystemConfig, DfsMetadataShardAssignment,
-    DfsMetadataShardConfig, SharedDfsControlPlaneKvClient, file_system_config_key,
-    metadata_shard_key, metadata_shards_prefix,
+    DfsMetadataShardConfig, DfsMetadataShardHeadWatermark, SharedDfsControlPlaneKvClient,
+    file_system_config_key, metadata_shard_authority_barrier_key,
+    metadata_shard_head_watermark_key, metadata_shard_key, metadata_shards_prefix,
 };
 #[cfg(test)]
 pub(crate) use default_cluster::run_default_cluster_dfs_smoke;
@@ -238,16 +250,16 @@ pub use metadata_records::{
     DfsConflictScanPage, DfsConflictStatus, DfsDentryPageCursor, DfsDirFragmentId,
     DfsDirFragmentRecord, DfsDirectoryPage, DfsDirectoryPageCursor, DfsInodeId, DfsInodeRecord,
     DfsMetadataJournalBatch, DfsMetadataJournalEntry, DfsMetadataMutation,
-    DfsMetadataReplayCursorStatus, DfsMetadataReplicaLagStatus, DfsMetadataShardId,
-    DfsMetadataShardMigrationReport, DfsMetadataShardStatus, DfsMetadataSubscription,
-    DfsMetadataSummary, DfsMetadataTableSnapshot, DfsNamespaceJobFrame, DfsNamespaceJobKind,
-    DfsNamespaceJobPage, DfsNamespaceJobPageCursor, DfsNamespaceJobRecord, DfsNamespaceJobStatus,
-    DfsNamespaceTransaction, DfsObjectPage, DfsObjectPageCursor, DfsObjectVersionPage,
-    DfsObjectVersionPageCursor, DfsObjectVersionRecord, DfsObjectVersionScanCursor,
-    DfsObjectVersionScanPage, DfsPathRecord, DfsReplicaReceiptPage, DfsReplicaReceiptPageCursor,
-    DfsReplicaReceiptRecord, DfsReplicaReceiptScanCursor, DfsReplicaReceiptScanPage,
-    DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport, DfsWriteIntentPage,
-    DfsWriteIntentPageCursor, DfsWriteIntentRecord, DfsWriteIntentScanCursor,
+    DfsMetadataPrefixAckFloor, DfsMetadataReplayCursorStatus, DfsMetadataReplicaLagStatus,
+    DfsMetadataShardId, DfsMetadataShardMigrationReport, DfsMetadataShardStatus,
+    DfsMetadataSubscription, DfsMetadataSummary, DfsMetadataTableSnapshot, DfsNamespaceJobFrame,
+    DfsNamespaceJobKind, DfsNamespaceJobPage, DfsNamespaceJobPageCursor, DfsNamespaceJobRecord,
+    DfsNamespaceJobStatus, DfsNamespaceTransaction, DfsObjectPage, DfsObjectPageCursor,
+    DfsObjectVersionPage, DfsObjectVersionPageCursor, DfsObjectVersionRecord,
+    DfsObjectVersionScanCursor, DfsObjectVersionScanPage, DfsPathRecord, DfsReplicaReceiptPage,
+    DfsReplicaReceiptPageCursor, DfsReplicaReceiptRecord, DfsReplicaReceiptScanCursor,
+    DfsReplicaReceiptScanPage, DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport,
+    DfsWriteIntentPage, DfsWriteIntentPageCursor, DfsWriteIntentRecord, DfsWriteIntentScanCursor,
     DfsWriteIntentScanPage, DfsWriteIntentStatus,
 };
 pub(crate) use metadata_records::{
@@ -353,10 +365,12 @@ pub use operator::{
     DfsOperatorUseConflictVersionReport, DfsPinAddRequest, DfsPinMode, DfsPinRecord,
     DfsPinStoreError, LocalDfsPinStore, resolve_dfs_conflicts, use_dfs_conflict_version,
 };
+pub use posix::sync::{DfsPosixDirectorySyncCertificate, DfsPosixFileSyncCertificate};
 pub use posix_model::{
     DfsDirEntry, DfsDirEntryPage, DfsNamespaceJobFailure, DfsNamespaceJobMaintenanceReport,
-    DfsPosixError, DfsPosixFilePrefixRead, DfsPosixFileRangeReadStream, DfsPosixFileReadStream,
-    DfsStat, DfsWriteOptions,
+    DfsPosixDirectorySyncTarget, DfsPosixError, DfsPosixFilePrefixRead,
+    DfsPosixFileRangeReadStream, DfsPosixFileReadStream, DfsPosixFileSyncEvidence,
+    DfsPosixFileSyncTarget, DfsPosixSyncKind, DfsStat, DfsWriteOptions,
 };
 pub use protocol::{
     DfsBlobTransferResult, DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest,
@@ -364,15 +378,15 @@ pub use protocol::{
     DfsDistributedWriteCommand, DfsDistributedWriteResponse, DfsDistributedWriteResult,
     DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResponseChunk, DfsFetchBlobResult,
     DfsMessageCommand, DfsMessageResponse, DfsMetadataJournalBatchCommand,
-    DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
+    DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataPrefixProbe,
     DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
     DfsMetadataSnapshotInstallResult, DfsNamespaceCommand, DfsNamespaceOperation,
     DfsNamespacePosixError, DfsNamespaceResponse, DfsNamespaceResult, DfsNamespaceShardCursor,
-    DfsNetworkMessage, DfsReadData, DfsReadRangeData, DfsReadRequest, DfsReadResponse,
-    DfsReadResponseChunk, DfsReadResult, DfsRepairReplicaChunkCommand, DfsRepairReplicaCommand,
-    DfsRepairReplicaResponse, DfsRoutedMessage, DfsStageBlobChunkCommand, DfsStageBlobCommand,
-    DfsStageBlobResponse, DfsStagePatchChunkCommand, DfsStagePatchCommand, DfsWriteCommand,
-    DfsWriteResponse, DfsWriteResult,
+    DfsNetworkMessage, DfsPosixCoordinationResult, DfsReadData, DfsReadRangeData, DfsReadRequest,
+    DfsReadResponse, DfsReadResponseChunk, DfsReadResult, DfsRepairReplicaChunkCommand,
+    DfsRepairReplicaCommand, DfsRepairReplicaResponse, DfsRoutedMessage, DfsStageBlobChunkCommand,
+    DfsStageBlobCommand, DfsStageBlobResponse, DfsStagePatchChunkCommand, DfsStagePatchCommand,
+    DfsWriteCommand, DfsWriteResponse, DfsWriteResult,
 };
 pub(crate) use repair::{
     repair_attempt_record_indicates_lost_authority,
@@ -413,6 +427,10 @@ pub(crate) use routes::{
 pub(crate) use service_content::object_content_identity;
 pub(crate) use service_outbound::read_small_blob_from_reader;
 pub(crate) use service_repair::DFS_CHUNK_TRANSFER_STALE_AFTER;
+pub use service_sync::{
+    DEFAULT_DFS_POSIX_SYNC_TIMEOUT, DfsMetadataQuorumSyncCertificate,
+    DfsMetadataQuorumSyncProgress, DfsMetadataQuorumSyncTarget, dfs_metadata_replica_quorum_size,
+};
 
 /// Identifier for a DFS filesystem such as the default `sifs`.
 pub type DfsFileSystemId = sinomo_core::Id;

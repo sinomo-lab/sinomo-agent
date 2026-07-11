@@ -918,6 +918,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 file_system_id: committed_object.file_system_id.clone(),
                 objects: vec![committed_object.clone()],
                 versions: vec![visible_version],
+                advisory_lock_states: Vec::new(),
                 created_at: OffsetDateTime::now_utc(),
             })?;
             return Ok(());

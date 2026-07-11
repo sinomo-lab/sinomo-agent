@@ -48,6 +48,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 epoch: shard.epoch,
             });
         }
+
+        let certified = self
+            .control_plane
+            .as_mut()
+            .map(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut()).certify_metadata_shard_authority(&shard)
+            })
+            .transpose()?
+            .unwrap_or(false);
+        if !certified {
+            self.refresh_control_plane_latest()?;
+            let refreshed = self
+                .select_metadata_shard_for_object(object)?
+                .unwrap_or_else(|| shard.clone());
+            return Err(DfsError::StaleOwnerEpoch {
+                file_system_id: object.file_system_id.clone(),
+                local_node_id: self.node_id.clone(),
+                primary_node_id: refreshed.primary_node_id,
+                epoch: refreshed.epoch,
+            });
+        }
         Ok(shard.epoch)
     }
 

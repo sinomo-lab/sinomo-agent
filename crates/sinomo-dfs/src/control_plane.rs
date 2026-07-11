@@ -14,11 +14,14 @@ use sinomo_core::kv::{
     InProcessKvStore, KvCompare, KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse,
 };
 use sinomo_core::node::NodeId;
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 const DFS_KV_PREFIX: &str = "/dfs";
+const METADATA_HEAD_WATERMARK_PUBLISH_RETRIES: usize = 4;
+const METADATA_PRIMARY_TRANSFER_RETRIES: usize = 4;
 
 pub fn file_system_config_key(file_system_id: &DfsFileSystemId) -> String {
     format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/config")
@@ -32,6 +35,32 @@ pub fn metadata_shard_key(file_system_id: &DfsFileSystemId, shard_id: &str) -> S
     format!(
         "{}/{}",
         metadata_shards_prefix(file_system_id),
+        normalize_segment(shard_id)
+    )
+}
+
+/// Compact Raft-backed write barrier used to prove that a metadata-shard
+/// assignment was current at a particular point in the cluster KV log.
+///
+/// This lives outside `metadata-shards/` so shard-prefix scans continue to
+/// contain only [`DfsMetadataShardConfig`] values.
+pub fn metadata_shard_authority_barrier_key(
+    file_system_id: &DfsFileSystemId,
+    shard_id: &str,
+) -> String {
+    format!(
+        "{DFS_KV_PREFIX}/filesystems/{file_system_id}/metadata-authority-barriers/{}",
+        normalize_segment(shard_id)
+    )
+}
+
+/// Quorum-committed durable head for one metadata-shard authority epoch.
+pub fn metadata_shard_head_watermark_key(
+    file_system_id: &DfsFileSystemId,
+    shard_id: &str,
+) -> String {
+    format!(
+        "{DFS_KV_PREFIX}/filesystems/{file_system_id}/metadata-head-watermarks/{}",
         normalize_segment(shard_id)
     )
 }
@@ -79,6 +108,24 @@ pub struct DfsMetadataShardConfig {
     pub default_policy: DfsObjectPolicy,
 }
 
+/// Highest metadata journal prefix known to be durable on a configured
+/// majority while the exact shard assignment and authority epoch were current.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataShardHeadWatermark {
+    pub file_system_id: DfsFileSystemId,
+    pub shard_id: String,
+    pub primary_node_id: NodeId,
+    pub epoch: u64,
+    pub journal_sequence: u64,
+    /// Exact complete materialized-state identity acknowledged at
+    /// `journal_sequence`. A sequence alone cannot distinguish table-only
+    /// recovery/job state at the same journal head.
+    #[serde(default)]
+    pub state_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acknowledged_node_ids: Vec<NodeId>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsMetadataShardAssignment {
@@ -101,6 +148,33 @@ pub trait DfsControlPlaneKvClient: std::fmt::Debug + Send {
     fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError>;
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError>;
     fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError>;
+
+    /// Compare a control-plane value through the client's linearizable write
+    /// path. The fresh barrier write is intentional: a compare-only or
+    /// same-value transaction can be answered by the cluster's semantic
+    /// no-effect fast path without committing a new Raft entry.
+    fn linearizable_compare_value(
+        &mut self,
+        key: String,
+        expected_value: Vec<u8>,
+        barrier_key: String,
+    ) -> Result<bool, KvError> {
+        let barrier_value =
+            sinomo_core::kv::encode_kv_value(&sinomo_core::Id::generate().to_string())?;
+        let response = self.txn(KvTxn {
+            compares: vec![KvCompare::ValueEquals {
+                key,
+                value: expected_value,
+            }],
+            success: vec![KvOp::Put {
+                key: barrier_key,
+                value: barrier_value,
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        })?;
+        Ok(response.succeeded)
+    }
 }
 
 pub type DfsControlPlaneKvFuture<'a, T> =
@@ -125,6 +199,35 @@ pub trait AsyncDfsControlPlaneKvClient: std::fmt::Debug + Send {
     ) -> DfsControlPlaneKvFuture<'a, KvRevision>;
 
     fn txn_async<'a>(&'a mut self, txn: KvTxn) -> DfsControlPlaneKvFuture<'a, KvTxnResponse>;
+
+    /// Async counterpart of
+    /// [`DfsControlPlaneKvClient::linearizable_compare_value`].
+    fn linearizable_compare_value_async<'a>(
+        &'a mut self,
+        key: String,
+        expected_value: Vec<u8>,
+        barrier_key: String,
+    ) -> DfsControlPlaneKvFuture<'a, bool> {
+        Box::pin(async move {
+            let barrier_value =
+                sinomo_core::kv::encode_kv_value(&sinomo_core::Id::generate().to_string())?;
+            let response = self
+                .txn_async(KvTxn {
+                    compares: vec![KvCompare::ValueEquals {
+                        key,
+                        value: expected_value,
+                    }],
+                    success: vec![KvOp::Put {
+                        key: barrier_key,
+                        value: barrier_value,
+                        lease_id: None,
+                    }],
+                    failure: Vec::new(),
+                })
+                .await?;
+            Ok(response.succeeded)
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -265,12 +368,124 @@ impl<'a> DfsControlPlaneStore<'a> {
         )
     }
 
+    /// Replace exactly `expected` (or create an absent shard when `None`) with
+    /// `desired`. The compare uses the stored bytes after logical decoding so
+    /// legacy encodings remain replaceable without allowing a stale overwrite.
+    pub fn compare_and_put_metadata_shard(
+        &mut self,
+        expected: Option<&DfsMetadataShardConfig>,
+        desired: &DfsMetadataShardConfig,
+    ) -> Result<bool, KvError> {
+        validate_metadata_shard_cas_identity(expected, desired)?;
+        let key = metadata_shard_key(&desired.file_system_id, &desired.shard_id);
+        let current_entry = self.kv.get(&key)?;
+        let compare = match (expected, current_entry.as_ref()) {
+            (None, None) => KvCompare::Missing { key: key.clone() },
+            (Some(expected), Some(entry))
+                if entry.decode::<DfsMetadataShardConfig>()? == *expected =>
+            {
+                KvCompare::ValueEquals {
+                    key: key.clone(),
+                    value: entry.value.clone(),
+                }
+            }
+            _ => return Ok(false),
+        };
+        Ok(self
+            .kv
+            .txn(KvTxn {
+                compares: vec![compare],
+                success: vec![KvOp::put_serde(key, desired, None)?],
+                failure: Vec::new(),
+            })?
+            .succeeded)
+    }
+
     pub fn get_metadata_shard(
         &self,
         file_system_id: &DfsFileSystemId,
         shard_id: &str,
     ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
         self.get_serde(&metadata_shard_key(file_system_id, shard_id))
+    }
+
+    pub fn get_metadata_shard_head_watermark(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        shard_id: &str,
+    ) -> Result<Option<DfsMetadataShardHeadWatermark>, KvError> {
+        self.get_serde(&metadata_shard_head_watermark_key(file_system_id, shard_id))
+    }
+
+    /// Publish a quorum-durable metadata head only while `expected_shard` is
+    /// still the exact committed shard assignment.
+    ///
+    /// The previous watermark participates in the compare so concurrent syncs
+    /// cannot regress the durable head. A fresh authority-barrier write keeps
+    /// repeated identical publication on the Raft quorum path instead of the
+    /// semantic no-effect fast path.
+    pub fn publish_metadata_shard_head_watermark(
+        &mut self,
+        expected_shard: &DfsMetadataShardConfig,
+        watermark: &DfsMetadataShardHeadWatermark,
+    ) -> Result<bool, KvError> {
+        let watermark = normalize_metadata_shard_head_watermark(expected_shard, watermark)?;
+        let shard_key =
+            metadata_shard_key(&expected_shard.file_system_id, &expected_shard.shard_id);
+        let watermark_key = metadata_shard_head_watermark_key(
+            &expected_shard.file_system_id,
+            &expected_shard.shard_id,
+        );
+
+        for _ in 0..METADATA_HEAD_WATERMARK_PUBLISH_RETRIES {
+            let Some(shard_entry) = self.kv.get(&shard_key)? else {
+                return Ok(false);
+            };
+            if shard_entry.decode::<DfsMetadataShardConfig>()? != *expected_shard {
+                return Ok(false);
+            }
+
+            let previous_entry = self.kv.get(&watermark_key)?;
+            let published = merged_metadata_shard_head_watermark(
+                expected_shard,
+                previous_entry.as_ref(),
+                &watermark,
+            )?;
+            let mut compares = vec![KvCompare::ValueEquals {
+                key: shard_key.clone(),
+                value: shard_entry.value,
+            }];
+            compares.push(match previous_entry.as_ref() {
+                Some(entry) => KvCompare::ValueEquals {
+                    key: watermark_key.clone(),
+                    value: entry.value.clone(),
+                },
+                None => KvCompare::Missing {
+                    key: watermark_key.clone(),
+                },
+            });
+            let barrier_value =
+                sinomo_core::kv::encode_kv_value(&sinomo_core::Id::generate().to_string())?;
+            let response = self.kv.txn(KvTxn {
+                compares,
+                success: vec![
+                    KvOp::put_serde(watermark_key.clone(), &published, None)?,
+                    KvOp::Put {
+                        key: metadata_shard_authority_barrier_key(
+                            &expected_shard.file_system_id,
+                            &expected_shard.shard_id,
+                        ),
+                        value: barrier_value,
+                        lease_id: None,
+                    },
+                ],
+                failure: Vec::new(),
+            })?;
+            if response.succeeded {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn list_metadata_shards(
@@ -311,6 +526,30 @@ impl<'a> DfsControlPlaneStore<'a> {
         )
     }
 
+    /// Prove through a Raft-backed write barrier that `expected` is still the
+    /// exact committed metadata-shard assignment.
+    ///
+    /// The preliminary read preserves compatibility with older encodings: the
+    /// barrier compares the bytes already stored in KV after verifying that
+    /// they decode to the expected logical value.
+    pub fn certify_metadata_shard_authority(
+        &mut self,
+        expected: &DfsMetadataShardConfig,
+    ) -> Result<bool, KvError> {
+        let key = metadata_shard_key(&expected.file_system_id, &expected.shard_id);
+        let Some(entry) = self.kv.get(&key)? else {
+            return Ok(false);
+        };
+        if entry.decode::<DfsMetadataShardConfig>()? != *expected {
+            return Ok(false);
+        }
+        self.kv.linearizable_compare_value(
+            key,
+            entry.value,
+            metadata_shard_authority_barrier_key(&expected.file_system_id, &expected.shard_id),
+        )
+    }
+
     pub fn transfer_metadata_shard_primary(
         &mut self,
         file_system_id: &DfsFileSystemId,
@@ -318,27 +557,54 @@ impl<'a> DfsControlPlaneStore<'a> {
         expected_epoch: u64,
         new_primary_node_id: NodeId,
     ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
-        let key = metadata_shard_key(file_system_id, shard_id);
-        let Some(entry) = self.kv.get(&key)? else {
-            return Ok(None);
-        };
-        let mut current: DfsMetadataShardConfig = entry.decode()?;
-        if current.epoch != expected_epoch {
-            return Ok(None);
+        let shard_key = metadata_shard_key(file_system_id, shard_id);
+        let watermark_key = metadata_shard_head_watermark_key(file_system_id, shard_id);
+        for _ in 0..METADATA_PRIMARY_TRANSFER_RETRIES {
+            let Some(shard_entry) = self.kv.get(&shard_key)? else {
+                return Ok(None);
+            };
+            let current: DfsMetadataShardConfig = shard_entry.decode()?;
+            if current.epoch != expected_epoch {
+                return Ok(None);
+            }
+            if current.primary_node_id == new_primary_node_id {
+                return Ok(Some(current));
+            }
+            let Some(watermark_entry) = self.kv.get(&watermark_key)? else {
+                return Ok(None);
+            };
+            let watermark = watermark_entry.decode::<DfsMetadataShardHeadWatermark>()?;
+            let Some((transferred, transferred_watermark)) =
+                prepare_metadata_shard_primary_transfer(
+                    &current,
+                    &watermark,
+                    &new_primary_node_id,
+                )?
+            else {
+                return Ok(None);
+            };
+            let response = self.kv.txn(KvTxn {
+                compares: vec![
+                    KvCompare::ValueEquals {
+                        key: shard_key.clone(),
+                        value: shard_entry.value,
+                    },
+                    KvCompare::ValueEquals {
+                        key: watermark_key.clone(),
+                        value: watermark_entry.value,
+                    },
+                ],
+                success: vec![
+                    KvOp::put_serde(shard_key.clone(), &transferred, None)?,
+                    KvOp::put_serde(watermark_key.clone(), &transferred_watermark, None)?,
+                ],
+                failure: Vec::new(),
+            })?;
+            if response.succeeded {
+                return Ok(Some(transferred));
+            }
         }
-
-        current.primary_node_id = new_primary_node_id;
-        current.epoch = current.epoch.saturating_add(1);
-        let response = self.kv.txn(KvTxn {
-            compares: vec![KvCompare::ValueEquals {
-                key: key.clone(),
-                value: entry.value,
-            }],
-            success: vec![KvOp::put_serde(key, &current, None)?],
-            failure: Vec::new(),
-        })?;
-
-        Ok(response.succeeded.then_some(current))
+        Ok(None)
     }
 
     fn put_serde<T>(&mut self, key: &str, value: &T) -> Result<(), KvError>
@@ -397,6 +663,38 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         .await
     }
 
+    /// Async exact-value compare-and-put for metadata-shard bootstrap.
+    pub async fn compare_and_put_metadata_shard(
+        &mut self,
+        expected: Option<&DfsMetadataShardConfig>,
+        desired: &DfsMetadataShardConfig,
+    ) -> Result<bool, KvError> {
+        validate_metadata_shard_cas_identity(expected, desired)?;
+        let key = metadata_shard_key(&desired.file_system_id, &desired.shard_id);
+        let current_entry = self.kv.get_async(&key).await?;
+        let compare = match (expected, current_entry.as_ref()) {
+            (None, None) => KvCompare::Missing { key: key.clone() },
+            (Some(expected), Some(entry))
+                if entry.decode::<DfsMetadataShardConfig>()? == *expected =>
+            {
+                KvCompare::ValueEquals {
+                    key: key.clone(),
+                    value: entry.value.clone(),
+                }
+            }
+            _ => return Ok(false),
+        };
+        Ok(self
+            .kv
+            .txn_async(KvTxn {
+                compares: vec![compare],
+                success: vec![KvOp::put_serde(key, desired, None)?],
+                failure: Vec::new(),
+            })
+            .await?
+            .succeeded)
+    }
+
     pub async fn get_metadata_shard(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -404,6 +702,86 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
     ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
         self.get_serde(&metadata_shard_key(file_system_id, shard_id))
             .await
+    }
+
+    pub async fn get_metadata_shard_head_watermark(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        shard_id: &str,
+    ) -> Result<Option<DfsMetadataShardHeadWatermark>, KvError> {
+        let key = metadata_shard_head_watermark_key(file_system_id, shard_id);
+        let Some(entry) = self.kv.get_async(&key).await? else {
+            return Ok(None);
+        };
+        entry.decode().map(Some)
+    }
+
+    /// Async exact-authority publication of a quorum-durable metadata head.
+    pub async fn publish_metadata_shard_head_watermark(
+        &mut self,
+        expected_shard: &DfsMetadataShardConfig,
+        watermark: &DfsMetadataShardHeadWatermark,
+    ) -> Result<bool, KvError> {
+        let watermark = normalize_metadata_shard_head_watermark(expected_shard, watermark)?;
+        let shard_key =
+            metadata_shard_key(&expected_shard.file_system_id, &expected_shard.shard_id);
+        let watermark_key = metadata_shard_head_watermark_key(
+            &expected_shard.file_system_id,
+            &expected_shard.shard_id,
+        );
+
+        for _ in 0..METADATA_HEAD_WATERMARK_PUBLISH_RETRIES {
+            let Some(shard_entry) = self.kv.get_async(&shard_key).await? else {
+                return Ok(false);
+            };
+            if shard_entry.decode::<DfsMetadataShardConfig>()? != *expected_shard {
+                return Ok(false);
+            }
+
+            let previous_entry = self.kv.get_async(&watermark_key).await?;
+            let published = merged_metadata_shard_head_watermark(
+                expected_shard,
+                previous_entry.as_ref(),
+                &watermark,
+            )?;
+            let mut compares = vec![KvCompare::ValueEquals {
+                key: shard_key.clone(),
+                value: shard_entry.value,
+            }];
+            compares.push(match previous_entry.as_ref() {
+                Some(entry) => KvCompare::ValueEquals {
+                    key: watermark_key.clone(),
+                    value: entry.value.clone(),
+                },
+                None => KvCompare::Missing {
+                    key: watermark_key.clone(),
+                },
+            });
+            let barrier_value =
+                sinomo_core::kv::encode_kv_value(&sinomo_core::Id::generate().to_string())?;
+            let response = self
+                .kv
+                .txn_async(KvTxn {
+                    compares,
+                    success: vec![
+                        KvOp::put_serde(watermark_key.clone(), &published, None)?,
+                        KvOp::Put {
+                            key: metadata_shard_authority_barrier_key(
+                                &expected_shard.file_system_id,
+                                &expected_shard.shard_id,
+                            ),
+                            value: barrier_value,
+                            lease_id: None,
+                        },
+                    ],
+                    failure: Vec::new(),
+                })
+                .await?;
+            if response.succeeded {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub async fn list_metadata_shards(
@@ -445,6 +823,28 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         )
     }
 
+    /// Async Raft-backed proof that `expected` remains the exact committed
+    /// metadata-shard assignment.
+    pub async fn certify_metadata_shard_authority(
+        &mut self,
+        expected: &DfsMetadataShardConfig,
+    ) -> Result<bool, KvError> {
+        let key = metadata_shard_key(&expected.file_system_id, &expected.shard_id);
+        let Some(entry) = self.kv.get_async(&key).await? else {
+            return Ok(false);
+        };
+        if entry.decode::<DfsMetadataShardConfig>()? != *expected {
+            return Ok(false);
+        }
+        self.kv
+            .linearizable_compare_value_async(
+                key,
+                entry.value,
+                metadata_shard_authority_barrier_key(&expected.file_system_id, &expected.shard_id),
+            )
+            .await
+    }
+
     pub async fn transfer_metadata_shard_primary(
         &mut self,
         file_system_id: &DfsFileSystemId,
@@ -452,30 +852,57 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         expected_epoch: u64,
         new_primary_node_id: NodeId,
     ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
-        let key = metadata_shard_key(file_system_id, shard_id);
-        let Some(entry) = self.kv.get_async(&key).await? else {
-            return Ok(None);
-        };
-        let mut current: DfsMetadataShardConfig = entry.decode()?;
-        if current.epoch != expected_epoch {
-            return Ok(None);
+        let shard_key = metadata_shard_key(file_system_id, shard_id);
+        let watermark_key = metadata_shard_head_watermark_key(file_system_id, shard_id);
+        for _ in 0..METADATA_PRIMARY_TRANSFER_RETRIES {
+            let Some(shard_entry) = self.kv.get_async(&shard_key).await? else {
+                return Ok(None);
+            };
+            let current: DfsMetadataShardConfig = shard_entry.decode()?;
+            if current.epoch != expected_epoch {
+                return Ok(None);
+            }
+            if current.primary_node_id == new_primary_node_id {
+                return Ok(Some(current));
+            }
+            let Some(watermark_entry) = self.kv.get_async(&watermark_key).await? else {
+                return Ok(None);
+            };
+            let watermark = watermark_entry.decode::<DfsMetadataShardHeadWatermark>()?;
+            let Some((transferred, transferred_watermark)) =
+                prepare_metadata_shard_primary_transfer(
+                    &current,
+                    &watermark,
+                    &new_primary_node_id,
+                )?
+            else {
+                return Ok(None);
+            };
+            let response = self
+                .kv
+                .txn_async(KvTxn {
+                    compares: vec![
+                        KvCompare::ValueEquals {
+                            key: shard_key.clone(),
+                            value: shard_entry.value,
+                        },
+                        KvCompare::ValueEquals {
+                            key: watermark_key.clone(),
+                            value: watermark_entry.value,
+                        },
+                    ],
+                    success: vec![
+                        KvOp::put_serde(shard_key.clone(), &transferred, None)?,
+                        KvOp::put_serde(watermark_key.clone(), &transferred_watermark, None)?,
+                    ],
+                    failure: Vec::new(),
+                })
+                .await?;
+            if response.succeeded {
+                return Ok(Some(transferred));
+            }
         }
-
-        current.primary_node_id = new_primary_node_id;
-        current.epoch = current.epoch.saturating_add(1);
-        let response = self
-            .kv
-            .txn_async(KvTxn {
-                compares: vec![KvCompare::ValueEquals {
-                    key: key.clone(),
-                    value: entry.value,
-                }],
-                success: vec![KvOp::put_serde(key, &current, None)?],
-                failure: Vec::new(),
-            })
-            .await?;
-
-        Ok(response.succeeded.then_some(current))
+        Ok(None)
     }
 
     async fn put_serde<T>(&mut self, key: &str, value: &T) -> Result<(), KvError>
@@ -496,6 +923,204 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             return Ok(None);
         };
         entry.decode().map(Some)
+    }
+}
+
+fn validate_metadata_shard_cas_identity(
+    expected: Option<&DfsMetadataShardConfig>,
+    desired: &DfsMetadataShardConfig,
+) -> Result<(), KvError> {
+    if expected.is_some_and(|expected| {
+        expected.file_system_id != desired.file_system_id || expected.shard_id != desired.shard_id
+    }) {
+        return Err(KvError::Serialization {
+            detail: "metadata-shard compare-and-put cannot change shard identity".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Rotate the existing ordered metadata membership around `new_primary` while
+/// preserving exactly the same unique configured nodes.
+///
+/// Keeping the old primary in the replica set is load-bearing: merely replacing
+/// `primary_node_id` leaves the new primary duplicated in `replica_node_ids` and
+/// silently shrinks the effective quorum after replica normalization.
+pub(crate) fn topology_preserving_metadata_shard_replicas(
+    current: &DfsMetadataShardConfig,
+    new_primary: &NodeId,
+) -> Option<Vec<NodeId>> {
+    let mut members = vec![current.primary_node_id.clone()];
+    for node_id in &current.replica_node_ids {
+        if !members.contains(node_id) {
+            members.push(node_id.clone());
+        }
+    }
+    let primary_index = members.iter().position(|node_id| node_id == new_primary)?;
+    if members.len() < 2 {
+        return None;
+    }
+    Some(
+        (1..members.len())
+            .map(|offset| members[(primary_index + offset) % members.len()].clone())
+            .collect(),
+    )
+}
+
+fn prepare_metadata_shard_primary_transfer(
+    current: &DfsMetadataShardConfig,
+    watermark: &DfsMetadataShardHeadWatermark,
+    new_primary: &NodeId,
+) -> Result<Option<(DfsMetadataShardConfig, DfsMetadataShardHeadWatermark)>, KvError> {
+    let Some(replica_node_ids) = topology_preserving_metadata_shard_replicas(current, new_primary)
+    else {
+        return Ok(None);
+    };
+    let watermark = normalize_metadata_shard_head_watermark(current, watermark)?;
+    if watermark.journal_sequence == 0
+        || !watermark
+            .acknowledged_node_ids
+            .iter()
+            .any(|node_id| node_id == new_primary)
+    {
+        return Ok(None);
+    }
+    let Some(next_epoch) = current.epoch.checked_add(1) else {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "metadata shard {} authority epoch is exhausted",
+                current.shard_id
+            ),
+        });
+    };
+    let transferred = DfsMetadataShardConfig {
+        primary_node_id: new_primary.clone(),
+        replica_node_ids,
+        epoch: next_epoch,
+        ..current.clone()
+    };
+    let transferred_watermark = normalize_metadata_shard_head_watermark(
+        &transferred,
+        &DfsMetadataShardHeadWatermark {
+            primary_node_id: new_primary.clone(),
+            epoch: next_epoch,
+            ..watermark
+        },
+    )?;
+    Ok(Some((transferred, transferred_watermark)))
+}
+
+fn normalize_metadata_shard_head_watermark(
+    expected_shard: &DfsMetadataShardConfig,
+    watermark: &DfsMetadataShardHeadWatermark,
+) -> Result<DfsMetadataShardHeadWatermark, KvError> {
+    if watermark.file_system_id != expected_shard.file_system_id
+        || watermark.shard_id != expected_shard.shard_id
+        || watermark.primary_node_id != expected_shard.primary_node_id
+        || watermark.epoch != expected_shard.epoch
+    {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "metadata-head watermark authority does not match shard {} epoch {}",
+                expected_shard.shard_id, expected_shard.epoch
+            ),
+        });
+    }
+
+    let configured_node_ids = std::iter::once(expected_shard.primary_node_id.clone())
+        .chain(expected_shard.replica_node_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let acknowledged_node_ids = watermark
+        .acknowledged_node_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if !acknowledged_node_ids.contains(&expected_shard.primary_node_id) {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "metadata-head watermark for shard {} does not acknowledge primary {}",
+                expected_shard.shard_id, expected_shard.primary_node_id
+            ),
+        });
+    }
+    if let Some(unconfigured) = acknowledged_node_ids
+        .iter()
+        .find(|node_id| !configured_node_ids.contains(*node_id))
+    {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "metadata-head watermark for shard {} acknowledges unconfigured node {}",
+                expected_shard.shard_id, unconfigured
+            ),
+        });
+    }
+    let quorum_size = configured_node_ids.len() / 2 + 1;
+    if acknowledged_node_ids.len() < quorum_size {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "metadata-head watermark for shard {} has {} acknowledgements; quorum is {}",
+                expected_shard.shard_id,
+                acknowledged_node_ids.len(),
+                quorum_size
+            ),
+        });
+    }
+    if watermark.state_fingerprint.is_empty() {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "metadata-head watermark for shard {} has no exact state fingerprint",
+                expected_shard.shard_id
+            ),
+        });
+    }
+
+    Ok(DfsMetadataShardHeadWatermark {
+        file_system_id: watermark.file_system_id.clone(),
+        shard_id: watermark.shard_id.clone(),
+        primary_node_id: watermark.primary_node_id.clone(),
+        epoch: watermark.epoch,
+        journal_sequence: watermark.journal_sequence,
+        state_fingerprint: watermark.state_fingerprint.clone(),
+        acknowledged_node_ids: acknowledged_node_ids.into_iter().collect(),
+    })
+}
+
+fn merged_metadata_shard_head_watermark(
+    expected_shard: &DfsMetadataShardConfig,
+    previous_entry: Option<&KvEntry>,
+    candidate: &DfsMetadataShardHeadWatermark,
+) -> Result<DfsMetadataShardHeadWatermark, KvError> {
+    let Some(previous_entry) = previous_entry else {
+        return Ok(candidate.clone());
+    };
+    let previous = previous_entry.decode::<DfsMetadataShardHeadWatermark>()?;
+    if previous.file_system_id != candidate.file_system_id
+        || previous.shard_id != candidate.shard_id
+        || previous.primary_node_id != candidate.primary_node_id
+        || previous.epoch != candidate.epoch
+    {
+        return Ok(candidate.clone());
+    }
+    let Ok(mut previous) = normalize_metadata_shard_head_watermark(expected_shard, &previous)
+    else {
+        return Ok(candidate.clone());
+    };
+
+    match previous.journal_sequence.cmp(&candidate.journal_sequence) {
+        std::cmp::Ordering::Greater => Ok(previous),
+        std::cmp::Ordering::Less => Ok(candidate.clone()),
+        std::cmp::Ordering::Equal => {
+            if previous.state_fingerprint != candidate.state_fingerprint {
+                // The candidate itself already carries a complete fresh
+                // quorum. Never union acknowledgements for different states
+                // that happen to share a journal sequence.
+                return Ok(candidate.clone());
+            }
+            previous
+                .acknowledged_node_ids
+                .extend(candidate.acknowledged_node_ids.iter().cloned());
+            normalize_metadata_shard_head_watermark(expected_shard, &previous)
+        }
     }
 }
 
@@ -681,6 +1306,67 @@ mod tests {
         DfsFileSystemId::from_legacy_named("sifs").expect("valid filesystem id")
     }
 
+    fn publish_transfer_watermark(
+        kv: &mut InProcessKvStore,
+        shard: &DfsMetadataShardConfig,
+        journal_sequence: u64,
+    ) {
+        let acknowledged_node_ids = std::iter::once(shard.primary_node_id.clone())
+            .chain(shard.replica_node_ids.iter().cloned())
+            .collect();
+        DfsControlPlaneStore::new(kv)
+            .publish_metadata_shard_head_watermark(
+                shard,
+                &DfsMetadataShardHeadWatermark {
+                    file_system_id: shard.file_system_id.clone(),
+                    shard_id: shard.shard_id.clone(),
+                    primary_node_id: shard.primary_node_id.clone(),
+                    epoch: shard.epoch,
+                    journal_sequence,
+                    state_fingerprint: format!("blake3:test-{journal_sequence}"),
+                    acknowledged_node_ids,
+                },
+            )
+            .expect("publish transfer watermark");
+    }
+
+    #[derive(Debug)]
+    struct WatermarkRacingKv {
+        inner: InProcessKvStore,
+        watermark_key: String,
+        replacement_watermark: Option<Vec<u8>>,
+    }
+
+    impl DfsControlPlaneKvClient for WatermarkRacingKv {
+        fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
+            Ok(self.inner.get(key).cloned())
+        }
+
+        fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+            self.inner.range_prefix(prefix)
+        }
+
+        fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
+            self.inner.put(key, value, None)
+        }
+
+        fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+            let compares_watermark = txn.compares.iter().any(|compare| match compare {
+                KvCompare::Missing { key }
+                | KvCompare::Exists { key }
+                | KvCompare::ValueEquals { key, .. }
+                | KvCompare::VersionEquals { key, .. }
+                | KvCompare::CreateRevisionEquals { key, .. }
+                | KvCompare::ModifyRevisionEquals { key, .. }
+                | KvCompare::LeaseEquals { key, .. } => key == &self.watermark_key,
+            });
+            if compares_watermark && let Some(value) = self.replacement_watermark.take() {
+                self.inner.put(self.watermark_key.clone(), value, None)?;
+            }
+            self.inner.txn(txn)
+        }
+    }
+
     #[test]
     fn key_helpers_use_control_plane_namespace() {
         let file_system_id = file_system_id();
@@ -692,6 +1378,14 @@ mod tests {
         assert_eq!(
             metadata_shard_key(&file_system_id, "root/frag"),
             format!("/dfs/filesystems/{file_system_id}/metadata-shards/root_frag")
+        );
+        assert_eq!(
+            metadata_shard_authority_barrier_key(&file_system_id, "root/frag"),
+            format!("/dfs/filesystems/{file_system_id}/metadata-authority-barriers/root_frag")
+        );
+        assert_eq!(
+            metadata_shard_head_watermark_key(&file_system_id, "root/frag"),
+            format!("/dfs/filesystems/{file_system_id}/metadata-head-watermarks/root_frag")
         );
     }
 
@@ -759,18 +1453,520 @@ mod tests {
         };
         let mut control = DfsControlPlaneStore::new(&mut kv);
         control.put_metadata_shard(&shard).expect("put shard");
+        publish_transfer_watermark(&mut kv, &shard, 5);
 
-        let transferred = control
+        let transferred = DfsControlPlaneStore::new(&mut kv)
             .transfer_metadata_shard_primary(&file_system_id, "root", 7, node_replica.clone())
             .expect("transfer")
             .expect("epoch match");
-        assert_eq!(transferred.primary_node_id, node_replica);
+        assert_eq!(transferred.primary_node_id, node_replica.clone());
+        assert_eq!(transferred.replica_node_ids, vec![node_owner.clone()]);
         assert_eq!(transferred.epoch, 8);
+        let transferred_watermark = DfsControlPlaneStore::new(&mut kv)
+            .get_metadata_shard_head_watermark(&file_system_id, "root")
+            .expect("read transferred watermark")
+            .expect("transferred watermark");
+        assert_eq!(transferred_watermark.primary_node_id, node_replica);
+        assert_eq!(transferred_watermark.epoch, 8);
+        assert_eq!(transferred_watermark.journal_sequence, 5);
         assert!(
-            control
+            DfsControlPlaneStore::new(&mut kv)
                 .transfer_metadata_shard_primary(&file_system_id, "root", 7, node_owner)
                 .expect("stale transfer")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn metadata_shard_primary_transfer_retries_an_exact_watermark_change() {
+        let owner = node("node_transfer_race_owner");
+        let replica_a = node("node_transfer_race_replica_a");
+        let replica_b = node("node_transfer_race_replica_b");
+        let file_system_id = file_system_id();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: vec![replica_a.clone(), replica_b.clone()],
+            epoch: 3,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let first_watermark = DfsMetadataShardHeadWatermark {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner.clone(),
+            epoch: shard.epoch,
+            journal_sequence: 10,
+            state_fingerprint: "blake3:first".to_string(),
+            acknowledged_node_ids: vec![owner.clone(), replica_b.clone()],
+        };
+        let replacement_watermark = DfsMetadataShardHeadWatermark {
+            journal_sequence: 11,
+            acknowledged_node_ids: vec![owner, replica_a.clone(), replica_b.clone()],
+            ..first_watermark.clone()
+        };
+        let mut inner = InProcessKvStore::new();
+        DfsControlPlaneStore::new(&mut inner)
+            .put_metadata_shard(&shard)
+            .expect("put shard");
+        assert!(
+            DfsControlPlaneStore::new(&mut inner)
+                .publish_metadata_shard_head_watermark(&shard, &first_watermark)
+                .expect("publish initial watermark")
+        );
+        let watermark_key = metadata_shard_head_watermark_key(&file_system_id, "root");
+        let mut racing = WatermarkRacingKv {
+            inner,
+            watermark_key,
+            replacement_watermark: Some(
+                sinomo_core::kv::encode_kv_value(&replacement_watermark)
+                    .expect("encode replacement watermark"),
+            ),
+        };
+
+        let transferred = DfsControlPlaneStore::new(&mut racing)
+            .transfer_metadata_shard_primary(
+                &file_system_id,
+                "root",
+                shard.epoch,
+                replica_b.clone(),
+            )
+            .expect("transfer after watermark race")
+            .expect("retry reaches certified replacement watermark");
+        assert_eq!(transferred.primary_node_id, replica_b.clone());
+        assert_eq!(
+            transferred.replica_node_ids,
+            vec![shard.primary_node_id.clone(), replica_a]
+        );
+        let stored_watermark = DfsControlPlaneStore::new(&mut racing)
+            .get_metadata_shard_head_watermark(&file_system_id, "root")
+            .expect("read transferred watermark")
+            .expect("transferred watermark");
+        assert_eq!(stored_watermark.primary_node_id, replica_b);
+        assert_eq!(stored_watermark.epoch, shard.epoch + 1);
+        assert_eq!(stored_watermark.journal_sequence, 11);
+    }
+
+    #[test]
+    fn metadata_shard_primary_transfer_rejects_uncertified_target() {
+        let owner = node("node_transfer_uncertified_owner");
+        let certified_replica = node("node_transfer_certified_replica");
+        let uncertified_replica = node("node_transfer_uncertified_replica");
+        let outsider = node("node_transfer_unconfigured_outsider");
+        let file_system_id = file_system_id();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: vec![certified_replica.clone(), uncertified_replica.clone()],
+            epoch: 9,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut kv = InProcessKvStore::new();
+        DfsControlPlaneStore::new(&mut kv)
+            .put_metadata_shard(&shard)
+            .expect("put shard");
+        assert!(
+            DfsControlPlaneStore::new(&mut kv)
+                .publish_metadata_shard_head_watermark(
+                    &shard,
+                    &DfsMetadataShardHeadWatermark {
+                        file_system_id: file_system_id.clone(),
+                        shard_id: "root".to_string(),
+                        primary_node_id: owner,
+                        epoch: shard.epoch,
+                        journal_sequence: 4,
+                        state_fingerprint: "blake3:transfer".to_string(),
+                        acknowledged_node_ids: vec![
+                            shard.primary_node_id.clone(),
+                            certified_replica,
+                        ],
+                    },
+                )
+                .expect("publish quorum watermark")
+        );
+
+        assert!(
+            DfsControlPlaneStore::new(&mut kv)
+                .transfer_metadata_shard_primary(
+                    &file_system_id,
+                    "root",
+                    shard.epoch,
+                    uncertified_replica,
+                )
+                .expect("reject uncertified target")
+                .is_none()
+        );
+        assert!(
+            DfsControlPlaneStore::new(&mut kv)
+                .transfer_metadata_shard_primary(&file_system_id, "root", shard.epoch, outsider,)
+                .expect("reject unconfigured target")
+                .is_none()
+        );
+        assert_eq!(
+            DfsControlPlaneStore::new(&mut kv)
+                .get_metadata_shard(&file_system_id, "root")
+                .expect("read unchanged shard"),
+            Some(shard)
+        );
+    }
+
+    #[test]
+    fn metadata_shard_primary_transfer_rejects_epoch_exhaustion() {
+        let owner = node("node_transfer_exhausted_owner");
+        let replica = node("node_transfer_exhausted_replica");
+        let file_system_id = file_system_id();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner,
+            replica_node_ids: vec![replica.clone()],
+            epoch: u64::MAX,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut kv = InProcessKvStore::new();
+        DfsControlPlaneStore::new(&mut kv)
+            .put_metadata_shard(&shard)
+            .expect("put shard");
+        publish_transfer_watermark(&mut kv, &shard, 1);
+
+        assert!(matches!(
+            DfsControlPlaneStore::new(&mut kv).transfer_metadata_shard_primary(
+                &file_system_id,
+                "root",
+                u64::MAX,
+                replica,
+            ),
+            Err(KvError::Serialization { detail }) if detail.contains("epoch is exhausted")
+        ));
+    }
+
+    #[tokio::test]
+    async fn async_metadata_shard_primary_transfer_rotates_certified_topology() {
+        let owner = node("node_transfer_async_owner");
+        let replica = node("node_transfer_async_replica");
+        let file_system_id = file_system_id();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: vec![replica.clone()],
+            epoch: 12,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut kv = InProcessKvStore::new();
+        DfsControlPlaneStore::new(&mut kv)
+            .put_metadata_shard(&shard)
+            .expect("put shard");
+        publish_transfer_watermark(&mut kv, &shard, 8);
+
+        let transferred = DfsControlPlaneAsyncStore::new(&mut kv)
+            .transfer_metadata_shard_primary(&file_system_id, "root", shard.epoch, replica.clone())
+            .await
+            .expect("async transfer")
+            .expect("certified async transfer");
+        assert_eq!(transferred.primary_node_id, replica.clone());
+        assert_eq!(transferred.replica_node_ids, vec![owner]);
+        assert_eq!(transferred.epoch, 13);
+        assert_eq!(
+            DfsControlPlaneAsyncStore::new(&mut kv)
+                .get_metadata_shard_head_watermark(&file_system_id, "root")
+                .await
+                .expect("read async watermark")
+                .expect("async watermark")
+                .primary_node_id,
+            replica
+        );
+    }
+
+    #[test]
+    fn metadata_shard_compare_and_put_rejects_stale_expected_value() {
+        let owner = node("node_shard_cas_owner");
+        let replacement = node("node_shard_cas_replacement");
+        let file_system_id = file_system_id();
+        let initial = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: vec![replacement.clone()],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let desired = DfsMetadataShardConfig {
+            primary_node_id: replacement.clone(),
+            epoch: 2,
+            ..initial.clone()
+        };
+        let mut kv = InProcessKvStore::new();
+        assert!(
+            DfsControlPlaneStore::new(&mut kv)
+                .compare_and_put_metadata_shard(None, &initial)
+                .expect("create missing shard")
+        );
+        publish_transfer_watermark(&mut kv, &initial, 1);
+        DfsControlPlaneStore::new(&mut kv)
+            .transfer_metadata_shard_primary(&file_system_id, "root", 1, replacement.clone())
+            .expect("transfer")
+            .expect("matching epoch");
+
+        assert!(
+            !DfsControlPlaneStore::new(&mut kv)
+                .compare_and_put_metadata_shard(Some(&initial), &desired)
+                .expect("stale compare")
+        );
+        assert_eq!(
+            DfsControlPlaneStore::new(&mut kv)
+                .get_metadata_shard(&file_system_id, "root")
+                .expect("read current shard")
+                .expect("shard")
+                .primary_node_id,
+            replacement
+        );
+    }
+
+    #[test]
+    fn metadata_shard_authority_certification_uses_fresh_write_barriers() {
+        let owner = node("node_authority_barrier_owner");
+        let file_system_id = file_system_id();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner,
+            replica_node_ids: Vec::new(),
+            epoch: 3,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let barrier_key = metadata_shard_authority_barrier_key(&file_system_id, "root");
+        let mut kv = InProcessKvStore::new();
+        DfsControlPlaneStore::new(&mut kv)
+            .put_metadata_shard(&shard)
+            .expect("put shard");
+
+        let before_first = kv.revision();
+        assert!(
+            DfsControlPlaneStore::new(&mut kv)
+                .certify_metadata_shard_authority(&shard)
+                .expect("first authority certification")
+        );
+        let first_revision = kv.revision();
+        let first_barrier = kv.get(&barrier_key).expect("first barrier").value.clone();
+        assert!(first_revision > before_first);
+
+        assert!(
+            DfsControlPlaneStore::new(&mut kv)
+                .certify_metadata_shard_authority(&shard)
+                .expect("second authority certification")
+        );
+        let second_revision = kv.revision();
+        let second_barrier = kv.get(&barrier_key).expect("second barrier").value.clone();
+        assert!(second_revision > first_revision);
+        assert_ne!(second_barrier, first_barrier);
+    }
+
+    #[test]
+    fn metadata_shard_authority_certification_rejects_stale_assignment() {
+        let owner = node("node_authority_stale_owner");
+        let replacement = node("node_authority_stale_replacement");
+        let file_system_id = file_system_id();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner,
+            replica_node_ids: vec![replacement.clone()],
+            epoch: 4,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut kv = InProcessKvStore::new();
+        let mut control = DfsControlPlaneStore::new(&mut kv);
+        control.put_metadata_shard(&shard).expect("put shard");
+        publish_transfer_watermark(&mut kv, &shard, 1);
+        DfsControlPlaneStore::new(&mut kv)
+            .transfer_metadata_shard_primary(&file_system_id, "root", 4, replacement)
+            .expect("transfer")
+            .expect("matching epoch");
+
+        let revision_before = kv.revision();
+        assert!(
+            !DfsControlPlaneStore::new(&mut kv)
+                .certify_metadata_shard_authority(&shard)
+                .expect("stale authority certification")
+        );
+        assert_eq!(kv.revision(), revision_before);
+    }
+
+    #[test]
+    fn metadata_head_watermark_publish_is_quorum_guarded_and_monotonic() {
+        let owner = node("node_head_watermark_owner");
+        let replica_a = node("node_head_watermark_replica_a");
+        let replica_b = node("node_head_watermark_replica_b");
+        let file_system_id = file_system_id();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: vec![replica_b, replica_a.clone()],
+            epoch: 6,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let watermark = DfsMetadataShardHeadWatermark {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner.clone(),
+            epoch: 6,
+            journal_sequence: 12,
+            state_fingerprint: "blake3:watermark-12".to_string(),
+            acknowledged_node_ids: vec![replica_a.clone(), owner.clone()],
+        };
+        let mut kv = InProcessKvStore::new();
+        DfsControlPlaneStore::new(&mut kv)
+            .put_metadata_shard(&shard)
+            .expect("put shard");
+
+        assert!(
+            DfsControlPlaneStore::new(&mut kv)
+                .publish_metadata_shard_head_watermark(&shard, &watermark)
+                .expect("publish watermark")
+        );
+        let first_revision = kv.revision();
+        let stored = DfsControlPlaneStore::new(&mut kv)
+            .get_metadata_shard_head_watermark(&file_system_id, "root")
+            .expect("read watermark")
+            .expect("watermark");
+        assert_eq!(stored.journal_sequence, 12);
+        let mut expected_acknowledgements = vec![owner.clone(), replica_a.clone()];
+        expected_acknowledgements.sort();
+        assert_eq!(stored.acknowledged_node_ids, expected_acknowledgements);
+
+        let lower = DfsMetadataShardHeadWatermark {
+            journal_sequence: 7,
+            ..watermark.clone()
+        };
+        assert!(
+            DfsControlPlaneStore::new(&mut kv)
+                .publish_metadata_shard_head_watermark(&shard, &lower)
+                .expect("repeat lower watermark through fresh barrier")
+        );
+        assert!(kv.revision() > first_revision);
+        assert_eq!(
+            DfsControlPlaneStore::new(&mut kv)
+                .get_metadata_shard_head_watermark(&file_system_id, "root")
+                .expect("read monotonic watermark")
+                .expect("watermark")
+                .journal_sequence,
+            12
+        );
+
+        DfsControlPlaneStore::new(&mut kv)
+            .transfer_metadata_shard_primary(&file_system_id, "root", 6, replica_a)
+            .expect("transfer")
+            .expect("matching epoch");
+        assert!(
+            !DfsControlPlaneStore::new(&mut kv)
+                .publish_metadata_shard_head_watermark(&shard, &watermark)
+                .expect("stale authority rejected")
+        );
+    }
+
+    #[test]
+    fn metadata_head_watermark_rejects_non_quorum_acknowledgements() {
+        let owner = node("node_head_watermark_quorum_owner");
+        let replica_a = node("node_head_watermark_quorum_replica_a");
+        let replica_b = node("node_head_watermark_quorum_replica_b");
+        let file_system_id = file_system_id();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: vec![replica_a, replica_b],
+            epoch: 2,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let watermark = DfsMetadataShardHeadWatermark {
+            file_system_id,
+            shard_id: "root".to_string(),
+            primary_node_id: owner.clone(),
+            epoch: 2,
+            journal_sequence: 3,
+            state_fingerprint: "blake3:non-quorum".to_string(),
+            acknowledged_node_ids: vec![owner],
+        };
+        let mut kv = InProcessKvStore::new();
+        DfsControlPlaneStore::new(&mut kv)
+            .put_metadata_shard(&shard)
+            .expect("put shard");
+
+        assert!(matches!(
+            DfsControlPlaneStore::new(&mut kv)
+                .publish_metadata_shard_head_watermark(&shard, &watermark),
+            Err(KvError::Serialization { detail }) if detail.contains("quorum is 2")
+        ));
+        assert!(
+            DfsControlPlaneStore::new(&mut kv)
+                .get_metadata_shard_head_watermark(&shard.file_system_id, "root")
+                .expect("read missing watermark")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn async_metadata_head_watermark_publish_uses_exact_authority() {
+        let owner = node("node_head_watermark_async_owner");
+        let replica = node("node_head_watermark_async_replica");
+        let file_system_id = file_system_id();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: vec![replica.clone()],
+            epoch: 9,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let watermark = DfsMetadataShardHeadWatermark {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner,
+            epoch: 9,
+            journal_sequence: 21,
+            state_fingerprint: "blake3:async-21".to_string(),
+            acknowledged_node_ids: vec![replica, shard.primary_node_id.clone()],
+        };
+        let mut kv = InProcessKvStore::new();
+        assert!(
+            DfsControlPlaneAsyncStore::new(&mut kv)
+                .compare_and_put_metadata_shard(None, &shard)
+                .await
+                .expect("create shard with async CAS")
+        );
+        assert!(
+            DfsControlPlaneAsyncStore::new(&mut kv)
+                .publish_metadata_shard_head_watermark(&shard, &watermark)
+                .await
+                .expect("publish watermark")
+        );
+        let mut expected_acknowledgements = vec![
+            shard.primary_node_id.clone(),
+            shard.replica_node_ids[0].clone(),
+        ];
+        expected_acknowledgements.sort();
+        assert_eq!(
+            DfsControlPlaneAsyncStore::new(&mut kv)
+                .get_metadata_shard_head_watermark(&file_system_id, "root")
+                .await
+                .expect("read watermark"),
+            Some(DfsMetadataShardHeadWatermark {
+                acknowledged_node_ids: expected_acknowledgements,
+                ..watermark
+            })
         );
     }
 
