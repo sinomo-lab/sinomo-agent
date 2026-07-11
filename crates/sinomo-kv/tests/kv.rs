@@ -5262,6 +5262,81 @@ mod tests {
     }
 
     #[test]
+    fn unanchored_materialized_snapshot_does_not_inflate_replayed_raft_revision() {
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-unanchored-cache-replay");
+        let leader_id = NodeId::from_legacy_named("node_unanchored_cache_leader").expect("leader");
+        let leader_paths = KvWalPaths::new(root.join("leader-raft"));
+        let (leader_snapshot, entries, leader_commit) = {
+            let mut leader =
+                DurableRaftKvNode::open(leader_id.clone(), leader_paths).expect("open leader");
+            for (key, value) in [
+                ("/replay/a", b"a".as_slice()),
+                ("/replay/b", b"b".as_slice()),
+            ] {
+                let entry = leader
+                    .append_local_command(
+                        1,
+                        KvCommand::Op(KvOp::Put {
+                            key: key.to_string(),
+                            value: value.to_vec(),
+                            lease_id: None,
+                        }),
+                    )
+                    .expect("append leader command");
+                leader
+                    .commit_to(entry.index)
+                    .expect("commit leader command");
+            }
+            (
+                leader.store().try_snapshot().expect("leader snapshot"),
+                leader.log().to_vec(),
+                leader.applied_index(),
+            )
+        };
+        assert_eq!(leader_snapshot.revision.0, leader_commit);
+
+        let follower_id =
+            NodeId::from_legacy_named("node_unanchored_cache_follower").expect("follower");
+        let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("follower-raft"));
+        assert!(
+            cache
+                .cache_snapshot_if_newer_than_raft(follower_id.clone(), leader_snapshot.clone(),)
+                .expect("cache newer snapshot")
+        );
+        let follower_paths = cache.raft_wal_paths(&follower_id);
+        assert!(
+            !follower_paths.snapshot.exists(),
+            "a KvSnapshot without index/term must not create a Raft snapshot"
+        );
+
+        let mut follower = cache
+            .open_raft_node(follower_id)
+            .expect("open empty follower");
+        assert_eq!(follower.applied_index(), 0);
+        assert_eq!(follower.last_log_index(), 0);
+        assert_eq!(follower.store().revision(), KvRevision::ZERO);
+        assert!(follower.store().get("/replay/a").is_none());
+
+        let response = follower
+            .append_entries(RaftAppendEntriesRequest {
+                term: 1,
+                leader_id,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries,
+                leader_commit,
+            })
+            .expect("replay authoritative log");
+        assert!(response.success);
+        assert_eq!(follower.applied_index(), leader_commit);
+        assert_eq!(
+            follower.store().try_snapshot().expect("follower snapshot"),
+            leader_snapshot,
+            "replaying indices 1..N must reconstruct the imported state once, not apply it on top of itself"
+        );
+    }
+
+    #[test]
     fn local_cache_current_snapshot_does_not_initialize_empty_raft_root() {
         let root = sinomo_testdir::TestDir::new("sinomo-kv-empty-raft-read-only");
         let node_id = NodeId::from_legacy_named("node_empty_raft_read_only").expect("node");
@@ -5350,26 +5425,34 @@ mod tests {
     }
 
     #[test]
-    fn materialized_cache_open_validates_fallback_before_quarantining_raft() {
-        let root = sinomo_testdir::TestDir::new("sinomo-kv-invalid-fallback-before-quarantine");
-        let node_id =
-            NodeId::from_legacy_named("node_invalid_fallback_before_quarantine").expect("node");
+    fn materialized_cache_open_preserves_corrupt_raft_without_reinitializing() {
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-corrupt-raft-fails-closed");
+        let node_id = NodeId::from_legacy_named("node_corrupt_raft_fails_closed").expect("node");
         let wal_paths = KvWalPaths::new(root.join("raft"));
-        std::fs::create_dir_all(&wal_paths.snapshot).expect("invalid raft snapshot");
+        std::fs::create_dir_all(&wal_paths.root).expect("raft root");
+        let corrupt_bytes = b"corrupt raft snapshot";
+        std::fs::write(&wal_paths.snapshot, corrupt_bytes).expect("write corrupt raft snapshot");
         let cache = KvMaterializedCache::new(root.join("cache.sobj"));
-        std::fs::create_dir_all(cache.path()).expect("invalid materialized cache path");
+        let mut cached_store = InProcessKvStore::new();
+        cached_store
+            .put("/cached", b"read-only".to_vec(), None)
+            .expect("seed materialized cache");
+        cache
+            .write_snapshot(&cached_store.try_snapshot().expect("cached snapshot"))
+            .expect("write materialized cache");
 
         let error =
             DurableRaftKvNode::open_with_materialized_cache(node_id, wal_paths.clone(), &cache)
-                .expect_err("invalid fallback cache should prevent raft quarantine");
+                .expect_err("corrupt raft must fail closed");
 
         assert!(
-            error.to_string().contains("cache.sobj"),
-            "fallback cache should be validated before quarantine, got {error}"
+            error.to_string().contains("snapshot.sobj"),
+            "error should identify the corrupt Raft snapshot, got {error}"
         );
-        assert!(
-            wal_paths.root.exists(),
-            "unreadable raft state should remain in place when fallback cache is invalid"
+        assert_eq!(
+            std::fs::read(&wal_paths.snapshot).expect("read preserved corrupt snapshot"),
+            corrupt_bytes,
+            "opening with a materialized cache must not quarantine or replace corrupt Raft state"
         );
         let quarantine_prefix = format!(
             "{}.corrupt-{}-",
@@ -5391,7 +5474,16 @@ mod tests {
             });
         assert!(
             !quarantined,
-            "invalid fallback cache must not create a raft quarantine directory"
+            "corrupt Raft state must stay in place for explicit recovery"
+        );
+        assert_eq!(
+            cache
+                .read_store()
+                .expect("materialized cache remains readable")
+                .get("/cached")
+                .expect("cached value")
+                .value,
+            b"read-only"
         );
     }
 

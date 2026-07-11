@@ -269,6 +269,85 @@ impl LocalShardedMetadataBackend {
         Ok(tombstone_shard)
     }
 
+    /// Resolve the newest physical record for one object without trusting the
+    /// derived shard index. Journal batches for different shards can arrive in
+    /// either order, and a cross-shard move deliberately leaves a same-version
+    /// eviction tombstone behind. The moved live record wins that exact tie;
+    /// otherwise later generations win deterministically.
+    fn authoritative_object_placement(
+        &self,
+        object_id: &DfsObjectId,
+    ) -> Result<Option<(DfsMetadataShardId, DfsObjectMetadata)>> {
+        let index = self.read_object_shard_index(object_id)?;
+        let mut candidates = Vec::new();
+        for (shard_id, backend) in &self.shards {
+            let Some(object) = backend.get_object(object_id)? else {
+                continue;
+            };
+            let routed_here = self
+                .select_shard_id_for_path(&object.file_system_id, &object.path)
+                .is_ok_and(|selected| selected == *shard_id);
+            candidates.push((shard_id.clone(), object, routed_here));
+        }
+        let require_routed_candidate = candidates.iter().any(|(_, _, routed_here)| *routed_here);
+        let mut selected: Option<(DfsMetadataShardId, DfsObjectMetadata)> = None;
+        for (shard_id, object, routed_here) in candidates {
+            if require_routed_candidate && !routed_here {
+                continue;
+            }
+            let replace = selected
+                .as_ref()
+                .is_none_or(|(selected_shard, selected_object)| {
+                    let generation = (object.changed_at_unix_nanos, &object.version);
+                    let selected_generation = (
+                        selected_object.changed_at_unix_nanos,
+                        &selected_object.version,
+                    );
+                    generation > selected_generation
+                        || (generation == selected_generation
+                            && object.kind != DfsObjectKind::Tombstone
+                            && selected_object.kind == DfsObjectKind::Tombstone)
+                        || (generation == selected_generation
+                            && (object.kind == DfsObjectKind::Tombstone)
+                                == (selected_object.kind == DfsObjectKind::Tombstone)
+                            && index.as_ref().is_some_and(|index| {
+                                index.shard_id == shard_id && index.shard_id != *selected_shard
+                            }))
+                });
+            if replace {
+                selected = Some((shard_id, object));
+            }
+        }
+        Ok(selected)
+    }
+
+    fn reconcile_object_shard_index(&self, object_id: &DfsObjectId) -> Result<()> {
+        let Some((shard_id, object)) = self.authoritative_object_placement(object_id)? else {
+            return self.remove_object_shard_index(object_id);
+        };
+        if self
+            .read_object_shard_index(object_id)?
+            .is_some_and(|index| {
+                index.file_system_id == object.file_system_id
+                    && index.path == normalize_path(&object.path)
+                    && index.shard_id == shard_id
+            })
+        {
+            return Ok(());
+        }
+        self.write_object_shard_index(&object, &shard_id)
+    }
+
+    fn reconcile_object_shard_indexes<'a>(
+        &self,
+        object_ids: impl IntoIterator<Item = &'a DfsObjectId>,
+    ) -> Result<()> {
+        for object_id in object_ids {
+            self.reconcile_object_shard_index(object_id)?;
+        }
+        Ok(())
+    }
+
     fn indexed_shard_id_for_object(
         &self,
         object_id: &DfsObjectId,
@@ -691,6 +770,38 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
 
     fn put_object(&mut self, object: &DfsObjectMetadata) -> Result<DfsMetadataJournalEntry> {
         self.put_object_routed(object)
+    }
+
+    fn add_object_location_if_current(
+        &mut self,
+        object_id: &DfsObjectId,
+        expected_version: &DfsVersion,
+        expected_content_hash: &str,
+        replica_node_id: &NodeId,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        let Some((shard_id, authoritative_object)) =
+            self.authoritative_object_placement(object_id)?
+        else {
+            return Ok(None);
+        };
+        if authoritative_object.kind == DfsObjectKind::Tombstone
+            || authoritative_object.version != *expected_version
+            || authoritative_object.content_hash.as_deref() != Some(expected_content_hash)
+        {
+            return Ok(None);
+        }
+        let updated = self
+            .shard_backend_mut(&shard_id)?
+            .add_object_location_if_current(
+                object_id,
+                expected_version,
+                expected_content_hash,
+                replica_node_id,
+            )?;
+        if let Some(object) = updated.as_ref() {
+            self.write_object_shard_index(object, &shard_id)?;
+        }
+        Ok(updated)
     }
 
     fn get_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsObjectMetadata>> {
@@ -1637,12 +1748,13 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     fn evict_object_record_for_foreign_shard_move(
         &mut self,
         moved_object: &DfsObjectMetadata,
+        source_path: &str,
     ) -> Result<()> {
         let target_shard_id =
             self.select_shard_id_for_path(&moved_object.file_system_id, &moved_object.path)?;
-        if let Some(source_shard_id) = self.shard_id_for_object(&moved_object.object_id)?
-            && source_shard_id != target_shard_id
-        {
+        let source_shard_id =
+            self.select_shard_id_for_path(&moved_object.file_system_id, source_path)?;
+        if source_shard_id != target_shard_id {
             self.put_cross_shard_tombstone(moved_object, &source_shard_id, &target_shard_id)?;
         }
         self.write_object_shard_index(moved_object, &target_shard_id)?;
@@ -1994,8 +2106,16 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 
     fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
-        self.shard_backend_mut(&batch.shard_id)?
-            .apply_journal_batch(batch)
+        let affected_object_ids = batch
+            .entries
+            .iter()
+            .flat_map(|entry| entry.mutation.affected_object_ids())
+            .collect::<BTreeSet<_>>();
+        let applied = self
+            .shard_backend_mut(&batch.shard_id)?
+            .apply_journal_batch(batch)?;
+        self.reconcile_object_shard_indexes(affected_object_ids.iter())?;
+        Ok(applied)
     }
 
     fn replace_with_replicated_snapshot(
@@ -2004,8 +2124,27 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         replayed_through_sequence: u64,
         snapshot: DfsMetadataTableSnapshot,
     ) -> Result<bool> {
-        self.shard_backend_mut(&source_shard_id)?
-            .replace_with_replicated_snapshot(source_shard_id, replayed_through_sequence, snapshot)
+        let mut affected_object_ids = self
+            .shard_backend(&source_shard_id)?
+            .export_table_snapshot()
+            .tables
+            .into_iter()
+            .flat_map(|tables| tables.objects)
+            .map(|object| object.object_id)
+            .collect::<BTreeSet<_>>();
+        if let Some(tables) = snapshot.tables.as_ref() {
+            affected_object_ids
+                .extend(tables.objects.iter().map(|object| object.object_id.clone()));
+        }
+        let archived = self
+            .shard_backend_mut(&source_shard_id)?
+            .replace_with_replicated_snapshot(
+                source_shard_id,
+                replayed_through_sequence,
+                snapshot,
+            )?;
+        self.reconcile_object_shard_indexes(affected_object_ids.iter())?;
+        Ok(archived)
     }
 
     fn subscribe(&self, after_sequence: u64) -> DfsMetadataSubscription {

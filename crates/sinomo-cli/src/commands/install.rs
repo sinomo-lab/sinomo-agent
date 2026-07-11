@@ -262,8 +262,29 @@ pub(crate) fn uninstall_with_layout(
     Ok(())
 }
 
+#[cfg(not(test))]
 pub(crate) fn install_current_binary(destination: &Path) -> Result<(), CliError> {
     Ok(install_current_executable(destination)?)
+}
+
+#[cfg(test)]
+pub(crate) fn install_current_binary(destination: &Path) -> Result<(), CliError> {
+    // The CLI test executable is over a gigabyte with debug symbols. Copying it
+    // twice per install-layout test exhausts small/tmpfs CI quotas and does not
+    // exercise the atomic installer (that behavior is covered in
+    // `sinomo-rollout`). These tests need only a stable installed artifact.
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| CliError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    std::fs::write(destination, b"sinomo cli install test executable").map_err(|source| {
+        CliError::Io {
+            path: destination.display().to_string(),
+            detail: source.to_string(),
+        }
+    })
 }
 
 #[cfg(test)]

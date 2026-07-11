@@ -1369,6 +1369,7 @@ pub(crate) fn try_cluster_member_publish_targets_impl(
         let Some(endpoint) =
             graph.best_healthy_endpoint_matching(&state.local_node_id, &node_id, |endpoint| {
                 !cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
+                    && !cluster_endpoint_uses_tcp_tunnel_address(endpoint)
             })
         else {
             continue;
@@ -1380,7 +1381,9 @@ pub(crate) fn try_cluster_member_publish_targets_impl(
         .into_iter()
         .chain(try_cluster_voter_command_targets_impl(paths, state)?)
     {
-        if endpoint.node_id == state.local_node_id {
+        if endpoint.node_id == state.local_node_id
+            || cluster_endpoint_uses_tcp_tunnel_address(&endpoint)
+        {
             continue;
         }
         push_unique_cluster_endpoint(&mut targets, &mut seen, &endpoint)?;
@@ -2217,7 +2220,7 @@ mod tests {
         let mut state = ClusterBootstrapState::initialized_locally(
             cluster_id.clone(),
             "member publish synthetic tunnel skip",
-            local,
+            local.clone(),
             "local",
             "pk-local",
             now,
@@ -2231,8 +2234,25 @@ mod tests {
         let mut member =
             ClusterMemberRecord::local_voter(cluster_id, remote, "remote", "pk-remote", now);
         member.capabilities = sinomo_node::main_daemon_capabilities(&member.role);
-        member.endpoints = vec![tunnel_endpoint];
+        member.endpoints = vec![tunnel_endpoint.clone()];
         state.members.push(member);
+        let connectivity = crate::connectivity::cluster_connectivity_record(
+            &state,
+            &tunnel_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            60,
+        );
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &local,
+            &[connectivity],
+        )
+        .expect("write local connectivity");
 
         let targets = try_cluster_member_publish_targets_impl(&paths, &state)
             .expect("member publish targets");

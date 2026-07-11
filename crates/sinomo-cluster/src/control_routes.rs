@@ -109,6 +109,11 @@ pub struct ClusterControlInitResponse {
 pub struct ClusterControlJoinRequest {
     /// `sinomo-join://...` invite URI or full `sinomo cluster join ...` command.
     pub invite: String,
+    /// Optional display name to persist as part of the accepted join. Applying
+    /// the name inside the join transaction avoids racing the daemon restart
+    /// required to activate the new cluster identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_display_name: Option<String>,
 }
 
 /// Result of a cluster join.
@@ -157,6 +162,15 @@ pub struct ClusterControlInviteRequest {
 pub struct ClusterControlInviteResponse {
     /// Encoded `sinomo-join://` invite URI.
     pub invite: String,
+    /// Authoritative identity is returned out-of-band because compact invite
+    /// URIs intentionally omit it until the introducer proves the invitation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_id: Option<ClusterId>,
+    /// Authoritative expiry for operator display; compact URIs use an epoch
+    /// placeholder until the stored invitation is resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub expires_at: Option<OffsetDateTime>,
 }
 
 /// Rename a cluster member. Without `node_id` the daemon renames its local
@@ -455,6 +469,37 @@ mod tests {
         assert_eq!(
             decode_cluster_control_role_rpc_response_body(&payload.body).expect("decode role"),
             role
+        );
+
+        let invite = ClusterControlInviteResponse {
+            invite: "sinomo-join://example".to_string(),
+            cluster_id: Some(ClusterId::generate()),
+            expires_at: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1)),
+        };
+        let payload =
+            cluster_control_invite_response_rpc_payload(&invite).expect("encode invite response");
+        assert_eq!(
+            decode_cluster_control_invite_rpc_response_body(&payload.body)
+                .expect("decode invite response"),
+            invite
+        );
+
+        #[derive(serde::Serialize)]
+        struct LegacyInviteResponse<'a> {
+            invite: &'a str,
+        }
+        let legacy_body = encode_cluster_control_rpc_body(&LegacyInviteResponse {
+            invite: "sinomo-join://legacy",
+        })
+        .expect("encode legacy invite response");
+        assert_eq!(
+            decode_cluster_control_invite_rpc_response_body(&legacy_body)
+                .expect("decode legacy invite response"),
+            ClusterControlInviteResponse {
+                invite: "sinomo-join://legacy".to_string(),
+                cluster_id: None,
+                expires_at: None,
+            }
         );
 
         let leave = ClusterControlLeaveResponse {

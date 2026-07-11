@@ -18,6 +18,7 @@ use sinomo_network::ClusterNetworkInfoRecord;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
 use sinomo_network::cluster_network_record_should_refresh;
+use sinomo_network::read_local_cluster_connectivity_records_for_source;
 use sinomo_network::write_local_cluster_connectivity_record_set;
 use sinomo_network::{CLUSTER_NETWORK_PUBLISH_INTERVAL, cluster_network_publish_interval_for_role};
 use sinomo_network::{
@@ -128,12 +129,19 @@ pub fn sync_cluster_connectivity_records_to_kv(
     records: Vec<ClusterConnectivityRecord>,
 ) -> Result<KvSnapshot, NetworkError> {
     write_local_cluster_connectivity_record_set(paths, source_node_id, &records)?;
+    // A newer observation may already have won a concurrent local merge. Use
+    // that authoritative merged set instead of publishing the caller's stale
+    // snapshot and making cluster KV oscillate backward.
     let now = OffsetDateTime::now_utc();
     let mut snapshot =
         read_cluster_kv_current_or_empty_snapshot_arc_for_source(paths, source_node_id)?;
     let mut local_node_id = None;
     let mut appended = false;
     loop {
+        // A probe can complete while an earlier publication batch is being
+        // appended. Re-read on every pass so the operation cannot finish with
+        // cluster KV reflecting the older set.
+        let records = read_local_cluster_connectivity_records_for_source(paths, source_node_id)?;
         let success = cluster_connectivity_full_sync_batch_ops_from_snapshot(
             snapshot.as_ref(),
             source_node_id,
@@ -186,35 +194,45 @@ where
     H: ClusterConnectivityPublishHost,
 {
     write_local_cluster_connectivity_record_set(paths, source_node_id, &records)?;
+    // Full-set writers reject observations older than the locally retained
+    // record, but callers can race while holding snapshots captured before
+    // that rejection. Always plan the quorum diff from the post-merge set.
     let mut state = None;
     let mut latest = None;
     let mut previous_ops: Option<Vec<KvOp>> = None;
     loop {
-        let success = match latest.as_ref() {
-            Some(snapshot) => cluster_connectivity_full_sync_batch_ops_from_snapshot(
-                snapshot,
+        // Re-read after every quorum round. If a newer local observation landed
+        // while the previous transaction was in flight, immediately plan a
+        // corrective transaction instead of returning on the stale response.
+        let records = read_local_cluster_connectivity_records_for_source(paths, source_node_id)?;
+        let local_snapshot = match latest.as_ref() {
+            Some(_) => None,
+            None => Some(read_cluster_kv_current_or_empty_snapshot_arc_for_source(
+                paths,
                 source_node_id,
-                &records,
-                OffsetDateTime::now_utc(),
-                sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
-            )?,
-            None => {
-                let snapshot = read_cluster_kv_current_or_empty_snapshot_arc_for_source(
-                    paths,
-                    source_node_id,
-                )?;
-                cluster_connectivity_full_sync_batch_ops_from_snapshot(
-                    snapshot.as_ref(),
-                    source_node_id,
-                    &records,
-                    OffsetDateTime::now_utc(),
-                    sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
-                )?
-            }
+            )?),
         };
+        let snapshot = latest
+            .as_ref()
+            .or_else(|| local_snapshot.as_deref())
+            .expect("connectivity sync always has a snapshot");
+        let success = cluster_connectivity_full_sync_batch_ops_from_snapshot(
+            snapshot,
+            source_node_id,
+            &records,
+            OffsetDateTime::now_utc(),
+            sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+        )?;
         if success.is_empty() {
-            if latest.is_some() {
-                host.remember_published_connectivity_record_set(paths, source_node_id, &records);
+            // A zero-op diff is just as authoritative as a successful commit:
+            // the complete source set was compared with cluster KV and already
+            // matches. Warm the process cache from the stored records, rather
+            // than the incoming probe records: stable-equal observations can
+            // carry a newer TTL that was deliberately not committed yet.
+            if let Some(published) =
+                cluster_connectivity_records_for_source_from_snapshot(snapshot, source_node_id)
+            {
+                host.remember_published_connectivity_record_set(paths, source_node_id, &published);
             }
             return Ok(latest);
         }
@@ -298,18 +316,19 @@ where
     let write_paths = paths.clone();
     let write_source_node_id = source_node_id.clone();
     let write_records = records.clone();
-    runtime
+    let mut records = runtime
         .spawn_blocking(move || {
             write_local_cluster_connectivity_record_set(
                 &write_paths,
                 &write_source_node_id,
                 &write_records,
-            )
+            )?;
+            read_local_cluster_connectivity_records_for_source(&write_paths, &write_source_node_id)
         })
         .await
         .map_err(|source| {
             H::Error::from(NetworkError::Io {
-                operation: "write local cluster connectivity record set".to_string(),
+                operation: "merge local cluster connectivity record set".to_string(),
                 detail: source.to_string(),
             })
         })?
@@ -326,20 +345,43 @@ where
     let mut latest: Option<KvSnapshot> = None;
     let mut previous_ops: Option<Vec<KvOp>> = None;
     loop {
-        let success = match latest.as_ref() {
+        let read_paths = paths.clone();
+        let read_source_node_id = source_node_id.clone();
+        records = runtime
+            .spawn_blocking(move || {
+                read_local_cluster_connectivity_records_for_source(
+                    &read_paths,
+                    &read_source_node_id,
+                )
+            })
+            .await
+            .map_err(|source| {
+                H::Error::from(NetworkError::Io {
+                    operation: "refresh local cluster connectivity record set".to_string(),
+                    detail: source.to_string(),
+                })
+            })?
+            .map_err(H::Error::from)?;
+        let (success, published_on_noop) = match latest.as_ref() {
             // After a forwarded commit the local store may not reflect the txn
             // yet (a learner depends on the voter's fan-out or a snapshot
             // import to observe it), so diff against the authoritative
             // post-commit snapshot: the loop must terminate on what the quorum
             // contains, not on local replay catching up.
-            Some(snapshot) => cluster_connectivity_full_sync_batch_ops_from_snapshot(
-                snapshot,
-                source_node_id,
-                &records,
-                OffsetDateTime::now_utc(),
-                sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
-            )
-            .map_err(H::Error::from)?,
+            Some(snapshot) => {
+                let success = cluster_connectivity_full_sync_batch_ops_from_snapshot(
+                    snapshot,
+                    source_node_id,
+                    &records,
+                    OffsetDateTime::now_utc(),
+                    sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+                )
+                .map_err(H::Error::from)?;
+                let published = success.is_empty().then(|| {
+                    cluster_connectivity_records_for_source_from_snapshot(snapshot, source_node_id)
+                });
+                (success, published.flatten())
+            }
             None => {
                 let batch_paths = paths.clone();
                 let batch_source_node_id = source_node_id.clone();
@@ -350,13 +392,20 @@ where
                             &batch_paths,
                             &batch_source_node_id,
                         )?;
-                        cluster_connectivity_full_sync_batch_ops_from_snapshot(
+                        let success = cluster_connectivity_full_sync_batch_ops_from_snapshot(
                             snapshot.as_ref(),
                             &batch_source_node_id,
                             &batch_records,
                             OffsetDateTime::now_utc(),
                             sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
-                        )
+                        )?;
+                        let published = success.is_empty().then(|| {
+                            cluster_connectivity_records_for_source_from_snapshot(
+                                snapshot.as_ref(),
+                                &batch_source_node_id,
+                            )
+                        });
+                        Ok::<_, NetworkError>((success, published.flatten()))
                     })
                     .await
                     .map_err(|source| {
@@ -369,11 +418,16 @@ where
             }
         };
         if success.is_empty() {
-            if latest.is_some() {
+            // The initial local/KV comparison can be a no-op after daemon
+            // restart. Remember that verified complete set too; otherwise the
+            // cache remains cold until some unrelated connectivity mutation.
+            // Cache the authoritative stored values so an uncommitted incoming
+            // TTL refresh cannot extend the cache's notion of KV freshness.
+            if let Some(published) = published_on_noop {
                 host.remember_published_connectivity_record_set_async(
                     paths,
                     source_node_id,
-                    &records,
+                    &published,
                 )
                 .await?;
             }
@@ -492,6 +546,21 @@ pub(crate) fn cluster_connectivity_full_sync_batch_ops_from_snapshot(
         }
     }
     Ok(ops)
+}
+
+fn cluster_connectivity_records_for_source_from_snapshot(
+    snapshot: &KvSnapshot,
+    source_node_id: &NodeId,
+) -> Option<Vec<ClusterConnectivityRecord>> {
+    snapshot
+        .prefix_entries(&cluster_connectivity_source_prefix(source_node_id))
+        .map(|entry| {
+            entry
+                .decode::<ClusterConnectivityRecord>()
+                .ok()
+                .filter(|record| record.source_node_id == *source_node_id)
+        })
+        .collect()
 }
 
 /// Returns true when publishing `records` for `source_node_id` would not change

@@ -56,6 +56,20 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// Create or replace an object metadata record and journal the mutation.
     fn put_object(&mut self, object: &DfsObjectMetadata) -> Result<DfsMetadataJournalEntry>;
 
+    /// Add a replica location only while the durable object still names the
+    /// expected visible version and content. Implementations must fence the
+    /// check and update as one metadata write so a concurrent rename or unlink
+    /// cannot be followed by a stale location update that resurrects the old
+    /// path. Returns the updated object, or `None` when the durable object has
+    /// moved, advanced, disappeared, or become a tombstone.
+    fn add_object_location_if_current(
+        &mut self,
+        object_id: &DfsObjectId,
+        expected_version: &DfsVersion,
+        expected_content_hash: &str,
+        replica_node_id: &NodeId,
+    ) -> Result<Option<DfsObjectMetadata>>;
+
     /// Store several object records using the backend's default single-record
     /// path unless the implementation overrides it with an atomic batch.
     fn put_objects(
@@ -861,8 +875,9 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     fn evict_object_record_for_foreign_shard_move(
         &mut self,
         moved_object: &DfsObjectMetadata,
+        source_path: &str,
     ) -> Result<()> {
-        let _ = moved_object;
+        let _ = (moved_object, source_path);
         Ok(())
     }
 

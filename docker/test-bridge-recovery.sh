@@ -4,11 +4,14 @@
 # iroh disabled.
 #
 #   docker/test-bridge-recovery.sh [recovery_wait_seconds]   (default 90)
+#
+#   SINOMO_BRIDGE_PROJECT overrides the compose project (default sinomo-dfs-test).
 
 # These helpers target the dev cluster compose file regardless of the caller's
 # working directory (the root docker-compose.yml is the production node).
 SINOMO_DOCKER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export COMPOSE_FILE="${COMPOSE_FILE:-$SINOMO_DOCKER_DIR/docker-compose.dev.yml}"
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-${SINOMO_BRIDGE_PROJECT:-sinomo-dfs-test}}"
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -18,8 +21,25 @@ BASELINE_WAIT="${SINOMO_BRIDGE_BASELINE_WAIT:-120}"
 OUTAGE_WAIT="${SINOMO_BRIDGE_OUTAGE_WAIT:-45}"
 POLL_INTERVAL="${SINOMO_BRIDGE_POLL_INTERVAL:-3}"
 EXPECTED_MAINS="${SINOMO_BRIDGE_EXPECTED_MAINS:-6}"
+COMMAND_TIMEOUT="${SINOMO_BRIDGE_COMMAND_TIMEOUT:-10}"
+HOST_TIMEOUT_GRACE="${SINOMO_BRIDGE_HOST_TIMEOUT_GRACE:-5}"
 SERVICE="${SINOMO_BRIDGE_TEST_SERVICE:-node4}"
-CONTAINER="${SINOMO_BRIDGE_TEST_CONTAINER:-$(docker compose ps -q "$SERVICE")}"
+
+compose_timeout() {
+  local seconds="$1"
+  shift
+  timeout --foreground "${seconds}s" docker compose "$@"
+}
+
+compose_exec_timeout() {
+  local seconds="$1" node="$2" host_seconds
+  shift 2
+  host_seconds=$(( seconds + HOST_TIMEOUT_GRACE ))
+  timeout --foreground "${host_seconds}s" docker compose exec -T "$node" \
+    timeout --foreground "${seconds}s" "$@"
+}
+
+CONTAINER="${SINOMO_BRIDGE_TEST_CONTAINER:-$(compose_timeout "$COMMAND_TIMEOUT" ps -q "$SERVICE")}"
 if [ -z "$CONTAINER" ]; then
   echo "could not resolve compose service container: $SERVICE"
   exit 1
@@ -42,22 +62,22 @@ connected() {
 }
 
 main_online_count() {
-  docker compose exec -T node1 sinomo cluster health 2>/dev/null \
+  compose_exec_timeout "$COMMAND_TIMEOUT" node1 sinomo cluster health 2>/dev/null \
     | grep -c "daemon-main.*online" || true
 }
 
 main_offline_count() {
-  docker compose exec -T node1 sinomo cluster health 2>/dev/null \
+  compose_exec_timeout "$COMMAND_TIMEOUT" node1 sinomo cluster health 2>/dev/null \
     | grep -c "daemon-main.*offline" || true
 }
 
 doctor_connectivity_warnings() {
-  docker compose exec -T node1 sinomo cluster doctor 2>/dev/null \
+  compose_exec_timeout "$COMMAND_TIMEOUT" node1 sinomo cluster doctor 2>/dev/null \
     | grep -E "endpoint-unreachable|node-offline" || true
 }
 
 cluster_health() {
-  docker compose exec -T node1 sinomo cluster health 2>/dev/null || true
+  compose_exec_timeout "$COMMAND_TIMEOUT" node1 sinomo cluster health 2>/dev/null || true
 }
 
 restore_bridge() {
@@ -127,7 +147,7 @@ echo "=== break bridge: $CONTAINER -X- $NETWORK ==="
 if connected; then
   docker network disconnect "$NETWORK" "$CONTAINER"
 fi
-if docker compose exec -T node3 sh -c 'getent hosts node4 >/dev/null'; then
+if compose_exec_timeout "$COMMAND_TIMEOUT" node3 sh -c 'getent hosts node4 >/dev/null'; then
   echo "node3 can still resolve node4 after bridge disconnect"
   exit 1
 fi

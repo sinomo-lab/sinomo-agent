@@ -317,6 +317,11 @@ pub struct DfsRepairAttemptRecord {
     pub next_retry_unix_nanos: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_chunk_index: Option<u32>,
+    /// Request identity for a resumable chunk transfer. A receiver keys its
+    /// partial assembler by this id, so maintenance services recreated between
+    /// windows must reuse it together with `next_chunk_index`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }

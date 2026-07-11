@@ -736,7 +736,7 @@ where
             let max_chunks =
                 self.adaptive_stage_chunk_window(&job.missing_replica_node_id, pending.size_bytes);
             let outcome = self
-                .send_repair_replica_window_if_routable_async(
+                .send_repair_replica_remaining_if_routable_async(
                     &job.missing_replica_node_id,
                     request_id.clone(),
                     &job.intent_id,
@@ -1310,7 +1310,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let object_metadata = Some(self.current_object_for_write(&pending.object_id)?);
             let max_chunks =
                 self.adaptive_stage_chunk_window(&job.missing_replica_node_id, pending.size_bytes);
-            let outcome = self.send_repair_replica_window_if_routable(
+            let outcome = self.send_repair_replica_remaining_if_routable(
                 &job.missing_replica_node_id,
                 request_id.clone(),
                 &job.intent_id,
@@ -2049,12 +2049,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 restored_record.in_flight = false;
                 restored_record.next_retry_unix_nanos = now;
                 restored_record.next_chunk_index = None;
+                restored_record.transfer_request_id = None;
             } else if repair_attempt_record_indicates_transient_route_failure(&restored_record)
                 && restored_record.next_retry_unix_nanos > now
             {
                 restored_record.in_flight = false;
                 restored_record.next_retry_unix_nanos = now;
                 restored_record.next_chunk_index = None;
+                restored_record.transfer_request_id = None;
             }
             self.repair_attempt_records.insert(
                 (
@@ -2082,16 +2084,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             state.inflight = restored_record.in_flight
                 && restored_record.next_retry_unix_nanos > dfs_now_unix_nanos();
-            if state.inflight
-                && let Some(next_chunk_index) = restored_record.next_chunk_index
-            {
+            if let (Some(next_chunk_index), Some(request_id)) = (
+                restored_record.next_chunk_index,
+                restored_record.transfer_request_id.as_ref(),
+            ) {
                 pending.repair_next_chunk_indexes.insert(
                     restored_record.missing_replica_node_id.clone(),
                     next_chunk_index,
                 );
+                pending.repair_inflight_request_ids.insert(
+                    restored_record.missing_replica_node_id.clone(),
+                    request_id.clone(),
+                );
             } else {
                 pending
                     .repair_next_chunk_indexes
+                    .remove(&restored_record.missing_replica_node_id);
+                pending
+                    .repair_inflight_request_ids
                     .remove(&restored_record.missing_replica_node_id);
             }
         }
@@ -2112,6 +2122,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         record.in_flight = false;
                         record.next_retry_unix_nanos = u64::MAX;
                         record.next_chunk_index = None;
+                        record.transfer_request_id = None;
                         records.push(record);
                     }
                     continue;
@@ -2119,9 +2130,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if state.attempts == 0 {
                     continue;
                 }
+                let (next_chunk_index, transfer_request_id) = match (
+                    pending
+                        .repair_next_chunk_indexes
+                        .get(replica_node_id)
+                        .copied(),
+                    pending
+                        .repair_inflight_request_ids
+                        .get(replica_node_id)
+                        .cloned(),
+                ) {
+                    (Some(next_chunk_index), Some(request_id)) => {
+                        (Some(next_chunk_index), Some(request_id))
+                    }
+                    _ => (None, None),
+                };
                 if let Some(existing) = self.repair_attempt_records.get(&key)
                     && existing.next_retry_unix_nanos > now
                     && existing.attempts >= state.attempts
+                    && existing.in_flight == state.inflight
+                    && existing.next_chunk_index == next_chunk_index
+                    && existing.transfer_request_id == transfer_request_id
                 {
                     records.push(existing.clone());
                     continue;
@@ -2143,10 +2172,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     in_flight: state.inflight,
                     last_attempt_unix_nanos: now,
                     next_retry_unix_nanos,
-                    next_chunk_index: pending
-                        .repair_next_chunk_indexes
-                        .get(replica_node_id)
-                        .copied(),
+                    next_chunk_index,
+                    transfer_request_id,
                     last_error,
                 });
             }
@@ -2217,6 +2244,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     .repair_next_chunk_indexes
                                     .get(replica_node_id)
                                     .copied(),
+                                transfer_request_id: pending
+                                    .repair_inflight_request_ids
+                                    .get(replica_node_id)
+                                    .cloned(),
                                 last_error: Some(reason.clone()),
                             },
                         );
@@ -2408,6 +2439,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     next_retry_unix_nanos: dfs_now_unix_nanos()
                         .saturating_add(repair_retry_delay_nanos_for_ticks(remaining_ticks)),
                     next_chunk_index: None,
+                    transfer_request_id: None,
                     last_error: Some(last_error),
                 });
             }
@@ -2442,6 +2474,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             record.in_flight = false;
             record.next_retry_unix_nanos = dfs_now_unix_nanos();
             record.next_chunk_index = None;
+            record.transfer_request_id = None;
         }
     }
 

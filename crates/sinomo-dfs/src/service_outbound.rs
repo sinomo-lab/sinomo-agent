@@ -301,6 +301,60 @@ where
         .await
     }
 
+    /// Sends every remaining repair window with one stable request identity.
+    ///
+    /// Each content-store read stays bounded by `max_chunks`; transports still
+    /// provide their own backpressure. Draining a progressing transfer here
+    /// prevents it from outliving the receiver's partial state between
+    /// maintenance ticks.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_repair_replica_remaining_if_routable_async(
+        &mut self,
+        target_node_id: &NodeId,
+        request_id: String,
+        intent_id: &str,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        expected_base_version: Option<DfsVersion>,
+        version: &DfsVersion,
+        content_hash: &str,
+        total_size_bytes: u64,
+        start_chunk_index: u32,
+        max_chunks: u32,
+        object_metadata: Option<DfsObjectMetadata>,
+    ) -> Result<StageBlobSendOutcome, DfsError> {
+        let mut next_chunk_index = start_chunk_index;
+        loop {
+            let outcome = self
+                .send_repair_replica_window_if_routable_async(
+                    target_node_id,
+                    request_id.clone(),
+                    intent_id,
+                    file_system_id,
+                    object_id,
+                    expected_base_version.clone(),
+                    version,
+                    content_hash,
+                    total_size_bytes,
+                    next_chunk_index,
+                    max_chunks,
+                    object_metadata.clone(),
+                )
+                .await?;
+            if !outcome.sent || outcome.complete {
+                return Ok(outcome);
+            }
+            if outcome.next_chunk_index <= next_chunk_index {
+                return Err(DfsError::Distributed {
+                    message: format!(
+                        "DFS repair transfer {request_id} made no chunk progress at index {next_chunk_index}"
+                    ),
+                });
+            }
+            next_chunk_index = outcome.next_chunk_index;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn send_object_version_chunk_window_if_routable_async(
         &mut self,
@@ -373,13 +427,13 @@ where
                         "failed to read blob {content_hash} {operation_label} chunk {chunk_index}: {source}"
                     ),
                 })?;
-            let sent = self
-                .send_best_effort_message_if_routable_async(
+            let send_outcome = self
+                .send_best_effort_message_if_routable_outcome_async(
                     target_node_id,
                     message_for_chunk(chunk_index, total_chunks, buffer[..chunk_len].to_vec()),
                 )
                 .await?;
-            if !sent {
+            if !send_outcome.sent {
                 tracing::warn!(
                     target: "sinomo.dfs.transfer",
                     local_node_id = %self.node_id,
@@ -396,7 +450,7 @@ where
                     sent: false,
                     complete: false,
                     next_chunk_index: chunk_index,
-                    last_error: None,
+                    last_error: send_outcome.last_error,
                 });
             }
         }
@@ -814,6 +868,54 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    /// Blocking counterpart of
+    /// [`Self::send_repair_replica_remaining_if_routable_async`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn send_repair_replica_remaining_if_routable(
+        &mut self,
+        target_node_id: &NodeId,
+        request_id: String,
+        intent_id: &str,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        expected_base_version: Option<DfsVersion>,
+        version: &DfsVersion,
+        content_hash: &str,
+        total_size_bytes: u64,
+        start_chunk_index: u32,
+        max_chunks: u32,
+        object_metadata: Option<DfsObjectMetadata>,
+    ) -> Result<StageBlobSendOutcome, DfsError> {
+        let mut next_chunk_index = start_chunk_index;
+        loop {
+            let outcome = self.send_repair_replica_window_if_routable(
+                target_node_id,
+                request_id.clone(),
+                intent_id,
+                file_system_id,
+                object_id,
+                expected_base_version.clone(),
+                version,
+                content_hash,
+                total_size_bytes,
+                next_chunk_index,
+                max_chunks,
+                object_metadata.clone(),
+            )?;
+            if !outcome.sent || outcome.complete {
+                return Ok(outcome);
+            }
+            if outcome.next_chunk_index <= next_chunk_index {
+                return Err(DfsError::Distributed {
+                    message: format!(
+                        "DFS repair transfer {request_id} made no chunk progress at index {next_chunk_index}"
+                    ),
+                });
+            }
+            next_chunk_index = outcome.next_chunk_index;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn send_object_version_chunk_window_if_routable(
         &mut self,
@@ -886,11 +988,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         "failed to read blob {content_hash} {operation_label} chunk {chunk_index}: {source}"
                     ),
                 })?;
-            let sent = self.send_best_effort_message_if_routable(
+            let send_outcome = self.send_best_effort_message_if_routable_outcome(
                 target_node_id,
                 message_for_chunk(chunk_index, total_chunks, buffer[..chunk_len].to_vec()),
             )?;
-            if !sent {
+            if !send_outcome.sent {
                 tracing::warn!(
                     target: "sinomo.dfs.transfer",
                     local_node_id = %self.node_id,
@@ -907,7 +1009,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     sent: false,
                     complete: false,
                     next_chunk_index: chunk_index,
-                    last_error: None,
+                    last_error: send_outcome.last_error,
                 });
             }
         }

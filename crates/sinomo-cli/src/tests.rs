@@ -10772,14 +10772,14 @@ fn stale_raft_snapshot_append_does_not_roll_back_local_state() {
             .any(|entry| entry.key == "/config/current")
     );
 
-    let restored = paths
+    let cached_ahead = paths
         .kv_paths()
         .local_cache()
-        .restore_raft_from_snapshot_if_newer(state.local_node_id.clone(), stale_snapshot)
-        .expect("stale snapshot restore");
-    assert!(!restored);
+        .cache_snapshot_if_newer_than_raft(state.local_node_id.clone(), stale_snapshot)
+        .expect("cache stale snapshot");
+    assert!(!cached_ahead);
     let snapshot_after_stale =
-        read_cluster_kv_snapshot(&paths).expect("snapshot after stale restore");
+        read_cluster_kv_snapshot(&paths).expect("snapshot after stale cache attempt");
     assert!(
         snapshot_after_stale
             .entries

@@ -3,6 +3,7 @@ use crate::kv_local_store::kv_err;
 use crate::kv_local_store::{
     append_cluster_raft_command, read_cluster_kv_current_snapshot,
     read_cluster_kv_current_snapshot_arc, read_cluster_kv_entry,
+    read_cluster_kv_latest_observed_entry,
 };
 use crate::local_state_store::{read_cluster_state, read_cluster_state_without_kv};
 use crate::member_mutation::ClusterMemberMutationAsyncHost;
@@ -10,7 +11,7 @@ use crate::membership_rpc::{ClusterInvitePublishRequest, ClusterInvitePublishRes
 use crate::prelude::*;
 use sinomo_kv::push_bounded_txn_success_op;
 #[allow(unused_imports)]
-use sinomo_kv::{KvCommand, KvOp, KvSnapshot, KvTxn};
+use sinomo_kv::{KvCommand, KvEntry, KvOp, KvSnapshot, KvTxn};
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
 use sinomo_node::{ClusterInvitationStateRecord, cluster_invitation_state_stable_eq};
@@ -31,7 +32,38 @@ pub fn read_cluster_invitation_from_kv(
     invite_id: &ClusterInviteId,
 ) -> Result<ClusterJoinInvite, NetworkError> {
     let key = cluster_invitation_key(invite_id);
-    let entry = read_cluster_kv_entry(paths, &key)?.ok_or_else(|| NetworkError::StorageIo {
+    decode_published_cluster_invitation(key.clone(), read_cluster_kv_entry(paths, &key)?)
+}
+
+/// Reads an invitation for a join introducer's transport authentication and
+/// local preflight.
+///
+/// A voter validates against its applied Raft view. A non-voting bridge may
+/// have just joined with a newer, authority-issued materialized snapshot while
+/// its local Raft log is still catching up; in that narrow case the bridge may
+/// use the newest observed read model so it can forward the registration. The
+/// state authority revalidates the same request against applied Raft before it
+/// can mutate membership.
+pub fn read_cluster_invitation_for_join_introducer(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    invite_id: &ClusterInviteId,
+) -> Result<ClusterJoinInvite, NetworkError> {
+    if sinomo_kv::cluster_kv_raft_local_is_voter(state) {
+        return read_cluster_invitation_from_kv(paths, invite_id);
+    }
+    let key = cluster_invitation_key(invite_id);
+    decode_published_cluster_invitation(
+        key.clone(),
+        read_cluster_kv_latest_observed_entry(paths, &key)?,
+    )
+}
+
+fn decode_published_cluster_invitation(
+    key: String,
+    entry: Option<KvEntry>,
+) -> Result<ClusterJoinInvite, NetworkError> {
+    let entry = entry.ok_or_else(|| NetworkError::StorageIo {
         path: key.clone(),
         detail: "cluster invitation is not published".to_string(),
     })?;

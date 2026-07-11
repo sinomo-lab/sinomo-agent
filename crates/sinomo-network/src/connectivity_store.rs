@@ -25,6 +25,9 @@ static LOCAL_CLUSTER_CONNECTIVITY_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
 static LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATION_CLOCK: AtomicU64 = AtomicU64::new(1);
 static LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATIONS: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static LOCAL_CLUSTER_CONNECTIVITY_ROUTING_GENERATION_CLOCK: AtomicU64 = AtomicU64::new(1);
+static LOCAL_CLUSTER_CONNECTIVITY_ROUTING_GENERATIONS: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 static LOCAL_CLUSTER_CONNECTIVITY_RECORDS: LazyLock<
     Mutex<HashMap<PathBuf, LocalClusterConnectivityRecordCacheEntry>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -50,6 +53,27 @@ pub fn local_cluster_connectivity_content_generation(paths: &ClusterPaths) -> u6
 fn bump_local_cluster_connectivity_content_generation(paths: &ClusterPaths) {
     let next = LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATION_CLOCK.fetch_add(1, Ordering::AcqRel);
     if let Ok(mut generations) = LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATIONS.lock() {
+        generations.insert(paths.root.clone(), next);
+    }
+}
+
+/// Generation of changes that can alter route reachability or topology.
+///
+/// The full content generation also advances for observation-only refreshes
+/// such as latency and timestamps. Delivery routing tables do not need to be
+/// rebuilt for those refreshes: their endpoint candidates are unchanged and
+/// live endpoint quality is applied again immediately before each attempt.
+pub(crate) fn local_cluster_connectivity_routing_generation(paths: &ClusterPaths) -> u64 {
+    LOCAL_CLUSTER_CONNECTIVITY_ROUTING_GENERATIONS
+        .lock()
+        .ok()
+        .and_then(|generations| generations.get(&paths.root).copied())
+        .unwrap_or(0)
+}
+
+fn bump_local_cluster_connectivity_routing_generation(paths: &ClusterPaths) {
+    let next = LOCAL_CLUSTER_CONNECTIVITY_ROUTING_GENERATION_CLOCK.fetch_add(1, Ordering::AcqRel);
+    if let Ok(mut generations) = LOCAL_CLUSTER_CONNECTIVITY_ROUTING_GENERATIONS.lock() {
         generations.insert(paths.root.clone(), next);
     }
 }
@@ -98,6 +122,27 @@ pub fn read_local_cluster_connectivity_records(
         now,
     );
     Ok(records)
+}
+
+/// Discards this process's local connectivity snapshot so the next read
+/// reloads the shared on-disk state.
+///
+/// Daemon-control clients can update the local connectivity file from another
+/// process. Advancing both generations ensures cached route graphs are rebuilt
+/// from the reloaded records as well.
+pub fn invalidate_local_cluster_connectivity_cache(
+    paths: &ClusterPaths,
+) -> Result<(), NetworkError> {
+    LOCAL_CLUSTER_CONNECTIVITY_RECORDS
+        .lock()
+        .map_err(|error| NetworkError::Io {
+            operation: "lock local cluster connectivity cache".to_string(),
+            detail: error.to_string(),
+        })?
+        .remove(&paths.root);
+    bump_local_cluster_connectivity_content_generation(paths);
+    bump_local_cluster_connectivity_routing_generation(paths);
+    Ok(())
 }
 
 pub fn read_local_cluster_connectivity_records_for_source(
@@ -200,6 +245,26 @@ pub fn write_local_cluster_connectivity_records(
     write_local_cluster_connectivity_records_inner(paths, source_node_id, records, false)
 }
 
+pub async fn write_local_cluster_connectivity_records_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+) -> Result<(), NetworkError> {
+    let paths = paths.clone();
+    let source_node_id = source_node_id.clone();
+    let records = records.to_vec();
+    runtime
+        .spawn_blocking(move || {
+            write_local_cluster_connectivity_records(&paths, &source_node_id, &records)
+        })
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "write local cluster connectivity records".to_string(),
+            detail: format!("local cluster connectivity write task failed: {source}"),
+        })?
+}
+
 pub fn write_local_cluster_connectivity_record_set(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
@@ -256,6 +321,11 @@ pub fn prune_local_cluster_connectivity_records_for_state(
         let cache_changed = replace_local_cluster_connectivity_cache_records(paths, retained, now)?;
         if cache_changed {
             bump_local_cluster_connectivity_content_generation(paths);
+            // A prune pass repairs an in-process cache that disagrees with the
+            // authoritative on-disk record set. Conservatively invalidate the
+            // routing table too; this path is maintenance, not the per-RPC
+            // observation hot path.
+            bump_local_cluster_connectivity_routing_generation(paths);
         }
         return Ok(0);
     }
@@ -268,6 +338,7 @@ pub fn prune_local_cluster_connectivity_records_for_state(
 
     let _cache_changed = replace_local_cluster_connectivity_cache_records(paths, retained, now)?;
     bump_local_cluster_connectivity_content_generation(paths);
+    bump_local_cluster_connectivity_routing_generation(paths);
     Ok(removed)
 }
 
@@ -487,7 +558,11 @@ fn local_cluster_connectivity_persisted_records_stable(
     existing_records: &[ClusterConnectivityRecord],
     merged_records: &[ClusterConnectivityRecord],
 ) -> bool {
-    local_cluster_connectivity_route_records_stable(existing_records, merged_records)
+    existing_records.len() == merged_records.len()
+        && existing_records
+            .iter()
+            .zip(merged_records)
+            .all(|(existing, merged)| cluster_connectivity_stable_eq(existing, merged))
 }
 
 fn local_cluster_connectivity_raw_persisted_records_stable(
@@ -510,7 +585,7 @@ fn local_cluster_connectivity_raw_persisted_records_stable(
     }
     let mut candidate = candidate.into_values().collect::<Vec<_>>();
     sort_cluster_connectivity_records(&mut candidate);
-    local_cluster_connectivity_route_records_stable(existing_records, &candidate)
+    local_cluster_connectivity_persisted_records_stable(existing_records, &candidate)
 }
 
 fn local_cluster_connectivity_route_records_stable(
@@ -521,7 +596,38 @@ fn local_cluster_connectivity_route_records_stable(
         && existing_records
             .iter()
             .zip(merged_records)
-            .all(|(existing, merged)| cluster_connectivity_stable_eq(existing, merged))
+            .all(local_cluster_connectivity_routing_record_stable_eq)
+}
+
+fn local_cluster_connectivity_routing_record_stable_eq(
+    existing: (&ClusterConnectivityRecord, &ClusterConnectivityRecord),
+) -> bool {
+    let (existing, merged) = existing;
+    cluster_connectivity_stable_eq(existing, merged)
+        && local_cluster_connectivity_routing_latency_class(existing)
+            == local_cluster_connectivity_routing_latency_class(merged)
+        && existing.consecutive_failures == merged.consecutive_failures
+        && merged.expires_at >= existing.expires_at
+}
+
+/// Coarse latency classes keep normal probe jitter from rebuilding every
+/// target's routing table while still invalidating routes after a material
+/// link-quality change. Exact endpoint quality is re-read before dialing; this
+/// class only governs the cached ordering of alternate relay paths.
+fn local_cluster_connectivity_routing_latency_class(record: &ClusterConnectivityRecord) -> u8 {
+    if !matches!(record.state, ClusterConnectivityState::Healthy) {
+        return 0;
+    }
+    match record.latency_ms {
+        None => 0,
+        // Ordinary LAN/container jitter must remain in one class: a boundary
+        // in the tens of milliseconds lets concurrent observations alternate
+        // the generation and recreate the original cache-thrashing bug.
+        Some(0..=128) => 1,
+        Some(129..=512) => 2,
+        Some(513..=2_000) => 3,
+        Some(_) => 4,
+    }
 }
 
 fn cluster_connectivity_record_key(
@@ -543,11 +649,45 @@ fn write_local_cluster_connectivity_records_inner(
     validate_cluster_connectivity_records_for_source(source_node_id, records)?;
     let now = OffsetDateTime::now_utc();
     let existing_records = read_local_cluster_connectivity_records(paths)?;
+    let replacement_keys = if replace_source_records {
+        records
+            .iter()
+            .filter(|record| {
+                record.source_node_id == *source_node_id
+                    && cluster_network_record_live(record.expires_at, now)
+            })
+            .map(cluster_connectivity_record_key)
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    let replacement_observed_at = replace_source_records
+        .then(|| {
+            records
+                .iter()
+                .filter(|record| {
+                    record.source_node_id == *source_node_id
+                        && cluster_network_record_live(record.expires_at, now)
+                })
+                .map(|record| record.observed_at)
+                .max()
+        })
+        .flatten();
     let mut merged = existing_records
         .iter()
         .filter(|record| {
             cluster_network_record_live(record.expires_at, now)
-                && (!replace_source_records || record.source_node_id != *source_node_id)
+                && (!replace_source_records
+                    || record.source_node_id != *source_node_id
+                    || replacement_keys.contains(&cluster_connectivity_record_key(record))
+                    // A complete-set producer can finish after a newer producer
+                    // whose snapshot contains an additional endpoint. Preserve
+                    // omitted observations newer than the incoming set's
+                    // generation; a genuinely newer set still removes older
+                    // omitted keys. An explicit empty set remains an explicit
+                    // clear because it has no generation.
+                    || replacement_observed_at
+                        .is_some_and(|observed_at| record.observed_at > observed_at))
         })
         .map(|record| (cluster_connectivity_record_key(record), record.clone()))
         .collect::<BTreeMap<_, _>>();
@@ -555,7 +695,17 @@ fn write_local_cluster_connectivity_records_inner(
         if record.source_node_id == *source_node_id
             && cluster_network_record_live(record.expires_at, now)
         {
-            merged.insert(cluster_connectivity_record_key(record), record.clone());
+            let key = cluster_connectivity_record_key(record);
+            if merged
+                .get(&key)
+                .is_some_and(|existing| existing.observed_at > record.observed_at)
+            {
+                // Observation tasks and full-set maintenance writes can finish
+                // out of order. Never let a late older result regress a newer
+                // reachability decision and make cluster KV oscillate.
+                continue;
+            }
+            merged.insert(key, record.clone());
         }
     }
     let retained_source_records = merged
@@ -618,6 +768,9 @@ fn write_local_cluster_connectivity_records_inner(
     }
     if records_changed {
         bump_local_cluster_connectivity_content_generation(paths);
+    }
+    if !route_records_stable {
+        bump_local_cluster_connectivity_routing_generation(paths);
     }
     Ok(())
 }
@@ -684,6 +837,512 @@ mod tests {
     };
     use sinomo_local::SinomoDataDir;
     use sinomo_node::ClusterId;
+
+    fn connectivity_generation_fixture(
+        name: &str,
+    ) -> (
+        sinomo_testdir::TestDir,
+        ClusterPaths,
+        ClusterBootstrapState,
+        NodeId,
+        ClusterEndpointRecord,
+        OffsetDateTime,
+    ) {
+        let root = sinomo_testdir::TestDir::new(name);
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named(format!("cluster_{name}"))
+            .expect("generation fixture cluster");
+        let local = NodeId::from_legacy_named(format!("node_{name}_local"))
+            .expect("generation fixture local node");
+        let remote = NodeId::from_legacy_named(format!("node_{name}_remote"))
+            .expect("generation fixture remote node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "connectivity generation fixture",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &remote,
+            "target:21353".to_string(),
+            10,
+        );
+        let mut remote_member =
+            ClusterMemberRecord::local_non_voting(cluster_id, remote, "remote", "pk", now);
+        remote_member.endpoints = vec![endpoint.clone()];
+        state.members.push(remote_member);
+        (root, paths, state, local, endpoint, now)
+    }
+
+    #[test]
+    fn observational_refresh_preserves_connectivity_routing_generation() {
+        let (_root, paths, state, local, endpoint, now) =
+            connectivity_generation_fixture("connectivity_observation_generation");
+        let initial = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(3),
+            0,
+            Some("initial success".to_string()),
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(&paths, &local, &[initial])
+            .expect("write initial connectivity observation");
+        let content_before = local_cluster_connectivity_content_generation(&paths);
+        let routing_before = local_cluster_connectivity_routing_generation(&paths);
+
+        let refreshed_at = now + time::Duration::seconds(1);
+        let refreshed = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(7),
+            0,
+            Some("refreshed success".to_string()),
+            None,
+            refreshed_at,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(&paths, &local, &[refreshed])
+            .expect("refresh connectivity observation");
+
+        assert_ne!(
+            local_cluster_connectivity_content_generation(&paths),
+            content_before,
+            "the route graph must still see a newer local observation"
+        );
+        assert_eq!(
+            local_cluster_connectivity_routing_generation(&paths),
+            routing_before,
+            "latency and timestamp refreshes must not invalidate the delivery routing table"
+        );
+    }
+
+    #[test]
+    fn explicit_invalidation_reloads_cross_process_connectivity_write() {
+        let (_root, paths, state, local, endpoint, now) =
+            connectivity_generation_fixture("connectivity_cross_process_reload");
+        let initial = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(3),
+            0,
+            Some("initial success".to_string()),
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(&paths, &local, &[initial])
+            .expect("write and cache initial connectivity");
+
+        let changed_at = now + time::Duration::seconds(1);
+        let externally_written = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Degraded,
+            None,
+            2,
+            None,
+            Some("external failure".to_string()),
+            changed_at,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_object_file(&paths.connectivity_local, &vec![externally_written])
+            .expect("simulate another process replacing connectivity file");
+        assert_eq!(
+            read_local_cluster_connectivity_records(&paths).expect("read cached connectivity")[0]
+                .state,
+            ClusterConnectivityState::Healthy,
+            "the test must prewarm the stale in-process cache"
+        );
+
+        invalidate_local_cluster_connectivity_cache(&paths).expect("invalidate connectivity");
+
+        assert_eq!(
+            read_local_cluster_connectivity_records(&paths).expect("reload connectivity from disk")
+                [0]
+            .state,
+            ClusterConnectivityState::Degraded
+        );
+    }
+
+    #[test]
+    fn route_semantic_change_advances_connectivity_routing_generation() {
+        let (_root, paths, state, local, endpoint, now) =
+            connectivity_generation_fixture("connectivity_routing_generation");
+        let initial = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(3),
+            0,
+            Some("initial success".to_string()),
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(&paths, &local, &[initial])
+            .expect("write initial healthy connectivity");
+        let content_before = local_cluster_connectivity_content_generation(&paths);
+        let routing_before = local_cluster_connectivity_routing_generation(&paths);
+
+        let failed_at = now + time::Duration::seconds(1);
+        let degraded = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Degraded,
+            None,
+            1,
+            None,
+            Some("connection failed".to_string()),
+            failed_at,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(&paths, &local, &[degraded])
+            .expect("write degraded connectivity");
+
+        assert_ne!(
+            local_cluster_connectivity_content_generation(&paths),
+            content_before
+        );
+        assert_ne!(
+            local_cluster_connectivity_routing_generation(&paths),
+            routing_before,
+            "reachability-state changes must invalidate the delivery routing table"
+        );
+    }
+
+    #[test]
+    fn material_latency_change_advances_connectivity_routing_generation() {
+        let (_root, paths, state, local, endpoint, now) =
+            connectivity_generation_fixture("connectivity_latency_generation");
+        let initial = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(3),
+            0,
+            Some("initial success".to_string()),
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(&paths, &local, &[initial])
+            .expect("write initial connectivity observation");
+        let routing_before = local_cluster_connectivity_routing_generation(&paths);
+
+        let refreshed_at = now + time::Duration::seconds(1);
+        let materially_slower = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(750),
+            0,
+            Some("materially slower success".to_string()),
+            None,
+            refreshed_at,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(&paths, &local, &[materially_slower])
+            .expect("write materially slower connectivity observation");
+
+        assert_ne!(
+            local_cluster_connectivity_routing_generation(&paths),
+            routing_before,
+            "material link-quality changes must re-rank cached relay paths"
+        );
+    }
+
+    #[test]
+    fn routing_stability_detects_failure_count_and_shorter_expiry() {
+        let (_root, _paths, state, _local, endpoint, now) =
+            connectivity_generation_fixture("connectivity_routing_stability");
+        let degraded = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Degraded,
+            Some(20),
+            1,
+            Some("earlier success".to_string()),
+            Some("first failure".to_string()),
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+
+        let mut failed_again = degraded.clone();
+        failed_again.consecutive_failures = 2;
+        assert!(
+            !local_cluster_connectivity_routing_record_stable_eq((&degraded, &failed_again)),
+            "failure-cost changes must invalidate cached route ordering"
+        );
+
+        let mut shorter_lived = degraded.clone();
+        shorter_lived.expires_at = degraded.expires_at - time::Duration::seconds(1);
+        assert!(
+            !local_cluster_connectivity_routing_record_stable_eq((&degraded, &shorter_lived)),
+            "an earlier expiry must not leave a route cached past its lifetime"
+        );
+    }
+
+    #[test]
+    fn older_connectivity_observation_cannot_regress_newer_state() {
+        let (_root, paths, state, local, endpoint, now) =
+            connectivity_generation_fixture("connectivity_observation_order");
+        let newer = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(4),
+            0,
+            Some("newer success".to_string()),
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(&paths, &local, std::slice::from_ref(&newer))
+            .expect("write newer connectivity observation");
+        let content_before = local_cluster_connectivity_content_generation(&paths);
+        let routing_before = local_cluster_connectivity_routing_generation(&paths);
+
+        let older_at = now - time::Duration::seconds(1);
+        let older = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Unreachable,
+            None,
+            3,
+            None,
+            Some("older failure".to_string()),
+            older_at,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_record_set(&paths, &local, &[older])
+            .expect("late full-set write must preserve newer observation");
+
+        let stored = read_local_cluster_connectivity_records(&paths)
+            .expect("read connectivity after stale write");
+        assert_eq!(stored, vec![newer]);
+        assert_eq!(
+            local_cluster_connectivity_content_generation(&paths),
+            content_before,
+            "discarding a stale observation must not churn route-graph content"
+        );
+        assert_eq!(
+            local_cluster_connectivity_routing_generation(&paths),
+            routing_before,
+            "discarding a stale observation must not invalidate delivery routes"
+        );
+    }
+
+    #[test]
+    fn stale_full_set_omission_cannot_delete_newer_endpoint() {
+        let (_root, paths, state, local, endpoint_a, now) =
+            connectivity_generation_fixture("connectivity_full_set_omission_order");
+        let mut endpoint_b = endpoint_a.clone();
+        endpoint_b.endpoint_id = ClusterEndpointId::derived(
+            "sinomo.test.connectivity.full-set.endpoint-b",
+            b"endpoint-b",
+        );
+        endpoint_b.address = "target:21354".to_string();
+        let newer_at = now + time::Duration::seconds(2);
+        let newer_a = cluster_connectivity_record(
+            &state,
+            &endpoint_a,
+            ClusterConnectivityState::Healthy,
+            Some(4),
+            0,
+            Some("newer a".to_string()),
+            None,
+            newer_at,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let newer_b = cluster_connectivity_record(
+            &state,
+            &endpoint_b,
+            ClusterConnectivityState::Healthy,
+            Some(5),
+            0,
+            Some("newer b".to_string()),
+            None,
+            newer_at,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_record_set(
+            &paths,
+            &local,
+            &[newer_a.clone(), newer_b.clone()],
+        )
+        .expect("seed newer complete source set");
+
+        let stale_at = now + time::Duration::seconds(1);
+        let stale_a = cluster_connectivity_record(
+            &state,
+            &endpoint_a,
+            ClusterConnectivityState::Degraded,
+            None,
+            2,
+            None,
+            Some("stale a".to_string()),
+            stale_at,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_record_set(&paths, &local, &[stale_a])
+            .expect("merge stale complete source set");
+
+        let mut expected = vec![newer_a, newer_b];
+        sort_cluster_connectivity_records(&mut expected);
+        assert_eq!(
+            read_local_cluster_connectivity_records_for_source(&paths, &local)
+                .expect("read source after stale full-set write"),
+            expected
+        );
+    }
+
+    #[test]
+    fn newer_full_set_still_removes_older_omitted_endpoint() {
+        let (_root, paths, state, local, endpoint_a, now) =
+            connectivity_generation_fixture("connectivity_full_set_removal");
+        let mut endpoint_b = endpoint_a.clone();
+        endpoint_b.endpoint_id = ClusterEndpointId::derived(
+            "sinomo.test.connectivity.full-set-removal.endpoint-b",
+            b"endpoint-b",
+        );
+        endpoint_b.address = "target:21354".to_string();
+        let initial_a = cluster_connectivity_record(
+            &state,
+            &endpoint_a,
+            ClusterConnectivityState::Healthy,
+            Some(4),
+            0,
+            Some("initial a".to_string()),
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let initial_b = cluster_connectivity_record(
+            &state,
+            &endpoint_b,
+            ClusterConnectivityState::Healthy,
+            Some(5),
+            0,
+            Some("initial b".to_string()),
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_record_set(&paths, &local, &[initial_a, initial_b])
+            .expect("seed initial complete source set");
+
+        let replacement_at = now + time::Duration::seconds(1);
+        let replacement_a = cluster_connectivity_record(
+            &state,
+            &endpoint_a,
+            ClusterConnectivityState::Healthy,
+            Some(4),
+            0,
+            Some("replacement a".to_string()),
+            None,
+            replacement_at,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_record_set(
+            &paths,
+            &local,
+            std::slice::from_ref(&replacement_a),
+        )
+        .expect("write newer complete source set");
+
+        assert_eq!(
+            read_local_cluster_connectivity_records_for_source(&paths, &local)
+                .expect("read source after newer removal"),
+            vec![replacement_a]
+        );
+    }
+
+    #[test]
+    fn merge_only_late_peer_subset_preserves_newer_source_set_without_generation_churn() {
+        let (_root, paths, state, source, endpoint_a, now) =
+            connectivity_generation_fixture("connectivity_peer_subset_order");
+        let mut endpoint_b = endpoint_a.clone();
+        endpoint_b.endpoint_id = ClusterEndpointId::derived(
+            "sinomo.test.connectivity.peer-subset.endpoint-b",
+            b"endpoint-b",
+        );
+        endpoint_b.address = "target:21354".to_string();
+
+        let newer_at = now + time::Duration::seconds(1);
+        let newer_a = cluster_connectivity_record(
+            &state,
+            &endpoint_a,
+            ClusterConnectivityState::Healthy,
+            Some(4),
+            0,
+            Some("newer a".to_string()),
+            None,
+            newer_at,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let newer_b = cluster_connectivity_record(
+            &state,
+            &endpoint_b,
+            ClusterConnectivityState::Healthy,
+            Some(5),
+            0,
+            Some("newer b".to_string()),
+            None,
+            newer_at,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_record_set(
+            &paths,
+            &source,
+            &[newer_a.clone(), newer_b.clone()],
+        )
+        .expect("seed newer peer source set");
+        let content_before = local_cluster_connectivity_content_generation(&paths);
+        let routing_before = local_cluster_connectivity_routing_generation(&paths);
+
+        let stale_a = cluster_connectivity_record(
+            &state,
+            &endpoint_a,
+            ClusterConnectivityState::Unreachable,
+            None,
+            2,
+            None,
+            Some("stale a".to_string()),
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(&paths, &source, &[stale_a])
+            .expect("merge late peer subset");
+
+        let stored = read_local_cluster_connectivity_records_for_source(&paths, &source)
+            .expect("read merged peer source");
+        let mut expected = vec![newer_a, newer_b];
+        sort_cluster_connectivity_records(&mut expected);
+        assert_eq!(stored, expected);
+        assert_eq!(
+            local_cluster_connectivity_content_generation(&paths),
+            content_before,
+            "discarding a stale subset must not churn route-graph content"
+        );
+        assert_eq!(
+            local_cluster_connectivity_routing_generation(&paths),
+            routing_before,
+            "discarding a stale subset must not invalidate delivery routes"
+        );
+    }
 
     #[test]
     fn topology_prune_removes_removed_members_and_unadvertised_endpoints() {

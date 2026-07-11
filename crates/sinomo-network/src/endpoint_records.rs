@@ -99,6 +99,13 @@ pub fn upsert_member_endpoint(
             changed
         } else if cluster_endpoint_stable_eq(existing, &endpoint) {
             changed
+        } else if cluster_endpoint_route_differs_only_by_discovery_source(existing, &endpoint) {
+            if cluster_endpoint_static_source_is_preferred(existing, &endpoint) {
+                *existing = endpoint;
+                true
+            } else {
+                changed
+            }
         } else {
             *existing = endpoint;
             true
@@ -118,6 +125,37 @@ pub fn upsert_member_endpoint(
         member.endpoints.push(endpoint);
         true
     }
+}
+
+fn cluster_endpoint_route_differs_only_by_discovery_source(
+    existing: &ClusterEndpointRecord,
+    incoming: &ClusterEndpointRecord,
+) -> bool {
+    existing.endpoint_id == incoming.endpoint_id
+        && existing.node_id == incoming.node_id
+        && existing.transport == incoming.transport
+        && existing.address == incoming.address
+        && existing.privacy == incoming.privacy
+        && existing.priority == incoming.priority
+        && existing.last_observed_latency_ms == incoming.last_observed_latency_ms
+        && matches!(
+            (&existing.source, &incoming.source),
+            (
+                ClusterEndpointSource::Static,
+                ClusterEndpointSource::Mdns | ClusterEndpointSource::Observed
+            ) | (
+                ClusterEndpointSource::Mdns | ClusterEndpointSource::Observed,
+                ClusterEndpointSource::Static
+            )
+        )
+}
+
+fn cluster_endpoint_static_source_is_preferred(
+    existing: &ClusterEndpointRecord,
+    incoming: &ClusterEndpointRecord,
+) -> bool {
+    !matches!(existing.source, ClusterEndpointSource::Static)
+        && matches!(incoming.source, ClusterEndpointSource::Static)
 }
 
 pub fn cluster_endpoint_duplicate_identity_eq(

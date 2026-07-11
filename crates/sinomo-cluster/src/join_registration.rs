@@ -1,5 +1,5 @@
 use crate::control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlaneTransport};
-use crate::invite_publish::read_cluster_invitation_from_kv;
+use crate::invite_publish::read_cluster_invitation_for_join_introducer;
 use crate::keyspace::{
     cluster_capability_policy_key, cluster_endpoint_prefix, cluster_identity_key,
 };
@@ -39,6 +39,8 @@ use sinomo_node::{
 };
 use std::time::{Duration, Instant};
 
+const JOIN_RECONCILIATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 fn join_registration_trace(args: std::fmt::Arguments<'_>) {
     let enabled = std::env::var("SINOMO_CLUSTER_JOIN_TRACE")
         .ok()
@@ -60,7 +62,8 @@ pub fn prepare_cluster_join_registration_response(
     request: ClusterJoinRegistrationRequest,
     now: OffsetDateTime,
 ) -> Result<ClusterJoinRegistrationResponse, NetworkError> {
-    let persisted_invite = read_cluster_invitation_from_kv(paths, &request.invite.invite_id)?;
+    let persisted_invite =
+        read_cluster_invitation_for_join_introducer(paths, &state, &request.invite.invite_id)?;
     if request.invite.cluster_public_key != persisted_invite.cluster_public_key
         || request.invitation_secret.trim().is_empty()
         || request.invitation_secret != persisted_invite.invitation_secret
@@ -180,11 +183,7 @@ pub fn handle_cluster_join_registration_request_with_host(
     }
 
     if !cluster_kv_local_is_state_authority(&state) {
-        let rpc_request = ObjectRpcRequest::encode_body(
-            CLUSTER_JOIN_REGISTER_ROUTE,
-            CLUSTER_MEMBERSHIP_RPC_CATEGORY,
-            &request,
-        )?;
+        let rpc_request = cluster_join_registration_rpc_request(&request)?;
         let response = forward_cluster_membership_rpc_to_state_authority_with_host(
             paths,
             &state,
@@ -257,11 +256,7 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
     }
 
     if !cluster_kv_local_is_state_authority(&state) {
-        let rpc_request = ObjectRpcRequest::encode_body(
-            CLUSTER_JOIN_REGISTER_ROUTE,
-            CLUSTER_MEMBERSHIP_RPC_CATEGORY,
-            &request,
-        )?;
+        let rpc_request = cluster_join_registration_rpc_request(&request)?;
         let forward_started = Instant::now();
         join_registration_trace(format_args!(
             "registration forward invite={} started with {} member(s)",
@@ -361,11 +356,7 @@ where
     let proof: crate::invite::ClusterInviteChallengeProof = proof_response.decode_body()?;
     crate::invite::verify_cluster_invite_challenge_proof(&request.invite, &challenge, &proof)?;
 
-    let register_rpc = ObjectRpcRequest::encode_body(
-        CLUSTER_JOIN_REGISTER_ROUTE,
-        CLUSTER_MEMBERSHIP_RPC_CATEGORY,
-        request,
-    )?;
+    let register_rpc = cluster_join_registration_rpc_request(request)?;
     let response = send_rpc(endpoint, &register_rpc, timeout)?;
     let responder_node_id = response
         .responder_node_id()
@@ -375,6 +366,22 @@ where
         decoded.responder_node_id = responder_node_id;
     }
     Ok(decoded)
+}
+
+/// Join registration is an idempotent member upsert keyed by the joining
+/// nodes' stable ids. Explicitly allow one fresh-auth redispatch when a pooled
+/// connection fails after dispatch; the repeated request cannot create a
+/// duplicate member, and the normal snapshot reconciliation still verifies
+/// the accepted state.
+fn cluster_join_registration_rpc_request(
+    request: &ClusterJoinRegistrationRequest,
+) -> Result<ObjectRpcRequest, NetworkError> {
+    Ok(ObjectRpcRequest::encode_body(
+        CLUSTER_JOIN_REGISTER_ROUTE,
+        CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+        request,
+    )?
+    .with_response_retry_safe())
 }
 
 pub fn record_forwarded_join_registration_acceptance_with_host(
@@ -448,16 +455,26 @@ pub fn reconcile_cluster_join_with_introducers_with_host(
         members: state.members.clone(),
     };
     let deadline = Instant::now() + tcp_timeout.max(iroh_timeout);
-    let remaining_for = |channel_timeout: Duration| {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .unwrap_or_else(|| Duration::from_millis(1));
-        remaining.min(channel_timeout)
-    };
     let mut failures = Vec::new();
     for channel in crate::invite_channels_for_join_registration(&request.invite) {
-        let tcp_remaining = remaining_for(tcp_timeout);
-        let iroh_remaining = remaining_for(iroh_timeout);
+        let channel_started = Instant::now();
+        let Some(global_remaining) = deadline
+            .checked_duration_since(channel_started)
+            .filter(|remaining| !remaining.is_zero())
+        else {
+            failures.push("join registration deadline elapsed".to_string());
+            break;
+        };
+        let tcp_remaining = global_remaining.min(tcp_timeout);
+        let iroh_remaining = global_remaining.min(iroh_timeout);
+        let channel_remaining = match channel.endpoint.transport {
+            ClusterTransportKind::Iroh => iroh_remaining,
+            _ => tcp_remaining,
+        };
+        let channel_reconciliation_deadline = channel_started
+            .checked_add(channel_remaining)
+            .unwrap_or(deadline)
+            .min(deadline);
         match host.send_join_registration(
             &channel.endpoint,
             &request,
@@ -466,10 +483,6 @@ pub fn reconcile_cluster_join_with_introducers_with_host(
         ) {
             Ok(response) => {
                 if response.accepted {
-                    let accepted_snapshot_timeout = match channel.endpoint.transport {
-                        ClusterTransportKind::Iroh => iroh_remaining,
-                        _ => tcp_remaining,
-                    };
                     if let Some(reconciliation) = reconcile_accepted_join_response_with_host(
                         state,
                         &request.invite,
@@ -485,7 +498,7 @@ pub fn reconcile_cluster_join_with_introducers_with_host(
                             state,
                             &request.invite,
                             &channel.endpoint,
-                            accepted_snapshot_timeout,
+                            channel_reconciliation_deadline,
                             connectivity_paths,
                             host,
                         )?
@@ -503,10 +516,7 @@ pub fn reconcile_cluster_join_with_introducers_with_host(
                         state,
                         &request.invite,
                         &channel.endpoint,
-                        match channel.endpoint.transport {
-                            ClusterTransportKind::Iroh => iroh_remaining,
-                            _ => tcp_remaining,
-                        },
+                        channel_reconciliation_deadline,
                         connectivity_paths,
                         host,
                     )?
@@ -524,10 +534,7 @@ pub fn reconcile_cluster_join_with_introducers_with_host(
                         state,
                         &request.invite,
                         &channel.endpoint,
-                        match channel.endpoint.transport {
-                            ClusterTransportKind::Iroh => iroh_remaining,
-                            _ => tcp_remaining,
-                        },
+                        channel_reconciliation_deadline,
                         connectivity_paths,
                         host,
                     )?
@@ -579,23 +586,43 @@ fn reconcile_already_accepted_join_from_snapshot_with_host(
     state: &mut ClusterBootstrapState,
     invite: &ClusterJoinInvite,
     endpoint: &ClusterEndpointRecord,
-    timeout: Duration,
+    deadline: Instant,
     connectivity_paths: Option<&ClusterPaths>,
     host: &mut impl ClusterJoinReconciliationHost,
 ) -> Result<Option<ClusterJoinReconciliation>, NetworkError> {
-    let snapshot = match host.fetch_cluster_kv_snapshot(endpoint, timeout) {
-        Ok(snapshot) => snapshot,
-        Err(_) => return Ok(None),
-    };
-    let reconciliation =
-        reconcile_accepted_cluster_join_snapshot(state, invite, endpoint, snapshot)?;
-    observe_join_reconciliation_connectivity(
-        connectivity_paths,
-        state,
-        reconciliation.as_ref(),
-        host,
-    )?;
-    Ok(reconciliation)
+    // Once registration has been dispatched, its outcome is ambiguous until
+    // the accepted member appears in an authoritative snapshot. Observe that
+    // outcome until the original budget expires; never create a second write
+    // attempt from this reconciliation path.
+    loop {
+        let Some(remaining) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+        else {
+            return Ok(None);
+        };
+        if let Ok(snapshot) = host.fetch_cluster_kv_snapshot(endpoint, remaining) {
+            let reconciliation =
+                reconcile_accepted_cluster_join_snapshot(state, invite, endpoint, snapshot)?;
+            observe_join_reconciliation_connectivity(
+                connectivity_paths,
+                state,
+                reconciliation.as_ref(),
+                host,
+            )?;
+            if reconciliation.is_some() {
+                return Ok(reconciliation);
+            }
+        }
+
+        let Some(remaining) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+        else {
+            return Ok(None);
+        };
+        host.wait_for_join_reconciliation_retry(remaining.min(JOIN_RECONCILIATION_POLL_INTERVAL));
+    }
 }
 
 fn observe_join_reconciliation_connectivity(
@@ -1174,6 +1201,10 @@ pub trait ClusterJoinReconciliationHost {
         endpoint: &ClusterEndpointRecord,
         timeout: Duration,
     ) -> Result<KvSnapshot, NetworkError>;
+
+    fn wait_for_join_reconciliation_retry(&mut self, interval: Duration) {
+        std::thread::sleep(interval);
+    }
 
     fn observe_join_reconciliation_connectivity(
         &mut self,

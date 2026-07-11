@@ -185,6 +185,14 @@ pub enum NetworkError {
         detail: String,
     },
     #[error(
+        "stale pooled connection during {operation} ({delivery_state:?}); reconnect with fresh authentication: {detail}"
+    )]
+    StalePooledConnection {
+        operation: String,
+        delivery_state: NetworkDeliveryState,
+        detail: String,
+    },
+    #[error(
         "network retries exhausted during {operation} after {attempts} attempts ({delivery_state:?}): {detail}"
     )]
     RetryExhausted {
@@ -249,6 +257,7 @@ impl NetworkError {
     pub fn delivery_state(&self) -> Option<NetworkDeliveryState> {
         match self {
             Self::Timeout { delivery_state, .. }
+            | Self::StalePooledConnection { delivery_state, .. }
             | Self::RetryExhausted { delivery_state, .. }
             | Self::DeliveryFailed { delivery_state, .. } => Some(*delivery_state),
             Self::OutcomeUnknown { .. } => Some(NetworkDeliveryState::PossiblyApplied),

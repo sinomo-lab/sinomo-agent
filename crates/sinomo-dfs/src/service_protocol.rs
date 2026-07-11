@@ -39,9 +39,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         loop {
             events.extend(self.process_incoming()?);
             if pending_request_ids.iter().all(|request_id| {
-                self.pending_routed_writes
-                    .get(request_id)
-                    .is_none_or(|pending| pending.result.is_some())
+                if !self.pending_routed_writes.contains_key(request_id) {
+                    return true;
+                }
+                !matches!(
+                    self.write_outcome(request_id),
+                    Ok(NetworkedDfsWriteOutcome::Pending { .. })
+                )
             }) {
                 return Ok(events);
             }

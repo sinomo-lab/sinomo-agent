@@ -1,7 +1,7 @@
 #[allow(unused_imports)]
 use crate::kv_local_store::kv_err;
 use crate::kv_local_store::{
-    locked_kv_state_authority_id, locked_restore_cluster_raft_from_snapshot_if_newer,
+    locked_cache_cluster_kv_snapshot_if_newer_than_raft, locked_kv_state_authority_id,
     read_cluster_kv_snapshot, write_imported_cluster_kv_snapshot_if_changed,
 };
 use sinomo_base::ClusterBootstrapState;
@@ -56,7 +56,7 @@ pub trait ClusterKvSnapshotRefreshHost {
         state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError>;
 
-    fn restore_cluster_kv_from_snapshot_if_newer(
+    fn cache_cluster_kv_snapshot_if_newer_than_raft(
         &mut self,
         paths: &ClusterPaths,
         local_node_id: &NodeId,
@@ -88,13 +88,13 @@ where
         locked_kv_state_authority_id(paths, state)
     }
 
-    fn restore_cluster_kv_from_snapshot_if_newer(
+    fn cache_cluster_kv_snapshot_if_newer_than_raft(
         &mut self,
         paths: &ClusterPaths,
         local_node_id: &NodeId,
         snapshot: KvSnapshot,
     ) -> Result<bool, NetworkError> {
-        locked_restore_cluster_raft_from_snapshot_if_newer(paths, local_node_id, snapshot)
+        locked_cache_cluster_kv_snapshot_if_newer_than_raft(paths, local_node_id, snapshot)
     }
 
     fn call_node_object_rpc(
@@ -123,7 +123,7 @@ where
 pub struct ClusterKvSnapshotRefreshOutcome {
     pub store: InProcessKvStore,
     pub fetched_remote: bool,
-    pub restored_newer_snapshot: bool,
+    pub materialized_cache_changed: bool,
 }
 
 pub fn refresh_current_cluster_kv_store_with_host(
@@ -184,7 +184,7 @@ pub fn refresh_current_cluster_kv_store_with_outcome(
             detail: "no local or reachable cluster KV snapshot is available".to_string(),
         })?;
     write_imported_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
-    let restored_newer_snapshot = host.restore_cluster_kv_from_snapshot_if_newer(
+    let materialized_cache_changed = host.cache_cluster_kv_snapshot_if_newer_than_raft(
         paths,
         &state.local_node_id,
         snapshot.clone(),
@@ -193,7 +193,7 @@ pub fn refresh_current_cluster_kv_store_with_outcome(
     Ok(ClusterKvSnapshotRefreshOutcome {
         store,
         fetched_remote,
-        restored_newer_snapshot,
+        materialized_cache_changed,
     })
 }
 

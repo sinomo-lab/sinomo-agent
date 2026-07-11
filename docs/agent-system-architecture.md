@@ -233,6 +233,11 @@ storage registry.
 
 ## Tool Surface and Progressive Disclosure
 
+The primary availability surface is `AgentToolSurface`. It projects the tools
+that a package, runtime, and current registry generation make available to a
+model turn; it is distinct from the executor registry and from capability
+authorization.
+
 The tool planner combines registry and module descriptors, package declarations,
 visibility, allow and deny policy, capabilities, and the current registry
 generation. Only the planned surface is callable in a model turn.
@@ -319,11 +324,26 @@ readiness:
 - tool-surface availability constraints survive the projection;
 - session snapshots can resume after compaction.
 
-Model quality is eval work, not an ordinary Rust unit test. The optional
+Model quality is eval work, not ordinary Rust unit testing. The optional
 benchmark module covers long-session resume, constraint retention, coding
 continuation, and cluster work after compaction. Live/model results are eval
 evidence; local readiness remains responsible for deterministic projection and
 persistence invariants.
+
+Run the compaction harness from the repository root in progressively stronger
+modes:
+
+```bash
+python3 modules/benchmark/sinomo-benchmarks/agent/run_compaction_eval.py --mode plan
+python3 modules/benchmark/sinomo-benchmarks/agent/run_compaction_eval.py --mode fixture
+python3 modules/benchmark/sinomo-benchmarks/agent/run_compaction_eval.py --mode run
+```
+
+Plan and fixture modes provide deterministic harness validation. Run mode may
+call configured models or a live cluster.
+
+Live/model results are research and eval evidence. Local and CI gates interpret
+them separately: local readiness remains responsible only for deterministic projection and persistence invariants.
 
 ## Skills
 

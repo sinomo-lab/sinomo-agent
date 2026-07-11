@@ -53,6 +53,7 @@ const CLUSTER_ROLLOUT_UPLOAD_MAX_CHUNK_BYTES: usize = 32 * 1024 * 1024;
 const SHADOW_MAIN_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const SHADOW_MAIN_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SHADOW_MAIN_RESTART_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
+const SUPERVISED_MAIN_RESTART_REQUEST_FILE: &str = "supervised-main-restart.request";
 const SHADOW_RUNTIME_TASK_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
 const SHADOW_NETWORK_MODULE_CONTEXT_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 const SHADOW_STATUS_PUBLISHER_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -310,6 +311,7 @@ pub enum ShadowMainStart {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShadowMainExit {
     PendingActivation,
     RestartRequested,
@@ -331,6 +333,60 @@ pub enum PendingShadowMainExit {
         main_binary: PathBuf,
         main_options: crate::DaemonRunOptions,
     },
+}
+
+fn supervised_main_restart_request_path(rollout_paths: &SelfRolloutPaths) -> PathBuf {
+    rollout_paths
+        .root
+        .join(SUPERVISED_MAIN_RESTART_REQUEST_FILE)
+}
+
+/// Mark a clean main-daemon exit as an intentional identity/runtime restart.
+/// The requesting PID prevents a stale marker from changing the meaning of a
+/// later operator-requested shutdown.
+pub(crate) fn request_supervised_main_restart(paths: &DaemonPaths) -> Result<(), DaemonError> {
+    let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let rollout_paths = SelfRolloutPaths::new(data_dir);
+    fs::create_dir_all(&rollout_paths.root).map_err(|source| DaemonError::Io {
+        path: rollout_paths.root.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let marker = supervised_main_restart_request_path(&rollout_paths);
+    fs::write(&marker, format!("{}\n", std::process::id())).map_err(|source| DaemonError::Io {
+        path: marker.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn take_supervised_main_restart_request(
+    rollout_paths: &SelfRolloutPaths,
+    exited_pid: u32,
+) -> Result<bool, DaemonError> {
+    let marker = supervised_main_restart_request_path(rollout_paths);
+    let requested_pid = match fs::read_to_string(&marker) {
+        Ok(value) => value.trim().parse::<u32>().ok(),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(DaemonError::Io {
+                path: marker.display().to_string(),
+                detail: source.to_string(),
+            });
+        }
+    };
+    match fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(DaemonError::Io {
+                path: marker.display().to_string(),
+                detail: source.to_string(),
+            });
+        }
+    }
+    Ok(requested_pid == Some(exited_pid))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1192,10 +1248,12 @@ pub fn run_shadow_daemon_supervision_loop(
                     continue;
                 }
 
+                let exited_pid = child.id();
                 match handle_shadow_main_process_exit(
                     &rollout_paths,
                     &main_binary,
                     &main_options,
+                    exited_pid,
                     status,
                 )? {
                     ShadowMainExit::PendingActivation => {
@@ -1222,7 +1280,7 @@ pub fn run_shadow_daemon_supervision_loop(
                         supervised_main_started_at = None;
                         let delay = main_restart_backoff.schedule_after_failure(Instant::now());
                         tracing::warn!(
-                            "sinomo shadow daemon supervised main crashed; retrying in {}ms",
+                            "sinomo shadow daemon supervised main exited with restart requested; retrying in {}ms",
                             delay.as_millis()
                         );
                         crate::append_operational_event_best_effort(
@@ -3294,15 +3352,18 @@ pub fn handle_shadow_main_process_exit(
     rollout_paths: &SelfRolloutPaths,
     _main_binary: &Path,
     _main_options: &crate::DaemonRunOptions,
+    exited_pid: u32,
     status: ExitStatus,
 ) -> Result<ShadowMainExit, DaemonError> {
+    let supervisor_restart_requested =
+        take_supervised_main_restart_request(rollout_paths, exited_pid)?;
     if read_rollout_main_activation(rollout_paths)?.is_some() {
         return Ok(ShadowMainExit::PendingActivation);
     }
     let observation = crate::main_exit_observation_from_status(status);
     let kind = classify_main_exit(observation);
     record_rollout_main_exit(rollout_paths, observation, kind)?;
-    if kind == sinomo_rollout::MainExitKind::Crash {
+    if supervisor_restart_requested || kind == sinomo_rollout::MainExitKind::Crash {
         Ok(ShadowMainExit::RestartRequested)
     } else {
         Ok(ShadowMainExit::Suppressed)
@@ -4244,9 +4305,8 @@ mod tests {
         let staged_shadow = rollout_staged_shadow_binary(&rollout_paths);
         std::fs::create_dir_all(staged_main.parent().expect("staged parent"))
             .expect("staged parent dir");
-        let current_exe = std::env::current_exe().expect("current exe");
-        std::fs::copy(&current_exe, &staged_main).expect("stage main executable");
-        std::fs::copy(&current_exe, &staged_shadow).expect("stage shadow executable");
+        write_test_executable(&staged_main);
+        write_test_executable(&staged_shadow);
         let mut activation = test_main_activation(&rollout_paths);
         activation.staged_main_binary = Some(staged_main);
         activation.staged_shadow_binary = Some(staged_shadow);
@@ -4369,15 +4429,11 @@ mod tests {
         let root = temp_rollout_test_root("promote-local-finalize");
         let rollout_paths = SelfRolloutPaths::new(&root);
         ensure_rollout_layout(&rollout_paths).expect("rollout layout");
-        let current_exe = env::current_exe().expect("current exe");
         let staged_shadow = rollout_staged_shadow_binary(&rollout_paths);
-        fs::create_dir_all(staged_shadow.parent().expect("staged parent")).expect("staged parent");
-        fs::copy(&current_exe, &staged_shadow).expect("staged shadow");
-        fs::create_dir_all(rollout_paths.shadow_binary.parent().expect("bin parent"))
-            .expect("bin parent");
-        fs::copy(&current_exe, &rollout_paths.shadow_binary).expect("installed shadow");
+        write_test_executable(&staged_shadow);
+        write_test_executable(&rollout_paths.shadow_binary);
         let previous_shadow_binary = root.join("previous-shadow");
-        fs::copy(&current_exe, &previous_shadow_binary).expect("previous shadow");
+        write_test_executable(&previous_shadow_binary);
 
         let activation = test_main_activation(&rollout_paths);
         write_main_activation(&rollout_paths, &activation).expect("main activation");
@@ -4427,7 +4483,7 @@ mod tests {
         let mut activation = test_main_activation(&rollout_paths);
         activation.shadow_binary = current_exe.clone();
         let previous_shadow_binary = root.join("previous-shadow");
-        fs::copy(&current_exe, &previous_shadow_binary).expect("previous shadow");
+        write_test_executable(&previous_shadow_binary);
         let monitor = ShadowMainRolloutMonitor {
             activation,
             main_options: crate::DaemonRunOptions {
@@ -4467,12 +4523,11 @@ mod tests {
         ensure_rollout_layout(&rollout_paths).expect("rollout layout");
         let current_exe = env::current_exe().expect("current exe");
         let staged_main = rollout_staged_main_binary(&rollout_paths);
-        fs::create_dir_all(staged_main.parent().expect("staged parent")).expect("staged parent");
-        fs::copy(&current_exe, &staged_main).expect("staged main");
+        write_test_executable(&staged_main);
         let mut activation = test_main_activation(&rollout_paths);
         activation.shadow_binary = current_exe.clone();
         let previous_shadow_binary = root.join("previous-shadow");
-        fs::copy(&current_exe, &previous_shadow_binary).expect("previous shadow");
+        write_test_executable(&previous_shadow_binary);
         let monitor = ShadowMainRolloutMonitor {
             activation,
             main_options: crate::DaemonRunOptions {
@@ -4546,6 +4601,28 @@ mod tests {
     }
 
     #[test]
+    fn supervised_restart_request_is_pid_scoped_and_consumed() {
+        let root = temp_rollout_test_root("supervised-main-restart-request");
+        let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        let pid = std::process::id();
+
+        request_supervised_main_restart(&daemon_paths).expect("write restart request");
+        assert!(
+            !take_supervised_main_restart_request(&rollout_paths, pid.saturating_add(1))
+                .expect("consume stale restart request")
+        );
+        assert!(!supervised_main_restart_request_path(&rollout_paths).exists());
+
+        request_supervised_main_restart(&daemon_paths).expect("rewrite restart request");
+        assert!(
+            take_supervised_main_restart_request(&rollout_paths, pid)
+                .expect("consume matching restart request")
+        );
+        assert!(!supervised_main_restart_request_path(&rollout_paths).exists());
+    }
+
+    #[test]
     fn deferred_shadow_rollout_completion_ignores_missing_pending_state() {
         let root = temp_rollout_test_root("deferred-shadow-no-pending");
         let paths = DaemonPaths::with_root(root.join("daemon"));
@@ -4558,6 +4635,13 @@ mod tests {
 
     fn temp_rollout_test_root(label: &str) -> sinomo_testdir::TestDir {
         sinomo_testdir::TestDir::new(&format!("sinomo-daemon-rollout-{label}"))
+    }
+
+    fn write_test_executable(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("test executable parent");
+        }
+        fs::write(path, b"sinomo rollout test executable").expect("test executable");
     }
 
     fn test_daemon_status(pid: u32) -> DaemonStatus {

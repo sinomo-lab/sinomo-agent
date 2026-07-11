@@ -1,5 +1,4 @@
 use crate::invite_publish::read_cluster_invitation_from_kv;
-use crate::kv_local_store::kv_err;
 use crate::prelude::*;
 use crate::read_cluster_state;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};

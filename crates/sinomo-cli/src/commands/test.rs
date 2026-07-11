@@ -268,6 +268,7 @@ pub(crate) fn test_registry() -> Result<SinomoTestRegistry, CliError> {
     let builder = crate::commands::test_cases_agent::register_agent_cluster_test_cases(builder);
     let builder =
         crate::commands::test_cases_cluster::register_cluster_migration_test_cases(builder);
+    let builder = crate::commands::test_cases_cluster_kv::register_cluster_kv_test_cases(builder);
     let builder = crate::commands::test_cases_dfs::register_dfs_cluster_test_cases(builder);
     let builder = cli_runtime_config()
         .test_registry_hooks
@@ -656,6 +657,7 @@ mod tests {
             "cluster.network.ping-benchmark",
             "cluster.network.hygiene",
             "cluster.network.hygiene-dirty-fixture",
+            "cluster.kv.quorum-commit-benchmark",
             "cluster.migration.seed-source",
             "cluster.migration.verify-joined",
             "cluster.dfs.lightweight-latency",

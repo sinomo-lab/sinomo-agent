@@ -263,7 +263,8 @@ pub fn authorize_authenticated_daemon_command(
         }
         route
             if route == crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE
-                || route == crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE =>
+                || route == crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE
+                || route == crate::DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE =>
         {
             authenticated.signer.can_run_local_command()
         }
@@ -910,7 +911,8 @@ fn authorize_cluster_join_request_signer(
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
     let state = sinomo_core::cluster::read_cluster_state(&cluster_paths)?;
 
-    let persisted_invite = read_active_cluster_invite(&cluster_paths, &request.invite.invite_id)?;
+    let persisted_invite =
+        read_active_cluster_invite(&cluster_paths, &state, &request.invite.invite_id)?;
     if !persisted_invite
         .allowed_member_roles
         .contains(&requested_member.role)
@@ -945,10 +947,15 @@ fn authorize_cluster_join_request_signer(
 
 fn read_active_cluster_invite(
     cluster_paths: &ClusterPaths,
+    state: &sinomo_core::ClusterBootstrapState,
     invite_id: &ClusterInviteId,
 ) -> Result<ClusterJoinInvite, DaemonError> {
-    sinomo_core::cluster::read_cluster_invitation_from_kv(cluster_paths, invite_id)
-        .map_err(Into::into)
+    sinomo_core::cluster::read_cluster_invitation_for_join_introducer(
+        cluster_paths,
+        state,
+        invite_id,
+    )
+    .map_err(Into::into)
 }
 
 fn verify_cluster_join_invite_signature(invite: &ClusterJoinInvite) -> Result<(), DaemonError> {
@@ -1247,6 +1254,158 @@ mod tests {
             DaemonSignerAuthority::StatusProbe,
         );
         assert!(authorize_authenticated_daemon_command(&cluster_health).is_err());
+    }
+
+    #[test]
+    fn join_candidate_auth_uses_newer_invite_cache_on_non_voter_bridge() {
+        let data_root = unique_auth_test_root("sinomo-daemon-auth-join-bridge-cache");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let daemon_paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let issuer_root = unique_auth_test_root("sinomo-daemon-auth-join-bridge-cache-issuer");
+        let issuer_identity =
+            load_or_create_main_node_identity(&issuer_root).expect("issuer identity");
+        let candidate_root =
+            unique_auth_test_root("sinomo-daemon-auth-join-bridge-cache-candidate");
+        let candidate_identity =
+            load_or_create_main_node_identity(&candidate_root).expect("candidate identity");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = sinomo_core::node::ClusterId::from_legacy_named(
+            "cluster_daemon_auth_join_bridge_cache",
+        )
+        .expect("cluster");
+        let issuer_node = sinomo_core::node::NodeId::from_legacy_named(
+            "node_daemon_auth_join_bridge_cache_issuer",
+        )
+        .expect("issuer");
+        let bridge_node = sinomo_core::node::NodeId::from_legacy_named(
+            "node_daemon_auth_join_bridge_cache_bridge",
+        )
+        .expect("bridge");
+        let candidate_node = sinomo_core::node::NodeId::from_legacy_named(
+            "node_daemon_auth_join_bridge_cache_candidate",
+        )
+        .expect("candidate");
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "auth join bridge cache",
+            issuer_node.clone(),
+            "issuer",
+            issuer_identity.public_key.clone(),
+            now,
+        );
+        state.members[0].capabilities =
+            sinomo_core::node::main_daemon_capabilities(&state.members[0].role);
+        state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+        let mut bridge = ClusterMemberRecord::pending_learner(
+            cluster_id.clone(),
+            bridge_node.clone(),
+            "bridge",
+            "pk-bridge",
+            now,
+        );
+        bridge.state = ClusterMemberState::Learner;
+        bridge.capabilities = sinomo_core::node::main_daemon_capabilities(&bridge.role);
+        bridge.allowed_capabilities = bridge.capabilities.clone();
+        state.members.push(bridge);
+
+        let mut invite = ClusterJoinInvite {
+            invite_id: ClusterInviteId::from_legacy_named("invite_daemon_auth_bridge_cache")
+                .expect("invite"),
+            cluster_id: cluster_id.clone(),
+            cluster_name: Some("auth join bridge cache".to_string()),
+            cluster_public_key: issuer_identity.public_key.clone(),
+            invitation_secret: "secret-daemon-auth-bridge-cache".to_string(),
+            communication_channels: Vec::new(),
+            introducers: Vec::new(),
+            token_id: "token-daemon-auth-bridge-cache".to_string(),
+            expires_at: now + time::Duration::hours(1),
+            trust_domain: sinomo_core::TrustDomain::new("trust.local").expect("trust domain"),
+            allowed_member_roles: vec![ClusterMemberRole::Learner],
+            issuer_node_id: issuer_node,
+            issuer_public_key: issuer_identity.public_key.clone(),
+            signature: String::new(),
+        };
+        invite.signature =
+            sinomo_core::cluster::sign_cluster_join_invite(&invite, &issuer_identity)
+                .expect("sign invite");
+
+        state.local_node_id = bridge_node;
+        state.local_node_display_name = "bridge".to_string();
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write bridge state");
+        let local_cache = cluster_paths.kv_paths().local_cache();
+        let mut raft_node = local_cache
+            .open_raft_node(state.local_node_id.clone())
+            .expect("open learner raft");
+        let baseline = raft_node
+            .append_local_command(
+                1,
+                sinomo_core::kv::KvCommand::Op(sinomo_core::kv::KvOp::Put {
+                    key: "/test/join-bridge-applied-baseline".to_string(),
+                    value: b"baseline".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append learner baseline");
+        raft_node
+            .commit_to(baseline.index)
+            .expect("commit learner baseline");
+        let applied = raft_node
+            .store()
+            .try_snapshot()
+            .expect("applied learner snapshot");
+        drop(raft_node);
+        let mut cache =
+            sinomo_core::kv::InProcessKvStore::restore(applied).expect("restore learner snapshot");
+        cache
+            .put_serde(
+                sinomo_core::node::cluster_invitation_key(&invite.invite_id),
+                &invite,
+                None,
+            )
+            .expect("cache invitation");
+        local_cache
+            .write_snapshot(&cache.snapshot().expect("cached snapshot"))
+            .expect("write invitation cache");
+
+        let request = sinomo_core::cluster::ClusterJoinRegistrationRequest {
+            invite: invite.clone(),
+            invitation_secret: invite.invitation_secret.clone(),
+            members: vec![ClusterMemberRecord::pending_learner(
+                cluster_id,
+                candidate_node,
+                "candidate",
+                candidate_identity.public_key.clone(),
+                now,
+            )],
+        };
+        authorize_cluster_join_request_signer(
+            &daemon_paths,
+            &request,
+            &candidate_identity.public_key,
+        )
+        .expect("authorize candidate through converging bridge cache");
+        assert!(matches!(
+            authorize_cluster_join_request_signer(
+                &daemon_paths,
+                &request,
+                &issuer_identity.public_key,
+            ),
+            Err(DaemonError::AuthDenied)
+        ));
+
+        let mut bad_secret = request;
+        bad_secret.invitation_secret.push_str("-tampered");
+        assert!(matches!(
+            authorize_cluster_join_request_signer(
+                &daemon_paths,
+                &bad_secret,
+                &candidate_identity.public_key,
+            ),
+            Err(DaemonError::AuthDenied)
+        ));
     }
 
     #[test]
@@ -1686,6 +1845,7 @@ mod tests {
         for route in [
             crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE,
             crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
+            crate::DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
         ] {
             authorize_authenticated_daemon_command(&authenticated_command(
                 route.to_string(),

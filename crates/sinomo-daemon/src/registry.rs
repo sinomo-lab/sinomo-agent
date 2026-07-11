@@ -7,11 +7,6 @@
 //! module and service loading (stage E of
 //! docs/plans/r0-r1-crate-boundary-refactor.md).
 
-#[allow(unused_imports)]
-use sinomo_core::storage::{
-    StorageContractError, StorageLayout, StorageRegistry, StorageVerificationReport,
-};
-
 pub use sinomo_core::storage::*;
 
 pub fn sinomo_data_dir_layout() -> Result<StorageLayout, StorageContractError> {

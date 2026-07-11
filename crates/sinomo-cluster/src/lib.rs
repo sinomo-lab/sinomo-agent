@@ -94,7 +94,8 @@ pub use health::{
     ClusterDoctorFinding, ClusterHealthRow, ClusterNetworkPingRequest, ClusterNetworkPingResponse,
     ClusterStatusAsyncProbe, ClusterStatusProbe, cluster_doctor_findings,
     cluster_health_rows_with_probe, cluster_health_rpc_request,
-    cluster_health_rpc_request_without_peer_views, cluster_local_health_rpc_request,
+    cluster_health_rpc_request_without_peer_views,
+    cluster_health_rpc_request_without_recursive_peer_views, cluster_local_health_rpc_request,
     cluster_network_ping_rpc_request, cluster_network_ping_rpc_request_with_response_payload,
     decode_cluster_health_rpc_response, decode_cluster_network_ping_rpc_response,
     handle_cluster_network_ping_rpc_request_for_node,
@@ -113,8 +114,8 @@ pub use invite::{
 };
 pub use invite_publish::{
     ClusterInvitePublishHost, handle_cluster_invite_publish_request_async_with_host,
-    publish_cluster_invitation_to_quorum_with_host, read_cluster_invitation_from_kv,
-    sync_cluster_invitation_to_kv,
+    publish_cluster_invitation_to_quorum_with_host, read_cluster_invitation_for_join_introducer,
+    read_cluster_invitation_from_kv, sync_cluster_invitation_to_kv,
 };
 pub use join_registration::{
     ClusterJoinReconciliation, ClusterJoinReconciliationHost, ClusterJoinRegistrationAsyncHost,
@@ -256,7 +257,6 @@ pub(crate) mod prelude {
     pub(crate) use sinomo_base::{LatencyClass, RoutingScope};
     #[cfg(test)]
     pub(crate) use sinomo_events::EventStore;
-    pub(crate) use sinomo_events::{EventId, EventStoreError};
     #[cfg(test)]
     pub(crate) use sinomo_events::{EventSequence, SessionId, StoredEvent};
     #[allow(unused_imports)]
@@ -277,11 +277,8 @@ pub(crate) mod prelude {
     pub(crate) use sinomo_node::{NodeId, shadow_daemon_node_id};
     #[cfg(test)]
     pub(crate) use std::collections::HashSet;
-    pub(crate) use std::collections::{BTreeMap, BTreeSet, VecDeque};
-    pub(crate) use std::io;
-    pub(crate) use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-    pub(crate) use std::path::PathBuf;
-    pub(crate) use std::sync::{Arc, Mutex};
+    pub(crate) use std::collections::{BTreeMap, BTreeSet};
+    pub(crate) use std::net::SocketAddr;
     pub(crate) use std::time::Duration;
     #[allow(unused_imports)]
     pub(crate) use thiserror::Error;
@@ -341,16 +338,16 @@ pub use kv_local_store::{
 pub use kv_local_store::{
     append_cluster_raft_command, append_cluster_raft_command_uncommitted,
     append_cluster_raft_command_with_response, apply_cluster_raft_append,
-    cached_cluster_kv_reader_node_id_for_test, cluster_kv_cached_snapshot_reads_for_test,
-    cluster_kv_metadata_cache_capacity_for_test, cluster_kv_reader_node_id_cache_contains_for_test,
-    cluster_raft_wal_paths, open_cluster_raft_kv_node, open_cluster_raft_kv_node_async,
-    read_cluster_kv_current_snapshot, read_cluster_kv_prefix_entries,
-    read_cluster_kv_prefix_entries_limited,
+    cache_cluster_kv_snapshot_if_newer_than_raft, cached_cluster_kv_reader_node_id_for_test,
+    cluster_kv_cached_snapshot_reads_for_test, cluster_kv_metadata_cache_capacity_for_test,
+    cluster_kv_reader_node_id_cache_contains_for_test, cluster_raft_wal_paths,
+    open_cluster_raft_kv_node, open_cluster_raft_kv_node_async, read_cluster_kv_current_snapshot,
+    read_cluster_kv_prefix_entries, read_cluster_kv_prefix_entries_limited,
     read_cluster_kv_prefix_entries_limited_by_payload_bytes, read_cluster_kv_snapshot,
     read_cluster_kv_store, record_cluster_kv_reader_node_id_cache_for_test,
     refresh_cluster_kv_reader_node_id_cache_for_test,
     remove_cluster_kv_reader_node_id_cache_entries_under_root_for_test,
-    reset_cluster_kv_cached_snapshot_reads_for_test, restore_cluster_raft_from_snapshot_if_newer,
+    reset_cluster_kv_cached_snapshot_reads_for_test,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use kv_local_store::{kv_err, write_cluster_kv_snapshot};

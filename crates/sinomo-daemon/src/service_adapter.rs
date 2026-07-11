@@ -132,8 +132,8 @@ use crate::{
     DAEMON_DFS_BROWSER_STATUS_ROUTE, DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
     DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE, DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE,
     DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
-    DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
-    DAEMON_STATUS_ROUTE,
+    DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE, DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
+    DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE,
 };
 
 static DAEMON_CLUSTER_NETWORK_PING_NODE_IDS: OnceLock<
@@ -506,6 +506,7 @@ impl Service for DaemonControlService {
             DAEMON_STATUS_ROUTE,
             DAEMON_SHUTDOWN_ROUTE,
             DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
+            DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
             DAEMON_OBJECT_RPC_FORWARD_ROUTE,
             DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
         ]
@@ -516,6 +517,7 @@ impl Service for DaemonControlService {
         for route in &mut routes {
             if route.route == DAEMON_OBJECT_RPC_FORWARD_ROUTE
                 || route.route == DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE
+                || route.route == DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE
             {
                 route.auth_scope = Some("local-command".to_string());
             }
@@ -568,6 +570,21 @@ impl Service for DaemonControlService {
                         ObjectRpcResponse::encode_body(
                             DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
                             &crate::DaemonClusterMaintenanceRefreshResponse,
+                        )?,
+                        ServiceDisposition::Continue,
+                    )
+                }
+                DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE => {
+                    let _: crate::DaemonLocalConnectivityReloadRequest = request.decode_body()?;
+                    let cluster_paths =
+                        cluster_paths_from_daemon_paths(&paths).map_err(daemon_error)?;
+                    sinomo_core::network::invalidate_local_cluster_connectivity_cache(
+                        &cluster_paths,
+                    )?;
+                    (
+                        ObjectRpcResponse::encode_body(
+                            DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
+                            &crate::DaemonLocalConnectivityReloadResponse,
                         )?,
                         ServiceDisposition::Continue,
                     )
@@ -1300,9 +1317,31 @@ impl Service for ClusterControlService {
             })
             .await?;
             ctx.respond(response)?;
-            Ok(ServiceDisposition::Continue)
+            Ok(cluster_control_service_disposition(&route))
         })
     }
+}
+
+/// Cluster identity is captured by foundational daemon services and network
+/// tasks at process startup. Once an operation creates or replaces that
+/// identity, continuing to serve would expose stale authorization, routing,
+/// and KV state. Drain after the response so the shadow supervisor can start
+/// a process bound to the newly committed identity.
+fn cluster_control_service_disposition(route: &str) -> ServiceDisposition {
+    if cluster_control_service_restart_required(route) {
+        ServiceDisposition::Stop
+    } else {
+        ServiceDisposition::Continue
+    }
+}
+
+fn cluster_control_service_restart_required(route: &str) -> bool {
+    matches!(
+        route,
+        sinomo_core::cluster::CLUSTER_CONTROL_INIT_ROUTE
+            | sinomo_core::cluster::CLUSTER_CONTROL_JOIN_ROUTE
+            | sinomo_core::cluster::CLUSTER_CONTROL_LEAVE_ROUTE
+    )
 }
 
 /// Dispatches one `/cluster/control/*` request to the daemon-side operation
@@ -4668,6 +4707,7 @@ async fn dispatch_via_registry_async(
     paths: Option<&DaemonPaths>,
     replay_key: Option<Vec<u8>>,
 ) -> Result<bool, DaemonError> {
+    let supervisor_restart_required = cluster_control_service_restart_required(&request.route);
     let (response, stop) = dispatch_rpc_via_registry_to_response_async(
         service_host,
         authenticated,
@@ -4678,6 +4718,12 @@ async fn dispatch_via_registry_async(
     .await?;
     write_async_daemon_rpc_response_frame(stream, stream_address, response).await?;
     if stop {
+        if supervisor_restart_required
+            && let Some(paths) = paths
+            && let Err(error) = crate::rollout::request_supervised_main_restart(paths)
+        {
+            tracing::error!(%error, "could not mark cluster identity restart for the shadow supervisor");
+        }
         stream
             .shutdown_write(stream_address)
             .await
@@ -5172,6 +5218,46 @@ mod tests {
     }
 
     #[test]
+    fn daemon_local_connectivity_reload_rpc_dispatches() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-connectivity-reload");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let registry = ServiceRegistry::builder()
+            .register(DaemonControlService {
+                paths,
+                runtime: Some(runtime.handle().clone()),
+            })
+            .build();
+        let host = test_service_host(&root, registry);
+        let mut router = host.route_policy_layer().layer(host.active_router());
+
+        let response = runtime
+            .block_on(sinomo_core::network::call_object_rpc_service_async(
+                &mut router,
+                {
+                    let mut request = ObjectRpcRequest::encode_body(
+                        DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
+                        DAEMON_RPC_CATEGORY,
+                        &crate::DaemonLocalConnectivityReloadRequest,
+                    )
+                    .expect("request");
+                    annotate_test_request(&mut request, DaemonSignerAuthority::Local);
+                    request
+                },
+            ))
+            .expect("connectivity reload response");
+
+        response.error_detail().expect("connectivity reload ok");
+        response
+            .decode_body::<crate::DaemonLocalConnectivityReloadResponse>()
+            .expect("decode connectivity reload response");
+    }
+
+    #[test]
     fn daemon_service_registry_host_installs_native_dylib_cancel_route() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-native-dylib-cancel-route");
         let registry = ServiceRegistry::builder().build();
@@ -5639,6 +5725,14 @@ mod tests {
         let init =
             sinomo_core::cluster::decode_cluster_control_init_rpc_response_body(&response.body)
                 .expect("init response body");
+        assert_eq!(
+            response
+                .metadata
+                .get(DAEMON_SERVICE_DISPOSITION_METADATA_KEY)
+                .map(String::as_str),
+            Some("stop"),
+            "identity-changing cluster control must drain the boot-time daemon runtime"
+        );
 
         let cluster_paths = ClusterPaths::new(&data_dir);
         assert!(cluster_paths.state.exists());
@@ -5673,6 +5767,13 @@ mod tests {
         let rename =
             sinomo_core::cluster::decode_cluster_control_rename_rpc_response_body(&response.body)
                 .expect("rename response body");
+        assert_eq!(
+            response
+                .metadata
+                .get(DAEMON_SERVICE_DISPOSITION_METADATA_KEY)
+                .map(String::as_str),
+            Some("continue")
+        );
         assert_eq!(rename.node_id, init.node_id);
         assert!(rename.changed);
         assert_eq!(rename.name, "cluster-control-node-renamed");
@@ -5686,6 +5787,33 @@ mod tests {
             .find(|member| member.node_id == init.node_id)
             .expect("renamed cluster member");
         assert_eq!(renamed_member.display_name, "cluster-control-node-renamed");
+    }
+
+    #[test]
+    fn cluster_identity_changes_stop_the_boot_time_daemon_runtime() {
+        for route in [
+            sinomo_core::cluster::CLUSTER_CONTROL_INIT_ROUTE,
+            sinomo_core::cluster::CLUSTER_CONTROL_JOIN_ROUTE,
+            sinomo_core::cluster::CLUSTER_CONTROL_LEAVE_ROUTE,
+        ] {
+            assert_eq!(
+                cluster_control_service_disposition(route),
+                ServiceDisposition::Stop,
+                "{route} replaces the cluster identity captured at daemon startup"
+            );
+        }
+        for route in [
+            sinomo_core::cluster::CLUSTER_CONTROL_INVITE_ROUTE,
+            sinomo_core::cluster::CLUSTER_CONTROL_RENAME_ROUTE,
+            sinomo_core::cluster::CLUSTER_CONTROL_ROLE_ROUTE,
+            sinomo_core::cluster::CLUSTER_CONTROL_REMOVE_ROUTE,
+        ] {
+            assert_eq!(
+                cluster_control_service_disposition(route),
+                ServiceDisposition::Continue,
+                "{route} does not replace the local daemon cluster identity"
+            );
+        }
     }
 
     #[test]
@@ -5916,6 +6044,14 @@ mod tests {
             !daemon_status
                 .observability
                 .contains_key("daemon.module_route")
+        );
+        let connectivity_reload = catalog
+            .routes
+            .get(DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE)
+            .expect("local connectivity reload route");
+        assert_eq!(
+            connectivity_reload.auth_scope.as_deref(),
+            Some("local-command")
         );
     }
 

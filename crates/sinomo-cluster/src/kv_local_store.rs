@@ -476,25 +476,25 @@ pub fn open_cluster_raft_kv_node(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn restore_cluster_raft_from_snapshot_if_newer(
+pub fn cache_cluster_kv_snapshot_if_newer_than_raft(
     paths: &ClusterPaths,
     node_id: &NodeId,
     snapshot: KvSnapshot,
 ) -> Result<bool, NetworkError> {
     paths
         .kv_paths()
-        .restore_raft_from_snapshot_if_newer_and_notify(node_id, snapshot)
+        .cache_snapshot_if_newer_than_raft_and_notify(node_id, snapshot)
         .map_err(kv_err)
 }
 
-pub(crate) fn locked_restore_cluster_raft_from_snapshot_if_newer(
+pub(crate) fn locked_cache_cluster_kv_snapshot_if_newer_than_raft(
     paths: &ClusterPaths,
     node_id: &NodeId,
     snapshot: KvSnapshot,
 ) -> Result<bool, NetworkError> {
     paths
         .kv_paths()
-        .locked_restore_raft_from_snapshot_if_newer_and_notify(node_id, snapshot)
+        .locked_cache_snapshot_if_newer_than_raft_and_notify(node_id, snapshot)
         .map_err(kv_err)
 }
 

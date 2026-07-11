@@ -970,39 +970,6 @@ pub(crate) fn file_lock_is_busy(source: &std::io::Error) -> bool {
         || matches!(source.raw_os_error(), Some(32 | 33))
 }
 
-pub(crate) fn kv_error_is_busy(error: &KvError) -> bool {
-    matches!(error, KvError::Busy { .. })
-}
-
-pub(crate) fn quarantine_unreadable_raft_view(paths: &KvWalPaths) {
-    if !paths.root.exists() {
-        return;
-    }
-    for suffix in 0..10 {
-        let candidate = paths.root.with_file_name(format!(
-            "{}.corrupt-{}-{suffix}",
-            paths
-                .root
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("raft"),
-            std::process::id()
-        ));
-        if candidate.exists() {
-            continue;
-        }
-        if let Err(error) = fs::rename(&paths.root, &candidate) {
-            eprintln!(
-                "warning: could not quarantine unreadable local kv raft view {} -> {}: {}",
-                paths.root.display(),
-                candidate.display(),
-                error
-            );
-        }
-        return;
-    }
-}
-
 pub(crate) fn sync_directory(path: &Path) -> Result<(), KvError> {
     durable_file::sync_directory(path).map_err(kv_durable_file_error)
 }

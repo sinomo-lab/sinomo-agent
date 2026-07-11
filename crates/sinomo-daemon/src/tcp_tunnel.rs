@@ -34,6 +34,12 @@ const TCP_TUNNEL_REAL_ENDPOINT_MIN_DIRECT_FALLBACK_BUDGET: Duration = Duration::
 const TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX: &str =
     sinomo_core::network::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TcpTunnelDirection {
+    Inbound,
+    Outbound,
+}
+
 type PendingTcpTunnelMap = Arc<tokio::sync::Mutex<HashMap<u64, PendingTcpTunnelRequest>>>;
 
 struct PendingTcpTunnelRequest {
@@ -102,8 +108,19 @@ impl TcpTunnelRegistry {
             if existing.active_requests.load(Ordering::Relaxed) > 0 {
                 return Err(existing);
             }
+            // Both peers are allowed to dial so asymmetric/NAT reachability
+            // still works. When both directions connect at once, however,
+            // replacing every idle duplicate makes the two sides close each
+            // other's physical connection forever. Prefer the connection
+            // initiated by the lower node id on both ends; retain a lone
+            // reverse-direction connection until that canonical one arrives.
+            let replace = existing.clean_shutdown.load(Ordering::Relaxed)
+                || (!existing.canonical_direction && handle.canonical_direction);
+            if !replace {
+                return Err(existing);
+            }
             peers.insert(handle.peer_node_id.clone(), handle);
-            existing.request_close("replaced by newer idle tunnel".to_string());
+            existing.request_close("replaced by canonical tcp tunnel".to_string());
             return Ok(());
         }
         peers.insert(handle.peer_node_id.clone(), handle);
@@ -151,6 +168,7 @@ pub(crate) fn insert_test_tcp_tunnel(node_id: NodeId, tx: mpsc::Sender<ClusterTc
         next_request_id: AtomicU64::new(1),
         active_requests: AtomicUsize::new(0),
         clean_shutdown: AtomicBool::new(false),
+        canonical_direction: true,
     });
     TCP_TUNNELS.insert(handle);
 }
@@ -169,6 +187,7 @@ struct TcpTunnelHandle {
     next_request_id: AtomicU64,
     active_requests: AtomicUsize,
     clean_shutdown: AtomicBool,
+    canonical_direction: bool,
 }
 
 struct TcpTunnelActiveRequestGuard<'a>(&'a AtomicUsize);
@@ -537,6 +556,7 @@ pub(crate) async fn accept_tcp_tunnel_connection_async(
         paths.clone(),
         service_runtime.clone(),
         tunnel_record_endpoint,
+        TcpTunnelDirection::Inbound,
     );
     if let Some((cluster_paths, cluster_state, endpoint)) = connectivity_endpoint.as_ref() {
         crate::cluster::remember_cluster_tunnel_connectivity(
@@ -1076,6 +1096,30 @@ fn tcp_tunnel_should_maintain_outbound(local_node_id: &NodeId, peer_node_id: &No
     local_node_id != peer_node_id
 }
 
+fn tcp_tunnel_direction_is_canonical(
+    local_node_id: &NodeId,
+    peer_node_id: &NodeId,
+    direction: TcpTunnelDirection,
+) -> bool {
+    match direction {
+        TcpTunnelDirection::Outbound => local_node_id < peer_node_id,
+        TcpTunnelDirection::Inbound => peer_node_id < local_node_id,
+    }
+}
+
+fn tcp_tunnel_direction_is_canonical_for_paths(
+    paths: &DaemonPaths,
+    peer_node_id: &NodeId,
+    direction: TcpTunnelDirection,
+) -> bool {
+    crate::cluster::cluster_paths_from_daemon_paths(paths)
+        .ok()
+        .and_then(|cluster_paths| read_cluster_state_without_kv(&cluster_paths).ok())
+        .is_some_and(|state| {
+            tcp_tunnel_direction_is_canonical(&state.local_node_id, peer_node_id, direction)
+        })
+}
+
 async fn maintain_tcp_tunnels_once(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
@@ -1266,6 +1310,7 @@ async fn connect_tcp_tunnel_to_endpoint_after_lock(
         paths.clone(),
         runtime.clone(),
         Some(endpoint.clone()),
+        TcpTunnelDirection::Outbound,
     );
     remember_tcp_tunnel_connectivity(
         &paths,
@@ -1355,7 +1400,10 @@ fn spawn_tcp_tunnel(
     paths: DaemonPaths,
     service_runtime: tokio::runtime::Handle,
     connectivity_endpoint: Option<ClusterEndpointRecord>,
+    direction: TcpTunnelDirection,
 ) -> Arc<TcpTunnelHandle> {
+    let canonical_direction =
+        tcp_tunnel_direction_is_canonical_for_paths(&paths, &peer_node_id, direction);
     let (read_half, write_half) = stream.into_split();
     let (tx, rx) = mpsc::channel(TCP_TUNNEL_CHANNEL_CAPACITY);
     let handle = Arc::new(TcpTunnelHandle {
@@ -1365,6 +1413,7 @@ fn spawn_tcp_tunnel(
         next_request_id: AtomicU64::new(1),
         active_requests: AtomicUsize::new(0),
         clean_shutdown: AtomicBool::new(false),
+        canonical_direction,
     });
     if let Err(existing) = TCP_TUNNELS.insert_or_existing(handle.clone()) {
         drop(read_half);
@@ -1741,6 +1790,14 @@ mod tests {
         node_name: &str,
         tx: mpsc::Sender<ClusterTcpTunnelFrame>,
     ) -> Arc<TcpTunnelHandle> {
+        test_tunnel_handle_with_direction(node_name, tx, true)
+    }
+
+    fn test_tunnel_handle_with_direction(
+        node_name: &str,
+        tx: mpsc::Sender<ClusterTcpTunnelFrame>,
+        canonical_direction: bool,
+    ) -> Arc<TcpTunnelHandle> {
         Arc::new(TcpTunnelHandle {
             peer_node_id: NodeId::from_legacy_named(node_name).expect("test node id"),
             tx,
@@ -1748,6 +1805,7 @@ mod tests {
             next_request_id: AtomicU64::new(1),
             active_requests: AtomicUsize::new(0),
             clean_shutdown: AtomicBool::new(false),
+            canonical_direction,
         })
     }
 
@@ -2013,11 +2071,11 @@ mod tests {
         drop(old_rx);
         let node_name = "tcp_tunnel_retry_after_idle_replacement";
         let node_id = NodeId::from_legacy_named(node_name).expect("test node id");
-        let old = test_tunnel_handle(node_name, old_tx);
+        let old = test_tunnel_handle_with_direction(node_name, old_tx, false);
         TCP_TUNNELS.insert(old.clone());
 
         let (new_tx, mut new_rx) = mpsc::channel(1);
-        let current = test_tunnel_handle(node_name, new_tx);
+        let current = test_tunnel_handle_with_direction(node_name, new_tx, true);
         TCP_TUNNELS.insert(current.clone());
         assert!(old.clean_shutdown.load(Ordering::Relaxed));
         assert!(Arc::ptr_eq(
@@ -2071,12 +2129,12 @@ mod tests {
     }
 
     #[test]
-    fn tcp_tunnel_registry_replaces_idle_tunnel_on_duplicate_open() {
+    fn tcp_tunnel_registry_replaces_idle_reverse_tunnel_with_canonical_open() {
         let (existing_tx, _existing_rx) = mpsc::channel(1);
         let (duplicate_tx, _duplicate_rx) = mpsc::channel(1);
         let node_name = "tcp_tunnel_duplicate_refreshes_idle";
-        let existing = test_tunnel_handle(node_name, existing_tx);
-        let duplicate = test_tunnel_handle(node_name, duplicate_tx);
+        let existing = test_tunnel_handle_with_direction(node_name, existing_tx, false);
+        let duplicate = test_tunnel_handle_with_direction(node_name, duplicate_tx, true);
         let registry = TcpTunnelRegistry::default();
 
         assert!(registry.insert_or_existing(existing.clone()).is_ok());
@@ -2417,6 +2475,34 @@ mod tests {
     }
 
     #[test]
+    fn tcp_tunnel_canonical_direction_is_lower_node_outbound() {
+        let low = NodeId::from_legacy_named("tcp_tunnel_direction_low").expect("low node id");
+        let high = NodeId::from_legacy_named("tcp_tunnel_direction_high").expect("high node id");
+        let (low, high) = if low < high { (low, high) } else { (high, low) };
+
+        assert!(tcp_tunnel_direction_is_canonical(
+            &low,
+            &high,
+            TcpTunnelDirection::Outbound
+        ));
+        assert!(tcp_tunnel_direction_is_canonical(
+            &high,
+            &low,
+            TcpTunnelDirection::Inbound
+        ));
+        assert!(!tcp_tunnel_direction_is_canonical(
+            &low,
+            &high,
+            TcpTunnelDirection::Inbound
+        ));
+        assert!(!tcp_tunnel_direction_is_canonical(
+            &high,
+            &low,
+            TcpTunnelDirection::Outbound
+        ));
+    }
+
+    #[test]
     fn tcp_tunnel_maintenance_keeps_all_peer_endpoints_until_connected() {
         let low =
             NodeId::from_legacy_named("tcp_tunnel_maintenance_multi_low").expect("low node id");
@@ -2656,14 +2742,14 @@ mod tests {
     }
 
     #[test]
-    fn tcp_tunnel_duplicate_insert_replaces_idle_existing_handle() {
+    fn tcp_tunnel_duplicate_insert_replaces_idle_reverse_handle_with_canonical() {
         let registry = TcpTunnelRegistry::default();
         let peer_name = "tcp_tunnel_duplicate_idle_peer";
         let peer = NodeId::from_legacy_named(peer_name).expect("test node id");
         let (first_tx, _first_rx) = mpsc::channel(1);
         let (second_tx, _second_rx) = mpsc::channel(1);
-        let first = test_tunnel_handle(peer_name, first_tx);
-        let second = test_tunnel_handle(peer_name, second_tx);
+        let first = test_tunnel_handle_with_direction(peer_name, first_tx, false);
+        let second = test_tunnel_handle_with_direction(peer_name, second_tx, true);
 
         assert!(registry.insert_or_existing(first.clone()).is_ok());
         assert!(registry.insert_or_existing(second.clone()).is_ok());
@@ -2674,5 +2760,54 @@ mod tests {
         ));
         assert!(first.clean_shutdown.load(Ordering::Relaxed));
         assert!(!second.clean_shutdown.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn tcp_tunnel_simultaneous_open_converges_on_canonical_direction() {
+        let peer_name = "tcp_tunnel_simultaneous_open_peer";
+        let lower_registry = TcpTunnelRegistry::default();
+        let higher_registry = TcpTunnelRegistry::default();
+        let (lower_outbound_tx, _lower_outbound_rx) = mpsc::channel(1);
+        let (higher_inbound_tx, _higher_inbound_rx) = mpsc::channel(1);
+        let (higher_outbound_tx, _higher_outbound_rx) = mpsc::channel(1);
+        let (lower_inbound_tx, _lower_inbound_rx) = mpsc::channel(1);
+        let lower_outbound = test_tunnel_handle_with_direction(peer_name, lower_outbound_tx, true);
+        let higher_inbound = test_tunnel_handle_with_direction(peer_name, higher_inbound_tx, true);
+        let higher_outbound =
+            test_tunnel_handle_with_direction(peer_name, higher_outbound_tx, false);
+        let lower_inbound = test_tunnel_handle_with_direction(peer_name, lower_inbound_tx, false);
+
+        assert!(
+            lower_registry
+                .insert_or_existing(lower_outbound.clone())
+                .is_ok()
+        );
+        assert!(
+            higher_registry
+                .insert_or_existing(higher_outbound.clone())
+                .is_ok()
+        );
+
+        let rejected_reverse = lower_registry.insert_or_existing(lower_inbound);
+        assert!(rejected_reverse.is_err());
+        assert!(
+            higher_registry
+                .insert_or_existing(higher_inbound.clone())
+                .is_ok()
+        );
+
+        assert!(Arc::ptr_eq(
+            &lower_registry
+                .get(&lower_outbound.peer_node_id)
+                .expect("lower canonical tunnel"),
+            &lower_outbound
+        ));
+        assert!(Arc::ptr_eq(
+            &higher_registry
+                .get(&higher_inbound.peer_node_id)
+                .expect("higher canonical tunnel"),
+            &higher_inbound
+        ));
+        assert!(higher_outbound.clean_shutdown.load(Ordering::Relaxed));
     }
 }

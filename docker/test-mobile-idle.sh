@@ -7,6 +7,7 @@
 #   docker/test-mobile-idle.sh [idle_window_seconds]   (default 60)
 #
 # Environment:
+#   SINOMO_MOBILE_IDLE_PROJECT="sinomo-dfs-test"
 #   SINOMO_MOBILE_IDLE_ROLES="node5=mobile node6=sensor"
 #   SINOMO_MOBILE_IDLE_MEASURE_NODES="node1 node2 node3 node4 node5 node6"
 #   SINOMO_MOBILE_IDLE_ROLE_WAIT=60
@@ -18,6 +19,7 @@
 # working directory (the root docker-compose.yml is the production node).
 SINOMO_DOCKER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export COMPOSE_FILE="${COMPOSE_FILE:-$SINOMO_DOCKER_DIR/docker-compose.dev.yml}"
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-${SINOMO_MOBILE_IDLE_PROJECT:-sinomo-dfs-test}}"
 
 set -euo pipefail
 cd "$(dirname "$0")/.."

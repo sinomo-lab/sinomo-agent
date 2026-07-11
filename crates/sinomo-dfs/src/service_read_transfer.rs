@@ -1088,6 +1088,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         },
                     });
                 }
+                // A partial range cannot be checked against the committed
+                // whole-object hash without a content proof. Preserve that
+                // range-read boundary, but when the requested range happens
+                // to contain the complete object, enforce the same byte-level
+                // hash validation as the full-read path.
+                if data.offset == 0 && range_end == data.total_size_bytes {
+                    let actual_hash = content_hash(&data.bytes);
+                    if pending.content_hash.as_deref() != Some(actual_hash.as_str()) {
+                        let expected_hash = pending
+                            .content_hash
+                            .clone()
+                            .unwrap_or_else(|| "committed content hash".to_string());
+                        self.mark_remote_read_location_missing(
+                            &pending.object_id,
+                            &pending.version,
+                            &pending.content_hash,
+                            &source_node_id,
+                        )?;
+                        return Ok(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                            request_id: response.request_id,
+                            object_id: response.object_id,
+                            source_node_id,
+                            result: DfsReadResult::Rejected {
+                                reason: DfsError::ContentHashMismatch {
+                                    expected: expected_hash,
+                                    actual: actual_hash,
+                                }
+                                .to_string(),
+                            },
+                        });
+                    }
+                }
             }
             DfsReadResult::NotFound => {
                 if pending.cache_response && self.pending_read_metadata_advanced(&pending)? {

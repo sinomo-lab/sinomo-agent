@@ -2,7 +2,6 @@ use crate::keyspace::{
     cluster_capability_policy_key, cluster_connectivity_key, cluster_endpoint_key,
     cluster_identity_key, cluster_network_info_key, cluster_node_status_key_matches_record,
 };
-use crate::kv_local_store::kv_err;
 use crate::kv_local_store::read_cluster_kv_current_snapshot;
 use crate::prelude::*;
 use sinomo_kv::ClusterKvRaftConfigRecord;
@@ -115,14 +114,19 @@ fn cluster_semantic_op_no_effect_response(
                     deleted: false,
                 }))
         }
-        KvOp::DeletePrefix { prefix } => Ok(snapshot
-            .range_prefix_limited(prefix, 1)
-            .map_err(kv_err)?
-            .is_empty()
-            .then(|| sinomo_kv::KvOpResponse::DeletePrefix {
-                prefix: prefix.clone(),
-                deleted_count: 0,
-            })),
+        // This is an existence check, not a bounded range read. Asking for a
+        // one-entry range rejects any prefix containing two or more keys and
+        // makes an otherwise valid DeletePrefix fail during no-effect
+        // detection (notably benchmark cleanup). Inspect only the first
+        // matching entry instead.
+        KvOp::DeletePrefix { prefix } => {
+            Ok(snapshot.prefix_entries(prefix).next().is_none().then(|| {
+                sinomo_kv::KvOpResponse::DeletePrefix {
+                    prefix: prefix.clone(),
+                    deleted_count: 0,
+                }
+            }))
+        }
         _ => Ok(None),
     }
 }

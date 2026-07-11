@@ -79,7 +79,7 @@ use crate::metadata_visible_commit::{
     visible_commit_record_from_parts, visible_commit_recovery_order, visible_commit_should_recover,
     visible_commit_table_ops, visible_object_location_recovery_ops,
 };
-use crate::{DfsFileSystem, DfsObjectKind, DfsObjectMetadata};
+use crate::{DfsFileSystem, DfsObjectKind, DfsObjectMetadata, namespace_transaction_id_for_batch};
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 #[cfg(test)]
 use sinomo_core::DfsWriteReceipt;
@@ -1190,6 +1190,67 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             DfsMetadataMutation::put_object(&object),
             |backend| backend.object_index_table_ops_with_previous(&object, previous.as_ref()),
         )
+    }
+
+    fn add_object_location_if_current(
+        &mut self,
+        object_id: &DfsObjectId,
+        expected_version: &DfsVersion,
+        expected_content_hash: &str,
+        replica_node_id: &NodeId,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        let _lock = self.begin_metadata_write()?;
+        let Some(mut object) = self.get_object(object_id)? else {
+            return Ok(None);
+        };
+        if object.kind == DfsObjectKind::Tombstone
+            || &object.version != expected_version
+            || object.content_hash.as_deref() != Some(expected_content_hash)
+        {
+            return Ok(None);
+        }
+
+        if !object.current_locations.contains(replica_node_id) {
+            object.current_locations.push(replica_node_id.clone());
+        }
+        object = normalized_object_metadata(&object);
+
+        let existing_version = self.get_version(object_id, expected_version)?;
+        let mut version = existing_version
+            .clone()
+            .unwrap_or_else(|| object_version_record(&object, object.content_size_bytes));
+        version.locations = object.current_locations.clone();
+        version = normalized_version_record(&version);
+        if self.get_object(object_id)?.as_ref() == Some(&object)
+            && existing_version.as_ref() == Some(&version)
+        {
+            return Ok(Some(object));
+        }
+
+        let transaction = normalized_namespace_transaction(&DfsNamespaceTransaction {
+            transaction_id: namespace_transaction_id_for_batch(
+                "location-repair",
+                &object.file_system_id,
+                std::slice::from_ref(&object),
+                std::slice::from_ref(&version),
+            ),
+            file_system_id: object.file_system_id.clone(),
+            objects: vec![object.clone()],
+            versions: vec![version],
+            created_at: OffsetDateTime::now_utc(),
+        });
+        validate_namespace_transaction_preconditions(&self.tables, &transaction)?;
+        let table_ops = namespace_transaction_table_ops(&self.tables, &transaction);
+        self.write_journal_entry_and_apply_table_ops_unlocked(
+            DfsMetadataMutation::ApplyNamespaceTransaction {
+                file_system_id: transaction.file_system_id.clone(),
+                transaction_id: transaction.transaction_id.clone(),
+                object_count: transaction.objects.len(),
+                transaction: Some(transaction),
+            },
+            table_ops,
+        )?;
+        Ok(Some(object))
     }
 
     fn put_objects(
@@ -2701,6 +2762,54 @@ mod tests {
     }
 
     #[test]
+    fn local_backend_location_merge_cannot_resurrect_superseded_object() {
+        let root = temp_root("local_backend_location_merge_version_fence");
+        let shard_id = DfsMetadataShardId::new("users");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        let file_system = file_system();
+        let mut live = object(version("version_1"));
+        live.path = "/users/repair-race.txt".to_string();
+        live.changed_at_unix_nanos = 1;
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&live).expect("live object");
+
+        let mut tombstone = live.clone();
+        tombstone.kind = DfsObjectKind::Tombstone;
+        tombstone.version = version("version_2");
+        tombstone.changed_at_unix_nanos = 2;
+        backend.put_object(&tombstone).expect("move tombstone");
+
+        assert_eq!(
+            backend
+                .add_object_location_if_current(
+                    &live.object_id,
+                    &live.version,
+                    live.content_hash.as_deref().expect("content hash"),
+                    &node("node_late_replica"),
+                )
+                .expect("conditional location merge"),
+            None,
+            "a delayed old-version repair must lose to the move tombstone"
+        );
+        assert_eq!(
+            backend.get_object(&live.object_id).expect("current object"),
+            Some(tombstone.clone())
+        );
+
+        drop(backend);
+        let reopened = LocalSobjMetadataBackend::new(shard_id, &root).expect("reopen");
+        assert_eq!(
+            reopened
+                .get_object(&live.object_id)
+                .expect("reopened current object"),
+            Some(tombstone),
+            "recovery must preserve the superseding tombstone"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn local_backend_batches_object_metadata_into_one_table_batch() {
         let root = temp_root("local_backend_batches_object_metadata_into_one_table_batch");
         let mut backend =
@@ -2945,6 +3054,230 @@ mod tests {
         );
 
         cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_evicts_explicit_source_without_object_index() {
+        let root = temp_root("sharded_backend_explicit_source_eviction");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+                shard_config(
+                    "users",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/users".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let file_system = file_system();
+        let mut source = object(version("version_1"));
+        source.path = "/users/move-src.txt".to_string();
+        source.changed_at_unix_nanos = 1;
+        let mut moved = source.clone();
+        moved.path = "/services/move-dst.txt".to_string();
+        moved.version = version("version_2");
+        moved.changed_at_unix_nanos = 2;
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend
+            .shard_backend_mut(&DfsMetadataShardId::new("users"))
+            .expect("users shard")
+            .put_object(&source)
+            .expect("source object");
+        backend
+            .shard_backend_mut(&DfsMetadataShardId::new("services"))
+            .expect("services shard")
+            .put_object(&moved)
+            .expect("destination object");
+        crate::metadata_shard_index::remove_object_shard_index(&root, &source.object_id)
+            .expect("remove derived index");
+
+        backend
+            .evict_object_record_for_foreign_shard_move(&moved, &source.path)
+            .expect("source eviction");
+
+        assert_eq!(
+            backend
+                .shard_backend(&DfsMetadataShardId::new("users"))
+                .expect("users shard")
+                .get_object(&source.object_id)
+                .expect("source record")
+                .map(|object| (object.kind, object.version)),
+            Some((DfsObjectKind::Tombstone, moved.version.clone())),
+            "eviction must derive the source shard from the old path, not a missing local index"
+        );
+        assert_eq!(
+            backend
+                .read_object_shard_index(&source.object_id)
+                .expect("destination index")
+                .map(|index| index.shard_id),
+            Some(DfsMetadataShardId::new("services"))
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_replay_converges_cross_shard_move_independent_of_batch_order() {
+        let users_leader_root = temp_root("sharded_replay_move_users_leader");
+        let services_leader_root = temp_root("sharded_replay_move_services_leader");
+        let first_replica_root = temp_root("sharded_replay_move_first_replica");
+        let second_replica_root = temp_root("sharded_replay_move_second_replica");
+        let file_system = file_system();
+        let mut source = object(version("version_1"));
+        source.path = "/users/replay-move-src.txt".to_string();
+        source.changed_at_unix_nanos = 1;
+        let mut moved = source.clone();
+        moved.path = "/services/replay-move-dst.txt".to_string();
+        moved.version = version("version_2");
+        moved.changed_at_unix_nanos = 2;
+        let mut source_eviction = source.clone();
+        source_eviction.kind = DfsObjectKind::Tombstone;
+        source_eviction.version = moved.version.clone();
+        source_eviction.changed_at_unix_nanos = moved.changed_at_unix_nanos;
+
+        let mut users_leader =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("users"), &users_leader_root)
+                .expect("users leader");
+        users_leader
+            .put_file_system(&file_system)
+            .expect("users filesystem");
+        users_leader.put_object(&source).expect("source object");
+        users_leader
+            .put_object(&source_eviction)
+            .expect("source eviction");
+        users_leader
+            .put_object(&source)
+            .expect("simulated stale location rewrite");
+        let mut users_subscription = users_leader.subscribe(0);
+        let mut users_batch = users_leader
+            .poll_subscription(&mut users_subscription)
+            .expect("users batch");
+
+        let mut services_leader = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("services"),
+            &services_leader_root,
+        )
+        .expect("services leader");
+        services_leader
+            .put_file_system(&file_system)
+            .expect("services filesystem");
+        services_leader
+            .put_object(&moved)
+            .expect("destination object");
+        let mut services_subscription = services_leader.subscribe(0);
+        let mut services_batch = services_leader
+            .poll_subscription(&mut services_subscription)
+            .expect("services batch");
+
+        for (batch_offset, batch) in [&mut users_batch, &mut services_batch]
+            .into_iter()
+            .enumerate()
+        {
+            let sequence_base = JOURNAL_SEGMENT_ENTRY_LIMIT + 128 + batch_offset as u64 * 32;
+            for (entry_offset, entry) in batch.entries.iter_mut().enumerate() {
+                entry.sequence = sequence_base + entry_offset as u64;
+            }
+            batch.next_after_sequence = batch.entries.last().expect("batch entry").sequence;
+        }
+
+        let configs = || {
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+                shard_config(
+                    "users",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/users".to_string(),
+                    },
+                ),
+            ]
+        };
+        for (replica_root, services_first) in [
+            (first_replica_root.path(), true),
+            (second_replica_root.path(), false),
+        ] {
+            let mut replica =
+                LocalShardedMetadataBackend::new(replica_root, configs()).expect("replica backend");
+            replica
+                .put_file_system(&file_system)
+                .expect("replica filesystem");
+            let ordered_batches = if services_first {
+                [&services_batch, &users_batch]
+            } else {
+                [&users_batch, &services_batch]
+            };
+            for batch in ordered_batches {
+                replica.apply_journal_batch(batch).expect("replay batch");
+            }
+            for batch in ordered_batches {
+                assert_eq!(
+                    replica
+                        .apply_journal_batch(batch)
+                        .expect("idempotent replay"),
+                    0
+                );
+            }
+            assert_eq!(
+                replica
+                    .read_object_shard_index(&source.object_id)
+                    .expect("reconciled index")
+                    .map(|index| index.shard_id),
+                Some(DfsMetadataShardId::new("services"))
+            );
+            assert_eq!(
+                replica
+                    .get_object(&source.object_id)
+                    .expect("current object"),
+                Some(moved.clone())
+            );
+            assert_eq!(
+                replica
+                    .get_object_by_path(&file_system.file_system_id, &source.path)
+                    .expect("source path"),
+                None
+            );
+            assert_eq!(
+                replica
+                    .get_object_by_path(&file_system.file_system_id, &moved.path)
+                    .expect("destination path"),
+                Some(moved.clone())
+            );
+
+            drop(replica);
+            let reopened = LocalShardedMetadataBackend::new(replica_root, configs())
+                .expect("reopened replica");
+            assert_eq!(
+                reopened
+                    .get_object(&source.object_id)
+                    .expect("reopened object"),
+                Some(moved.clone())
+            );
+            assert_eq!(
+                reopened
+                    .get_object_by_path(&file_system.file_system_id, &source.path)
+                    .expect("reopened source path"),
+                None
+            );
+        }
+
+        cleanup(&users_leader_root);
+        cleanup(&services_leader_root);
+        cleanup(&first_replica_root);
+        cleanup(&second_replica_root);
     }
 
     #[test]

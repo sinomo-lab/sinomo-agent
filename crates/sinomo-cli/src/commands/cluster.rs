@@ -1,35 +1,15 @@
 use super::*;
 
-#[cfg(test)]
-pub(crate) use cluster::apply_cluster_node_role;
-#[cfg(test)]
-pub(crate) use cluster::cluster_state_sync_txn;
-#[cfg(test)]
-pub(crate) use cluster::invite_channels_for_join_registration;
-#[cfg(test)]
-pub(crate) use cluster::invite_communication_channels;
-#[cfg(test)]
-pub(crate) use cluster::invite_introducer_endpoint;
-#[cfg(test)]
-pub(crate) use cluster::read_cluster_members_from_kv;
-#[cfg(test)]
-pub(crate) use cluster::read_cluster_node_statuses_from_kv;
-#[cfg(test)]
-pub(crate) use cluster::sign_cluster_join_invite;
 use cluster::{
     cluster_join_command, cluster_status_summary_label, decode_cluster_join_invite,
     encode_cluster_join_invite, extract_invite_from_join_command,
     invite_introducer_endpoint_from_state, is_remote_usable_invite_endpoint,
     verify_cluster_join_invite_signature,
 };
-#[cfg(test)]
-pub(crate) use cluster::{compact_default_invite_introducers, push_unique_introducer};
 pub(crate) use network::cluster_state_needs_join_registration;
 use sinomo_runtime::cluster;
 #[allow(unused_imports)]
 use sinomo_runtime::cluster::ClusterKvPathsExt;
-#[cfg(test)]
-pub(crate) use sinomo_runtime::node::apply_cluster_raft_role;
 use sinomo_runtime::node::cluster_member_is_legacy_shadow_daemon;
 
 #[cfg(test)]
@@ -933,6 +913,7 @@ pub(crate) fn cluster_init(options: ClusterInitOptions) -> Result<(), CliError> 
         println!("cluster initialized: {}", response.cluster_id);
         println!("local node: {}", response.node_id);
         println!("state: {}", paths.state.display());
+        print_daemon_cluster_identity_activation_notice();
         return Ok(());
     }
     cluster_init_with_paths(options, &paths)?;
@@ -999,13 +980,12 @@ pub(crate) fn initialize_single_node_cluster_with_paths(
 /// direct implementation stays reachable through [`cluster_invite_with_paths`].
 pub(crate) fn cluster_invite(options: ClusterInviteOptions) -> Result<(), CliError> {
     let client = cluster_control_daemon_client("invite")?;
-    let uri = client
-        .cluster_invite_with_request(cluster::ClusterControlInviteRequest {
-            ttl_seconds: (options.ttl_seconds != CLUSTER_INVITE_DEFAULT_TTL_SECONDS)
-                .then_some(options.ttl_seconds),
-            introducers: options.introducers.clone(),
-        })?
-        .invite;
+    let response = client.cluster_invite_with_request(cluster::ClusterControlInviteRequest {
+        ttl_seconds: (options.ttl_seconds != CLUSTER_INVITE_DEFAULT_TTL_SECONDS)
+            .then_some(options.ttl_seconds),
+        introducers: options.introducers.clone(),
+    })?;
+    let uri = response.invite;
     let invite = decode_cluster_join_invite(&uri)?;
     if invite
         .introducers
@@ -1019,8 +999,14 @@ pub(crate) fn cluster_invite(options: ClusterInviteOptions) -> Result<(), CliErr
     let join_command = cluster_join_command(&uri);
     println!("invite: {uri}");
     println!("join command: {join_command}");
-    println!("cluster: {}", invite.cluster_id);
-    println!("expires: {}", format_rfc3339(invite.expires_at));
+    println!(
+        "cluster: {}",
+        response.cluster_id.as_ref().unwrap_or(&invite.cluster_id)
+    );
+    println!(
+        "expires: {}",
+        format_rfc3339(response.expires_at.unwrap_or(invite.expires_at))
+    );
     println!(
         "saved: {}",
         sinomo_runtime::node::cluster_invitation_key(&invite.invite_id)
@@ -1318,19 +1304,10 @@ fn cluster_join_via_daemon(
             });
         }
     }
-    let response =
-        client.cluster_join(cluster::ClusterControlJoinRequest { invite: invite_uri })?;
-    if options.name_explicit
-        && let Err(error) = client.cluster_rename(cluster::ClusterControlRenameRequest {
-            node_id: Some(response.node_id.clone()),
-            display_name: options.name.clone(),
-        })
-    {
-        eprintln!(
-            "warning: joined cluster but failed to apply node name `{}`: {error}",
-            options.name
-        );
-    }
+    let response = client.cluster_join(cluster::ClusterControlJoinRequest {
+        invite: invite_uri,
+        node_display_name: options.name_explicit.then_some(options.name.clone()),
+    })?;
     if let Some(endpoint) = &response.accepted_endpoint {
         println!("introducer accepted join: {endpoint}");
     }
@@ -1347,6 +1324,7 @@ fn cluster_join_via_daemon(
     println!("local node: {}", response.node_id);
     println!("invite: {}", options.invite);
     println!("state: {}", paths.state.display());
+    print_daemon_cluster_identity_activation_notice();
     Ok(())
 }
 
@@ -2562,7 +2540,14 @@ pub(crate) fn cluster_leave() -> Result<(), CliError> {
     println!("single-node cluster: {}", response.new_cluster_id);
     println!("local node: {}", response.node_id);
     println!("state: {}", cluster_paths_from_defaults()?.state.display());
+    print_daemon_cluster_identity_activation_notice();
     Ok(())
+}
+
+fn print_daemon_cluster_identity_activation_notice() {
+    println!(
+        "daemon activation: the main daemon is stopping so its supervisor can restart with the new cluster identity"
+    );
 }
 
 fn nudge_local_daemon_cluster_activation() {
@@ -2731,7 +2716,7 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
             result
         }
 
-        fn restore_cluster_kv_from_snapshot_if_newer(
+        fn cache_cluster_kv_snapshot_if_newer_than_raft(
             &mut self,
             paths: &ClusterPaths,
             local_node_id: &NodeId,
@@ -2744,7 +2729,7 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
             paths
                 .kv_paths()
                 .local_cache()
-                .restore_raft_from_snapshot_if_newer(local_node_id.clone(), snapshot)
+                .cache_snapshot_if_newer_than_raft(local_node_id.clone(), snapshot)
                 .map_err(sinomo_runtime::network::NetworkError::directory)
         }
     }

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sinomo_core::DfsWriteReceipt;
 use sinomo_core::events::EventId;
 use sinomo_core::node::NodeId;
+use std::collections::BTreeSet;
 use std::time::Duration;
 use time::OffsetDateTime;
 
@@ -335,6 +336,43 @@ pub enum DfsMetadataMutation {
 }
 
 impl DfsMetadataMutation {
+    pub(crate) fn affected_object_ids(&self) -> BTreeSet<DfsObjectId> {
+        let mut object_ids = BTreeSet::new();
+        match self {
+            Self::PutFileSystem { .. } => {}
+            Self::PutObject { object_id, .. }
+            | Self::PutVersion { object_id, .. }
+            | Self::PutReceipt { object_id, .. }
+            | Self::RemoveReceipt { object_id, .. }
+            | Self::PutIntent { object_id, .. }
+            | Self::CommitVisibleVersion { object_id, .. }
+            | Self::PutConflict { object_id, .. } => {
+                object_ids.insert(object_id.clone());
+            }
+            Self::ApplyNamespaceTransaction {
+                transaction: Some(transaction),
+                ..
+            } => {
+                object_ids.extend(
+                    transaction
+                        .objects
+                        .iter()
+                        .map(|object| object.object_id.clone()),
+                );
+                object_ids.extend(
+                    transaction
+                        .versions
+                        .iter()
+                        .map(|version| version.object_id.clone()),
+                );
+            }
+            Self::ApplyNamespaceTransaction {
+                transaction: None, ..
+            } => {}
+        }
+        object_ids
+    }
+
     pub(crate) fn put_file_system(file_system: &DfsFileSystem) -> Self {
         Self::PutFileSystem {
             file_system_id: file_system.file_system_id.clone(),

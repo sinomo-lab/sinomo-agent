@@ -104,8 +104,10 @@ the connectivity graph's **healthy** links. So every node integrates into one cl
   directly — they are full members.
 
 Joins are best-effort and time-bounded, so **no node hangs**; each joiner waits for the dev
-harness readiness marker, then runs one cluster join command. The docker gates treat clean
-six-node formation taking more than 10 seconds as a bug.
+harness readiness marker, then runs one cluster join command. The docker gates allow 30
+seconds for clean six-node formation. This covers a complete 5-second transport timeout plus
+deep-segment relay convergence without turning normal startup jitter into a false failure;
+the measured elapsed time is still reported so regressions remain visible.
 
 ## Layout
 
@@ -156,12 +158,13 @@ docker compose -f docker/docker-compose.dev.yml down -v   # tear down + wipe vol
 
 `docker/test-cluster.sh` runs the cluster-wide POSIX/DFS correctness suite in a
 **dedicated compose project** (`sinomo-dfs-test` by default, so it never touches a
-manually started dev cluster): it builds the host binary if missing, brings up the
+manually started dev cluster): it builds the current host binary by default, brings up the
 6 nodes, waits for clean formation, then drives the in-binary `cluster-dfs` runtime
 test cases from different nodes:
 
 ```bash
-docker/test-cluster.sh                       # up, test, down -v
+docker/test-cluster.sh                       # build current binary, up, test, down -v
+SINOMO_TEST_BUILD=0 docker/test-cluster.sh   # reuse an existing host binary
 SINOMO_TEST_REUSE=1 docker/test-cluster.sh   # reuse the running test project
 SINOMO_TEST_KEEP=1  docker/test-cluster.sh   # leave the cluster up afterwards
 ```
@@ -204,6 +207,25 @@ or gate it with
 `SINOMO_TEST_PERF_MIN_WRITE_FILES_PER_SEC`, and
 `SINOMO_TEST_PERF_MIN_READ_FILES_PER_SEC`.
 
+## Automated routing scenario
+
+`docker/test-routing-scenario.sh` runs the three-node segmented/forwarded-endpoint
+gate, including endpoint-error fallback, stalled persistent-tunnel fallback,
+stale direct-endpoint demotion, routed payload throughput, cross-segment DFS,
+one-node outage, and restart recovery:
+
+```bash
+docker/test-routing-scenario.sh
+SINOMO_SCENARIO_KEEP=1 docker/test-routing-scenario.sh
+```
+
+Readiness requires two consecutive successful full-cluster network sweeps by
+default; tune this with `SINOMO_SCENARIO_NETWORK_READY_STABLE_SWEEPS`. Individual
+runtime probes are bounded by `SINOMO_SCENARIO_PROBE_COMMAND_TIMEOUT` (default
+300 seconds), while the host-side Docker timeout retains a small cleanup grace
+over the in-container deadline. Failure evidence lands in
+`target/routing-scenario-artifacts/<run>/`.
+
 ## Automated cluster migration suite
 
 `docker/test-cluster-migration.sh` runs a focused two-container migration gate in
@@ -221,16 +243,22 @@ The target initializes a cluster, writes a signed invite, and starts the shadow
 supervisor/main daemon. The source initializes a separate single-node cluster,
 uses the in-binary `cluster.migration.seed-source` probe to write source KV and
 DFS metadata fixtures, then runs `sinomo cluster join /shared/target-invite.txt`.
-After the join, the source daemon starts and `cluster.migration.verify-joined`
-checks the finalized migration record, target KV authority, imported node-local
-config under `/config/nodes/<node_id>/...`, skipped source cluster-level config,
-source KV/Raft quarantine, and DFS metadata import marker. Failure evidence is
-written to `target/cluster-test-artifacts/migration-<run>/`.
+After the join response, the source main daemon drains and the shadow supervisor
+restarts it with the target identity. The harness requires both a new PID and
+the target cluster ID before `cluster.migration.verify-joined` checks the
+finalized migration record, target KV authority, imported node-local config
+under `/config/nodes/<node_id>/...`, skipped source cluster-level config, source
+KV/Raft quarantine, and DFS metadata import marker. Commands and probes are
+bounded by `SINOMO_MIGRATION_TEST_COMMAND_TIMEOUT` and
+`SINOMO_MIGRATION_TEST_PROBE_TIMEOUT`; failure evidence is written to
+`target/cluster-test-artifacts/migration-<run>/`.
 
 ## Validation gates
 
 The hardening harnesses are designed to fail with useful evidence instead of only printing
-diagnostics. They target the dev cluster automatically (override with `COMPOSE_FILE`):
+diagnostics. They target the `sinomo-dfs-test` dev-cluster project automatically
+(override with `SINOMO_GATE_PROJECT`/`SINOMO_IDLE_PROJECT`, `COMPOSE_PROJECT_NAME`,
+or `COMPOSE_FILE`):
 
 ```bash
 # Full production gate: build/start the 6-node cluster, wait for clean formation,
@@ -241,10 +269,15 @@ docker/measure-final.sh 60 90
 # Short soak: reuse running containers and repeat the full idle/mobile/bridge cycle.
 SINOMO_GATE_REBUILD=0 SINOMO_GATE_CYCLES=3 docker/measure-final.sh 60 90
 
-# Enforces 0 daemon block-write bytes, <10 KB/s daemon block reads, and <10 KB/s
-# network traffic per container during the idle window. Thresholds can be adjusted
-# with SINOMO_IDLE_MAX_*_BPS and SINOMO_IDLE_MAX_WRITE_BLOCK_BYTES when intentionally
-# testing a noisier environment.
+# Enforces 0 daemon block-write bytes, <10 KiB/s daemon block reads, and
+# <64 KiB/s sustained network traffic per container during the idle window,
+# with one bounded 4 MiB liveness burst. The gate requires exactly one main
+# and one shadow daemon per node and fails if either process restarts while its
+# counters are sampled. The production gate retries complete 135-second
+# zero-write windows for up to ten minutes so finite recovery can settle while
+# recurring 60-second churn still fails. Thresholds can be adjusted with
+# SINOMO_IDLE_MAX_*_BPS, SINOMO_IDLE_MAX_NET_BURST_BYTES, and
+# SINOMO_IDLE_MAX_WRITE_BLOCK_BYTES when intentionally testing a noisier environment.
 docker/measure-idle.sh 60
 
 # Changes node5 to `mobile` and node6 to `sensor`, waits for the roles to publish,

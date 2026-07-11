@@ -142,10 +142,13 @@ pub(crate) fn plan_namespace_transaction_recovery_table_ops(
     }
     for version in &transaction.versions {
         let version = normalized_version_record(version);
-        if scratch
+        // A present version record may have been enriched by later receipt or
+        // repair activity. Namespace recovery fills partial writes; it must
+        // never roll an existing same-key record back to the historical
+        // transaction payload.
+        if !scratch
             .versions
-            .get(&(version.object_id.clone(), version.version.clone()))
-            != Some(&version)
+            .contains_key(&(version.object_id.clone(), version.version.clone()))
         {
             apply_planned_op(
                 &mut scratch,
@@ -394,6 +397,51 @@ mod tests {
             tables
                 .dentries
                 .contains_key(&dentry_key(&path_record_for_object(&existing)))
+        );
+    }
+
+    #[test]
+    fn recovery_plan_preserves_later_enrichment_of_existing_version() {
+        let mut file = object(
+            object_id("obj_namespace_enriched_version"),
+            "/docs/enriched.md",
+            DfsObjectKind::File,
+        );
+        file.current_locations = vec![node("node_a")];
+        let historical_version = version_record(&file);
+        let transaction = DfsNamespaceTransaction {
+            transaction_id: "txn_namespace_historical_version".to_string(),
+            file_system_id: file_system_id(),
+            objects: vec![file.clone()],
+            versions: vec![historical_version],
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let mut enriched_version = version_record(&file);
+        enriched_version.locations.push(node("node_b"));
+        let mut tables = DfsMetadataTables::default();
+        for op in plan_namespace_transaction_table_ops(&tables, &transaction) {
+            tables.apply(op);
+        }
+        tables.apply(DfsMetadataTableOp::PutVersion {
+            version: enriched_version.clone(),
+        });
+
+        let ops = plan_namespace_transaction_recovery_table_ops(&tables, &transaction);
+
+        assert!(
+            !ops.iter().any(|op| matches!(
+                op,
+                DfsMetadataTableOp::PutVersion { version }
+                    if version.object_id == file.object_id
+                        && version.version == file.version
+            )),
+            "recovery must not replace an existing same-key version with the historical transaction payload"
+        );
+        assert_eq!(
+            tables
+                .versions
+                .get(&(file.object_id.clone(), file.version.clone())),
+            Some(&enriched_version)
         );
     }
 }

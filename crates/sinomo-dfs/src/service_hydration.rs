@@ -441,6 +441,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         for entry in &batch.entries {
             self.apply_metadata_journal_entry_to_service_state(entry)?;
         }
+        if self.metadata_backend.is_some() {
+            let affected_object_ids = batch
+                .entries
+                .iter()
+                .flat_map(|entry| entry.mutation.affected_object_ids())
+                .collect::<BTreeSet<_>>();
+            for object_id in affected_object_ids {
+                // The raw payload order is shard-local, while the sharded
+                // backend has just reconciled global object placement. End the
+                // replay with that authoritative view so a late source-shard
+                // payload cannot leave the service cache on the pre-move path.
+                self.apply_backend_object_to_service_state(&object_id)?;
+            }
+        }
         let cursor = self
             .local_metadata_journal_cursors
             .entry(batch.shard_id.clone())

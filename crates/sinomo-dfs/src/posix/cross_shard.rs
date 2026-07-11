@@ -286,7 +286,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if current_path == target_child_path {
                 // Already adopted; ensure the source half is evicted.
                 if let Some(backend) = self.metadata_backend.as_mut() {
-                    backend.evict_object_record_for_foreign_shard_move(&current)?;
+                    backend.evict_object_record_for_foreign_shard_move(&current, &object_path)?;
                 }
                 if current.kind == DfsObjectKind::Directory {
                     child_dirs.push((object_path, target_child_path));
@@ -301,7 +301,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             moved.path = target_child_path.clone();
             self.adopt_moved_object_on_destination_primary(&moved, &object_path)?;
             if let Some(backend) = self.metadata_backend.as_mut() {
-                backend.evict_object_record_for_foreign_shard_move(&moved)?;
+                backend.evict_object_record_for_foreign_shard_move(&moved, &object_path)?;
             }
             job.processed_object_count = job.processed_object_count.saturating_add(1);
             if moved.kind == DfsObjectKind::Directory {
@@ -802,8 +802,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             })?;
         }
         if let Some(backend) = self.metadata_backend.as_mut() {
-            backend.evict_object_record_for_foreign_shard_move(moved_object)?;
+            backend.evict_object_record_for_foreign_shard_move(moved_object, &old_path)?;
         }
+        self.clear_metadata_lookup_cache();
+        self.apply_metadata_object_to_service_state(moved_object.clone())?;
+        self.clear_metadata_lookup_cache();
         if touch_parent {
             self.touch_parent_directory_if_local_primary(&old_path)?;
         }

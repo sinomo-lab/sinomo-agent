@@ -696,8 +696,8 @@ fn run_remote_shard_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             shard.epoch,
         ))
     }) else {
-        return Ok(SinomoTestOutcome::failed(format!(
-            "node {node} has no known SIFS metadata shard whose primary is remote"
+        return Ok(SinomoTestOutcome::skipped(format!(
+            "node {node} owns every known SIFS metadata shard primary; remote-primary routing is not applicable on this node"
         )));
     };
 
@@ -2212,33 +2212,91 @@ fn run_expect_replicated(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let deadline = started + timeout;
     let backend = open_read_only_backend_until(ctx, deadline)?;
     let node = backend.node_label();
+    let daemon_client = DaemonApiClient::connect().map_err(|source| {
+        SinomoTestError::failed(format!(
+            "cannot connect to local daemon for DFS replica inspection: {source}"
+        ))
+    })?;
     ctx.record("node", &node);
     ctx.record("path", &path);
     ctx.record("min_locations", min_locations);
     loop {
         let last_state = match backend.dfs_stat(&path) {
-            Ok(stat)
-                if stat.content_hash.is_some() && stat.current_locations.len() >= min_locations =>
-            {
-                ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
-                ctx.record("object_id", stat.object_id.to_string());
-                ctx.record("version", stat.version.to_string());
-                ctx.record("content_hash", stat.content_hash.unwrap_or_default());
-                ctx.record("size_bytes", stat.size_bytes.unwrap_or_default());
-                ctx.record(
-                    "current_locations",
-                    stat_location_labels(&stat.current_locations),
-                );
-                return Ok(SinomoTestOutcome::passed(format!(
-                    "{path} has {} current locations on node {node} after {}ms",
-                    stat.current_locations.len(),
-                    started.elapsed().as_millis()
-                )));
-            }
             Ok(stat) => {
+                let desired_replica_nodes = if matches!(
+                    &stat.policy,
+                    sinomo_runtime::core::DfsObjectPolicy::ReplicatedConfirmed
+                        | sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual
+                ) {
+                    match current_version_desired_replica_nodes(
+                        &daemon_client,
+                        &stat.object_id,
+                        &stat.version,
+                    ) {
+                        Ok(desired_replica_nodes) if !desired_replica_nodes.is_empty() => {
+                            desired_replica_nodes
+                        }
+                        Ok(_) => {
+                            if Instant::now() >= deadline {
+                                ctx.record(
+                                    "last_state",
+                                    "current replicated intent has no desired replica nodes",
+                                );
+                                return Ok(SinomoTestOutcome::failed(format!(
+                                    "{path} did not reach {min_locations} current locations on node {node} within {}s: current replicated intent has no desired replica nodes",
+                                    timeout.as_secs()
+                                )));
+                            }
+                            std::thread::sleep(EXPECT_POLL_INTERVAL);
+                            continue;
+                        }
+                        Err(error) => {
+                            if Instant::now() >= deadline {
+                                ctx.record("last_state", &error);
+                                return Ok(SinomoTestOutcome::failed(format!(
+                                    "{path} did not reach {min_locations} current locations on node {node} within {}s: {error}",
+                                    timeout.as_secs()
+                                )));
+                            }
+                            std::thread::sleep(EXPECT_POLL_INTERVAL);
+                            continue;
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+                let missing_desired_replica_nodes =
+                    missing_desired_replica_nodes(&desired_replica_nodes, &stat.current_locations);
+                if stat.content_hash.is_some()
+                    && stat.current_locations.len() >= min_locations
+                    && missing_desired_replica_nodes.is_empty()
+                {
+                    ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
+                    ctx.record("object_id", stat.object_id.to_string());
+                    ctx.record("version", stat.version.to_string());
+                    ctx.record("content_hash", stat.content_hash.unwrap_or_default());
+                    ctx.record("size_bytes", stat.size_bytes.unwrap_or_default());
+                    ctx.record(
+                        "current_locations",
+                        stat_location_labels(&stat.current_locations),
+                    );
+                    ctx.record(
+                        "desired_replica_nodes",
+                        stat_location_labels(&desired_replica_nodes),
+                    );
+                    return Ok(SinomoTestOutcome::passed(format!(
+                        "{path} has all {} desired replicas among {} current locations on node {node} after {}ms",
+                        desired_replica_nodes.len(),
+                        stat.current_locations.len(),
+                        started.elapsed().as_millis()
+                    )));
+                }
                 format!(
-                    "locations={} content_hash={:?} size={:?}",
+                    "locations={} current={:?} desired={:?} missing_desired={:?} content_hash={:?} size={:?}",
                     stat.current_locations.len(),
+                    stat_location_labels(&stat.current_locations),
+                    stat_location_labels(&desired_replica_nodes),
+                    stat_location_labels(&missing_desired_replica_nodes),
                     stat.content_hash,
                     stat.size_bytes
                 )
@@ -2254,6 +2312,49 @@ fn run_expect_replicated(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         }
         std::thread::sleep(EXPECT_POLL_INTERVAL);
     }
+}
+
+fn current_version_desired_replica_nodes(
+    daemon_client: &DaemonApiClient,
+    object_id: &DfsObjectId,
+    version: &DfsVersion,
+) -> Result<Vec<NodeId>, String> {
+    let request = dfs::dfs_inspection_rpc_request(&DaemonDfsInspectionRequest::Object {
+        object_id: object_id.clone(),
+    })
+    .map_err(|error| error.to_string())?;
+    let response = daemon_client
+        .call_request(&request)
+        .map_err(|error| error.to_string())?;
+    let response =
+        dfs::decode_dfs_inspection_rpc_response(&response).map_err(|error| error.to_string())?;
+    let DaemonDfsInspectionResponse::Object {
+        object: Some(object),
+    } = response
+    else {
+        return Err(format!("DFS inspection did not return object {object_id}"));
+    };
+    object
+        .intents
+        .iter()
+        .find(|intent| &intent.target_version == version)
+        .map(|intent| intent.desired_replica_node_ids.clone())
+        .ok_or_else(|| {
+            format!(
+                "DFS inspection did not return the write intent for object {object_id} version {version}"
+            )
+        })
+}
+
+fn missing_desired_replica_nodes(
+    desired_replica_nodes: &[NodeId],
+    current_locations: &[NodeId],
+) -> Vec<NodeId> {
+    desired_replica_nodes
+        .iter()
+        .filter(|node_id| !current_locations.contains(node_id))
+        .cloned()
+        .collect()
 }
 
 fn run_damage_local_loose_blob(ctx: &mut SinomoTestContext) -> SinomoTestResult {
@@ -3942,6 +4043,24 @@ mod tests {
     use sinomo_runtime::node::ClusterId;
 
     #[test]
+    fn desired_replica_check_rejects_an_equal_sized_wrong_location_set() {
+        let desired = [
+            NodeId::from_legacy_named("node_desired_a").expect("desired a"),
+            NodeId::from_legacy_named("node_desired_b").expect("desired b"),
+        ];
+        let current = [
+            desired[0].clone(),
+            NodeId::from_legacy_named("node_wrong").expect("wrong node"),
+        ];
+
+        assert_eq!(
+            missing_desired_replica_nodes(&desired, &current),
+            vec![desired[1].clone()]
+        );
+        assert_eq!(desired.len(), current.len());
+    }
+
+    #[test]
     fn remote_shard_write_phase_budget_allows_a_cold_routed_namespace_operation() {
         assert_eq!(
             remote_shard_write_phase_timeout(Duration::from_secs(30)),
@@ -4032,6 +4151,7 @@ mod tests {
             last_attempt_unix_nanos: 1,
             next_retry_unix_nanos: 2,
             next_chunk_index: None,
+            transfer_request_id: None,
             last_error: Some("network error at cluster target rpc: no usable route".to_string()),
         }
     }

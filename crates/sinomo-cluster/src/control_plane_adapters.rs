@@ -11,24 +11,23 @@ use crate::control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlane
 use crate::invite_publish::ClusterInvitePublishHost;
 #[cfg(test)]
 pub(crate) use crate::kv_local_store::apply_cluster_raft_append;
-use crate::kv_local_store::kv_err;
+use crate::kv_local_store::locked_cache_cluster_kv_snapshot_if_newer_than_raft;
 use crate::kv_local_store::locked_kv_state_authority_id;
-use crate::kv_local_store::locked_restore_cluster_raft_from_snapshot_if_newer;
 #[cfg(test)]
 pub(crate) use crate::kv_local_store::write_imported_cluster_kv_snapshot_if_changed;
 #[cfg(test)]
 pub(crate) use crate::kv_local_store::{
     LocalClusterRaftCommandStorage, append_cluster_raft_command_uncommitted,
-    append_cluster_raft_command_with_response, cached_cluster_kv_reader_node_id_for_test,
-    cluster_kv_cached_snapshot_reads_for_test, cluster_kv_metadata_cache_capacity_for_test,
-    cluster_kv_reader_node_id_cache_contains_for_test, cluster_raft_wal_paths,
-    open_cluster_raft_kv_node_async, read_cluster_kv_prefix_entries,
+    append_cluster_raft_command_with_response, cache_cluster_kv_snapshot_if_newer_than_raft,
+    cached_cluster_kv_reader_node_id_for_test, cluster_kv_cached_snapshot_reads_for_test,
+    cluster_kv_metadata_cache_capacity_for_test, cluster_kv_reader_node_id_cache_contains_for_test,
+    cluster_raft_wal_paths, open_cluster_raft_kv_node_async, read_cluster_kv_prefix_entries,
     read_cluster_kv_prefix_entries_limited,
     read_cluster_kv_prefix_entries_limited_by_payload_bytes, read_cluster_kv_snapshot,
     read_cluster_kv_store, record_cluster_kv_reader_node_id_cache_for_test,
     refresh_cluster_kv_reader_node_id_cache_for_test,
     remove_cluster_kv_reader_node_id_cache_entries_under_root_for_test,
-    reset_cluster_kv_cached_snapshot_reads_for_test, restore_cluster_raft_from_snapshot_if_newer,
+    reset_cluster_kv_cached_snapshot_reads_for_test,
 };
 #[cfg(test)]
 pub(crate) use crate::kv_local_store::{
@@ -140,13 +139,13 @@ where
         locked_kv_state_authority_id(paths, state)
     }
 
-    fn restore_cluster_kv_from_snapshot_if_newer(
+    fn cache_cluster_kv_snapshot_if_newer_than_raft(
         &mut self,
         paths: &ClusterPaths,
         local_node_id: &NodeId,
         snapshot: KvSnapshot,
     ) -> Result<bool, NetworkError> {
-        locked_restore_cluster_raft_from_snapshot_if_newer(paths, local_node_id, snapshot)
+        locked_cache_cluster_kv_snapshot_if_newer_than_raft(paths, local_node_id, snapshot)
     }
 
     fn call_node_object_rpc(

@@ -199,7 +199,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .cloned()
                 .unwrap_or_else(|| self.next_request_id());
             let max_chunks = self.adaptive_stage_chunk_window(&replica_node_id, pending.size_bytes);
-            let outcome = self.send_repair_replica_window_if_routable(
+            let outcome = self.send_repair_replica_remaining_if_routable(
                 &replica_node_id,
                 request_id.clone(),
                 intent_id,
@@ -557,6 +557,47 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replica_node_id: &NodeId,
         content_hash: &str,
     ) -> Result<(), DfsError> {
+        if self.metadata_backend.is_some() {
+            let durable_object = self
+                .metadata_backend
+                .as_ref()
+                .expect("metadata backend checked above")
+                .get_object(object_id)?;
+            let Some(durable_object) = durable_object else {
+                // A cross-shard adoption can repoint the local derived index
+                // before the destination journal is materialized. Never fall
+                // back to the stale in-memory source path for a durable
+                // metadata mutation in that window.
+                return Ok(());
+            };
+            if durable_object.kind == DfsObjectKind::Tombstone || &durable_object.version != version
+            {
+                return Ok(());
+            }
+            if let Some(expected_hash) = durable_object.content_hash.as_deref()
+                && expected_hash != content_hash
+            {
+                return Err(DfsError::ContentHashMismatch {
+                    expected: expected_hash.to_string(),
+                    actual: content_hash.to_string(),
+                });
+            }
+            let updated = self
+                .metadata_backend
+                .as_mut()
+                .expect("metadata backend checked above")
+                .add_object_location_if_current(
+                    object_id,
+                    version,
+                    content_hash,
+                    replica_node_id,
+                )?;
+            if let Some(updated) = updated {
+                self.apply_metadata_object_to_service_state(updated)?;
+            }
+            return Ok(());
+        }
+
         let mut object = self.current_read_object_metadata(object_id)?;
         if &object.version != version {
             return Ok(());

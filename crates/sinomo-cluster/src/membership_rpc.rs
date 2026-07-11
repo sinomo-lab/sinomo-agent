@@ -4,7 +4,6 @@ use crate::invite_publish::{
 use crate::join_registration::{
     ClusterJoinRegistrationHost, handle_cluster_join_registration_request_with_host,
 };
-use crate::kv_local_store::kv_err;
 use crate::member_publish::{
     ClusterMemberPublishHost, handle_cluster_member_publish_request_with_host,
 };

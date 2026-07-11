@@ -527,10 +527,10 @@ impl KvMaterializedCache {
         // advanced. Re-putting an identical value bumps modify_revision/version and
         // appends events, which would otherwise rewrite the whole (~25 KiB+)
         // materialized file for no durable change. The materialized snapshot is only
-        // a fast-restore fallback for a cold node with an empty WAL (the WAL is the
-        // source of truth for revision/version/events), so persisting stale bookkeeping
-        // there is safe. Check before materializing `snapshot` so the common no-op path
-        // avoids cloning the full entry set.
+        // a read cache rather than writable Raft state (the WAL and anchored Raft
+        // snapshots are the source of truth for revision/version/events), so
+        // persisting stale bookkeeping there is safe. Check before materializing
+        // `snapshot` so the common no-op path avoids cloning the full entry set.
         if self.read_snapshot_arc_if_present().is_ok_and(|existing| {
             existing.is_some_and(|existing| kv_snapshot_durable_eq(existing.as_ref(), snapshot))
         }) {
@@ -722,7 +722,12 @@ impl KvLocalCache {
         self.materialized.write_snapshot_if_changed(snapshot)
     }
 
-    pub fn restore_raft_from_snapshot_if_newer(
+    /// Cache a remote read model when it is newer than the local applied Raft
+    /// state. This deliberately does not restore Raft: `KvSnapshot` has no
+    /// log index or term and therefore cannot be a consensus baseline.
+    ///
+    /// Returns `true` when reconciling the materialized cache changed it.
+    pub fn cache_snapshot_if_newer_than_raft(
         &self,
         node_id: NodeId,
         snapshot: KvSnapshot,
@@ -734,21 +739,16 @@ impl KvLocalCache {
             &self.materialized,
         )?;
         if snapshot.revision <= node.store().revision() {
-            self.materialized
-                .write_snapshot_if_changed(&node.store().try_snapshot()?)?;
-            return Ok(false);
+            return self
+                .materialized
+                .write_snapshot_if_changed(&node.store().try_snapshot()?);
         }
-        self.materialized.write_snapshot_if_changed(&snapshot)?;
-        if node.applied_index() == 0 && node.last_log_index() == 0 {
-            drop(node);
-            let mut node = self.open_raft_node(node_id)?;
-            node.restore_snapshot(RaftSnapshot {
-                last_included_index: 0,
-                last_included_term: 0,
-                kv: snapshot,
-            })?;
-        }
-        Ok(true)
+        // Cache the newer read model, but do not install it into Raft. A plain
+        // `KvSnapshot` carries no last-included index or term, so it cannot
+        // establish a safe consensus baseline. The learner must replay from its
+        // actual log position or receive an anchored `RaftSnapshot` from the
+        // leader.
+        self.materialized.write_snapshot_if_changed(&snapshot)
     }
 
     pub fn open_raft_node(&self, node_id: NodeId) -> Result<DurableRaftKvNode, KvError> {

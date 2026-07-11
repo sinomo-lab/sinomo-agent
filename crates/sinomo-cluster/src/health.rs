@@ -2,6 +2,7 @@
 #[allow(unused_imports)]
 use crate::kv_local_store::kv_err;
 use crate::kv_read_model::read_cluster_node_statuses_from_kv;
+#[cfg(any(test, feature = "test-support"))]
 use crate::local_state_store::read_cluster_state;
 use crate::local_state_store::read_cluster_state_async;
 use crate::prelude::*;
@@ -26,8 +27,19 @@ use sinomo_node::{
 };
 
 const CLUSTER_HEALTH_PEER_ROWS_MAX_PEERS: usize = 8;
+// Peer expansion is a semantic aggregation budget, not a transport no-progress
+// timeout. Keep it below the outer 5s daemon RPC idle window so an unresolved
+// cluster can still return a deliberate partial view instead of making the
+// caller fall back to a less capable local-only sweep.
 const CLUSTER_HEALTH_PEER_ROWS_TOTAL_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(2);
+// Live status fanout and any peer expansion share this semantic operation
+// budget. The daemon RPC transport has a 5s no-progress timeout, so retaining
+// one second for dispatch, storage reads, and response encoding keeps a
+// deliberately partial health response preferable to a transport timeout.
+const CLUSTER_HEALTH_LIVE_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+const CLUSTER_HEALTH_LIVE_PROBES_METADATA_KEY: &str = "sinomo-health-live-probes";
+const CLUSTER_HEALTH_LIVE_PROBES_METADATA_VALUE: &str = "true";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClusterHealthRow {
@@ -79,6 +91,21 @@ pub fn cluster_health_rpc_request_without_peer_views() -> Result<ObjectRpcReques
     Ok(request)
 }
 
+/// Requests a live cluster-wide view from one peer without asking that peer to
+/// recursively expand through additional peers.
+///
+/// This is distinct from [`cluster_health_rpc_request_without_peer_views`],
+/// which is the cheap KV-backed snapshot used by routine foreground readers.
+pub fn cluster_health_rpc_request_without_recursive_peer_views()
+-> Result<ObjectRpcRequest, NetworkError> {
+    let mut request = cluster_health_rpc_request_without_peer_views()?;
+    request.metadata.insert(
+        CLUSTER_HEALTH_LIVE_PROBES_METADATA_KEY.to_string(),
+        CLUSTER_HEALTH_LIVE_PROBES_METADATA_VALUE.to_string(),
+    );
+    Ok(request)
+}
+
 pub fn cluster_network_ping_rpc_request(
     nonce: impl Into<String>,
     payload_bytes: usize,
@@ -100,6 +127,7 @@ pub fn cluster_network_ping_rpc_request_with_response_payload(
             response_payload_bytes,
         },
     )
+    .map(ObjectRpcRequest::with_response_retry_safe)
 }
 
 pub fn cluster_local_health_rpc_request() -> Result<ObjectRpcRequest, NetworkError> {
@@ -123,6 +151,13 @@ fn cluster_health_rpc_request_includes_peer_views(request: &ObjectRpcRequest) ->
         .metadata
         .get(CLUSTER_HEALTH_INCLUDE_PEER_VIEWS_METADATA_KEY)
         .is_some_and(|include| include == "false" || include == "0")
+}
+
+fn cluster_health_rpc_request_uses_live_probes(request: &ObjectRpcRequest) -> bool {
+    request
+        .metadata
+        .get(CLUSTER_HEALTH_LIVE_PROBES_METADATA_KEY)
+        .is_some_and(|value| value == CLUSTER_HEALTH_LIVE_PROBES_METADATA_VALUE)
 }
 
 pub fn decode_cluster_health_rpc_response(
@@ -150,6 +185,7 @@ pub fn handle_cluster_health_rpc_request<P: ClusterStatusProbe + ?Sized>(
             let _: () = request.decode_body()?;
             let local_scope = cluster_health_rpc_request_is_local_scope(&request);
             let include_peer_views = cluster_health_rpc_request_includes_peer_views(&request);
+            let live_probes = cluster_health_rpc_request_uses_live_probes(&request);
             let rows = if local_scope {
                 cluster_health_rows_with_probe_for_scope(
                     paths,
@@ -159,6 +195,8 @@ pub fn handle_cluster_health_rpc_request<P: ClusterStatusProbe + ?Sized>(
                     true,
                     observed_at,
                 )?
+            } else if live_probes {
+                cluster_health_rows_with_probe(paths, state, probe, false, observed_at)?
             } else if !include_peer_views {
                 cluster_health_rows_from_stored_statuses(paths, state, false, observed_at)?
             } else {
@@ -204,6 +242,7 @@ pub async fn handle_cluster_health_rpc_request_async<P: ClusterStatusAsyncProbe 
             let _: () = request.decode_body()?;
             let local_scope = cluster_health_rpc_request_is_local_scope(&request);
             let include_peer_views = cluster_health_rpc_request_includes_peer_views(&request);
+            let live_probes = cluster_health_rpc_request_uses_live_probes(&request);
             let rows = if local_scope {
                 cluster_health_rows_with_async_probe_for_scope(
                     paths,
@@ -214,6 +253,9 @@ pub async fn handle_cluster_health_rpc_request_async<P: ClusterStatusAsyncProbe 
                     observed_at,
                 )
                 .await?
+            } else if live_probes {
+                cluster_health_rows_with_async_probe(paths, state, probe, false, observed_at)
+                    .await?
             } else if !include_peer_views {
                 cluster_health_rows_from_stored_statuses_async(paths, state, false, observed_at)
                     .await?
@@ -313,10 +355,14 @@ pub trait ClusterStatusProbe {
         member: &ClusterMemberRecord,
     ) -> Option<ClusterNodeStatusRecord>;
 
-    fn peer_local_health_rows(
+    /// Fetches the peer's live full-cluster view without recursive peer
+    /// expansion. `timeout` is this attempt's slice of the shared aggregation
+    /// deadline.
+    fn peer_health_rows(
         &self,
         _state: &ClusterBootstrapState,
         _member: &ClusterMemberRecord,
+        _timeout: std::time::Duration,
     ) -> Option<Vec<ClusterHealthRow>> {
         None
     }
@@ -333,23 +379,25 @@ pub trait ClusterStatusAsyncProbe: Sync {
         &'a self,
         state: &'a ClusterBootstrapState,
         members: &'a [ClusterMemberRecord],
-    ) -> ClusterMembershipRpcFuture<'a, BTreeMap<NodeId, Option<ClusterNodeStatusRecord>>> {
+        statuses: &'a mut BTreeMap<NodeId, Option<ClusterNodeStatusRecord>>,
+    ) -> ClusterMembershipRpcFuture<'a, ()> {
         Box::pin(async move {
-            let mut statuses = BTreeMap::new();
             for member in members {
                 statuses.insert(
                     member.node_id.clone(),
                     self.probe_member_status_async(state, member).await?,
                 );
             }
-            Ok(statuses)
+            Ok(())
         })
     }
 
-    fn peer_local_health_rows_async<'a>(
+    /// Async counterpart of [`ClusterStatusProbe::peer_health_rows`].
+    fn peer_health_rows_async<'a>(
         &'a self,
         _state: &'a ClusterBootstrapState,
         _member: &'a ClusterMemberRecord,
+        _timeout: std::time::Duration,
     ) -> ClusterMembershipRpcFuture<'a, Option<Vec<ClusterHealthRow>>> {
         Box::pin(async { Ok(None) })
     }
@@ -504,6 +552,42 @@ async fn cluster_health_rows_with_async_probe_for_scope<P: ClusterStatusAsyncPro
     local_scope: bool,
     observed_at: OffsetDateTime,
 ) -> Result<Vec<ClusterHealthRow>, NetworkError> {
+    cluster_health_rows_with_async_probe_for_scope_with_budget(
+        paths,
+        state,
+        probe,
+        include_peer_views,
+        local_scope,
+        observed_at,
+        CLUSTER_HEALTH_LIVE_TOTAL_BUDGET,
+    )
+    .await
+}
+
+async fn cluster_health_rows_with_async_probe_for_scope_with_budget<
+    P: ClusterStatusAsyncProbe + ?Sized,
+>(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    probe: &P,
+    include_peer_views: bool,
+    local_scope: bool,
+    observed_at: OffsetDateTime,
+    live_budget: std::time::Duration,
+) -> Result<Vec<ClusterHealthRow>, NetworkError> {
+    let deadline = tokio::time::Instant::now() + live_budget;
+    // A stalled direct member must not consume the only opportunity to learn
+    // about it through a healthy bridge. Recursive health reserves the peer
+    // aggregation slice up front; nonrecursive peer requests keep the whole
+    // live budget because they cannot expand again.
+    let peer_budget_reserve = if include_peer_views {
+        CLUSTER_HEALTH_PEER_ROWS_TOTAL_BUDGET.min(live_budget / 2)
+    } else {
+        std::time::Duration::ZERO
+    };
+    let probe_deadline = deadline
+        .checked_sub(peer_budget_reserve)
+        .unwrap_or(deadline);
     let paths_for_statuses = paths.clone();
     let stored_statuses = tokio::task::spawn_blocking(move || {
         read_cluster_node_statuses_from_kv(&paths_for_statuses)
@@ -520,9 +604,22 @@ async fn cluster_health_rows_with_async_probe_for_scope<P: ClusterStatusAsyncPro
         .filter(|member| cluster_health_member_is_in_scope(state, member, local_scope))
         .cloned()
         .collect::<Vec<_>>();
-    let live_statuses = probe
-        .probe_member_statuses_async(state, &reportable_members)
-        .await?;
+    let mut live_statuses = BTreeMap::new();
+    if tokio::time::Instant::now() < probe_deadline {
+        match tokio::time::timeout_at(
+            probe_deadline,
+            probe.probe_member_statuses_async(state, &reportable_members, &mut live_statuses),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                // The probe writes each completed status into caller-owned
+                // state, so cancellation retains useful rows while the
+                // remaining members fall back to stored/unknown status below.
+            }
+        }
+    }
     let mut rows = Vec::new();
     for member in &reportable_members {
         let expected_process = cluster_member_expected_daemon_process(member);
@@ -559,15 +656,7 @@ async fn cluster_health_rows_with_async_probe_for_scope<P: ClusterStatusAsyncPro
         });
     }
     if include_peer_views {
-        match tokio::time::timeout(
-            CLUSTER_HEALTH_PEER_ROWS_TOTAL_BUDGET,
-            merge_reachable_peer_health_rows_async(state, &mut rows, probe),
-        )
-        .await
-        {
-            Ok(result) => result?,
-            Err(_) => {}
-        }
+        merge_reachable_peer_health_rows_async(state, &mut rows, probe, deadline).await?;
     }
     rows.sort_by(|left, right| left.member.node_id.cmp(&right.member.node_id));
     Ok(rows)
@@ -869,12 +958,26 @@ fn merge_reachable_peer_health_rows<P: ClusterStatusProbe + ?Sized>(
     // every node more than one bridge away.
     let mut queried = std::collections::BTreeSet::new();
     queried.insert(state.local_node_id.clone());
+    let deadline = std::time::Instant::now() + CLUSTER_HEALTH_PEER_ROWS_TOTAL_BUDGET;
     while queried.len() <= CLUSTER_HEALTH_PEER_ROWS_MAX_PEERS {
+        if !cluster_health_rows_have_unresolved_members(rows) {
+            return;
+        }
         let Some(member) = next_online_peer_to_query(state, rows, &queried) else {
             return;
         };
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        // Peer views are queried sequentially, so give the preferred bridge the
+        // entire remaining shared budget. Dividing by every possible peer can
+        // make each slice shorter than the bounded nonrecursive health view,
+        // guaranteeing that every useful response is cancelled. A fast
+        // failure leaves the unspent portion for the next candidate.
+        let timeout = remaining;
         queried.insert(member.node_id.clone());
-        let Some(peer_rows) = probe.peer_local_health_rows(state, &member) else {
+        let Some(peer_rows) = probe.peer_health_rows(state, &member, timeout) else {
             continue;
         };
         merge_online_peer_health_rows(rows, peer_rows);
@@ -915,20 +1018,48 @@ async fn merge_reachable_peer_health_rows_async<P: ClusterStatusAsyncProbe + ?Si
     state: &ClusterBootstrapState,
     rows: &mut [ClusterHealthRow],
     probe: &P,
+    live_deadline: tokio::time::Instant,
 ) -> Result<(), NetworkError> {
     let mut queried = std::collections::BTreeSet::new();
     queried.insert(state.local_node_id.clone());
+    let deadline =
+        live_deadline.min(tokio::time::Instant::now() + CLUSTER_HEALTH_PEER_ROWS_TOTAL_BUDGET);
     while queried.len() <= CLUSTER_HEALTH_PEER_ROWS_MAX_PEERS {
+        if !cluster_health_rows_have_unresolved_members(rows) {
+            return Ok(());
+        }
         let Some(member) = next_online_peer_to_query(state, rows, &queried) else {
             return Ok(());
         };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        // Preserve the absolute deadline while letting the preferred bridge
+        // finish one bounded nonrecursive view. Later peers receive whatever
+        // remains after this attempt returns.
+        let timeout = remaining;
         queried.insert(member.node_id.clone());
-        let Some(peer_rows) = probe.peer_local_health_rows_async(state, &member).await? else {
+        let peer_rows = match tokio::time::timeout(
+            timeout,
+            probe.peer_health_rows_async(state, &member, timeout),
+        )
+        .await
+        {
+            Ok(rows) => rows?,
+            Err(_) => continue,
+        };
+        let Some(peer_rows) = peer_rows else {
             continue;
         };
         merge_online_peer_health_rows(rows, peer_rows);
     }
     Ok(())
+}
+
+fn cluster_health_rows_have_unresolved_members(rows: &[ClusterHealthRow]) -> bool {
+    rows.iter()
+        .any(|row| row.availability != ClusterNodeAvailability::Online)
 }
 
 fn merge_online_peer_health_rows(
@@ -1004,6 +1135,16 @@ mod tests {
                 observed_at: OffsetDateTime::UNIX_EPOCH,
             },
             "response_payload",
+        );
+    }
+
+    #[test]
+    fn cluster_network_ping_requests_are_response_retry_safe() {
+        let request = cluster_network_ping_rpc_request("retry-safe", 0).expect("ping request");
+
+        assert!(
+            request.is_response_retry_safe(),
+            "a read-only nonce ping can safely retry after an ambiguous response timeout"
         );
     }
 
@@ -1108,13 +1249,225 @@ mod tests {
             None
         }
 
-        fn peer_local_health_rows(
+        fn peer_health_rows(
             &self,
             _state: &ClusterBootstrapState,
             member: &ClusterMemberRecord,
+            _timeout: std::time::Duration,
         ) -> Option<Vec<ClusterHealthRow>> {
             self.rows_by_peer.get(&member.node_id).cloned()
         }
+    }
+
+    fn add_health_test_lan_endpoint(member: &mut ClusterMemberRecord, address: impl Into<String>) {
+        member.endpoints.push(ClusterEndpointRecord {
+            endpoint_id: sinomo_base::Id::generate(),
+            node_id: member.node_id.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: address.into(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 0,
+            last_observed_latency_ms: None,
+        });
+    }
+
+    fn peer_budget_test_fixture(
+        name: &str,
+    ) -> (
+        ClusterBootstrapState,
+        Vec<ClusterHealthRow>,
+        NodeId,
+        NodeId,
+        ClusterHealthRow,
+    ) {
+        let cluster_id = ClusterId::from_legacy_named(format!("cluster_health_peer_budget_{name}"))
+            .expect("cluster");
+        let local_id = NodeId::from_legacy_named(format!("node_peer_budget_{name}_local"))
+            .expect("local node");
+        let bridge_id = NodeId::from_legacy_named(format!("node_peer_budget_{name}_bridge"))
+            .expect("bridge node");
+        let decoy_a_id =
+            NodeId::from_legacy_named(format!("node_peer_budget_{name}_decoy_a")).expect("decoy a");
+        let decoy_b_id =
+            NodeId::from_legacy_named(format!("node_peer_budget_{name}_decoy_b")).expect("decoy b");
+        let deep_id =
+            NodeId::from_legacy_named(format!("node_peer_budget_{name}_deep")).expect("deep node");
+        let now = OffsetDateTime::now_utc();
+        let local = health_test_member(&cluster_id, &local_id, "local", now);
+        let mut bridge = health_test_member(&cluster_id, &bridge_id, "bridge", now);
+        add_health_test_lan_endpoint(&mut bridge, "bridge-a:21353");
+        add_health_test_lan_endpoint(&mut bridge, "bridge-b:21353");
+        let decoy_a = health_test_member(&cluster_id, &decoy_a_id, "decoy-a", now);
+        let decoy_b = health_test_member(&cluster_id, &decoy_b_id, "decoy-b", now);
+        let deep = health_test_member(&cluster_id, &deep_id, "deep", now);
+        let state = ClusterBootstrapState {
+            cluster_id: cluster_id.clone(),
+            cluster_name: format!("peer budget {name}"),
+            local_node_id: local_id.clone(),
+            local_node_display_name: "local".to_string(),
+            term: 1,
+            kv_revision: 1,
+            members: vec![
+                local.clone(),
+                bridge.clone(),
+                decoy_a.clone(),
+                decoy_b.clone(),
+                deep.clone(),
+            ],
+            initialized_at: now,
+            updated_at: now,
+        };
+        let mut deep_unknown = health_test_status(&cluster_id, &deep_id, "unknown", now);
+        deep_unknown.availability = ClusterNodeAvailability::Unknown;
+        let rows = vec![
+            health_test_row(
+                &local,
+                health_test_status(&cluster_id, &local_id, "local", now),
+            ),
+            health_test_row(
+                &bridge,
+                health_test_status(&cluster_id, &bridge_id, "bridge", now),
+            ),
+            health_test_row(
+                &decoy_a,
+                health_test_status(&cluster_id, &decoy_a_id, "decoy-a", now),
+            ),
+            health_test_row(
+                &decoy_b,
+                health_test_status(&cluster_id, &decoy_b_id, "decoy-b", now),
+            ),
+            ClusterHealthRow {
+                member: deep.clone(),
+                status: deep_unknown,
+                availability: ClusterNodeAvailability::Unknown,
+            },
+        ];
+        let deep_row = health_test_row(
+            &deep,
+            health_test_status(&cluster_id, &deep_id, "via-preferred-bridge", now),
+        );
+        (state, rows, bridge_id, deep_id, deep_row)
+    }
+
+    #[test]
+    fn preferred_bridge_receives_full_remaining_sync_peer_budget() {
+        struct BudgetSensitivePeerView {
+            bridge_node_id: NodeId,
+            deep_row: ClusterHealthRow,
+            attempts: std::sync::Mutex<Vec<(NodeId, std::time::Duration)>>,
+        }
+
+        impl ClusterStatusProbe for BudgetSensitivePeerView {
+            fn probe_member_status(
+                &self,
+                _state: &ClusterBootstrapState,
+                _member: &ClusterMemberRecord,
+            ) -> Option<ClusterNodeStatusRecord> {
+                None
+            }
+
+            fn peer_health_rows(
+                &self,
+                _state: &ClusterBootstrapState,
+                member: &ClusterMemberRecord,
+                timeout: std::time::Duration,
+            ) -> Option<Vec<ClusterHealthRow>> {
+                self.attempts
+                    .lock()
+                    .expect("peer attempts")
+                    .push((member.node_id.clone(), timeout));
+                (member.node_id == self.bridge_node_id
+                    && timeout >= std::time::Duration::from_millis(1_500))
+                .then(|| vec![self.deep_row.clone()])
+            }
+        }
+
+        let (state, mut rows, bridge_id, deep_id, deep_row) = peer_budget_test_fixture("sync");
+        let probe = BudgetSensitivePeerView {
+            bridge_node_id: bridge_id.clone(),
+            deep_row,
+            attempts: std::sync::Mutex::new(Vec::new()),
+        };
+
+        merge_reachable_peer_health_rows(&state, &mut rows, &probe);
+
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.member.node_id == deep_id)
+                .expect("deep row")
+                .availability,
+            ClusterNodeAvailability::Online
+        );
+        let attempts = probe.attempts.lock().expect("peer attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].0, bridge_id);
+        assert!(attempts[0].1 >= std::time::Duration::from_millis(1_500));
+    }
+
+    #[tokio::test]
+    async fn preferred_bridge_receives_full_remaining_async_peer_budget() {
+        struct BudgetSensitiveAsyncPeerView {
+            bridge_node_id: NodeId,
+            deep_row: ClusterHealthRow,
+            attempts: std::sync::Mutex<Vec<(NodeId, std::time::Duration)>>,
+        }
+
+        impl ClusterStatusAsyncProbe for BudgetSensitiveAsyncPeerView {
+            fn probe_member_status_async<'a>(
+                &'a self,
+                _state: &'a ClusterBootstrapState,
+                _member: &'a ClusterMemberRecord,
+            ) -> ClusterMembershipRpcFuture<'a, Option<ClusterNodeStatusRecord>> {
+                Box::pin(async { Ok(None) })
+            }
+
+            fn peer_health_rows_async<'a>(
+                &'a self,
+                _state: &'a ClusterBootstrapState,
+                member: &'a ClusterMemberRecord,
+                timeout: std::time::Duration,
+            ) -> ClusterMembershipRpcFuture<'a, Option<Vec<ClusterHealthRow>>> {
+                self.attempts
+                    .lock()
+                    .expect("peer attempts")
+                    .push((member.node_id.clone(), timeout));
+                let can_finish = member.node_id == self.bridge_node_id
+                    && timeout >= std::time::Duration::from_millis(1_500);
+                let deep_row = self.deep_row.clone();
+                Box::pin(async move { Ok(can_finish.then(|| vec![deep_row])) })
+            }
+        }
+
+        let (state, mut rows, bridge_id, deep_id, deep_row) = peer_budget_test_fixture("async");
+        let probe = BudgetSensitiveAsyncPeerView {
+            bridge_node_id: bridge_id.clone(),
+            deep_row,
+            attempts: std::sync::Mutex::new(Vec::new()),
+        };
+        let started = tokio::time::Instant::now();
+
+        merge_reachable_peer_health_rows_async(
+            &state,
+            &mut rows,
+            &probe,
+            tokio::time::Instant::now() + CLUSTER_HEALTH_PEER_ROWS_TOTAL_BUDGET,
+        )
+        .await
+        .expect("peer expansion");
+
+        assert!(started.elapsed() < CLUSTER_HEALTH_PEER_ROWS_TOTAL_BUDGET);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.member.node_id == deep_id)
+                .expect("deep row")
+                .availability,
+            ClusterNodeAvailability::Online
+        );
+        let attempts = probe.attempts.lock().expect("peer attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].0, bridge_id);
+        assert!(attempts[0].1 >= std::time::Duration::from_millis(1_500));
     }
 
     #[test]
@@ -1125,9 +1478,11 @@ mod tests {
             NodeId::from_legacy_named("node_health_all_online_local").expect("local node");
         let remote_id =
             NodeId::from_legacy_named("node_health_all_online_remote").expect("remote node");
+        let unresolved_id = NodeId::from_legacy_named("node_health_unresolved").expect("node");
         let now = OffsetDateTime::now_utc();
         let local_member = health_test_member(&cluster_id, &local_id, "local", now);
         let remote_member = health_test_member(&cluster_id, &remote_id, "remote", now);
+        let unresolved_member = health_test_member(&cluster_id, &unresolved_id, "unresolved", now);
         let state = ClusterBootstrapState {
             cluster_id: cluster_id.clone(),
             cluster_name: "health refresh".to_string(),
@@ -1135,7 +1490,11 @@ mod tests {
             local_node_display_name: "local".to_string(),
             term: 1,
             kv_revision: 1,
-            members: vec![local_member.clone(), remote_member.clone()],
+            members: vec![
+                local_member.clone(),
+                remote_member.clone(),
+                unresolved_member.clone(),
+            ],
             initialized_at: now,
             updated_at: now,
         };
@@ -1153,14 +1512,30 @@ mod tests {
                     now - time::Duration::seconds(60),
                 ),
             ),
+            ClusterHealthRow {
+                member: unresolved_member.clone(),
+                status: {
+                    let mut status =
+                        health_test_status(&cluster_id, &unresolved_id, "unknown", now);
+                    status.availability = ClusterNodeAvailability::Unknown;
+                    status
+                },
+                availability: ClusterNodeAvailability::Unknown,
+            },
         ];
         let probe = StaticPeerHealthProbe {
             rows_by_peer: BTreeMap::from([(
                 remote_id.clone(),
-                vec![health_test_row(
-                    &remote_member,
-                    health_test_status(&cluster_id, &remote_id, "fresh", now),
-                )],
+                vec![
+                    health_test_row(
+                        &remote_member,
+                        health_test_status(&cluster_id, &remote_id, "fresh", now),
+                    ),
+                    health_test_row(
+                        &unresolved_member,
+                        health_test_status(&cluster_id, &unresolved_id, "resolved", now),
+                    ),
+                ],
             )]),
         };
 
@@ -1171,5 +1546,423 @@ mod tests {
             .find(|row| row.member.node_id == remote_id)
             .expect("remote row");
         assert_eq!(remote.status.commit.as_deref(), Some("fresh"));
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.member.node_id == unresolved_id)
+                .expect("resolved row")
+                .availability,
+            ClusterNodeAvailability::Online
+        );
+    }
+
+    #[test]
+    fn peer_health_expansion_skips_fully_resolved_rows() {
+        struct NoPeerCalls;
+
+        impl ClusterStatusProbe for NoPeerCalls {
+            fn probe_member_status(
+                &self,
+                _state: &ClusterBootstrapState,
+                _member: &ClusterMemberRecord,
+            ) -> Option<ClusterNodeStatusRecord> {
+                None
+            }
+
+            fn peer_health_rows(
+                &self,
+                _state: &ClusterBootstrapState,
+                _member: &ClusterMemberRecord,
+                _timeout: std::time::Duration,
+            ) -> Option<Vec<ClusterHealthRow>> {
+                panic!("resolved health must not query peer views")
+            }
+        }
+
+        let cluster_id = ClusterId::from_legacy_named("cluster_health_resolved").expect("cluster");
+        let local_id = NodeId::from_legacy_named("node_health_resolved_local").expect("local");
+        let remote_id = NodeId::from_legacy_named("node_health_resolved_remote").expect("remote");
+        let now = OffsetDateTime::now_utc();
+        let local = health_test_member(&cluster_id, &local_id, "local", now);
+        let remote = health_test_member(&cluster_id, &remote_id, "remote", now);
+        let state = ClusterBootstrapState {
+            cluster_id: cluster_id.clone(),
+            cluster_name: "resolved health".to_string(),
+            local_node_id: local_id.clone(),
+            local_node_display_name: "local".to_string(),
+            term: 1,
+            kv_revision: 1,
+            members: vec![local.clone(), remote.clone()],
+            initialized_at: now,
+            updated_at: now,
+        };
+        let mut rows = vec![
+            health_test_row(
+                &local,
+                health_test_status(&cluster_id, &local_id, "local", now),
+            ),
+            health_test_row(
+                &remote,
+                health_test_status(&cluster_id, &remote_id, "remote", now),
+            ),
+        ];
+
+        merge_reachable_peer_health_rows(&state, &mut rows, &NoPeerCalls);
+    }
+
+    #[tokio::test]
+    async fn delayed_two_hop_peer_health_expansion_reaches_deep_node() {
+        struct DelayedPeerViews {
+            rows_by_peer: BTreeMap<NodeId, Vec<ClusterHealthRow>>,
+            attempted_timeouts: std::sync::Mutex<Vec<std::time::Duration>>,
+        }
+
+        impl ClusterStatusAsyncProbe for DelayedPeerViews {
+            fn probe_member_status_async<'a>(
+                &'a self,
+                _state: &'a ClusterBootstrapState,
+                _member: &'a ClusterMemberRecord,
+            ) -> ClusterMembershipRpcFuture<'a, Option<ClusterNodeStatusRecord>> {
+                Box::pin(async { Ok(None) })
+            }
+
+            fn peer_health_rows_async<'a>(
+                &'a self,
+                _state: &'a ClusterBootstrapState,
+                member: &'a ClusterMemberRecord,
+                timeout: std::time::Duration,
+            ) -> ClusterMembershipRpcFuture<'a, Option<Vec<ClusterHealthRow>>> {
+                self.attempted_timeouts
+                    .lock()
+                    .expect("timeout observations")
+                    .push(timeout);
+                let rows = self.rows_by_peer.get(&member.node_id).cloned();
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    Ok(rows)
+                })
+            }
+        }
+
+        let cluster_id = ClusterId::from_legacy_named("cluster_health_two_hop").expect("cluster");
+        let local_id = NodeId::from_legacy_named("node_health_two_hop_local").expect("local");
+        let bridge_a_id =
+            NodeId::from_legacy_named("node_health_two_hop_bridge_a").expect("bridge a");
+        let bridge_b_id =
+            NodeId::from_legacy_named("node_health_two_hop_bridge_b").expect("bridge b");
+        let deep_id = NodeId::from_legacy_named("node_health_two_hop_deep").expect("deep");
+        let now = OffsetDateTime::now_utc();
+        let local = health_test_member(&cluster_id, &local_id, "local", now);
+        let bridge_a = health_test_member(&cluster_id, &bridge_a_id, "bridge-a", now);
+        let bridge_b = health_test_member(&cluster_id, &bridge_b_id, "bridge-b", now);
+        let deep = health_test_member(&cluster_id, &deep_id, "deep", now);
+        let state = ClusterBootstrapState {
+            cluster_id: cluster_id.clone(),
+            cluster_name: "two hop health".to_string(),
+            local_node_id: local_id.clone(),
+            local_node_display_name: "local".to_string(),
+            term: 1,
+            kv_revision: 1,
+            members: vec![
+                local.clone(),
+                bridge_a.clone(),
+                bridge_b.clone(),
+                deep.clone(),
+            ],
+            initialized_at: now,
+            updated_at: now,
+        };
+        let unresolved_row = |member: &ClusterMemberRecord| {
+            let mut status = health_test_status(&cluster_id, &member.node_id, "unknown", now);
+            status.availability = ClusterNodeAvailability::Unknown;
+            ClusterHealthRow {
+                member: member.clone(),
+                status,
+                availability: ClusterNodeAvailability::Unknown,
+            }
+        };
+        let mut rows = vec![
+            health_test_row(
+                &local,
+                health_test_status(&cluster_id, &local_id, "local", now),
+            ),
+            health_test_row(
+                &bridge_a,
+                health_test_status(&cluster_id, &bridge_a_id, "bridge-a", now),
+            ),
+            unresolved_row(&bridge_b),
+            unresolved_row(&deep),
+        ];
+        let probe = DelayedPeerViews {
+            rows_by_peer: BTreeMap::from([
+                (
+                    bridge_a_id,
+                    vec![health_test_row(
+                        &bridge_b,
+                        health_test_status(&cluster_id, &bridge_b_id, "bridge-b", now),
+                    )],
+                ),
+                (
+                    bridge_b_id,
+                    vec![health_test_row(
+                        &deep,
+                        health_test_status(&cluster_id, &deep_id, "deep", now),
+                    )],
+                ),
+            ]),
+            attempted_timeouts: std::sync::Mutex::new(Vec::new()),
+        };
+
+        merge_reachable_peer_health_rows_async(
+            &state,
+            &mut rows,
+            &probe,
+            tokio::time::Instant::now() + CLUSTER_HEALTH_LIVE_TOTAL_BUDGET,
+        )
+        .await
+        .expect("two-hop peer expansion");
+
+        assert!(
+            rows.iter()
+                .all(|row| row.availability == ClusterNodeAvailability::Online),
+            "both bridge views should resolve the deep member"
+        );
+        let attempted_timeouts = probe
+            .attempted_timeouts
+            .lock()
+            .expect("timeout observations");
+        assert_eq!(attempted_timeouts.len(), 2);
+        assert!(
+            attempted_timeouts[0] > CLUSTER_HEALTH_PEER_ROWS_TOTAL_BUDGET / 2,
+            "the preferred bridge should receive enough of the shared deadline"
+        );
+        assert!(
+            attempted_timeouts[1] <= attempted_timeouts[0],
+            "the next bridge should receive only the remaining shared budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_live_probe_returns_completed_statuses_within_shared_budget() {
+        struct StalledAfterLocalProbe {
+            local_node_id: NodeId,
+            cluster_id: ClusterId,
+            observed_at: OffsetDateTime,
+        }
+
+        impl ClusterStatusAsyncProbe for StalledAfterLocalProbe {
+            fn probe_member_status_async<'a>(
+                &'a self,
+                _state: &'a ClusterBootstrapState,
+                member: &'a ClusterMemberRecord,
+            ) -> ClusterMembershipRpcFuture<'a, Option<ClusterNodeStatusRecord>> {
+                let status = (member.node_id == self.local_node_id).then(|| {
+                    health_test_status(
+                        &self.cluster_id,
+                        &self.local_node_id,
+                        "completed-before-timeout",
+                        self.observed_at,
+                    )
+                });
+                Box::pin(async move {
+                    if status.is_none() {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                    Ok(status)
+                })
+            }
+        }
+
+        let root = sinomo_testdir::TestDir::new("sinomo-cluster-health-stalled-live-probe");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_health_stalled_live_probe").expect("cluster");
+        let local_id =
+            NodeId::from_legacy_named("node_health_stalled_live_probe_local").expect("local");
+        let remote_id =
+            NodeId::from_legacy_named("node_health_stalled_live_probe_remote").expect("remote");
+        let local = health_test_member(&cluster_id, &local_id, "local", now);
+        let remote = health_test_member(&cluster_id, &remote_id, "remote", now);
+        let state = ClusterBootstrapState {
+            cluster_id: cluster_id.clone(),
+            cluster_name: "stalled live probe".to_string(),
+            local_node_id: local_id.clone(),
+            local_node_display_name: "local".to_string(),
+            term: 1,
+            kv_revision: 1,
+            members: vec![local, remote],
+            initialized_at: now,
+            updated_at: now,
+        };
+        let probe = StalledAfterLocalProbe {
+            local_node_id: local_id.clone(),
+            cluster_id,
+            observed_at: now,
+        };
+
+        let started = tokio::time::Instant::now();
+        let rows = cluster_health_rows_with_async_probe_for_scope_with_budget(
+            &paths,
+            &state,
+            &probe,
+            false,
+            false,
+            now,
+            std::time::Duration::from_millis(75),
+        )
+        .await
+        .expect("partial health rows");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "stalled member must not overrun the shared health budget"
+        );
+        let local_row = rows
+            .iter()
+            .find(|row| row.member.node_id == local_id)
+            .expect("local row");
+        assert_eq!(local_row.availability, ClusterNodeAvailability::Online);
+        assert_eq!(
+            local_row.status.commit.as_deref(),
+            Some("completed-before-timeout"),
+            "a status completed before cancellation must be retained"
+        );
+        let remote_row = rows
+            .iter()
+            .find(|row| row.member.node_id == remote_id)
+            .expect("remote row");
+        assert_eq!(remote_row.availability, ClusterNodeAvailability::Unknown);
+    }
+
+    #[tokio::test]
+    async fn stalled_deep_probe_preserves_budget_for_useful_bridge_peer_view() {
+        struct StalledDeepWithBridgeView {
+            cluster_id: ClusterId,
+            local_node_id: NodeId,
+            bridge_node_id: NodeId,
+            deep_node_id: NodeId,
+            deep_member: ClusterMemberRecord,
+            observed_at: OffsetDateTime,
+            peer_calls: std::sync::Mutex<usize>,
+        }
+
+        impl ClusterStatusAsyncProbe for StalledDeepWithBridgeView {
+            fn probe_member_status_async<'a>(
+                &'a self,
+                _state: &'a ClusterBootstrapState,
+                member: &'a ClusterMemberRecord,
+            ) -> ClusterMembershipRpcFuture<'a, Option<ClusterNodeStatusRecord>> {
+                let stalled = member.node_id == self.deep_node_id;
+                let status = (!stalled).then(|| {
+                    let commit = if member.node_id == self.local_node_id {
+                        "local-direct"
+                    } else {
+                        "bridge-direct"
+                    };
+                    health_test_status(&self.cluster_id, &member.node_id, commit, self.observed_at)
+                });
+                Box::pin(async move {
+                    if stalled {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                    Ok(status)
+                })
+            }
+
+            fn peer_health_rows_async<'a>(
+                &'a self,
+                _state: &'a ClusterBootstrapState,
+                member: &'a ClusterMemberRecord,
+                _timeout: std::time::Duration,
+            ) -> ClusterMembershipRpcFuture<'a, Option<Vec<ClusterHealthRow>>> {
+                assert_eq!(member.node_id, self.bridge_node_id);
+                *self.peer_calls.lock().expect("peer calls") += 1;
+                let row = health_test_row(
+                    &self.deep_member,
+                    health_test_status(
+                        &self.cluster_id,
+                        &self.deep_node_id,
+                        "via-bridge",
+                        self.observed_at,
+                    ),
+                );
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    Ok(Some(vec![row]))
+                })
+            }
+        }
+
+        let root = sinomo_testdir::TestDir::new("sinomo-cluster-health-stalled-deep-bridge");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_health_stalled_deep_bridge").expect("cluster");
+        let local_id =
+            NodeId::from_legacy_named("node_health_stalled_deep_bridge_local").expect("local");
+        let bridge_id =
+            NodeId::from_legacy_named("node_health_stalled_deep_bridge_bridge").expect("bridge");
+        let deep_id =
+            NodeId::from_legacy_named("node_health_stalled_deep_bridge_deep").expect("deep");
+        let local = health_test_member(&cluster_id, &local_id, "local", now);
+        let bridge = health_test_member(&cluster_id, &bridge_id, "bridge", now);
+        let deep = health_test_member(&cluster_id, &deep_id, "deep", now);
+        let state = ClusterBootstrapState {
+            cluster_id: cluster_id.clone(),
+            cluster_name: "stalled deep bridge".to_string(),
+            local_node_id: local_id.clone(),
+            local_node_display_name: "local".to_string(),
+            term: 1,
+            kv_revision: 1,
+            members: vec![local, bridge, deep.clone()],
+            initialized_at: now,
+            updated_at: now,
+        };
+        let probe = StalledDeepWithBridgeView {
+            cluster_id,
+            local_node_id: local_id,
+            bridge_node_id: bridge_id,
+            deep_node_id: deep_id.clone(),
+            deep_member: deep,
+            observed_at: now,
+            peer_calls: std::sync::Mutex::new(0),
+        };
+
+        let started = tokio::time::Instant::now();
+        let rows = cluster_health_rows_with_async_probe_for_scope_with_budget(
+            &paths,
+            &state,
+            &probe,
+            true,
+            false,
+            now,
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .expect("bridge-expanded health rows");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "recursive health must remain within its shared budget"
+        );
+        assert_eq!(*probe.peer_calls.lock().expect("peer calls"), 1);
+        let deep_row = rows
+            .iter()
+            .find(|row| row.member.node_id == deep_id)
+            .expect("deep row");
+        assert_eq!(deep_row.availability, ClusterNodeAvailability::Online);
+        assert_eq!(deep_row.status.commit.as_deref(), Some("via-bridge"));
+    }
+
+    #[test]
+    fn non_recursive_peer_view_request_keeps_live_probes_enabled() {
+        let request =
+            cluster_health_rpc_request_without_recursive_peer_views().expect("peer view request");
+        assert!(!cluster_health_rpc_request_includes_peer_views(&request));
+        assert!(cluster_health_rpc_request_uses_live_probes(&request));
     }
 }

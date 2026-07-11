@@ -16,8 +16,8 @@ use crate::posix_model::{
 use crate::posix_path::normalize_posix_path;
 use crate::{
     DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest, DfsError, DfsMessageTransport,
-    DfsNetworkMessage, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsReadData,
-    DfsReadRangeData, DfsReadResult, DfsVersion, NetworkedDfsRangeReadOutcome,
+    DfsNetworkMessage, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsPosixFilePrefixRead,
+    DfsReadData, DfsReadRangeData, DfsReadResult, DfsVersion, NetworkedDfsRangeReadOutcome,
     NetworkedDfsRangeReadStreamOutcome, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
     NetworkedDfsReadStreamOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
     sifs_file_system_id,
@@ -46,6 +46,180 @@ enum PosixBulkReadPlan {
         pending: PosixPendingBulkRead,
     },
     Fallback,
+}
+
+#[derive(Debug)]
+struct PosixRemoteRangeReadAssembly {
+    object_id: DfsObjectId,
+    source_node_id: NodeId,
+    version: DfsVersion,
+    content_hash: Option<String>,
+    range_offset: u64,
+    range_size_bytes: u64,
+    object_total_size_bytes: u64,
+    next_chunk_index: u32,
+    total_chunks: u32,
+    bytes: Vec<u8>,
+}
+
+impl PosixRemoteRangeReadAssembly {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        object_id: DfsObjectId,
+        source_node_id: NodeId,
+        version: DfsVersion,
+        content_hash: Option<String>,
+        range_offset: u64,
+        range_size_bytes: u64,
+        object_total_size_bytes: u64,
+        total_chunks: u32,
+        max_bytes: usize,
+    ) -> Result<Self> {
+        let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+        let expected_range_size = object_total_size_bytes
+            .saturating_sub(range_offset)
+            .min(max_bytes_u64);
+        if range_size_bytes != expected_range_size {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "chunked prefix range size mismatch: expected {expected_range_size}, actual {range_size_bytes}"
+                ),
+            }
+            .into());
+        }
+        if total_chunks == 0 {
+            return Err(DfsError::Distributed {
+                message: "chunked prefix range response has no chunks".to_string(),
+            }
+            .into());
+        }
+        let capacity = usize::try_from(range_size_bytes).map_err(|_| DfsError::Distributed {
+            message: format!(
+                "chunked prefix range size does not fit this platform: {range_size_bytes}"
+            ),
+        })?;
+        Ok(Self {
+            object_id,
+            source_node_id,
+            version,
+            content_hash,
+            range_offset,
+            range_size_bytes,
+            object_total_size_bytes,
+            next_chunk_index: 0,
+            total_chunks,
+            bytes: Vec::with_capacity(capacity),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn metadata_matches(
+        &self,
+        object_id: &DfsObjectId,
+        source_node_id: &NodeId,
+        version: &DfsVersion,
+        content_hash: &Option<String>,
+        range_offset: u64,
+        range_size_bytes: u64,
+        object_total_size_bytes: u64,
+        total_chunks: u32,
+    ) -> bool {
+        self.object_id == *object_id
+            && self.source_node_id == *source_node_id
+            && self.version == *version
+            && self.content_hash == *content_hash
+            && self.range_offset == range_offset
+            && self.range_size_bytes == range_size_bytes
+            && self.object_total_size_bytes == object_total_size_bytes
+            && self.total_chunks == total_chunks
+    }
+
+    fn push_chunk(&mut self, chunk_index: u32, bytes: Vec<u8>, complete: bool) -> Result<bool> {
+        if chunk_index != self.next_chunk_index {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "chunked prefix range response is out of order: expected {}, actual {chunk_index}",
+                    self.next_chunk_index
+                ),
+            }
+            .into());
+        }
+        let next_len =
+            self.bytes
+                .len()
+                .checked_add(bytes.len())
+                .ok_or_else(|| DfsError::Distributed {
+                    message: "chunked prefix range response length overflow".to_string(),
+                })?;
+        if u64::try_from(next_len).unwrap_or(u64::MAX) > self.range_size_bytes {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "chunked prefix range response exceeds requested range: expected {}, actual {next_len}",
+                    self.range_size_bytes
+                ),
+            }
+            .into());
+        }
+        self.bytes.extend(bytes);
+        self.next_chunk_index = self.next_chunk_index.saturating_add(1);
+        let expected_complete = self.next_chunk_index == self.total_chunks;
+        if complete != expected_complete {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "chunked prefix range completion mismatch: chunk={}, total={}, complete={complete}",
+                    self.next_chunk_index, self.total_chunks
+                ),
+            }
+            .into());
+        }
+        if complete && u64::try_from(self.bytes.len()).unwrap_or(u64::MAX) != self.range_size_bytes
+        {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "completed chunked prefix range size mismatch: expected {}, actual {}",
+                    self.range_size_bytes,
+                    self.bytes.len()
+                ),
+            }
+            .into());
+        }
+        Ok(complete)
+    }
+
+    fn into_data(self) -> DfsReadRangeData {
+        DfsReadRangeData {
+            object_id: self.object_id,
+            version: self.version,
+            content_hash: self.content_hash,
+            offset: self.range_offset,
+            total_size_bytes: self.object_total_size_bytes,
+            bytes: self.bytes,
+        }
+    }
+}
+
+fn validate_complete_posix_range_content_hash(
+    object: &DfsObjectMetadata,
+    data: &DfsReadRangeData,
+) -> std::result::Result<(), DfsError> {
+    // Truncated ranges have no whole-object content proof. When a range covers
+    // the complete object, preserve full-read integrity by hashing the bytes
+    // against the authoritative metadata before exposing them to the caller.
+    if data.offset != 0 || u64::try_from(data.bytes.len()).ok() != Some(data.total_size_bytes) {
+        return Ok(());
+    }
+    let actual_hash = crate::content_hash(&data.bytes);
+    let expected_hash = object
+        .content_hash
+        .as_deref()
+        .unwrap_or("committed content hash");
+    if actual_hash != expected_hash {
+        return Err(DfsError::ContentHashMismatch {
+            expected: expected_hash.to_string(),
+            actual: actual_hash,
+        });
+    }
+    Ok(())
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -223,6 +397,37 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             | NetworkedDfsReadOutcome::NotConfirmed { .. }
             | NetworkedDfsReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
             NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
+                Err(read_conflict_error(path, conflicts))
+            }
+        }
+    }
+
+    /// Reads at most `max_bytes` from the authoritative version of `path` and
+    /// reports whether more content remains. Path metadata is resolved once,
+    /// then reused for the range fetch so callers do not perform a separate
+    /// distributed stat and read freshness round.
+    pub fn posix_read_file_prefix_distributed(
+        &mut self,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<DfsPosixFilePrefixRead> {
+        self.check_cancelled("distributed prefix read")?;
+        let (path, object) = self.distributed_posix_file_content_object(path, true)?;
+        match self
+            .read_object_metadata_range_or_fetch_remote_without_cache(&object, 0, max_bytes)?
+        {
+            NetworkedDfsRangeReadOutcome::Found { data, .. } => {
+                let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+                validate_complete_posix_range_content_hash(&object, &data)?;
+                Ok(DfsPosixFilePrefixRead {
+                    bytes: data.bytes,
+                    truncated: data.total_size_bytes > max_bytes_u64,
+                })
+            }
+            NetworkedDfsRangeReadOutcome::PendingReplication { .. }
+            | NetworkedDfsRangeReadOutcome::NotConfirmed { .. }
+            | NetworkedDfsRangeReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
+            NetworkedDfsRangeReadOutcome::Conflicted { conflicts, .. } => {
                 Err(read_conflict_error(path, conflicts))
             }
         }
@@ -751,6 +956,212 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .unwrap_or(remaining);
             // Same pacing floor as `read_current_object_or_fetch_remote`: an
             // always-due retry on a degraded link must not spin this loop hot.
+            let wait = idle_wait
+                .min(remaining)
+                .min(until_retry)
+                .max(POSIX_REMOTE_READ_IDLE_WAIT_INITIAL.min(remaining));
+            if self
+                .transport
+                .wait_for_incoming(wait)
+                .map_err(DfsError::from_network)?
+            {
+                idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
+            } else {
+                idle_wait = idle_wait
+                    .saturating_mul(2)
+                    .min(POSIX_REMOTE_READ_IDLE_WAIT_MAX);
+            }
+        }
+    }
+
+    fn read_object_metadata_range_or_fetch_remote_without_cache(
+        &mut self,
+        object: &DfsObjectMetadata,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<NetworkedDfsRangeReadOutcome> {
+        self.with_posix_remote_read_deadline(|service, deadline| {
+            service.read_object_metadata_range_or_fetch_remote_without_cache_with_deadline(
+                object, offset, max_bytes, deadline,
+            )
+        })
+    }
+
+    fn read_object_metadata_range_or_fetch_remote_without_cache_with_deadline(
+        &mut self,
+        object: &DfsObjectMetadata,
+        offset: u64,
+        max_bytes: usize,
+        deadline: Instant,
+    ) -> Result<NetworkedDfsRangeReadOutcome> {
+        let mut object = self.current_read_object_metadata_or_path_object(object)?;
+        let initial =
+            self.read_object_metadata_local_range_with_state(&object, offset, max_bytes, false)?;
+        if !matches!(
+            initial,
+            NetworkedDfsRangeReadOutcome::PendingReplication { .. }
+        ) {
+            return Ok(initial);
+        }
+        let mut request_ids = self
+            .request_remote_object_range_read_for_metadata_without_cache(
+                &object, offset, max_bytes,
+            )?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if request_ids.is_empty() {
+            return Ok(initial);
+        }
+        let mut range_assemblies = BTreeMap::<String, PosixRemoteRangeReadAssembly>::new();
+        let mut idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
+        loop {
+            self.check_cancelled("remote metadata range read wait")?;
+            let events = self.process_incoming()?;
+            if !events.is_empty() {
+                idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
+            }
+            for event in events {
+                match event {
+                    NetworkedDfsServiceEvent::RemoteReadCompleted {
+                        request_id,
+                        object_id: event_object_id,
+                        source_node_id,
+                        result: DfsReadResult::RangeFound(data),
+                    } if request_ids.contains(&request_id)
+                        && event_object_id == object.object_id =>
+                    {
+                        if let Err(error) =
+                            validate_complete_posix_range_content_hash(&object, &data)
+                        {
+                            self.mark_remote_read_location_missing(
+                                &object.object_id,
+                                &object.version,
+                                &object.content_hash,
+                                &source_node_id,
+                            )?;
+                            return Err(error.into());
+                        }
+                        return Ok(NetworkedDfsRangeReadOutcome::Found {
+                            data,
+                            freshness: NetworkedDfsReadFreshness::Current,
+                        });
+                    }
+                    NetworkedDfsServiceEvent::RemoteReadCompleted { request_id, .. }
+                        if request_ids.contains(&request_id) =>
+                    {
+                        range_assemblies.remove(&request_id);
+                    }
+                    NetworkedDfsServiceEvent::RemoteRangeReadChunkReceived {
+                        request_id,
+                        object_id: event_object_id,
+                        source_node_id,
+                        version,
+                        content_hash,
+                        range_offset,
+                        range_size_bytes,
+                        object_total_size_bytes,
+                        chunk_index,
+                        total_chunks,
+                        bytes,
+                        complete,
+                    } if request_ids.contains(&request_id)
+                        && event_object_id == object.object_id =>
+                    {
+                        if !range_assemblies.contains_key(&request_id) {
+                            range_assemblies.insert(
+                                request_id.clone(),
+                                PosixRemoteRangeReadAssembly::new(
+                                    event_object_id.clone(),
+                                    source_node_id.clone(),
+                                    version.clone(),
+                                    content_hash.clone(),
+                                    range_offset,
+                                    range_size_bytes,
+                                    object_total_size_bytes,
+                                    total_chunks,
+                                    max_bytes,
+                                )?,
+                            );
+                        }
+                        let assembly = range_assemblies
+                            .get_mut(&request_id)
+                            .expect("range assembly inserted above");
+                        if !assembly.metadata_matches(
+                            &event_object_id,
+                            &source_node_id,
+                            &version,
+                            &content_hash,
+                            range_offset,
+                            range_size_bytes,
+                            object_total_size_bytes,
+                            total_chunks,
+                        ) {
+                            return Err(DfsError::Distributed {
+                                message: format!(
+                                    "conflicting chunked prefix range metadata for {request_id}"
+                                ),
+                            }
+                            .into());
+                        }
+                        if assembly.push_chunk(chunk_index, bytes, complete)? {
+                            let assembly = range_assemblies
+                                .remove(&request_id)
+                                .expect("completed range assembly");
+                            let completed_source = assembly.source_node_id.clone();
+                            let data = assembly.into_data();
+                            if let Err(error) =
+                                validate_complete_posix_range_content_hash(&object, &data)
+                            {
+                                self.mark_remote_read_location_missing(
+                                    &object.object_id,
+                                    &object.version,
+                                    &object.content_hash,
+                                    &completed_source,
+                                )?;
+                                return Err(error.into());
+                            }
+                            return Ok(NetworkedDfsRangeReadOutcome::Found {
+                                data,
+                                freshness: NetworkedDfsReadFreshness::Current,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            range_assemblies.retain(|request_id, _| self.pending_reads.contains_key(request_id));
+            object = self.current_read_object_metadata_or_path_object(&object)?;
+            let current = self
+                .read_object_metadata_local_range_with_state(&object, offset, max_bytes, false)?;
+            if !matches!(
+                current,
+                NetworkedDfsRangeReadOutcome::PendingReplication { .. }
+            ) {
+                return Ok(current);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(current);
+            }
+            let next_retry =
+                self.next_pending_remote_range_read_retry_for_metadata(&object, offset, max_bytes);
+            if next_retry.is_none_or(|retry_at| retry_at <= now) {
+                let next_request_ids = self
+                    .request_remote_object_range_read_for_metadata_without_cache(
+                        &object, offset, max_bytes,
+                    )?;
+                if next_request_ids.is_empty() {
+                    return Ok(current);
+                }
+                request_ids.extend(next_request_ids);
+                idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
+            }
+            let now = Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            let until_retry = self
+                .next_pending_remote_range_read_retry_for_metadata(&object, offset, max_bytes)
+                .map(|retry_at| retry_at.saturating_duration_since(now))
+                .unwrap_or(remaining);
             let wait = idle_wait
                 .min(remaining)
                 .min(until_retry)

@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 #[cfg(any(test, feature = "test-support"))]
 use std::net::TcpStream;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const SINOMO_NETWORK_OBJECT_VERSION: u16 = 1;
@@ -600,9 +600,19 @@ fn object_rpc_stream_overall_timeout(timeout: Duration) -> NetworkError {
 }
 
 const ASYNC_DAEMON_CONTROL_STREAM_POOL_MAX_IDLE_PER_ADDRESS: usize = 64;
+// The daemon closes a connection after DEFAULT_NETWORK_TIMEOUT without frame
+// progress. Retire client-side idle entries first so normal reuse never races
+// the server's idle close.
+const ASYNC_DAEMON_CONTROL_STREAM_POOL_IDLE_EXPIRY_MARGIN: Duration = Duration::from_secs(1);
+
+#[derive(Debug)]
+struct PooledAsyncDaemonControlStream {
+    stream: AsyncDaemonControlStream,
+    returned_at: Instant,
+}
 
 static ASYNC_DAEMON_CONTROL_STREAM_POOL: LazyLock<
-    Mutex<HashMap<String, Vec<AsyncDaemonControlStream>>>,
+    Mutex<HashMap<String, Vec<PooledAsyncDaemonControlStream>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -626,15 +636,27 @@ impl DaemonControlAttemptError {
     }
 
     fn into_source(self) -> NetworkError {
-        let delivery_state = match self.dispatch {
-            DaemonRequestDispatch::DefinitelyNotSent => NetworkDeliveryState::DefinitelyNotSent,
-            DaemonRequestDispatch::PossiblySent => NetworkDeliveryState::PossiblyApplied,
-        };
+        let delivery_state = self.delivery_state();
         network_error_with_delivery_state(
             self.source,
             "send daemon control request",
             delivery_state,
         )
+    }
+
+    fn into_stale_pooled_connection(self) -> NetworkError {
+        NetworkError::StalePooledConnection {
+            operation: "reuse daemon control connection".to_string(),
+            delivery_state: self.delivery_state(),
+            detail: self.source.to_string(),
+        }
+    }
+
+    fn delivery_state(&self) -> NetworkDeliveryState {
+        self.source.delivery_state().unwrap_or(match self.dispatch {
+            DaemonRequestDispatch::DefinitelyNotSent => NetworkDeliveryState::DefinitelyNotSent,
+            DaemonRequestDispatch::PossiblySent => NetworkDeliveryState::PossiblyApplied,
+        })
     }
 }
 
@@ -1033,22 +1055,38 @@ async fn send_reusable_daemon_control_request_async(
             return_pooled_daemon_control_stream(address, stream);
             Ok(response)
         }
-        Err(error) if reused && reused_stream_failure_is_retry_safe(request, error.dispatch) => {
-            let mut stream =
-                AsyncDaemonControlStream::connect_with_options(address, timeouts).await?;
-            let response = send_daemon_control_request_on_stream_async(
-                address,
-                request,
-                timeouts,
-                max_response_bytes,
-                &mut stream,
-            )
-            .await
-            .map_err(DaemonControlAttemptError::into_source)?;
-            return_pooled_daemon_control_stream(address, stream);
-            Ok(response)
+        Err(error) => {
+            // A frame failure means every idle socket for this address may
+            // predate the same peer restart. Dropping the whole address pool
+            // also covers EOF, connection reset, and broken pipe failures.
+            purge_pooled_daemon_control_streams(address);
+            if reused && reused_stream_failure_is_retry_safe(request, error.dispatch) {
+                let mut stream =
+                    AsyncDaemonControlStream::connect_with_options(address, timeouts).await?;
+                match send_daemon_control_request_on_stream_async(
+                    address,
+                    request,
+                    timeouts,
+                    max_response_bytes,
+                    &mut stream,
+                )
+                .await
+                {
+                    Ok(response) => {
+                        return_pooled_daemon_control_stream(address, stream);
+                        Ok(response)
+                    }
+                    Err(error) => {
+                        purge_pooled_daemon_control_streams(address);
+                        Err(error.into_source())
+                    }
+                }
+            } else if reused {
+                Err(error.into_stale_pooled_connection())
+            } else {
+                Err(error.into_source())
+            }
         }
-        Err(error) => Err(error.into_source()),
     }
 }
 
@@ -1078,22 +1116,35 @@ async fn send_reusable_daemon_control_rpc_request_raw_response_async(
             return_pooled_daemon_control_stream(address, stream);
             Ok(response)
         }
-        Err(error) if reused && reused_stream_failure_is_retry_safe(request, error.dispatch) => {
-            let mut stream =
-                AsyncDaemonControlStream::connect_with_options(address, timeouts).await?;
-            let response = send_daemon_control_rpc_request_raw_response_on_stream_async(
-                address,
-                request,
-                timeouts,
-                max_response_bytes,
-                &mut stream,
-            )
-            .await
-            .map_err(DaemonControlAttemptError::into_source)?;
-            return_pooled_daemon_control_stream(address, stream);
-            Ok(response)
+        Err(error) => {
+            purge_pooled_daemon_control_streams(address);
+            if reused && reused_stream_failure_is_retry_safe(request, error.dispatch) {
+                let mut stream =
+                    AsyncDaemonControlStream::connect_with_options(address, timeouts).await?;
+                match send_daemon_control_rpc_request_raw_response_on_stream_async(
+                    address,
+                    request,
+                    timeouts,
+                    max_response_bytes,
+                    &mut stream,
+                )
+                .await
+                {
+                    Ok(response) => {
+                        return_pooled_daemon_control_stream(address, stream);
+                        Ok(response)
+                    }
+                    Err(error) => {
+                        purge_pooled_daemon_control_streams(address);
+                        Err(error.into_source())
+                    }
+                }
+            } else if reused {
+                Err(error.into_stale_pooled_connection())
+            } else {
+                Err(error.into_source())
+            }
         }
-        Err(error) => Err(error.into_source()),
     }
 }
 
@@ -1162,8 +1213,9 @@ fn reused_stream_failure_is_retry_safe(
     // request made write progress. An unsigned local request may opt into an
     // ambiguous redispatch. A signed request must return to the route layer so
     // the retry gets a fresh daemon-auth nonce.
-    dispatch == DaemonRequestDispatch::DefinitelyNotSent
-        || (request.auth.is_none() && request.is_response_retry_safe())
+    request.auth.is_none()
+        && (dispatch == DaemonRequestDispatch::DefinitelyNotSent
+            || request.is_response_retry_safe())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1340,10 +1392,25 @@ fn daemon_control_request_allows_stream_reuse(request: &DaemonControlRequest) ->
         || object_rpc_request_reuses_daemon_stream(request)
 }
 
+fn pooled_daemon_control_stream_max_idle() -> Duration {
+    DEFAULT_NETWORK_TIMEOUT.saturating_sub(ASYNC_DAEMON_CONTROL_STREAM_POOL_IDLE_EXPIRY_MARGIN)
+}
+
+fn pooled_daemon_control_stream_is_expired(returned_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(returned_at) >= pooled_daemon_control_stream_max_idle()
+}
+
 fn take_pooled_daemon_control_stream(address: &str) -> Option<AsyncDaemonControlStream> {
     let mut pool = ASYNC_DAEMON_CONTROL_STREAM_POOL.lock().ok()?;
     let streams = pool.get_mut(address)?;
-    let stream = streams.pop();
+    let now = Instant::now();
+    let mut stream = None;
+    while let Some(pooled) = streams.pop() {
+        if !pooled_daemon_control_stream_is_expired(pooled.returned_at, now) {
+            stream = Some(pooled.stream);
+            break;
+        }
+    }
     if streams.is_empty() {
         pool.remove(address);
     }
@@ -1351,12 +1418,29 @@ fn take_pooled_daemon_control_stream(address: &str) -> Option<AsyncDaemonControl
 }
 
 fn return_pooled_daemon_control_stream(address: &str, stream: AsyncDaemonControlStream) {
+    return_pooled_daemon_control_stream_at(address, stream, Instant::now());
+}
+
+fn return_pooled_daemon_control_stream_at(
+    address: &str,
+    stream: AsyncDaemonControlStream,
+    returned_at: Instant,
+) {
     let Ok(mut pool) = ASYNC_DAEMON_CONTROL_STREAM_POOL.lock() else {
         return;
     };
     let streams = pool.entry(address.to_string()).or_default();
     if streams.len() < ASYNC_DAEMON_CONTROL_STREAM_POOL_MAX_IDLE_PER_ADDRESS {
-        streams.push(stream);
+        streams.push(PooledAsyncDaemonControlStream {
+            stream,
+            returned_at,
+        });
+    }
+}
+
+fn purge_pooled_daemon_control_streams(address: &str) {
+    if let Ok(mut pool) = ASYNC_DAEMON_CONTROL_STREAM_POOL.lock() {
+        pool.remove(address);
     }
 }
 
@@ -2435,7 +2519,7 @@ mod serde_bytes_tests {
     use serde::{Deserialize, Serialize};
     use sinomo_object::{BorrowedDocumentBuilder, DocumentView, LengthMode};
     use std::io::Cursor;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -3086,15 +3170,56 @@ mod serde_bytes_tests {
         server.await.expect("server task");
     }
 
+    #[tokio::test]
+    async fn daemon_control_pool_expires_before_server_idle_timeout_and_purges_address() {
+        let listener = AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("listener address");
+        let (client, server) = tokio::join!(
+            AsyncDaemonControlStream::connect(&address),
+            listener.accept()
+        );
+        let client = client.expect("client");
+        let server = server.expect("server");
+        let max_idle = super::pooled_daemon_control_stream_max_idle();
+        assert!(max_idle < super::DEFAULT_NETWORK_TIMEOUT);
+        let expired_at = Instant::now()
+            .checked_sub(max_idle)
+            .expect("expired instant");
+        super::return_pooled_daemon_control_stream_at(&address, client, expired_at);
+        assert!(
+            super::take_pooled_daemon_control_stream(&address).is_none(),
+            "a pooled stream must expire before the server's idle deadline"
+        );
+        drop(server);
+
+        let (client, server) = tokio::join!(
+            AsyncDaemonControlStream::connect(&address),
+            listener.accept()
+        );
+        let client = client.expect("client");
+        let server = server.expect("server");
+        super::return_pooled_daemon_control_stream(&address, client);
+        super::purge_pooled_daemon_control_streams(&address);
+        assert!(
+            super::take_pooled_daemon_control_stream(&address).is_none(),
+            "purging an address must discard all of its pooled streams"
+        );
+        drop(server);
+    }
+
     async fn exercise_ambiguous_reused_stream_failure(
         stream_mode: ObjectRpcRequestStreamMode,
         response_retry_safe: bool,
+        signed: bool,
     ) -> (Result<crate::ObjectRpcResponse, NetworkError>, bool) {
         let listener = AsyncDaemonControlListener::bind("127.0.0.1:0")
             .await
             .expect("listener");
         let address = listener.local_addr_string().expect("listener address");
-        let route = format!("/test/reused-stream-retry/{stream_mode:?}/{response_retry_safe}");
+        let route =
+            format!("/test/reused-stream-retry/{stream_mode:?}/{response_retry_safe}/{signed}");
         let server_route = route.clone();
         let server = tokio::spawn(async move {
             let frame_options = ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1));
@@ -3145,6 +3270,9 @@ mod serde_bytes_tests {
         if response_retry_safe {
             request = request.with_response_retry_safe();
         }
+        if signed {
+            request = request.with_auth(vec![1, 2, 3]);
+        }
 
         let first = super::send_daemon_control_rpc_request_async(
             &address,
@@ -3185,8 +3313,12 @@ mod serde_bytes_tests {
             super::DaemonRequestDispatch::PossiblySent,
         ));
         assert!(!super::reused_stream_failure_is_retry_safe(
-            &request.with_auth(vec![1, 2, 3]),
+            &request.clone().with_auth(vec![1, 2, 3]),
             super::DaemonRequestDispatch::PossiblySent,
+        ));
+        assert!(!super::reused_stream_failure_is_retry_safe(
+            &request.with_auth(vec![1, 2, 3]),
+            super::DaemonRequestDispatch::DefinitelyNotSent,
         ));
     }
 
@@ -3263,7 +3395,7 @@ mod serde_bytes_tests {
             ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
         ] {
             let (response, retried) =
-                exercise_ambiguous_reused_stream_failure(stream_mode, false).await;
+                exercise_ambiguous_reused_stream_failure(stream_mode, false, false).await;
             assert!(response.is_err(), "{stream_mode:?} should remain failed");
             assert!(!retried, "{stream_mode:?} should not be redispatched");
         }
@@ -3276,13 +3408,35 @@ mod serde_bytes_tests {
             ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
         ] {
             let (response, retried) =
-                exercise_ambiguous_reused_stream_failure(stream_mode, true).await;
+                exercise_ambiguous_reused_stream_failure(stream_mode, true, false).await;
             let response = response.expect("retry-safe response");
             assert_eq!(
                 response.decode_body::<String>().expect("retry body"),
                 "retried"
             );
             assert!(retried, "{stream_mode:?} should be redispatched");
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_reused_stream_failure_returns_to_route_for_fresh_auth() {
+        for stream_mode in [
+            ObjectRpcRequestStreamMode::ReuseDaemonStream,
+            ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
+        ] {
+            let (response, retried) =
+                exercise_ambiguous_reused_stream_failure(stream_mode, true, true).await;
+            assert!(matches!(
+                response,
+                Err(NetworkError::StalePooledConnection {
+                    delivery_state: NetworkDeliveryState::PossiblyApplied,
+                    ..
+                })
+            ));
+            assert!(
+                !retried,
+                "{stream_mode:?} must be re-signed before a fresh connection retry"
+            );
         }
     }
 

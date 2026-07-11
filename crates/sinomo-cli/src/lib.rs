@@ -26,8 +26,6 @@ macro_rules! eprintln {
     }};
 }
 
-#[cfg(test)]
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sinomo_agent::{
     AGENT_RPC_CATEGORY, AGENT_SESSION_FOLLOW_UP_ROUTE, AGENT_SESSION_INSPECT_ROUTE,
     AGENT_SESSION_INTERRUPT_ROUTE, AGENT_SESSION_PROGRESS_ROUTE, AGENT_SESSION_RESUME_ROUTE,
@@ -95,8 +93,6 @@ use sinomo_runtime::cluster::ClusterJoinRegistrationRequest;
 use sinomo_runtime::cluster::ClusterJoinRegistrationResponse;
 use sinomo_runtime::cluster::cluster_doctor_findings;
 use sinomo_runtime::cluster::{ClusterDoctorFinding, ClusterHealthRow};
-#[cfg(test)]
-use sinomo_runtime::cluster::{ClusterInviteChallengeProof, ClusterInviteChallengeRequest};
 use sinomo_runtime::core::{
     ClusterBootstrapState, ClusterEndpointRecord, ClusterJoinInvite, ClusterMemberRecord,
     ClusterMemberRole, ClusterMemberState, ClusterMigrationMode, ClusterMigrationPhase,
@@ -105,7 +101,7 @@ use sinomo_runtime::core::{
 };
 #[cfg(test)]
 use sinomo_runtime::daemon::{
-    AuthenticatedDaemonCommand, DaemonError, DaemonSignerAuthority, SignedDaemonCommand,
+    AuthenticatedDaemonCommand, DaemonError, DaemonSignerAuthority,
     authenticate_daemon_control_request, authorize_authenticated_daemon_command,
     sign_daemon_rpc_request_from_data_dir,
 };
@@ -136,8 +132,6 @@ use sinomo_runtime::daemon::{
     send_daemon_cluster_maintenance_refresh_to_endpoint as daemon_send_daemon_cluster_maintenance_refresh_to_endpoint,
     send_daemon_rollout_binary as daemon_send_daemon_rollout_binary,
     send_daemon_rollout_binary_to_endpoint as daemon_send_daemon_rollout_binary_to_endpoint,
-    send_daemon_rollout_binary_upload_chunk as daemon_send_daemon_rollout_binary_upload_chunk,
-    send_daemon_rollout_binary_upload_chunk_to_endpoint as daemon_send_daemon_rollout_binary_upload_chunk_to_endpoint,
     send_daemon_rollout_binary_upload_finalize as daemon_send_daemon_rollout_binary_upload_finalize,
     send_daemon_rollout_binary_upload_finalize_to_endpoint as daemon_send_daemon_rollout_binary_upload_finalize_to_endpoint,
     send_daemon_rollout_build_to_endpoint_with_timeouts as daemon_send_daemon_rollout_build_to_endpoint_with_timeouts,
@@ -219,6 +213,8 @@ use sinomo_runtime::node::{
     ClusterId, NodeId, cluster_member_expected_daemon_process, cluster_member_is_local_process,
     load_or_create_main_node_identity, load_or_create_shadow_node_identity, shadow_daemon_node_id,
 };
+#[cfg(not(test))]
+use sinomo_runtime::rollout::install_current_executable;
 #[cfg(test)]
 use sinomo_runtime::rollout::read_rollout_status;
 #[cfg(test)]
@@ -235,7 +231,6 @@ use sinomo_runtime::rollout::{
     RolloutActivationStrategy, RolloutController, RolloutError, RolloutMainActivation,
     RolloutObservation, RolloutRuntimeState, RolloutTelemetryGateConfig, SelfRolloutPaths,
     clear_rollout_status, ensure_rollout_layout, ensure_rollout_source_repo_with_options,
-    install_current_executable,
     install_local_rollout_native_dylib_modules as rollout_install_local_rollout_native_dylib_modules,
     managed_source_status, prepare_cluster_rollout_binary_request,
     prepare_cluster_rollout_build_request, prepare_cluster_rollout_native_dylib_module_request,
@@ -359,12 +354,13 @@ impl cluster::ClusterStatusProbe for CliClusterStatusProbe<'_> {
         cli_probe_member_daemon_status(self.paths, state, member)
     }
 
-    fn peer_local_health_rows(
+    fn peer_health_rows(
         &self,
         state: &ClusterBootstrapState,
         member: &ClusterMemberRecord,
+        timeout: Duration,
     ) -> Option<Vec<ClusterHealthRow>> {
-        cli_fetch_local_cluster_health_rows_from_member(self.paths, state, member)
+        cli_fetch_cluster_health_rows_from_member(self.paths, state, member, timeout)
     }
 }
 
@@ -556,24 +552,27 @@ fn cli_probe_local_member_daemon_status(
     Some(status)
 }
 
-fn cli_fetch_local_cluster_health_rows_from_member(
+fn cli_fetch_cluster_health_rows_from_member(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,
+    timeout: Duration,
 ) -> Option<Vec<ClusterHealthRow>> {
+    let deadline = Instant::now() + timeout;
     for endpoint in network::ClusterEndpointSelector::new(paths, state)
         .select(network::ClusterEndpointSelectionPurpose::MemberDaemonStatus)
         .into_iter()
         .filter(|endpoint| endpoint.node_id == member.node_id)
     {
-        let Ok(request) = cluster::cluster_local_health_rpc_request() else {
+        let Ok(request) = cluster::cluster_health_rpc_request_without_recursive_peer_views() else {
             return None;
         };
-        let Ok(response) = daemon_send_daemon_rpc_to_endpoint(
-            &endpoint,
-            &request,
-            CLUSTER_HEALTH_PEER_ROWS_TIMEOUT,
-        ) else {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let Ok(response) = daemon_send_daemon_rpc_to_endpoint(&endpoint, &request, remaining)
+        else {
             continue;
         };
         let Ok(rows) = cluster::decode_cluster_health_rpc_response(&response) else {
@@ -4158,7 +4157,7 @@ const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const CLUSTER_HEALTH_CLI_ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const CLUSTER_HEALTH_CLI_MAX_ENDPOINTS_PER_MEMBER: usize = 2;
-const CLUSTER_HEALTH_PEER_ROWS_TIMEOUT: Duration = Duration::from_secs(8);
+const CLUSTER_HEALTH_PEER_ROWS_TIMEOUT: Duration = network::DEFAULT_NETWORK_TIMEOUT;
 const DAEMON_AGENT_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const SINOMO_JOIN_URI_PREFIX: &str = cluster::SINOMO_JOIN_URI_PREFIX;

@@ -31,8 +31,6 @@ use std::time::{Duration, Instant};
 
 const SIFS_PEER_TARGET_REFRESH_TTL: Duration = Duration::from_secs(1);
 const SIFS_FOREGROUND_METADATA_PUBLISH_MAX_BATCHES_PER_TARGET: usize = 1;
-const SIFS_FOREGROUND_METADATA_PUBLISH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
-const SIFS_FOREGROUND_METADATA_PUBLISH_TARGET_TIMEOUT: Duration = Duration::from_secs(2);
 const SIFS_MAINTENANCE_REFRESH_TIMEOUT: Duration = Duration::from_millis(750);
 
 #[derive(Debug)]
@@ -169,7 +167,7 @@ impl SifsFileManagerBackend {
                 .map_err(|error| error.to_string())?;
             service
                 .process_incoming_until_pending_routed_writes_ready(
-                    SIFS_FOREGROUND_METADATA_PUBLISH_ATTEMPT_TIMEOUT,
+                    network::DEFAULT_NETWORK_TIMEOUT,
                 )
                 .map_err(|error| error.to_string())?;
         }
@@ -895,25 +893,17 @@ impl FileManagerBackend for SifsFileManagerBackend {
 
     fn read_file_prefix(&self, path: &str, max_bytes: u64) -> Result<FileManagerRead, String> {
         let path = normalize_sifs_path(path)?;
+        let max_bytes = usize::try_from(max_bytes)
+            .map_err(|_| format!("cannot read {path}: prefix length does not fit this platform"))?;
         let mut service = self.lock_service()?;
         self.refresh_service_peer_targets(&mut service);
-        let stat = service
-            .posix_stat_distributed(&path)
-            .map_err(|error| format!("cannot inspect {path}: {error}"))?;
-        let truncated = stat
-            .size_bytes
-            .map(|size| size > max_bytes)
-            .unwrap_or(false);
-        let bytes = if truncated {
-            service
-                .posix_read_file_range(&path, 0, max_bytes as usize)
-                .map_err(|error| format!("cannot read {path}: {error}"))?
-        } else {
-            service
-                .posix_read_file_distributed(&path)
-                .map_err(|error| format!("cannot read {path}: {error}"))?
-        };
-        Ok(FileManagerRead { bytes, truncated })
+        let read = service
+            .posix_read_file_prefix_distributed(&path, max_bytes)
+            .map_err(|error| format!("cannot read {path}: {error}"))?;
+        Ok(FileManagerRead {
+            bytes: read.bytes,
+            truncated: read.truncated,
+        })
     }
 
     fn directory_entry_count(&self, path: &str) -> Result<usize, String> {
@@ -1534,8 +1524,6 @@ fn publish_sifs_metadata_journal_from_data_dir(
 fn sifs_foreground_metadata_publish_options() -> DfsMetadataJournalReplicationOptions {
     DfsMetadataJournalReplicationOptions {
         max_batches_per_target: SIFS_FOREGROUND_METADATA_PUBLISH_MAX_BATCHES_PER_TARGET,
-        attempt_timeout: SIFS_FOREGROUND_METADATA_PUBLISH_ATTEMPT_TIMEOUT,
-        target_timeout: SIFS_FOREGROUND_METADATA_PUBLISH_TARGET_TIMEOUT,
         ..DfsMetadataJournalReplicationOptions::default()
     }
 }
@@ -1904,12 +1892,12 @@ mod tests {
     }
 
     #[test]
-    fn sifs_foreground_metadata_publish_is_bounded() {
+    fn sifs_foreground_metadata_publish_uses_network_timeout_defaults() {
         let options = sifs_foreground_metadata_publish_options();
 
         assert_eq!(options.max_batches_per_target, 1);
-        assert_eq!(options.attempt_timeout, Duration::from_secs(2));
-        assert_eq!(options.target_timeout, Duration::from_secs(2));
+        assert_eq!(options.attempt_timeout, network::DEFAULT_NETWORK_TIMEOUT);
+        assert_eq!(options.target_timeout, network::DEFAULT_NETWORK_TIMEOUT);
     }
 
     fn healthy_connectivity_record(

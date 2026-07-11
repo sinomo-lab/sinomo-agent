@@ -262,7 +262,7 @@ fn snapshot_wal_compaction_ignores_leftover_artifacts_after_reopen() {
 }
 
 #[test]
-fn materialized_snapshot_paths_ignore_stale_or_corrupt_cache_and_recover_corrupt_raft_view() {
+fn materialized_snapshot_paths_ignore_stale_cache_and_fail_closed_on_corrupt_raft() {
     let root = temp_root("sinomo-kv-power-loss-materialized-fallback");
     let paths = ClusterKvPaths::new(root.join("cluster"));
     let local = node_id("kv_power_loss_materialized_fallback");
@@ -310,19 +310,28 @@ fn materialized_snapshot_paths_ignore_stale_or_corrupt_cache_and_recover_corrupt
     fs::write(&raft_paths.snapshot, b"corrupt raft snapshot")
         .expect("corrupt durable raft snapshot file");
 
-    let recovered = cache
+    let error = cache
         .open_raft_node(local)
-        .expect("recover corrupt raft view from materialized snapshot");
+        .expect_err("an unanchored materialized snapshot must not recover corrupt Raft state");
+    assert!(
+        error.to_string().contains("invalid magic"),
+        "corrupt Raft error should be preserved, got {error}"
+    );
     assert_eq!(
-        entry_value(recovered.store(), "/power-loss/materialized/live"),
+        fs::read(&raft_paths.snapshot).expect("read preserved corrupt Raft snapshot"),
+        b"corrupt raft snapshot"
+    );
+    let recovered = InProcessKvStore::restore(
+        cache
+            .cached_snapshot()
+            .expect("materialized read cache remains available"),
+    )
+    .expect("restore materialized read cache");
+    assert_eq!(
+        entry_value(&recovered, "/power-loss/materialized/live"),
         b"live"
     );
-    assert!(
-        recovered
-            .store()
-            .get("/power-loss/materialized/stale")
-            .is_none()
-    );
+    assert!(recovered.get("/power-loss/materialized/stale").is_none());
 }
 
 #[test]

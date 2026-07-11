@@ -133,22 +133,12 @@ impl Backend {
             return Err("enter an invitation link before joining".to_string());
         }
         let client = self.cluster_control_client()?;
-        let response = client
+        client
             .cluster_join(cluster::ClusterControlJoinRequest {
                 invite: invite.to_string(),
+                node_display_name: Some(self.node.display_name.clone()),
             })
             .map_err(|error| error.to_string())?;
-        // Preserve the app's node display name; the daemon defaults to the
-        // hostname. Best effort: the join itself already succeeded.
-        let display_name = self.node.display_name.trim();
-        if !display_name.is_empty()
-            && let Err(error) = client.cluster_rename(cluster::ClusterControlRenameRequest {
-                node_id: Some(response.node_id.clone()),
-                display_name: display_name.to_string(),
-            })
-        {
-            tracing::warn!(%error, "joined cluster but could not apply app node display name");
-        }
         Ok(sinomo_cli::app_api::cluster_status(self.data_dir.as_ref()))
     }
 

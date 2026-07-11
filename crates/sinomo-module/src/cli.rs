@@ -309,6 +309,10 @@ impl CliCommand for ModuleCliCommandRunner {
         MODULE_POLICY
     }
 
+    fn is_help(&self) -> bool {
+        matches!(self.command, ModuleCliCommand::Help)
+    }
+
     fn help(&self) -> CliCommandHelp {
         module_cli_help(&self.config)
     }

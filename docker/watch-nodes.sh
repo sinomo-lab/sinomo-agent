@@ -11,6 +11,7 @@
 # working directory (the root docker-compose.yml is the production node).
 SINOMO_DOCKER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export COMPOSE_FILE="${COMPOSE_FILE:-$SINOMO_DOCKER_DIR/docker-compose.dev.yml}"
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-${SINOMO_WATCH_PROJECT:-sinomo-dfs-test}}"
 
 set -uo pipefail
 cd "$(dirname "$0")/.."

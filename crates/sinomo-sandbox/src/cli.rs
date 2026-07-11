@@ -618,6 +618,10 @@ impl CliCommand for SandboxCliCommandRunner {
         SANDBOX_CLI_POLICY
     }
 
+    fn is_help(&self) -> bool {
+        matches!(self.command, SandboxCliCommand::Help)
+    }
+
     fn help(&self) -> CliCommandHelp {
         sandbox_cli_help()
     }

@@ -62,11 +62,13 @@ pub use connectivity::{
     cluster_connectivity_stable_eq, validate_cluster_connectivity_records_for_source,
 };
 pub use connectivity_store::{
+    invalidate_local_cluster_connectivity_cache,
     prune_local_cluster_connectivity_records_for_state,
     prune_local_cluster_connectivity_records_for_state_async,
     read_local_cluster_connectivity_records, read_local_cluster_connectivity_records_for_source,
     record_local_cluster_endpoint_command_auth_denied,
     record_local_cluster_endpoint_command_connectivity, write_local_cluster_connectivity_records,
+    write_local_cluster_connectivity_records_async,
 };
 pub use connectivity_store::{
     write_local_cluster_connectivity_record_set, write_local_cluster_connectivity_record_set_async,

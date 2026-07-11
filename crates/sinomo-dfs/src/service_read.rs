@@ -107,6 +107,34 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.request_remote_object_read_for_metadata_inner(object, None, false)
     }
 
+    pub(crate) fn request_remote_object_range_read_for_metadata_without_cache(
+        &mut self,
+        object: &DfsObjectMetadata,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<Vec<String>, DfsError> {
+        let requested_nodes = self.request_remote_object_read_for_metadata_inner(
+            object,
+            Some((offset, max_bytes)),
+            false,
+        )?;
+        Ok(self
+            .pending_reads
+            .iter()
+            .filter(|(_, pending)| {
+                pending.object_id == object.object_id
+                    && pending.version == object.version
+                    && pending.content_hash == object.content_hash
+                    && pending.content_size_bytes == object.content_size_bytes
+                    && pending.range_offset == Some(offset)
+                    && pending.range_max_bytes == Some(max_bytes)
+                    && !pending.cache_response
+                    && requested_nodes.contains(&pending.target_node_id)
+            })
+            .map(|(request_id, _)| request_id.clone())
+            .collect())
+    }
+
     pub fn request_remote_object_range_read(
         &mut self,
         object_id: &DfsObjectId,
@@ -352,6 +380,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     && pending.content_size_bytes == object.content_size_bytes
                     && pending.range_offset.is_none()
                     && pending.range_max_bytes.is_none()
+                    && object.current_locations.contains(&pending.target_node_id)
+            })
+            .map(|pending| pending.next_retry_at)
+            .min()
+    }
+
+    pub(crate) fn next_pending_remote_range_read_retry_for_metadata(
+        &self,
+        object: &DfsObjectMetadata,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Option<Instant> {
+        self.pending_reads
+            .values()
+            .filter(|pending| {
+                pending.object_id == object.object_id
+                    && pending.version == object.version
+                    && pending.content_hash == object.content_hash
+                    && pending.content_size_bytes == object.content_size_bytes
+                    && pending.range_offset == Some(offset)
+                    && pending.range_max_bytes == Some(max_bytes)
+                    && !pending.cache_response
                     && object.current_locations.contains(&pending.target_node_id)
             })
             .map(|pending| pending.next_retry_at)

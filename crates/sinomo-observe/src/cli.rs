@@ -161,6 +161,10 @@ impl CliCommand for ObserveCliCommandRunner {
         OBSERVE_POLICY
     }
 
+    fn is_help(&self) -> bool {
+        matches!(self.command, ObserveCliCommand::Help)
+    }
+
     fn help(&self) -> CliCommandHelp {
         observe_cli_help()
     }

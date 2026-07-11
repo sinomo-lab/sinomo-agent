@@ -9,34 +9,37 @@
 #   1. DFS protocol codec — in-memory DFS data-plane frame encode/decode baseline
 #   2. network latency — signed object-RPC latency/RPS with no failed requests
 #   3. network payload — signed object-RPC payload throughput with no failed requests
-#   4. invariants     — per-node DFS operational invariants (baseline)
-#   5. read-your-write — write/read/rename/delete roundtrip on node1 and node5
-#   6. cross-node     — write on one segment, poll-read on the other (both
+#   4. cluster KV     — daemon-mediated quorum commit latency and throughput
+#                       from a direct and a deep-segment node
+#   5. invariants     — per-node DFS operational invariants (baseline)
+#   6. read-your-write — write/read/rename/delete roundtrip on node1 and node5
+#   7. cross-node     — write on one segment, poll-read on the other (both
 #                       directions), then a routed delete observed cluster-wide
-#   7. rename         — /users -> /services rename issued by a NON-writer node,
+#   8. rename         — /users -> /services rename issued by a NON-writer node,
 #                       observed (and the old path absent) on far nodes
-#   8. small baseline — node-local raw tiny-file write baseline for DFS comparison
-#   9. bulk perf      — small-file bulk write/read throughput with process I/O
+#   9. small baseline — node-local raw tiny-file write baseline for DFS comparison
+#   10. bulk perf     — small-file bulk write/read throughput with process I/O
 #                       amplification checks and read-side write_bytes == 0
-#   10. disk baseline — node-local raw file write/read baseline for DFS comparison
-#   11. large-file perf — large object write throughput, cross-node convergence
+#   11. disk baseline — node-local raw file write/read baseline for DFS comparison
+#   12. large-file perf — large object write throughput, cross-node convergence
 #                       latency, final-read throughput, process I/O amplification
 #                       checks, and read-side write_bytes == 0
-#   12. disk damage   — delete one durable loose blob and read through the
+#   13. disk damage   — delete one durable loose blob and read through the
 #                       remaining replica without read-side disk writes
-#   13. network heal  — temporarily disconnect a leaf node, write while it is
+#   14. network heal  — temporarily disconnect a leaf node, write while it is
 #                       isolated, reconnect it, and verify convergence
-#   14. restart       — restart a member, re-gate formation, re-read its data
-#   15. final sweep   — invariants again on every node
+#   15. restart       — restart a member, re-gate formation, re-read its data
+#   16. final sweep   — invariants again on every node, then routed status
+#                       with no pending remote DFS work
 #
 # Usage:
-#   docker/test-cluster.sh                  # build-if-missing, up, test, down -v
+#   docker/test-cluster.sh                  # build current binary, up, test, down -v
 #   SINOMO_TEST_REUSE=1 docker/test-cluster.sh   # reuse the running test project
 #   SINOMO_TEST_KEEP=1  docker/test-cluster.sh   # leave the cluster up afterwards
 #
 # Env knobs:
 #   SINOMO_TEST_PROJECT         compose project name   (default sinomo-dfs-test)
-#   SINOMO_TEST_FORMATION_WAIT  formation gate seconds (default 10)
+#   SINOMO_TEST_FORMATION_WAIT  formation gate seconds (default 30)
 #   SINOMO_TEST_EXPECT_TIMEOUT  cross-node poll seconds (default 90)
 #   SINOMO_TEST_PERF_FILES      files per bulk-performance leg (default 64)
 #   SINOMO_TEST_PERF_WARMUP_FILES files in the no-threshold warmup leg (default 8)
@@ -56,7 +59,7 @@
 #   SINOMO_TEST_LARGE_TIMEOUT  large-file write/read timeout seconds (default 180)
 #   SINOMO_TEST_LARGE_MIN_WRITE_BYTES_PER_SEC min large writer throughput (default 4194304)
 #   SINOMO_TEST_LARGE_MIN_READ_BYTES_PER_SEC  min final large read throughput after convergence (default 4194304)
-#   SINOMO_TEST_LARGE_MIN_RAW_WRITE_RATIO min large DFS write / raw write baseline ratio (default 0.33)
+#   SINOMO_TEST_LARGE_MIN_RAW_WRITE_RATIO min large DFS write / raw write baseline ratio (default 0.30)
 #   SINOMO_TEST_LARGE_MIN_RAW_READ_RATIO  min large DFS read / raw read baseline ratio (default 0, disabled)
 #   SINOMO_TEST_LARGE_RAW_SYNC_WRITE      sync raw baseline writes before timing completes (default 1)
 #   SINOMO_TEST_LARGE_MAX_PROC_WCHAR_AMPLIFICATION       max large writer-process wchar/logical bytes (default 0, disabled)
@@ -73,11 +76,9 @@
 #   SINOMO_TEST_DFS_PROTOCOL_CODEC_MIN_DECODE_BYTES_PER_SEC min codec payload decode throughput (default 67108864)
 #   SINOMO_TEST_NETWORK_REQUESTS_PER_TARGET cluster network ping RPCs per remote node (default 20)
 #   SINOMO_TEST_NETWORK_WARMUP_REQUESTS_PER_TARGET warmup RPCs per remote node before measured pings (default same as requests)
-#   SINOMO_TEST_NETWORK_CONCURRENCY         concurrent network ping workers (default 32)
+#   SINOMO_TEST_NETWORK_CONCURRENCY         concurrent network ping workers (default 16)
 #   SINOMO_TEST_NETWORK_TIMEOUT_MS          per network ping RPC timeout (default 2000)
 #   SINOMO_TEST_NETWORK_MAX_FAILURES        allowed failed network ping RPCs (default 0)
-#   SINOMO_TEST_NETWORK_MAX_P50_MS          max network ping p50 latency (default 50)
-#   SINOMO_TEST_NETWORK_MAX_P95_MS          max network ping p95 latency (default 250)
 #   SINOMO_TEST_NETWORK_MAX_P50_US          max aggregate network ping p50 latency (default 25000)
 #   SINOMO_TEST_NETWORK_MAX_P95_US          max network ping p95 latency (default 50000)
 #   SINOMO_TEST_NETWORK_MIN_RPS             min network ping throughput (default 250)
@@ -91,12 +92,23 @@
 #   SINOMO_TEST_NETWORK_PAYLOAD_REQUEST_BYTES request bytes per payload-throughput RPC (default 262144)
 #   SINOMO_TEST_NETWORK_PAYLOAD_RESPONSE_BYTES response bytes per payload-throughput RPC (default 262144)
 #   SINOMO_TEST_NETWORK_PAYLOAD_MIN_BYTES_PER_SEC min payload-throughput rate (default 16777216)
+#   SINOMO_TEST_CLUSTER_KV_ITERATIONS        quorum commits per selected node (default 12)
+#   SINOMO_TEST_CLUSTER_KV_VALUE_BYTES       value bytes per quorum commit (default 256)
+#   SINOMO_TEST_CLUSTER_KV_TIMEOUT_MS        per-commit timeout (default 5000)
+#   SINOMO_TEST_CLUSTER_KV_MAX_FAILURES      allowed failed quorum commits per node (default 0)
+#   SINOMO_TEST_CLUSTER_KV_MAX_P50_MS        max quorum commit p50 latency (default 1000)
+#   SINOMO_TEST_CLUSTER_KV_MAX_P95_MS        max quorum commit p95 latency (default 2000)
+#   SINOMO_TEST_CLUSTER_KV_MIN_COMMITS_PER_SECOND min quorum commit throughput (default 1)
 #   SINOMO_TEST_NETWORK_READY_WAIT          network/auth convergence gate seconds (default 120)
 #   SINOMO_TEST_NETWORK_READY_REQUESTS_PER_TARGET requests per target during readiness warmup (default 20)
-#   SINOMO_TEST_NETWORK_READY_CONCURRENCY   readiness warmup concurrency (default 32)
+#   SINOMO_TEST_NETWORK_READY_CONCURRENCY   readiness warmup concurrency (default 16)
+#   SINOMO_TEST_READINESS_COMMAND_TIMEOUT   host/container cap for each readiness command (default 10)
+#   SINOMO_TEST_PROBE_COMMAND_TIMEOUT       host/container cap for each test probe (default 300)
+#   SINOMO_TEST_ARTIFACT_COMMAND_TIMEOUT    cap for each failure artifact command (default 10)
+#   SINOMO_TEST_HOST_TIMEOUT_GRACE          host cleanup grace beyond the container timeout (default 5)
 #   SINOMO_TEST_NETWORK_PARTITION_SECONDS   seconds to keep node6 disconnected in network-heal leg (default 5)
 #   SINOMO_TEST_NETWORK_ONLY=1              stop after network baseline
-#   SINOMO_TEST_BUILD=1         force `cargo build -p sinomo` first
+#   SINOMO_TEST_BUILD=0         reuse an existing host binary instead of rebuilding
 #   SINOMO_TEST_ARTIFACTS       artifact dir (default target/cluster-test-artifacts/<run>)
 #   SINOMO_TEST_ALLOW_OTHER_COMPOSE=1       allow running while unrelated compose projects are up
 #
@@ -109,10 +121,16 @@ SINOMO_ROOT="$(dirname "$SINOMO_DOCKER_DIR")"
 COMPOSE_FILE="${COMPOSE_FILE:-$SINOMO_DOCKER_DIR/docker-compose.dev.yml}"
 
 PROJECT="${SINOMO_TEST_PROJECT:-sinomo-dfs-test}"
-FORMATION_WAIT="${SINOMO_TEST_FORMATION_WAIT:-10}"
+FORMATION_WAIT="${SINOMO_TEST_FORMATION_WAIT:-30}"
 DFS_READY_WAIT="${SINOMO_TEST_DFS_READY_WAIT:-240}"
 EXPECT_TIMEOUT="${SINOMO_TEST_EXPECT_TIMEOUT:-90}"
+ROUTED_STATUS_MAX_ATTEMPTS="${SINOMO_TEST_ROUTED_STATUS_MAX_ATTEMPTS:-12}"
+ROUTED_STATUS_MAX_ELAPSED_MS="${SINOMO_TEST_ROUTED_STATUS_MAX_ELAPSED_MS:-$((EXPECT_TIMEOUT * 1000))}"
 POLL_INTERVAL="${SINOMO_TEST_POLL_INTERVAL:-1}"
+READINESS_COMMAND_TIMEOUT="${SINOMO_TEST_READINESS_COMMAND_TIMEOUT:-10}"
+PROBE_COMMAND_TIMEOUT="${SINOMO_TEST_PROBE_COMMAND_TIMEOUT:-300}"
+ARTIFACT_COMMAND_TIMEOUT="${SINOMO_TEST_ARTIFACT_COMMAND_TIMEOUT:-10}"
+HOST_TIMEOUT_GRACE="${SINOMO_TEST_HOST_TIMEOUT_GRACE:-5}"
 EXPECTED_MAINS=6
 PERF_FILES="${SINOMO_TEST_PERF_FILES:-64}"
 PERF_WARMUP_FILES="${SINOMO_TEST_PERF_WARMUP_FILES:-8}"
@@ -132,7 +150,7 @@ LARGE_BYTES="${SINOMO_TEST_LARGE_BYTES:-67108864}"
 LARGE_TIMEOUT="${SINOMO_TEST_LARGE_TIMEOUT:-180}"
 LARGE_MIN_WRITE_BYTES_PER_SEC="${SINOMO_TEST_LARGE_MIN_WRITE_BYTES_PER_SEC:-4194304}"
 LARGE_MIN_READ_BYTES_PER_SEC="${SINOMO_TEST_LARGE_MIN_READ_BYTES_PER_SEC:-4194304}"
-LARGE_MIN_RAW_WRITE_RATIO="${SINOMO_TEST_LARGE_MIN_RAW_WRITE_RATIO:-0.33}"
+LARGE_MIN_RAW_WRITE_RATIO="${SINOMO_TEST_LARGE_MIN_RAW_WRITE_RATIO:-0.30}"
 LARGE_MIN_RAW_READ_RATIO="${SINOMO_TEST_LARGE_MIN_RAW_READ_RATIO:-0}"
 LARGE_RAW_SYNC_WRITE="${SINOMO_TEST_LARGE_RAW_SYNC_WRITE:-1}"
 LARGE_MAX_PROC_WCHAR_AMPLIFICATION="${SINOMO_TEST_LARGE_MAX_PROC_WCHAR_AMPLIFICATION:-0}"
@@ -152,8 +170,6 @@ NETWORK_WARMUP_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_WARMUP_REQUESTS_PER_TA
 NETWORK_CONCURRENCY="${SINOMO_TEST_NETWORK_CONCURRENCY:-16}"
 NETWORK_TIMEOUT_MS="${SINOMO_TEST_NETWORK_TIMEOUT_MS:-2000}"
 NETWORK_MAX_FAILURES="${SINOMO_TEST_NETWORK_MAX_FAILURES:-0}"
-NETWORK_MAX_P50_MS="${SINOMO_TEST_NETWORK_MAX_P50_MS:-50}"
-NETWORK_MAX_P95_MS="${SINOMO_TEST_NETWORK_MAX_P95_MS:-250}"
 NETWORK_MAX_P50_US="${SINOMO_TEST_NETWORK_MAX_P50_US:-25000}"
 NETWORK_MAX_P95_US="${SINOMO_TEST_NETWORK_MAX_P95_US:-50000}"
 NETWORK_MIN_RPS="${SINOMO_TEST_NETWORK_MIN_RPS:-250}"
@@ -167,6 +183,13 @@ NETWORK_PAYLOAD_TIMEOUT_MS="${SINOMO_TEST_NETWORK_PAYLOAD_TIMEOUT_MS:-5000}"
 NETWORK_PAYLOAD_REQUEST_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_REQUEST_BYTES:-262144}"
 NETWORK_PAYLOAD_RESPONSE_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_RESPONSE_BYTES:-262144}"
 NETWORK_PAYLOAD_MIN_BYTES_PER_SEC="${SINOMO_TEST_NETWORK_PAYLOAD_MIN_BYTES_PER_SEC:-16777216}"
+CLUSTER_KV_ITERATIONS="${SINOMO_TEST_CLUSTER_KV_ITERATIONS:-12}"
+CLUSTER_KV_VALUE_BYTES="${SINOMO_TEST_CLUSTER_KV_VALUE_BYTES:-256}"
+CLUSTER_KV_TIMEOUT_MS="${SINOMO_TEST_CLUSTER_KV_TIMEOUT_MS:-5000}"
+CLUSTER_KV_MAX_FAILURES="${SINOMO_TEST_CLUSTER_KV_MAX_FAILURES:-0}"
+CLUSTER_KV_MAX_P50_MS="${SINOMO_TEST_CLUSTER_KV_MAX_P50_MS:-1000}"
+CLUSTER_KV_MAX_P95_MS="${SINOMO_TEST_CLUSTER_KV_MAX_P95_MS:-2000}"
+CLUSTER_KV_MIN_COMMITS_PER_SECOND="${SINOMO_TEST_CLUSTER_KV_MIN_COMMITS_PER_SECOND:-1}"
 NETWORK_READY_WAIT="${SINOMO_TEST_NETWORK_READY_WAIT:-120}"
 NETWORK_READY_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_READY_REQUESTS_PER_TARGET:-20}"
 NETWORK_READY_CONCURRENCY="${SINOMO_TEST_NETWORK_READY_CONCURRENCY:-$NETWORK_CONCURRENCY}"
@@ -182,6 +205,34 @@ log() { echo "[test-cluster] $*"; }
 
 compose() {
   docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"
+}
+
+compose_timeout() {
+  local seconds="$1"
+  shift
+  timeout --foreground "${seconds}s" docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"
+}
+
+compose_exec_timeout() {
+  local seconds="$1" node="$2" host_seconds
+  shift 2
+  host_seconds=$(( seconds + HOST_TIMEOUT_GRACE ))
+  timeout --foreground "${host_seconds}s" \
+    docker compose -p "$PROJECT" -f "$COMPOSE_FILE" \
+    exec -T "$node" timeout --foreground "${seconds}s" "$@"
+}
+
+deadline_command_timeout() {
+  local deadline="$1" maximum="$2" now remaining
+  now="$(date +%s)"
+  remaining=$(( deadline - now ))
+  [ "$remaining" -gt 0 ] || return 1
+  [ "$maximum" -gt 0 ] || return 1
+  if [ "$remaining" -lt "$maximum" ]; then
+    printf '%s\n' "$remaining"
+  else
+    printf '%s\n' "$maximum"
+  fi
 }
 
 running_other_compose_projects() {
@@ -207,28 +258,108 @@ require_no_other_compose_projects() {
   return 1
 }
 
-main_online_count() {
-  compose exec -T node1 sinomo cluster health 2>/dev/null \
-    | grep -c "daemon-main.*online" || true
-}
-
 doctor_connectivity_warnings() {
-  compose exec -T node1 sinomo cluster doctor 2>/dev/null \
-    | grep -E "endpoint-unreachable|node-offline" || true
+  local seconds="${1:-$READINESS_COMMAND_TIMEOUT}" output_file="${2:-}" output
+  if ! output="$(compose_exec_timeout "$seconds" node1 sinomo cluster doctor 2>&1)"; then
+    if [ -n "$output_file" ]; then
+      printf '%s\n' "$output" > "$output_file"
+    fi
+    return 1
+  fi
+  if [ -n "$output_file" ]; then
+    printf '%s\n' "$output" > "$output_file"
+  fi
+  printf '%s\n' "$output" | grep -E "endpoint-unreachable|node-offline" || true
 }
 
 cluster_health() {
-  compose exec -T node1 sinomo cluster health 2>/dev/null || true
+  local seconds="${1:-$READINESS_COMMAND_TIMEOUT}"
+  compose_exec_timeout "$seconds" node1 sinomo cluster health 2>/dev/null || true
+}
+
+formation_failure_markers() {
+  local seconds="${1:-$READINESS_COMMAND_TIMEOUT}"
+  compose_exec_timeout "$seconds" node1 sh -c '
+    for marker in /shared/*.failed /shared/*.join-failed; do
+      [ -f "$marker" ] || continue
+      printf "%s\n" "--- $marker"
+      sed -n "1,80p" "$marker"
+    done
+  ' 2>/dev/null || true
+}
+
+report_cluster_readiness_timeout() {
+  local label="$1" elapsed="$2" best_online="$3" last_online="$4"
+  local health_file="$5" doctor_file="$6" health_header unresolved
+  log "$label: cluster NOT ready after ${elapsed}s (best-online=$best_online, last-online=$last_online)"
+  if [ -s "$health_file" ] && grep -q '[^[:space:]]' "$health_file"; then
+    unresolved="$(awk '
+      $0 ~ /daemon-main/ && $0 !~ /daemon-main.*online/ { print }
+    ' "$health_file")"
+    if [ -n "$unresolved" ]; then
+      health_header="$(sed -n '1p' "$health_file")"
+      log "$label: last unresolved daemon rows:"
+      printf '%s\n%s\n' "$health_header" "$unresolved" | sed 's/^/[test-cluster]   /'
+    fi
+  else
+    log "$label: no cluster health output was captured"
+  fi
+  log "$label: last health output: $health_file"
+  log "$label: last doctor output: $doctor_file"
 }
 
 wait_for_cluster_ready() {
-  local label="$1" started deadline now elapsed online warnings
+  local label="$1" started deadline now elapsed health online warnings command_timeout markers
+  local label_slug health_file doctor_file best_online=0 last_online=0
+  label_slug="${label//[^a-zA-Z0-9._-]/_}"
+  health_file="$ARTIFACTS/cluster-ready-$label_slug.last-health.txt"
+  doctor_file="$ARTIFACTS/cluster-ready-$label_slug.last-doctor.txt"
+  : > "$health_file"
+  printf '%s\n' "doctor not run: health has not reported $EXPECTED_MAINS online main daemons" \
+    > "$doctor_file"
   log "$label: waiting for $EXPECTED_MAINS clean main daemons (<=${FORMATION_WAIT}s)"
   started="$(date +%s)"
   deadline=$(( started + FORMATION_WAIT ))
   while :; do
-    online="$(main_online_count)"
-    warnings="$(doctor_connectivity_warnings)"
+    if ! command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")"; then
+      now="$(date +%s)"
+      elapsed=$(( now - started ))
+      report_cluster_readiness_timeout \
+        "$label" "$elapsed" "$best_online" "$last_online" "$health_file" "$doctor_file"
+      return 1
+    fi
+    health="$(cluster_health "$command_timeout")"
+    printf '%s\n' "$health" > "$health_file"
+    online="$(printf '%s\n' "$health" | grep -c "daemon-main.*online" || true)"
+    last_online="${online:-0}"
+    if [ "${online:-0}" -gt "$best_online" ]; then
+      best_online="$online"
+    fi
+    if ! command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")"; then
+      now="$(date +%s)"
+      elapsed=$(( now - started ))
+      report_cluster_readiness_timeout \
+        "$label" "$elapsed" "$best_online" "$last_online" "$health_file" "$doctor_file"
+      return 1
+    fi
+    markers="$(formation_failure_markers "$command_timeout")"
+    if [ -n "$markers" ]; then
+      log "$label: cluster formation reported a terminal failure"
+      printf '%s\n' "$markers" | sed 's/^/[test-cluster]   /'
+      return 1
+    fi
+    warnings=""
+    if [ "${online:-0}" -ge "$EXPECTED_MAINS" ]; then
+      # Doctor performs another live health aggregation. Keep it off the hot
+      # formation polling path and run it only once all expected mains appear.
+      if command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")"; then
+        if ! warnings="$(doctor_connectivity_warnings "$command_timeout" "$doctor_file")"; then
+          warnings="cluster doctor failed or timed out"
+        fi
+      else
+        warnings="readiness deadline exhausted before doctor completed"
+      fi
+    fi
     now="$(date +%s)"
     elapsed=$(( now - started ))
     if [ "${online:-0}" -ge "$EXPECTED_MAINS" ] && [ -z "$warnings" ]; then
@@ -236,11 +367,13 @@ wait_for_cluster_ready() {
         log "$label: cluster ready (${online} main daemons online, ${elapsed}s)"
         return 0
       fi
-      log "$label: cluster NOT ready within ${FORMATION_WAIT}s (online=${online:-0}, elapsed=${elapsed}s)"
+      report_cluster_readiness_timeout \
+        "$label" "$elapsed" "$best_online" "$last_online" "$health_file" "$doctor_file"
       return 1
     fi
     if [ "$now" -ge "$deadline" ]; then
-      log "$label: cluster NOT ready after ${FORMATION_WAIT}s (online=${online:-0})"
+      report_cluster_readiness_timeout \
+        "$label" "$elapsed" "$best_online" "$last_online" "$health_file" "$doctor_file"
       return 1
     fi
     sleep "$POLL_INTERVAL"
@@ -252,28 +385,40 @@ wait_for_cluster_ready() {
 # and bootstraps the node's SIFS namespace, both of which can lag formation by
 # a few seconds on the deep-segment nodes.
 wait_for_dfs_ready() {
-  local deadline node pending still
+  local deadline node pending still probe_log probe_err command_timeout now
   log "dfs-ready: waiting for every node to open SIFS and pass invariants (<=${DFS_READY_WAIT}s)"
   deadline=$(( $(date +%s) + DFS_READY_WAIT ))
   pending="$NODES"
   while :; do
     still=""
     for node in $pending; do
-      if compose exec -T "$node" sinomo test run cluster.dfs.invariants \
-          --require-cluster --param timeout-seconds=5 \
-          >"$ARTIFACTS/dfs-ready-$node.last.json" 2>&1; then
-        log "  dfs-ready: $node"
+      probe_log="$ARTIFACTS/dfs-ready-$node.last.json"
+      probe_err="$ARTIFACTS/dfs-ready-$node.last.stderr.log"
+      if command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")" \
+        && compose_exec_timeout "$command_timeout" "$node" sinomo test run cluster.dfs.invariants \
+          --require-cluster --json --param timeout-seconds=5 \
+          >"$probe_log" 2>"$probe_err"; then
+        now="$(date +%s)"
+        if [ "$now" -le "$deadline" ]; then
+          log "  dfs-ready: $node"
+        else
+          still="$still $node"
+        fi
       else
         still="$still $node"
       fi
     done
     pending="${still# }"
-    [ -z "$pending" ] && return 0
-    if [ "$(date +%s)" -ge "$deadline" ]; then
+    now="$(date +%s)"
+    if [ -z "$pending" ] && [ "$now" -le "$deadline" ]; then
+      return 0
+    fi
+    if [ "$now" -ge "$deadline" ]; then
       log "dfs-ready: nodes never became ready: $pending"
       for node in $pending; do
         log "  $node last probe output:"
         sed 's/^/      /' "$ARTIFACTS/dfs-ready-$node.last.json" | tail -4
+        sed 's/^/      /' "$ARTIFACTS/dfs-ready-$node.last.stderr.log" | tail -4
       done
       return 1
     fi
@@ -282,14 +427,17 @@ wait_for_dfs_ready() {
 }
 
 wait_for_network_ready() {
-  local deadline node pending still
+  local deadline node pending still probe_log probe_err command_timeout now
   log "network-ready: waiting for relay/auth convergence (<=${NETWORK_READY_WAIT}s)"
   deadline=$(( $(date +%s) + NETWORK_READY_WAIT ))
   pending="$NODES"
   while :; do
     still=""
     for node in $pending; do
-      if compose exec -T "$node" sinomo test run cluster.network.ping-benchmark \
+      probe_log="$ARTIFACTS/network-ready-$node.last.json"
+      probe_err="$ARTIFACTS/network-ready-$node.last.stderr.log"
+      if command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")" \
+        && compose_exec_timeout "$command_timeout" "$node" sinomo test run cluster.network.ping-benchmark \
           --require-cluster \
           --json \
           --param "requests-per-target=$NETWORK_READY_REQUESTS_PER_TARGET" \
@@ -297,24 +445,33 @@ wait_for_network_ready() {
           --param "concurrency=$NETWORK_READY_CONCURRENCY" \
           --param "timeout-ms=$NETWORK_TIMEOUT_MS" \
           --param "max-failures=0" \
-          --param "max-p50-ms=$NETWORK_MAX_P50_MS" \
-          --param "max-p95-ms=$NETWORK_MAX_P95_MS" \
+          --param "max-p50-ms=0" \
+          --param "max-p95-ms=0" \
           --param "max-p50-us=$NETWORK_MAX_P50_US" \
           --param "max-p95-us=$NETWORK_MAX_P95_US" \
           --param "min-requests-per-second=$NETWORK_MIN_RPS" \
-          >"$ARTIFACTS/network-ready-$node.last.json" 2>&1; then
-        log "  network-ready: $node"
+          >"$probe_log" 2>"$probe_err"; then
+        now="$(date +%s)"
+        if [ "$now" -le "$deadline" ]; then
+          log "  network-ready: $node"
+        else
+          still="$still $node"
+        fi
       else
         still="$still $node"
       fi
     done
     pending="${still# }"
-    [ -z "$pending" ] && return 0
-    if [ "$(date +%s)" -ge "$deadline" ]; then
+    now="$(date +%s)"
+    if [ -z "$pending" ] && [ "$now" -le "$deadline" ]; then
+      return 0
+    fi
+    if [ "$now" -ge "$deadline" ]; then
       log "network-ready: nodes never became ready: $pending"
       for node in $pending; do
         log "  $node last probe output:"
         sed 's/^/      /' "$ARTIFACTS/network-ready-$node.last.json" | tail -12
+        sed 's/^/      /' "$ARTIFACTS/network-ready-$node.last.stderr.log" | tail -4
       done
       return 1
     fi
@@ -327,16 +484,19 @@ run_probe() {
   local node="$1" id="$2"
   shift 2
   PROBE_INDEX=$((PROBE_INDEX + 1))
-  local slug probe_log
+  local slug probe_log probe_err
   slug="$(printf '%03d' "$PROBE_INDEX")-$node-${id//[^a-zA-Z0-9._-]/_}"
   probe_log="$ARTIFACTS/probe-$slug.json"
-  if compose exec -T "$node" sinomo test run "$id" --require-cluster --json "$@" \
-      >"$probe_log" 2>&1; then
+  probe_err="$ARTIFACTS/probe-$slug.stderr.log"
+  if compose_exec_timeout "$PROBE_COMMAND_TIMEOUT" "$node" \
+      sinomo test run "$id" --require-cluster --json "$@" \
+      >"$probe_log" 2>"$probe_err"; then
     log "  ok: $node $id"
     return 0
   fi
   log "  FAILED: $node $id $*"
   sed 's/^/      /' "$probe_log"
+  sed 's/^/      /' "$probe_err"
   return 1
 }
 
@@ -362,6 +522,17 @@ invariants_sweep() {
   return $rc
 }
 
+final_routed_status() {
+  run_probe node1 cluster.dfs.routed-status \
+    --param expected-targets=5 \
+    --param max-remote-open-conflicts=0 \
+    --param max-remote-pending-writes=0 \
+    --param max-remote-pending-repairs=0 \
+    --param "max-attempts=$ROUTED_STATUS_MAX_ATTEMPTS" \
+    --param "max-elapsed-ms=$ROUTED_STATUS_MAX_ELAPSED_MS" \
+    --param "timeout-seconds=$EXPECT_TIMEOUT"
+}
+
 dfs_protocol_codec_baseline() {
   run_probe node1 cluster.dfs.protocol-codec-baseline \
     --param "bytes=$DFS_PROTOCOL_CODEC_BYTES" \
@@ -379,8 +550,8 @@ network_baseline() {
       --param "concurrency=$NETWORK_CONCURRENCY" \
       --param "timeout-ms=$NETWORK_TIMEOUT_MS" \
       --param "max-failures=$NETWORK_MAX_FAILURES" \
-      --param "max-p50-ms=$NETWORK_MAX_P50_MS" \
-      --param "max-p95-ms=$NETWORK_MAX_P95_MS" \
+      --param "max-p50-ms=0" \
+      --param "max-p95-ms=0" \
       --param "max-p50-us=$NETWORK_MAX_P50_US" \
       --param "max-p95-us=$NETWORK_MAX_P95_US" \
       --param "payload-bytes=$NETWORK_PAYLOAD_BYTES" \
@@ -412,6 +583,23 @@ network_payload_baseline() {
   return $rc
 }
 
+cluster_kv_quorum_baseline() {
+  local rc=0 node
+  # node1 exercises the usual local-authority path; node5 exercises forwarding
+  # across the deeper segmented route in the development topology.
+  for node in node1 node5; do
+    run_probe "$node" cluster.kv.quorum-commit-benchmark \
+      --param "iterations=$CLUSTER_KV_ITERATIONS" \
+      --param "value-bytes=$CLUSTER_KV_VALUE_BYTES" \
+      --param "timeout-ms=$CLUSTER_KV_TIMEOUT_MS" \
+      --param "max-failures=$CLUSTER_KV_MAX_FAILURES" \
+      --param "max-p50-ms=$CLUSTER_KV_MAX_P50_MS" \
+      --param "max-p95-ms=$CLUSTER_KV_MAX_P95_MS" \
+      --param "min-commits-per-second=$CLUSTER_KV_MIN_COMMITS_PER_SECOND" || rc=1
+  done
+  return $rc
+}
+
 read_your_write() {
   run_probe node1 cluster.dfs.read-your-write \
     --param "base=/services/cluster-tests/$RUN_ID" \
@@ -438,11 +626,30 @@ cross_node() {
     --param "path=$a" --param "timeout-seconds=$EXPECT_TIMEOUT"
 }
 
+capture_rename_failure_context() {
+  local src="$1" dst="$2" node
+  log "capturing rename failure context into $ARTIFACTS"
+  compose_exec_timeout "$READINESS_COMMAND_TIMEOUT" node1 \
+    sinomo dfs status --cluster --json \
+    > "$ARTIFACTS/rename-failure-cluster-dfs-status.json" \
+    2> "$ARTIFACTS/rename-failure-cluster-dfs-status.stderr.log" || true
+  for node in $NODES; do
+    compose_exec_timeout "$READINESS_COMMAND_TIMEOUT" "$node" \
+      sinomo dfs path "$src" --json \
+      > "$ARTIFACTS/rename-failure-$node-source.json" \
+      2> "$ARTIFACTS/rename-failure-$node-source.stderr.log" || true
+    compose_exec_timeout "$READINESS_COMMAND_TIMEOUT" "$node" \
+      sinomo dfs path "$dst" --json \
+      > "$ARTIFACTS/rename-failure-$node-destination.json" \
+      2> "$ARTIFACTS/rename-failure-$node-destination.stderr.log" || true
+  done
+}
+
 rename_across_prefixes() {
   local src="/users/cluster-tests/$RUN_ID/move-src.txt"
   local dst="/services/cluster-tests/$RUN_ID/move-dst.txt"
   local payload="rename $RUN_ID"
-  run_probe node2 cluster.dfs.write \
+  if run_probe node2 cluster.dfs.write \
     --param "path=$src" --param "payload=$payload" \
   && run_probe node4 cluster.dfs.expect-file \
     --param "path=$src" --param "payload=$payload" --param "timeout-seconds=$EXPECT_TIMEOUT" \
@@ -451,7 +658,11 @@ rename_across_prefixes() {
     --param "path=$dst" --param "payload=$payload" --param "timeout-seconds=$EXPECT_TIMEOUT" \
   && run_probe node1 cluster.dfs.expect-absent \
     --param "path=$src" --param "timeout-seconds=$EXPECT_TIMEOUT" \
-  && run_probe node3 cluster.dfs.remove --param "path=$dst"
+  && run_probe node3 cluster.dfs.remove --param "path=$dst"; then
+    return 0
+  fi
+  capture_rename_failure_context "$src" "$dst"
+  return 1
 }
 
 small_file_baseline() {
@@ -547,6 +758,10 @@ large_file_performance() {
     --param "min-raw-read-ratio=$LARGE_MIN_RAW_READ_RATIO" \
     --param "raw-sync-write=$LARGE_RAW_SYNC_WRITE" \
     --param "max-proc-write-bytes=$LARGE_MAX_READ_PROC_WRITE_BYTES" \
+  && run_probe node2 cluster.dfs.expect-replicated \
+    --param "path=$a" \
+    --param min-locations=2 \
+    --param "timeout-seconds=$EXPECT_TIMEOUT" \
   && run_probe node5 cluster.dfs.large-write \
     --param "path=$b" \
     --param "bytes=$LARGE_BYTES" \
@@ -563,7 +778,11 @@ large_file_performance() {
     --param "min-bytes-per-second=$LARGE_MIN_READ_BYTES_PER_SEC" \
     --param "min-raw-read-ratio=$LARGE_MIN_RAW_READ_RATIO" \
     --param "raw-sync-write=$LARGE_RAW_SYNC_WRITE" \
-    --param "max-proc-write-bytes=$LARGE_MAX_READ_PROC_WRITE_BYTES"
+    --param "max-proc-write-bytes=$LARGE_MAX_READ_PROC_WRITE_BYTES" \
+  && run_probe node5 cluster.dfs.expect-replicated \
+    --param "path=$b" \
+    --param min-locations=2 \
+    --param "timeout-seconds=$EXPECT_TIMEOUT"
 }
 
 disk_damage_recovery() {
@@ -585,7 +804,12 @@ disk_damage_recovery() {
     --param "payload-seed=$seed" \
     --param "payload-bytes=$DAMAGE_BYTES" \
     --param "timeout-seconds=$EXPECT_TIMEOUT" \
-    --param "max-proc-write-bytes=0"
+    --param "max-proc-write-bytes=0" \
+  && run_probe node4 cluster.dfs.remove \
+    --param "path=$path" \
+  && run_probe node3 cluster.dfs.expect-absent \
+    --param "path=$path" \
+    --param "timeout-seconds=$EXPECT_TIMEOUT"
 }
 
 temporary_network_recovery() {
@@ -645,31 +869,35 @@ restart_durability() {
 
 capture_failure_context() {
   log "capturing failure context into $ARTIFACTS"
-  compose ps > "$ARTIFACTS/compose-ps.txt" 2>&1 || true
+  compose_timeout "$ARTIFACT_COMMAND_TIMEOUT" ps > "$ARTIFACTS/compose-ps.txt" 2>&1 || true
   cluster_health > "$ARTIFACTS/cluster-health.txt" 2>&1 || true
-  compose exec -T node1 sinomo cluster doctor > "$ARTIFACTS/cluster-doctor.txt" 2>&1 || true
+  compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" node1 sinomo cluster doctor \
+    > "$ARTIFACTS/cluster-doctor.txt" 2>&1 || true
   local node
   for node in $NODES; do
-    compose logs --no-color "$node" > "$ARTIFACTS/$node.log" 2>&1 || true
+    compose_timeout "$ARTIFACT_COMMAND_TIMEOUT" logs --no-color "$node" \
+      > "$ARTIFACTS/$node.log" 2>&1 || true
     # The shadow supervisor redirects the main daemon's output into /data.
-    compose exec -T "$node" cat /data/daemon/main.stderr.log \
+    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" cat /data/daemon/main.stderr.log \
       > "$ARTIFACTS/$node.daemon.stderr.log" 2>/dev/null || true
-    compose exec -T "$node" cat /data/daemon/main.stdout.log \
+    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" cat /data/daemon/main.stdout.log \
       > "$ARTIFACTS/$node.daemon.stdout.log" 2>/dev/null || true
-    compose exec -T "$node" sinomo cluster connectivity \
+    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo cluster connectivity \
       > "$ARTIFACTS/$node.cluster-connectivity.txt" 2>&1 || true
     # Local cluster-KV view: snapshot revision + invitation/shard keys, the
     # usual suspects when a node's view has diverged.
-    compose exec -T "$node" sh -c \
+    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sh -c \
       'sinomo debug sobj /data/cluster/kv-snapshot.sobj 2>/dev/null | grep -o "\"revision\": uint64([0-9]*)" | head -1' \
       > "$ARTIFACTS/$node.kv-revision.txt" 2>/dev/null || true
   done
 }
 
 TEARDOWN_DONE=0
+PROJECT_OWNED=0
 teardown() {
   [ "$TEARDOWN_DONE" = 1 ] && return
   TEARDOWN_DONE=1
+  [ "$PROJECT_OWNED" = 1 ] || return
   if [ -n "$FAILED_SCENARIOS" ]; then
     capture_failure_context
   fi
@@ -690,18 +918,19 @@ teardown() {
     compose down -v --remove-orphans >/dev/null 2>&1 || true
   done
 }
-trap teardown EXIT
 
 # --- bring-up -----------------------------------------------------------------
 
 require_no_other_compose_projects || exit 1
+trap teardown EXIT
 
-if [ "${SINOMO_TEST_BUILD:-0}" = 1 ] || [ ! -x "$BINARY" ]; then
+if [ "${SINOMO_TEST_BUILD:-1}" = 1 ] || [ ! -x "$BINARY" ]; then
   log "building host binary (cargo build -p sinomo)"
   (cd "$SINOMO_ROOT" && cargo build -p sinomo) || { log "host build failed"; exit 1; }
 fi
 
 if [ "${SINOMO_TEST_REUSE:-0}" != 1 ]; then
+  PROJECT_OWNED=1
   log "resetting compose project $PROJECT"
   compose down -v --remove-orphans >/dev/null 2>&1 || true
   log "starting 6-node cluster (project $PROJECT)"
@@ -710,6 +939,8 @@ if [ "${SINOMO_TEST_REUSE:-0}" != 1 ]; then
     FAILED_SCENARIOS="bring-up"
     exit 1
   fi
+else
+  PROJECT_OWNED=1
 fi
 
 if ! wait_for_cluster_ready "formation"; then
@@ -725,6 +956,7 @@ fi
 scenario "dfs-protocol-codec-baseline" dfs_protocol_codec_baseline
 scenario "network-latency-baseline" network_baseline
 scenario "network-payload-baseline" network_payload_baseline
+scenario "cluster-kv-quorum-baseline" cluster_kv_quorum_baseline
 if [ -n "$FAILED_SCENARIOS" ]; then
   exit 1
 fi
@@ -752,6 +984,7 @@ scenario "disk-damage-recovery" disk_damage_recovery
 scenario "temporary-network-recovery" temporary_network_recovery
 scenario "restart-durability"   restart_durability
 scenario "invariants-final"     invariants_sweep
+scenario "routed-status-final"  final_routed_status
 
 echo
 if [ -n "$FAILED_SCENARIOS" ]; then

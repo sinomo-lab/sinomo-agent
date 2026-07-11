@@ -1976,35 +1976,35 @@ impl ClusterKvRaftStore {
         })?
     }
 
-    pub fn restore_from_snapshot_if_newer(
+    pub fn cache_snapshot_if_newer_than_raft(
         &self,
         node_id: &NodeId,
         snapshot: KvSnapshot,
     ) -> Result<bool, KvError> {
         self.paths
             .local_cache()
-            .restore_raft_from_snapshot_if_newer(node_id.clone(), snapshot)
+            .cache_snapshot_if_newer_than_raft(node_id.clone(), snapshot)
     }
 
-    pub fn restore_from_snapshot_if_newer_and_notify(
+    pub fn cache_snapshot_if_newer_than_raft_and_notify(
         &self,
         node_id: &NodeId,
         snapshot: KvSnapshot,
     ) -> Result<bool, KvError> {
-        let restored = self.restore_from_snapshot_if_newer(node_id, snapshot)?;
-        if restored {
+        let cache_changed = self.cache_snapshot_if_newer_than_raft(node_id, snapshot)?;
+        if cache_changed {
             notify_cluster_kv_watchers(&self.paths);
         }
-        Ok(restored)
+        Ok(cache_changed)
     }
 
-    pub fn locked_restore_from_snapshot_if_newer_and_notify(
+    pub fn locked_cache_snapshot_if_newer_than_raft_and_notify(
         &self,
         node_id: &NodeId,
         snapshot: KvSnapshot,
     ) -> Result<bool, KvError> {
         let _raft_guard = self.lock_operation()?;
-        self.restore_from_snapshot_if_newer_and_notify(node_id, snapshot)
+        self.cache_snapshot_if_newer_than_raft_and_notify(node_id, snapshot)
     }
 
     pub fn local_vote_metadata(
@@ -2876,43 +2876,27 @@ impl DurableRaftKvNode {
     fn open_with_materialized_cache_inner(
         node_id: NodeId,
         paths: KvWalPaths,
-        cache: &KvMaterializedCache,
+        _cache: &KvMaterializedCache,
         discard_uncommitted_tail: bool,
         lock_wait: Duration,
     ) -> Result<Self, KvError> {
-        let mut fallback_snapshot = None;
-        let mut node = match Self::open_inner(
+        // A materialized `KvSnapshot` has no Raft log position or term. Treating
+        // it as an index-zero Raft snapshot makes a fresh learner apply entries
+        // 1..N on top of state that already includes those entries, inflating KV
+        // revisions and potentially changing compare/transaction results.
+        //
+        // The materialized snapshot remains a read cache. Writable Raft state
+        // may only come from the durable Raft files or an explicitly anchored
+        // `RaftSnapshot { last_included_index, last_included_term, .. }` received
+        // through replication. Corrupt durable state must likewise fail closed;
+        // silently quarantining it and restarting at index zero loses the
+        // consensus position needed for a safe recovery.
+        Self::open_inner(
             node_id.clone(),
-            paths.clone(),
+            paths,
             discard_uncommitted_tail,
             lock_wait,
-        ) {
-            Ok(node) => node,
-            Err(error) if !kv_error_is_busy(&error) => {
-                let Some(snapshot) = cache.read_snapshot_arc_if_present()? else {
-                    return Err(error);
-                };
-                fallback_snapshot = Some(snapshot);
-                quarantine_unreadable_raft_view(&paths);
-                Self::open_inner(node_id, paths, discard_uncommitted_tail, lock_wait)?
-            }
-            Err(error) => return Err(error),
-        };
-        if node.applied_index() == 0 && node.last_log_index() == 0 {
-            let snapshot = match fallback_snapshot {
-                Some(snapshot) => Some(snapshot),
-                None => cache.read_snapshot_arc_if_present()?,
-            };
-            let Some(snapshot) = snapshot else {
-                return Ok(node);
-            };
-            node.restore_snapshot(RaftSnapshot {
-                last_included_index: 0,
-                last_included_term: 0,
-                kv: (*snapshot).clone(),
-            })?;
-        }
-        Ok(node)
+        )
     }
 
     pub async fn open_async_with_materialized_cache(

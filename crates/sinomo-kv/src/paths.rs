@@ -369,22 +369,22 @@ impl ClusterKvPaths {
         self.raft_store().open_node_async(node_id).await
     }
 
-    pub fn restore_raft_from_snapshot_if_newer_and_notify(
+    pub fn cache_snapshot_if_newer_than_raft_and_notify(
         &self,
         node_id: &NodeId,
         snapshot: KvSnapshot,
     ) -> Result<bool, KvError> {
         self.raft_store()
-            .restore_from_snapshot_if_newer_and_notify(node_id, snapshot)
+            .cache_snapshot_if_newer_than_raft_and_notify(node_id, snapshot)
     }
 
-    pub fn locked_restore_raft_from_snapshot_if_newer_and_notify(
+    pub fn locked_cache_snapshot_if_newer_than_raft_and_notify(
         &self,
         node_id: &NodeId,
         snapshot: KvSnapshot,
     ) -> Result<bool, KvError> {
         self.raft_store()
-            .locked_restore_from_snapshot_if_newer_and_notify(node_id, snapshot)
+            .locked_cache_snapshot_if_newer_than_raft_and_notify(node_id, snapshot)
     }
 
     pub async fn locked_last_raft_log_index_async(&self, node_id: &NodeId) -> Result<u64, KvError> {

@@ -1050,7 +1050,7 @@ fn daemon_rpc_connectivity_observation(
         (
             sinomo_core::network::ClusterConnectivityState::Degraded,
             None,
-            false,
+            observation.is_hard_io_failure(),
             false,
         )
     } else if observation.is_auth_denied() {
@@ -2378,16 +2378,17 @@ mod tests {
             };
             let mut host = super::DaemonSignedObjectRpcAsyncHost::new(runtime.handle(), true)
                 .with_paths(&daemon_paths);
+            let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
             let request =
                 ObjectRpcRequest::encode_body("/test/auth-denied", "test", &()).expect("request");
-            let result =
-                sinomo_core::network::ClusterSignedObjectRpcAsyncHost::send_signed_object_rpc_async(
-                    &mut host,
+            let result = client
+                .call_endpoint(
                     &endpoint,
-                    b"invalid-auth",
                     &request,
-                    sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
-                        Duration::from_secs(1),
+                    sinomo_core::network::ClusterObjectRpcOptions::new(
+                        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
+                            Duration::from_secs(1),
+                        ),
                     ),
                 )
                 .await;
@@ -2429,6 +2430,19 @@ mod tests {
 
         let degraded = super::daemon_rpc_connectivity_observation(
             sinomo_core::network::ClusterSignedObjectRpcObservation::io_failure(),
+        );
+
+        let hard_failure = super::daemon_rpc_connectivity_observation(
+            sinomo_core::network::ClusterSignedObjectRpcObservation::hard_io_failure(),
+        );
+        assert_eq!(
+            hard_failure,
+            (
+                sinomo_core::network::ClusterConnectivityState::Degraded,
+                None,
+                true,
+                false
+            )
         );
         assert_eq!(
             degraded,

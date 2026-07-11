@@ -103,6 +103,12 @@ pub struct DfsDirEntryPage {
     pub next_cursor: Option<DfsDirectoryPageCursor>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsPosixFilePrefixRead {
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+}
+
 #[derive(Debug)]
 pub struct DfsPosixFileReadStream {
     pub object_id: DfsObjectId,

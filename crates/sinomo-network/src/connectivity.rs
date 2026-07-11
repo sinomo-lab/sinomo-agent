@@ -321,6 +321,11 @@ pub struct ClusterConnectivityProbeBatchEntry {
 pub struct ClusterConnectivityProbeBatch {
     pub active_keys: Vec<String>,
     pub entries: Vec<ClusterConnectivityProbeBatchEntry>,
+    /// Number of currently-due entries omitted from this bounded batch.
+    ///
+    /// Callers should keep convergence scheduling active while this is non-zero
+    /// instead of waiting for the normal role-specific probe interval.
+    pub remaining_due: usize,
     pub next_cursor: usize,
 }
 
@@ -459,6 +464,7 @@ pub fn select_cluster_connectivity_probe_batch(
     connectivity_cursor: usize,
     local_node_role: &ClusterNodeRole,
     startup_settle_active: bool,
+    convergence_active: bool,
     now: OffsetDateTime,
 ) -> ClusterConnectivityProbeBatch {
     try_select_cluster_connectivity_probe_batch(
@@ -468,11 +474,13 @@ pub fn select_cluster_connectivity_probe_batch(
         connectivity_cursor,
         local_node_role,
         startup_settle_active,
+        convergence_active,
         now,
     )
     .unwrap_or_else(|_| ClusterConnectivityProbeBatch {
         active_keys: Vec::new(),
         entries: Vec::new(),
+        remaining_due: 0,
         next_cursor: 0,
     })
 }
@@ -484,6 +492,7 @@ pub fn try_select_cluster_connectivity_probe_batch(
     connectivity_cursor: usize,
     local_node_role: &ClusterNodeRole,
     startup_settle_active: bool,
+    convergence_active: bool,
     now: OffsetDateTime,
 ) -> Result<ClusterConnectivityProbeBatch, NetworkError> {
     let refresh_deadline =
@@ -534,7 +543,7 @@ pub fn try_select_cluster_connectivity_probe_batch(
             })
             .transpose()?;
         let due = previous.as_ref().is_none_or(|record| {
-            cluster_connectivity_probe_due_with_graph(
+            cluster_connectivity_probe_due_with_graph_and_policy(
                 record,
                 endpoint,
                 now,
@@ -543,6 +552,7 @@ pub fn try_select_cluster_connectivity_probe_batch(
                 &graph,
                 &state.local_node_id,
                 startup_settle_active,
+                convergence_active,
             )
         });
         if !due {
@@ -563,21 +573,21 @@ pub fn try_select_cluster_connectivity_probe_batch(
         });
     }
     probe_entries.sort_by(|left, right| cluster_connectivity_probe_entry_cmp(left, right));
-    let probe_count =
-        probe_entries
-            .len()
-            .min(cluster_connectivity_probe_max_endpoints_per_tick_for_role(
-                local_node_role,
-            ));
+    let due_count = probe_entries.len();
+    let probe_count = due_count.min(cluster_connectivity_probe_max_endpoints_per_tick_for_role(
+        local_node_role,
+    ));
     let (probe_entries, next_cursor) = select_rotating_cluster_connectivity_probe_entries(
         probe_entries,
         probe_count,
         connectivity_cursor,
     );
+    let remaining_due = due_count.saturating_sub(probe_entries.len());
 
     Ok(ClusterConnectivityProbeBatch {
         active_keys,
         entries: probe_entries,
+        remaining_due,
         next_cursor,
     })
 }
@@ -916,6 +926,24 @@ pub fn cluster_connectivity_probe_due_with_startup_settle(
     local_node_role: &ClusterNodeRole,
     startup_settle_active: bool,
 ) -> bool {
+    cluster_connectivity_probe_due_with_policy(
+        record,
+        now,
+        refresh_deadline,
+        local_node_role,
+        startup_settle_active,
+        false,
+    )
+}
+
+pub fn cluster_connectivity_probe_due_with_policy(
+    record: &ClusterConnectivityRecord,
+    now: OffsetDateTime,
+    refresh_deadline: OffsetDateTime,
+    local_node_role: &ClusterNodeRole,
+    startup_settle_active: bool,
+    convergence_active: bool,
+) -> bool {
     let retry_interval = cluster_network_probe_interval_for_role(local_node_role);
     let retry_seconds = retry_interval.as_secs().min(i64::MAX as u64) as i64;
     let retry_due = record.observed_at + time::Duration::seconds(retry_seconds) <= now;
@@ -929,6 +957,9 @@ pub fn cluster_connectivity_probe_due_with_startup_settle(
         return true;
     }
     if startup_settle_active && retry_due {
+        return true;
+    }
+    if convergence_active && record.state == ClusterConnectivityState::Degraded {
         return true;
     }
     if record.expires_at <= refresh_deadline {
@@ -963,19 +994,47 @@ pub fn cluster_connectivity_probe_due_with_graph(
     local_node_id: &NodeId,
     startup_settle_active: bool,
 ) -> bool {
+    cluster_connectivity_probe_due_with_graph_and_policy(
+        record,
+        endpoint,
+        now,
+        refresh_deadline,
+        local_node_role,
+        graph,
+        local_node_id,
+        startup_settle_active,
+        false,
+    )
+}
+
+pub fn cluster_connectivity_probe_due_with_graph_and_policy(
+    record: &ClusterConnectivityRecord,
+    endpoint: &ClusterEndpointRecord,
+    now: OffsetDateTime,
+    refresh_deadline: OffsetDateTime,
+    local_node_role: &ClusterNodeRole,
+    graph: &ClusterConnectivityGraph,
+    local_node_id: &NodeId,
+    startup_settle_active: bool,
+    convergence_active: bool,
+) -> bool {
     if record.transport != endpoint.transport || record.address != endpoint.address {
         return true;
     }
-    if !cluster_connectivity_probe_due_with_startup_settle(
+    if !cluster_connectivity_probe_due_with_policy(
         record,
         now,
         refresh_deadline,
         local_node_role,
         startup_settle_active,
+        convergence_active,
     ) {
         return false;
     }
     if startup_settle_active && record.state != ClusterConnectivityState::Healthy {
+        return true;
+    }
+    if convergence_active && record.state == ClusterConnectivityState::Degraded {
         return true;
     }
     if record.expires_at <= refresh_deadline {
@@ -1453,5 +1512,160 @@ fn cluster_route_connectivity_quality_rank(connectivity: Option<&ClusterConnecti
         Some(ClusterConnectivityState::Degraded) => 1,
         None => 2,
         Some(ClusterConnectivityState::Unreachable) => 3,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn probe_record(
+        state: ClusterConnectivityState,
+        now: OffsetDateTime,
+    ) -> ClusterConnectivityRecord {
+        ClusterConnectivityRecord {
+            cluster_id: ClusterId::from_legacy_named("cluster_connectivity_convergence")
+                .expect("cluster id"),
+            source_node_id: NodeId::from_legacy_named("node_connectivity_convergence_source")
+                .expect("source node id"),
+            target_node_id: NodeId::from_legacy_named("node_connectivity_convergence_target")
+                .expect("target node id"),
+            endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_connectivity_convergence")
+                .expect("endpoint id"),
+            transport: ClusterTransportKind::LanTcp,
+            address: "192.0.2.10:21353".to_string(),
+            state,
+            latency_ms: None,
+            consecutive_failures: 1,
+            last_success_at: None,
+            last_failure_at: Some("failed".to_string()),
+            failure_reason: None,
+            observed_at: now,
+            expires_at: now + time::Duration::minutes(10),
+        }
+    }
+
+    #[test]
+    fn convergence_only_accelerates_degraded_records() {
+        let now = OffsetDateTime::now_utc();
+        let refresh_deadline = now + time::Duration::seconds(30);
+
+        for state in [
+            ClusterConnectivityState::Healthy,
+            ClusterConnectivityState::Unreachable,
+        ] {
+            let record = probe_record(state, now);
+            assert!(!cluster_connectivity_probe_due_with_policy(
+                &record,
+                now,
+                refresh_deadline,
+                &ClusterNodeRole::Workstation,
+                false,
+                true,
+            ));
+        }
+
+        let degraded = probe_record(ClusterConnectivityState::Degraded, now);
+        assert!(!cluster_connectivity_probe_due_with_policy(
+            &degraded,
+            now,
+            refresh_deadline,
+            &ClusterNodeRole::Workstation,
+            false,
+            false,
+        ));
+        assert!(cluster_connectivity_probe_due_with_policy(
+            &degraded,
+            now,
+            refresh_deadline,
+            &ClusterNodeRole::Workstation,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn convergence_degraded_probe_bypasses_alternate_route_suppression() {
+        let now = OffsetDateTime::now_utc();
+        let observed_at = now - time::Duration::minutes(2);
+        let refresh_deadline = now + time::Duration::seconds(30);
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_connectivity_alternate").expect("cluster id");
+        let local =
+            NodeId::from_legacy_named("node_connectivity_alternate_local").expect("local node id");
+        let bridge = NodeId::from_legacy_named("node_connectivity_alternate_bridge")
+            .expect("bridge node id");
+        let target = NodeId::from_legacy_named("node_connectivity_alternate_target")
+            .expect("target node id");
+
+        let healthy_edge =
+            |source: &NodeId, target: &NodeId, suffix: &str| ClusterConnectivityRecord {
+                cluster_id: cluster_id.clone(),
+                source_node_id: source.clone(),
+                target_node_id: target.clone(),
+                endpoint_id: ClusterEndpointId::from_legacy_named(format!(
+                    "endpoint_connectivity_alternate_{suffix}"
+                ))
+                .expect("endpoint id"),
+                transport: ClusterTransportKind::LanTcp,
+                address: format!("192.0.2.{}:21353", suffix.len()),
+                state: ClusterConnectivityState::Healthy,
+                latency_ms: Some(1),
+                consecutive_failures: 0,
+                last_success_at: Some("ok".to_string()),
+                last_failure_at: None,
+                failure_reason: None,
+                observed_at: now,
+                expires_at: now + time::Duration::minutes(10),
+            };
+        let graph = ClusterConnectivityGraph::from_records(
+            local.clone(),
+            [
+                healthy_edge(&local, &bridge, "local_bridge"),
+                healthy_edge(&bridge, &target, "bridge_target"),
+            ],
+        );
+        let endpoint = ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named(
+                "endpoint_connectivity_alternate_direct",
+            )
+            .expect("endpoint id"),
+            node_id: target.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "192.0.2.20:21353".to_string(),
+            source: ClusterEndpointSource::Observed,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 0,
+            last_observed_latency_ms: None,
+        };
+        let mut degraded = probe_record(ClusterConnectivityState::Degraded, observed_at);
+        degraded.cluster_id = cluster_id;
+        degraded.source_node_id = local.clone();
+        degraded.target_node_id = target;
+        degraded.endpoint_id = endpoint.endpoint_id.clone();
+        degraded.address.clone_from(&endpoint.address);
+
+        assert!(!cluster_connectivity_probe_due_with_graph_and_policy(
+            &degraded,
+            &endpoint,
+            now,
+            refresh_deadline,
+            &ClusterNodeRole::Workstation,
+            &graph,
+            &local,
+            false,
+            false,
+        ));
+        assert!(cluster_connectivity_probe_due_with_graph_and_policy(
+            &degraded,
+            &endpoint,
+            now,
+            refresh_deadline,
+            &ClusterNodeRole::Workstation,
+            &graph,
+            &local,
+            false,
+            true,
+        ));
     }
 }

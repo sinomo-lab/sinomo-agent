@@ -263,11 +263,25 @@ fn run_network_state_hygiene_dirty_fixture(ctx: &mut SinomoTestContext) -> Sinom
 
     let probe_result =
         run_network_state_hygiene_dirty_fixture_probe(&cluster_paths, &cluster_state, &dirty);
-    let restore_result = network::write_local_cluster_connectivity_record_set(
-        &cluster_paths,
-        &cluster_state.local_node_id,
-        &original_source_records,
-    );
+    let restore_result = (|| -> Result<(), network::NetworkError> {
+        let mut current_source_records =
+            network::read_local_cluster_connectivity_records_for_source(
+                &cluster_paths,
+                &cluster_state.local_node_id,
+            )?;
+        current_source_records.retain(|record| record.endpoint_id != dirty.endpoint_id);
+        let restored_records = target_scoped_connectivity_fixture_records(
+            &cluster_paths,
+            &cluster_state.local_node_id,
+            &target,
+            current_source_records,
+        )?;
+        network::write_local_cluster_connectivity_record_set(
+            &cluster_paths,
+            &cluster_state.local_node_id,
+            &restored_records,
+        )
+    })();
     if let Err(error) = restore_result {
         return Err(SinomoTestError::failed(format!(
             "cannot restore local connectivity after hygiene dirty fixture: {error}"
@@ -806,6 +820,7 @@ fn run_network_endpoint_error_fallback(ctx: &mut SinomoTestContext) -> SinomoTes
     sync_connectivity_fixture_to_quorum(
         &cluster_paths,
         &cluster_state.local_node_id,
+        &target.node_id,
         seed_records,
         "seed deterministic bad endpoint preference",
     )?;
@@ -816,6 +831,7 @@ fn run_network_endpoint_error_fallback(ctx: &mut SinomoTestContext) -> SinomoTes
     let restore_result = sync_connectivity_fixture_to_quorum(
         &cluster_paths,
         &cluster_state.local_node_id,
+        &target.node_id,
         original_connectivity.clone(),
         "restore connectivity after endpoint fallback probe",
     );
@@ -850,6 +866,7 @@ fn run_network_endpoint_error_fallback(ctx: &mut SinomoTestContext) -> SinomoTes
     sync_connectivity_fixture_to_quorum(
         &cluster_paths,
         &cluster_state.local_node_id,
+        &target.node_id,
         final_connectivity,
         "mark bad endpoint as identity-mismatch after fallback probe",
     )?;
@@ -889,9 +906,23 @@ fn cluster_connectivity_records_for_source_with_bootstrap_fallback(
 fn sync_connectivity_fixture_to_quorum(
     cluster_paths: &ClusterPaths,
     source_node_id: &NodeId,
+    target_node_id: &NodeId,
     records: Vec<network::ClusterConnectivityRecord>,
     action: &str,
 ) -> Result<(), SinomoTestError> {
+    // Fault-injection probes snapshot an existing source set, publish a newer
+    // synthetic observation, and then restore the snapshot. Production
+    // connectivity merging intentionally rejects observations older than the
+    // current record, so an unmodified snapshot cannot undo the fixture. Make
+    // the requested fixture set a fresh observation without changing its
+    // reachability semantics.
+    let records = target_scoped_connectivity_fixture_records(
+        cluster_paths,
+        source_node_id,
+        target_node_id,
+        records,
+    )
+    .map_err(|error| SinomoTestError::failed(format!("cannot prepare to {action}: {error}")))?;
     let mut driver = super::cli_cluster_control_plane_driver();
     let snapshot = cluster::sync_cluster_connectivity_records_to_quorum_with_host(
         cluster_paths,
@@ -904,6 +935,57 @@ fn sync_connectivity_fixture_to_quorum(
         super::write_imported_cluster_kv_snapshot(cluster_paths, &snapshot)
             .map_err(|error| SinomoTestError::failed(format!("cannot cache {action}: {error}")))?;
     }
+    Ok(())
+}
+
+fn refresh_connectivity_fixture_records(
+    mut records: Vec<network::ClusterConnectivityRecord>,
+    target_node_id: &NodeId,
+) -> Vec<network::ClusterConnectivityRecord> {
+    let now = OffsetDateTime::now_utc();
+    for record in records
+        .iter_mut()
+        .filter(|record| record.target_node_id == *target_node_id)
+    {
+        let ttl_seconds = if matches!(record.state, network::ClusterConnectivityState::Unreachable)
+        {
+            network::CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS
+        } else {
+            network::CLUSTER_CONNECTIVITY_TTL_SECONDS
+        };
+        record.observed_at = now;
+        record.expires_at = now + time::Duration::seconds(ttl_seconds);
+    }
+    records
+}
+
+fn target_scoped_connectivity_fixture_records(
+    cluster_paths: &ClusterPaths,
+    source_node_id: &NodeId,
+    target_node_id: &NodeId,
+    desired_source_records: Vec<network::ClusterConnectivityRecord>,
+) -> Result<Vec<network::ClusterConnectivityRecord>, network::NetworkError> {
+    let mut records =
+        network::read_local_cluster_connectivity_records_for_source(cluster_paths, source_node_id)?;
+    records.retain(|record| record.target_node_id != *target_node_id);
+    records.extend(desired_source_records.into_iter().filter(|record| {
+        record.source_node_id == *source_node_id && record.target_node_id == *target_node_id
+    }));
+    Ok(refresh_connectivity_fixture_records(
+        records,
+        target_node_id,
+    ))
+}
+
+fn reload_local_daemon_connectivity_for_fixture(action: &str) -> Result<(), SinomoTestError> {
+    let daemon_client = DaemonApiClient::connect().map_err(|error| {
+        SinomoTestError::failed(format!(
+            "cannot connect to local daemon to {action}: {error}"
+        ))
+    })?;
+    daemon_client.reload_local_connectivity().map_err(|error| {
+        SinomoTestError::failed(format!("cannot ask local daemon to {action}: {error}"))
+    })?;
     Ok(())
 }
 
@@ -1078,20 +1160,41 @@ fn run_network_stale_direct_timeout_demotion(ctx: &mut SinomoTestContext) -> Sin
             "cannot snapshot KV connectivity before stale direct demotion probe: {error}"
         ))
     })?;
-    let seed_records = endpoint_error_fallback_seed_records(
+    let seed_records = stale_direct_timeout_seed_records(
         &cluster_state,
         target,
         &stall_endpoint,
         original_connectivity.clone(),
     );
-    sync_connectivity_fixture_to_quorum(
+    let seed_records = target_scoped_connectivity_fixture_records(
         &cluster_paths,
         &cluster_state.local_node_id,
+        &target.node_id,
         seed_records,
-        "seed stale direct endpoint preference",
-    )?;
-
+    )
+    .map_err(|error| {
+        SinomoTestError::failed(format!(
+            "cannot prepare stale direct endpoint preference: {error}"
+        ))
+    })?;
     let probe_result = (|| -> Result<(SinomoTestOutcome, Duration, Duration), SinomoTestError> {
+        // This fixture changes the route used to reach the quorum authority.
+        // Keep it out of quorum: publishing it first would make that transaction
+        // route through the intentionally stalled endpoint and become
+        // outcome-unknown before the actual demotion probe starts. Explicitly
+        // reload the daemon's process cache after the shared file update.
+        network::write_local_cluster_connectivity_records(
+            &cluster_paths,
+            &cluster_state.local_node_id,
+            &seed_records,
+        )
+        .map_err(|error| {
+            SinomoTestError::failed(format!(
+                "cannot seed stale direct endpoint preference: {error}"
+            ))
+        })?;
+        reload_local_daemon_connectivity_for_fixture("reload stale direct endpoint preference")?;
+
         let (first_outcome, first_elapsed) =
             run_network_target_ping_timed(target, timeout_ms, "stale-direct-timeout-demotion")?;
         if !matches!(
@@ -1111,12 +1214,32 @@ fn run_network_stale_direct_timeout_demotion(ctx: &mut SinomoTestContext) -> Sin
         Ok((followup_outcome, first_elapsed, followup_elapsed))
     })();
 
-    let restore_result = sync_connectivity_fixture_to_quorum(
+    let restored_connectivity = target_scoped_connectivity_fixture_records(
         &cluster_paths,
         &cluster_state.local_node_id,
+        &target.node_id,
         original_connectivity,
-        "restore connectivity after stale direct demotion probe",
-    );
+    )
+    .map_err(|error| {
+        SinomoTestError::failed(format!(
+            "cannot prepare connectivity restore after stale direct demotion probe: {error}"
+        ))
+    })?;
+    let restore_result = (|| -> Result<(), SinomoTestError> {
+        network::write_local_cluster_connectivity_record_set(
+            &cluster_paths,
+            &cluster_state.local_node_id,
+            &restored_connectivity,
+        )
+        .map_err(|error| {
+            SinomoTestError::failed(format!(
+                "cannot restore connectivity after stale direct demotion probe: {error}"
+            ))
+        })?;
+        reload_local_daemon_connectivity_for_fixture(
+            "reload connectivity restored after stale direct demotion probe",
+        )
+    })();
     restore_result?;
 
     let (probe_outcome, first_elapsed, followup_elapsed) = probe_result?;
@@ -1218,6 +1341,41 @@ fn endpoint_error_fallback_seed_records(
             && record.endpoint_id == bad_endpoint.endpoint_id)
     });
     records.push(bad_preference);
+    records
+}
+
+fn stale_direct_timeout_seed_records(
+    cluster_state: &ClusterBootstrapState,
+    target: &ClusterMemberRecord,
+    stall_endpoint: &sinomo_runtime::core::ClusterEndpointRecord,
+    original_connectivity: Vec<network::ClusterConnectivityRecord>,
+) -> Vec<network::ClusterConnectivityRecord> {
+    let mut records = endpoint_error_fallback_seed_records(
+        cluster_state,
+        target,
+        stall_endpoint,
+        original_connectivity,
+    );
+    let now = OffsetDateTime::now_utc();
+    for record in records.iter_mut().filter(|record| {
+        record.source_node_id == cluster_state.local_node_id
+            && record.target_node_id == target.node_id
+            && record.endpoint_id != stall_endpoint.endpoint_id
+    }) {
+        // Keep real fallbacks Healthy so the stall's first command timeout
+        // moves it behind them. A deliberately high observed latency makes the
+        // zero-latency stall deterministic for the first attempt without
+        // poisoning the alternatives as Degraded fixture residue.
+        record.state = network::ClusterConnectivityState::Healthy;
+        record.latency_ms = Some(60_000);
+        record.consecutive_failures = 0;
+        record.last_success_at = Some(now.to_string());
+        record.last_failure_at = None;
+        record.failure_reason = None;
+        record.observed_at = now;
+        record.expires_at =
+            now + time::Duration::seconds(network::CLUSTER_CONNECTIVITY_TTL_SECONDS);
+    }
     records
 }
 
@@ -2449,6 +2607,161 @@ mod tests {
             ),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn connectivity_fixture_refresh_restores_an_older_snapshot() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-fixture-refresh");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let paths = ClusterPaths::new(&data_dir);
+        let mut state = test_state();
+        let remote = state.members[1].node_id.clone();
+        let unrelated_target =
+            add_remote_main(&mut state, "node_network_fixture_refresh_unrelated");
+        let endpoint = test_endpoint(
+            &remote,
+            "endpoint_network_fixture_refresh",
+            "remote.test:21353",
+        );
+        let fixture_only_endpoint = test_endpoint(
+            &remote,
+            "endpoint_network_fixture_only",
+            "fixture-only.test:21353",
+        );
+        let unrelated_endpoint = test_endpoint(
+            &unrelated_target,
+            "endpoint_network_fixture_unrelated",
+            "unrelated.test:21353",
+        );
+        state.members[1].endpoints = vec![endpoint.clone(), fixture_only_endpoint.clone()];
+        state.members[2].endpoints = vec![unrelated_endpoint.clone()];
+        let now = OffsetDateTime::now_utc();
+        let original_at = now - time::Duration::seconds(2);
+        let seeded_at = now - time::Duration::seconds(1);
+        let original = network::cluster_connectivity_record(
+            &state,
+            &endpoint,
+            network::ClusterConnectivityState::Healthy,
+            Some(2),
+            0,
+            Some(original_at.to_string()),
+            None,
+            original_at,
+            network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let seeded = network::cluster_connectivity_record(
+            &state,
+            &endpoint,
+            network::ClusterConnectivityState::Degraded,
+            None,
+            network::CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD.saturating_sub(1),
+            None,
+            Some(seeded_at.to_string()),
+            seeded_at,
+            network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let fixture_only = network::cluster_connectivity_record(
+            &state,
+            &fixture_only_endpoint,
+            network::ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some(seeded_at.to_string()),
+            None,
+            seeded_at,
+            network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let unrelated = network::cluster_connectivity_record(
+            &state,
+            &unrelated_endpoint,
+            network::ClusterConnectivityState::Unreachable,
+            None,
+            network::CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD,
+            None,
+            Some(original_at.to_string()),
+            original_at,
+            network::CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
+        );
+        network::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[seeded, fixture_only, unrelated.clone()],
+        )
+        .expect("seed newer fixture observation");
+
+        let restored =
+            refresh_connectivity_fixture_records(vec![original, unrelated.clone()], &remote);
+        assert!(restored[0].observed_at > seeded_at);
+        assert_eq!(
+            restored[1], unrelated,
+            "unrelated target TTLs stay untouched"
+        );
+        network::write_local_cluster_connectivity_record_set(
+            &paths,
+            &state.local_node_id,
+            &restored,
+        )
+        .expect("restore refreshed fixture snapshot");
+
+        let records = network::read_local_cluster_connectivity_records_for_source(
+            &paths,
+            &state.local_node_id,
+        )
+        .expect("read restored connectivity");
+        assert_eq!(records.len(), 2);
+        let restored_target = records
+            .iter()
+            .find(|record| record.target_node_id == remote)
+            .expect("restored fixture target");
+        assert_eq!(
+            restored_target.state,
+            network::ClusterConnectivityState::Healthy
+        );
+        assert_eq!(
+            restored_target.expires_at - restored_target.observed_at,
+            time::Duration::seconds(network::CLUSTER_CONNECTIVITY_TTL_SECONDS)
+        );
+    }
+
+    #[test]
+    fn stale_direct_timeout_fixture_keeps_real_fallbacks_healthy() {
+        let mut state = test_state();
+        let target_node = state.members[1].node_id.clone();
+        let stall = test_endpoint(
+            &target_node,
+            "endpoint_network_stale_direct_stall",
+            "stall.test:21353",
+        );
+        let fallback = test_endpoint(
+            &target_node,
+            "endpoint_network_stale_direct_fallback",
+            "fallback.test:21353",
+        );
+        state.members[1].endpoints = vec![stall.clone(), fallback.clone()];
+
+        let records =
+            stale_direct_timeout_seed_records(&state, &state.members[1], &stall, Vec::new());
+        let stall_record = records
+            .iter()
+            .find(|record| record.endpoint_id == stall.endpoint_id)
+            .expect("stall record");
+        let fallback_record = records
+            .iter()
+            .find(|record| record.endpoint_id == fallback.endpoint_id)
+            .expect("fallback record");
+
+        assert_eq!(
+            stall_record.state,
+            network::ClusterConnectivityState::Healthy
+        );
+        assert_eq!(stall_record.latency_ms, Some(0));
+        assert_eq!(
+            fallback_record.state,
+            network::ClusterConnectivityState::Healthy
+        );
+        assert_eq!(fallback_record.latency_ms, Some(60_000));
+        assert_eq!(fallback_record.consecutive_failures, 0);
     }
 
     #[test]

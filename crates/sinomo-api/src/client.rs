@@ -1,9 +1,11 @@
 //! Typed client for the running daemon's control API.
 
 use crate::{
-    DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
-    DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE, DaemonApiError, DaemonObjectRpcForwardRequest,
-    DaemonPaths, DaemonProbeStatus, DaemonStatus, probe_daemon_status,
+    DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
+    DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
+    DAEMON_STATUS_ROUTE, DaemonApiError, DaemonLocalConnectivityReloadRequest,
+    DaemonLocalConnectivityReloadResponse, DaemonObjectRpcForwardRequest, DaemonPaths,
+    DaemonProbeStatus, DaemonStatus, probe_daemon_status,
 };
 use sinomo_config::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_RPC_CATEGORY, CONFIG_SET_ROUTE,
@@ -321,6 +323,21 @@ impl DaemonApiClient {
     pub fn shutdown(&self) -> Result<String, DaemonApiError> {
         let request =
             ObjectRpcRequest::encode_body(DAEMON_SHUTDOWN_ROUTE, DAEMON_RPC_CATEGORY, &())?;
+        self.call_request(&request)?
+            .decode_body()
+            .map_err(DaemonApiError::from)
+    }
+
+    /// Drops the daemon process's cached local connectivity snapshot so its
+    /// next route read reloads state written through the shared data directory.
+    pub fn reload_local_connectivity(
+        &self,
+    ) -> Result<DaemonLocalConnectivityReloadResponse, DaemonApiError> {
+        let request = ObjectRpcRequest::encode_body(
+            DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
+            DAEMON_RPC_CATEGORY,
+            &DaemonLocalConnectivityReloadRequest,
+        )?;
         self.call_request(&request)?
             .decode_body()
             .map_err(DaemonApiError::from)
