@@ -108,7 +108,7 @@ pub struct DfsObjectRpcSendOptions {
     /// Connection-phase override. Defaults to the shared network policy.
     pub connect_timeout: Duration,
     /// Exceptional response no-progress override. `None` keeps the shared
-    /// network idle policy; durable namespace RPCs opt into their bounded
+    /// network idle policy; durable mutation RPCs opt into their bounded
     /// semantic deadline because they cannot emit progress before the response.
     pub no_progress_timeout: Option<Duration>,
     /// Optional DFS semantic deadline covering routing and the full response.
@@ -1213,8 +1213,10 @@ impl NetworkedDfsService<DfsNodeTransport> {
 mod tests {
     use super::*;
     use crate::{
-        DfsNamespaceCommand, DfsNamespaceOperation, DfsObjectId, DfsReadResult, sifs_file_system_id,
+        DfsDistributedWriteCommand, DfsNamespaceCommand, DfsNamespaceOperation, DfsObjectId,
+        DfsReadResult, DfsReplicationPolicy, DfsVersion, sifs_file_system_id,
     };
+    use sinomo_core::DfsWriteRequest;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1252,6 +1254,41 @@ mod tests {
                 operation: DfsNamespaceOperation::Mkdir {
                     path: format!("/namespace-{frame_id}"),
                 },
+            }),
+        }
+    }
+
+    fn test_distributed_write_message(
+        source: &NodeId,
+        target: &NodeId,
+        frame_id: u64,
+    ) -> DfsRoutedMessage {
+        let object_id =
+            DfsObjectId::from_legacy_named(format!("write_object_{frame_id}")).expect("object id");
+        DfsRoutedMessage {
+            source_node_id: source.clone(),
+            target_node_id: target.clone(),
+            frame_id,
+            message_id: frame_id,
+            message: DfsNetworkMessage::DistributedWriteRequest(DfsDistributedWriteCommand {
+                request_id: format!("write_request_{frame_id}"),
+                request: DfsWriteRequest {
+                    file_system_id: sifs_file_system_id(),
+                    object_id,
+                    target_version: DfsVersion::from_legacy_named(format!("version_{frame_id}"))
+                        .expect("version"),
+                    requesting_node_id: source.clone(),
+                },
+                expected_base_version: None,
+                metadata_journal_after_sequence: None,
+                bytes: Vec::new(),
+                content_hash: Some(format!("blake3:write-{frame_id}")),
+                content_size_bytes: Some(0),
+                desired_replica_nodes: vec![source.clone()],
+                policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+                object_metadata: None,
+                touch_parent_on_create: true,
+                foreground_replica_repair: false,
             }),
         }
     }
@@ -1303,9 +1340,9 @@ mod tests {
     }
 
     #[test]
-    fn namespace_send_extends_only_the_silent_response_progress_timeout() {
-        let local = node_id("node_namespace_timeout_local");
-        let remote = node_id("node_namespace_timeout_remote");
+    fn durable_mutation_sends_extend_only_the_silent_response_progress_timeout() {
+        let local = node_id("node_durable_timeout_local");
+        let remote = node_id("node_durable_timeout_remote");
         let observed_options = Arc::new(Mutex::new(Vec::new()));
         let sender_options = Arc::clone(&observed_options);
         let sender: DfsMessageSender = Arc::new(move |_target, command, options| {
@@ -1321,11 +1358,14 @@ mod tests {
             .send_routed_message(&remote, test_namespace_message(&local, &remote, 1))
             .expect("namespace send");
         transport
-            .send_routed_message(&remote, test_message(&local, &remote, 2))
+            .send_routed_message(&remote, test_distributed_write_message(&local, &remote, 2))
+            .expect("distributed write send");
+        transport
+            .send_routed_message(&remote, test_message(&local, &remote, 3))
             .expect("ordinary send");
 
         let observed = observed_options.lock().expect("options");
-        assert_eq!(observed.len(), 2);
+        assert_eq!(observed.len(), 3);
         assert_eq!(
             observed[0].connect_timeout,
             sinomo_core::network::DEFAULT_NETWORK_TIMEOUT
@@ -1335,7 +1375,16 @@ mod tests {
             Some(crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT)
         );
         assert_eq!(observed[0].overall_timeout, None);
-        assert_eq!(observed[1], DfsObjectRpcSendOptions::default());
+        assert_eq!(
+            observed[1].connect_timeout,
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT
+        );
+        assert_eq!(
+            observed[1].no_progress_timeout,
+            Some(crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT)
+        );
+        assert_eq!(observed[1].overall_timeout, None);
+        assert_eq!(observed[2], DfsObjectRpcSendOptions::default());
     }
 
     #[test]

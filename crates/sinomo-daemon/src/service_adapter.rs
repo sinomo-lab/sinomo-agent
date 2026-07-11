@@ -163,7 +163,7 @@ async fn forward_object_rpc_from_daemon_control(
     paths: &crate::DaemonPaths,
     payload: crate::DaemonObjectRpcForwardRequest,
     runtime: &tokio::runtime::Handle,
-) -> Result<ObjectRpcResponse, ServiceError> {
+) -> Result<crate::DaemonObjectRpcForwardResponse, ServiceError> {
     let transport_timeouts = sinomo_core::network::DaemonRpcTimeouts::default()
         .with_connect_timeout(Some(Duration::from_millis(payload.connect_timeout_millis)));
     let mut options = sinomo_core::network::ClusterObjectRpcOptions::new(transport_timeouts);
@@ -174,7 +174,7 @@ async fn forward_object_rpc_from_daemon_control(
     if let Some(overall_timeout_millis) = payload.overall_timeout_millis {
         options = options.with_overall_timeout(Duration::from_millis(overall_timeout_millis));
     }
-    crate::client::send_object_rpc_to_target_async_with_daemon_paths_and_options(
+    match crate::client::send_daemon_rpc_to_target_async_with_daemon_paths_and_network_error(
         paths,
         &payload.target_node_id,
         &payload.request,
@@ -183,7 +183,20 @@ async fn forward_object_rpc_from_daemon_control(
         payload.observe_connectivity,
     )
     .await
-    .map_err(daemon_error)
+    {
+        Ok(response) => Ok(crate::DaemonObjectRpcForwardResponse::Success { response }),
+        Err(error) => Ok(crate::DaemonObjectRpcForwardResponse::NetworkError {
+            detail: error.to_string(),
+            delivery_state: error.delivery_state().map(|state| match state {
+                sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent => {
+                    crate::DaemonObjectRpcForwardDeliveryState::DefinitelyNotSent
+                }
+                sinomo_core::network::NetworkDeliveryState::PossiblyApplied => {
+                    crate::DaemonObjectRpcForwardDeliveryState::PossiblyApplied
+                }
+            }),
+        }),
+    }
 }
 
 fn service_stream_response_from_collected_object_rpc_response(
@@ -642,8 +655,14 @@ impl Service for DaemonControlService {
             let runtime =
                 require_service_runtime(runtime.as_ref(), "daemon object RPC stream forward")?
                     .clone();
-            let response =
+            let forwarded =
                 forward_object_rpc_from_daemon_control(&paths, payload, &runtime).await?;
+            let response = match forwarded {
+                crate::DaemonObjectRpcForwardResponse::Success { response } => response,
+                crate::DaemonObjectRpcForwardResponse::NetworkError { detail, .. } => {
+                    ObjectRpcResponse::encode_error(request.route, detail)?
+                }
+            };
             Ok(service_stream_response_from_collected_object_rpc_response(
                 response,
             ))

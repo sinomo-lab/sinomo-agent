@@ -557,9 +557,29 @@ async fn send_daemon_rpc_to_target_async_with_daemon_paths_and_connectivity_obse
     runtime: &tokio::runtime::Handle,
     observe_connectivity: bool,
 ) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
-    let data_dir = daemon_data_dir_from_paths(daemon_paths).map_err(DaemonError::from)?;
+    send_daemon_rpc_to_target_async_with_daemon_paths_and_network_error(
+        daemon_paths,
+        target_node_id,
+        request,
+        options,
+        runtime,
+        observe_connectivity,
+    )
+    .await
+    .map_err(DaemonError::from)
+}
+
+pub(crate) async fn send_daemon_rpc_to_target_async_with_daemon_paths_and_network_error(
+    daemon_paths: &DaemonPaths,
+    target_node_id: &NodeId,
+    request: &ObjectRpcRequest,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+    runtime: &tokio::runtime::Handle,
+    observe_connectivity: bool,
+) -> Result<sinomo_core::network::ObjectRpcResponse, sinomo_core::network::NetworkError> {
+    let data_dir = daemon_data_dir_from_paths(daemon_paths)?;
     let paths = sinomo_core::network::ClusterPaths::new(&data_dir);
-    let state = sinomo_core::cluster::read_cluster_state(&paths).map_err(DaemonError::from)?;
+    let state = sinomo_core::cluster::read_cluster_state(&paths)?;
     let mut host =
         DaemonSignedObjectRpcAsyncHost::new(runtime, observe_connectivity).with_paths(daemon_paths);
     let mut client =
@@ -567,7 +587,6 @@ async fn send_daemon_rpc_to_target_async_with_daemon_paths_and_connectivity_obse
     client
         .call_target(&state, target_node_id, request, options)
         .await
-        .map_err(DaemonError::from)
 }
 
 fn block_on_daemon_client<F, T>(future: F) -> Result<T, DaemonError>

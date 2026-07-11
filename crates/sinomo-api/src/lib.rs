@@ -93,6 +93,27 @@ pub struct DaemonObjectRpcForwardRequest {
     pub raw_response: bool,
 }
 
+/// Retry-safety evidence carried only across the trusted local daemon-control
+/// boundary. Remote object-RPC responses must not be allowed to assert that a
+/// request was definitely not applied.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub enum DaemonObjectRpcForwardDeliveryState {
+    DefinitelyNotSent,
+    PossiblyApplied,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub enum DaemonObjectRpcForwardResponse {
+    Success {
+        response: sinomo_core::network::ObjectRpcResponse,
+    },
+    NetworkError {
+        detail: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_state: Option<DaemonObjectRpcForwardDeliveryState>,
+    },
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonDfsObjectRpcForwardRequest {
     pub target_node_id: sinomo_core::node::NodeId,

@@ -4,8 +4,9 @@ use crate::{
     DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
     DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
     DAEMON_STATUS_ROUTE, DaemonApiError, DaemonLocalConnectivityReloadRequest,
-    DaemonLocalConnectivityReloadResponse, DaemonObjectRpcForwardRequest, DaemonPaths,
-    DaemonProbeStatus, DaemonStatus, probe_daemon_status,
+    DaemonLocalConnectivityReloadResponse, DaemonObjectRpcForwardDeliveryState,
+    DaemonObjectRpcForwardRequest, DaemonObjectRpcForwardResponse, DaemonPaths, DaemonProbeStatus,
+    DaemonStatus, probe_daemon_status,
 };
 use sinomo_config::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_RPC_CATEGORY, CONFIG_SET_ROUTE,
@@ -99,11 +100,16 @@ impl DaemonApiClient {
         }
     }
 
-    fn object_rpc_forward_control_timeouts(&self) -> sinomo_core::network::DaemonRpcTimeouts {
+    fn object_rpc_forward_control_timeouts(
+        &self,
+        effective_inner_timeout: Duration,
+    ) -> sinomo_core::network::DaemonRpcTimeouts {
         if self.timeout_overridden {
             sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(self.timeout)
         } else {
-            sinomo_core::network::DaemonRpcTimeouts::default()
+            let idle_timeout = effective_inner_timeout
+                .saturating_add(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT);
+            sinomo_core::network::DaemonRpcTimeouts::default().with_idle_timeout(Some(idle_timeout))
         }
     }
 
@@ -114,25 +120,6 @@ impl DaemonApiClient {
             sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(self.timeout)
         } else {
             sinomo_core::network::DaemonRpcTimeouts::default()
-        }
-    }
-
-    fn dfs_object_rpc_forward_control_timeouts(
-        &self,
-        no_progress_timeout: Option<Duration>,
-    ) -> sinomo_core::network::DaemonRpcTimeouts {
-        if self.timeout_overridden {
-            sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(self.timeout)
-        } else {
-            // The loopback wrapper must outlive the inner routed call instead of
-            // racing its semantic deadline. One normal network phase provides
-            // bounded time for the daemon to encode and return the terminal frame.
-            let idle_timeout = no_progress_timeout
-                .map(|timeout| {
-                    timeout.saturating_add(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
-                })
-                .unwrap_or(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT);
-            sinomo_core::network::DaemonRpcTimeouts::default().with_idle_timeout(Some(idle_timeout))
         }
     }
 
@@ -197,6 +184,31 @@ impl DaemonApiClient {
         connect_timeout: Duration,
         observe_connectivity: bool,
     ) -> Result<ObjectRpcResponse, DaemonApiError> {
+        self.object_rpc_to_target_with_deadline(
+            target_node_id,
+            request,
+            connect_timeout,
+            None,
+            observe_connectivity,
+        )
+    }
+
+    /// Sends an object-RPC through the running local daemon with an explicit
+    /// route-wide semantic deadline. The loopback wrapper gets one default
+    /// network phase of grace so the daemon can return the terminal response.
+    pub fn object_rpc_to_target_with_deadline(
+        &self,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        connect_timeout: Duration,
+        overall_timeout: Option<Duration>,
+        observe_connectivity: bool,
+    ) -> Result<ObjectRpcResponse, DaemonApiError> {
+        let effective_overall_timeout =
+            sinomo_core::network::cluster_object_rpc_effective_route_timeout(
+                request,
+                overall_timeout,
+            );
         if sinomo_core::network::object_rpc_request_stream_mode(request)
             .expects_raw_streamed_response()
         {
@@ -206,7 +218,7 @@ impl DaemonApiClient {
                 request,
                 connect_timeout,
                 None,
-                None,
+                Some(effective_overall_timeout),
                 observe_connectivity,
                 self.object_rpc_forward_stream_control_timeouts(),
             );
@@ -217,17 +229,17 @@ impl DaemonApiClient {
             request,
             connect_timeout,
             None,
-            None,
+            Some(effective_overall_timeout),
             observe_connectivity,
             false,
         )?;
         let response = send_daemon_rpc_with_timeouts(
             &self.address,
             &request,
-            self.object_rpc_forward_control_timeouts(),
+            self.object_rpc_forward_control_timeouts(effective_overall_timeout),
         )?;
         response.error_detail()?;
-        response.decode_body().map_err(DaemonApiError::from)
+        decode_daemon_object_rpc_forward_response(&response)
     }
 
     fn object_rpc_to_target_raw_response(
@@ -280,6 +292,11 @@ impl DaemonApiClient {
         request: &ObjectRpcRequest,
         options: sinomo_dfs::DfsObjectRpcSendOptions,
     ) -> Result<ObjectRpcResponse, DaemonApiError> {
+        let effective_overall_timeout =
+            sinomo_core::network::cluster_object_rpc_effective_route_timeout(
+                request,
+                options.overall_timeout,
+            );
         if sinomo_core::network::object_rpc_request_stream_mode(request)
             .expects_raw_streamed_response()
         {
@@ -289,9 +306,9 @@ impl DaemonApiClient {
                 request,
                 options.connect_timeout,
                 options.no_progress_timeout,
-                options.overall_timeout,
+                Some(effective_overall_timeout),
                 options.observe_connectivity,
-                self.dfs_object_rpc_forward_control_timeouts(options.no_progress_timeout),
+                self.object_rpc_forward_stream_control_timeouts(),
             );
         }
         let request = object_rpc_forward_request(
@@ -300,17 +317,17 @@ impl DaemonApiClient {
             request,
             options.connect_timeout,
             options.no_progress_timeout,
-            options.overall_timeout,
+            Some(effective_overall_timeout),
             options.observe_connectivity,
             false,
         )?;
         let response = send_daemon_rpc_with_timeouts(
             &self.address,
             &request,
-            self.dfs_object_rpc_forward_control_timeouts(options.no_progress_timeout),
+            self.object_rpc_forward_control_timeouts(effective_overall_timeout),
         )?;
         response.error_detail()?;
-        response.decode_body().map_err(DaemonApiError::from)
+        decode_daemon_object_rpc_forward_response(&response)
     }
 
     fn call_control_payload(
@@ -509,6 +526,32 @@ fn object_rpc_forward_request(
         );
     }
     Ok(request)
+}
+
+fn decode_daemon_object_rpc_forward_response(
+    response: &ObjectRpcResponse,
+) -> Result<ObjectRpcResponse, DaemonApiError> {
+    match response.decode_body::<DaemonObjectRpcForwardResponse>() {
+        Ok(DaemonObjectRpcForwardResponse::Success { response }) => Ok(response),
+        Ok(DaemonObjectRpcForwardResponse::NetworkError {
+            detail,
+            delivery_state,
+        }) => Err(DaemonApiError::ForwardNetwork {
+            detail,
+            delivery_state: delivery_state.map(|state| match state {
+                DaemonObjectRpcForwardDeliveryState::DefinitelyNotSent => {
+                    sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent
+                }
+                DaemonObjectRpcForwardDeliveryState::PossiblyApplied => {
+                    sinomo_core::network::NetworkDeliveryState::PossiblyApplied
+                }
+            }),
+        }),
+        // Rolling upgrades may talk to a daemon that still encodes the inner
+        // ObjectRpcResponse directly. Accept that legacy body until every node
+        // runs the new envelope format.
+        Err(_) => response.decode_body().map_err(DaemonApiError::from),
+    }
 }
 
 pub fn send_daemon_rpc(
@@ -907,9 +950,20 @@ mod tests {
     fn forwarded_object_rpc_control_timeout_uses_client_budget() {
         let client =
             DaemonApiClient::at_address("127.0.0.1:21353").with_timeout(Duration::from_secs(6));
-        let timeouts = client.object_rpc_forward_control_timeouts();
+        let timeouts = client.object_rpc_forward_control_timeouts(Duration::from_secs(10));
         assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(6)));
         assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn forwarded_object_rpc_deadline_gets_loopback_grace() {
+        let client = DaemonApiClient::at_address("127.0.0.1:21353");
+        let timeouts = client.object_rpc_forward_control_timeouts(Duration::from_secs(10));
+        assert_eq!(
+            timeouts.connect_timeout,
+            Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        );
+        assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(15)));
     }
 
     #[test]
@@ -936,34 +990,34 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_dfs_object_rpc_uses_network_default() {
+    fn forwarded_buffered_full_response_outlives_the_inner_route_budget() {
         let client = DaemonApiClient::at_address("127.0.0.1:21353");
-        let timeouts = client.dfs_object_rpc_forward_control_timeouts(None);
+        let request = ObjectRpcRequest::from_encoded_body("/test/data", "test", Vec::new())
+            .with_full_response_budget();
+        let inner_timeout =
+            sinomo_core::network::cluster_object_rpc_effective_route_timeout(&request, None);
+        let timeouts = client.object_rpc_forward_control_timeouts(inner_timeout);
+        assert_eq!(inner_timeout, Duration::from_secs(60));
         assert_eq!(
             timeouts.connect_timeout,
             Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
         );
-        assert_eq!(
-            timeouts.idle_timeout,
-            Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
-        );
+        assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(65)));
     }
 
     #[test]
-    fn forwarded_dfs_object_rpc_honors_explicit_client_timeout() {
+    fn forwarded_buffered_object_rpc_honors_explicit_client_timeout() {
         let client =
             DaemonApiClient::at_address("127.0.0.1:21353").with_timeout(Duration::from_secs(6));
-        let timeouts =
-            client.dfs_object_rpc_forward_control_timeouts(Some(Duration::from_secs(15)));
+        let timeouts = client.object_rpc_forward_control_timeouts(Duration::from_secs(60));
         assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(6)));
         assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(6)));
     }
 
     #[test]
-    fn forwarded_dfs_object_rpc_gives_extended_inner_wait_loopback_grace() {
+    fn forwarded_bounded_object_rpc_gets_loopback_grace() {
         let client = DaemonApiClient::at_address("127.0.0.1:21353");
-        let timeouts =
-            client.dfs_object_rpc_forward_control_timeouts(Some(Duration::from_secs(15)));
+        let timeouts = client.object_rpc_forward_control_timeouts(Duration::from_secs(15));
         assert_eq!(
             timeouts.connect_timeout,
             Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
@@ -1001,5 +1055,76 @@ mod tests {
         assert_eq!(payload.overall_timeout_millis, Some(30_000));
         assert!(payload.observe_connectivity);
         assert!(payload.raw_response);
+    }
+
+    #[test]
+    fn generic_forward_request_carries_the_requested_overall_deadline() {
+        let target_node_id = NodeId::from_legacy_named("node_generic_forward").expect("node id");
+        let inner_request = ObjectRpcRequest::encode_body("/cluster/raft/append", "cluster", &())
+            .expect("inner request");
+        let request = object_rpc_forward_request(
+            DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+            &target_node_id,
+            &inner_request,
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            None,
+            Some(Duration::from_secs(10)),
+            true,
+            false,
+        )
+        .expect("forward request");
+        let payload: DaemonObjectRpcForwardRequest =
+            request.decode_body().expect("forward payload");
+
+        assert_eq!(payload.target_node_id, target_node_id);
+        assert_eq!(payload.connect_timeout_millis, 5_000);
+        assert_eq!(payload.no_progress_timeout_millis, None);
+        assert_eq!(payload.overall_timeout_millis, Some(10_000));
+        assert!(!payload.raw_response);
+    }
+
+    #[test]
+    fn forward_response_envelope_preserves_trusted_delivery_state() {
+        for (wire_state, network_state) in [
+            (
+                DaemonObjectRpcForwardDeliveryState::DefinitelyNotSent,
+                sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+            ),
+            (
+                DaemonObjectRpcForwardDeliveryState::PossiblyApplied,
+                sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+            ),
+        ] {
+            let outer = ObjectRpcResponse::encode_body(
+                DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+                &DaemonObjectRpcForwardResponse::NetworkError {
+                    detail: "forward failed".to_string(),
+                    delivery_state: Some(wire_state),
+                },
+            )
+            .expect("outer response");
+            let error = decode_daemon_object_rpc_forward_response(&outer)
+                .expect_err("forward response must fail");
+
+            assert!(matches!(
+                error,
+                DaemonApiError::ForwardNetwork {
+                    delivery_state: Some(state),
+                    ..
+                } if state == network_state
+            ));
+        }
+    }
+
+    #[test]
+    fn forward_response_decoder_accepts_legacy_inner_response_body() {
+        let inner = ObjectRpcResponse::encode_body("/test/legacy", &"ok").expect("inner response");
+        let outer = ObjectRpcResponse::encode_body(DAEMON_OBJECT_RPC_FORWARD_ROUTE, &inner)
+            .expect("legacy outer response");
+
+        assert_eq!(
+            decode_daemon_object_rpc_forward_response(&outer).expect("legacy response"),
+            inner
+        );
     }
 }

@@ -1494,7 +1494,7 @@ fn cluster_join_single_node_migration_with_paths(
             migration.target_cluster_id = joined.cluster_id.clone();
             migration.target_cluster_name = Some(joined.cluster_name.clone());
             migration.target_node_id = joined.local_node_id.clone();
-            let mut driver = cli_cluster_control_plane_driver();
+            let mut driver = cli_cluster_control_plane_driver(paths);
             let kv_import = cluster::import_node_local_configs_from_source_kv_with_host(
                 paths,
                 &mut joined,

@@ -14,6 +14,11 @@ pub enum DaemonApiError {
     Parse { detail: String },
     #[error("network error at {address}: {detail}")]
     Network { address: String, detail: String },
+    #[error("daemon-forwarded network request failed: {detail}")]
+    ForwardNetwork {
+        detail: String,
+        delivery_state: Option<sinomo_core::network::NetworkDeliveryState>,
+    },
     #[error("sinomo daemon is already running or locked at {lock_file}: {detail}")]
     AlreadyRunning { lock_file: String, detail: String },
     #[error("sinomo daemon is not running: {detail}")]

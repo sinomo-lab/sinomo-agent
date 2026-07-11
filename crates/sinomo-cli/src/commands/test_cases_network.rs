@@ -923,7 +923,7 @@ fn sync_connectivity_fixture_to_quorum(
         records,
     )
     .map_err(|error| SinomoTestError::failed(format!("cannot prepare to {action}: {error}")))?;
-    let mut driver = super::cli_cluster_control_plane_driver();
+    let mut driver = super::cli_cluster_control_plane_driver(cluster_paths);
     let snapshot = cluster::sync_cluster_connectivity_records_to_quorum_with_host(
         cluster_paths,
         source_node_id,

@@ -554,7 +554,7 @@ pub(crate) fn cli_current_cluster_kv_store(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<InProcessKvStore, network::NetworkError> {
-    let mut driver = cli_cluster_control_plane_driver();
+    let mut driver = cli_cluster_control_plane_driver(paths);
     cluster::refresh_current_cluster_kv_store_with_host(
         paths,
         state,
@@ -576,7 +576,7 @@ pub(crate) fn cli_commit_cluster_kv_txn_with_quorum_response(
     state: &mut ClusterBootstrapState,
     txn: KvTxn,
 ) -> Result<sinomo_runtime::kv::ClusterKvTxnCommitResult, network::NetworkError> {
-    let mut driver = cli_cluster_control_plane_driver();
+    let mut driver = cli_cluster_control_plane_driver(paths);
     cluster::commit_cluster_kv_txn_with_quorum_response_with_host(
         paths,
         state,
@@ -604,7 +604,7 @@ pub(crate) fn handle_daemon_cluster_kv_txn_request(
             other => other.into(),
         })?;
     let mut state = state;
-    let mut driver = cli_cluster_control_plane_driver();
+    let mut driver = cli_cluster_control_plane_driver(&cluster_paths);
     let result = cluster::commit_cluster_kv_txn_with_quorum_response_with_host(
         &cluster_paths,
         &mut state,
@@ -624,15 +624,106 @@ pub(crate) fn handle_daemon_cluster_kv_txn_request(
     }))
 }
 
-pub(crate) fn cli_cluster_control_plane_driver()
--> cluster::ClusterControlPlaneDriver<CliClusterControlPlaneTransport> {
+pub(crate) fn cli_cluster_control_plane_driver(
+    paths: &ClusterPaths,
+) -> cluster::ClusterControlPlaneDriver<CliClusterControlPlaneTransport> {
     cluster::ClusterControlPlaneDriver::with_timeouts(
-        CliClusterControlPlaneTransport,
+        CliClusterControlPlaneTransport::new(paths),
         cli_cluster_control_plane_timeouts(),
     )
 }
 
-pub(crate) struct CliClusterControlPlaneTransport;
+pub(crate) struct CliClusterControlPlaneTransport {
+    cluster_paths: ClusterPaths,
+}
+
+impl CliClusterControlPlaneTransport {
+    fn new(cluster_paths: &ClusterPaths) -> Self {
+        Self {
+            cluster_paths: cluster_paths.clone(),
+        }
+    }
+
+    fn matching_data_dir(&self) -> Option<SinomoDataDir> {
+        self.cluster_paths.root.parent().map(SinomoDataDir::new)
+    }
+
+    fn matching_daemon_paths(&self) -> Option<DaemonPaths> {
+        self.matching_data_dir()
+            .map(|data_dir| DaemonPaths::new(&data_dir))
+    }
+
+    /// Delegate node-routed calls to the daemon that owns this cluster state.
+    /// Synthetic `tcp-tunnel://` endpoints are daemon-local route evidence and
+    /// cannot be dialed by a standalone CLI transport. `None` means daemon
+    /// discovery failed before the request was sent, so the caller may retain
+    /// the direct routed fallback used by daemon-down/bootstrap workflows.
+    fn call_node_object_rpc_via_matching_daemon(
+        &self,
+        target_node_id: &NodeId,
+        request: &network::ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Option<Result<network::ObjectRpcResponse, network::NetworkError>> {
+        let daemon_paths = self.matching_daemon_paths()?;
+        let client = DaemonApiClient::connect_for_paths(&daemon_paths).ok()?;
+        let connect_timeout = timeout.min(network::DEFAULT_NETWORK_TIMEOUT);
+        Some(
+            client
+                .object_rpc_to_target_with_deadline(
+                    target_node_id,
+                    request,
+                    connect_timeout,
+                    Some(timeout),
+                    true,
+                )
+                .map_err(|error| {
+                    cli_daemon_forward_network_error("daemon-mediated cluster node rpc", error)
+                }),
+        )
+    }
+
+    fn call_node_object_rpc_direct(
+        &self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &network::ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| network::NetworkError::Io {
+                operation: "cli daemon node object rpc runtime".to_string(),
+                detail: error.to_string(),
+            })?;
+        let mut host = CliSignedEndpointRpcHost::new(
+            Some(state.cluster_id.clone()),
+            "cli endpoint rpc signing",
+        );
+        if let Some(data_dir) = self.matching_data_dir() {
+            host = host.with_data_dir(data_dir);
+        }
+        let options = network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout);
+        let mut client = network::ClusterObjectRpcClient::routed(
+            &mut host,
+            runtime.handle(),
+            &self.cluster_paths,
+        );
+        let result = runtime.block_on(client.call_target(state, target_node_id, request, options));
+        runtime.shutdown_timeout(Duration::from_millis(250));
+        result
+    }
+}
+
+fn daemon_mediated_result_or_direct_fallback<T, E>(
+    daemon_result: Option<Result<T, E>>,
+    direct_fallback: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    match daemon_result {
+        Some(result) => result,
+        None => direct_fallback(),
+    }
+}
 
 impl cluster::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
     fn send_kv_replication(
@@ -702,29 +793,10 @@ impl cluster::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
         request: &network::ObjectRpcRequest,
         timeout: Duration,
     ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
-        let data_dir =
-            SinomoDataDir::from_env_or_home().map_err(|error| network::NetworkError::Io {
-                operation: "cli daemon cluster paths".to_string(),
-                detail: error.to_string(),
-            })?;
-        let paths = ClusterPaths::new(&data_dir);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| network::NetworkError::Io {
-                operation: "cli daemon node object rpc runtime".to_string(),
-                detail: error.to_string(),
-            })?;
-        let mut host = CliSignedEndpointRpcHost::new(
-            Some(state.cluster_id.clone()),
-            "cli endpoint rpc signing",
-        );
-        let options = network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout);
-        let mut client =
-            network::ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
-        let result = runtime.block_on(client.call_target(state, target_node_id, request, options));
-        runtime.shutdown_timeout(Duration::from_millis(250));
-        result
+        daemon_mediated_result_or_direct_fallback(
+            self.call_node_object_rpc_via_matching_daemon(target_node_id, request, timeout),
+            || self.call_node_object_rpc_direct(state, target_node_id, request, timeout),
+        )
     }
 }
 
@@ -797,6 +869,19 @@ fn cli_daemon_rpc_network_error(
     }
 }
 
+fn cli_daemon_forward_network_error(
+    operation: &str,
+    error: sinomo_runtime::api::DaemonApiError,
+) -> network::NetworkError {
+    match error {
+        sinomo_runtime::api::DaemonApiError::ForwardNetwork {
+            detail,
+            delivery_state: Some(delivery_state),
+        } => network::NetworkError::delivery_failed(operation, delivery_state, detail),
+        other => cli_daemon_rpc_network_error(operation, other),
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn handle_daemon_cluster_join_request(
     paths: &DaemonPaths,
@@ -858,4 +943,89 @@ pub(crate) fn handle_daemon_rollout_build_request(
     request: ClusterRolloutBuildRequest,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
     daemon_handle_daemon_rollout_build_request(paths, request).map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn cli_control_plane_transport_scopes_daemon_discovery_to_supplied_paths() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cli-control-plane-path-scope");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir layout");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let transport = CliClusterControlPlaneTransport::new(&cluster_paths);
+
+        assert_eq!(transport.cluster_paths.root, cluster_paths.root);
+        assert_eq!(
+            transport
+                .matching_daemon_paths()
+                .expect("daemon paths")
+                .root,
+            DaemonPaths::new(&data_dir).root
+        );
+    }
+
+    #[test]
+    fn cli_control_plane_transport_falls_back_only_before_daemon_send() {
+        let fallback_called = Cell::new(false);
+        let fallback = || {
+            fallback_called.set(true);
+            Ok::<_, &'static str>("direct")
+        };
+        let result = daemon_mediated_result_or_direct_fallback(None, fallback);
+        assert_eq!(result, Ok("direct"));
+        assert!(fallback_called.get());
+
+        fallback_called.set(false);
+        let result =
+            daemon_mediated_result_or_direct_fallback(Some(Err("possibly applied")), || {
+                fallback_called.set(true);
+                Ok("direct")
+            });
+        assert_eq!(result, Err("possibly applied"));
+        assert!(!fallback_called.get());
+    }
+
+    #[test]
+    fn cli_control_plane_transport_missing_matching_daemon_allows_direct_fallback() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cli-control-plane-no-daemon");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir layout");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let transport = CliClusterControlPlaneTransport::new(&cluster_paths);
+        let target = NodeId::from_legacy_named("node_cli_control_plane_target").expect("node");
+        let request =
+            network::ObjectRpcRequest::from_encoded_body("/test/control-plane", "test", Vec::new());
+
+        assert!(
+            transport
+                .call_node_object_rpc_via_matching_daemon(
+                    &target,
+                    &request,
+                    Duration::from_millis(10),
+                )
+                .is_none(),
+            "daemon discovery failure before send must retain direct fallback"
+        );
+    }
+
+    #[test]
+    fn cli_daemon_forward_preserves_authority_retry_safety() {
+        for delivery_state in [
+            network::NetworkDeliveryState::DefinitelyNotSent,
+            network::NetworkDeliveryState::PossiblyApplied,
+        ] {
+            let error = cli_daemon_forward_network_error(
+                "test authority forward",
+                sinomo_runtime::api::DaemonApiError::ForwardNetwork {
+                    detail: "forward failed".to_string(),
+                    delivery_state: Some(delivery_state),
+                },
+            );
+            assert_eq!(error.delivery_state(), Some(delivery_state));
+        }
+    }
 }
