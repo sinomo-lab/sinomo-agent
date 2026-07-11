@@ -1058,10 +1058,11 @@ QUINT_CASE_FILTER=raft-protocol,network-route-cache,network-delivery,network-att
 ```
 
 Per-command timeouts default to 300 seconds and can be changed with
-`QUINT_CASE_TIMEOUT_SECONDS`. Failed CI jobs retain `_apalache-out/`. The
-checked-in `.gitlab-ci.yml` runs typechecking, deterministic smoke exploration,
-witness coverage, and focused symbolic checks on relevant changes; scheduled
-pipelines run the full symbolic tier.
+`QUINT_CASE_TIMEOUT_SECONDS`. Formal verification is intentionally run on
+demand with the local harness rather than in GitLab CI: symbolic exploration is
+too computationally expensive to repeat for every commit. Use the smallest
+focused mode that covers the changed proof boundary, and reserve the full tier
+for deliberate verification runs.
 
 For deeper whole-system randomized exploration, use:
 
