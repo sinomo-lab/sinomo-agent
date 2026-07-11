@@ -2010,6 +2010,9 @@ fn send_rollout_object_rpc_with_timeouts(
     timeouts: network::DaemonRpcTimeouts,
 ) -> Result<network::ObjectRpcResponse, CliError> {
     if let Some(node_id) = target.rollout_node_id() {
+        // Mixed-version routed/data-plane RPC is intentionally not downgraded.
+        // Operators needing the rolling auth bridge must use a direct rollout
+        // target until every daemon speaks metadata-bound auth.
         let status = default_main_daemon_status()?.ok_or_else(|| CliError::Network {
             address: node_id.to_string(),
             detail:
@@ -2025,14 +2028,38 @@ fn send_rollout_object_rpc_with_timeouts(
             .object_rpc_to_target(node_id, request, connect_timeout, true)
             .map_err(Into::into)
     } else if let Some(endpoint) = &target.endpoint {
-        sinomo_runtime::daemon::send_daemon_rpc_to_endpoint_with_timeouts(
-            endpoint, request, timeouts,
+        if rollout_request_allows_legacy_auth_fallback(request) {
+            sinomo_runtime::daemon::send_daemon_rpc_to_endpoint_with_rollout_legacy_compatibility(
+                endpoint, request, timeouts,
+            )
+            .map_err(Into::into)
+        } else {
+            sinomo_runtime::daemon::send_daemon_rpc_to_endpoint_with_timeouts(
+                endpoint, request, timeouts,
+            )
+            .map_err(Into::into)
+        }
+    } else if rollout_request_allows_legacy_auth_fallback(request) {
+        sinomo_runtime::daemon::send_daemon_rpc_with_rollout_legacy_compatibility(
+            &target.address,
+            request,
+            timeouts,
         )
         .map_err(Into::into)
     } else {
         sinomo_runtime::daemon::send_daemon_rpc_with_timeouts(&target.address, request, timeouts)
             .map_err(Into::into)
     }
+}
+
+fn rollout_request_allows_legacy_auth_fallback(request: &network::ObjectRpcRequest) -> bool {
+    let eligible_route = request.route == sinomo_runtime::daemon::DAEMON_STATUS_ROUTE
+        || sinomo_runtime::rollout::ROLLOUT_OBJECT_RPC_ROUTES.contains(&request.route.as_str());
+    eligible_route
+        && (request.metadata.is_empty()
+            || (request.route == sinomo_runtime::rollout::ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE
+                && request.metadata.len() == 1
+                && request.is_response_retry_safe()))
 }
 
 const ROLLOUT_INLINE_BINARY_MAX_BYTES: u64 = 64 * 1024 * 1024;

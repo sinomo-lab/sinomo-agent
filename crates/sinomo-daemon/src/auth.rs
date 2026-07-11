@@ -199,10 +199,25 @@ fn verify_daemon_rpc_body_binding(
     };
     let actual = daemon_rpc_body_sha256(request);
     if expected == actual.as_slice() {
-        Ok(())
-    } else {
-        Err(DaemonError::AuthDenied)
+        return Ok(());
     }
+    // During a rolling upgrade, an old rollout client can still be polling a
+    // daemon while that daemon restarts into the new binary. Let that one
+    // metadata-free, read-only probe finish. New clients always send the
+    // metadata-bound digest first, and every command or metadata-bearing probe
+    // continues to require it.
+    if legacy_daemon_rpc_body_binding_allowed(request)
+        && expected == sinomo_core::network::daemon_rpc_legacy_body_sha256(request).as_slice()
+    {
+        return Ok(());
+    }
+    Err(DaemonError::AuthDenied)
+}
+
+fn legacy_daemon_rpc_body_binding_allowed(
+    request: &sinomo_core::network::ObjectRpcRequest,
+) -> bool {
+    request.route == crate::DAEMON_STATUS_ROUTE && request.metadata.is_empty()
 }
 
 pub fn create_cluster_invite_challenge_proof(
@@ -1105,6 +1120,61 @@ mod tests {
         assert!(!has_byte_window(&auth_bytes, public_key_base64.as_bytes()));
         assert!(!has_byte_window(&auth_bytes, hash_base64.as_bytes()));
         assert!(!has_byte_window(&auth_bytes, signature_base64.as_bytes()));
+    }
+
+    #[test]
+    fn legacy_body_binding_allows_only_metadata_free_status_poll() {
+        let status = sinomo_core::network::ObjectRpcRequest::encode_body(
+            crate::DAEMON_STATUS_ROUTE,
+            crate::DAEMON_RPC_CATEGORY,
+            &(),
+        )
+        .expect("status request");
+        let legacy_digest = sinomo_core::network::daemon_rpc_legacy_body_sha256(&status);
+        let mut envelope = signed_nonce("legacy-status-poll");
+        envelope.rpc_body_sha256 = Some(legacy_digest);
+
+        verify_daemon_rpc_body_binding(&envelope, &status)
+            .expect("old rollout status poll remains compatible");
+
+        let status_with_metadata = status.clone().with_metadata("traceparent", "test-trace");
+        envelope.rpc_body_sha256 = Some(sinomo_core::network::daemon_rpc_legacy_body_sha256(
+            &status_with_metadata,
+        ));
+        assert!(matches!(
+            verify_daemon_rpc_body_binding(&envelope, &status_with_metadata),
+            Err(DaemonError::AuthDenied)
+        ));
+
+        let command = sinomo_core::network::ObjectRpcRequest::encode_body(
+            crate::DAEMON_SHUTDOWN_ROUTE,
+            crate::DAEMON_RPC_CATEGORY,
+            &(),
+        )
+        .expect("command request");
+        envelope.rpc_body_sha256 = Some(sinomo_core::network::daemon_rpc_legacy_body_sha256(
+            &command,
+        ));
+        assert!(matches!(
+            verify_daemon_rpc_body_binding(&envelope, &command),
+            Err(DaemonError::AuthDenied)
+        ));
+    }
+
+    #[test]
+    fn metadata_bound_status_binding_remains_valid() {
+        let request = sinomo_core::network::ObjectRpcRequest::encode_body(
+            crate::DAEMON_STATUS_ROUTE,
+            crate::DAEMON_RPC_CATEGORY,
+            &(),
+        )
+        .expect("status request")
+        .with_metadata("traceparent", "test-trace");
+        let mut envelope = signed_nonce("bound-status-poll");
+        envelope.rpc_body_sha256 = Some(daemon_rpc_body_sha256(&request));
+
+        verify_daemon_rpc_body_binding(&envelope, &request)
+            .expect("new status requests keep metadata binding");
     }
 
     #[test]

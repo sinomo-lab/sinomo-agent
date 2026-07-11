@@ -27,7 +27,7 @@ use sinomo_rollout::{
     ClusterRolloutNativeDylibModuleRequest, ROLLOUT_BINARY_ROUTE,
     ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE, ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE, ROLLOUT_BUILD_ROUTE,
     ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
-    ROLLOUT_RPC_CATEGORY,
+    ROLLOUT_OBJECT_RPC_ROUTES, ROLLOUT_RPC_CATEGORY,
 };
 use std::time::{Duration, Instant};
 
@@ -336,6 +336,113 @@ pub fn send_daemon_rpc_to_endpoint_with_timeouts(
     output
 }
 
+/// Sends one rollout/status request with a one-shot, metadata-free legacy-auth
+/// retry for a directly addressed daemon during a sequential upgrade.
+///
+/// Generic daemon RPC never downgrades. This compatibility path is deliberately
+/// limited to rollout routes and the rollout status poll; mixed-version routed
+/// and data-plane RPC remain incompatible during the upgrade window.
+pub fn send_daemon_rpc_with_rollout_legacy_compatibility(
+    address: &str,
+    request: &ObjectRpcRequest,
+    timeouts: sinomo_core::network::DaemonRpcTimeouts,
+) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
+    let legacy_request = rollout_legacy_auth_fallback_request(request)
+        .ok_or_else(|| rollout_legacy_auth_fallback_denied(request))?;
+    let response = send_daemon_rpc_with_timeouts(address, request, timeouts)?;
+    if !matches!(
+        response.error_detail(),
+        Err(sinomo_core::network::NetworkError::AuthDenied)
+    ) {
+        return Ok(response);
+    }
+    let legacy_auth = sign_daemon_rpc_request_digest_for_local_node(
+        &legacy_request.route,
+        &legacy_request.category,
+        sinomo_core::network::daemon_rpc_legacy_body_sha256(&legacy_request),
+    )?;
+    send_daemon_rpc_raw_with_timeouts(address, Some(&legacy_auth), &legacy_request, timeouts)
+}
+
+/// Endpoint variant of [`send_daemon_rpc_with_rollout_legacy_compatibility`].
+pub fn send_daemon_rpc_to_endpoint_with_rollout_legacy_compatibility(
+    endpoint: &ClusterEndpointRecord,
+    request: &ObjectRpcRequest,
+    timeouts: sinomo_core::network::DaemonRpcTimeouts,
+) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
+    if rollout_legacy_auth_fallback_request(request).is_none() {
+        return Err(rollout_legacy_auth_fallback_denied(request));
+    }
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return if matches!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            let runtime = handle.clone();
+            tokio::task::block_in_place(|| {
+                runtime.block_on(
+                    send_daemon_rpc_to_endpoint_with_rollout_legacy_compatibility_async(
+                        endpoint, request, timeouts, &runtime,
+                    ),
+                )
+            })
+        } else {
+            Err(DaemonError::Network {
+                address: "daemon client runtime".to_string(),
+                detail: "rollout-compatible daemon RPC sync client cannot run inside a current-thread Tokio runtime".to_string(),
+            })
+        };
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| DaemonError::Network {
+            address: "daemon client runtime".to_string(),
+            detail: source.to_string(),
+        })?;
+    let output = runtime.block_on(
+        send_daemon_rpc_to_endpoint_with_rollout_legacy_compatibility_async(
+            endpoint,
+            request,
+            timeouts,
+            runtime.handle(),
+        ),
+    );
+    runtime.shutdown_timeout(Duration::from_millis(250));
+    output
+}
+
+async fn send_daemon_rpc_to_endpoint_with_rollout_legacy_compatibility_async(
+    endpoint: &ClusterEndpointRecord,
+    request: &ObjectRpcRequest,
+    timeouts: sinomo_core::network::DaemonRpcTimeouts,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
+    if rollout_legacy_auth_fallback_request(request).is_none() {
+        return Err(rollout_legacy_auth_fallback_denied(request));
+    }
+    let mut host =
+        DaemonSignedObjectRpcAsyncHost::new(runtime, true).with_rollout_legacy_auth_fallback();
+    let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
+    client
+        .call_endpoint(
+            endpoint,
+            request,
+            sinomo_core::network::ClusterObjectRpcOptions::new(timeouts),
+        )
+        .await
+        .map_err(DaemonError::from)
+}
+
+fn rollout_legacy_auth_fallback_denied(request: &ObjectRpcRequest) -> DaemonError {
+    DaemonError::Parse {
+        detail: format!(
+            "legacy daemon auth compatibility is limited to rollout/status RPCs with a metadata-free fallback; route {} is not eligible",
+            request.route
+        ),
+    }
+}
+
 pub(crate) fn send_daemon_rpc_to_endpoint_with_options_on_runtime(
     endpoint: &ClusterEndpointRecord,
     request: &ObjectRpcRequest,
@@ -518,6 +625,7 @@ pub(crate) struct DaemonSignedObjectRpcAsyncHost {
     observe_connectivity: bool,
     paths: Option<DaemonPaths>,
     use_tcp_tunnel: bool,
+    rollout_legacy_auth_fallback: bool,
 }
 
 impl DaemonSignedObjectRpcAsyncHost {
@@ -527,6 +635,7 @@ impl DaemonSignedObjectRpcAsyncHost {
             observe_connectivity,
             paths: None,
             use_tcp_tunnel: true,
+            rollout_legacy_auth_fallback: false,
         }
     }
 
@@ -536,6 +645,7 @@ impl DaemonSignedObjectRpcAsyncHost {
             observe_connectivity: false,
             paths: None,
             use_tcp_tunnel: false,
+            rollout_legacy_auth_fallback: false,
         }
     }
 
@@ -546,6 +656,11 @@ impl DaemonSignedObjectRpcAsyncHost {
 
     pub(crate) fn with_cluster_paths(mut self, paths: &sinomo_core::network::ClusterPaths) -> Self {
         self.paths = daemon_paths_from_cluster_paths(paths);
+        self
+    }
+
+    fn with_rollout_legacy_auth_fallback(mut self) -> Self {
+        self.rollout_legacy_auth_fallback = true;
         self
     }
 
@@ -650,6 +765,46 @@ where
     )
 }
 
+fn send_daemon_rollout_compatible_body<Req, Resp>(
+    address: &str,
+    route: &str,
+    category: &str,
+    body: &Req,
+    timeout: Duration,
+) -> Result<Resp, DaemonError>
+where
+    Req: serde::Serialize + ?Sized,
+    Resp: serde::de::DeserializeOwned,
+{
+    let request = ObjectRpcRequest::encode_body(route, category, body)?;
+    let response = send_daemon_rpc_with_rollout_legacy_compatibility(
+        address,
+        &request,
+        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
+    )?;
+    response.decode_body().map_err(Into::into)
+}
+
+fn send_daemon_rollout_compatible_body_to_endpoint<Req, Resp>(
+    endpoint: &ClusterEndpointRecord,
+    route: &str,
+    category: &str,
+    body: &Req,
+    timeout: Duration,
+) -> Result<Resp, DaemonError>
+where
+    Req: serde::Serialize + ?Sized,
+    Resp: serde::de::DeserializeOwned,
+{
+    let request = ObjectRpcRequest::encode_body(route, category, body)?;
+    let response = send_daemon_rpc_to_endpoint_with_rollout_legacy_compatibility(
+        endpoint,
+        &request,
+        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
+    )?;
+    response.decode_body().map_err(Into::into)
+}
+
 fn send_daemon_rpc_request_with_decoder<Resp, DecodeError>(
     address: &str,
     request: &ObjectRpcRequest,
@@ -663,19 +818,6 @@ where
     decode(&response).map_err(Into::into)
 }
 
-fn send_daemon_rpc_request_with_decoder_and_timeouts<Resp, DecodeError>(
-    address: &str,
-    request: &ObjectRpcRequest,
-    timeouts: sinomo_core::network::DaemonRpcTimeouts,
-    decode: impl FnOnce(&sinomo_core::network::ObjectRpcResponse) -> Result<Resp, DecodeError>,
-) -> Result<Resp, DaemonError>
-where
-    DecodeError: Into<DaemonError>,
-{
-    let response = send_daemon_rpc_with_timeouts(address, request, timeouts)?;
-    decode(&response).map_err(Into::into)
-}
-
 fn send_daemon_rpc_request_to_endpoint_with_decoder<Resp, DecodeError>(
     endpoint: &ClusterEndpointRecord,
     request: &ObjectRpcRequest,
@@ -686,19 +828,6 @@ where
     DecodeError: Into<DaemonError>,
 {
     let response = send_daemon_rpc_to_endpoint(endpoint, request, timeout)?;
-    decode(&response).map_err(Into::into)
-}
-
-fn send_daemon_rpc_request_to_endpoint_with_decoder_and_timeouts<Resp, DecodeError>(
-    endpoint: &ClusterEndpointRecord,
-    request: &ObjectRpcRequest,
-    timeouts: sinomo_core::network::DaemonRpcTimeouts,
-    decode: impl FnOnce(&sinomo_core::network::ObjectRpcResponse) -> Result<Resp, DecodeError>,
-) -> Result<Resp, DaemonError>
-where
-    DecodeError: Into<DaemonError>,
-{
-    let response = send_daemon_rpc_to_endpoint_with_timeouts(endpoint, request, timeouts)?;
     decode(&response).map_err(Into::into)
 }
 
@@ -865,29 +994,46 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonSignedObjec
     > {
         let runtime = self.runtime.clone();
         let use_tcp_tunnel = self.tcp_tunnel_available() && daemon_endpoint_is_tcp_tunnel(endpoint);
+        let daemon_paths = self.paths.clone();
+        let legacy_request = self
+            .rollout_legacy_auth_fallback
+            .then(|| rollout_legacy_auth_fallback_request(request))
+            .flatten();
+        let signing_data_dir = legacy_request.as_ref().map(|_| self.signing_data_dir());
         Box::pin(async move {
             let started = Instant::now();
-            let result = if use_tcp_tunnel
-                && let Some(result) = crate::tcp_tunnel::send_signed_endpoint_rpc_via_tcp_tunnel(
+            let mut result = send_signed_object_rpc_to_endpoint_once(
+                endpoint,
+                auth,
+                request,
+                timeouts,
+                &runtime,
+                daemon_paths.as_ref(),
+                use_tcp_tunnel,
+            )
+            .await;
+            if let Some(legacy_request) = legacy_request.as_ref()
+                && daemon_signed_rpc_result_is_auth_denied(&result)
+            {
+                let data_dir =
+                    signing_data_dir.expect("rollout legacy signing data dir must be captured")?;
+                let legacy_auth = sign_legacy_daemon_rpc_request_from_data_dir_async(
+                    &runtime,
+                    data_dir,
+                    legacy_request,
+                )
+                .await?;
+                result = send_signed_object_rpc_to_endpoint_once(
                     endpoint,
-                    auth,
-                    request,
+                    &legacy_auth,
+                    legacy_request,
                     timeouts,
                     &runtime,
-                    self.paths.as_ref(),
+                    daemon_paths.as_ref(),
+                    use_tcp_tunnel,
                 )
-                .await
-            {
-                result
-            } else {
-                sinomo_core::network::send_daemon_rpc_response_to_cluster_endpoint_async(
-                    endpoint,
-                    Some(auth),
-                    request,
-                    timeouts,
-                )
-                .await
-            };
+                .await;
+            }
             let observation =
                 daemon_signed_endpoint_object_rpc_observation(result.as_ref(), started);
             let _ = self
@@ -1029,6 +1175,91 @@ fn daemon_endpoint_is_tcp_tunnel(endpoint: &ClusterEndpointRecord) -> bool {
         && endpoint
             .address
             .starts_with(sinomo_core::network::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX)
+}
+
+fn rollout_legacy_auth_fallback_request(request: &ObjectRpcRequest) -> Option<ObjectRpcRequest> {
+    let eligible_route = request.route == crate::DAEMON_STATUS_ROUTE
+        || ROLLOUT_OBJECT_RPC_ROUTES.contains(&request.route.as_str());
+    if !eligible_route {
+        return None;
+    }
+    if request.metadata.is_empty() {
+        return Some(request.clone());
+    }
+    if request.route == ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE
+        && request.metadata.len() == 1
+        && request.is_response_retry_safe()
+    {
+        let mut fallback = request.clone();
+        fallback.metadata.clear();
+        return Some(fallback);
+    }
+    None
+}
+
+async fn send_signed_object_rpc_to_endpoint_once(
+    endpoint: &ClusterEndpointRecord,
+    auth: &[u8],
+    request: &ObjectRpcRequest,
+    timeouts: sinomo_core::network::DaemonRpcTimeouts,
+    runtime: &tokio::runtime::Handle,
+    daemon_paths: Option<&DaemonPaths>,
+    use_tcp_tunnel: bool,
+) -> Result<sinomo_core::network::ObjectRpcResponse, sinomo_core::network::NetworkError> {
+    if use_tcp_tunnel
+        && let Some(result) = crate::tcp_tunnel::send_signed_endpoint_rpc_via_tcp_tunnel(
+            endpoint,
+            auth,
+            request,
+            timeouts,
+            runtime,
+            daemon_paths,
+        )
+        .await
+    {
+        return result;
+    }
+    sinomo_core::network::send_daemon_rpc_response_to_cluster_endpoint_async(
+        endpoint,
+        Some(auth),
+        request,
+        timeouts,
+    )
+    .await
+}
+
+async fn sign_legacy_daemon_rpc_request_from_data_dir_async(
+    runtime: &tokio::runtime::Handle,
+    data_dir: sinomo_core::local::SinomoDataDir,
+    request: &ObjectRpcRequest,
+) -> Result<Vec<u8>, sinomo_core::network::NetworkError> {
+    let route = request.route.clone();
+    let category = request.category.clone();
+    let digest = sinomo_core::network::daemon_rpc_legacy_body_sha256(request);
+    runtime
+        .spawn_blocking(move || {
+            sinomo_core::network::sign_daemon_rpc_request_digest_from_data_dir(
+                &data_dir, &route, &category, digest,
+            )
+        })
+        .await
+        .map_err(|source| sinomo_core::network::NetworkError::Io {
+            operation: "cluster object RPC legacy signing".to_string(),
+            detail: format!("object RPC legacy signing task failed: {source}"),
+        })?
+}
+
+fn daemon_signed_rpc_result_is_auth_denied(
+    result: &Result<sinomo_core::network::ObjectRpcResponse, sinomo_core::network::NetworkError>,
+) -> bool {
+    match result {
+        Ok(response) => matches!(
+            response.error_detail(),
+            Err(sinomo_core::network::NetworkError::AuthDenied)
+        ),
+        Err(sinomo_core::network::NetworkError::AuthDenied) => true,
+        Err(_) => false,
+    }
 }
 
 fn daemon_rpc_connectivity_observation(
@@ -1644,7 +1875,7 @@ pub fn send_daemon_rollout_binary(
     request: &ClusterRolloutBinaryRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    send_daemon_rpc_body(
+    send_daemon_rollout_compatible_body(
         address,
         ROLLOUT_BINARY_ROUTE,
         ROLLOUT_RPC_CATEGORY,
@@ -1658,7 +1889,7 @@ pub fn send_daemon_rollout_binary_to_endpoint(
     request: &ClusterRolloutBinaryRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    send_daemon_rpc_body_to_endpoint(
+    send_daemon_rollout_compatible_body_to_endpoint(
         endpoint,
         ROLLOUT_BINARY_ROUTE,
         ROLLOUT_RPC_CATEGORY,
@@ -1678,9 +1909,13 @@ pub fn send_daemon_rollout_binary_upload_chunk(
         request,
     )?
     .with_response_retry_safe();
-    send_daemon_rpc_request_with_decoder(address, &request, timeout, |response| {
-        response.decode_body()
-    })
+    send_daemon_rpc_with_rollout_legacy_compatibility(
+        address,
+        &request,
+        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
+    )?
+    .decode_body()
+    .map_err(Into::into)
 }
 
 pub fn send_daemon_rollout_binary_upload_chunk_to_endpoint(
@@ -1694,9 +1929,13 @@ pub fn send_daemon_rollout_binary_upload_chunk_to_endpoint(
         request,
     )?
     .with_response_retry_safe();
-    send_daemon_rpc_request_to_endpoint_with_decoder(endpoint, &request, timeout, |response| {
-        response.decode_body()
-    })
+    send_daemon_rpc_to_endpoint_with_rollout_legacy_compatibility(
+        endpoint,
+        &request,
+        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
+    )?
+    .decode_body()
+    .map_err(Into::into)
 }
 
 pub fn send_daemon_rollout_binary_upload_finalize(
@@ -1704,7 +1943,7 @@ pub fn send_daemon_rollout_binary_upload_finalize(
     request: &ClusterRolloutBinaryUploadFinalizeRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    send_daemon_rpc_body(
+    send_daemon_rollout_compatible_body(
         address,
         ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
         ROLLOUT_RPC_CATEGORY,
@@ -1718,7 +1957,7 @@ pub fn send_daemon_rollout_binary_upload_finalize_to_endpoint(
     request: &ClusterRolloutBinaryUploadFinalizeRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    send_daemon_rpc_body_to_endpoint(
+    send_daemon_rollout_compatible_body_to_endpoint(
         endpoint,
         ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
         ROLLOUT_RPC_CATEGORY,
@@ -1732,7 +1971,7 @@ pub fn send_daemon_rollout_native_dylib_module(
     request: &ClusterRolloutNativeDylibModuleRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    send_daemon_rpc_body(
+    send_daemon_rollout_compatible_body(
         address,
         ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
         ROLLOUT_RPC_CATEGORY,
@@ -1746,7 +1985,7 @@ pub fn send_daemon_rollout_native_dylib_module_to_endpoint(
     request: &ClusterRolloutNativeDylibModuleRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    send_daemon_rpc_body_to_endpoint(
+    send_daemon_rollout_compatible_body_to_endpoint(
         endpoint,
         ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
         ROLLOUT_RPC_CATEGORY,
@@ -1774,9 +2013,9 @@ pub fn send_daemon_rollout_build_with_timeouts(
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
     let request =
         ObjectRpcRequest::encode_body(ROLLOUT_BUILD_ROUTE, ROLLOUT_RPC_CATEGORY, request)?;
-    send_daemon_rpc_request_with_decoder_and_timeouts(address, &request, timeouts, |response| {
-        response.decode_body()
-    })
+    send_daemon_rpc_with_rollout_legacy_compatibility(address, &request, timeouts)?
+        .decode_body()
+        .map_err(Into::into)
 }
 
 pub fn send_daemon_rollout_build_to_endpoint(
@@ -1798,19 +2037,16 @@ pub fn send_daemon_rollout_build_to_endpoint_with_timeouts(
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
     let request =
         ObjectRpcRequest::encode_body(ROLLOUT_BUILD_ROUTE, ROLLOUT_RPC_CATEGORY, request)?;
-    send_daemon_rpc_request_to_endpoint_with_decoder_and_timeouts(
-        endpoint,
-        &request,
-        timeouts,
-        |response| response.decode_body(),
-    )
+    send_daemon_rpc_to_endpoint_with_rollout_legacy_compatibility(endpoint, &request, timeouts)?
+        .decode_body()
+        .map_err(Into::into)
 }
 
 pub fn send_daemon_rollout_clear_status(
     address: &str,
     timeout: Duration,
 ) -> Result<String, DaemonError> {
-    send_daemon_rpc_body(
+    send_daemon_rollout_compatible_body(
         address,
         ROLLOUT_CLEAR_STATUS_ROUTE,
         ROLLOUT_RPC_CATEGORY,
@@ -1823,7 +2059,7 @@ pub fn send_daemon_rollout_clear_status_to_endpoint(
     endpoint: &ClusterEndpointRecord,
     timeout: Duration,
 ) -> Result<String, DaemonError> {
-    send_daemon_rpc_body_to_endpoint(
+    send_daemon_rollout_compatible_body_to_endpoint(
         endpoint,
         ROLLOUT_CLEAR_STATUS_ROUTE,
         ROLLOUT_RPC_CATEGORY,
@@ -2289,7 +2525,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_signed_endpoint_send_records_auth_denied_connectivity() {
+    fn daemon_signed_endpoint_send_never_downgrades_ordinary_auth_denial() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-client-auth-denied-observation");
         let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
         let daemon_paths = crate::DaemonPaths::with_root(root.join("daemon"));
@@ -2349,6 +2585,15 @@ mod tests {
                     )
                     .await
                     .expect("request");
+                let auth: sinomo_core::network::SignedDaemonCommand =
+                    sinomo_core::network::SinomoObjectCodec::default()
+                        .decode(request.auth.as_deref().expect("signed request"))
+                        .expect("auth envelope");
+                let expected_digest = sinomo_core::network::daemon_rpc_body_sha256(&request);
+                assert_eq!(
+                    auth.rpc_body_sha256.as_deref(),
+                    Some(expected_digest.as_slice())
+                );
                 let response = sinomo_core::network::ObjectRpcResponse::encode_error(
                     request.route,
                     "network authorization was denied",
@@ -2364,6 +2609,12 @@ mod tests {
                     )
                     .await
                     .expect("response");
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err(),
+                    "ordinary endpoint RPC must not retry with legacy auth"
+                );
             });
 
             let endpoint = sinomo_core::ClusterEndpointRecord {
@@ -2379,8 +2630,9 @@ mod tests {
             let mut host = super::DaemonSignedObjectRpcAsyncHost::new(runtime.handle(), true)
                 .with_paths(&daemon_paths);
             let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
-            let request =
-                ObjectRpcRequest::encode_body("/test/auth-denied", "test", &()).expect("request");
+            let request = ObjectRpcRequest::encode_body("/test/auth-denied", "test", &())
+                .expect("request")
+                .with_metadata("sender-controlled", "must-stay-bound");
             let result = client
                 .call_endpoint(
                     &endpoint,
@@ -2415,6 +2667,151 @@ mod tests {
             record.state,
             sinomo_core::network::ClusterConnectivityState::Unreachable
         );
+    }
+
+    #[test]
+    fn rollout_endpoint_retries_auth_denial_once_with_fresh_legacy_signature() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-client-rollout-legacy-auth");
+        let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let daemon_paths = crate::DaemonPaths::new(&data_dir);
+        daemon_paths.ensure().expect("daemon paths");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let response = runtime.block_on(async {
+            let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener");
+            let address = listener.local_addr_string().expect("listener address");
+            let server = tokio::spawn(async move {
+                let mut first_nonce = None;
+                for legacy_attempt in [false, true] {
+                    let mut stream = listener.accept().await.expect("accept");
+                    let request = stream
+                        .read_request(
+                            "rollout-legacy-auth-test",
+                            sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
+                            sinomo_core::network::ObjectFrameIoOptions::idle_timeout(
+                                Duration::from_secs(1),
+                            ),
+                        )
+                        .await
+                        .expect("request");
+                    assert_eq!(request.route, sinomo_rollout::ROLLOUT_BUILD_ROUTE);
+                    assert!(request.metadata.is_empty());
+                    let auth: sinomo_core::network::SignedDaemonCommand =
+                        sinomo_core::network::SinomoObjectCodec::default()
+                            .decode(request.auth.as_deref().expect("signed request"))
+                            .expect("auth envelope");
+                    let expected_digest = if legacy_attempt {
+                        sinomo_core::network::daemon_rpc_legacy_body_sha256(&request)
+                    } else {
+                        sinomo_core::network::daemon_rpc_body_sha256(&request)
+                    };
+                    assert_eq!(
+                        auth.rpc_body_sha256.as_deref(),
+                        Some(expected_digest.as_slice())
+                    );
+                    if let Some(first_nonce) = first_nonce.as_ref() {
+                        assert_ne!(first_nonce, &auth.nonce, "retry must use a fresh nonce");
+                    } else {
+                        first_nonce = Some(auth.nonce.clone());
+                    }
+                    let response = if legacy_attempt {
+                        sinomo_core::network::ObjectRpcResponse::encode_body(
+                            request.route,
+                            &"rollout-ok",
+                        )
+                        .expect("success response")
+                    } else {
+                        sinomo_core::network::ObjectRpcResponse::encode_error(
+                            request.route,
+                            "network authorization was denied",
+                        )
+                        .expect("auth denied response")
+                    };
+                    stream
+                        .write_response(
+                            "rollout-legacy-auth-test",
+                            &response,
+                            sinomo_core::network::ObjectFrameIoOptions::idle_timeout(
+                                Duration::from_secs(1),
+                            ),
+                        )
+                        .await
+                        .expect("response");
+                }
+            });
+
+            let endpoint = sinomo_core::ClusterEndpointRecord {
+                endpoint_id: sinomo_core::network::ClusterEndpointId::from_legacy_named(
+                    "endpoint_rollout_legacy_auth",
+                )
+                .expect("endpoint"),
+                node_id: sinomo_core::node::NodeId::from_legacy_named("node_rollout_legacy_auth")
+                    .expect("node"),
+                transport: sinomo_core::ClusterTransportKind::Loopback,
+                address,
+                source: sinomo_core::ClusterEndpointSource::Static,
+                privacy: sinomo_core::ClusterEndpointPrivacy::LocalOnly,
+                priority: 0,
+                last_observed_latency_ms: None,
+            };
+            let request = ObjectRpcRequest::encode_body(
+                sinomo_rollout::ROLLOUT_BUILD_ROUTE,
+                sinomo_rollout::ROLLOUT_RPC_CATEGORY,
+                &(),
+            )
+            .expect("rollout request");
+            let mut host = super::DaemonSignedObjectRpcAsyncHost::new(runtime.handle(), false)
+                .with_paths(&daemon_paths)
+                .with_rollout_legacy_auth_fallback();
+            let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
+            let response = client
+                .call_endpoint(
+                    &endpoint,
+                    &request,
+                    sinomo_core::network::ClusterObjectRpcOptions::new(
+                        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
+                            Duration::from_secs(1),
+                        ),
+                    ),
+                )
+                .await
+                .expect("rollout fallback response");
+            server.await.expect("server");
+            response
+        });
+
+        assert_eq!(
+            response.decode_body::<String>().expect("decode response"),
+            "rollout-ok"
+        );
+    }
+
+    #[test]
+    fn rollout_chunk_legacy_fallback_strips_retry_metadata() {
+        let request = ObjectRpcRequest::encode_body(
+            sinomo_rollout::ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
+            sinomo_rollout::ROLLOUT_RPC_CATEGORY,
+            &(),
+        )
+        .expect("chunk request")
+        .with_response_retry_safe();
+        let fallback = super::rollout_legacy_auth_fallback_request(&request)
+            .expect("chunk is rollout-compatible");
+
+        assert!(request.is_response_retry_safe());
+        assert!(fallback.metadata.is_empty());
+        assert_eq!(fallback.body, request.body);
+
+        let ordinary = ObjectRpcRequest::encode_body("/dfs/status", "dfs", &())
+            .expect("ordinary request")
+            .with_metadata("sender-controlled", "value");
+        assert!(super::rollout_legacy_auth_fallback_request(&ordinary).is_none());
     }
 
     #[test]
