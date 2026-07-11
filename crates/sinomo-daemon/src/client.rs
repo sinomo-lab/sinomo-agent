@@ -347,20 +347,44 @@ pub fn send_daemon_rpc_with_rollout_legacy_compatibility(
     request: &ObjectRpcRequest,
     timeouts: sinomo_core::network::DaemonRpcTimeouts,
 ) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
+    send_daemon_rpc_with_rollout_legacy_compatibility_and_signer(
+        address,
+        request,
+        timeouts,
+        |request, legacy| {
+            if legacy {
+                sign_daemon_rpc_request_digest_for_local_node(
+                    &request.route,
+                    &request.category,
+                    sinomo_core::network::daemon_rpc_legacy_body_sha256(request),
+                )
+            } else {
+                sign_daemon_rpc_request_for_local_node(request)
+            }
+        },
+    )
+}
+
+fn send_daemon_rpc_with_rollout_legacy_compatibility_and_signer(
+    address: &str,
+    request: &ObjectRpcRequest,
+    timeouts: sinomo_core::network::DaemonRpcTimeouts,
+    mut sign: impl FnMut(&ObjectRpcRequest, bool) -> Result<Vec<u8>, DaemonError>,
+) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
     let legacy_request = rollout_legacy_auth_fallback_request(request)
         .ok_or_else(|| rollout_legacy_auth_fallback_denied(request))?;
-    let response = send_daemon_rpc_with_timeouts(address, request, timeouts)?;
-    if !matches!(
-        response.error_detail(),
-        Err(sinomo_core::network::NetworkError::AuthDenied)
-    ) {
-        return Ok(response);
+    let current_auth = sign(request, false)?;
+    match send_daemon_rpc_raw_with_timeouts(address, Some(&current_auth), request, timeouts) {
+        Ok(response)
+            if matches!(
+                response.error_detail(),
+                Err(sinomo_core::network::NetworkError::AuthDenied)
+            ) => {}
+        Ok(response) => return Ok(response),
+        Err(DaemonError::AuthDenied) => {}
+        Err(error) => return Err(error),
     }
-    let legacy_auth = sign_daemon_rpc_request_digest_for_local_node(
-        &legacy_request.route,
-        &legacy_request.category,
-        sinomo_core::network::daemon_rpc_legacy_body_sha256(&legacy_request),
-    )?;
+    let legacy_auth = sign(&legacy_request, true)?;
     send_daemon_rpc_raw_with_timeouts(address, Some(&legacy_auth), &legacy_request, timeouts)
 }
 
@@ -2789,6 +2813,124 @@ mod tests {
         assert_eq!(
             response.decode_body::<String>().expect("decode response"),
             "rollout-ok"
+        );
+    }
+
+    #[test]
+    fn rollout_direct_address_retries_auth_denial_with_fresh_legacy_signature() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-client-rollout-direct-legacy-auth");
+        let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let response = runtime.block_on(async {
+            let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener");
+            let address = listener.local_addr_string().expect("listener address");
+            let server = tokio::spawn(async move {
+                let mut first_nonce = None;
+                for legacy_attempt in [false, true] {
+                    let mut stream = listener.accept().await.expect("accept");
+                    let request = stream
+                        .read_request(
+                            "rollout-direct-legacy-auth-test",
+                            sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
+                            sinomo_core::network::ObjectFrameIoOptions::idle_timeout(
+                                Duration::from_secs(1),
+                            ),
+                        )
+                        .await
+                        .expect("request");
+                    let auth: sinomo_core::network::SignedDaemonCommand =
+                        sinomo_core::network::SinomoObjectCodec::default()
+                            .decode(request.auth.as_deref().expect("signed request"))
+                            .expect("auth envelope");
+                    let expected_digest = if legacy_attempt {
+                        sinomo_core::network::daemon_rpc_legacy_body_sha256(&request)
+                    } else {
+                        sinomo_core::network::daemon_rpc_body_sha256(&request)
+                    };
+                    assert_eq!(
+                        auth.rpc_body_sha256.as_deref(),
+                        Some(expected_digest.as_slice())
+                    );
+                    if let Some(first_nonce) = first_nonce.as_ref() {
+                        assert_ne!(first_nonce, &auth.nonce, "retry must use a fresh nonce");
+                    } else {
+                        first_nonce = Some(auth.nonce.clone());
+                    }
+                    let response = if legacy_attempt {
+                        sinomo_core::network::ObjectRpcResponse::encode_body(
+                            request.route,
+                            &"direct-rollout-ok",
+                        )
+                        .expect("success response")
+                    } else {
+                        sinomo_core::network::ObjectRpcResponse::encode_error(
+                            request.route,
+                            "network authorization was denied",
+                        )
+                        .expect("auth denied response")
+                    };
+                    stream
+                        .write_response(
+                            "rollout-direct-legacy-auth-test",
+                            &response,
+                            sinomo_core::network::ObjectFrameIoOptions::idle_timeout(
+                                Duration::from_secs(1),
+                            ),
+                        )
+                        .await
+                        .expect("response");
+                }
+            });
+
+            let request = ObjectRpcRequest::encode_body(
+                sinomo_rollout::ROLLOUT_BUILD_ROUTE,
+                sinomo_rollout::ROLLOUT_RPC_CATEGORY,
+                &(),
+            )
+            .expect("rollout request");
+            let client_data_dir = data_dir.clone();
+            let client_request = request.clone();
+            let client = tokio::task::spawn_blocking(move || {
+                super::send_daemon_rpc_with_rollout_legacy_compatibility_and_signer(
+                    &address,
+                    &client_request,
+                    sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(
+                        1,
+                    )),
+                    |request, legacy| {
+                        if legacy {
+                            sinomo_core::network::sign_daemon_rpc_request_digest_from_data_dir(
+                                &client_data_dir,
+                                &request.route,
+                                &request.category,
+                                sinomo_core::network::daemon_rpc_legacy_body_sha256(request),
+                            )
+                        } else {
+                            sinomo_core::network::sign_daemon_rpc_request_from_data_dir(
+                                &client_data_dir,
+                                request,
+                            )
+                        }
+                        .map_err(crate::DaemonError::from)
+                    },
+                )
+            });
+            let response = client.await.expect("client task").expect("client response");
+            server.await.expect("server");
+            response
+        });
+
+        assert_eq!(
+            response.decode_body::<String>().expect("decode response"),
+            "direct-rollout-ok"
         );
     }
 
