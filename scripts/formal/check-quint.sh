@@ -66,6 +66,7 @@ register_case dfs-posix-partitioned-operation specs/quint/checks/dfs/posix_parti
 register_case dfs-local-first-file specs/quint/checks/dfs/local_first_file_branch_safety.qnt dfs_local_first_file_branch_safety "${QUINT_DFS_LOCAL_FIRST_FILE_VERIFY_MAX_STEPS:-4}" apalache step step fast "witnessVolatileWriteLostOnCrash witnessLocallySyncedTruncateSurvivesCrash witnessStalePlanRejected witnessLocalBranchApplied witnessLocalBranchConverged witnessLocalBranchConflictRetained witnessLostReplyExactRetry witnessChangedRetryRejected witnessChangedRetryBaseRejected witnessChangedRetryGenerationRejected witnessAuthorityReturnSealsDirtyBranch witnessAuthorityReturnFreezesUnsyncedBranch witnessFrozenBranchSurvivesRouteLoss witnessCleanFrozenBranchClosed witnessCanonicalQuorumLost witnessCanonicalQuorumRestored witnessRouteRestoredWithoutQuorum witnessExactRetryAfterProcessRestart witnessExactRetryWithConcurrentBase"
 register_case dfs-local-first-namespace specs/quint/checks/dfs/local_first_namespace_safety.qnt dfs_local_first_namespace_safety "${QUINT_DFS_LOCAL_FIRST_NAMESPACE_VERIFY_MAX_STEPS:-4}" apalache step step fast "witnessApplicable witnessConverged witnessConflictPreserved witnessSuperseded witnessStalePlanRejected witnessSameObjectAbaSuperseded witnessChildParentChangeConflicts witnessDirectoryRenamePreservesConcurrentChild witnessRmdirConcurrentChildConflicts"
 register_case dfs-local-first-namespace-durability specs/quint/checks/dfs/local_first_namespace_durability_safety.qnt dfs_local_first_namespace_durability_safety "${QUINT_DFS_LOCAL_FIRST_NAMESPACE_DURABILITY_VERIFY_MAX_STEPS:-8}" apalache step step fast "witnessReturnedMutationIsVolatile witnessVolatileMutationLostOnCrash witnessDirectoryFsyncMadeMutationDurable witnessDurableMutationSurvivesCrash witnessSealedExactDurableNamespace"
+register_case dfs-local-first-reconcile-gateway specs/quint/checks/dfs/local_first_reconcile_gateway_safety.qnt dfs_local_first_reconcile_gateway_safety "${QUINT_DFS_LOCAL_FIRST_RECONCILE_GATEWAY_VERIFY_MAX_STEPS:-4}" apalache step step fast "witnessPermitBuilt witnessApplyCommitted witnessConvergedCommitted witnessConflictCommitted witnessUncommittedAppendDiscardedByCrash witnessCommittedEntrySurvivesCrash witnessCommittedEntryMaterialized witnessExactRetryFromJournal witnessChangedPayloadRetryRejected witnessStaleHeadRejected witnessStaleEpochRejected witnessInsufficientEvidenceRejected"
 register_case dfs-primary-failover specs/quint/checks/dfs/metadata_primary_failover_safety.qnt dfs_metadata_primary_failover_safety "${QUINT_DFS_PRIMARY_FAILOVER_VERIFY_MAX_STEPS:-3}"
 register_case dfs-namespace-command-replay specs/quint/checks/dfs/namespace_command_replay_safety.qnt dfs_namespace_command_replay_safety "${QUINT_DFS_NAMESPACE_REPLAY_VERIFY_MAX_STEPS:-5}" apalache step step deep "witnessExactResidentRetryReplays witnessSameRequestIdChangedPayloadExecutes witnessCancelledCommandStillExecutes witnessEvictedExactRetryReexecutes witnessRestartClearedRetryReexecutes witnessCancelledFreshIdRetryExecutes"
 register_case dfs-namespace-transaction specs/quint/checks/dfs/namespace_transaction_safety.qnt dfs_namespace_transaction_safety "${QUINT_DFS_NAMESPACE_VERIFY_MAX_STEPS:-$verify_steps}"
@@ -337,6 +338,18 @@ run_smoke_scenarios() {
     10 \
     1
   run_scenario \
+    dfs-local-first-reconcile-gateway-crash-recovery \
+    specs/quint/scenarios/dfs/local_first_reconcile_gateway_recovery.qnt \
+    dfs_local_first_reconcile_gateway_crash_recovery_scenario \
+    22 \
+    1
+  run_scenario \
+    dfs-local-first-reconcile-gateway-fencing \
+    specs/quint/scenarios/dfs/local_first_reconcile_gateway_recovery.qnt \
+    dfs_local_first_reconcile_gateway_fencing_scenario \
+    18 \
+    1
+  run_scenario \
     system-smoke \
     specs/quint/scenarios/system/smoke.qnt \
     system_smoke \
@@ -481,6 +494,29 @@ verify_cases() {
       8 \
       apalache \
       lfndRecoveryFullSafetyStep
+  fi
+  if case_selected dfs-local-first-reconcile-gateway; then
+    verify_check \
+      dfs-local-first-reconcile-gateway-precommit-crash-full-safety \
+      specs/quint/checks/dfs/local_first_reconcile_gateway_safety.qnt \
+      dfs_local_first_reconcile_gateway_safety \
+      8 \
+      apalache \
+      gatewayPrecommitCrashFullSafetyStep
+    verify_check \
+      dfs-local-first-reconcile-gateway-postcommit-recovery-full-safety \
+      specs/quint/checks/dfs/local_first_reconcile_gateway_safety.qnt \
+      dfs_local_first_reconcile_gateway_safety \
+      12 \
+      apalache \
+      gatewayPostcommitRecoveryFullSafetyStep
+    verify_check \
+      dfs-local-first-reconcile-gateway-fencing-full-safety \
+      specs/quint/checks/dfs/local_first_reconcile_gateway_safety.qnt \
+      dfs_local_first_reconcile_gateway_safety \
+      16 \
+      apalache \
+      gatewayFencingFullSafetyStep
   fi
 
   if [[ -n "$verify_lock_fd" ]]; then

@@ -390,16 +390,28 @@ clean image enters a permanently frozen phase that cannot resume degraded
 mutation after another route flap. The frozen branch may locally sync and seal,
 or a clean branch may close without publishing anything.
 
-The current formal boundary is an assume/guarantee abstraction, represented by
-a compact projection of authority epoch, journal head, object and namespace
+The formal boundary is an assume/guarantee abstraction, represented by a
+compact projection of authority epoch, journal head, object and namespace
 revision counters, visible-authority/head counts, and canonical conflict count.
 Local writes, local durability barriers, crashes, branch sealing,
 reconciliation planning, and local conflict preservation stutter under that
-projection. A non-stuttering publication requires supplied Boolean evidence
-for quorum, current authority, matching epoch and plan head, content policy,
-metadata prepare, and atomic publication. The local-first slices do not yet
-derive that evidence by direct composition with the canonical lock, sync, or
-no-conflict state machines. Subject to those assumed canonical guarantees,
+projection. The focused file and namespace slices still consume seven compact
+publication facts: quorum, current authority, matching epoch and plan head,
+content policy, metadata prepare, and atomic publication.
+
+A separate one-shard reconciliation gateway now refines those facts into a
+typed permit. Its quorum, authority, content-receipt, and metadata-prepare
+certificates are all bound to the same payload digest, configuration revision,
+authority epoch, predecessor head, and successor journal index. The permit also
+contains one atomic publication envelope holding the canonical delta, terminal
+result, and optional conflict-sidecar descriptor. Changing the head, epoch,
+primary, configuration, or payload invalidates the permit instead of relying on
+a caller-supplied Boolean. The gateway explicitly models volatile planning,
+append, quorum commit, crash before and after commit, journal replay,
+materialization, lost replies, exact retry, and changed-payload rejection.
+This closes the abstract action-level result-recording gap for the bounded
+gateway, but it is not yet direct composition with Raft, advisory locks,
+`fsync`, partition recovery, or the Rust journal. Under the derived permit, a
 publication retains one visible authority and head and creates no canonical
 conflict record.
 
@@ -421,17 +433,22 @@ The target reconciliation protocol includes applicable, already-converged,
 conflicted, superseded, dependency-blocked, and rejected outcomes. The bounded
 file slice exercises apply, converge, and conflict; the namespace slice adds
 superseded. An applicable operation becomes one canonical metadata
-transaction. In the model, a conflict leaves the quorum winner at the
-canonical path and retains a symbolic file-content value or a set of namespace
-object identities in a disjoint sidecar. It does not yet prove storage
+transaction. In the focused branch models, a conflict leaves the quorum winner
+at the canonical path and retains a symbolic file-content value or a set of namespace
+object identities in a disjoint sidecar. Those slices do not prove storage
 retention receipts, retained subtree bytes, or post-crash reachability of those
-objects. File reconciliation records are keyed by the full modeled payload, so
+objects. The gateway adds a bounded receipt certificate from two distinct
+symbolic holders and proves that it intersects the metadata-prepare quorum. It
+still does not validate concrete bytes, hashes, holder persistence, subtree
+closure, or post-crash object reachability. File reconciliation records are
+keyed by the full modeled payload, so
 a lost reply can be replayed exactly while changed content, base head, or local
-sync generation is rejected. The abstract publication action atomically stores
-the terminal result record with its canonical effect or conflict sidecar; this
-is an assumed metadata-transaction boundary, not yet a refinement of the Rust
-journal. A modeled process restart clears the transient reply but preserves the
-terminal result and conflict records before replay. The namespace slice proves
+sync generation is rejected. In the gateway, the committed journal envelope is
+the durable source of the terminal result and canonical effect; table and
+sidecar materialization may lag and recover idempotently from that envelope. A
+modeled process restart clears the transient reply but preserves the committed
+envelope before replay. The byte-level WAL and Rust metadata-transaction
+refinement remain open. The namespace slice proves
 only that retrying its deterministic terminal branch is an idempotent stutter; it
 does not model a payload-keyed retry record. A changed canonical journal head
 invalidates either plan and requires reclassification. Explicit conflict
@@ -444,7 +461,8 @@ identity and exact entry stamps. Rename requires an absent destination; POSIX
 replacement semantics are not modeled. The directory-durability companion is
 separate from namespace reconciliation. The slices exclude hardlinks,
 symlinks, cross-shard local changes, branch gossip, semantic content mergers,
-retention receipts, byte-range locks, and full open-unlinked lifetime. The Rust
+concrete byte-validated retention receipts, byte-range locks, and full
+open-unlinked lifetime. The Rust
 DFS still takes the conservative strong-path behavior described above; the
 local-first slices are target-hardening models, not a claim that degraded
 mutation is implemented end to end.

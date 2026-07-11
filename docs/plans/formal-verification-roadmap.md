@@ -108,11 +108,20 @@ stranding durable jobs with path reservations held.
    sealing. A shared stuttering projection requires local work to leave
    authority/journal/object/namespace counters unchanged and accepts a crossing
    publication only with supplied abstract quorum/current-authority/epoch/plan/
-   durability evidence. Canonical effect/result recording is atomic in the
-   abstraction. It does not yet derive that evidence or atomicity by composing
-   the canonical lock, sync, journal, partition, and no-conflict models. Next
-   add retention receipts for file content and namespace subtrees, POSIX rename replacement,
-   payload-keyed namespace replay, multi-operation dependency graphs,
-   open-handle rename/unlink, cross-shard branches, hardlinks and symlinks,
-   branch gossip, and explicit service-produced merge candidates before Rust
-   implementation claims conformance.
+   durability evidence. Added 2026-07-11: a separate one-shard publication
+   gateway derives that compact evidence from a typed permit binding quorum,
+   authority, symbolic content receipts, metadata prepare, epoch, configuration,
+   predecessor head, successor index, payload, and one atomic effect/result
+   envelope. Its journal lifecycle covers append, commit, pre/post-commit crash,
+   recovery materialization, exact retry, changed-payload rejection, and stale
+   head/epoch fencing. This removes assumed action-level atomic result recording
+   inside the gateway, but the file and namespace branch models do not yet feed
+   it directly and it is not a Raft or Rust-journal refinement. Next, in order:
+   connect branch terminal actions to the gateway; compose the gateway permit
+   with canonical lock, sync, partition, no-conflict, and Raft evidence; refine
+   symbolic holders into byte-validated file/subtree retention receipts; then
+   add POSIX rename replacement, payload-keyed namespace replay, open-handle
+   rename/unlink, and only afterward multi-operation dependency graphs,
+   cross-shard branches, hardlinks and symlinks, branch gossip, and explicit
+   service-produced merge candidates before Rust implementation claims
+   conformance.

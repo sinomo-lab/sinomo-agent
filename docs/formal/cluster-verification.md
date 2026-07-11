@@ -59,7 +59,8 @@ The model inventory is split by subsystem:
   behavior, whole-file advisory locks, file and directory sync barriers,
   lock-holding operation recovery across partitions, opt-in local-first file
   branches and same-shard namespace reconciliation, a local directory
-  durability companion, local failover-target selection,
+  durability companion, a typed one-shard reconciliation publication gateway,
+  local failover-target selection,
   namespace transaction publication, sharded namespace routing,
   namespace-command replay and cancellation, metadata journal source
   validation, repair authorization, replication policy, no-conflict
@@ -68,8 +69,8 @@ The model inventory is split by subsystem:
   Matching invariant entrypoints live under `checks/dfs/`; deterministic
   advisory-lock fencing, file-sync recovery, directory-generation barriers,
   complete-holder/quorum-repair partitions, local-first reconciliation,
-  local directory-durability recovery, and retry-exhaustion traces live under
-  `scenarios/dfs/`.
+  local directory-durability recovery, reconciliation-gateway crash/fencing,
+  and retry-exhaustion traces live under `scenarios/dfs/`.
 
 This maps to the repository boundary documented in
 `docs/clustering-architecture.md` and `docs/network-architecture.md`:
@@ -695,14 +696,24 @@ machine rather than adding provisional versions to it. The shared
 to authority epoch, journal head, canonical object and namespace revisions,
 visible-authority/head counts, and the canonical conflict count. Local overlay,
 local durability, planning, and purely local sidecar steps must stutter under
-that projection. This is an assume/guarantee interface: a strong or
-reconciliation publication is permitted only when supplied Boolean evidence
-asserts quorum, current authority, epoch, exact plan head, content policy,
-metadata prepare, and atomic publication. The focused local-first models do
-not derive those facts by directly composing the canonical advisory-lock,
-`fsync`, partition-recovery, or no-conflict state machines. Given the supplied
-evidence, a publication advances one authority journal record while preserving
-one visible authority, one visible head, and zero canonical conflicts.
+that projection. The focused file and namespace slices retain an
+assume/guarantee interface: a strong or reconciliation publication consumes
+seven compact facts for quorum, current authority, epoch, exact plan head,
+content policy, metadata prepare, and atomic publication.
+
+`contracts/dfs/local_first_reconcile_permit.qnt` now supplies a typed
+refinement of those facts. Quorum, authority, content, and prepare certificates
+must agree on the payload, configuration revision, authority epoch,
+predecessor head, and successor journal index. The atomic publication envelope
+must agree with the plan's canonical delta, result digest, and optional
+conflict descriptor. `canonicalEvidenceFromPermit` is the sole adapter back to
+the seven-field projection contract; none of its fields is asserted directly.
+The focused local-first branch models are not yet directly composed with this
+gateway or with the canonical advisory-lock, `fsync`, partition-recovery,
+no-conflict, or Raft transition systems. Given either the assumed focused
+evidence or the derived gateway permit, a publication advances one authority
+journal record while preserving one visible authority, one visible head, and
+zero canonical conflicts.
 
 The `dfs_local_first_file_branch_safety.safety` invariant covers a bounded
 regular-file branch:
@@ -756,6 +767,36 @@ projection. This slice does not distinguish file `fdatasync` from file
 `fsync`, model a general local journal, or connect the durable image directly
 to reconciliation publication.
 
+The `dfs_local_first_reconcile_gateway_safety.safety` invariant covers one
+shard, one active reconciliation request id, two payload digests, and all three
+file-level publication outcomes:
+
+- a typed permit cannot be built until quorum acknowledgements, at least two
+  symbolic content-holder receipts, and a metadata-prepare quorum exist for the
+  exact frozen plan;
+- append is canonical stuttering and remains discardable until commit;
+- an unrelated canonical head advance or authority-epoch change makes the
+  appended permit unusable, after which rejection clears the volatile slot
+  without publishing it;
+- commit is the sole local-first canonical linearization point and stores one
+  envelope containing the effect, terminal result, and optional conflict
+  descriptor;
+- a crash before commit discards the append, while a crash after commit retains
+  the envelope even if the materialized object/result/sidecar tables still lag;
+- recovery materializes exactly that committed envelope, and an exact retry
+  can read the journal result without repeating the effect while a changed
+  payload is rejected; and
+- Apply advances the object revision once, Converged and Conflict preserve it,
+  and Conflict creates only a disjoint sidecar descriptor while the canonical
+  conflict count stays zero.
+
+The gateway's content certificate is a finite receipt-set abstraction, not a
+byte-level storage proof. Its strong-head and authority changes are bounded
+environment transitions guarded by a quorum set, not direct refinement of the
+Raft log. Lock tokens, sync certificates, arbitrary membership changes,
+multiple journal entries, byte hashes, torn writes, snapshots, and Rust table
+batches remain outside this slice.
+
 `scenarios/dfs/local_first_file_reconcile.qnt` deterministically exercises
 volatile-write loss, locally synced recovery, stale-plan rejection, divergent
 content preservation, an outcome-unknown reply, process restart, and exact
@@ -769,10 +810,15 @@ target-hardening specifications.
 `scenarios/dfs/local_first_namespace_durability_recovery.qnt` deterministically
 loses an unsynced mutation, replays it with the same bounded mutation identity,
 directory-syncs it, recovers it after a second crash, and seals that durable
-image. The slices do not yet model hardlinks, symlinks, cross-shard local work,
-branch gossip, service-defined semantic merge, arbitrary byte offsets,
-retention receipts, POSIX rename replacement, or Rust refinement of the
-degraded path.
+image. `scenarios/dfs/local_first_reconcile_gateway_recovery.qnt` contains a
+crash-boundary trace and a fencing trace. The first discards an uncommitted
+append, then recovers a committed outcome-unknown conflict and checks exact and
+changed retries. The second separately rejects a stale-head append and a
+stale-epoch append. The slices do not yet model hardlinks, symlinks,
+cross-shard local work, branch gossip, service-defined semantic merge,
+arbitrary byte offsets,
+concrete byte-validated retention receipts, POSIX rename replacement, or Rust
+refinement of the degraded path.
 
 The cross-shard namespace slice additionally defines a mandatory forward
 finalization for an exhausted `FailedRecoverable` state with durable destination
@@ -1012,10 +1058,11 @@ QUINT_CASE_FILTER=raft-protocol,network-route-cache,network-delivery,network-att
 ```
 
 Per-command timeouts default to 300 seconds and can be changed with
-`QUINT_CASE_TIMEOUT_SECONDS`. Failed CI jobs retain `_apalache-out/`. The
-checked-in `.gitlab-ci.yml` runs typechecking, deterministic smoke exploration,
-witness coverage, and focused symbolic checks on relevant changes; scheduled
-pipelines run the full symbolic tier.
+`QUINT_CASE_TIMEOUT_SECONDS`. Formal verification is intentionally run on
+demand with the local harness rather than in GitLab CI: symbolic exploration is
+too computationally expensive to repeat for every commit. Use the smallest
+focused mode that covers the changed proof boundary, and reserve the full tier
+for deliberate verification runs.
 
 For deeper whole-system randomized exploration, use:
 
@@ -1100,13 +1147,19 @@ checks use
 `QUINT_DFS_LOCAL_FIRST_FILE_VERIFY_MAX_STEPS` and
 `QUINT_DFS_LOCAL_FIRST_NAMESPACE_VERIFY_MAX_STEPS`, both defaulting to 4, and
 `QUINT_DFS_LOCAL_FIRST_NAMESPACE_DURABILITY_VERIFY_MAX_STEPS`, defaulting to
-8. On this checkout the focused file, namespace, and namespace-durability runs
+8. The typed reconciliation gateway uses
+`QUINT_DFS_LOCAL_FIRST_RECONCILE_GATEWAY_VERIFY_MAX_STEPS`, defaulting to 4.
+On this checkout the focused file, namespace, and namespace-durability runs
 passed in about 36, 59, and 7 seconds. The file conflict/restart/mismatch,
 apply, and converge drivers passed at depths 19, 15, and 11 in about 32, 37,
 and 42 seconds; the namespace and namespace-durability full-causal drivers
-passed in about 71 and 6 seconds. A 5,000-trace local-first coverage run reached
-every currently registered local-first witness.
-The harness also registers separate reconciliation smoke scenarios.
+passed in about 71 and 6 seconds. The gateway additionally has deterministic
+precommit-crash, postcommit-recovery, and head/epoch-fencing full-safety drivers
+at depths 8, 12, and 16. On this checkout its nondeterministic depth-4 check
+passed in about 116 seconds and the three full-causal drivers passed in about
+100, 106, and 109 seconds. A 5,000-trace local-first coverage run reached every
+currently registered local-first witness. The harness also registers separate
+branch and gateway reconciliation smoke scenarios.
 A fixed-seed 5,000-trace coverage run reached the other then-registered witnesses,
 and deterministic lock-fence, file-sync recovery, directory-generation sync,
 partition-winner, and cross-shard exhaustion scenarios reached their clean
@@ -1157,7 +1210,7 @@ resident-replay and cache-loss/cancellation witnesses.
 Use larger bounds for local audit runs, not as a routine CI gate:
 
 ```bash
-QUINT_VERIFY_MAX_STEPS=8 QUINT_RAFT_PROTOCOL_VERIFY_MAX_STEPS=2 QUINT_NETWORK_ENDPOINT_VERIFY_MAX_STEPS=5 QUINT_NETWORK_ROUTE_VERIFY_MAX_STEPS=5 QUINT_NETWORK_ROUTE_CACHE_VERIFY_MAX_STEPS=5 QUINT_NETWORK_DELIVERY_VERIFY_MAX_STEPS=6 QUINT_NETWORK_ATTEMPT_BUDGET_VERIFY_MAX_STEPS=4 QUINT_NETWORK_TIMED_TRANSPORT_VERIFY_MAX_STEPS=6 QUINT_NETWORK_TIMED_DELIVERY_VERIFY_MAX_STEPS=8 QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_STEPS=160 QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_SAMPLES=5000 QUINT_SYSTEM_SMOKE_RUN_MAX_STEPS=240 QUINT_SYSTEM_SMOKE_RUN_MAX_SAMPLES=10000 QUINT_DFS_ROUTING_VERIFY_MAX_STEPS=6 QUINT_DFS_READ_FRESHNESS_VERIFY_MAX_STEPS=4 QUINT_DFS_ROUTED_NAMESPACE_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_NAMESPACE_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_LINKS_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_CROSS_SHARD_VERIFY_MAX_STEPS=3 QUINT_DFS_POSIX_READ_WRITE_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_ADVISORY_LOCKS_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_FSYNC_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_PARTITIONED_OPERATION_VERIFY_MAX_STEPS=10 QUINT_DFS_LOCAL_FIRST_FILE_VERIFY_MAX_STEPS=6 QUINT_DFS_LOCAL_FIRST_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_LOCAL_FIRST_NAMESPACE_DURABILITY_VERIFY_MAX_STEPS=8 QUINT_DFS_PRIMARY_FAILOVER_VERIFY_MAX_STEPS=4 QUINT_DFS_NAMESPACE_REPLAY_VERIFY_MAX_STEPS=6 QUINT_DFS_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_SHARDED_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_JOURNAL_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_VERIFY_MAX_STEPS=6 QUINT_DFS_REPLICATION_VERIFY_MAX_STEPS=6 QUINT_DFS_NO_CONFLICT_VERIFY_MAX_STEPS=6 QUINT_DFS_PENDING_VERIFY_MAX_STEPS=4 QUINT_DFS_REPAIR_CONTENT_VERIFY_MAX_STEPS=6 QUINT_DFS_CHUNKED_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_LOST_AUTHORITY_VERIFY_MAX_STEPS=5 QUINT_DFS_ANTI_ENTROPY_VERIFY_MAX_STEPS=6 QUINT_MEMBERSHIP_VERIFY_MAX_STEPS=5 QUINT_MEMBERSHIP_KV_VERIFY_MAX_STEPS=5 QUINT_MEMBERSHIP_RAFT_CONFIG_VERIFY_MAX_STEPS=5 bash scripts/formal/check-quint.sh all
+QUINT_VERIFY_MAX_STEPS=8 QUINT_RAFT_PROTOCOL_VERIFY_MAX_STEPS=2 QUINT_NETWORK_ENDPOINT_VERIFY_MAX_STEPS=5 QUINT_NETWORK_ROUTE_VERIFY_MAX_STEPS=5 QUINT_NETWORK_ROUTE_CACHE_VERIFY_MAX_STEPS=5 QUINT_NETWORK_DELIVERY_VERIFY_MAX_STEPS=6 QUINT_NETWORK_ATTEMPT_BUDGET_VERIFY_MAX_STEPS=4 QUINT_NETWORK_TIMED_TRANSPORT_VERIFY_MAX_STEPS=6 QUINT_NETWORK_TIMED_DELIVERY_VERIFY_MAX_STEPS=8 QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_STEPS=160 QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_SAMPLES=5000 QUINT_SYSTEM_SMOKE_RUN_MAX_STEPS=240 QUINT_SYSTEM_SMOKE_RUN_MAX_SAMPLES=10000 QUINT_DFS_ROUTING_VERIFY_MAX_STEPS=6 QUINT_DFS_READ_FRESHNESS_VERIFY_MAX_STEPS=4 QUINT_DFS_ROUTED_NAMESPACE_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_NAMESPACE_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_LINKS_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_CROSS_SHARD_VERIFY_MAX_STEPS=3 QUINT_DFS_POSIX_READ_WRITE_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_ADVISORY_LOCKS_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_FSYNC_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_PARTITIONED_OPERATION_VERIFY_MAX_STEPS=10 QUINT_DFS_LOCAL_FIRST_FILE_VERIFY_MAX_STEPS=6 QUINT_DFS_LOCAL_FIRST_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_LOCAL_FIRST_NAMESPACE_DURABILITY_VERIFY_MAX_STEPS=8 QUINT_DFS_LOCAL_FIRST_RECONCILE_GATEWAY_VERIFY_MAX_STEPS=6 QUINT_DFS_PRIMARY_FAILOVER_VERIFY_MAX_STEPS=4 QUINT_DFS_NAMESPACE_REPLAY_VERIFY_MAX_STEPS=6 QUINT_DFS_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_SHARDED_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_JOURNAL_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_VERIFY_MAX_STEPS=6 QUINT_DFS_REPLICATION_VERIFY_MAX_STEPS=6 QUINT_DFS_NO_CONFLICT_VERIFY_MAX_STEPS=6 QUINT_DFS_PENDING_VERIFY_MAX_STEPS=4 QUINT_DFS_REPAIR_CONTENT_VERIFY_MAX_STEPS=6 QUINT_DFS_CHUNKED_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_LOST_AUTHORITY_VERIFY_MAX_STEPS=5 QUINT_DFS_ANTI_ENTROPY_VERIFY_MAX_STEPS=6 QUINT_MEMBERSHIP_VERIFY_MAX_STEPS=5 QUINT_MEMBERSHIP_KV_VERIFY_MAX_STEPS=5 QUINT_MEMBERSHIP_RAFT_CONFIG_VERIFY_MAX_STEPS=5 bash scripts/formal/check-quint.sh all
 ```
 
 ## Current Abstractions
@@ -1189,9 +1242,10 @@ This slice does not yet model:
   across rename/unlink, multi-operation local branch dependency graphs,
   hardlink/symlink and cross-shard local-first reconciliation, branch gossip,
   service-defined semantic merge, payload-keyed namespace replay, POSIX rename
-  replacement, retained-content/subtree receipts, and direct composition of
-  local-first publication evidence with the canonical lock, sync, and
-  no-conflict models.
+  replacement, concrete byte-validated retained-content/subtree receipts,
+  direct composition of branch reconciliation with the typed gateway, and
+  direct gateway composition with the canonical lock, sync, no-conflict, and
+  Raft models.
 
 Future models should remain layered instead of expanding one state machine.
 The active verification backlog is maintained in the
