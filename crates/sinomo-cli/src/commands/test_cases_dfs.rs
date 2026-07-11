@@ -411,13 +411,13 @@ fn run_read_your_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     expect_payload_now(&backend, &path, payload.as_bytes(), "after write")?;
 
     backend
-        .rename(&path, &renamed)
+        .rename_with_deadline(&path, &renamed, deadline)
         .map_err(SinomoTestError::failed)?;
     expect_payload_now(&backend, &renamed, payload.as_bytes(), "after rename")?;
     expect_absent_now(&backend, &path, "after rename")?;
 
     backend
-        .delete_file(&renamed)
+        .delete_file_with_deadline(&renamed, deadline)
         .map_err(SinomoTestError::failed)?;
     expect_absent_now(&backend, &renamed, "after delete")?;
 

@@ -37,10 +37,11 @@ use crate::{
     default_dfs_metadata_replication_suppression_snapshot_path,
     dfs_metadata_journal_batch_rpc_request, dfs_metadata_snapshot_install_rpc_request,
     dfs_now_unix_nanos, distributed_sifs, distributed_sifs_bootstrap_objects_for_nodes,
-    metadata_shards_prefix, object_rpc_request_from_kv_payload, open_local_metadata_shard_backend,
-    put_local_dfs_metadata_replication_suppression,
+    local_dfs_metadata_shard_path, metadata_shards_prefix, object_rpc_request_from_kv_payload,
+    open_local_metadata_shard_backend, put_local_dfs_metadata_replication_suppression,
     read_dfs_metadata_replication_suppression_snapshot, sifs_file_system_id,
 };
+use crate::{metadata_cursor, metadata_lock};
 
 pub const DEFAULT_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
 
@@ -1900,8 +1901,18 @@ async fn put_local_dfs_metadata_replication_cursor_async(
     next_after_sequence: u64,
 ) -> Result<(), DfsError> {
     tokio::task::spawn_blocking(move || {
-        let mut backend = open_local_metadata_shard_backend(&data_dir, shard_id.clone())?;
-        Ok(backend.put_metadata_replication_cursor(
+        // Cursor acknowledgement is independent of materialized metadata
+        // tables. Opening a complete shard backend here replays and decodes
+        // those tables once per replicated batch, which can dominate publish
+        // latency on large shards. Keep the same shard write lock and durable
+        // monotonic cursor update without loading unrelated table state.
+        let root = local_dfs_metadata_shard_path(&data_dir, &shard_id);
+        let _lock = metadata_lock::metadata_write_lock(
+            root.clone(),
+            metadata_cursor::journal_write_lock_path(&root),
+        )?;
+        Ok(metadata_cursor::put_metadata_replication_cursor(
+            &root,
             &target_node_id,
             &shard_id,
             next_after_sequence,
@@ -2994,4 +3005,49 @@ pub(crate) fn dfs_metadata_snapshot_install_sender_from_peer_transport(
         decode_dfs_metadata_snapshot_install_rpc_response(&response)
             .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
     })
+}
+
+#[cfg(test)]
+mod cursor_update_tests {
+    use super::*;
+
+    #[test]
+    fn async_cursor_commit_does_not_open_materialized_tables() {
+        let temp = sinomo_testdir::TestDir::new("sinomo-dfs-replication-cursor-direct");
+        let data_dir = SinomoDataDir::new(temp.path());
+        let shard_id = DfsMetadataShardId::new("services");
+        let root = local_dfs_metadata_shard_path(&data_dir, &shard_id);
+        let table_dir = root.join("records").join("tables");
+        std::fs::create_dir_all(&table_dir).expect("table dir");
+        std::fs::write(table_dir.join("materialized.slog"), b"not-a-table-log")
+            .expect("corrupt table fixture");
+        let target_node_id = NodeId::from_legacy_named("cursor-target").expect("node id");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        runtime
+            .block_on(put_local_dfs_metadata_replication_cursor_async(
+                data_dir.clone(),
+                target_node_id.clone(),
+                shard_id.clone(),
+                42,
+            ))
+            .expect("cursor commit");
+        runtime
+            .block_on(put_local_dfs_metadata_replication_cursor_async(
+                data_dir,
+                target_node_id.clone(),
+                shard_id.clone(),
+                12,
+            ))
+            .expect("monotonic cursor commit");
+
+        assert_eq!(
+            metadata_cursor::metadata_replication_cursor(&root, &target_node_id, &shard_id)
+                .expect("cursor read"),
+            42
+        );
+    }
 }

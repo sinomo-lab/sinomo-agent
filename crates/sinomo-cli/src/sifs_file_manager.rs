@@ -440,6 +440,80 @@ impl SifsFileManagerBackend {
         self.write_file_with_options(path, bytes, true, true, true, Some(deadline))
     }
 
+    pub(crate) fn rename_with_deadline(
+        &self,
+        from: &str,
+        to: &str,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        self.rename_with_operation_deadline(from, to, Some(deadline))
+    }
+
+    pub(crate) fn delete_file_with_deadline(
+        &self,
+        path: &str,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        self.delete_file_with_operation_deadline(path, Some(deadline))
+    }
+
+    fn run_namespace_mutation_with_deadline(
+        &self,
+        operation_deadline: Option<Instant>,
+        operation: &str,
+        mutation: impl FnOnce(&mut NetworkedDfsService<DfsNodeTransport>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        sifs_operation_remaining(operation_deadline, operation)?;
+        let mut service = self.lock_service_with_deadline(operation_deadline)?;
+        let previous_deadline = operation_deadline
+            .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
+        let result = (|| {
+            self.refresh_service_peer_targets_with_deadline(&mut service, operation_deadline);
+            sifs_operation_remaining(operation_deadline, "refreshing SIFS peer targets")?;
+            mutation(&mut service)
+        })();
+        if let Some(previous_deadline) = previous_deadline {
+            service.set_transport_operation_deadline(previous_deadline);
+        }
+        result?;
+        drop(service);
+        self.publish_metadata_after_mutation_with_deadline(operation_deadline)
+    }
+
+    fn rename_with_operation_deadline(
+        &self,
+        from: &str,
+        to: &str,
+        operation_deadline: Option<Instant>,
+    ) -> Result<(), String> {
+        let from = normalize_sifs_path(from)?;
+        let to = normalize_sifs_path(to)?;
+        self.run_namespace_mutation_with_deadline(operation_deadline, "SIFS rename", |service| {
+            service
+                .posix_rename(&from, &to)
+                .map(|_| ())
+                .map_err(|error| format!("cannot rename SIFS item {from} to {to}: {error}"))
+        })
+    }
+
+    fn delete_file_with_operation_deadline(
+        &self,
+        path: &str,
+        operation_deadline: Option<Instant>,
+    ) -> Result<(), String> {
+        let path = normalize_sifs_path(path)?;
+        self.run_namespace_mutation_with_deadline(
+            operation_deadline,
+            "SIFS file delete",
+            |service| {
+                service
+                    .posix_unlink(&path)
+                    .map(|_| ())
+                    .map_err(|error| format!("cannot delete SIFS file {path}: {error}"))
+            },
+        )
+    }
+
     pub(crate) fn create_dir_all_deferred_publish_until(
         &self,
         path: &str,
@@ -1072,30 +1146,11 @@ impl FileManagerBackend for SifsFileManagerBackend {
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<(), String> {
-        let from = normalize_sifs_path(from)?;
-        let to = normalize_sifs_path(to)?;
-        let mut service = self.lock_service()?;
-        self.refresh_service_peer_targets(&mut service);
-        service
-            .posix_rename(&from, &to)
-            .map(|_| ())
-            .map_err(|error| format!("cannot rename SIFS item {from} to {to}: {error}"))?;
-        drop(service);
-        self.publish_metadata_after_mutation()?;
-        Ok(())
+        self.rename_with_operation_deadline(from, to, None)
     }
 
     fn delete_file(&self, path: &str) -> Result<(), String> {
-        let path = normalize_sifs_path(path)?;
-        let mut service = self.lock_service()?;
-        self.refresh_service_peer_targets(&mut service);
-        service
-            .posix_unlink(&path)
-            .map(|_| ())
-            .map_err(|error| format!("cannot delete SIFS file {path}: {error}"))?;
-        drop(service);
-        self.publish_metadata_after_mutation()?;
-        Ok(())
+        self.delete_file_with_operation_deadline(path, None)
     }
 
     fn delete_dir(&self, path: &str) -> Result<(), String> {
@@ -2148,6 +2203,22 @@ mod tests {
                     b"deferred",
                     deadline,
                 )
+            }),
+        );
+        run_contended(
+            "rename",
+            Box::new(|backend, deadline| {
+                backend.rename_with_deadline(
+                    "/services/contended-rename-source.txt",
+                    "/services/contended-rename-target.txt",
+                    deadline,
+                )
+            }),
+        );
+        run_contended(
+            "file delete",
+            Box::new(|backend, deadline| {
+                backend.delete_file_with_deadline("/services/contended-delete.txt", deadline)
             }),
         );
         drop(service_guard);

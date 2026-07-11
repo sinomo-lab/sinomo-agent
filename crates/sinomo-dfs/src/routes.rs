@@ -270,11 +270,13 @@ pub fn dfs_message_is_read_only_request(command: &DfsMessageCommand) -> bool {
 /// Returns the exceptional first-response silence allowance for DFS messages
 /// that cannot emit transport progress while completing bounded durable work.
 pub fn dfs_network_message_no_progress_timeout(message: &DfsNetworkMessage) -> Option<Duration> {
-    matches!(
-        message,
-        DfsNetworkMessage::NamespaceRequest(_) | DfsNetworkMessage::DistributedWriteRequest(_)
-    )
-    .then_some(crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT)
+    match message {
+        DfsNetworkMessage::NamespaceRequest(_) => Some(crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT),
+        DfsNetworkMessage::DistributedWriteRequest(_) => {
+            Some(crate::DFS_ROUTED_DISTRIBUTED_WRITE_NO_PROGRESS_TIMEOUT)
+        }
+        _ => None,
+    }
 }
 
 fn dfs_network_message_uses_full_response_budget(message: &DfsNetworkMessage) -> bool {

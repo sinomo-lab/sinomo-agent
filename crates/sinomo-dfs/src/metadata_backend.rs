@@ -120,6 +120,21 @@ fn metadata_backend_perf_trace(args: std::fmt::Arguments<'_>) {
     tracing::trace!(target: "sinomo.dfs.perf", detail = %args, "dfs metadata backend perf");
 }
 
+#[cfg(test)]
+thread_local! {
+    static METADATA_BEGIN_WRITE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_metadata_begin_write_calls() {
+    METADATA_BEGIN_WRITE_CALLS.set(0);
+}
+
+#[cfg(test)]
+fn metadata_begin_write_calls() -> usize {
+    METADATA_BEGIN_WRITE_CALLS.get()
+}
+
 /// Shard-local SOBJ metadata backend.
 ///
 /// This backend owns one durable metadata shard: packed materialized tables,
@@ -1212,6 +1227,8 @@ impl LocalSobjMetadataBackend {
     }
 
     fn begin_metadata_write(&mut self) -> Result<MetadataWriteLock> {
+        #[cfg(test)]
+        METADATA_BEGIN_WRITE_CALLS.set(METADATA_BEGIN_WRITE_CALLS.get().saturating_add(1));
         let lock = self.metadata_write_lock()?;
         self.refresh_metadata_tables()?;
         self.next_sequence = self
@@ -2655,8 +2672,13 @@ impl LocalSobjMetadataBackend {
     }
 
     fn recover_visible_version_commits(&mut self) -> Result<()> {
+        // One recovery pass owns one refreshed table view. Taking and
+        // refreshing the shard lock once per retained (usually already
+        // materialized) commit turns every backend open into an O(commits)
+        // sequence of lock/open syscalls even when there is no work to do.
+        let _lock = self.begin_metadata_write()?;
         for commit in visible_commit_recovery_order(&self.tables) {
-            self.recover_visible_version_commit(&commit)?;
+            self.recover_visible_version_commit_unlocked(&commit)?;
         }
         Ok(())
     }
@@ -2671,11 +2693,10 @@ impl LocalSobjMetadataBackend {
         self.append_and_apply_table_ops(sequence, table_ops)
     }
 
-    fn recover_visible_version_commit(
+    fn recover_visible_version_commit_unlocked(
         &mut self,
         commit: &DfsVisibleVersionCommitRecord,
     ) -> Result<()> {
-        let _lock = self.begin_metadata_write()?;
         if !visible_commit_should_recover(&self.tables, commit) {
             return Ok(());
         }
@@ -9024,6 +9045,87 @@ mod tests {
                 .get_version(&committed.object_id, &committed.version)
                 .expect("get version"),
             Some(version_record)
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn healthy_visible_commit_recovery_refreshes_once_for_all_retained_commits() {
+        let root = temp_root("healthy_visible_commit_recovery_refreshes_once");
+        let mut backend =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+
+        let replica_node_id = node("node_replica");
+        let mut current = object(version("version_1"));
+        backend.put_object(&current).expect("initial object");
+        for index in 2..=9 {
+            let mut committed = current.clone();
+            committed.version = version(&format!("version_{index}"));
+            committed.content_hash = Some(format!("blake3:grouped-recovery-{index}"));
+            committed.content_size_bytes = Some(index);
+            committed.current_locations = vec![replica_node_id.clone()];
+            let visible_version = DfsObjectVersionRecord {
+                file_system_id: committed.file_system_id.clone(),
+                object_id: committed.object_id.clone(),
+                version: committed.version.clone(),
+                content_hash: committed.content_hash.clone(),
+                size_bytes: committed.content_size_bytes,
+                locations: committed.current_locations.clone(),
+                created_by_event_id: None,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                visible: true,
+            };
+            let receipt = DfsReplicaReceiptRecord {
+                receipt: DfsWriteReceipt {
+                    file_system_id: committed.file_system_id.clone(),
+                    object_id: committed.object_id.clone(),
+                    committed_version: committed.version.clone(),
+                    owner_node_id: committed.owner_node_id.clone(),
+                    event_id: EventId::from_legacy_named(format!("evt_grouped_recovery_{index}"))
+                        .expect("event"),
+                },
+                replica_node_id: replica_node_id.clone(),
+                content_hash: committed.content_hash.clone(),
+                received_at: OffsetDateTime::UNIX_EPOCH,
+            };
+            backend.put_receipt(&receipt).expect("receipt");
+            backend
+                .commit_visible_version(
+                    &current.version,
+                    &committed,
+                    &visible_version,
+                    std::slice::from_ref(&replica_node_id),
+                )
+                .expect("visible commit");
+            current = committed;
+        }
+
+        assert_eq!(backend.tables.visible_commits.len(), 8);
+        let journal_sequence = backend.journal_last_sequence();
+        reset_metadata_begin_write_calls();
+
+        backend
+            .recover_visible_version_commits()
+            .expect("healthy recovery pass");
+
+        assert_eq!(
+            metadata_begin_write_calls(),
+            1,
+            "one healthy recovery pass should refresh once, independent of retained commit count"
+        );
+        assert_eq!(
+            backend.journal_last_sequence(),
+            journal_sequence,
+            "healthy retained commits must not be re-journaled"
+        );
+        assert_eq!(
+            backend
+                .get_object(&current.object_id)
+                .expect("current object"),
+            Some(current)
         );
 
         cleanup(&root);

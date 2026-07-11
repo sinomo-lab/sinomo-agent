@@ -1452,7 +1452,7 @@ mod tests {
         );
         assert_eq!(
             observed[1].no_progress_timeout,
-            Some(crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT)
+            Some(crate::DFS_ROUTED_DISTRIBUTED_WRITE_NO_PROGRESS_TIMEOUT)
         );
         assert_eq!(observed[1].overall_timeout, None);
         assert_eq!(observed[2], DfsObjectRpcSendOptions::default());

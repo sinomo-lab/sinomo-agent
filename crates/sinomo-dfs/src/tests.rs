@@ -2300,6 +2300,11 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         namespace_request.forwarded_response_idle_timeout(),
         Some(crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT)
     );
+    assert_eq!(
+        sinomo_core::network::cluster_object_rpc_effective_route_timeout(&namespace_request, None,),
+        crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+        "namespace semantic and forwarded silence ceilings must cover the same bounded durable operation"
+    );
     assert!(
         !namespace_request.is_response_retry_safe(),
         "namespace mutations lack durable replay tracking and must not be redispatched"
@@ -2326,7 +2331,7 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
     );
     assert_eq!(
         distributed_request.forwarded_response_idle_timeout(),
-        Some(crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT)
+        Some(crate::DFS_ROUTED_DISTRIBUTED_WRITE_NO_PROGRESS_TIMEOUT)
     );
     let mismatched_route_request = sinomo_core::network::ObjectRpcRequest::encode_body(
         DFS_DATA_WRITE_ROUTE,

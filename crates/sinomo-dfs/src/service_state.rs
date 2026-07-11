@@ -36,11 +36,16 @@ pub(crate) const DFS_CONFLICT_SCAN_PAGE_SIZE: usize = 2;
 
 pub(crate) const DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT: usize = 8;
 // Namespace RPCs are on the app-visible critical path, but they may include a
-// durable WAN metadata mutation and bounded journal replay. Keep the deadline
-// short enough to surface an unhealthy route while allowing slower real-cluster
-// primaries to finish instead of abandoning an in-flight mutation at five
-// seconds.
-pub const DFS_ROUTED_NAMESPACE_OP_TIMEOUT: Duration = Duration::from_secs(15);
+// durable WAN metadata mutation and bounded journal replay. They are not safe
+// to redispatch after a response timeout because their exact-response replay
+// cache is not durable across daemon restarts. Give the primary the bounded
+// full-response route ceiling instead of abandoning a possibly-applied
+// mutation at the normal network no-progress deadline.
+pub const DFS_ROUTED_NAMESPACE_OP_TIMEOUT: Duration = Duration::from_secs(60);
+// Distributed writes have durable request identity and are response-retry
+// safe. Keep their shorter no-progress interval separate so sinomo-network can
+// retry a lost response without shortening namespace mutation semantics.
+pub const DFS_ROUTED_DISTRIBUTED_WRITE_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(15);
 /// Nested coordination depth (serving a namespace request while settling
 /// another) beyond which new coordination rejects as Busy instead of growing
 /// the stack.
