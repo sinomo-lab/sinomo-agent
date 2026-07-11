@@ -2259,6 +2259,7 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         message_request.uses_full_response_budget(),
         "DFS read data-plane message RPCs need the full verified final-hop response budget"
     );
+    assert_eq!(message_request.forwarded_response_idle_timeout(), None);
     assert_eq!(
         message_request
             .decode_body::<DfsMessageCommand>()
@@ -2295,6 +2296,10 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         namespace_request.uses_full_response_budget(),
         "DFS namespace message RPCs need the full verified final-hop response budget"
     );
+    assert_eq!(
+        namespace_request.forwarded_response_idle_timeout(),
+        Some(crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT)
+    );
     assert!(
         !namespace_request.is_response_retry_safe(),
         "namespace mutations lack durable replay tracking and must not be redispatched"
@@ -2318,6 +2323,10 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
     assert!(
         distributed_request.is_response_retry_safe(),
         "distributed write request IDs make a lost response safe to redispatch"
+    );
+    assert_eq!(
+        distributed_request.forwarded_response_idle_timeout(),
+        Some(crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT)
     );
     let mismatched_route_request = sinomo_core::network::ObjectRpcRequest::encode_body(
         DFS_DATA_WRITE_ROUTE,

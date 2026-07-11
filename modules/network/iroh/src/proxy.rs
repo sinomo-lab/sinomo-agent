@@ -293,16 +293,23 @@ fn try_acquire_iroh_proxy_permit(
     }
 }
 
-/// Best-effort route hint for error responses when the inbound frame cannot
-/// be forwarded (decodes the command frame's route when possible).
-fn iroh_proxy_route_hint(payload: &[u8]) -> String {
+/// Exceptional buffered-response silence allowance carried by the signed
+/// object RPC. The proxy uses this only while waiting for the local daemon's
+/// response frame; connection setup, request writes, and streamed chunks keep
+/// the shared network timeout.
+fn iroh_proxy_forwarded_response_idle_timeout(payload: &[u8]) -> Option<Duration> {
     let Ok(request) = decode_single_object_frame_from_slice::<DaemonControlRequest>(
         payload,
         IROH_DAEMON_COMMAND_MAX_BYTES,
     ) else {
-        return IROH_DAEMON_PROXY_ERROR_ROUTE.to_string();
+        return None;
     };
-    request.route
+    if !request.uses_full_response_budget() {
+        return None;
+    }
+    request
+        .forwarded_response_idle_timeout()
+        .map(|timeout| timeout.max(DEFAULT_NETWORK_TIMEOUT))
 }
 
 fn encode_iroh_proxy_error_response_frame(
@@ -349,6 +356,7 @@ async fn forward_daemon_control_payload_async(
     address: &str,
     payload: &[u8],
     timeouts: DaemonRpcTimeouts,
+    response_idle_timeout: Option<Duration>,
     budget: &IrohProxyByteBudget,
 ) -> Result<ForwardedDaemonControlPayload, NetworkError> {
     use tokio::io::AsyncWriteExt;
@@ -394,7 +402,7 @@ async fn forward_daemon_control_payload_async(
         &mut stream,
         budget,
         "command response",
-        timeouts.idle_timeout,
+        response_idle_timeout.or(timeouts.idle_timeout),
     )
     .await?;
     let streamed_body = match decode_single_object_frame_from_slice::<ObjectRpcResponse>(
@@ -901,12 +909,14 @@ async fn run_iroh_daemon_proxy(
                             return;
                         }
                     };
-                    let route_hint = iroh_proxy_route_hint(&request);
+                    let response_idle_timeout =
+                        iroh_proxy_forwarded_response_idle_timeout(&request);
                     let forward_budget = command_byte_budget.clone();
                     let response_result = forward_daemon_control_payload_async(
                         &daemon_address,
                         &request,
                         DaemonRpcTimeouts::default(),
+                        response_idle_timeout,
                         &forward_budget,
                     )
                     .await;
@@ -919,7 +929,7 @@ async fn run_iroh_daemon_proxy(
                             if write_iroh_proxy_error_response(
                                 &mut send,
                                 &command_byte_budget,
-                                route_hint,
+                                IROH_DAEMON_PROXY_ERROR_ROUTE,
                                 detail,
                             )
                             .await
@@ -1112,24 +1122,20 @@ mod tests {
     }
 
     #[test]
-    fn iroh_daemon_proxy_error_frame_preserves_rpc_route_and_budget() {
-        let request =
-            ObjectRpcRequest::encode_body("/test/proxy-error", "test", &()).expect("rpc request");
-        let payload = encode_object_frame_to_vec(&request).expect("control frame");
-
-        let route = iroh_proxy_route_hint(&payload);
-        assert_eq!(route, "/test/proxy-error");
-
+    fn iroh_daemon_proxy_error_frame_uses_transport_route_and_budget() {
         let budget = IrohProxyByteBudget::new(4096);
-        let (frame, permit) =
-            encode_iroh_proxy_error_response_frame(&budget, route, "daemon forward failed")
-                .expect("error response frame");
+        let (frame, permit) = encode_iroh_proxy_error_response_frame(
+            &budget,
+            IROH_DAEMON_PROXY_ERROR_ROUTE,
+            "daemon forward failed",
+        )
+        .expect("error response frame");
         assert_eq!(budget.in_flight_bytes(), frame.len());
 
         let response: ObjectRpcResponse =
             decode_single_object_frame_from_slice(&frame, IROH_DAEMON_COMMAND_MAX_BYTES)
                 .expect("decode rpc response");
-        assert_eq!(response.route, "/test/proxy-error");
+        assert_eq!(response.route, IROH_DAEMON_PROXY_ERROR_ROUTE);
         let error = response.error_detail().expect_err("rpc error detail");
         assert!(error.to_string().contains("daemon forward failed"));
 
@@ -1138,11 +1144,93 @@ mod tests {
     }
 
     #[test]
-    fn iroh_daemon_proxy_error_route_hint_falls_back_for_unreadable_payload() {
+    fn iroh_daemon_proxy_uses_only_signed_forwarded_response_idle_timeout() {
+        let ordinary =
+            ObjectRpcRequest::encode_body("/test/ordinary", "test", &()).expect("rpc request");
+        let ordinary_frame = encode_object_frame_to_vec(&ordinary).expect("control frame");
         assert_eq!(
-            iroh_proxy_route_hint(b"not-a-control-frame"),
-            IROH_DAEMON_PROXY_ERROR_ROUTE
+            iroh_proxy_forwarded_response_idle_timeout(&ordinary_frame),
+            None
         );
+
+        let hint_without_full_budget = ordinary
+            .clone()
+            .with_forwarded_response_idle_timeout(Duration::from_secs(15));
+        let hint_without_full_budget_frame =
+            encode_object_frame_to_vec(&hint_without_full_budget).expect("hint-only frame");
+        assert_eq!(
+            iroh_proxy_forwarded_response_idle_timeout(&hint_without_full_budget_frame),
+            None
+        );
+
+        let extended = ordinary
+            .with_full_response_budget()
+            .with_forwarded_response_idle_timeout(Duration::from_secs(15));
+        let extended_frame = encode_object_frame_to_vec(&extended).expect("extended frame");
+        assert_eq!(
+            iroh_proxy_forwarded_response_idle_timeout(&extended_frame),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(
+            iroh_proxy_forwarded_response_idle_timeout(b"not-a-control-frame"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_daemon_payload_extends_only_response_frame_idle_timeout() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind daemon fixture");
+        let daemon_address = listener
+            .local_addr()
+            .expect("daemon fixture address")
+            .to_string();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept daemon fixture");
+            let request: sinomo_core::network::DaemonControlRequest = read_object_frame_async(
+                &mut stream,
+                IROH_DAEMON_COMMAND_MAX_BYTES,
+                ObjectFrameIoOptions::none(),
+            )
+            .await
+            .expect("read daemon fixture request");
+            assert_eq!(request.route, "/test/delayed-response");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let response =
+                ObjectRpcResponse::encode_body("/test/delayed-response", &"done".to_string())
+                    .expect("rpc response");
+            stream
+                .write_all(&encode_object_frame_to_vec(&response).expect("response frame"))
+                .await
+                .expect("write delayed response");
+        });
+
+        let request = ObjectRpcRequest::encode_body("/test/delayed-response", "test", &())
+            .expect("rpc request");
+        let payload = encode_object_frame_to_vec(&request).expect("request frame");
+        let budget = IrohProxyByteBudget::new(4096);
+        let forwarded = forward_daemon_control_payload_async(
+            &daemon_address,
+            &payload,
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(25)),
+            Some(Duration::from_secs(1)),
+            &budget,
+        )
+        .await
+        .expect("extended response-frame wait");
+        let response: ObjectRpcResponse = decode_single_object_frame_from_slice(
+            &forwarded.response_frame,
+            IROH_DAEMON_COMMAND_MAX_BYTES,
+        )
+        .expect("decode delayed response");
+        assert_eq!(
+            response.decode_body::<String>().expect("response body"),
+            "done"
+        );
+        fixture.await.expect("fixture task");
     }
 
     #[tokio::test]
@@ -1207,6 +1295,7 @@ mod tests {
             &daemon_address,
             &payload,
             DaemonRpcTimeouts::connect_only(Duration::from_secs(1)),
+            None,
             &budget,
         )
         .await

@@ -428,6 +428,10 @@ pub fn dfs_message_rpc_request(
     if dfs_message_uses_full_response_budget(command) {
         request = request.with_full_response_budget();
     }
+    if let Some(timeout) = dfs_network_message_no_progress_timeout(&command.routed_message.message)
+    {
+        request = request.with_forwarded_response_idle_timeout(timeout);
+    }
     if dfs_network_message_response_retry_safe(&command.routed_message.message) {
         // Distributed writes carry a stable request identity and their outcome
         // is durably reconciled at the metadata primary. If a transport loses

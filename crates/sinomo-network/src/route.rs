@@ -3924,6 +3924,18 @@ fn propagate_relay_response_metadata(inner: &ObjectRpcRequest, outer: &mut Objec
             inner.observe_sampled().to_string(),
         );
     }
+    if let Some(timeout) = inner.forwarded_response_idle_timeout() {
+        outer.metadata.insert(
+            crate::rpc::OBJECT_RPC_FORWARDED_RESPONSE_IDLE_TIMEOUT_MS_METADATA_KEY.to_string(),
+            duration_millis_u64(timeout).to_string(),
+        );
+    }
+    if inner.uses_full_response_budget() {
+        outer.metadata.insert(
+            crate::rpc::OBJECT_RPC_FULL_RESPONSE_BUDGET_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+    }
     if crate::object_rpc_request_expects_raw_daemon_response(inner) {
         outer.metadata.insert(
             crate::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY.to_string(),
@@ -6774,7 +6786,8 @@ mod tests {
             NodeId::from_legacy_named("node_relay_extended_idle_target").expect("target node");
         let request = ObjectRpcRequest::encode_body("/test/data", "test", &"payload")
             .expect("request")
-            .with_full_response_budget();
+            .with_full_response_budget()
+            .with_forwarded_response_idle_timeout(Duration::from_secs(15));
         let options =
             ClusterObjectRpcOptions::default().with_extended_idle_timeout(Duration::from_secs(15));
         assert_eq!(
@@ -6802,6 +6815,12 @@ mod tests {
 
         assert_eq!(envelope.max_hop_timeout_ms, Some(20_000));
         assert_eq!(envelope.extended_idle_timeout_ms, Some(15_000));
+        assert_eq!(
+            outer.forwarded_response_idle_timeout(),
+            Some(Duration::from_secs(15)),
+            "the proxy-facing relay request must preserve the signed idle allowance"
+        );
+        assert!(outer.uses_full_response_budget());
         assert_eq!(
             relay_envelope_extended_idle_timeout(&envelope),
             Some(Duration::from_secs(15))

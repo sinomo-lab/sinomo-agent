@@ -71,6 +71,11 @@ pub const OBJECT_RPC_CANCELS_OPERATION_ID_METADATA_KEY: &str = "sinomo-cancels-o
 pub const OBJECT_RPC_RESPONSE_RETRY_SAFE_METADATA_KEY: &str = "sinomo-response-retry-safe";
 pub const OBJECT_RPC_RESPONDER_NODE_ID_METADATA_KEY: &str = "sinomo-responder-node-id";
 pub const OBJECT_RPC_FULL_RESPONSE_BUDGET_METADATA_KEY: &str = "sinomo-full-response-budget";
+pub const OBJECT_RPC_FORWARDED_RESPONSE_IDLE_TIMEOUT_MS_METADATA_KEY: &str =
+    "sinomo-forwarded-response-idle-timeout-ms";
+/// Upper bound for a signed request's exceptional silent-response allowance
+/// on an internal daemon-forwarding hop.
+pub const OBJECT_RPC_FORWARDED_RESPONSE_IDLE_TIMEOUT_MAX: Duration = Duration::from_secs(60);
 pub const OBJECT_RPC_TRACEPARENT_METADATA_KEY: &str = "traceparent";
 pub const OBJECT_RPC_TRACESTATE_METADATA_KEY: &str = "tracestate";
 pub const OBJECT_RPC_OBSERVE_SAMPLED_METADATA_KEY: &str = "sinomo-observe-sampled";
@@ -199,6 +204,19 @@ impl ObjectRpcRequest {
         self.with_metadata(OBJECT_RPC_FULL_RESPONSE_BUDGET_METADATA_KEY, "true")
     }
 
+    /// Carries an exceptional buffered-response no-progress allowance across
+    /// transports that proxy the signed RPC through a local daemon socket.
+    /// Connection, request-write, and streamed-body progress retain their
+    /// ordinary transport timeouts.
+    pub fn with_forwarded_response_idle_timeout(self, timeout: Duration) -> Self {
+        let timeout = timeout.min(OBJECT_RPC_FORWARDED_RESPONSE_IDLE_TIMEOUT_MAX);
+        let timeout_ms = timeout.as_millis().clamp(1, u128::from(u64::MAX)) as u64;
+        self.with_metadata(
+            OBJECT_RPC_FORWARDED_RESPONSE_IDLE_TIMEOUT_MS_METADATA_KEY,
+            timeout_ms.to_string(),
+        )
+    }
+
     pub fn with_traceparent(self, traceparent: impl Into<String>) -> Self {
         self.with_metadata(OBJECT_RPC_TRACEPARENT_METADATA_KEY, traceparent)
     }
@@ -265,6 +283,16 @@ impl ObjectRpcRequest {
         self.metadata
             .get(OBJECT_RPC_FULL_RESPONSE_BUDGET_METADATA_KEY)
             .is_some_and(|value| value == "true")
+    }
+
+    pub fn forwarded_response_idle_timeout(&self) -> Option<Duration> {
+        let timeout_ms = self
+            .metadata
+            .get(OBJECT_RPC_FORWARDED_RESPONSE_IDLE_TIMEOUT_MS_METADATA_KEY)?
+            .parse::<u64>()
+            .ok()
+            .filter(|timeout_ms| *timeout_ms > 0)?;
+        Some(Duration::from_millis(timeout_ms).min(OBJECT_RPC_FORWARDED_RESPONSE_IDLE_TIMEOUT_MAX))
     }
 }
 
@@ -1606,6 +1634,26 @@ mod tests {
             &response.body
         ));
         assert!(slice_is_borrowed_from(decoded.bytes, &response.body));
+    }
+
+    #[test]
+    fn forwarded_response_idle_timeout_is_explicit_and_bounded() {
+        let ordinary = ObjectRpcRequest::from_encoded_body("/test/ordinary", "test", Vec::new());
+        assert_eq!(ordinary.forwarded_response_idle_timeout(), None);
+
+        let extended = ordinary
+            .clone()
+            .with_forwarded_response_idle_timeout(Duration::from_secs(15));
+        assert_eq!(
+            extended.forwarded_response_idle_timeout(),
+            Some(Duration::from_secs(15))
+        );
+
+        let oversized = ordinary.with_forwarded_response_idle_timeout(Duration::MAX);
+        assert_eq!(
+            oversized.forwarded_response_idle_timeout(),
+            Some(OBJECT_RPC_FORWARDED_RESPONSE_IDLE_TIMEOUT_MAX)
+        );
     }
 
     fn slice_is_borrowed_from(slice: &[u8], source: &[u8]) -> bool {

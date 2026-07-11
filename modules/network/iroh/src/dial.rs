@@ -10,7 +10,9 @@
 //! signed instead of reusing a consumed daemon-auth nonce.
 
 use crate::frames::{IrohProxyByteBudget, read_proxy_frame_async, write_all_frame_async};
-use crate::proxy::{IROH_ROAMING_PROTOCOL, sinomo_iroh_endpoint_builder};
+use crate::proxy::{
+    IROH_DAEMON_PROXY_ERROR_ROUTE, IROH_ROAMING_PROTOCOL, sinomo_iroh_endpoint_builder,
+};
 use crate::{
     IROH_DAEMON_COMMAND_MAX_BYTES,
     endpoint::{IrohEndpointRecord, iroh_endpoint_record_from_address},
@@ -385,6 +387,9 @@ async fn dial_iroh_daemon_control_frame_attempt_async(
             ));
         }
     };
+    if let Some(error) = iroh_daemon_proxy_forward_error(&response_frame) {
+        return Err(IrohDaemonControlAttemptError::AfterRequestAccepted(error));
+    }
     let response =
         match collect_streamed_response_body_if_needed(&mut recv, response_frame, timeouts).await {
             Ok(response) => response,
@@ -398,6 +403,25 @@ async fn dial_iroh_daemon_control_frame_attempt_async(
         };
     drop(recv);
     Ok(response)
+}
+
+fn iroh_daemon_proxy_forward_error(response_frame: &[u8]) -> Option<NetworkError> {
+    let response: ObjectRpcResponse =
+        decode_single_object_frame_from_slice(response_frame, IROH_DAEMON_COMMAND_MAX_BYTES)
+            .ok()?;
+    if response.route != IROH_DAEMON_PROXY_ERROR_ROUTE {
+        return None;
+    }
+    let detail = response
+        .error_detail()
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_else(|| "iroh daemon proxy reported a forwarding failure".to_string());
+    Some(NetworkError::delivery_failed(
+        "forward iroh command to target daemon",
+        NetworkDeliveryState::PossiblyApplied,
+        detail,
+    ))
 }
 
 async fn collect_streamed_response_body_if_needed<R>(
@@ -555,6 +579,42 @@ pub(crate) fn iroh_endpoint_addr_from_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_forward_error_becomes_ambiguous_transport_failure() {
+        let response = ObjectRpcResponse::encode_error(
+            IROH_DAEMON_PROXY_ERROR_ROUTE,
+            "local daemon response timed out",
+        )
+        .expect("proxy error response");
+        let frame = encode_object_frame_to_vec(&response).expect("proxy error frame");
+
+        let error = iroh_daemon_proxy_forward_error(&frame).expect("proxy forwarding error");
+        assert_eq!(
+            error.delivery_state(),
+            Some(NetworkDeliveryState::PossiblyApplied)
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("local daemon response timed out")
+        );
+
+        let attempt = IrohDaemonControlAttemptError::AfterRequestAccepted(error);
+        assert_eq!(
+            attempt.into_network_error().delivery_state(),
+            Some(NetworkDeliveryState::PossiblyApplied)
+        );
+    }
+
+    #[test]
+    fn ordinary_application_error_is_not_a_proxy_transport_failure() {
+        let response = ObjectRpcResponse::encode_error("/test/application", "rejected")
+            .expect("application error response");
+        let frame = encode_object_frame_to_vec(&response).expect("application error frame");
+
+        assert!(iroh_daemon_proxy_forward_error(&frame).is_none());
+    }
 
     #[test]
     fn attempt_retry_is_limited_to_pre_accept_failures() {
