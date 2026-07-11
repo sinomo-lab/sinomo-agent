@@ -370,6 +370,85 @@ metadata-checkpoint proof also hashes the complete shard snapshot on each
 participant; replacing this bounded correctness-first path with a cached
 incremental or Merkle commitment is future scale hardening.
 
+## Opt-in Local-first Degraded Operation
+
+The target local-first protocol is an extension beside the canonical DFS
+protocol, not a second metadata authority. A service or subtree must opt in
+through previously certified strong metadata. When a client cannot reach the
+current authority, the target permits operations on a durable local branch
+rooted at an exact certified metadata checkpoint. This remains true even when
+a quorum exists elsewhere: the disconnected node cannot observe that quorum,
+and its branch never becomes a second canonical history. The bounded model
+represents certification as a supplied opt-in policy and certified base state;
+it does not derive either from the canonical control plane.
+
+The bounded file slice varies global quorum availability independently from the
+local authority route. Canonical writes and reconciliation stop without quorum,
+while local overlay work remains isolated. If the authority route returns to
+an open branch, a locally synced dirty image seals atomically; an unsynced or
+clean image enters a permanently frozen phase that cannot resume degraded
+mutation after another route flap. The frozen branch may locally sync and seal,
+or a clean branch may close without publishing anything.
+
+The current formal boundary is an assume/guarantee abstraction, represented by
+a compact projection of authority epoch, journal head, object and namespace
+revision counters, visible-authority/head counts, and canonical conflict count.
+Local writes, local durability barriers, crashes, branch sealing,
+reconciliation planning, and local conflict preservation stutter under that
+projection. A non-stuttering publication requires supplied Boolean evidence
+for quorum, current authority, matching epoch and plan head, content policy,
+metadata prepare, and atomic publication. The local-first slices do not yet
+derive that evidence by direct composition with the canonical lock, sync, or
+no-conflict state machines. Subject to those assumed canonical guarantees,
+publication retains one visible authority and head and creates no canonical
+conflict record.
+
+The target protocol gives each branch a durable incarnation, monotonic
+operation identities, an immutable base checkpoint, exact object-version and
+namespace-entry stamps, and a sealed manifest. Offline-created objects use
+globally unique stable ids, and file and directory operations target those ids
+rather than relying on a pathname that may have moved. The bounded file slice
+models one complete reconciliation payload and a local sync generation. A
+companion namespace-durability slice models one returned namespace mutation,
+local directory `fsync`, crash restoration from the exact locally durable
+image, and sealing only after that image is durable. These local barriers do
+not produce a canonical quorum sync certificate; distinct local `fdatasync`
+and full-file `fsync` semantics remain a target protocol concern. A distributed
+advisory-lock token is never converted into a local authority token after loss
+or fencing, but direct lock-state composition is also future work.
+
+The target reconciliation protocol includes applicable, already-converged,
+conflicted, superseded, dependency-blocked, and rejected outcomes. The bounded
+file slice exercises apply, converge, and conflict; the namespace slice adds
+superseded. An applicable operation becomes one canonical metadata
+transaction. In the model, a conflict leaves the quorum winner at the
+canonical path and retains a symbolic file-content value or a set of namespace
+object identities in a disjoint sidecar. It does not yet prove storage
+retention receipts, retained subtree bytes, or post-crash reachability of those
+objects. File reconciliation records are keyed by the full modeled payload, so
+a lost reply can be replayed exactly while changed content, base head, or local
+sync generation is rejected. The abstract publication action atomically stores
+the terminal result record with its canonical effect or conflict sidecar; this
+is an assumed metadata-transaction boundary, not yet a refinement of the Rust
+journal. A modeled process restart clears the transient reply but preserves the
+terminal result and conflict records before replay. The namespace slice proves
+only that retrying its deterministic terminal branch is an idempotent stutter; it
+does not model a payload-keyed retry record. A changed canonical journal head
+invalidates either plan and requires reclassification. Explicit conflict
+resolution is itself a target strong compare-and-swap transaction.
+
+The first bounded Quint slices cover regular-file write, truncate, local sync,
+crash recovery, sealing and reconciliation, plus one same-shard create, mkdir,
+unlink, rmdir, or atomic no-replacement rename with stable parent/object
+identity and exact entry stamps. Rename requires an absent destination; POSIX
+replacement semantics are not modeled. The directory-durability companion is
+separate from namespace reconciliation. The slices exclude hardlinks,
+symlinks, cross-shard local changes, branch gossip, semantic content mergers,
+retention receipts, byte-range locks, and full open-unlinked lifetime. The Rust
+DFS still takes the conservative strong-path behavior described above; the
+local-first slices are target-hardening models, not a claim that degraded
+mutation is implemented end to end.
+
 ## Reads and Caches
 
 Reads prefer the closest valid copy:

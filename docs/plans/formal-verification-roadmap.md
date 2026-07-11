@@ -93,9 +93,26 @@ stranding durable jobs with path reservations held.
    the combined model beyond target hardening. Then deepen directory, by-id
    lookup, open-handle rename/unlink, byte-range locks, application wait-cycle
    detection, and aborted-move reservation release.
-8. **Local-first DFS extension (deferred).** Do not add provisional branches or
-   reconciliation to the canonical model until the authority permit, lock-loss,
-   sync durability, and partition-recovery contracts have corresponding Rust
-   boundaries and trace refinement. The first later slice should remain regular
-   file content only; hardlinks, cross-shard local changes, branch gossip, and
-   service-defined configuration merge stay out of the initial model.
+8. **Local-first DFS extension.** Completed 2026-07-10 as separate
+   target-hardening slices rather than weakening the canonical model. The
+   regular-file slice covers local write/truncate/fsync, crash recovery,
+   immutable sealing, fresh/stale reconciliation planning, apply/converge/
+   conflict outcomes, a retained symbolic content value, independent quorum and
+   route transitions, frozen reconnect behavior, and full-payload exact retry
+   across a modeled process restart. The namespace slice covers one same-shard
+   create, mkdir, unlink, rmdir, or atomic no-replacement rename using stable
+   parent/object ids and exact entry stamps; its terminal retry is an idempotent
+   stutter, not a
+   payload-keyed replay protocol. A companion slice covers one returned local
+   namespace mutation, directory `fsync`, crash restoration, and durable-only
+   sealing. A shared stuttering projection requires local work to leave
+   authority/journal/object/namespace counters unchanged and accepts a crossing
+   publication only with supplied abstract quorum/current-authority/epoch/plan/
+   durability evidence. Canonical effect/result recording is atomic in the
+   abstraction. It does not yet derive that evidence or atomicity by composing
+   the canonical lock, sync, journal, partition, and no-conflict models. Next
+   add retention receipts for file content and namespace subtrees, POSIX rename replacement,
+   payload-keyed namespace replay, multi-operation dependency graphs,
+   open-handle rename/unlink, cross-shard branches, hardlinks and symlinks,
+   branch gossip, and explicit service-produced merge candidates before Rust
+   implementation claims conformance.

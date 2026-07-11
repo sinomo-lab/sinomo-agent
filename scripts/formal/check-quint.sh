@@ -63,6 +63,9 @@ register_case dfs-posix-read-write specs/quint/checks/dfs/posix_read_write_visib
 register_case dfs-posix-advisory-locks specs/quint/checks/dfs/posix_advisory_locks_safety.qnt dfs_posix_advisory_locks_safety "${QUINT_DFS_POSIX_ADVISORY_LOCKS_VERIFY_MAX_STEPS:-3}" apalache step step fast "witnessCompatibleSharedLocks witnessExclusiveConflictRejectedNonBlocking witnessBlockingWaiterQueued witnessWaiterGrantedAfterUnlock witnessWaiterGrantedAfterClose witnessWaiterGrantedAfterCrash witnessWaiterGrantedAfterLeaseExpiry witnessHealthyTickRenewsHeldLock witnessEpochFencesHeldLockOrWaiter witnessEpochSettlesBlockedWaiter witnessStaleTokenCannotUnlockNewEpoch"
 register_case dfs-posix-fsync specs/quint/checks/dfs/posix_fsync_safety.qnt dfs_posix_fsync_safety "${QUINT_DFS_POSIX_FSYNC_VERIFY_MAX_STEPS:-3}" apalache step step fast "fileFsyncSuccessWithoutDirectoryDurabilityWitness fdatasyncSuccessWithoutAncillaryMetadataWitness directoryFsyncDoesNotSyncFileDataWitness laterWriteNotCoveredByEarlierFsyncWitness committedUnknownOutcomeDeduplicatesWitness payloadMismatchRejectedWitness inflightSyncFencedWithoutStaleCommitWitness successfulSyncSurvivesAuthorityChangeWitness committedPrefixRepairWitness"
 register_case dfs-posix-partitioned-operation specs/quint/checks/dfs/posix_partitioned_operation_safety.qnt dfs_posix_partitioned_operation_safety "${QUINT_DFS_POSIX_PARTITIONED_OPERATION_VERIFY_MAX_STEPS:-8}" apalache step step fast "witnessCompleteHolderContinuesBeforeFence witnessHolderSyncEvidencePrepared witnessIncompleteHolderSuspends witnessCompleteHolderCanStillBeFencedAfterExpiry witnessQuorumWinsAndWaitsForRepair witnessStaleUnlockRejected witnessQuorumCompletesAfterRepair witnessQuorumCommitsWhileHolderOffline witnessFencedHolderSettlesAfterRejoin witnessBothSidesReachCleanHolderWinnerEndState witnessBothSidesReachCleanQuorumWinnerEndState"
+register_case dfs-local-first-file specs/quint/checks/dfs/local_first_file_branch_safety.qnt dfs_local_first_file_branch_safety "${QUINT_DFS_LOCAL_FIRST_FILE_VERIFY_MAX_STEPS:-4}" apalache step step fast "witnessVolatileWriteLostOnCrash witnessLocallySyncedTruncateSurvivesCrash witnessStalePlanRejected witnessLocalBranchApplied witnessLocalBranchConverged witnessLocalBranchConflictRetained witnessLostReplyExactRetry witnessChangedRetryRejected witnessChangedRetryBaseRejected witnessChangedRetryGenerationRejected witnessAuthorityReturnSealsDirtyBranch witnessAuthorityReturnFreezesUnsyncedBranch witnessFrozenBranchSurvivesRouteLoss witnessCleanFrozenBranchClosed witnessCanonicalQuorumLost witnessCanonicalQuorumRestored witnessRouteRestoredWithoutQuorum witnessExactRetryAfterProcessRestart witnessExactRetryWithConcurrentBase"
+register_case dfs-local-first-namespace specs/quint/checks/dfs/local_first_namespace_safety.qnt dfs_local_first_namespace_safety "${QUINT_DFS_LOCAL_FIRST_NAMESPACE_VERIFY_MAX_STEPS:-4}" apalache step step fast "witnessApplicable witnessConverged witnessConflictPreserved witnessSuperseded witnessStalePlanRejected witnessSameObjectAbaSuperseded witnessChildParentChangeConflicts witnessDirectoryRenamePreservesConcurrentChild witnessRmdirConcurrentChildConflicts"
+register_case dfs-local-first-namespace-durability specs/quint/checks/dfs/local_first_namespace_durability_safety.qnt dfs_local_first_namespace_durability_safety "${QUINT_DFS_LOCAL_FIRST_NAMESPACE_DURABILITY_VERIFY_MAX_STEPS:-8}" apalache step step fast "witnessReturnedMutationIsVolatile witnessVolatileMutationLostOnCrash witnessDirectoryFsyncMadeMutationDurable witnessDurableMutationSurvivesCrash witnessSealedExactDurableNamespace"
 register_case dfs-primary-failover specs/quint/checks/dfs/metadata_primary_failover_safety.qnt dfs_metadata_primary_failover_safety "${QUINT_DFS_PRIMARY_FAILOVER_VERIFY_MAX_STEPS:-3}"
 register_case dfs-namespace-command-replay specs/quint/checks/dfs/namespace_command_replay_safety.qnt dfs_namespace_command_replay_safety "${QUINT_DFS_NAMESPACE_REPLAY_VERIFY_MAX_STEPS:-5}" apalache step step deep "witnessExactResidentRetryReplays witnessSameRequestIdChangedPayloadExecutes witnessCancelledCommandStillExecutes witnessEvictedExactRetryReexecutes witnessRestartClearedRetryReexecutes witnessCancelledFreshIdRetryExecutes"
 register_case dfs-namespace-transaction specs/quint/checks/dfs/namespace_transaction_safety.qnt dfs_namespace_transaction_safety "${QUINT_DFS_NAMESPACE_VERIFY_MAX_STEPS:-$verify_steps}"
@@ -316,6 +319,24 @@ run_smoke_scenarios() {
     12 \
     1
   run_scenario \
+    dfs-local-first-file-reconcile \
+    specs/quint/scenarios/dfs/local_first_file_reconcile.qnt \
+    dfs_local_first_file_reconcile_scenario \
+    19 \
+    1
+  run_scenario \
+    dfs-local-first-namespace-reconcile \
+    specs/quint/scenarios/dfs/local_first_namespace_reconcile.qnt \
+    dfs_local_first_namespace_reconcile_scenario \
+    12 \
+    200
+  run_scenario \
+    dfs-local-first-namespace-durability-recovery \
+    specs/quint/scenarios/dfs/local_first_namespace_durability_recovery.qnt \
+    dfs_local_first_namespace_durability_recovery_scenario \
+    10 \
+    1
+  run_scenario \
     system-smoke \
     specs/quint/scenarios/system/smoke.qnt \
     system_smoke \
@@ -391,7 +412,7 @@ verify_cases() {
       dfs-posix-directory-fsync-generation-scenario \
       specs/quint/scenarios/dfs/posix_fsync_recovery.qnt \
       dfs_posix_directory_fsync_generation_scenario \
-      10 \
+      15 \
       apalache \
       step
   fi
@@ -419,6 +440,47 @@ verify_cases() {
       10 \
       apalache \
       step
+  fi
+  if case_selected dfs-local-first-file; then
+    verify_check \
+      dfs-local-first-file-conflict-restart-full-safety \
+      specs/quint/checks/dfs/local_first_file_branch_safety.qnt \
+      dfs_local_first_file_branch_safety \
+      19 \
+      apalache \
+      fileReconcileFullSafetyStep
+    verify_check \
+      dfs-local-first-file-apply-full-safety \
+      specs/quint/checks/dfs/local_first_file_branch_safety.qnt \
+      dfs_local_first_file_branch_safety \
+      15 \
+      apalache \
+      fileApplyFullSafetyStep
+    verify_check \
+      dfs-local-first-file-converge-full-safety \
+      specs/quint/checks/dfs/local_first_file_branch_safety.qnt \
+      dfs_local_first_file_branch_safety \
+      11 \
+      apalache \
+      fileConvergeFullSafetyStep
+  fi
+  if [[ "$requested_tier" == "all" ]] && case_selected dfs-local-first-namespace; then
+    verify_check \
+      dfs-local-first-namespace-full-safety \
+      specs/quint/checks/dfs/local_first_namespace_safety.qnt \
+      dfs_local_first_namespace_safety \
+      10 \
+      apalache \
+      namespaceReconcileFullSafetyStep
+  fi
+  if case_selected dfs-local-first-namespace-durability; then
+    verify_check \
+      dfs-local-first-namespace-durability-full-safety \
+      specs/quint/checks/dfs/local_first_namespace_durability_safety.qnt \
+      dfs_local_first_namespace_durability_safety \
+      8 \
+      apalache \
+      lfndRecoveryFullSafetyStep
   fi
 
   if [[ -n "$verify_lock_fd" ]]; then
