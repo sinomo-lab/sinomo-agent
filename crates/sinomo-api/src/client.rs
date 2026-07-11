@@ -117,11 +117,22 @@ impl DaemonApiClient {
         }
     }
 
-    fn dfs_object_rpc_forward_control_timeouts(&self) -> sinomo_core::network::DaemonRpcTimeouts {
+    fn dfs_object_rpc_forward_control_timeouts(
+        &self,
+        no_progress_timeout: Option<Duration>,
+    ) -> sinomo_core::network::DaemonRpcTimeouts {
         if self.timeout_overridden {
             sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(self.timeout)
         } else {
-            sinomo_core::network::DaemonRpcTimeouts::default()
+            // The loopback wrapper must outlive the inner routed call instead of
+            // racing its semantic deadline. One normal network phase provides
+            // bounded time for the daemon to encode and return the terminal frame.
+            let idle_timeout = no_progress_timeout
+                .map(|timeout| {
+                    timeout.saturating_add(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+                })
+                .unwrap_or(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT);
+            sinomo_core::network::DaemonRpcTimeouts::default().with_idle_timeout(Some(idle_timeout))
         }
     }
 
@@ -195,6 +206,7 @@ impl DaemonApiClient {
                 request,
                 connect_timeout,
                 None,
+                None,
                 observe_connectivity,
                 self.object_rpc_forward_stream_control_timeouts(),
             );
@@ -204,6 +216,7 @@ impl DaemonApiClient {
             target_node_id,
             request,
             connect_timeout,
+            None,
             None,
             observe_connectivity,
             false,
@@ -223,6 +236,7 @@ impl DaemonApiClient {
         target_node_id: &NodeId,
         request: &ObjectRpcRequest,
         connect_timeout: Duration,
+        no_progress_timeout: Option<Duration>,
         overall_timeout: Option<Duration>,
         observe_connectivity: bool,
         control_timeouts: sinomo_core::network::DaemonRpcTimeouts,
@@ -232,6 +246,7 @@ impl DaemonApiClient {
             target_node_id,
             request,
             connect_timeout,
+            no_progress_timeout,
             overall_timeout,
             observe_connectivity,
             true,
@@ -273,9 +288,10 @@ impl DaemonApiClient {
                 target_node_id,
                 request,
                 options.connect_timeout,
+                options.no_progress_timeout,
                 options.overall_timeout,
                 options.observe_connectivity,
-                self.dfs_object_rpc_forward_control_timeouts(),
+                self.dfs_object_rpc_forward_control_timeouts(options.no_progress_timeout),
             );
         }
         let request = object_rpc_forward_request(
@@ -283,6 +299,7 @@ impl DaemonApiClient {
             target_node_id,
             request,
             options.connect_timeout,
+            options.no_progress_timeout,
             options.overall_timeout,
             options.observe_connectivity,
             false,
@@ -290,7 +307,7 @@ impl DaemonApiClient {
         let response = send_daemon_rpc_with_timeouts(
             &self.address,
             &request,
-            self.dfs_object_rpc_forward_control_timeouts(),
+            self.dfs_object_rpc_forward_control_timeouts(options.no_progress_timeout),
         )?;
         response.error_detail()?;
         response.decode_body().map_err(DaemonApiError::from)
@@ -468,6 +485,7 @@ fn object_rpc_forward_request(
     target_node_id: &NodeId,
     request: &ObjectRpcRequest,
     connect_timeout: Duration,
+    no_progress_timeout: Option<Duration>,
     overall_timeout: Option<Duration>,
     observe_connectivity: bool,
     raw_response: bool,
@@ -476,6 +494,8 @@ fn object_rpc_forward_request(
         target_node_id: target_node_id.clone(),
         request: request.clone(),
         connect_timeout_millis: u64::try_from(connect_timeout.as_millis()).unwrap_or(u64::MAX),
+        no_progress_timeout_millis: no_progress_timeout
+            .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
         overall_timeout_millis: overall_timeout
             .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
         observe_connectivity,
@@ -918,7 +938,7 @@ mod tests {
     #[test]
     fn forwarded_dfs_object_rpc_uses_network_default() {
         let client = DaemonApiClient::at_address("127.0.0.1:21353");
-        let timeouts = client.dfs_object_rpc_forward_control_timeouts();
+        let timeouts = client.dfs_object_rpc_forward_control_timeouts(None);
         assert_eq!(
             timeouts.connect_timeout,
             Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
@@ -933,9 +953,22 @@ mod tests {
     fn forwarded_dfs_object_rpc_honors_explicit_client_timeout() {
         let client =
             DaemonApiClient::at_address("127.0.0.1:21353").with_timeout(Duration::from_secs(6));
-        let timeouts = client.dfs_object_rpc_forward_control_timeouts();
+        let timeouts =
+            client.dfs_object_rpc_forward_control_timeouts(Some(Duration::from_secs(15)));
         assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(6)));
         assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn forwarded_dfs_object_rpc_gives_extended_inner_wait_loopback_grace() {
+        let client = DaemonApiClient::at_address("127.0.0.1:21353");
+        let timeouts =
+            client.dfs_object_rpc_forward_control_timeouts(Some(Duration::from_secs(15)));
+        assert_eq!(
+            timeouts.connect_timeout,
+            Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        );
+        assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(20)));
     }
 
     #[test]
@@ -948,6 +981,7 @@ mod tests {
             &target_node_id,
             &inner_request,
             Duration::from_secs(5),
+            Some(Duration::from_secs(15)),
             Some(Duration::from_secs(30)),
             true,
             true,
@@ -963,6 +997,7 @@ mod tests {
         assert_eq!(payload.target_node_id, target_node_id);
         assert_eq!(payload.request.route, "/dfs/test/stream");
         assert_eq!(payload.connect_timeout_millis, 5_000);
+        assert_eq!(payload.no_progress_timeout_millis, Some(15_000));
         assert_eq!(payload.overall_timeout_millis, Some(30_000));
         assert!(payload.observe_connectivity);
         assert!(payload.raw_response);

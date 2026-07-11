@@ -26,8 +26,8 @@ use crate::{
     decode_dfs_message_rpc_response, dfs_direct_read_request_from_read_request,
     dfs_direct_read_response_from_rpc_response, dfs_direct_read_response_from_rpc_stream_response,
     dfs_direct_read_rpc_request, dfs_message_is_read_only_request, dfs_message_rpc_request,
-    dfs_network_message_allows_write_repair_progress, dfs_perf_trace, dfs_perf_trace_enabled,
-    retained_networked_dfs_service_events,
+    dfs_network_message_allows_write_repair_progress, dfs_network_message_no_progress_timeout,
+    dfs_perf_trace, dfs_perf_trace_enabled, retained_networked_dfs_service_events,
 };
 #[cfg(test)]
 use crate::{
@@ -107,6 +107,10 @@ pub(crate) type AsyncDfsDirectReadStreamSender = Arc<
 pub struct DfsObjectRpcSendOptions {
     /// Connection-phase override. Defaults to the shared network policy.
     pub connect_timeout: Duration,
+    /// Exceptional response no-progress override. `None` keeps the shared
+    /// network idle policy; durable namespace RPCs opt into their bounded
+    /// semantic deadline because they cannot emit progress before the response.
+    pub no_progress_timeout: Option<Duration>,
     /// Optional DFS semantic deadline covering routing and the full response.
     pub overall_timeout: Option<Duration>,
     pub observe_connectivity: bool,
@@ -118,9 +122,15 @@ impl DfsObjectRpcSendOptions {
     pub fn new(connect_timeout: Duration) -> Self {
         Self {
             connect_timeout,
+            no_progress_timeout: None,
             overall_timeout: None,
             observe_connectivity: true,
         }
+    }
+
+    pub fn with_no_progress_timeout(mut self, no_progress_timeout: Duration) -> Self {
+        self.no_progress_timeout = Some(no_progress_timeout);
+        self
     }
 
     pub fn with_overall_timeout(mut self, overall_timeout: Duration) -> Self {
@@ -143,12 +153,26 @@ impl DfsObjectRpcSendOptions {
         if let Some(overall_timeout) = self.overall_timeout {
             route_options = route_options.with_overall_timeout(overall_timeout);
         }
+        if let Some(no_progress_timeout) = self.no_progress_timeout {
+            route_options = route_options.with_extended_idle_timeout(no_progress_timeout);
+        }
         route_options
     }
 
     pub fn with_observe_connectivity(mut self, observe_connectivity: bool) -> Self {
         self.observe_connectivity = observe_connectivity;
         self
+    }
+}
+
+fn dfs_routed_message_send_options(
+    message: &DfsRoutedMessage,
+    options: DfsObjectRpcSendOptions,
+) -> DfsObjectRpcSendOptions {
+    if let Some(timeout) = dfs_network_message_no_progress_timeout(&message.message) {
+        options.with_no_progress_timeout(timeout)
+    } else {
+        options
     }
 }
 
@@ -602,6 +626,7 @@ impl DfsNodeTransport {
             };
             let options =
                 self.current_send_options(format!("send DFS message to {target_node_id}"))?;
+            let options = dfs_routed_message_send_options(&routed_message, options);
             let returned_messages =
                 send_dfs_routed_message_to_peer(sender, options, target_node_id, routed_message)?;
             for returned_message in returned_messages {
@@ -694,6 +719,7 @@ impl DfsNodeTransport {
         };
         let options =
             self.current_send_options(format!("send detached DFS message to {target_node_id}"))?;
+        let options = dfs_routed_message_send_options(&routed_message, options);
         self.detached_sends
             .lock()
             .map_err(|_| NetworkError::Io {
@@ -802,6 +828,7 @@ impl DfsNodeTransport {
             }
             let options =
                 self.current_send_options(format!("send DFS message to {target_node_id}"))?;
+            let options = dfs_routed_message_send_options(&routed_message, options);
             let Some(sender) = self.async_sender.as_ref().cloned() else {
                 return Err(NetworkError::Io {
                     operation: format!("send DFS message to {target_node_id}"),
@@ -1185,7 +1212,9 @@ impl NetworkedDfsService<DfsNodeTransport> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DfsObjectId, DfsReadResult};
+    use crate::{
+        DfsNamespaceCommand, DfsNamespaceOperation, DfsObjectId, DfsReadResult, sifs_file_system_id,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1204,6 +1233,25 @@ mod tests {
                 object_id: DfsObjectId::from_legacy_named(format!("object_{frame_id}"))
                     .expect("object id"),
                 result: DfsReadResult::NotFound,
+            }),
+        }
+    }
+
+    fn test_namespace_message(source: &NodeId, target: &NodeId, frame_id: u64) -> DfsRoutedMessage {
+        DfsRoutedMessage {
+            source_node_id: source.clone(),
+            target_node_id: target.clone(),
+            frame_id,
+            message_id: frame_id,
+            message: DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                request_id: format!("namespace_request_{frame_id}"),
+                file_system_id: sifs_file_system_id(),
+                requesting_node_id: source.clone(),
+                include_metadata_journal_batches: true,
+                metadata_journal_after_sequences: Vec::new(),
+                operation: DfsNamespaceOperation::Mkdir {
+                    path: format!("/namespace-{frame_id}"),
+                },
             }),
         }
     }
@@ -1250,7 +1298,44 @@ mod tests {
             DfsObjectRpcSendOptions::default().connect_timeout,
             sinomo_core::network::DEFAULT_NETWORK_TIMEOUT
         );
+        assert_eq!(DfsObjectRpcSendOptions::default().no_progress_timeout, None);
         assert_eq!(DfsObjectRpcSendOptions::default().overall_timeout, None);
+    }
+
+    #[test]
+    fn namespace_send_extends_only_the_silent_response_progress_timeout() {
+        let local = node_id("node_namespace_timeout_local");
+        let remote = node_id("node_namespace_timeout_remote");
+        let observed_options = Arc::new(Mutex::new(Vec::new()));
+        let sender_options = Arc::clone(&observed_options);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, options| {
+            sender_options.lock().expect("options").push(options);
+            Ok(DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: Vec::new(),
+            })
+        });
+        let mut transport = DfsNodeTransport::new(local.clone(), vec![remote.clone()], sender);
+
+        transport
+            .send_routed_message(&remote, test_namespace_message(&local, &remote, 1))
+            .expect("namespace send");
+        transport
+            .send_routed_message(&remote, test_message(&local, &remote, 2))
+            .expect("ordinary send");
+
+        let observed = observed_options.lock().expect("options");
+        assert_eq!(observed.len(), 2);
+        assert_eq!(
+            observed[0].connect_timeout,
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT
+        );
+        assert_eq!(
+            observed[0].no_progress_timeout,
+            Some(crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT)
+        );
+        assert_eq!(observed[0].overall_timeout, None);
+        assert_eq!(observed[1], DfsObjectRpcSendOptions::default());
     }
 
     #[test]

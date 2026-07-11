@@ -167,6 +167,10 @@ async fn forward_object_rpc_from_daemon_control(
     let transport_timeouts = sinomo_core::network::DaemonRpcTimeouts::default()
         .with_connect_timeout(Some(Duration::from_millis(payload.connect_timeout_millis)));
     let mut options = sinomo_core::network::ClusterObjectRpcOptions::new(transport_timeouts);
+    if let Some(no_progress_timeout_millis) = payload.no_progress_timeout_millis {
+        options =
+            options.with_extended_idle_timeout(Duration::from_millis(no_progress_timeout_millis));
+    }
     if let Some(overall_timeout_millis) = payload.overall_timeout_millis {
         options = options.with_overall_timeout(Duration::from_millis(overall_timeout_millis));
     }

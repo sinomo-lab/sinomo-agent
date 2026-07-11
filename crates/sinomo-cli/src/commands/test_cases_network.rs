@@ -2033,6 +2033,7 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
         target_node_id: job.target_node_id.clone(),
         request: job.request.clone(),
         connect_timeout_millis: u64::try_from(job.timeout.as_millis()).unwrap_or(u64::MAX),
+        no_progress_timeout_millis: None,
         overall_timeout_millis: Some(u64::try_from(job.timeout.as_millis()).unwrap_or(u64::MAX)),
         observe_connectivity: true,
         raw_response: false,

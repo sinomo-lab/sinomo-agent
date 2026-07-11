@@ -439,6 +439,11 @@ pub struct RelayEnvelope {
     /// originating caller. Intermediate relays must not expand this budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) max_hop_timeout_ms: Option<u64>,
+    /// Exceptional response no-progress timeout requested by the originating
+    /// caller. This applies only while waiting for a buffered response; streamed
+    /// body progress retains the shared network timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) extended_idle_timeout_ms: Option<u64>,
     /// The original signed request to deliver at the target, re-injected through its
     /// normal auth + dispatch path (its own signature/invite-proof is carried within).
     pub(crate) inner: DaemonControlRequest,
@@ -455,6 +460,7 @@ impl RelayEnvelope {
             planned_path: Vec::new(),
             target_endpoints: Vec::new(),
             max_hop_timeout_ms: None,
+            extended_idle_timeout_ms: None,
             inner,
         }
     }
@@ -2132,6 +2138,7 @@ async fn write_streamed_daemon_rpc_response_to_upstream(
 pub struct ClusterObjectRpcOptions {
     timeouts: DaemonRpcTimeouts,
     overall_timeout: Option<Duration>,
+    extended_idle_timeout: Option<Duration>,
     enforce_stream_deadline: bool,
 }
 
@@ -2143,6 +2150,7 @@ impl ClusterObjectRpcOptions {
         Self {
             timeouts,
             overall_timeout: None,
+            extended_idle_timeout: None,
             // `new` preserves the phase-only contract of legacy callers. A
             // connect-only override must not silently become a body deadline.
             enforce_stream_deadline: false,
@@ -2157,6 +2165,18 @@ impl ClusterObjectRpcOptions {
     pub fn with_overall_timeout(mut self, timeout: Duration) -> Self {
         self.overall_timeout = Some(timeout);
         self.enforce_stream_deadline = true;
+        self
+    }
+
+    /// Explicitly allow a buffered response to remain silent longer than the
+    /// shared network no-progress timeout.
+    ///
+    /// This is intended for bounded operations that cannot emit progress before
+    /// returning their response. Route, endpoint-attempt, and whole-call budgets
+    /// still cap the selected timeout. Streamed response bodies continue to use
+    /// [`DEFAULT_NETWORK_TIMEOUT`] between chunks.
+    pub fn with_extended_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.extended_idle_timeout = Some(timeout);
         self
     }
 
@@ -2176,6 +2196,7 @@ impl Default for ClusterObjectRpcOptions {
         Self {
             timeouts: DaemonRpcTimeouts::default(),
             overall_timeout: None,
+            extended_idle_timeout: None,
             enforce_stream_deadline: true,
         }
     }
@@ -2660,7 +2681,11 @@ where
                     endpoint,
                     &request_auth,
                     request,
-                    cluster_endpoint_transport_timeouts(options.timeouts, remaining),
+                    cluster_endpoint_transport_timeouts(
+                        options.timeouts,
+                        options.extended_idle_timeout,
+                        remaining,
+                    ),
                 ),
                 remaining,
                 endpoint,
@@ -2715,7 +2740,7 @@ where
                     endpoint,
                     &request_auth,
                     request,
-                    cluster_endpoint_transport_timeouts(options.timeouts, remaining),
+                    cluster_endpoint_transport_timeouts(options.timeouts, None, remaining),
                 ),
                 remaining,
                 endpoint,
@@ -2895,12 +2920,17 @@ where
                 let hop_timeouts = if final_hop || hop_full_response_budget {
                     cluster_target_final_hop_transport_timeouts(
                         options.timeouts,
+                        options.extended_idle_timeout,
                         endpoint_attempt_budget,
                         hop_attempt_budget,
                         remaining,
                     )
                 } else {
-                    cluster_relay_hop_transport_timeouts(options.timeouts, endpoint_attempt_budget)
+                    cluster_relay_hop_transport_timeouts(
+                        options.timeouts,
+                        options.extended_idle_timeout,
+                        endpoint_attempt_budget,
+                    )
                 };
                 let attempt_deadline = deadline.capped_by(hop_attempt_budget);
                 let sign_started_at = Instant::now();
@@ -2954,6 +2984,7 @@ where
                         &route_plan.path,
                         &relay_target_endpoints,
                         route_timeout,
+                        cluster_relay_request_extended_idle_timeout(options, false),
                     )?;
                     let outer_build_us = cluster_object_rpc_elapsed_us(outer_build_started_at);
                     let outer_sign_started_at = Instant::now();
@@ -3418,12 +3449,17 @@ where
                 let hop_timeouts = if final_hop || hop_full_response_budget {
                     cluster_target_final_hop_transport_timeouts(
                         options.timeouts,
+                        None,
                         endpoint_attempt_budget,
                         hop_attempt_budget,
                         remaining,
                     )
                 } else {
-                    cluster_relay_hop_transport_timeouts(options.timeouts, endpoint_attempt_budget)
+                    cluster_relay_hop_transport_timeouts(
+                        options.timeouts,
+                        None,
+                        endpoint_attempt_budget,
+                    )
                 };
                 let attempt_deadline = deadline.capped_by(hop_attempt_budget);
                 let sign_started_at = Instant::now();
@@ -3477,6 +3513,7 @@ where
                         &route_plan.path,
                         &relay_target_endpoints,
                         route_timeout,
+                        cluster_relay_request_extended_idle_timeout(options, true),
                     )?;
                     let outer_build_us = cluster_object_rpc_elapsed_us(outer_build_started_at);
                     let outer_sign_started_at = Instant::now();
@@ -3904,6 +3941,7 @@ fn propagate_relay_response_metadata(inner: &ObjectRpcRequest, outer: &mut Objec
 
 fn cluster_endpoint_transport_timeouts(
     timeouts: DaemonRpcTimeouts,
+    extended_idle_timeout: Option<Duration>,
     remaining_route_budget: Option<Duration>,
 ) -> DaemonRpcTimeouts {
     let connect_timeout = match (timeouts.connect_timeout, remaining_route_budget) {
@@ -3912,11 +3950,21 @@ fn cluster_endpoint_transport_timeouts(
         (None, Some(remaining)) => Some(remaining),
         (None, None) => None,
     };
-    let idle_timeout = match (timeouts.idle_timeout, remaining_route_budget) {
+    let requested_idle_timeout = extended_idle_timeout.or(timeouts.idle_timeout);
+    let idle_timeout = match (requested_idle_timeout, remaining_route_budget) {
         (Some(idle_timeout), Some(remaining)) => {
-            Some(idle_timeout.min(DEFAULT_NETWORK_TIMEOUT).min(remaining))
+            let idle_timeout = if extended_idle_timeout.is_some() {
+                idle_timeout
+            } else {
+                idle_timeout.min(DEFAULT_NETWORK_TIMEOUT)
+            };
+            Some(idle_timeout.min(remaining))
         }
-        (Some(idle_timeout), None) => Some(idle_timeout.min(DEFAULT_NETWORK_TIMEOUT)),
+        (Some(idle_timeout), None) => Some(if extended_idle_timeout.is_some() {
+            idle_timeout
+        } else {
+            idle_timeout.min(DEFAULT_NETWORK_TIMEOUT)
+        }),
         (None, _) => None,
     };
     timeouts
@@ -3926,13 +3974,15 @@ fn cluster_endpoint_transport_timeouts(
 
 fn cluster_relay_hop_transport_timeouts(
     timeouts: DaemonRpcTimeouts,
+    extended_idle_timeout: Option<Duration>,
     remaining_route_budget: Option<Duration>,
 ) -> DaemonRpcTimeouts {
-    cluster_endpoint_transport_timeouts(timeouts, remaining_route_budget)
+    cluster_endpoint_transport_timeouts(timeouts, extended_idle_timeout, remaining_route_budget)
 }
 
 fn cluster_target_final_hop_transport_timeouts(
     timeouts: DaemonRpcTimeouts,
+    extended_idle_timeout: Option<Duration>,
     endpoint_connect_budget: Option<Duration>,
     endpoint_response_budget: Option<Duration>,
     remaining_route_budget: Option<Duration>,
@@ -3943,16 +3993,22 @@ fn cluster_target_final_hop_transport_timeouts(
         (None, Some(remaining)) => Some(remaining),
         (None, None) => None,
     };
-    let idle_timeout = timeouts.idle_timeout.map(|idle_timeout| {
-        let mut capped = idle_timeout.min(DEFAULT_NETWORK_TIMEOUT);
-        if let Some(remaining) = remaining_route_budget {
-            capped = capped.min(remaining);
-        }
-        if let Some(remaining) = endpoint_response_budget {
-            capped = capped.min(remaining);
-        }
-        capped
-    });
+    let idle_timeout = extended_idle_timeout
+        .or(timeouts.idle_timeout)
+        .map(|idle_timeout| {
+            let mut capped = if extended_idle_timeout.is_some() {
+                idle_timeout
+            } else {
+                idle_timeout.min(DEFAULT_NETWORK_TIMEOUT)
+            };
+            if let Some(remaining) = remaining_route_budget {
+                capped = capped.min(remaining);
+            }
+            if let Some(remaining) = endpoint_response_budget {
+                capped = capped.min(remaining);
+            }
+            capped
+        });
     timeouts
         .with_connect_timeout(connect_timeout)
         .with_idle_timeout(idle_timeout)
@@ -4156,6 +4212,16 @@ fn relay_envelope_hop_timeout(envelope: &RelayEnvelope) -> Option<Duration> {
         .map(|timeout_ms| Duration::from_millis(timeout_ms.max(1)))
 }
 
+fn relay_envelope_extended_idle_timeout(envelope: &RelayEnvelope) -> Option<Duration> {
+    if !cluster_target_final_hop_request_uses_full_response_budget(envelope.inner()) {
+        return None;
+    }
+    envelope
+        .extended_idle_timeout_ms
+        .map(|timeout_ms| Duration::from_millis(timeout_ms.max(1)))
+        .map(|timeout| timeout.min(CLUSTER_TARGET_FULL_RESPONSE_ROUTE_DEADLINE_MAX))
+}
+
 fn cluster_target_route_timeout(
     timeout: Option<Duration>,
     use_full_response_budget: bool,
@@ -4303,6 +4369,7 @@ fn relay_request_for_signed_rpc_with_max_hop_timeout(
     planned_path: &[NodeId],
     target_endpoints: &[ClusterEndpointRecord],
     max_hop_timeout: Option<Duration>,
+    extended_idle_timeout: Option<Duration>,
 ) -> Result<ObjectRpcRequest, NetworkError> {
     let inner = request.clone().with_auth(request_auth.into());
     let mut envelope = RelayEnvelope::new(cluster_id.clone(), target_node_id.clone(), inner);
@@ -4321,7 +4388,17 @@ fn relay_request_for_signed_rpc_with_max_hop_timeout(
         )?);
     }
     envelope.max_hop_timeout_ms = max_hop_timeout.map(duration_millis_u64);
+    envelope.extended_idle_timeout_ms = extended_idle_timeout.map(duration_millis_u64);
     envelope.into_request()
+}
+
+fn cluster_relay_request_extended_idle_timeout(
+    options: ClusterObjectRpcOptions,
+    streamed_response: bool,
+) -> Option<Duration> {
+    (!streamed_response)
+        .then_some(options.extended_idle_timeout)
+        .flatten()
 }
 
 fn duration_millis_u64(duration: Duration) -> u64 {
@@ -4390,6 +4467,7 @@ async fn handle_cluster_relay_envelope_async_with_host(
     let inner_category = envelope.inner.category.clone();
     let use_full_response_budget =
         cluster_target_final_hop_request_uses_full_response_budget(envelope.inner());
+    let extended_idle_timeout = relay_envelope_extended_idle_timeout(&envelope);
     let traceparent = envelope.inner.traceparent().unwrap_or_default().to_string();
     metrics::counter!(
         "sinomo.object_rpc.relay.calls",
@@ -4416,7 +4494,11 @@ async fn handle_cluster_relay_envelope_async_with_host(
                 state,
                 &envelope.target_node_id,
                 envelope.inner(),
-                options.timeouts,
+                cluster_endpoint_transport_timeouts(
+                    options.timeouts,
+                    extended_idle_timeout,
+                    relay_envelope_hop_timeout(&envelope).or(options.timeouts.connect_timeout),
+                ),
             )
             .await
         {
@@ -4602,12 +4684,17 @@ async fn handle_cluster_relay_envelope_async_with_host(
             let hop_timeouts = if final_hop || hop_full_response_budget {
                 cluster_target_final_hop_transport_timeouts(
                     options.timeouts,
+                    extended_idle_timeout,
                     endpoint_attempt_budget,
                     hop_attempt_budget,
                     remaining,
                 )
             } else {
-                cluster_relay_hop_transport_timeouts(options.timeouts, endpoint_attempt_budget)
+                cluster_relay_hop_transport_timeouts(
+                    options.timeouts,
+                    extended_idle_timeout,
+                    endpoint_attempt_budget,
+                )
             };
             let response = if final_hop {
                 cluster_object_rpc_attempt_with_timeout(
@@ -5022,12 +5109,17 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
             let hop_timeouts = if final_hop || hop_full_response_budget {
                 cluster_target_final_hop_transport_timeouts(
                     options.timeouts,
+                    None,
                     endpoint_attempt_budget,
                     hop_attempt_budget,
                     remaining,
                 )
             } else {
-                cluster_relay_hop_transport_timeouts(options.timeouts, endpoint_attempt_budget)
+                cluster_relay_hop_transport_timeouts(
+                    options.timeouts,
+                    None,
+                    endpoint_attempt_budget,
+                )
             };
             let mut forwarded = envelope.clone();
             forwarded.ttl = envelope.ttl.saturating_sub(1);
@@ -6413,6 +6505,7 @@ mod tests {
             Some(DEFAULT_NETWORK_TIMEOUT)
         );
         assert_eq!(options.timeouts.idle_timeout, Some(DEFAULT_NETWORK_TIMEOUT));
+        assert_eq!(options.extended_idle_timeout, None);
     }
 
     #[test]
@@ -6561,6 +6654,7 @@ mod tests {
         let base = DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(15));
         let shaped = cluster_target_final_hop_transport_timeouts(
             base,
+            None,
             Some(Duration::from_secs(2)),
             Some(Duration::from_secs(2)),
             Some(Duration::from_secs(12)),
@@ -6575,6 +6669,7 @@ mod tests {
         let base = DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(15));
         let shaped = cluster_target_final_hop_transport_timeouts(
             base,
+            None,
             Some(Duration::from_secs(2)),
             Some(Duration::from_secs(12)),
             Some(Duration::from_secs(12)),
@@ -6582,6 +6677,117 @@ mod tests {
 
         assert_eq!(shaped.connect_timeout, Some(Duration::from_secs(2)));
         assert_eq!(shaped.idle_timeout, Some(DEFAULT_NETWORK_TIMEOUT));
+    }
+
+    #[test]
+    fn ordinary_buffered_response_idle_timeout_stays_capped_on_every_route_path() {
+        let base = DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(30));
+        let remaining = Some(Duration::from_secs(20));
+
+        let direct = cluster_endpoint_transport_timeouts(base, None, remaining);
+        let final_hop = cluster_target_final_hop_transport_timeouts(
+            base, None, remaining, remaining, remaining,
+        );
+        let relay = cluster_relay_hop_transport_timeouts(base, None, remaining);
+
+        assert_eq!(direct.idle_timeout, Some(DEFAULT_NETWORK_TIMEOUT));
+        assert_eq!(final_hop.idle_timeout, Some(DEFAULT_NETWORK_TIMEOUT));
+        assert_eq!(relay.idle_timeout, Some(DEFAULT_NETWORK_TIMEOUT));
+    }
+
+    #[test]
+    fn explicit_extended_idle_timeout_is_still_capped_by_each_route_budget() {
+        let options =
+            ClusterObjectRpcOptions::default().with_extended_idle_timeout(Duration::from_secs(15));
+        let base = options.timeouts;
+        let extended = options.extended_idle_timeout;
+
+        let direct =
+            cluster_endpoint_transport_timeouts(base, extended, Some(Duration::from_secs(12)));
+        let final_hop = cluster_target_final_hop_transport_timeouts(
+            base,
+            extended,
+            Some(Duration::from_secs(4)),
+            Some(Duration::from_secs(9)),
+            Some(Duration::from_secs(11)),
+        );
+        let relay =
+            cluster_relay_hop_transport_timeouts(base, extended, Some(Duration::from_secs(7)));
+
+        assert_eq!(direct.idle_timeout, Some(Duration::from_secs(12)));
+        assert_eq!(final_hop.connect_timeout, Some(Duration::from_secs(4)));
+        assert_eq!(final_hop.idle_timeout, Some(Duration::from_secs(9)));
+        assert_eq!(relay.idle_timeout, Some(Duration::from_secs(7)));
+        assert!(direct.idle_timeout.expect("direct idle") > DEFAULT_NETWORK_TIMEOUT);
+        assert!(relay.idle_timeout.expect("relay idle") > DEFAULT_NETWORK_TIMEOUT);
+        assert_eq!(
+            cluster_endpoint_transport_timeouts(base, None, Some(Duration::from_secs(20)),)
+                .idle_timeout,
+            Some(DEFAULT_NETWORK_TIMEOUT),
+            "streamed body progress must not inherit the buffered-response exception"
+        );
+    }
+
+    #[test]
+    fn relay_envelope_round_trips_extended_idle_timeout() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_relay_extended_idle").expect("cluster id");
+        let source_node =
+            NodeId::from_legacy_named("node_relay_extended_idle_source").expect("source node");
+        let target_node =
+            NodeId::from_legacy_named("node_relay_extended_idle_target").expect("target node");
+        let request = ObjectRpcRequest::encode_body("/test/data", "test", &"payload")
+            .expect("request")
+            .with_full_response_budget();
+        let options =
+            ClusterObjectRpcOptions::default().with_extended_idle_timeout(Duration::from_secs(15));
+        assert_eq!(
+            cluster_relay_request_extended_idle_timeout(options, false),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(
+            cluster_relay_request_extended_idle_timeout(options, true),
+            None,
+            "streaming relays must retain the shared per-chunk progress timeout"
+        );
+        let outer = relay_request_for_signed_rpc_with_max_hop_timeout(
+            &cluster_id,
+            &target_node,
+            &request,
+            b"auth".to_vec(),
+            std::iter::once(source_node.clone()),
+            &[source_node, target_node.clone()],
+            &[],
+            Some(Duration::from_secs(20)),
+            Some(Duration::from_secs(15)),
+        )
+        .expect("relay request");
+        let envelope = RelayEnvelope::from_request(&outer).expect("relay envelope");
+
+        assert_eq!(envelope.max_hop_timeout_ms, Some(20_000));
+        assert_eq!(envelope.extended_idle_timeout_ms, Some(15_000));
+        assert_eq!(
+            relay_envelope_extended_idle_timeout(&envelope),
+            Some(Duration::from_secs(15))
+        );
+
+        let mut oversized = envelope.clone();
+        oversized.extended_idle_timeout_ms = Some(u64::MAX);
+        assert_eq!(
+            relay_envelope_extended_idle_timeout(&oversized),
+            Some(CLUSTER_TARGET_FULL_RESPONSE_ROUTE_DEADLINE_MAX),
+            "a member-supplied relay envelope must not expand the bounded data-plane policy"
+        );
+
+        oversized
+            .inner
+            .metadata
+            .remove(crate::rpc::OBJECT_RPC_FULL_RESPONSE_BUDGET_METADATA_KEY);
+        assert_eq!(
+            relay_envelope_extended_idle_timeout(&oversized),
+            None,
+            "ordinary relay requests must stay on the shared network progress timeout"
+        );
     }
 
     #[test]
@@ -8259,6 +8465,29 @@ mod tests {
             idle_timeout <= DEFAULT_NETWORK_TIMEOUT,
             "full-response no-progress timeout should use the network default, got {idle_timeout:?}"
         );
+
+        let mut extended_host = RecordingSignedHost::default();
+        let mut extended_client =
+            ClusterObjectRpcClient::routed(&mut extended_host, runtime.handle(), &paths);
+        runtime
+            .block_on(
+                extended_client.call_target(
+                    &state,
+                    &target_node,
+                    &request,
+                    ClusterObjectRpcOptions::default()
+                        .with_overall_timeout(Duration::from_secs(12))
+                        .with_extended_idle_timeout(Duration::from_secs(15)),
+                ),
+            )
+            .expect("target rpc with extended idle timeout");
+
+        let extended_idle_timeout = extended_host.target_sends[0]
+            .2
+            .idle_timeout
+            .expect("extended idle timeout");
+        assert!(extended_idle_timeout > DEFAULT_NETWORK_TIMEOUT);
+        assert!(extended_idle_timeout <= Duration::from_secs(12));
     }
 
     #[test]
@@ -9050,7 +9279,8 @@ mod tests {
     #[test]
     fn cluster_relay_hop_transport_timeouts_cap_response_budget() {
         let base = DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(15));
-        let shaped = cluster_relay_hop_transport_timeouts(base, Some(Duration::from_secs(12)));
+        let shaped =
+            cluster_relay_hop_transport_timeouts(base, None, Some(Duration::from_secs(12)));
 
         assert_eq!(shaped.connect_timeout, Some(Duration::from_secs(12)));
         assert_eq!(shaped.idle_timeout, Some(DEFAULT_NETWORK_TIMEOUT));
