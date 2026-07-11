@@ -382,10 +382,9 @@ where
         &mut self,
         _target: &Self::Target,
         remaining: Duration,
-        request: &ClusterRaftAppendRequest,
+        _request: &ClusterRaftAppendRequest,
     ) -> Duration {
-        self.options
-            .routed_node_append_attempt_timeout(remaining, request)
+        self.options.routed_node_append_attempt_timeout(remaining)
     }
 
     fn on_raft_append_sent_async<'a>(

@@ -5877,6 +5877,26 @@ fn cluster_kv_object_rpc_request(
     ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body)
 }
 
+fn cluster_raft_append_object_rpc_request(
+    payload: sinomo_core::kv::ClusterKvRpcPayload,
+) -> ObjectRpcRequest {
+    // Retrying identical AppendEntries is safe under Raft. Preserve the 30s
+    // control-plane budget for snapshot and catch-up responses while transport
+    // connect and no-progress waits remain independently bounded.
+    cluster_kv_object_rpc_request(payload)
+        .with_response_retry_safe()
+        .with_full_response_budget()
+}
+
+fn cluster_raft_vote_object_rpc_request(
+    payload: sinomo_core::kv::ClusterKvRpcPayload,
+) -> ObjectRpcRequest {
+    // Retrying an identical RequestVote is safe under Raft, but voting stays
+    // on the ordinary short route budget to preserve recovery-oriented route
+    // ordering and bounded election latency.
+    cluster_kv_object_rpc_request(payload).with_response_retry_safe()
+}
+
 fn decode_routed_cluster_raft_append_response(
     response: &ObjectRpcResponse,
 ) -> Result<ClusterRaftAppendResponse, sinomo_core::network::NetworkError> {
@@ -5908,7 +5928,7 @@ async fn send_cluster_raft_append_routed_async(
     timeout: Duration,
     runtime: &tokio::runtime::Handle,
 ) -> Result<ClusterRaftAppendResponse, sinomo_core::network::NetworkError> {
-    let rpc_request = cluster_kv_object_rpc_request(
+    let rpc_request = cluster_raft_append_object_rpc_request(
         sinomo_core::kv::cluster_raft_append_rpc_payload(request).map_err(|error| {
             sinomo_core::network::NetworkError::Io {
                 operation: "encode routed cluster raft append".to_string(),
@@ -5950,7 +5970,7 @@ async fn send_cluster_raft_vote_routed_async(
     timeout: Duration,
     runtime: &tokio::runtime::Handle,
 ) -> Result<ClusterRaftVoteResponse, sinomo_core::network::NetworkError> {
-    let rpc_request = cluster_kv_object_rpc_request(
+    let rpc_request = cluster_raft_vote_object_rpc_request(
         sinomo_core::kv::cluster_raft_vote_rpc_payload(request).map_err(|error| {
             sinomo_core::network::NetworkError::Io {
                 operation: "encode routed cluster raft vote".to_string(),
@@ -8140,6 +8160,45 @@ fn cluster_kv_txn_quorum_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routed_raft_requests_have_operation_specific_retry_and_budget_markers() {
+        let append = cluster_raft_append_object_rpc_request(sinomo_core::kv::ClusterKvRpcPayload {
+            route: "/test/daemon/raft/append",
+            category: "test.cluster.kv",
+            body: Vec::new(),
+        });
+        let vote = cluster_raft_vote_object_rpc_request(sinomo_core::kv::ClusterKvRpcPayload {
+            route: "/test/daemon/raft/vote",
+            category: "test.cluster.kv",
+            body: Vec::new(),
+        });
+        let general = cluster_kv_object_rpc_request(sinomo_core::kv::ClusterKvRpcPayload {
+            route: "/test/daemon/kv",
+            category: "test.cluster.kv",
+            body: Vec::new(),
+        });
+
+        assert!(append.is_response_retry_safe());
+        assert!(append.uses_full_response_budget());
+        assert!(vote.is_response_retry_safe());
+        assert!(!vote.uses_full_response_budget());
+        assert!(!general.is_response_retry_safe());
+        assert!(!general.uses_full_response_budget());
+        let requested = Some(Duration::from_secs(30));
+        assert_eq!(
+            sinomo_core::network::cluster_object_rpc_effective_route_timeout(&append, requested),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            sinomo_core::network::cluster_object_rpc_effective_route_timeout(&vote, requested),
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT
+        );
+        assert_eq!(
+            sinomo_core::network::cluster_object_rpc_effective_route_timeout(&general, requested),
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT
+        );
+    }
 
     fn test_cluster_node_status(
         cluster_id: &ClusterId,

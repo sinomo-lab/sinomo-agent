@@ -65,16 +65,12 @@ impl ClusterRaftAppendReplicationOptions {
         self.fair_command_timeout(endpoint, remaining)
     }
 
-    pub(crate) fn routed_node_command_timeout(&self, remaining: Duration) -> Duration {
-        remaining.min(self.tcp_command_timeout.max(self.iroh_command_timeout))
-    }
-
-    pub(crate) fn routed_node_append_attempt_timeout(
-        &self,
-        remaining: Duration,
-        _request: &ClusterRaftAppendRequest,
-    ) -> Duration {
-        self.routed_node_command_timeout(remaining)
+    pub(crate) fn routed_node_append_attempt_timeout(&self, remaining: Duration) -> Duration {
+        // Routed AppendEntries carries its own per-connect and stream
+        // no-progress limits. Give routing the remaining Raft operation budget
+        // so it can fall back across endpoints and accept a progressing
+        // snapshot response without an outer 5s command timeout racing it.
+        remaining
     }
 }
 
@@ -289,5 +285,20 @@ mod tests {
         assert!(timeouts.tcp_foreground_attempt_timeout < DEFAULT_NETWORK_TIMEOUT);
         assert!(timeouts.public_foreground_attempt_timeout < DEFAULT_NETWORK_TIMEOUT);
         assert!(timeouts.iroh_foreground_attempt_timeout < DEFAULT_NETWORK_TIMEOUT);
+    }
+
+    #[test]
+    fn routed_raft_append_preserves_operation_budget_above_transport_timeout() {
+        let timeouts = ClusterControlPlaneTimeouts::default_daemon_transport();
+        let options = timeouts.raft_append_replication_options(timeouts.raft_append_timeout);
+        let remaining = timeouts.raft_append_timeout - Duration::from_secs(1);
+
+        assert!(remaining > DEFAULT_NETWORK_TIMEOUT);
+        assert_eq!(
+            options.routed_node_append_attempt_timeout(remaining),
+            remaining
+        );
+        assert_eq!(options.tcp_command_timeout, DEFAULT_NETWORK_TIMEOUT);
+        assert_eq!(options.iroh_command_timeout, DEFAULT_NETWORK_TIMEOUT);
     }
 }

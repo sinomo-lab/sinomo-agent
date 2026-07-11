@@ -3952,7 +3952,7 @@ mod tests {
     }
 
     #[test]
-    fn default_cluster_metadata_shard_transfers_after_candidate_replays_journal() {
+    fn default_cluster_metadata_shard_transfers_after_candidate_replays_certified_journal() {
         let root = temp_root("default_cluster_metadata_shard_transfer_after_replay");
         let data_root = root.join("data");
         let data_dir = SinomoDataDir::new(&data_root);
@@ -4029,6 +4029,48 @@ mod tests {
         backend
             .put_metadata_replication_cursor(&target_primary, &shard_id, 1)
             .expect("candidate replay cursor");
+
+        let replayed_but_uncertified =
+            sinomo_dfs::default_cluster_metadata_shards_with_host(&mut host, &state, &file_system)
+                .expect("uncertified shards")
+                .into_iter()
+                .find(|shard| shard.shard_id == "services")
+                .expect("services shard");
+        assert_eq!(
+            replayed_but_uncertified.primary_node_id, bootstrap_primary,
+            "a replica cursor alone must not authorize primary transfer"
+        );
+        assert_eq!(replayed_but_uncertified.epoch, services_shard.epoch);
+
+        let journal_sequence = backend.journal_last_sequence();
+        let snapshot = backend.export_table_snapshot();
+        let encoded_snapshot = serde_json::to_vec(&snapshot).expect("encode shard snapshot");
+        let state_fingerprint = format!("blake3:{}", blake3::hash(&encoded_snapshot).to_hex());
+        let watermark = sinomo_dfs::DfsMetadataShardHeadWatermark {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: services_shard.shard_id.clone(),
+            primary_node_id: bootstrap_primary.clone(),
+            epoch: services_shard.epoch,
+            journal_sequence,
+            state_fingerprint,
+            acknowledged_node_ids: vec![bootstrap_primary.clone(), target_primary.clone()],
+        };
+        append_cluster_raft_command(
+            &cluster_paths,
+            &state.local_node_id,
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
+                    sinomo_dfs::metadata_shard_head_watermark_key(
+                        &file_system.file_system_id,
+                        "services",
+                    ),
+                    &watermark,
+                    None,
+                )
+                .expect("put certified shard head op"),
+            ),
+        )
+        .expect("publish certified shard head");
 
         let transferred =
             sinomo_dfs::default_cluster_metadata_shards_with_host(&mut host, &state, &file_system)

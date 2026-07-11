@@ -35,7 +35,7 @@ pub trait ClusterControlPlaneTransport {
         request: &ClusterKvReplicationRequest,
         timeout: Duration,
     ) -> Result<ClusterKvReplicationResponse, NetworkError> {
-        let rpc_request = cluster_kv_object_rpc_request(
+        let rpc_request = cluster_raft_append_object_rpc_request(
             sinomo_kv::cluster_raft_append_rpc_payload(request).map_err(|source| {
                 NetworkError::Io {
                     operation: "encode routed cluster raft append".to_string(),
@@ -54,7 +54,7 @@ pub trait ClusterControlPlaneTransport {
         request: &ClusterKvStateAuthorityVoteRequest,
         timeout: Duration,
     ) -> Result<ClusterKvStateAuthorityVoteResponse, NetworkError> {
-        let rpc_request = cluster_kv_object_rpc_request(
+        let rpc_request = cluster_raft_vote_object_rpc_request(
             sinomo_kv::cluster_raft_vote_rpc_payload(request).map_err(|source| {
                 NetworkError::Io {
                     operation: "encode routed cluster raft vote".to_string(),
@@ -184,6 +184,22 @@ fn cluster_kv_object_rpc_request(payload: ClusterKvRpcPayload) -> ObjectRpcReque
     ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body)
 }
 
+fn cluster_raft_append_object_rpc_request(payload: ClusterKvRpcPayload) -> ObjectRpcRequest {
+    // AppendEntries is idempotent for an identical Raft request. Preserve the
+    // 30s control-plane budget for snapshot and catch-up responses while the
+    // transport still enforces shorter connect and no-progress timeouts.
+    cluster_kv_object_rpc_request(payload)
+        .with_response_retry_safe()
+        .with_full_response_budget()
+}
+
+fn cluster_raft_vote_object_rpc_request(payload: ClusterKvRpcPayload) -> ObjectRpcRequest {
+    // RequestVote is idempotent for an identical candidate/term. It may retry
+    // another endpoint, but stays on the short ordinary route budget so the
+    // endpoint order remains optimized for leader recovery latency.
+    cluster_kv_object_rpc_request(payload).with_response_retry_safe()
+}
+
 fn decode_cluster_raft_append_response(
     response: &ObjectRpcResponse,
 ) -> Result<ClusterKvReplicationResponse, NetworkError> {
@@ -234,5 +250,46 @@ impl<T> ClusterControlPlaneDriver<T> {
 
     pub fn into_transport(self) -> T {
         self.transport
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_payload(route: &'static str) -> ClusterKvRpcPayload {
+        ClusterKvRpcPayload {
+            route,
+            category: "test.cluster.kv",
+            body: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn raft_requests_have_operation_specific_retry_and_budget_markers() {
+        let append =
+            cluster_raft_append_object_rpc_request(test_payload("/test/cluster/raft/append"));
+        let vote = cluster_raft_vote_object_rpc_request(test_payload("/test/cluster/raft/vote"));
+        let general = cluster_kv_object_rpc_request(test_payload("/test/cluster/kv"));
+
+        assert!(append.is_response_retry_safe());
+        assert!(append.uses_full_response_budget());
+        assert!(vote.is_response_retry_safe());
+        assert!(!vote.uses_full_response_budget());
+        assert!(!general.is_response_retry_safe());
+        assert!(!general.uses_full_response_budget());
+        let requested = Some(Duration::from_secs(30));
+        assert_eq!(
+            sinomo_network::cluster_object_rpc_effective_route_timeout(&append, requested),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            sinomo_network::cluster_object_rpc_effective_route_timeout(&vote, requested),
+            sinomo_network::DEFAULT_NETWORK_TIMEOUT
+        );
+        assert_eq!(
+            sinomo_network::cluster_object_rpc_effective_route_timeout(&general, requested),
+            sinomo_network::DEFAULT_NETWORK_TIMEOUT
+        );
     }
 }
