@@ -1550,8 +1550,10 @@ fn run_concurrent_dir_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             .collect::<Vec<_>>(),
     );
 
-    let dir_present = backend.stat(&dir).is_ok();
-    let child_present = backend.stat(&child).is_ok();
+    let dir_present =
+        dfs_stat_reports_path_present(&dir, backend.stat(&dir)).map_err(SinomoTestError::failed)?;
+    let child_present = dfs_stat_reports_path_present(&child, backend.stat(&child))
+        .map_err(SinomoTestError::failed)?;
     ctx.record("dir_present", dir_present);
     ctx.record("child_present", child_present);
     if (dir_present && child_present) || (!dir_present && !child_present) {
@@ -4009,6 +4011,16 @@ fn is_not_found(error: &str) -> bool {
     error.contains("not found")
 }
 
+fn dfs_stat_reports_path_present<T>(path: &str, stat: Result<T, String>) -> Result<bool, String> {
+    match stat {
+        Ok(_) => Ok(true),
+        Err(error) if is_not_found(&error) => Ok(false),
+        Err(error) => Err(format!(
+            "cannot determine whether {path} is present after concurrent directory race: {error}"
+        )),
+    }
+}
+
 fn is_retryable_rename_error(error: &str) -> bool {
     error.contains("moving between metadata shards")
         || error.contains("retry the operation")
@@ -4041,6 +4053,29 @@ mod tests {
         ClusterEndpointSource, ClusterMemberRecord, ClusterTransportKind,
     };
     use sinomo_runtime::node::ClusterId;
+
+    #[test]
+    fn concurrent_dir_presence_distinguishes_absence_from_probe_failure() {
+        assert_eq!(
+            dfs_stat_reports_path_present("/present", Ok::<_, String>(())),
+            Ok(true)
+        );
+        assert_eq!(
+            dfs_stat_reports_path_present::<()>(
+                "/absent",
+                Err("cannot inspect /absent: path not found".to_string()),
+            ),
+            Ok(false)
+        );
+
+        let error = dfs_stat_reports_path_present::<()>(
+            "/unknown",
+            Err("network read timed out".to_string()),
+        )
+        .expect_err("transport failure must not look like absence");
+        assert!(error.contains("cannot determine whether /unknown is present"));
+        assert!(error.contains("network read timed out"));
+    }
 
     #[test]
     fn desired_replica_check_rejects_an_equal_sized_wrong_location_set() {
