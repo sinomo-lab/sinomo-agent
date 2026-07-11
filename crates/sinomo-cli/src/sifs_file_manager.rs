@@ -1555,24 +1555,13 @@ impl AsyncDfsPeerTransport for SifsDfsPeerTransport {
                     operation_deadline,
                 )
             });
-            let daemon_result = if let Some(deadline) = operation_deadline {
-                let remaining = sifs_rpc_remaining_operation_budget(
-                    deadline,
-                    "waiting for local daemon discovery",
-                )?;
-                tokio::time::timeout(remaining, daemon_probe)
-                    .await
-                    .map_err(|_| {
-                        DfsPeerTransportError::new(
-                            "SIFS operation deadline expired during local daemon discovery",
-                        )
-                    })?
-                    .map_err(|error| DfsPeerTransportError::new(error.to_string()))?
-            } else {
-                daemon_probe
-                    .await
-                    .map_err(|error| DfsPeerTransportError::new(error.to_string()))?
-            };
+            // Discovery and the forwarded RPC are each bounded internally.
+            // Do not add a competing outer deadline: the daemon-control client
+            // intentionally waits one default network phase beyond the inner
+            // route budget so it can return the terminal delivery state.
+            let daemon_result = daemon_probe
+                .await
+                .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
             if let Some(result) = daemon_result {
                 return result;
             }
@@ -1727,16 +1716,17 @@ fn sifs_send_dfs_object_rpc_via_daemon(
         Ok(options) => options,
         Err(error) => return Some(Err(error)),
     };
-    let client = if let Some(deadline) = operation_deadline {
-        let remaining = match sifs_rpc_remaining_operation_budget(deadline, "daemon-forwarded RPC")
-        {
-            Ok(remaining) => remaining,
-            Err(error) => return Some(Err(error)),
-        };
-        client.with_timeout(remaining)
-    } else {
-        client
-    };
+    if let Some(deadline) = operation_deadline
+        && let Err(error) = sifs_rpc_remaining_operation_budget(deadline, "daemon-forwarded RPC")
+    {
+        return Some(Err(error));
+    }
+    // Keep the inner routed RPC clamped to the DFS operation deadline through
+    // `options`, but do not clamp the loopback control stream to that same
+    // instant. `DaemonApiClient` deliberately gives buffered forwarding one
+    // default network phase of grace so the daemon can return the terminal
+    // response (including a precise possibly-applied error) after the inner
+    // route budget expires.
     Some(
         client
             .dfs_object_rpc_to_target_with_options(target_node_id, request, options)

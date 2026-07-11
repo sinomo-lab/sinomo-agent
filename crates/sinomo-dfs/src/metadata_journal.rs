@@ -422,47 +422,83 @@ pub(crate) fn journal_entries_since_limited_with_next_sequence(
 pub(crate) fn bounded_metadata_journal_batch(
     shard_id: DfsMetadataShardId,
     after_sequence: u64,
-    entries: Vec<DfsMetadataJournalEntry>,
+    mut entries: Vec<DfsMetadataJournalEntry>,
     max_entries: usize,
     max_encoded_bytes: usize,
 ) -> Result<Option<DfsMetadataJournalBatch>> {
     if max_entries == 0 {
         return Ok(None);
     }
-    let max_encoded_bytes = max_encoded_bytes.max(1);
-    let mut selected = Vec::new();
-    let mut next_after_sequence = after_sequence;
-    for entry in entries.into_iter().take(max_entries) {
-        let candidate_sequence = entry.sequence;
-        selected.push(entry);
-        let candidate = DfsMetadataJournalBatch {
-            shard_id: selected
-                .last()
-                .map(|entry| entry.shard_id.clone())
-                .unwrap_or_else(|| shard_id.clone()),
-            entries: selected.clone(),
-            next_after_sequence: candidate_sequence,
-        };
-        if selected.len() > 1 && metadata_journal_batch_encoded_len(&candidate)? > max_encoded_bytes
-        {
-            selected.pop();
-            break;
-        }
-        next_after_sequence = candidate_sequence;
-    }
-    if selected.is_empty() {
+    entries.truncate(max_entries);
+    if entries.is_empty() {
         return Ok(None);
     }
+
+    let max_encoded_bytes = max_encoded_bytes.max(1);
+    let selected_len = if entries.len() == 1 {
+        1
+    } else if metadata_journal_batch_prefix_encoded_len(&entries)? <= max_encoded_bytes {
+        entries.len()
+    } else {
+        // The full prefix is too large. One entry is deliberately always
+        // allowed so replication can make progress even when a single entry
+        // exceeds the configured byte limit. Journal entries in a batch all
+        // belong to one shard, so encoded prefix size grows monotonically.
+        let mut accepted = 1usize;
+        let mut rejected = entries.len();
+        while accepted + 1 < rejected {
+            let candidate_len = accepted + (rejected - accepted) / 2;
+            if metadata_journal_batch_prefix_encoded_len(&entries[..candidate_len])?
+                <= max_encoded_bytes
+            {
+                accepted = candidate_len;
+            } else {
+                rejected = candidate_len;
+            }
+        }
+        accepted
+    };
+
+    entries.truncate(selected_len);
+    let next_after_sequence = entries
+        .last()
+        .map(|entry| entry.sequence)
+        .unwrap_or(after_sequence);
     Ok(Some(DfsMetadataJournalBatch {
-        shard_id: selected
+        shard_id: entries
             .first()
             .map(|entry| entry.shard_id.clone())
             .unwrap_or(shard_id),
-        entries: selected,
+        entries,
         next_after_sequence,
     }))
 }
 
+#[derive(Serialize)]
+struct BorrowedMetadataJournalBatch<'a> {
+    shard_id: &'a DfsMetadataShardId,
+    entries: &'a [DfsMetadataJournalEntry],
+    next_after_sequence: u64,
+}
+
+fn metadata_journal_batch_prefix_encoded_len(entries: &[DfsMetadataJournalEntry]) -> Result<usize> {
+    let last = entries
+        .last()
+        .expect("metadata journal prefix must contain an entry");
+    sinomo_object_serde::to_bytes(
+        &BorrowedMetadataJournalBatch {
+            shard_id: &last.shard_id,
+            entries,
+            next_after_sequence: last.sequence,
+        },
+        1,
+        LengthMode::U32,
+    )
+    .map(|bytes| bytes.len())
+    .map_err(|source| MetadataBackendError::Serde(source.to_string()))
+}
+
+#[cfg(test)]
 pub(crate) fn metadata_journal_batch_encoded_len(batch: &DfsMetadataJournalBatch) -> Result<usize> {
     sinomo_object_serde::to_bytes(batch, 1, LengthMode::U32)
         .map(|bytes| bytes.len())
@@ -673,4 +709,192 @@ pub(crate) fn journal_segment_id(sequence: u64) -> u64 {
         .checked_div(JOURNAL_SEGMENT_ENTRY_LIMIT)
         .unwrap_or(0)
         .saturating_add(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_journal_entry(sequence: u64) -> DfsMetadataJournalEntry {
+        DfsMetadataJournalEntry {
+            shard_id: DfsMetadataShardId::new("services"),
+            sequence,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            mutation: DfsMetadataMutation::PutFileSystem {
+                file_system_id: crate::DfsFileSystemId::from_legacy_named(
+                    "sifs-journal-suffix-test",
+                )
+                .expect("filesystem id"),
+                file_system: None,
+            },
+        }
+    }
+
+    fn journal_batch_for_prefix(
+        entries: &[DfsMetadataJournalEntry],
+        prefix_len: usize,
+    ) -> DfsMetadataJournalBatch {
+        let entries = entries[..prefix_len].to_vec();
+        let last = entries.last().expect("non-empty journal prefix");
+        DfsMetadataJournalBatch {
+            shard_id: last.shard_id.clone(),
+            next_after_sequence: last.sequence,
+            entries,
+        }
+    }
+
+    fn linear_bounded_metadata_journal_batch(
+        shard_id: DfsMetadataShardId,
+        after_sequence: u64,
+        entries: Vec<DfsMetadataJournalEntry>,
+        max_entries: usize,
+        max_encoded_bytes: usize,
+    ) -> Result<Option<DfsMetadataJournalBatch>> {
+        if max_entries == 0 {
+            return Ok(None);
+        }
+        let max_encoded_bytes = max_encoded_bytes.max(1);
+        let mut selected = Vec::new();
+        let mut next_after_sequence = after_sequence;
+        for entry in entries.into_iter().take(max_entries) {
+            let candidate_sequence = entry.sequence;
+            selected.push(entry);
+            let candidate = journal_batch_for_prefix(&selected, selected.len());
+            if selected.len() > 1
+                && metadata_journal_batch_encoded_len(&candidate)? > max_encoded_bytes
+            {
+                selected.pop();
+                break;
+            }
+            next_after_sequence = candidate_sequence;
+        }
+        if selected.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(DfsMetadataJournalBatch {
+            shard_id: selected
+                .first()
+                .map(|entry| entry.shard_id.clone())
+                .unwrap_or(shard_id),
+            entries: selected,
+            next_after_sequence,
+        }))
+    }
+
+    #[test]
+    fn bounded_journal_batch_honors_exact_entry_and_byte_bounds() {
+        let shard_id = DfsMetadataShardId::new("services");
+        let entries = (1..=5).map(test_journal_entry).collect::<Vec<_>>();
+        let two_entry_len =
+            metadata_journal_batch_encoded_len(&journal_batch_for_prefix(&entries, 2))
+                .expect("two-entry encoded length");
+        let three_entry_len =
+            metadata_journal_batch_encoded_len(&journal_batch_for_prefix(&entries, 3))
+                .expect("three-entry encoded length");
+        assert!(two_entry_len < three_entry_len);
+
+        let entry_bounded =
+            bounded_metadata_journal_batch(shard_id.clone(), 0, entries.clone(), 2, usize::MAX)
+                .expect("entry-bounded batch")
+                .expect("batch");
+        assert_eq!(entry_bounded.entries.len(), 2);
+        assert_eq!(entry_bounded.next_after_sequence, 2);
+
+        let exactly_byte_bounded = bounded_metadata_journal_batch(
+            shard_id.clone(),
+            0,
+            entries.clone(),
+            entries.len(),
+            three_entry_len,
+        )
+        .expect("exactly byte-bounded batch")
+        .expect("batch");
+        assert_eq!(exactly_byte_bounded.entries.len(), 3);
+        assert_eq!(
+            metadata_journal_batch_encoded_len(&exactly_byte_bounded)
+                .expect("selected encoded length"),
+            three_entry_len
+        );
+
+        let just_under_byte_bound = bounded_metadata_journal_batch(
+            shard_id.clone(),
+            0,
+            entries.clone(),
+            entries.len(),
+            three_entry_len - 1,
+        )
+        .expect("just-under byte-bounded batch")
+        .expect("batch");
+        assert_eq!(just_under_byte_bound.entries.len(), 2);
+        assert!(
+            metadata_journal_batch_encoded_len(&just_under_byte_bound)
+                .expect("selected encoded length")
+                <= two_entry_len
+        );
+
+        let oversized_first =
+            bounded_metadata_journal_batch(shard_id.clone(), 0, entries.clone(), 5, 0)
+                .expect("oversized-first batch")
+                .expect("batch");
+        assert_eq!(oversized_first.entries.len(), 1);
+        assert!(
+            metadata_journal_batch_encoded_len(&oversized_first).expect("oversized encoded length")
+                > 1
+        );
+        assert!(
+            bounded_metadata_journal_batch(shard_id, 0, entries, 0, usize::MAX)
+                .expect("zero-entry bound")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn bounded_journal_batch_matches_linear_prefix_selection() {
+        let shard_id = DfsMetadataShardId::new("services");
+        let entries = (41..=47).map(test_journal_entry).collect::<Vec<_>>();
+        let mut byte_limits = vec![0, 1, usize::MAX];
+        for prefix_len in 1..=entries.len() {
+            let encoded_len =
+                metadata_journal_batch_encoded_len(&journal_batch_for_prefix(&entries, prefix_len))
+                    .expect("prefix encoded length");
+            assert_eq!(
+                metadata_journal_batch_prefix_encoded_len(&entries[..prefix_len])
+                    .expect("borrowed prefix encoded length"),
+                encoded_len,
+                "borrowed sizing view must preserve the emitted batch wire layout"
+            );
+            byte_limits.extend([
+                encoded_len.saturating_sub(1),
+                encoded_len,
+                encoded_len.saturating_add(1),
+            ]);
+        }
+        byte_limits.sort_unstable();
+        byte_limits.dedup();
+
+        for max_entries in [0, 1, 2, 3, entries.len(), entries.len() + 3] {
+            for max_encoded_bytes in byte_limits.iter().copied() {
+                let expected = linear_bounded_metadata_journal_batch(
+                    shard_id.clone(),
+                    40,
+                    entries.clone(),
+                    max_entries,
+                    max_encoded_bytes,
+                )
+                .expect("linear selection");
+                let actual = bounded_metadata_journal_batch(
+                    shard_id.clone(),
+                    40,
+                    entries.clone(),
+                    max_entries,
+                    max_encoded_bytes,
+                )
+                .expect("binary selection");
+                assert_eq!(
+                    actual, expected,
+                    "selection differs for max_entries={max_entries}, max_encoded_bytes={max_encoded_bytes}"
+                );
+            }
+        }
+    }
 }
