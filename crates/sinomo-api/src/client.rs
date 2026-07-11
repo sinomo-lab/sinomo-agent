@@ -57,7 +57,16 @@ impl DaemonApiClient {
     /// Connects to the running daemon owning `paths` (main or shadow),
     /// verifying liveness through the status/probe flow.
     pub fn connect_for_paths(paths: &DaemonPaths) -> Result<Self, DaemonApiError> {
-        match probe_daemon_status(paths, DAEMON_API_PROBE_TIMEOUT) {
+        Self::connect_for_paths_with_timeout(paths, DAEMON_API_PROBE_TIMEOUT)
+    }
+
+    /// Connects to the daemon while bounding discovery by the caller's
+    /// remaining operation budget.
+    pub fn connect_for_paths_with_timeout(
+        paths: &DaemonPaths,
+        probe_timeout: Duration,
+    ) -> Result<Self, DaemonApiError> {
+        match probe_daemon_status(paths, probe_timeout) {
             DaemonProbeStatus::Running(status) => Ok(Self::at_address(status.address)),
             DaemonProbeStatus::Locked { .. } => Err(DaemonApiError::NotRunning {
                 detail: format!(
@@ -896,6 +905,19 @@ mod tests {
         let paths = DaemonPaths::new(&data_dir);
         let error = DaemonApiClient::connect_for_paths(&paths)
             .expect_err("no daemon is running in the test data dir");
+        assert!(matches!(error, DaemonApiError::NotRunning { .. }));
+    }
+
+    #[test]
+    fn daemon_api_client_accepts_a_caller_bounded_discovery_timeout() {
+        let root = sinomo_testdir::TestDir::new("sinomo-api-client-bounded-discovery");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir layout");
+        let paths = DaemonPaths::new(&data_dir);
+        let error =
+            DaemonApiClient::connect_for_paths_with_timeout(&paths, Duration::from_millis(10))
+                .expect_err("no daemon is running in the test data dir");
+
         assert!(matches!(error, DaemonApiError::NotRunning { .. }));
     }
 

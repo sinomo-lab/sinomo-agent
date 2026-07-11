@@ -3208,6 +3208,8 @@ mod tests {
             status: DfsWriteIntentStatus::ReceiptsPending,
             content_hash: Some("blake3:orphan-intent".to_string()),
             object_metadata: Some(object.clone()),
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
             created_at: OffsetDateTime::now_utc(),
             updated_at: Some(OffsetDateTime::now_utc()),
         };
@@ -3897,6 +3899,8 @@ mod tests {
                 status: DfsWriteIntentStatus::ReceiptsPending,
                 content_hash: Some(format!("blake3:intent-{index}")),
                 object_metadata: Some(file.clone()),
+                touch_parent_on_create: false,
+                create_predecessor_object_id: None,
                 created_at: OffsetDateTime::now_utc(),
                 updated_at: None,
             };
@@ -3947,6 +3951,8 @@ mod tests {
                 status: DfsWriteIntentStatus::ReceiptsPending,
                 content_hash: Some(format!("blake3:shared-target-{index}")),
                 object_metadata: Some(file.clone()),
+                touch_parent_on_create: false,
+                create_predecessor_object_id: None,
                 created_at: OffsetDateTime::now_utc(),
                 updated_at: None,
             };
@@ -4007,6 +4013,8 @@ mod tests {
             status: DfsWriteIntentStatus::Staging,
             content_hash: Some("blake3:transient".to_string()),
             object_metadata: Some(transient_object.clone()),
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
             created_at: OffsetDateTime::now_utc(),
             updated_at: None,
         };
@@ -4047,6 +4055,8 @@ mod tests {
             status: DfsWriteIntentStatus::ReceiptsPending,
             content_hash: Some("blake3:stale-source".to_string()),
             object_metadata: Some(moved_object.clone()),
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
             created_at: OffsetDateTime::now_utc(),
             updated_at: None,
         };
@@ -4472,6 +4482,8 @@ mod tests {
             status: DfsWriteIntentStatus::ReceiptsPending,
             content_hash: object.content_hash.clone(),
             object_metadata: None,
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: Some(OffsetDateTime::UNIX_EPOCH),
         };
@@ -4918,6 +4930,8 @@ mod tests {
             status: DfsWriteIntentStatus::Committed,
             content_hash: object.content_hash.clone(),
             object_metadata: Some(object.clone()),
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: Some(OffsetDateTime::UNIX_EPOCH),
         };
@@ -5023,6 +5037,8 @@ mod tests {
             status: DfsWriteIntentStatus::Committed,
             content_hash: committed.content_hash.clone(),
             object_metadata: Some(committed.clone()),
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: Some(OffsetDateTime::UNIX_EPOCH),
         };
@@ -7132,6 +7148,8 @@ mod tests {
                 status: DfsWriteIntentStatus::ReceiptsPending,
                 content_hash: Some(format!("blake3:intent-{index}")),
                 object_metadata: Some(file.clone()),
+                touch_parent_on_create: false,
+                create_predecessor_object_id: None,
                 created_at: OffsetDateTime::now_utc(),
                 updated_at: None,
             };
@@ -7218,6 +7236,8 @@ mod tests {
                 status: DfsWriteIntentStatus::ReceiptsPending,
                 content_hash: Some(format!("blake3:intent-target-{index}")),
                 object_metadata: Some(file.clone()),
+                touch_parent_on_create: false,
+                create_predecessor_object_id: None,
                 created_at: OffsetDateTime::UNIX_EPOCH,
                 updated_at: None,
             };
@@ -8163,6 +8183,8 @@ mod tests {
             status: DfsWriteIntentStatus::ReceiptsPending,
             content_hash: Some("blake3:new".to_string()),
             object_metadata: None,
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: Some(OffsetDateTime::UNIX_EPOCH),
         };
@@ -9546,6 +9568,8 @@ mod tests {
             status: DfsWriteIntentStatus::ReceiptsPending,
             content_hash: Some("blake3:batched".to_string()),
             object_metadata: Some(file.clone()),
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: Some(OffsetDateTime::UNIX_EPOCH),
         };

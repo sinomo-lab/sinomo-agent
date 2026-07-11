@@ -339,6 +339,8 @@ mod tests {
             status,
             content_hash: object.content_hash.clone(),
             object_metadata: Some(object.clone()),
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: Some(OffsetDateTime::UNIX_EPOCH),
         }

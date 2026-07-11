@@ -311,6 +311,10 @@ fn dfs_network_message_uses_full_response_budget(message: &DfsNetworkMessage) ->
     )
 }
 
+fn dfs_network_message_response_retry_safe(message: &DfsNetworkMessage) -> bool {
+    matches!(message, DfsNetworkMessage::DistributedWriteRequest(_))
+}
+
 pub fn dfs_message_uses_full_response_budget(command: &DfsMessageCommand) -> bool {
     dfs_network_message_uses_full_response_budget(&command.routed_message.message)
 }
@@ -423,6 +427,13 @@ pub fn dfs_message_rpc_request(
         ObjectRpcRequest::encode_body(dfs_message_route(command), DFS_RPC_CATEGORY, command)?;
     if dfs_message_uses_full_response_budget(command) {
         request = request.with_full_response_budget();
+    }
+    if dfs_network_message_response_retry_safe(&command.routed_message.message) {
+        // Distributed writes carry a stable request identity and their outcome
+        // is durably reconciled at the metadata primary. If a transport loses
+        // only the response, sinomo-network may safely redispatch the command
+        // instead of surfacing an ambiguous timeout.
+        request = request.with_response_retry_safe();
     }
     request.ensure_trace_context();
     Ok(request)

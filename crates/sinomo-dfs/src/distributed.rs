@@ -167,6 +167,10 @@ pub struct DistributedWriteIntent {
     pub owner_epoch: u64,
     pub desired_replica_nodes: Vec<NodeId>,
     pub policy: DfsReplicationPolicy,
+    #[serde(default)]
+    pub touch_parent_on_create: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_predecessor_object_id: Option<DfsObjectId>,
     pub state: DfsWriteIntentState,
 }
 
@@ -258,6 +262,34 @@ impl DistributedEventualCoordinator {
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
     ) -> Result<DistributedWriteIntent, DfsDistributedError> {
+        self.create_intent_at_epoch_with_parent_touch(
+            file_system_id,
+            object_id,
+            base_version,
+            target_version,
+            requesting_node_id,
+            owner_epoch,
+            desired_replica_nodes,
+            policy,
+            false,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_intent_at_epoch_with_parent_touch(
+        &mut self,
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        base_version: Option<DfsVersion>,
+        target_version: DfsVersion,
+        requesting_node_id: NodeId,
+        owner_epoch: u64,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        touch_parent_on_create: bool,
+        create_predecessor_object_id: Option<DfsObjectId>,
+    ) -> Result<DistributedWriteIntent, DfsDistributedError> {
         self.validate_new_intent(
             &file_system_id,
             &object_id,
@@ -278,6 +310,8 @@ impl DistributedEventualCoordinator {
             owner_epoch,
             desired_replica_nodes,
             policy,
+            touch_parent_on_create,
+            create_predecessor_object_id,
             state: DfsWriteIntentState::AwaitingReceipts,
         };
         self.intents.insert(intent_id, intent.clone());

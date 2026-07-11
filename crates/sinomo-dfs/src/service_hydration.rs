@@ -14,6 +14,20 @@ use crate::metadata_pages::{try_walk_metadata_pages, walk_metadata_pages};
 use crate::transfer::PendingNetworkedWrite;
 use crate::*;
 
+fn durable_path_object_fences_replayed_create(
+    durable_path_object: &DfsObjectMetadata,
+    intent_record: &DfsWriteIntentRecord,
+) -> bool {
+    durable_path_object.kind != DfsObjectKind::Tombstone
+        || intent_record
+            .create_predecessor_object_id
+            .as_ref()
+            .is_none_or(|predecessor_object_id| {
+                predecessor_object_id == &intent_record.object_id
+                    || predecessor_object_id != &durable_path_object.object_id
+            })
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn seed_local_metadata_journal_cursors_from_backend(
         &mut self,
@@ -74,6 +88,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.metadata = DfsMetadataStore::new();
         self.tombstones_by_metadata_path.clear();
         self.transient_metadata_object_ids.clear();
+        self.transient_metadata_predecessor_object_ids.clear();
         self.coordinator = DistributedEventualCoordinator::new();
         self.pending_writes.clear();
         self.pending_reads.clear();
@@ -130,13 +145,42 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .expect("metadata backend checked above")
                 .write_intents_page(intent_scan_cursor, DFS_METADATA_OBJECT_INTENT_PAGE_SIZE)?;
             for mut intent_record in intent_page.intents {
-                if self.metadata.object(&intent_record.object_id).is_none() {
-                    continue;
-                }
                 self.coordinator
                     .observe_restored_intent_id(&intent_record.intent_id);
                 if !write_intent_status_requires_hydrate_restore(&intent_record.status) {
                     continue;
+                }
+                if self.metadata.object(&intent_record.object_id).is_none() {
+                    if !matches!(
+                        intent_record.status,
+                        DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+                    ) {
+                        continue;
+                    }
+                    let Some(object) = intent_record.object_metadata.clone() else {
+                        continue;
+                    };
+                    if object.object_id != intent_record.object_id
+                        || object.file_system_id != intent_record.file_system_id
+                    {
+                        continue;
+                    }
+                    let durable_path_object = self
+                        .metadata_backend
+                        .as_ref()
+                        .expect("metadata backend checked above")
+                        .get_object_by_path(&object.file_system_id, &object.path)?;
+                    if durable_path_object.as_ref().is_some_and(|durable| {
+                        durable_path_object_fences_replayed_create(durable, &intent_record)
+                    }) {
+                        // The create lost a later namespace race while its
+                        // response was detached. A live object or compacted
+                        // tombstone other than the exact predecessor recorded
+                        // when the create began is authoritative, even if a
+                        // damaged index happens to reuse this object ID.
+                        self.mark_replayed_intent_as_rejected(&intent_record)?;
+                        continue;
+                    }
                 }
                 self.repair_visible_committed_pending_intent_record(&mut intent_record)?;
                 let intent = distributed_intent_from_record(&intent_record);
@@ -211,43 +255,85 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .collect();
         let mut recovered_commit_ready_intent_ids = Vec::new();
         for intent_record in pending_write_records {
-            let Some(restored_intent) = self.coordinator.intent(&intent_record.intent_id) else {
-                continue;
-            };
-            if !distributed_intent_matches_record(restored_intent, &intent_record) {
+            if !self
+                .coordinator
+                .intent(&intent_record.intent_id)
+                .is_some_and(|restored_intent| {
+                    distributed_intent_matches_record(restored_intent, &intent_record)
+                })
+            {
                 continue;
             }
+            let commit_ready = self
+                .coordinator
+                .is_commit_ready(&intent_record.intent_id)
+                .unwrap_or(false);
+            let missing_visible_object = self.metadata.object(&intent_record.object_id).is_none();
+            if missing_visible_object
+                && (!matches!(
+                    intent_record.status,
+                    DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+                ) || !commit_ready)
+            {
+                continue;
+            }
+            let authority_object = self
+                .metadata
+                .object(&intent_record.object_id)
+                .cloned()
+                .or_else(|| intent_record.object_metadata.clone());
             let locally_coordinated_intent = intent_record.coordinator_node_id == self.node_id;
-            let needs_pending_write = locally_coordinated_intent
+            let locally_authoritative_intent = if locally_coordinated_intent {
+                true
+            } else if missing_visible_object
+                && commit_ready
+                && matches!(
+                    intent_record.status,
+                    DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+                )
+                && let Some(object) = authority_object.as_ref()
+            {
+                self.is_local_metadata_primary_for_object(object)?
+            } else {
+                false
+            };
+            let needs_pending_write = locally_authoritative_intent
                 && (matches!(
                     intent_record.status,
                     DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
                 ) || (matches!(intent_record.status, DfsWriteIntentStatus::Committed)
                     && repair_intent_ids.contains(&intent_record.intent_id)));
             if needs_pending_write && let Some(content_hash) = intent_record.content_hash.clone() {
-                let size_bytes = self
-                    .pending_write_size_hint(
-                        &intent_record.object_id,
-                        &intent_record.target_version,
-                        &content_hash,
-                    )?
-                    .unwrap_or(0);
+                let size_hint = self.pending_write_size_hint(
+                    &intent_record.object_id,
+                    &intent_record.target_version,
+                    &content_hash,
+                )?;
+                if missing_visible_object && size_hint.is_none() {
+                    continue;
+                }
+                if missing_visible_object {
+                    let Some(object) = authority_object else {
+                        continue;
+                    };
+                    // A create intent is durable before its first visible object.
+                    // Expose its base metadata only once durable receipts prove the
+                    // write commit-ready, immediately before finalizing it.
+                    self.add_transient_object_metadata(object)?;
+                }
                 self.pending_writes.insert(
                     intent_record.intent_id.clone(),
                     PendingNetworkedWrite::new(
                         intent_record.object_id.clone(),
                         intent_record.target_version.clone(),
                         content_hash,
-                        size_bytes,
+                        size_hint.unwrap_or(0),
                     ),
                 );
                 if matches!(
                     intent_record.status,
                     DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
-                ) && self
-                    .coordinator
-                    .is_commit_ready(&intent_record.intent_id)
-                    .unwrap_or(false)
+                ) && commit_ready
                 {
                     recovered_commit_ready_intent_ids.push(intent_record.intent_id.clone());
                 }
@@ -763,6 +849,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<(), DfsError> {
         normalize_current_locations(&mut object.current_locations);
         self.transient_metadata_object_ids.remove(&object.object_id);
+        self.transient_metadata_predecessor_object_ids
+            .remove(&object.object_id);
         if !self
             .metadata
             .filesystems

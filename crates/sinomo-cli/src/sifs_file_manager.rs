@@ -103,8 +103,58 @@ impl SifsFileManagerBackend {
             .map_err(|_| "SIFS service lock is poisoned".to_string())
     }
 
+    fn lock_service_with_deadline(
+        &self,
+        operation_deadline: Option<Instant>,
+    ) -> Result<std::sync::MutexGuard<'_, NetworkedDfsService<DfsNodeTransport>>, String> {
+        let Some(deadline) = operation_deadline else {
+            return self.lock_service();
+        };
+        loop {
+            match self.service.try_lock() {
+                Ok(service) => return Ok(service),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err("SIFS service lock is poisoned".to_string());
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let remaining = sifs_operation_remaining(
+                        Some(deadline),
+                        "waiting for the SIFS service lock",
+                    )?
+                    .expect("deadline is present");
+                    std::thread::sleep(Duration::from_millis(1).min(remaining));
+                }
+            }
+        }
+    }
+
     fn refresh_service_peer_targets(&self, service: &mut NetworkedDfsService<DfsNodeTransport>) {
+        self.refresh_service_peer_targets_with_deadline(service, None);
+    }
+
+    fn refresh_service_peer_targets_with_deadline(
+        &self,
+        service: &mut NetworkedDfsService<DfsNodeTransport>,
+        operation_deadline: Option<Instant>,
+    ) {
         let now = Instant::now();
+        if operation_deadline.is_some() {
+            let needs_refresh = match self.peer_targets_refreshed_at.try_lock() {
+                Ok(refreshed_at) => !refreshed_at
+                    .as_ref()
+                    .is_some_and(|last| now.duration_since(*last) < SIFS_PEER_TARGET_REFRESH_TTL),
+                Err(_) => false,
+            };
+            if !needs_refresh {
+                return;
+            }
+            if self.refresh_service_peer_targets_now(service, operation_deadline)
+                && let Ok(mut refreshed_at) = self.peer_targets_refreshed_at.try_lock()
+            {
+                *refreshed_at = Some(now);
+            }
+            return;
+        }
         if let Ok(mut refreshed_at) = self.peer_targets_refreshed_at.lock() {
             if refreshed_at
                 .as_ref()
@@ -112,23 +162,37 @@ impl SifsFileManagerBackend {
             {
                 return;
             }
-            if self.refresh_service_peer_targets_now(service) {
+            if self.refresh_service_peer_targets_now(service, operation_deadline) {
                 *refreshed_at = Some(now);
             }
             return;
         }
-        let _ = self.refresh_service_peer_targets_now(service);
+        let _ = self.refresh_service_peer_targets_now(service, operation_deadline);
     }
 
     fn refresh_service_peer_targets_now(
         &self,
         service: &mut NetworkedDfsService<DfsNodeTransport>,
+        operation_deadline: Option<Instant>,
     ) -> bool {
         let cluster_paths = ClusterPaths::new(&self.data_dir);
         if !cluster_paths.state.exists() {
             return false;
         }
-        if refresh_sifs_cluster_kv_snapshot(&self.data_dir, &cluster_paths).is_err() {
+        if let Some(deadline) = operation_deadline {
+            if sifs_operation_remaining(Some(deadline), "refreshing SIFS peer targets").is_err() {
+                return false;
+            }
+            let peer_transport: Arc<dyn DfsPeerTransport> = Arc::new(
+                SifsDfsPeerTransport::new(self.rpc_runtime.clone(), self.data_dir.clone())
+                    .with_operation_deadline(Some(deadline)),
+            );
+            if refresh_cluster_dfs_kv_snapshot_with_peer_transport(&cluster_paths, peer_transport)
+                .is_err()
+            {
+                return false;
+            }
+        } else if refresh_sifs_cluster_kv_snapshot(&self.data_dir, &cluster_paths).is_err() {
             return false;
         }
         let Ok(state) = cluster::read_cluster_state(&cluster_paths) else {
@@ -139,37 +203,71 @@ impl SifsFileManagerBackend {
     }
 
     pub(crate) fn publish_metadata_after_mutation(&self) -> Result<(), String> {
-        self.prepare_metadata_after_mutation()?;
-        let result = publish_sifs_metadata_journal_from_data_dir(&self.data_dir, &self.rpc_runtime)
-            .map(|_| ())
-            .map_err(|error| error.to_string());
-        let _ = request_sifs_daemon_maintenance_refresh(&self.data_dir);
-        result
+        self.publish_metadata_after_mutation_with_deadline(None)
+    }
+
+    fn publish_metadata_after_mutation_with_deadline(
+        &self,
+        operation_deadline: Option<Instant>,
+    ) -> Result<(), String> {
+        self.prepare_metadata_after_mutation(operation_deadline)?;
+        sifs_operation_remaining(operation_deadline, "metadata publication")?;
+        let result = publish_sifs_metadata_journal_from_data_dir(
+            &self.data_dir,
+            &self.rpc_runtime,
+            operation_deadline,
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string());
+        if operation_deadline.is_none() {
+            let _ = request_sifs_daemon_maintenance_refresh(&self.data_dir);
+        }
+        result?;
+        sifs_operation_remaining(operation_deadline, "metadata publication")?;
+        Ok(())
     }
 
     pub(crate) fn publish_metadata_after_mutation_report(
         &self,
     ) -> Result<DfsMetadataJournalReplicationReport, String> {
-        self.prepare_metadata_after_mutation()?;
-        let report = publish_sifs_metadata_journal_from_data_dir(&self.data_dir, &self.rpc_runtime)
-            .map_err(|error| error.to_string())?;
+        self.prepare_metadata_after_mutation(None)?;
+        let report =
+            publish_sifs_metadata_journal_from_data_dir(&self.data_dir, &self.rpc_runtime, None)
+                .map_err(|error| error.to_string())?;
         let _ = request_sifs_daemon_maintenance_refresh(&self.data_dir);
         Ok(report)
     }
 
-    fn prepare_metadata_after_mutation(&self) -> Result<(), String> {
-        if let Ok(mut service) = self.lock_service() {
-            service
-                .flush_deferred_content_durability()
-                .map_err(|error| error.to_string())?;
-            service
-                .flush_detached_transport_sends()
-                .map_err(|error| error.to_string())?;
-            service
-                .process_incoming_until_pending_routed_writes_ready(
-                    network::DEFAULT_NETWORK_TIMEOUT,
-                )
-                .map_err(|error| error.to_string())?;
+    fn prepare_metadata_after_mutation(
+        &self,
+        operation_deadline: Option<Instant>,
+    ) -> Result<(), String> {
+        if let Ok(mut service) = self.lock_service_with_deadline(operation_deadline) {
+            let previous_deadline = operation_deadline
+                .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
+            let result: Result<(), String> = (|| {
+                sifs_operation_remaining(operation_deadline, "deferred content durability")?;
+                service
+                    .flush_deferred_content_durability()
+                    .map_err(|error| error.to_string())?;
+                sifs_operation_remaining(operation_deadline, "detached DFS sends")?;
+                service
+                    .flush_detached_transport_sends()
+                    .map_err(|error| error.to_string())?;
+                let response_wait =
+                    sifs_operation_remaining(operation_deadline, "pending routed write responses")?
+                        .map(|remaining| remaining.min(network::DEFAULT_NETWORK_TIMEOUT))
+                        .unwrap_or(network::DEFAULT_NETWORK_TIMEOUT);
+                service
+                    .process_incoming_until_pending_routed_writes_ready(response_wait)
+                    .map_err(|error| error.to_string())?;
+                sifs_operation_remaining(operation_deadline, "pending routed write responses")?;
+                Ok(())
+            })();
+            if let Some(previous_deadline) = previous_deadline {
+                service.set_transport_operation_deadline(previous_deadline);
+            }
+            result?;
         }
         Ok(())
     }
@@ -312,7 +410,7 @@ impl SifsFileManagerBackend {
     }
 
     pub(crate) fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
-        self.write_file_with_options(path, bytes, false, true, None)
+        self.write_file_with_options(path, bytes, false, false, true, None)
     }
 
     pub(crate) fn write_file_with_deadline(
@@ -321,7 +419,16 @@ impl SifsFileManagerBackend {
         bytes: &[u8],
         deadline: Instant,
     ) -> Result<(), String> {
-        self.write_file_with_options(path, bytes, false, true, Some(deadline))
+        self.write_file_with_options(path, bytes, false, false, true, Some(deadline))
+    }
+
+    pub(crate) fn write_file_wait_for_commit_with_deadline(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<(), String> {
+        self.write_file_with_options(path, bytes, false, true, true, Some(deadline))
     }
 
     pub(crate) fn write_file_with_foreground_replica_repair_deadline(
@@ -330,7 +437,7 @@ impl SifsFileManagerBackend {
         bytes: &[u8],
         deadline: Instant,
     ) -> Result<(), String> {
-        self.write_file_with_options(path, bytes, true, true, Some(deadline))
+        self.write_file_with_options(path, bytes, true, true, true, Some(deadline))
     }
 
     pub(crate) fn create_dir_all_deferred_publish_until(
@@ -339,13 +446,18 @@ impl SifsFileManagerBackend {
         deadline: Instant,
     ) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
-        let mut service = self.lock_service()?;
-        self.refresh_service_peer_targets(&mut service);
+        let operation_deadline = Some(deadline);
+        sifs_operation_remaining(operation_deadline, "SIFS directory create")?;
+        let mut service = self.lock_service_with_deadline(operation_deadline)?;
         let previous_deadline = service.set_transport_operation_deadline(Some(deadline));
-        let result = service
-            .posix_mkdir_all(&path)
-            .map(|_| ())
-            .map_err(|error| format!("cannot create SIFS directory {path}: {error}"));
+        let result = (|| {
+            self.refresh_service_peer_targets_with_deadline(&mut service, operation_deadline);
+            sifs_operation_remaining(operation_deadline, "refreshing SIFS peer targets")?;
+            service
+                .posix_mkdir_all(&path)
+                .map(|_| ())
+                .map_err(|error| format!("cannot create SIFS directory {path}: {error}"))
+        })();
         service.set_transport_operation_deadline(previous_deadline);
         result
     }
@@ -355,16 +467,19 @@ impl SifsFileManagerBackend {
         path: &str,
         bytes: &[u8],
         foreground_replica_repair: bool,
+        wait_for_commit: bool,
         publish_metadata: bool,
         operation_deadline: Option<Instant>,
     ) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
-        let mut service = self.lock_service()?;
-        self.refresh_service_peer_targets(&mut service);
+        sifs_operation_remaining(operation_deadline, "SIFS write")?;
+        let mut service = self.lock_service_with_deadline(operation_deadline)?;
         let previous_deadline = operation_deadline
             .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
         let result = (|| {
-            let mut options = if foreground_replica_repair {
+            self.refresh_service_peer_targets_with_deadline(&mut service, operation_deadline);
+            sifs_operation_remaining(operation_deadline, "refreshing SIFS peer targets")?;
+            let mut options = if wait_for_commit {
                 sifs_write_options(&service, &self.replica_candidates)
             } else {
                 sifs_deferred_publish_write_options(&service, &self.replica_candidates)
@@ -407,7 +522,7 @@ impl SifsFileManagerBackend {
         result?;
         drop(service);
         if publish_metadata {
-            self.publish_metadata_after_mutation()?;
+            self.publish_metadata_after_mutation_with_deadline(operation_deadline)?;
         }
         Ok(())
     }
@@ -429,18 +544,22 @@ impl SifsFileManagerBackend {
             .iter()
             .map(|(path, bytes)| normalize_sifs_path(path).map(|path| (path, bytes.as_slice())))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut service = self.lock_service()?;
-        self.refresh_service_peer_targets(&mut service);
+        sifs_operation_remaining(operation_deadline, "SIFS bulk write")?;
+        let mut service = self.lock_service_with_deadline(operation_deadline)?;
         let previous_deadline = operation_deadline
             .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
-        let result = service
-            .posix_create_files_local_eventual_with_known_parents(
-                normalized
-                    .iter()
-                    .map(|(path, bytes)| (path.as_str(), *bytes)),
-            )
-            .map(|_| ())
-            .map_err(|error| format!("cannot write SIFS bulk batch: {error}"));
+        let result = (|| {
+            self.refresh_service_peer_targets_with_deadline(&mut service, operation_deadline);
+            sifs_operation_remaining(operation_deadline, "refreshing SIFS peer targets")?;
+            service
+                .posix_create_files_local_eventual_with_known_parents(
+                    normalized
+                        .iter()
+                        .map(|(path, bytes)| (path.as_str(), *bytes)),
+                )
+                .map(|_| ())
+                .map_err(|error| format!("cannot write SIFS bulk batch: {error}"))
+        })();
         if let Some(previous_deadline) = previous_deadline {
             service.set_transport_operation_deadline(previous_deadline);
         }
@@ -467,10 +586,13 @@ impl SifsFileManagerBackend {
         deadline: Instant,
     ) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
-        let mut service = self.lock_service()?;
-        self.refresh_service_peer_targets(&mut service);
+        let operation_deadline = Some(deadline);
+        sifs_operation_remaining(operation_deadline, "SIFS known-parent write")?;
+        let mut service = self.lock_service_with_deadline(operation_deadline)?;
         let previous_deadline = service.set_transport_operation_deadline(Some(deadline));
         let result = (|| {
+            self.refresh_service_peer_targets_with_deadline(&mut service, operation_deadline);
+            sifs_operation_remaining(operation_deadline, "refreshing SIFS peer targets")?;
             let options = sifs_write_options(&service, &self.replica_candidates);
             service
                 .posix_write_file_with_known_parent(&path, bytes, options)
@@ -488,11 +610,13 @@ impl SifsFileManagerBackend {
         operation_deadline: Option<Instant>,
     ) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
-        let mut service = self.lock_service()?;
-        self.refresh_service_peer_targets(&mut service);
+        sifs_operation_remaining(operation_deadline, "SIFS deferred known-parent write")?;
+        let mut service = self.lock_service_with_deadline(operation_deadline)?;
         let previous_deadline = operation_deadline
             .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
         let result = (|| {
+            self.refresh_service_peer_targets_with_deadline(&mut service, operation_deadline);
+            sifs_operation_remaining(operation_deadline, "refreshing SIFS peer targets")?;
             let options = sifs_deferred_publish_write_options(&service, &self.replica_candidates);
             service
                 .posix_write_file_with_known_parent_deferred_local_replay(&path, bytes, options)
@@ -1363,6 +1487,7 @@ fn sifs_replica_candidate_rank(
 struct SifsDfsPeerTransport {
     rpc_runtime: SifsRpcRuntime,
     data_dir: SinomoDataDir,
+    operation_deadline: Option<Instant>,
 }
 
 impl SifsDfsPeerTransport {
@@ -1370,7 +1495,13 @@ impl SifsDfsPeerTransport {
         Self {
             rpc_runtime,
             data_dir,
+            operation_deadline: None,
         }
+    }
+
+    fn with_operation_deadline(mut self, operation_deadline: Option<Instant>) -> Self {
+        self.operation_deadline = operation_deadline;
+        self
     }
 }
 
@@ -1381,12 +1512,16 @@ impl DfsPeerTransport for SifsDfsPeerTransport {
         request: &network::ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> Result<network::ObjectRpcResponse, DfsPeerTransportError> {
+        let operation_deadline =
+            sifs_rpc_effective_operation_deadline(&options, self.operation_deadline);
+        let options = sifs_rpc_options_with_operation_deadline(options, operation_deadline)?;
         sifs_send_dfs_object_rpc(
             &self.rpc_runtime,
             &self.data_dir,
             target_node_id,
             request,
             options,
+            operation_deadline,
         )
     }
 }
@@ -1398,6 +1533,12 @@ impl AsyncDfsPeerTransport for SifsDfsPeerTransport {
         request: &'a network::ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> DfsPeerTransportFuture<'a, Result<network::ObjectRpcResponse, DfsPeerTransportError>> {
+        let operation_deadline =
+            sifs_rpc_effective_operation_deadline(&options, self.operation_deadline);
+        let options = match sifs_rpc_options_with_operation_deadline(options, operation_deadline) {
+            Ok(options) => options,
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
         let handle = self.rpc_runtime.runtime.handle().clone();
         let target_node_id = target_node_id.clone();
         let request = request.clone();
@@ -1405,20 +1546,38 @@ impl AsyncDfsPeerTransport for SifsDfsPeerTransport {
         Box::pin(async move {
             let daemon_target_node_id = target_node_id.clone();
             let daemon_request = request.clone();
-            if let Some(result) = tokio::task::spawn_blocking(move || {
+            let daemon_probe = tokio::task::spawn_blocking(move || {
                 sifs_send_dfs_object_rpc_via_daemon(
                     &data_dir,
                     &daemon_target_node_id,
                     &daemon_request,
                     options,
+                    operation_deadline,
                 )
-            })
-            .await
-            .map_err(|error| DfsPeerTransportError::new(error.to_string()))?
-            {
+            });
+            let daemon_result = if let Some(deadline) = operation_deadline {
+                let remaining = sifs_rpc_remaining_operation_budget(
+                    deadline,
+                    "waiting for local daemon discovery",
+                )?;
+                tokio::time::timeout(remaining, daemon_probe)
+                    .await
+                    .map_err(|_| {
+                        DfsPeerTransportError::new(
+                            "SIFS operation deadline expired during local daemon discovery",
+                        )
+                    })?
+                    .map_err(|error| DfsPeerTransportError::new(error.to_string()))?
+            } else {
+                daemon_probe
+                    .await
+                    .map_err(|error| DfsPeerTransportError::new(error.to_string()))?
+            };
+            if let Some(result) = daemon_result {
                 return result;
             }
 
+            let options = sifs_rpc_options_with_operation_deadline(options, operation_deadline)?;
             sinomo_runtime::daemon::send_object_rpc_to_target_async_with_options(
                 &target_node_id,
                 &request,
@@ -1432,18 +1591,71 @@ impl AsyncDfsPeerTransport for SifsDfsPeerTransport {
     }
 }
 
+fn sifs_rpc_effective_operation_deadline(
+    options: &DfsObjectRpcSendOptions,
+    operation_deadline: Option<Instant>,
+) -> Option<Instant> {
+    let now = Instant::now();
+    let relative_deadline = options
+        .overall_timeout
+        .map(|timeout| now.checked_add(timeout).unwrap_or(now));
+    match (operation_deadline, relative_deadline) {
+        (Some(operation), Some(relative)) => Some(operation.min(relative)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
+}
+
+fn sifs_rpc_remaining_operation_budget(
+    deadline: Instant,
+    operation: &str,
+) -> Result<Duration, DfsPeerTransportError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| {
+            DfsPeerTransportError::new(format!(
+                "SIFS operation deadline expired during {operation}"
+            ))
+        })
+}
+
+fn sifs_rpc_options_with_operation_deadline(
+    mut options: DfsObjectRpcSendOptions,
+    operation_deadline: Option<Instant>,
+) -> Result<DfsObjectRpcSendOptions, DfsPeerTransportError> {
+    let Some(deadline) = operation_deadline else {
+        return Ok(options);
+    };
+    let remaining = sifs_rpc_remaining_operation_budget(deadline, "SIFS peer RPC dispatch")?;
+    options.overall_timeout = Some(
+        options
+            .overall_timeout
+            .map(|timeout| timeout.min(remaining))
+            .unwrap_or(remaining),
+    );
+    Ok(options)
+}
+
 fn sifs_send_dfs_object_rpc(
     rpc_runtime: &SifsRpcRuntime,
     data_dir: &SinomoDataDir,
     target_node_id: &NodeId,
     request: &network::ObjectRpcRequest,
     options: DfsObjectRpcSendOptions,
+    operation_deadline: Option<Instant>,
 ) -> Result<network::ObjectRpcResponse, DfsPeerTransportError> {
-    if let Some(result) =
-        sifs_send_dfs_object_rpc_via_daemon(data_dir, target_node_id, request, options)
-    {
+    let options = sifs_rpc_options_with_operation_deadline(options, operation_deadline)?;
+    if let Some(result) = sifs_send_dfs_object_rpc_via_daemon(
+        data_dir,
+        target_node_id,
+        request,
+        options,
+        operation_deadline,
+    ) {
         return result;
     }
+    let options = sifs_rpc_options_with_operation_deadline(options, operation_deadline)?;
 
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         if matches!(
@@ -1492,10 +1704,38 @@ fn sifs_send_dfs_object_rpc_via_daemon(
     target_node_id: &NodeId,
     request: &network::ObjectRpcRequest,
     options: DfsObjectRpcSendOptions,
+    operation_deadline: Option<Instant>,
 ) -> Option<Result<network::ObjectRpcResponse, DfsPeerTransportError>> {
     let paths = sinomo_runtime::daemon::DaemonPaths::new(data_dir);
-    let Ok(client) = sinomo_runtime::daemon::DaemonApiClient::connect_for_paths(&paths) else {
+    let client = if let Some(deadline) = operation_deadline {
+        let remaining =
+            match sifs_rpc_remaining_operation_budget(deadline, "local daemon discovery") {
+                Ok(remaining) => remaining,
+                Err(error) => return Some(Err(error)),
+            };
+        sinomo_runtime::daemon::DaemonApiClient::connect_for_paths_with_timeout(
+            &paths,
+            remaining.min(sinomo_runtime::daemon::DAEMON_API_PROBE_TIMEOUT),
+        )
+    } else {
+        sinomo_runtime::daemon::DaemonApiClient::connect_for_paths(&paths)
+    };
+    let Ok(client) = client else {
         return None;
+    };
+    let options = match sifs_rpc_options_with_operation_deadline(options, operation_deadline) {
+        Ok(options) => options,
+        Err(error) => return Some(Err(error)),
+    };
+    let client = if let Some(deadline) = operation_deadline {
+        let remaining = match sifs_rpc_remaining_operation_budget(deadline, "daemon-forwarded RPC")
+        {
+            Ok(remaining) => remaining,
+            Err(error) => return Some(Err(error)),
+        };
+        client.with_timeout(remaining)
+    } else {
+        client
     };
     Some(
         client
@@ -1507,17 +1747,20 @@ fn sifs_send_dfs_object_rpc_via_daemon(
 fn publish_sifs_metadata_journal_from_data_dir(
     data_dir: &SinomoDataDir,
     rpc_runtime: &SifsRpcRuntime,
+    operation_deadline: Option<Instant>,
 ) -> Result<DfsMetadataJournalReplicationReport, sinomo_runtime::dfs::DfsError> {
     let cluster_paths = ClusterPaths::new(data_dir);
-    let peer_transport: Arc<dyn DfsPeerTransport> = Arc::new(SifsDfsPeerTransport::new(
-        rpc_runtime.clone(),
-        data_dir.clone(),
-    ));
+    let peer_transport: Arc<dyn DfsPeerTransport> = Arc::new(
+        SifsDfsPeerTransport::new(rpc_runtime.clone(), data_dir.clone())
+            .with_operation_deadline(operation_deadline),
+    );
+    let options = sifs_foreground_metadata_publish_options_with_deadline(operation_deadline)
+        .map_err(|message| sinomo_runtime::dfs::DfsError::Network { message })?;
     publish_cluster_dfs_metadata_journal_with_peer_transport(
         data_dir,
         &cluster_paths,
         peer_transport,
-        sifs_foreground_metadata_publish_options(),
+        options,
     )
 }
 
@@ -1526,6 +1769,17 @@ fn sifs_foreground_metadata_publish_options() -> DfsMetadataJournalReplicationOp
         max_batches_per_target: SIFS_FOREGROUND_METADATA_PUBLISH_MAX_BATCHES_PER_TARGET,
         ..DfsMetadataJournalReplicationOptions::default()
     }
+}
+
+fn sifs_foreground_metadata_publish_options_with_deadline(
+    operation_deadline: Option<Instant>,
+) -> Result<DfsMetadataJournalReplicationOptions, String> {
+    let mut options = sifs_foreground_metadata_publish_options();
+    if let Some(remaining) = sifs_operation_remaining(operation_deadline, "metadata publication")? {
+        options.attempt_timeout = options.attempt_timeout.min(remaining);
+        options.target_timeout = options.target_timeout.min(remaining);
+    }
+    Ok(options)
 }
 
 fn request_sifs_daemon_maintenance_refresh(data_dir: &SinomoDataDir) -> bool {
@@ -1608,6 +1862,20 @@ fn ensure_sifs_parent_directory_for_write(
 
 fn sifs_write_error_needs_parent_create(error: &DfsPosixError) -> bool {
     matches!(error, DfsPosixError::MissingParent { .. })
+}
+
+fn sifs_operation_remaining(
+    operation_deadline: Option<Instant>,
+    operation: &str,
+) -> Result<Option<Duration>, String> {
+    let Some(deadline) = operation_deadline else {
+        return Ok(None);
+    };
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .map(Some)
+        .ok_or_else(|| format!("SIFS operation deadline expired during {operation}"))
 }
 
 fn sifs_entry_kind(kind: &DfsObjectKind) -> FileManagerEntryKind {
@@ -1702,6 +1970,197 @@ mod tests {
              deadlock whichever thread drops the last handle while a blocking \
              daemon probe or peer RPC is still in flight"
         );
+    }
+
+    #[test]
+    fn metadata_peer_rpc_options_are_clamped_to_remaining_operation_budget() {
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let options = sifs_rpc_options_with_operation_deadline(
+            DfsObjectRpcSendOptions::default().with_overall_timeout(Duration::from_secs(5)),
+            Some(deadline),
+        )
+        .expect("bounded metadata RPC options");
+        let overall_timeout = options.overall_timeout.expect("overall timeout");
+        assert!(overall_timeout > Duration::ZERO);
+        assert!(
+            overall_timeout <= Duration::from_millis(100),
+            "metadata RPC must receive only the operation's remaining budget: {overall_timeout:?}"
+        );
+    }
+
+    #[test]
+    fn peer_rpc_budget_is_recomputed_after_daemon_discovery_time() {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let initial = sifs_rpc_options_with_operation_deadline(
+            DfsObjectRpcSendOptions::default().with_overall_timeout(Duration::from_secs(5)),
+            Some(deadline),
+        )
+        .expect("initial bounded options")
+        .overall_timeout
+        .expect("initial overall timeout");
+        std::thread::sleep(Duration::from_millis(30));
+        let before_dispatch = Instant::now();
+        let after_discovery = sifs_rpc_options_with_operation_deadline(
+            DfsObjectRpcSendOptions::default().with_overall_timeout(initial),
+            Some(deadline),
+        )
+        .expect("dispatch-time bounded options")
+        .overall_timeout
+        .expect("dispatch-time overall timeout");
+
+        assert!(
+            after_discovery < initial,
+            "daemon discovery time restarted the route budget: initial={initial:?}, after={after_discovery:?}"
+        );
+        assert!(
+            after_discovery <= deadline.saturating_duration_since(before_dispatch),
+            "dispatch timeout exceeds the remaining absolute operation budget"
+        );
+    }
+
+    #[test]
+    fn relative_rpc_timeout_becomes_an_absolute_dispatch_deadline() {
+        let started_at = Instant::now();
+        let options =
+            DfsObjectRpcSendOptions::default().with_overall_timeout(Duration::from_millis(100));
+        let deadline =
+            sifs_rpc_effective_operation_deadline(&options, None).expect("relative RPC deadline");
+
+        assert!(deadline > started_at);
+        assert!(
+            deadline.saturating_duration_since(started_at) <= Duration::from_millis(110),
+            "relative route timeout was not converted at transport entry"
+        );
+    }
+
+    #[test]
+    fn metadata_peer_rpc_options_reject_an_expired_operation_budget() {
+        let error = sifs_rpc_options_with_operation_deadline(
+            DfsObjectRpcSendOptions::default(),
+            Some(Instant::now() - Duration::from_millis(1)),
+        )
+        .expect_err("expired metadata RPC must fail before transport dispatch");
+
+        assert!(error.to_string().contains("operation deadline expired"));
+    }
+
+    #[test]
+    fn wait_for_commit_write_rejects_an_already_expired_deadline() {
+        let root = temp_sifs_data_dir("expired-wait-for-commit");
+        let data_dir = SinomoDataDir::new(&root);
+        let backend = SifsFileManagerBackend::open(&data_dir).expect("backend");
+        let path = "/services/expired-wait-for-commit.txt";
+
+        let error = backend
+            .write_file_wait_for_commit_with_deadline(
+                path,
+                b"must not be written",
+                Instant::now() - Duration::from_millis(1),
+            )
+            .expect_err("expired write must fail before mutating DFS");
+
+        assert!(error.contains("operation deadline expired"));
+        assert!(
+            backend.dfs_stat(path).is_err(),
+            "expired write became visible"
+        );
+    }
+
+    #[test]
+    fn wait_for_commit_write_bounds_service_lock_contention() {
+        let root = temp_sifs_data_dir("contended-wait-for-commit");
+        let data_dir = SinomoDataDir::new(&root);
+        let backend = Arc::new(SifsFileManagerBackend::open(&data_dir).expect("backend"));
+        let contended = Arc::clone(&backend);
+        let service_guard = backend.lock_service().expect("service lock");
+        let started_at = Instant::now();
+        let writer = std::thread::spawn(move || {
+            contended.write_file_wait_for_commit_with_deadline(
+                "/services/contended-wait-for-commit.txt",
+                b"must not be written",
+                Instant::now() + Duration::from_millis(30),
+            )
+        });
+
+        let error = writer
+            .join()
+            .expect("writer thread")
+            .expect_err("contended lock must respect the write deadline");
+        drop(service_guard);
+
+        assert!(error.contains("operation deadline expired"));
+        assert!(
+            started_at.elapsed() < Duration::from_millis(500),
+            "service lock contention exceeded the caller deadline"
+        );
+    }
+
+    #[test]
+    fn deadline_named_deferred_helpers_bound_service_lock_contention() {
+        type ContendedOperation = Box<
+            dyn FnOnce(Arc<SifsFileManagerBackend>, Instant) -> Result<(), String> + Send + 'static,
+        >;
+
+        let root = temp_sifs_data_dir("contended-deadline-helpers");
+        let data_dir = SinomoDataDir::new(&root);
+        let backend = Arc::new(SifsFileManagerBackend::open(&data_dir).expect("backend"));
+        let service_guard = backend.lock_service().expect("service lock");
+        let run_contended = |label: &str, operation: ContendedOperation| {
+            let contended = Arc::clone(&backend);
+            let started_at = Instant::now();
+            let worker = std::thread::spawn(move || {
+                operation(contended, Instant::now() + Duration::from_millis(30))
+            });
+            let error = worker
+                .join()
+                .expect("deadline helper thread")
+                .expect_err("contended helper must respect its deadline");
+            assert!(
+                error.contains("operation deadline expired"),
+                "unexpected {label} error: {error}"
+            );
+            assert!(
+                started_at.elapsed() < Duration::from_millis(500),
+                "{label} exceeded its caller deadline"
+            );
+        };
+
+        run_contended(
+            "directory create",
+            Box::new(|backend, deadline| {
+                backend.create_dir_all_deferred_publish_until("/services/contended-dir", deadline)
+            }),
+        );
+        run_contended(
+            "bulk write",
+            Box::new(|backend, deadline| {
+                backend.write_files_with_known_parents_deferred_publish_until(
+                    &[("/services/contended-bulk.txt".to_string(), b"bulk".to_vec())],
+                    deadline,
+                )
+            }),
+        );
+        run_contended(
+            "known-parent write",
+            Box::new(|backend, deadline| {
+                backend.write_file_with_known_parent_no_publish_until(
+                    "/services/contended-known.txt",
+                    b"known",
+                    deadline,
+                )
+            }),
+        );
+        run_contended(
+            "deferred known-parent write",
+            Box::new(|backend, deadline| {
+                backend.write_file_with_known_parent_deferred_publish_until(
+                    "/services/contended-deferred.txt",
+                    b"deferred",
+                    deadline,
+                )
+            }),
+        );
+        drop(service_guard);
     }
 
     #[test]

@@ -327,6 +327,7 @@ pub(crate) fn dfs_direct_read_sender_from_peer_transport(
 struct DeferredDfsPeerSend {
     sender: DfsMessageSender,
     options: DfsObjectRpcSendOptions,
+    operation_deadline: Option<Instant>,
     target_node_id: NodeId,
     routed_message: DfsRoutedMessage,
 }
@@ -553,12 +554,27 @@ impl DfsNodeTransport {
         std::mem::replace(&mut self.operation_deadline, deadline)
     }
 
+    pub fn operation_deadline(&self) -> Option<Instant> {
+        self.operation_deadline
+    }
+
     fn current_send_options(
         &self,
         operation: impl Into<String>,
     ) -> Result<DfsObjectRpcSendOptions, NetworkError> {
-        let options = DfsObjectRpcSendOptions::new(self.connect_timeout);
-        let Some(deadline) = self.operation_deadline else {
+        Self::clamp_send_options_to_operation_deadline(
+            DfsObjectRpcSendOptions::new(self.connect_timeout),
+            self.operation_deadline,
+            operation,
+        )
+    }
+
+    fn clamp_send_options_to_operation_deadline(
+        mut options: DfsObjectRpcSendOptions,
+        operation_deadline: Option<Instant>,
+        operation: impl Into<String>,
+    ) -> Result<DfsObjectRpcSendOptions, NetworkError> {
+        let Some(deadline) = operation_deadline else {
             return Ok(options);
         };
         let Some(remaining) = deadline
@@ -570,7 +586,23 @@ impl DfsNodeTransport {
                 detail: "DFS operation deadline expired before routed send".to_string(),
             });
         };
-        Ok(options.with_overall_timeout(remaining))
+        options.overall_timeout = Some(
+            options
+                .overall_timeout
+                .map_or(remaining, |timeout| timeout.min(remaining)),
+        );
+        Ok(options)
+    }
+
+    fn earlier_operation_deadline(
+        queued_deadline: Option<Instant>,
+        current_deadline: Option<Instant>,
+    ) -> Option<Instant> {
+        match (queued_deadline, current_deadline) {
+            (Some(queued), Some(current)) => Some(queued.min(current)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        }
     }
 
     fn replace_peer_nodes(&mut self, peer_node_ids: impl IntoIterator<Item = NodeId>) {
@@ -717,8 +749,12 @@ impl DfsNodeTransport {
                 detail: "DFS peer transport was constructed without a sync sender".to_string(),
             });
         };
-        let options =
-            self.current_send_options(format!("send detached DFS message to {target_node_id}"))?;
+        let operation_deadline = self.operation_deadline;
+        let options = Self::clamp_send_options_to_operation_deadline(
+            DfsObjectRpcSendOptions::new(self.connect_timeout),
+            operation_deadline,
+            format!("send detached DFS message to {target_node_id}"),
+        )?;
         let options = dfs_routed_message_send_options(&routed_message, options);
         self.detached_sends
             .lock()
@@ -729,6 +765,7 @@ impl DfsNodeTransport {
             .push(DeferredDfsPeerSend {
                 sender,
                 options,
+                operation_deadline,
                 target_node_id: target_node_id.clone(),
                 routed_message,
             });
@@ -743,16 +780,46 @@ impl DfsNodeTransport {
             })?;
             std::mem::take(&mut *sends)
         };
-        for send in sends {
-            let returned_messages = send_dfs_routed_message_to_peer(
-                send.sender,
-                send.options,
-                send.target_node_id,
-                send.routed_message,
-            )?;
-            for returned_message in returned_messages {
-                let target_node_id = returned_message.target_node_id.clone();
-                self.send_routed_message_to_peer(&target_node_id, returned_message, false)?;
+        let mut sends = VecDeque::from(sends);
+        while let Some(send) = sends.pop_front() {
+            let result = (|| {
+                let operation_deadline = Self::earlier_operation_deadline(
+                    send.operation_deadline,
+                    self.operation_deadline,
+                );
+                let options = Self::clamp_send_options_to_operation_deadline(
+                    send.options,
+                    operation_deadline,
+                    format!("flush detached DFS message send to {}", send.target_node_id),
+                )?;
+                let returned_messages = send_dfs_routed_message_to_peer(
+                    send.sender,
+                    options,
+                    send.target_node_id,
+                    send.routed_message,
+                )?;
+                for returned_message in returned_messages {
+                    let target_node_id = returned_message.target_node_id.clone();
+                    self.send_routed_message_to_peer(&target_node_id, returned_message, false)?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                // The current send may already have reached its target, so it
+                // cannot be replayed generically. The remaining suffix has not
+                // been attempted, however, and must stay queued so one failed
+                // peer cannot discard unrelated durable work. Put that older
+                // suffix ahead of sends concurrently enqueued through a clone.
+                if !sends.is_empty() {
+                    let mut queued = self.detached_sends.lock().map_err(|_| NetworkError::Io {
+                        operation: "restore detached DFS message sends".to_string(),
+                        detail: "detached send lock is poisoned".to_string(),
+                    })?;
+                    let mut preserved = sends.into_iter().collect::<Vec<_>>();
+                    preserved.append(&mut queued);
+                    *queued = preserved;
+                }
+                return Err(error);
             }
         }
         Ok(())
@@ -1191,6 +1258,10 @@ impl DfsMessageTransport for DfsNodeTransport {
         DfsNodeTransport::set_operation_deadline(self, deadline)
     }
 
+    fn operation_deadline(&self) -> Option<Instant> {
+        DfsNodeTransport::operation_deadline(self)
+    }
+
     fn transfer_profile(&self, target_node_id: &NodeId) -> DfsTransferProfile {
         self.transfer_profile_for_target(target_node_id)
     }
@@ -1432,6 +1503,195 @@ mod tests {
         assert!(
             second_overall < first_overall,
             "second send should receive only remaining operation budget: {observed:?}"
+        );
+    }
+
+    #[test]
+    fn detached_send_recomputes_remaining_operation_budget_when_flushed() {
+        let local = node_id("node_detached_deadline_local");
+        let remote = node_id("node_detached_deadline_remote");
+        let observed_options = Arc::new(Mutex::new(Vec::new()));
+        let sender_options = Arc::clone(&observed_options);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, options| {
+            sender_options
+                .lock()
+                .expect("options")
+                .push((options, Instant::now()));
+            Ok(DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: Vec::new(),
+            })
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![remote.clone()],
+            Duration::from_secs(60),
+            sender,
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        transport.set_operation_deadline(Some(deadline));
+
+        transport
+            .send_detached_routed_message(&remote, test_namespace_message(&local, &remote, 1))
+            .expect("queue detached send");
+        std::thread::sleep(Duration::from_millis(100));
+        transport
+            .flush_detached_sends()
+            .expect("flush detached send");
+
+        let observed = observed_options.lock().expect("options");
+        let (options, dispatched_at) = observed.first().expect("dispatched send");
+        let overall_timeout = options.overall_timeout.expect("operation budget");
+        let remaining_at_dispatch = deadline.saturating_duration_since(*dispatched_at);
+        assert!(
+            overall_timeout <= remaining_at_dispatch.saturating_add(Duration::from_millis(25)),
+            "detached send restarted its queued timeout budget: {options:?}"
+        );
+        assert!(
+            overall_timeout < Duration::from_millis(950),
+            "detached send did not account for time spent queued: {options:?}"
+        );
+        assert_eq!(
+            options.no_progress_timeout,
+            Some(crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT),
+            "dispatch-time deadline clamping must preserve message-specific options"
+        );
+    }
+
+    #[test]
+    fn detached_send_keeps_enqueued_absolute_deadline_when_transport_deadline_changes() {
+        let local = node_id("node_detached_expired_deadline_local");
+        let remote = node_id("node_detached_expired_deadline_remote");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sender_calls = Arc::clone(&calls);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            sender_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: Vec::new(),
+            })
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![remote.clone()],
+            Duration::from_secs(60),
+            sender,
+        );
+        transport.set_operation_deadline(Some(Instant::now() + Duration::from_millis(50)));
+        transport
+            .send_detached_routed_message(&remote, test_message(&local, &remote, 1))
+            .expect("queue detached send");
+
+        transport.set_operation_deadline(Some(Instant::now() + Duration::from_secs(5)));
+        std::thread::sleep(Duration::from_millis(80));
+        let error = transport
+            .flush_detached_sends()
+            .expect_err("queued operation deadline should expire before dispatch");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            error
+                .to_string()
+                .contains("DFS operation deadline expired before routed send"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn detached_send_clamps_unbounded_queue_to_current_flush_deadline() {
+        let local = node_id("node_detached_flush_deadline_local");
+        let remote = node_id("node_detached_flush_deadline_remote");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sender_calls = Arc::clone(&calls);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            sender_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: Vec::new(),
+            })
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![remote.clone()],
+            Duration::from_secs(60),
+            sender,
+        );
+        transport
+            .send_detached_routed_message(&remote, test_message(&local, &remote, 1))
+            .expect("queue unbounded detached send");
+
+        transport.set_operation_deadline(Some(Instant::now() + Duration::from_millis(50)));
+        std::thread::sleep(Duration::from_millis(80));
+        let error = transport
+            .flush_detached_sends()
+            .expect_err("current flush deadline should bound an older unbounded send");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            error
+                .to_string()
+                .contains("DFS operation deadline expired before routed send"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn detached_send_failure_preserves_unattempted_queue_suffix() {
+        let local = node_id("node_detached_suffix_local");
+        let first_remote = node_id("node_detached_suffix_first");
+        let second_remote = node_id("node_detached_suffix_second");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sender_calls = Arc::clone(&calls);
+        let sender: DfsMessageSender = Arc::new(move |target, command, _options| {
+            let mut calls = sender_calls.lock().expect("calls");
+            calls.push(target.clone());
+            if calls.len() == 1 {
+                return Err(DfsPeerTransportError::new("first detached send failed"));
+            }
+            Ok(DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: Vec::new(),
+            })
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![first_remote.clone(), second_remote.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        transport
+            .send_detached_routed_message(&first_remote, test_message(&local, &first_remote, 1))
+            .expect("queue first detached send");
+        transport
+            .send_detached_routed_message(&second_remote, test_message(&local, &second_remote, 2))
+            .expect("queue second detached send");
+
+        transport
+            .flush_detached_sends()
+            .expect_err("first detached send should fail");
+        assert_eq!(
+            transport
+                .detached_sends
+                .lock()
+                .expect("queued suffix")
+                .len(),
+            1,
+            "the unattempted send must remain queued"
+        );
+
+        transport
+            .flush_detached_sends()
+            .expect("unattempted suffix should flush on retry");
+        assert_eq!(
+            calls.lock().expect("calls").as_slice(),
+            &[first_remote, second_remote]
+        );
+        assert!(
+            transport
+                .detached_sends
+                .lock()
+                .expect("empty detached queue")
+                .is_empty()
         );
     }
 

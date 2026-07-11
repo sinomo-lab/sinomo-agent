@@ -977,6 +977,8 @@ mod tests {
             status: DfsWriteIntentStatus::Committed,
             content_hash: None,
             object_metadata: None,
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
             created_at,
             updated_at: Some(created_at),
         }

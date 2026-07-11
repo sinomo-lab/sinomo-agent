@@ -1358,6 +1358,10 @@ impl DfsMessageTransport for DfsCloudFilesEndpointTransport {
     fn set_operation_deadline(&mut self, deadline: Option<Instant>) -> Option<Instant> {
         std::mem::replace(&mut self.operation_deadline, deadline)
     }
+
+    fn operation_deadline(&self) -> Option<Instant> {
+        self.operation_deadline
+    }
 }
 
 fn cloud_files_response_no_progress_timeout(message: &DfsRoutedMessage) -> Duration {
@@ -1517,6 +1521,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(2);
         assert_eq!(transport.set_operation_deadline(Some(deadline)), None);
+        assert_eq!(transport.operation_deadline(), Some(deadline));
         let bounded = transport
             .send_timeouts(&test_namespace_message())
             .expect("deadline-bounded timeouts");
@@ -1531,6 +1536,7 @@ mod tests {
                 .is_some_and(|timeout| timeout <= Duration::from_secs(2))
         );
         assert_eq!(transport.set_operation_deadline(None), Some(deadline));
+        assert_eq!(transport.operation_deadline(), None);
     }
 
     #[test]

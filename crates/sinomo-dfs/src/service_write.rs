@@ -95,7 +95,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             reader,
             candidate_nodes,
             policy,
-            true,
+            false,
             true,
         )
     }
@@ -164,13 +164,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if !detach_request {
             self.content.flush_deferred_durable_dirs()?;
         }
-        self.write_distributed_eventual_from_remote_manifest_with_base(
+        self.write_distributed_eventual_from_remote_manifest_with_base_and_parent_touch(
             request,
             expected_base_version,
             content_hash,
             content_size_bytes,
             plan.desired_replica_nodes,
             policy,
+            touch_parent_on_create,
             foreground_replica_repair,
         )
     }
@@ -247,7 +248,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             reader,
             desired_replica_nodes,
             policy,
-            true,
+            false,
             true,
         )
     }
@@ -858,7 +859,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             reader,
             desired_replica_nodes,
             policy,
-            true,
+            false,
             true,
         )
     }
@@ -874,6 +875,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         foreground_replica_repair: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let object = self.current_object_for_write(&request.object_id)?;
+        let transient_create = self
+            .transient_metadata_object_ids
+            .contains(&request.object_id);
+        let touch_parent_on_create = touch_parent_on_create && transient_create;
+        let create_predecessor_object_id = transient_create
+            .then(|| {
+                self.transient_metadata_predecessor_object_ids
+                    .get(&request.object_id)
+                    .cloned()
+            })
+            .flatten();
         if !matches!(
             object.policy,
             DfsObjectPolicy::ReplicatedEventual | DfsObjectPolicy::ReplicatedConfirmed
@@ -1005,7 +1017,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
 
-        let intent = match self.coordinator.create_intent_at_epoch(
+        let intent = match self.coordinator.create_intent_at_epoch_with_parent_touch(
             request.file_system_id.clone(),
             request.object_id.clone(),
             expected_base_version.clone(),
@@ -1014,6 +1026,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             owner_epoch,
             desired_replica_nodes.clone(),
             policy,
+            touch_parent_on_create,
+            create_predecessor_object_id,
         ) {
             Ok(intent) => intent,
             Err(error)
@@ -1070,6 +1084,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(outcome)
     }
 
+    #[cfg(test)]
     pub(crate) fn write_distributed_eventual_from_remote_manifest_with_base(
         &mut self,
         request: DfsWriteRequest,
@@ -1078,6 +1093,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         content_size_bytes: u64,
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
+        foreground_replica_repair: bool,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        self.write_distributed_eventual_from_remote_manifest_with_base_and_parent_touch(
+            request,
+            expected_base_version,
+            content_hash,
+            content_size_bytes,
+            desired_replica_nodes,
+            policy,
+            false,
+            foreground_replica_repair,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_distributed_eventual_from_remote_manifest_with_base_and_parent_touch(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: Option<DfsVersion>,
+        content_hash: String,
+        content_size_bytes: u64,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        touch_parent_on_create: bool,
         foreground_replica_repair: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let trace_started = Instant::now();
@@ -1089,6 +1128,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_policy_desired = policy.desired_replicas;
         let trace_content_size_bytes = content_size_bytes;
         let object = self.current_object_for_write(&request.object_id)?;
+        let transient_create = self
+            .transient_metadata_object_ids
+            .contains(&request.object_id);
+        let touch_parent_on_create = touch_parent_on_create && transient_create;
+        let create_predecessor_object_id = transient_create
+            .then(|| {
+                self.transient_metadata_predecessor_object_ids
+                    .get(&request.object_id)
+                    .cloned()
+            })
+            .flatten();
         if !matches!(
             object.policy,
             DfsObjectPolicy::ReplicatedEventual | DfsObjectPolicy::ReplicatedConfirmed
@@ -1170,7 +1220,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
 
         let create_intent_started = Instant::now();
-        let intent = match self.coordinator.create_intent_at_epoch(
+        let intent = match self.coordinator.create_intent_at_epoch_with_parent_touch(
             request.file_system_id.clone(),
             request.object_id.clone(),
             expected_base_version.clone(),
@@ -1179,6 +1229,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             owner_epoch,
             desired_replica_nodes.clone(),
             policy,
+            touch_parent_on_create,
+            create_predecessor_object_id,
         ) {
             Ok(intent) => intent,
             Err(error)
@@ -1208,7 +1260,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .record_durable_receipt(&intent.intent_id, request.requesting_node_id.clone())?;
         let record_receipt_elapsed = record_receipt_started.elapsed();
         let commit_started = Instant::now();
-        if !foreground_replica_repair && updated_intent.policy.min_commit_replicas <= 1 {
+        if !foreground_replica_repair
+            && updated_intent.policy.min_commit_replicas <= 1
+            && !updated_intent.touch_parent_on_create
+        {
             self.commit_remote_manifest_ready_intent_batched(
                 &updated_intent,
                 &object,
@@ -1323,7 +1378,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             bytes,
             desired_replica_nodes,
             policy,
-            true,
+            false,
             foreground_replica_repair,
             false,
             true,
@@ -1344,6 +1399,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replay_response_journal: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let object = self.current_object_for_write(&request.object_id)?;
+        let transient_create = self
+            .transient_metadata_object_ids
+            .contains(&request.object_id);
+        let touch_parent_on_create = touch_parent_on_create && transient_create;
+        let create_predecessor_object_id = transient_create
+            .then(|| {
+                self.transient_metadata_predecessor_object_ids
+                    .get(&request.object_id)
+                    .cloned()
+            })
+            .flatten();
         if !matches!(
             object.policy,
             DfsObjectPolicy::ReplicatedEventual | DfsObjectPolicy::ReplicatedConfirmed
@@ -1496,7 +1562,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )?;
         let content_elapsed = content_started.elapsed();
         let create_intent_started = Instant::now();
-        let intent = match self.coordinator.create_intent_at_epoch(
+        let intent = match self.coordinator.create_intent_at_epoch_with_parent_touch(
             request.file_system_id.clone(),
             request.object_id.clone(),
             expected_base_version.clone(),
@@ -1505,6 +1571,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             owner_epoch,
             desired_replica_nodes.clone(),
             policy,
+            touch_parent_on_create,
+            create_predecessor_object_id,
         ) {
             Ok(intent) => intent,
             Err(error)

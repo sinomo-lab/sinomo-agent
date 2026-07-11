@@ -15,8 +15,61 @@ use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt};
 use time::OffsetDateTime;
 
 use crate::metadata_pages::walk_metadata_pages;
+use crate::posix_path::parent_posix_path;
 use crate::transfer::PendingNetworkedWrite;
 use crate::*;
+
+fn ensure_atomic_create_parent_touch_shard(
+    file_system_id: &DfsFileSystemId,
+    local_node_id: &NodeId,
+    child_path: &str,
+    parent_path: &str,
+    shards: &[DfsMetadataShardConfig],
+) -> Result<(), DfsError> {
+    // A service without a control plane is the local, unsharded case. Once
+    // shard placement exists, both records must be owned by the same shard:
+    // ShardedSobjMetadataBackend partitions a multi-shard namespace batch into
+    // independent commits and therefore cannot provide this POSIX atomicity.
+    if shards.is_empty() {
+        return Ok(());
+    }
+    if shards.len() != 1 {
+        let shard_ids = shards
+            .iter()
+            .map(|shard| shard.shard_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(DfsError::Distributed {
+            message: format!(
+                "cannot atomically publish created object {child_path} and parent {parent_path} across metadata shards [{shard_ids}]"
+            ),
+        });
+    }
+    let shard = &shards[0];
+    if shard.primary_node_id != *local_node_id {
+        return Err(DfsError::StaleOwnerEpoch {
+            file_system_id: file_system_id.clone(),
+            local_node_id: local_node_id.clone(),
+            primary_node_id: shard.primary_node_id.clone(),
+            epoch: shard.epoch,
+        });
+    }
+    Ok(())
+}
+
+fn create_visible_path_is_available(
+    intent: &DistributedWriteIntent,
+    durable_path_object: Option<&DfsObjectMetadata>,
+) -> bool {
+    match durable_path_object {
+        None => true,
+        Some(object) => {
+            object.kind == DfsObjectKind::Tombstone
+                && object.object_id != intent.object_id
+                && intent.create_predecessor_object_id.as_ref() == Some(&object.object_id)
+        }
+    }
+}
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn apply_committed_intent(&mut self, intent_id: &str) -> Result<(), DfsError> {
@@ -503,8 +556,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             object.version.clone(),
         );
         let object = object.clone();
+        self.transient_metadata_object_ids.remove(object_id);
+        self.transient_metadata_predecessor_object_ids
+            .remove(object_id);
         self.track_metadata_tombstone(&object);
-        Ok(object.clone())
+        self.clear_metadata_lookup_cache();
+        Ok(object)
     }
 
     pub(crate) fn ensure_replicated_confirmed_object(
@@ -905,10 +962,56 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         committed_object.current_locations = durable_locations;
         let visible_version = object_version_record(&committed_object, Some(pending.size_bytes));
         let required_replica_node_ids: Vec<NodeId> = durable_nodes.into_iter().collect();
+        let durable_object_exists = self
+            .metadata_backend
+            .as_ref()
+            .map(|backend| backend.get_object(&pending.object_id))
+            .transpose()?
+            .flatten()
+            .is_some();
+        let parent_touch = if intent.touch_parent_on_create && !durable_object_exists {
+            self.parent_directory_touch_metadata_for_create(&committed_object)?
+        } else {
+            None
+        };
+        if !durable_object_exists && self.metadata_backend.is_some() {
+            let durable_path_object = self
+                .metadata_backend
+                .as_ref()
+                .expect("metadata backend checked above")
+                .get_object_by_path(&committed_object.file_system_id, &committed_object.path)?;
+            if !create_visible_path_is_available(&intent, durable_path_object.as_ref()) {
+                let occupant = durable_path_object
+                    .as_ref()
+                    .map(|object| format!("{} {:?}", object.object_id, object.kind))
+                    .unwrap_or_else(|| "unknown object".to_string());
+                // The metadata-primary service serializes this check with the
+                // following same-shard transaction. Once another durable path
+                // record wins, terminalize the stale intent so restart cannot
+                // attempt to resurrect it.
+                self.abort_pending_write(&intent.intent_id)?;
+                return Err(DfsError::Distributed {
+                    message: format!(
+                        "cannot publish created object {} because its path is owned by {occupant}",
+                        committed_object.path
+                    ),
+                });
+            }
+        }
         let Some(backend) = self.metadata_backend.as_mut() else {
+            if let Some(parent) = parent_touch {
+                self.metadata.add_object(parent)?;
+                self.clear_metadata_lookup_cache();
+            }
             return Ok(());
         };
-        if backend.get_object(&pending.object_id)?.is_none() {
+        if !durable_object_exists {
+            let mut objects = vec![committed_object.clone()];
+            let mut versions = vec![visible_version];
+            if let Some(parent) = parent_touch.as_ref() {
+                objects.push(parent.clone());
+                versions.push(object_version_record(parent, parent.content_size_bytes));
+            }
             backend.apply_namespace_transaction(&DfsNamespaceTransaction {
                 transaction_id: namespace_transaction_id_for_object(
                     "create-visible",
@@ -916,11 +1019,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &pending.version,
                 ),
                 file_system_id: committed_object.file_system_id.clone(),
-                objects: vec![committed_object.clone()],
-                versions: vec![visible_version],
+                objects,
+                versions,
                 advisory_lock_states: Vec::new(),
                 created_at: OffsetDateTime::now_utc(),
             })?;
+            if let Some(parent) = parent_touch {
+                self.metadata.add_object(parent)?;
+                self.clear_metadata_lookup_cache();
+            }
             return Ok(());
         }
         backend.commit_visible_version(
@@ -930,6 +1037,60 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &required_replica_node_ids,
         )?;
         Ok(())
+    }
+
+    /// Builds the parent-directory half of a POSIX create commit. The caller
+    /// persists it in the same namespace transaction that first publishes the
+    /// child, so a restart can observe neither mutation or both and can never
+    /// advance the parent twice while replaying a commit-ready intent.
+    fn parent_directory_touch_metadata_for_create(
+        &mut self,
+        child: &DfsObjectMetadata,
+    ) -> Result<Option<DfsObjectMetadata>, DfsError> {
+        let Some(parent_path) = parent_posix_path(&child.path) else {
+            return Ok(None);
+        };
+        let shards = self.namespace_shards_for_exact_paths(
+            &child.file_system_id,
+            [child.path.as_str(), parent_path.as_str()],
+        )?;
+        ensure_atomic_create_parent_touch_shard(
+            &child.file_system_id,
+            &self.node_id,
+            &child.path,
+            &parent_path,
+            &shards,
+        )?;
+        let parent = if let Some(backend) = self.metadata_backend.as_ref() {
+            backend.get_object_by_path(&child.file_system_id, &parent_path)?
+        } else {
+            self.metadata
+                .object_by_normalized_posix_path(&child.file_system_id, &parent_path)
+                .cloned()
+        }
+        .ok_or_else(|| DfsError::Metadata {
+            message: format!(
+                "cannot publish created object {} without parent directory {parent_path}",
+                child.path
+            ),
+        })?;
+        if parent.kind != DfsObjectKind::Directory {
+            return Err(DfsError::Metadata {
+                message: format!(
+                    "cannot publish created object {} because parent {parent_path} is {:?}",
+                    child.path, parent.kind
+                ),
+            });
+        }
+        let mut touched_parent = parent;
+        let touch_time = dfs_now_unix_nanos()
+            .max(touched_parent.modified_at_unix_nanos.saturating_add(1))
+            .max(touched_parent.changed_at_unix_nanos.saturating_add(1));
+        touched_parent.modified_at_unix_nanos = touch_time;
+        touched_parent.changed_at_unix_nanos = touch_time;
+        touched_parent.version = namespace::next_version(&touched_parent.version);
+        touched_parent.last_modified_by_event_id = Some(EventId::generate());
+        Ok(Some(touched_parent))
     }
 
     pub(crate) fn commit_remote_manifest_ready_intent_batched(
@@ -1198,6 +1359,167 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 durable_receipts: self.coordinator.durable_receipt_count(intent_id),
                 required_receipts: intent.policy.min_commit_replicas,
             })
+        }
+    }
+}
+
+#[cfg(test)]
+mod atomic_create_parent_touch_tests {
+    use super::*;
+
+    fn node(name: &str) -> NodeId {
+        NodeId::from_legacy_named(name).expect("node id")
+    }
+
+    fn shard(shard_id: &str, primary_node_id: NodeId, epoch: u64) -> DfsMetadataShardConfig {
+        DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: shard_id.to_string(),
+            primary_node_id,
+            replica_node_ids: Vec::new(),
+            epoch,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        }
+    }
+
+    #[test]
+    fn atomic_parent_touch_accepts_one_locally_owned_shard() {
+        let local = node("node_atomic_parent_local");
+        ensure_atomic_create_parent_touch_shard(
+            &sifs_file_system_id(),
+            &local,
+            "/services/child.txt",
+            "/services",
+            &[shard("services", local.clone(), 7)],
+        )
+        .expect("same-shard parent touch");
+    }
+
+    #[test]
+    fn atomic_parent_touch_rejects_split_shards() {
+        let local = node("node_atomic_parent_split_local");
+        let error = ensure_atomic_create_parent_touch_shard(
+            &sifs_file_system_id(),
+            &local,
+            "/services/anchor/child.txt",
+            "/services/anchor",
+            &[
+                shard("anchor", local.clone(), 3),
+                shard("services", local.clone(), 3),
+            ],
+        )
+        .expect_err("split-shard parent touch must fail closed");
+
+        assert!(error.to_string().contains("across metadata shards"));
+    }
+
+    #[test]
+    fn atomic_parent_touch_rejects_foreign_primary() {
+        let local = node("node_atomic_parent_foreign_local");
+        let remote = node("node_atomic_parent_foreign_remote");
+        let error = ensure_atomic_create_parent_touch_shard(
+            &sifs_file_system_id(),
+            &local,
+            "/services/child.txt",
+            "/services",
+            &[shard("services", remote.clone(), 11)],
+        )
+        .expect_err("foreign-primary parent touch must fail closed");
+
+        assert!(matches!(
+            error,
+            DfsError::StaleOwnerEpoch {
+                primary_node_id,
+                epoch: 11,
+                ..
+            } if primary_node_id == remote
+        ));
+    }
+
+    #[test]
+    fn create_visible_path_accepts_absent_path() {
+        let intent = intent_with_predecessor(None);
+        assert!(create_visible_path_is_available(&intent, None));
+    }
+
+    #[test]
+    fn create_visible_path_accepts_exact_predecessor_tombstone() {
+        let predecessor_id = DfsObjectId::from_legacy_named("obj_create_predecessor")
+            .expect("predecessor object id");
+        let intent = intent_with_predecessor(Some(predecessor_id.clone()));
+        let predecessor = path_object(predecessor_id, DfsObjectKind::Tombstone);
+
+        assert!(create_visible_path_is_available(
+            &intent,
+            Some(&predecessor)
+        ));
+    }
+
+    #[test]
+    fn create_visible_path_rejects_live_or_different_tombstone() {
+        let predecessor_id = DfsObjectId::from_legacy_named("obj_create_expected_predecessor")
+            .expect("predecessor object id");
+        let intent = intent_with_predecessor(Some(predecessor_id));
+        let live = path_object(
+            DfsObjectId::from_legacy_named("obj_create_live_winner").expect("live object id"),
+            DfsObjectKind::File,
+        );
+        let different_tombstone = path_object(
+            DfsObjectId::from_legacy_named("obj_create_later_tombstone")
+                .expect("tombstone object id"),
+            DfsObjectKind::Tombstone,
+        );
+
+        assert!(!create_visible_path_is_available(&intent, Some(&live)));
+        assert!(!create_visible_path_is_available(
+            &intent,
+            Some(&different_tombstone)
+        ));
+    }
+
+    fn intent_with_predecessor(
+        create_predecessor_object_id: Option<DfsObjectId>,
+    ) -> DistributedWriteIntent {
+        DistributedWriteIntent {
+            intent_id: "intent_create_path_fence".to_string(),
+            file_system_id: sifs_file_system_id(),
+            object_id: DfsObjectId::from_legacy_named("obj_create_candidate")
+                .expect("candidate object id"),
+            base_version: None,
+            target_version: DfsVersion::from_legacy_named("version_2").expect("version"),
+            requesting_node_id: node("node_create_path_fence"),
+            owner_epoch: 1,
+            desired_replica_nodes: vec![node("node_create_path_fence")],
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            touch_parent_on_create: true,
+            create_predecessor_object_id,
+            state: DfsWriteIntentState::AwaitingReceipts,
+        }
+    }
+
+    fn path_object(object_id: DfsObjectId, kind: DfsObjectKind) -> DfsObjectMetadata {
+        DfsObjectMetadata {
+            object_id,
+            file_system_id: sifs_file_system_id(),
+            path: "/services/fenced-create.txt".to_string(),
+            kind,
+            owner_node_id: node("node_create_path_fence"),
+            current_locations: Vec::new(),
+            content_hash: None,
+            content_size_bytes: None,
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 1,
+            modified_at_unix_nanos: 1,
+            created_at_unix_nanos: 1,
+            changed_at_unix_nanos: 1,
+            version: DfsVersion::from_legacy_named("version_1").expect("version"),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
         }
     }
 }

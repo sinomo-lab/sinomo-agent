@@ -88,6 +88,16 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         None
     }
 
+    /// Returns the absolute deadline currently bounding the caller's DFS
+    /// operation, when one was installed through [`Self::set_operation_deadline`].
+    ///
+    /// Service-level settle loops use the same deadline as routed sends so a
+    /// caller budget cannot be extended by waiting for an already-dispatched
+    /// write after the transport phase completes.
+    fn operation_deadline(&self) -> Option<Instant> {
+        None
+    }
+
     fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {
         if self
             .pending_incoming_count()?

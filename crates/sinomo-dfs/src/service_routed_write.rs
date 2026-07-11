@@ -14,6 +14,14 @@ use sinomo_core::node::NodeId;
 use crate::metadata_pages::walk_metadata_pages;
 use crate::*;
 
+fn routed_write_command_content_size_bytes(command: &DfsDistributedWriteCommand) -> Option<u64> {
+    if command.content_hash.is_some() {
+        command.content_size_bytes
+    } else {
+        Some(command.bytes.len() as u64)
+    }
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn replayed_routed_write_outcome_if_known(
         &mut self,
@@ -23,6 +31,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if requester_node_id != &command.request.requesting_node_id {
             return Ok(None);
         }
+        let expected_content_hash = routed_write_command_content_hash(command);
+        let Some(expected_content_size_bytes) = routed_write_command_content_size_bytes(command)
+        else {
+            return Ok(None);
+        };
         if let Some(intent) = self
             .coordinator
             .intent_for_target(
@@ -32,18 +45,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )
             .cloned()
             && distributed_intent_matches_routed_write_command(&intent, requester_node_id, command)
+            && self.routed_write_intent_matches_content_identity(
+                &intent,
+                &expected_content_hash,
+                expected_content_size_bytes,
+            )?
         {
             return self.replayed_routed_write_outcome_for_intent(&intent);
         }
 
-        let expected_content_hash = routed_write_command_content_hash(command);
         let matching_record = {
             let Some(backend) = self.metadata_backend.as_ref() else {
                 return Ok(None);
             };
-            if backend
-                .get_version(&command.request.object_id, &command.request.target_version)?
-                .is_none()
+            let Some(version) =
+                backend.get_version(&command.request.object_id, &command.request.target_version)?
+            else {
+                return Ok(None);
+            };
+            if version
+                .size_bytes
+                .is_some_and(|size| size != expected_content_size_bytes)
             {
                 return Ok(None);
             }
@@ -82,6 +104,49 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(None);
         };
         self.replayed_routed_write_outcome_for_intent(&intent)
+    }
+
+    /// Proves that an in-memory intent belongs to this exact write payload
+    /// before the response-safe transport path treats the command as a replay.
+    /// The coordinator intentionally does not own content bytes, so consult the
+    /// pending transfer first and then its durable intent/current version.
+    fn routed_write_intent_matches_content_identity(
+        &self,
+        intent: &DistributedWriteIntent,
+        expected_content_hash: &str,
+        expected_size_bytes: u64,
+    ) -> Result<bool, DfsError> {
+        if let Some(pending) = self.pending_writes.get(&intent.intent_id) {
+            return Ok(pending.content_hash == expected_content_hash
+                && pending.size_bytes == expected_size_bytes);
+        }
+
+        if let Some(backend) = self.metadata_backend.as_ref()
+            && let Some(record) = backend.get_intent(&intent.object_id, &intent.intent_id)?
+        {
+            if record.content_hash.as_deref() != Some(expected_content_hash) {
+                return Ok(false);
+            }
+            if let Some(version) = backend.get_version(&intent.object_id, &intent.target_version)?
+                && version
+                    .size_bytes
+                    .is_some_and(|size| size != expected_size_bytes)
+            {
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+
+        Ok(matches!(intent.state, DfsWriteIntentState::Committed)
+            && self
+                .current_read_object_metadata(&intent.object_id)
+                .is_ok_and(|object| {
+                    object.version == intent.target_version
+                        && object.content_hash.as_deref() == Some(expected_content_hash)
+                        && object
+                            .content_size_bytes
+                            .is_none_or(|size| size == expected_size_bytes)
+                }))
     }
 
     fn replayed_routed_write_outcome_for_intent(
@@ -163,13 +228,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 ),
                             });
                         }
-                        self.write_distributed_eventual_from_remote_manifest_with_base(
+                        self.write_distributed_eventual_from_remote_manifest_with_base_and_parent_touch(
                             command.request,
                             command.expected_base_version,
                             content_hash,
                             content_size_bytes,
                             command.desired_replica_nodes,
                             command.policy,
+                            created_object_path.is_some(),
                             write_foreground_replica_repair,
                         )
                     } else {
@@ -179,7 +245,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             command.bytes,
                             command.desired_replica_nodes,
                             command.policy,
-                            touch_parent_on_create,
+                            created_object_path.is_some(),
                             write_foreground_replica_repair,
                             false,
                             true,
@@ -205,12 +271,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             repair_jobs,
                             ..
                         } if command.foreground_replica_repair && !repair_jobs.is_empty() => {
-                            if let Some(path) = created_object_path.as_deref() {
-                                self.record_routed_create_parent_directory_touch(
-                                    path,
-                                    command.foreground_replica_repair,
-                                );
-                            }
                             self.track_pending_remote_write_response(
                                 intent_id,
                                 &requester_node_id,
@@ -232,15 +292,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     }),
                             }
                         }
-                        NetworkedDfsWriteOutcome::Committed { .. } => {
-                            if let Some(path) = created_object_path.as_deref() {
-                                self.record_routed_create_parent_directory_touch(
-                                    path,
-                                    command.foreground_replica_repair,
-                                );
-                            }
-                            outcome.clone()
-                        }
+                        NetworkedDfsWriteOutcome::Committed { .. } => outcome.clone(),
                         NetworkedDfsWriteOutcome::Conflict { .. } => outcome.clone(),
                     };
                     DfsDistributedWriteResult::Outcome {
@@ -349,6 +401,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         created_object_path: Option<String>,
         foreground_replica_repair: bool,
     ) {
+        if let Some(existing) = self.pending_remote_write_responses.get_mut(intent_id) {
+            if existing.requester_node_id == *requester_node_id
+                && existing.request_id == request_id
+                && existing.object_id == *object_id
+            {
+                // A response-safe transport retry can redispatch the exact
+                // request while its intent is still pending. Replay no longer
+                // runs namespace creation, so preserve the first dispatch's
+                // parent-touch obligation until the write commits.
+                if existing.created_object_path.is_none() {
+                    existing.created_object_path = created_object_path;
+                }
+            }
+            return;
+        }
         self.pending_remote_write_responses.insert(
             intent_id.to_string(),
             PendingRemoteWriteResponse {
@@ -688,18 +755,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let Some(pending) = self.pending_remote_write_responses.remove(&intent_id) else {
                 continue;
             };
-            if matches!(
-                &result,
-                DfsDistributedWriteResult::Outcome {
-                    outcome: NetworkedDfsWriteOutcome::Committed { .. }
-                }
-            ) && let Some(path) = pending.created_object_path.as_deref()
-            {
-                self.record_routed_create_parent_directory_touch(
-                    path,
-                    pending.foreground_replica_repair,
-                );
-            }
             let metadata_journal_batches = self.routed_write_response_metadata_journal_batches(
                 &pending.object_id,
                 &result,
@@ -889,16 +944,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 message: format!("parent directory does not exist: {parent_path}"),
             }),
         }
-    }
-
-    /// Records the parent-directory mtime update for an object that a routed
-    /// write created. The metadata shard primary is the namespace authority,
-    /// so the update must be journaled here and reach every replica (including
-    /// the requester) through journal replay. Best effort: a primary that does
-    /// not hold the parent directory record must still answer the committed
-    /// write.
-    fn record_routed_create_parent_directory_touch(&mut self, path: &str, _foreground: bool) {
-        self.touch_routed_create_parent_directory(path);
     }
 
     fn touch_routed_create_parent_directory(&mut self, path: &str) {

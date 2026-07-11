@@ -213,6 +213,17 @@ pub struct DfsWriteIntentRecord {
     pub content_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
+    /// Whether committing this intent makes a previously invisible directory
+    /// entry visible and therefore owes the parent directory a POSIX mtime /
+    /// version update. Older intent records predate this obligation and
+    /// deserialize to `false`.
+    #[serde(default)]
+    pub touch_parent_on_create: bool,
+    /// Exact tombstone object occupying this path when a new transient object
+    /// was created. Recovery may replace only this predecessor; a different
+    /// live object or tombstone proves that a later namespace mutation won.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_predecessor_object_id: Option<DfsObjectId>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1377,6 +1388,8 @@ mod tests {
             status: DfsWriteIntentStatus::Staging,
             content_hash: object.content_hash.clone(),
             object_metadata: Some(object.clone()),
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: None,
         };
@@ -1418,6 +1431,41 @@ mod tests {
                 status: intent.status.clone(),
                 intent: Some(intent),
             }
+        );
+    }
+
+    #[test]
+    fn legacy_write_intent_without_parent_touch_field_defaults_to_raw_semantics() {
+        let object = object(version("version_legacy_intent"));
+        let intent = DfsWriteIntentRecord {
+            intent_id: "intent_legacy_parent_touch".to_string(),
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            base_version: None,
+            target_version: object.version.clone(),
+            coordinator_node_id: node("node_owner"),
+            owner_epoch: 0,
+            desired_replica_node_ids: vec![node("node_replica")],
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            status: DfsWriteIntentStatus::ReceiptsPending,
+            content_hash: object.content_hash.clone(),
+            object_metadata: Some(object),
+            touch_parent_on_create: true,
+            create_predecessor_object_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+        };
+        let mut encoded = serde_json::to_value(intent).expect("serialize intent");
+        encoded
+            .as_object_mut()
+            .expect("intent object")
+            .remove("touch_parent_on_create");
+
+        let decoded: DfsWriteIntentRecord =
+            serde_json::from_value(encoded).expect("deserialize legacy intent");
+        assert!(
+            !decoded.touch_parent_on_create,
+            "legacy raw write intents must not invent POSIX parent effects"
         );
     }
 

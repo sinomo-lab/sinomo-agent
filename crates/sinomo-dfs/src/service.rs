@@ -924,6 +924,8 @@ mod tests {
                 status: DfsWriteIntentStatus::Committed,
                 content_hash: Some(content_hash.clone()),
                 object_metadata: Some(object),
+                touch_parent_on_create: false,
+                create_predecessor_object_id: None,
                 created_at: now,
                 updated_at: Some(now),
             })

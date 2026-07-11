@@ -405,7 +405,7 @@ fn run_read_your_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 
     retry_bulk_mutation(
         deadline,
-        || backend.write_file_with_deadline(&path, payload.as_bytes(), deadline),
+        || backend.write_file_wait_for_commit_with_deadline(&path, payload.as_bytes(), deadline),
         || format!("cannot write SIFS file {path}"),
     )?;
     expect_payload_now(&backend, &path, payload.as_bytes(), "after write")?;
@@ -743,7 +743,13 @@ fn run_remote_shard_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         let app_write_deadline = next_phase_deadline();
         let app_write_result = retry_bulk_mutation(
             app_write_deadline,
-            || backend.write_file_with_deadline(&app_path, &payload, app_write_deadline),
+            || {
+                backend.write_file_wait_for_commit_with_deadline(
+                    &app_path,
+                    &payload,
+                    app_write_deadline,
+                )
+            },
             || format!("cannot app-write SIFS file {app_path} through remote metadata shard"),
         );
         let app_write_ms = app_write_started.elapsed().as_millis() as u64;
@@ -839,7 +845,7 @@ fn run_remote_shard_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         let write_deadline = next_phase_deadline();
         retry_bulk_mutation(
             write_deadline,
-            || backend.write_file_with_deadline(&path, &payload, write_deadline),
+            || backend.write_file_wait_for_commit_with_deadline(&path, &payload, write_deadline),
             || format!("cannot write SIFS file {path} through remote metadata shard"),
         )?;
     }
@@ -906,7 +912,7 @@ fn remote_shard_write_probe_prefix(shard_id: &str) -> Option<&'static str> {
 }
 
 fn remote_shard_write_phase_timeout(timeout: Duration) -> Duration {
-    timeout.min(dfs::DFS_ROUTED_NAMESPACE_OP_TIMEOUT)
+    timeout
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1333,7 +1339,7 @@ fn run_concurrent_file_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         .create_dir_all(&base)
         .map_err(SinomoTestError::failed)?;
     backend
-        .write_file_with_deadline(&path, &seed, Instant::now() + timeout)
+        .write_file_wait_for_commit_with_deadline(&path, &seed, Instant::now() + timeout)
         .map_err(SinomoTestError::failed)?;
     ctx.record("node", &node);
     ctx.record("path", &path);
@@ -1347,8 +1353,9 @@ fn run_concurrent_file_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                       deadline: Instant| {
         std::thread::spawn(move || {
             let started = Instant::now();
-            let result = SifsFileManagerBackend::open(&data_dir)
-                .and_then(|backend| backend.write_file_with_deadline(&path, &bytes, deadline));
+            let result = SifsFileManagerBackend::open(&data_dir).and_then(|backend| {
+                backend.write_file_wait_for_commit_with_deadline(&path, &bytes, deadline)
+            });
             (
                 label,
                 result.map(|_| ()).map_err(|error| error.to_string()),
@@ -1494,6 +1501,7 @@ fn run_concurrent_dir_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         .unwrap_or(DEFAULT_ROUNDTRIP_BASE)
         .trim_end_matches('/')
         .to_string();
+    let timeout = expect_timeout(ctx)?;
     let data_dir = SinomoDataDir::new(ctx.data_dir());
     let backend = open_backend(ctx)?;
     let node = backend.node_label();
@@ -1510,10 +1518,16 @@ fn run_concurrent_dir_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 
     let create_dir = data_dir.clone();
     let create_child = child.clone();
+    let create_deadline = Instant::now() + timeout;
     let create_thread = std::thread::spawn(move || {
         let started = Instant::now();
-        let result = SifsFileManagerBackend::open(&create_dir)
-            .and_then(|backend| backend.write_file(&create_child, b"child"));
+        let result = SifsFileManagerBackend::open(&create_dir).and_then(|backend| {
+            backend.write_file_wait_for_commit_with_deadline(
+                &create_child,
+                b"child",
+                create_deadline,
+            )
+        });
         (
             "child-create",
             result.map(|_| ()).map_err(|error| error.to_string()),
@@ -1582,7 +1596,7 @@ fn run_failover_current_read(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let old = format!("old current-read payload {nonce}");
     let new = format!("new current-read payload {nonce} refreshed");
     backend
-        .write_file(&path, old.as_bytes())
+        .write_file_wait_for_commit_with_deadline(&path, old.as_bytes(), Instant::now() + timeout)
         .map_err(SinomoTestError::failed)?;
     let cached_reader = SifsFileManagerBackend::open_read_only(&data_dir).map_err(|error| {
         SinomoTestError::failed(format!("cannot open cached reader backend: {error}"))
@@ -1596,7 +1610,7 @@ fn run_failover_current_read(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         )));
     }
     backend
-        .write_file(&path, new.as_bytes())
+        .write_file_wait_for_commit_with_deadline(&path, new.as_bytes(), Instant::now() + timeout)
         .map_err(SinomoTestError::failed)?;
 
     let started = Instant::now();
@@ -4099,7 +4113,7 @@ mod tests {
     fn remote_shard_write_phase_budget_allows_a_cold_routed_namespace_operation() {
         assert_eq!(
             remote_shard_write_phase_timeout(Duration::from_secs(30)),
-            dfs::DFS_ROUTED_NAMESPACE_OP_TIMEOUT
+            Duration::from_secs(30)
         );
         assert_eq!(
             remote_shard_write_phase_timeout(Duration::from_secs(3)),

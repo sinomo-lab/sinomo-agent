@@ -42,6 +42,7 @@ use std::io::{Cursor, Read};
 use std::time::{Duration, Instant};
 
 const POSIX_WAIT_FOR_COMMIT_READY_DRAIN_LIMIT: usize = 8;
+const POSIX_WAIT_FOR_COMMIT_REPAIR_MAX_JOBS_PER_PASS: usize = 1;
 const POSIX_WAIT_FOR_COMMIT_IDLE_SLEEP: Duration = Duration::from_millis(10);
 const POSIX_WAIT_FOR_COMMIT_TIMEOUT: Duration = Duration::from_secs(45);
 const POSIX_LIST_DIR_COLLECT_PAGE_SIZE: usize = 4096;
@@ -111,11 +112,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let mut intent_id = intent_id.clone();
         let started_at = Instant::now();
+        let caller_deadline = self.transport.operation_deadline();
+        let settle_deadline = caller_deadline
+            .map(|deadline| deadline.min(started_at + POSIX_WAIT_FOR_COMMIT_TIMEOUT))
+            .unwrap_or(started_at + POSIX_WAIT_FOR_COMMIT_TIMEOUT);
+        let mut outcome = outcome;
         let mut ready_drains = 0;
         loop {
+            if Instant::now() >= settle_deadline {
+                return Ok(outcome);
+            }
             self.check_cancelled("write settle")?;
             let mut events = self.process_incoming()?;
-            let outcome = self.write_outcome(&intent_id)?;
+            outcome = self.write_outcome(&intent_id)?;
             if let NetworkedDfsWriteOutcome::Pending {
                 intent_id: next_intent_id,
                 ..
@@ -124,7 +133,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 intent_id = next_intent_id.clone();
             }
             if !matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }) {
-                if foreground_replica_repair {
+                // With a caller deadline the write is already committed: leave
+                // best-effort repair to maintenance instead of extending the
+                // foreground operation with local recovery scans. Unbudgeted
+                // legacy callers preserve their eager-repair behavior.
+                if foreground_replica_repair && caller_deadline.is_none() {
                     let (_, repair_events) = self.retry_pending_repairs_best_effort();
                     if !repair_events.is_empty() {
                         events.extend(repair_events);
@@ -133,11 +146,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 return Ok(outcome);
             }
-            let (_scheduled, repair_events) = if foreground_replica_repair {
-                self.retry_pending_repairs_best_effort()
-            } else {
-                (Vec::new(), Vec::new())
-            };
+            let (_scheduled, repair_events) =
+                if foreground_replica_repair && Instant::now() < settle_deadline {
+                    if caller_deadline.is_some() {
+                        self.retry_pending_repairs_best_effort_bounded(
+                            POSIX_WAIT_FOR_COMMIT_REPAIR_MAX_JOBS_PER_PASS,
+                        )
+                    } else {
+                        self.retry_pending_repairs_best_effort()
+                    }
+                } else {
+                    (Vec::new(), Vec::new())
+                };
             if !repair_events.is_empty() {
                 events.extend(repair_events);
                 self.last_events = events.clone();
@@ -148,12 +168,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // write). Only incoming events skip the pacing wait — which wakes
             // early on arrival, so healthy-path settle latency is unchanged.
             if events.is_empty() || ready_drains >= POSIX_WAIT_FOR_COMMIT_READY_DRAIN_LIMIT {
-                let elapsed = started_at.elapsed();
-                if elapsed >= POSIX_WAIT_FOR_COMMIT_TIMEOUT {
+                let now = Instant::now();
+                if now >= settle_deadline {
                     return Ok(outcome);
                 }
                 let wait = POSIX_WAIT_FOR_COMMIT_IDLE_SLEEP
-                    .min(POSIX_WAIT_FOR_COMMIT_TIMEOUT.saturating_sub(elapsed));
+                    .min(settle_deadline.saturating_duration_since(now));
                 self.transport
                     .wait_for_incoming(wait)
                     .map_err(DfsError::from_network)?;
@@ -944,10 +964,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         ));
         match outcome {
             NetworkedDfsWriteOutcome::Committed {
+                intent_id,
                 version,
                 content_hash,
                 repair_jobs,
-                ..
             } => {
                 let mut committed_object = object.clone();
                 committed_object.version = version;
@@ -968,6 +988,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.add_transient_object_metadata(committed_object.clone())?;
                 if transient_create
                     && touch_parent_on_create
+                    && !self
+                        .coordinator
+                        .intent(&intent_id)
+                        .is_some_and(|intent| intent.touch_parent_on_create)
                     && self.is_local_metadata_primary_for_object(&object)?
                 {
                     self.touch_parent_directory_modified(&path)?;
@@ -1017,6 +1041,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.add_transient_object_metadata(pending_object.clone())?;
                 if transient_create
                     && touch_parent_on_create
+                    && !self
+                        .coordinator
+                        .intent(&intent_id)
+                        .is_some_and(|intent| intent.touch_parent_on_create)
                     && self.is_local_metadata_primary_for_object(&pending_object)?
                 {
                     self.touch_parent_directory_modified(&path)?;
@@ -1170,10 +1198,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         match outcome {
             NetworkedDfsWriteOutcome::Committed {
+                intent_id,
                 version,
                 content_hash,
                 repair_jobs,
-                ..
             } => {
                 let mut committed_object = object.clone();
                 committed_object.version = version;
@@ -1199,6 +1227,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 // replica's journal sequence space from the primary's stream.
                 if transient_create
                     && touch_parent_on_create
+                    && !self
+                        .coordinator
+                        .intent(&intent_id)
+                        .is_some_and(|intent| intent.touch_parent_on_create)
                     && self.is_local_metadata_primary_for_object(&object)?
                 {
                     self.touch_parent_directory_modified(&path)?;

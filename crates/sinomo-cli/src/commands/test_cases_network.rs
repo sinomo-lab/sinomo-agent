@@ -6,7 +6,7 @@
 
 use sinomo_runtime::api::{
     DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DaemonApiClient,
-    DaemonObjectRpcForwardRequest, send_daemon_rpc_async,
+    DaemonObjectRpcForwardRequest, DaemonObjectRpcForwardResponse, send_daemon_rpc_async,
 };
 use sinomo_runtime::cluster;
 use sinomo_runtime::core::{
@@ -2060,9 +2060,9 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
     if let Err(error) = response.error_detail() {
         return NetworkPingOutcome::Failure(error.to_string());
     }
-    let response = match response.decode_body::<network::ObjectRpcResponse>() {
+    let response = match decode_network_ping_forward_response(&response) {
         Ok(response) => response,
-        Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
+        Err(error) => return NetworkPingOutcome::Failure(error),
     };
     let response = match cluster::decode_cluster_network_ping_rpc_response(&response) {
         Ok(response) => response,
@@ -2094,6 +2094,24 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
         ));
     }
     NetworkPingOutcome::Success
+}
+
+fn decode_network_ping_forward_response(
+    response: &network::ObjectRpcResponse,
+) -> Result<network::ObjectRpcResponse, String> {
+    match response.decode_body::<DaemonObjectRpcForwardResponse>() {
+        Ok(DaemonObjectRpcForwardResponse::Success { response }) => Ok(response),
+        Ok(DaemonObjectRpcForwardResponse::NetworkError { detail, .. }) => Err(detail),
+        // During a rolling upgrade, an older daemon can still return the inner
+        // ObjectRpcResponse directly instead of the typed forwarding envelope.
+        Err(envelope_error) => response
+            .decode_body::<network::ObjectRpcResponse>()
+            .map_err(|legacy_error| {
+                format!(
+                    "cannot decode daemon-forwarded ping response: {envelope_error}; legacy response decode failed: {legacy_error}"
+                )
+            }),
+    }
 }
 
 fn optional_usize_parameter(
@@ -2289,6 +2307,55 @@ mod tests {
         ClusterTransportKind,
     };
     use sinomo_runtime::node::ClusterId;
+
+    #[test]
+    fn network_ping_decodes_typed_daemon_forward_success() {
+        let inner = network::ObjectRpcResponse::encode_body("/cluster/network/ping", &"pong")
+            .expect("inner response");
+        let outer = network::ObjectRpcResponse::encode_body(
+            DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+            &DaemonObjectRpcForwardResponse::Success {
+                response: inner.clone(),
+            },
+        )
+        .expect("forward response");
+
+        assert_eq!(
+            decode_network_ping_forward_response(&outer).expect("decoded forward response"),
+            inner
+        );
+    }
+
+    #[test]
+    fn network_ping_reports_typed_daemon_forward_error() {
+        let outer = network::ObjectRpcResponse::encode_body(
+            DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+            &DaemonObjectRpcForwardResponse::NetworkError {
+                detail: "forward failed".to_string(),
+                delivery_state: None,
+            },
+        )
+        .expect("forward response");
+
+        assert_eq!(
+            decode_network_ping_forward_response(&outer).expect_err("forward failure"),
+            "forward failed"
+        );
+    }
+
+    #[test]
+    fn network_ping_accepts_legacy_daemon_forward_response() {
+        let inner = network::ObjectRpcResponse::encode_body("/cluster/network/ping", &"pong")
+            .expect("inner response");
+        let outer =
+            network::ObjectRpcResponse::encode_body(DAEMON_OBJECT_RPC_FORWARD_ROUTE, &inner)
+                .expect("legacy forward response");
+
+        assert_eq!(
+            decode_network_ping_forward_response(&outer).expect("legacy response"),
+            inner
+        );
+    }
 
     fn test_state() -> ClusterBootstrapState {
         let now = OffsetDateTime::now_utc();

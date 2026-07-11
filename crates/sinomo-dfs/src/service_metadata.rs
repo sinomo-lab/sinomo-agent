@@ -45,6 +45,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.clear_metadata_lookup_cache();
         self.put_visible_object_in_metadata_backend(&object)?;
         self.transient_metadata_object_ids.remove(&object.object_id);
+        self.transient_metadata_predecessor_object_ids
+            .remove(&object.object_id);
         self.coordinator.set_committed_version(
             object.file_system_id.clone(),
             object.object_id.clone(),
@@ -137,6 +139,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         for (_, records) in grouped {
             for (object, _) in records {
                 self.transient_metadata_object_ids.remove(&object.object_id);
+                self.transient_metadata_predecessor_object_ids
+                    .remove(&object.object_id);
                 self.coordinator.set_committed_version(
                     object.file_system_id.clone(),
                     object.object_id.clone(),
@@ -157,6 +161,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.clear_metadata_lookup_cache();
         normalize_current_locations(&mut object.current_locations);
         let object_id = object.object_id.clone();
+        let predecessor_object_id = match self.metadata_backend.as_ref() {
+            Some(backend) => backend
+                .get_object_by_path(&object.file_system_id, &object.path)
+                .ok()
+                .flatten(),
+            None => self
+                .tombstones_by_metadata_path
+                .get(&(object.file_system_id.clone(), metadata_path(&object.path)))
+                .cloned(),
+        }
+        .filter(|predecessor| {
+            predecessor.kind == DfsObjectKind::Tombstone
+                && predecessor.object_id != object.object_id
+        })
+        .map(|predecessor| predecessor.object_id);
         let backend_object = self
             .metadata_backend
             .as_ref()
@@ -175,9 +194,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let result = self.metadata.add_object(object);
         if result.is_ok() {
             if changes_namespace_view {
-                self.transient_metadata_object_ids.insert(object_id);
+                self.transient_metadata_object_ids.insert(object_id.clone());
+                if let Some(predecessor_object_id) = predecessor_object_id {
+                    self.transient_metadata_predecessor_object_ids
+                        .insert(object_id, predecessor_object_id);
+                } else {
+                    self.transient_metadata_predecessor_object_ids
+                        .remove(&object_id);
+                }
             } else {
                 self.transient_metadata_object_ids.remove(&object_id);
+                self.transient_metadata_predecessor_object_ids
+                    .remove(&object_id);
             }
         }
         self.clear_metadata_lookup_cache();
@@ -225,6 +253,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn remove_transient_object_metadata(&mut self, object_id: &DfsObjectId) {
         self.clear_metadata_lookup_cache();
         self.transient_metadata_object_ids.remove(object_id);
+        self.transient_metadata_predecessor_object_ids
+            .remove(object_id);
         self.metadata.remove_object(object_id);
         self.clear_metadata_lookup_cache();
     }
