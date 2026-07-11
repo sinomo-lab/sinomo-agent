@@ -3173,7 +3173,7 @@ where
                         return Ok(response);
                     }
                     Err(error) => {
-                        if cluster_object_rpc_error_is_route_attempt_timeout(&error) {
+                        if cluster_object_rpc_error_requires_hard_failure_observation(&error) {
                             let _ = self
                                 .host
                                 .observe_signed_endpoint_rpc_async(
@@ -3703,7 +3703,7 @@ where
                         return Ok(response);
                     }
                     Err(error) => {
-                        if cluster_object_rpc_error_is_route_attempt_timeout(&error) {
+                        if cluster_object_rpc_error_requires_hard_failure_observation(&error) {
                             let _ = self
                                 .host
                                 .observe_signed_endpoint_rpc_async(
@@ -4141,12 +4141,13 @@ fn cluster_object_rpc_attempt_timeout_error(
     )
 }
 
-fn cluster_object_rpc_error_is_route_attempt_timeout(error: &NetworkError) -> bool {
-    matches!(
-        error,
-        NetworkError::Timeout { operation, .. }
-            if operation.starts_with("cluster endpoint rpc attempt to ")
-    )
+fn cluster_object_rpc_error_requires_hard_failure_observation(error: &NetworkError) -> bool {
+    // The host normally observes transport failures itself, but ordinary
+    // failures retain the endpoint's healthy grace period. Any bounded phase
+    // timeout exhausted the endpoint's usable command budget and must bypass
+    // that grace, whether the timer fired inside the transport or in the
+    // route-level attempt wrapper.
+    matches!(error, NetworkError::Timeout { .. })
 }
 
 fn relay_envelope_hop_timeout(envelope: &RelayEnvelope) -> Option<Duration> {
@@ -6022,6 +6023,7 @@ mod tests {
         signed_routes: Vec<String>,
         signed_requests: Vec<ObjectRpcRequest>,
         fail_first_send: bool,
+        timeout_first_send: bool,
         stale_pooled_connection_first_send: Option<NetworkDeliveryState>,
         relay_outcome_unknown_first_send: bool,
         fresh_signature_retry_first_send: bool,
@@ -6080,6 +6082,7 @@ mod tests {
             let endpoint = endpoint.clone();
             let request = request.clone();
             let should_fail = self.fail_first_send && self.target_sends.is_empty();
+            let should_timeout = self.timeout_first_send && self.target_sends.is_empty();
             let stale_pool_delivery_state = self
                 .stale_pooled_connection_first_send
                 .filter(|_| self.target_sends.is_empty());
@@ -6108,7 +6111,14 @@ mod tests {
                 if let Some(stall) = stall_second {
                     tokio::time::sleep(stall).await;
                 }
-                if let Some(delivery_state) = stale_pool_delivery_state {
+                if should_timeout {
+                    Err(NetworkError::timeout(
+                        "connect test target endpoint",
+                        NetworkTimeoutPhase::Connect,
+                        timeouts.connect_timeout.unwrap_or(DEFAULT_NETWORK_TIMEOUT),
+                        NetworkDeliveryState::DefinitelyNotSent,
+                    ))
+                } else if let Some(delivery_state) = stale_pool_delivery_state {
                     Err(NetworkError::StalePooledConnection {
                         operation: "reuse test daemon control connection".to_string(),
                         delivery_state,
@@ -8531,7 +8541,7 @@ mod tests {
             .build()
             .expect("runtime");
         let mut host = RecordingSignedHost {
-            stall_first_send: Some(Duration::from_secs(60)),
+            timeout_first_send: true,
             ..RecordingSignedHost::default()
         };
         let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
