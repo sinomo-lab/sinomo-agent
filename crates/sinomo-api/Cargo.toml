@@ -24,3 +24,4 @@ tokio.workspace = true
 
 [dev-dependencies]
 sinomo-testdir = { path = "../sinomo-testdir" }
+tokio = { workspace = true, features = ["test-util"] }
