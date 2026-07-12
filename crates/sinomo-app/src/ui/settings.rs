@@ -15,16 +15,19 @@
 //! the one bespoke region — a live-reading [`StatusReflector`] widget.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
 use serde_json::Value;
 use sinomo_agent::{AgentDefinition, AgentOutputFormat, AgentPackageDefinition, AgentRole};
-use sinomo_cli::app_api::{SkillDetail, SkillMutationResult, SkillSummary, agent_summaries};
+use sinomo_cli::app_api::{
+    AgentSummary, ProviderSummary, SkillDetail, SkillMutationResult, SkillSummary, agent_summaries,
+};
 use sui::{
     Alignment, ArrangeCtx, Constraints, DefaultTheme, Event, EventCtx, FieldGroup, FontWeight,
     FormRow, FormSection, Label, ListItem, ListView, MeasureCtx, PaintCtx, PointerEventKind, Rect,
@@ -43,14 +46,14 @@ use crate::backend::agents::{
     AgentConfigSnapshot, AgentConfigSummary, agent_definition_is_editable, agent_role_label,
     agent_source_label, built_in_agent_config_snapshot,
 };
-use crate::backend::cluster::{AppClusterInvite, AppClusterStatus};
+use crate::backend::cluster::{AppClusterInvite, AppClusterStatus, ClusterSnapshot};
 use crate::backend::config::{
     CONFIGURABLE_PROVIDERS, ConfigEditKind, ConfigItem, ProviderForm, REASONING_EFFORT_OPTIONS,
-    add_provider_account, cluster_provider_summaries, cycle_provider_reasoning_effort,
-    provider_default_model, provider_display_name, provider_forms, reasoning_effort_index,
-    remove_provider_account, resolve_items, run_provider_device_login, set_bool,
-    set_provider_api_key, set_provider_base_url, set_provider_chat_default, set_provider_effort,
-    set_provider_enabled, set_provider_model, set_value,
+    add_provider_account, cluster_provider_summaries, provider_default_model,
+    provider_display_name, provider_forms, reasoning_effort_index, remove_provider_account,
+    resolve_items, run_provider_device_login, set_bool, set_provider_api_key,
+    set_provider_base_url, set_provider_chat_default, set_provider_effort, set_provider_enabled,
+    set_provider_model, set_value,
 };
 use crate::backend::modules::ModuleConfigSnapshot;
 use crate::rendering::AppRenderMode;
@@ -145,6 +148,7 @@ pub struct SettingsState {
     pub cluster_action_error: Option<String>,
     pub cluster_action_status: Option<String>,
     pub leave_confirming: bool,
+    pub join_confirming: bool,
     pub version: String,
     /// The open section. `None` means "at the menu level" (only meaningful when
     /// the layout is narrow; when wide we always show a section).
@@ -183,14 +187,303 @@ pub struct SettingsState {
     pub skill_action_error: Option<String>,
     pub skill_action_status: Option<String>,
     pub skill_text_expanded: bool,
-    initial_load_rx: Option<Receiver<SettingsState>>,
+    /// Text controls write drafts here. A daemon/config write only starts from an explicit Save
+    /// action, so typing never waits for the RPC timeout and failed saves retain the user's input.
+    field_drafts: HashMap<String, String>,
+    initial_load_rx: Option<Receiver<SettingsInitialLoadResult>>,
     initial_load_started: bool,
+    operation_lane: Option<SettingsOperationLane>,
+    next_operation_request_id: u64,
+    pending_operations: HashMap<SettingsOperationScope, u64>,
+    provider_refresh_needed: bool,
+    server_generations: SettingsGenerations,
+    draft_generations: SettingsGenerations,
     connection_detail_expanded: Vec<Tab>,
     node_detail_expanded: bool,
     advanced_detail_expanded: Vec<String>,
     provider_detail_expanded: Vec<String>,
     provider_storage_detail_expanded: bool,
     provider_remove_confirming: Option<(String, String)>,
+}
+
+/// Independent generations keep a slow preload or operation result from replacing newer state in
+/// the same Settings surface. Server generations protect snapshots; draft generations protect
+/// text, selection, confirmation, and other user-owned state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SettingsGenerations {
+    config: u64,
+    providers: u64,
+    agents: u64,
+    modules: u64,
+    skills: u64,
+    cluster: u64,
+}
+
+impl SettingsGenerations {
+    fn get(self, domain: SettingsOperationDomain) -> u64 {
+        match domain {
+            SettingsOperationDomain::Config => self.config,
+            SettingsOperationDomain::Providers => self.providers,
+            SettingsOperationDomain::Agents => self.agents,
+            SettingsOperationDomain::Modules => self.modules,
+            SettingsOperationDomain::Skills => self.skills,
+            SettingsOperationDomain::Cluster => self.cluster,
+        }
+    }
+
+    fn bump(&mut self, domain: SettingsOperationDomain) {
+        let generation = match domain {
+            SettingsOperationDomain::Config => &mut self.config,
+            SettingsOperationDomain::Providers => &mut self.providers,
+            SettingsOperationDomain::Agents => &mut self.agents,
+            SettingsOperationDomain::Modules => &mut self.modules,
+            SettingsOperationDomain::Skills => &mut self.skills,
+            SettingsOperationDomain::Cluster => &mut self.cluster,
+        };
+        *generation = generation.wrapping_add(1);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum SettingsOperationDomain {
+    Config,
+    Providers,
+    Agents,
+    Modules,
+    Skills,
+    Cluster,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+enum SettingsOperationScope {
+    ConfigField(String),
+    Providers,
+    Agents,
+    Modules,
+    Skills,
+    Cluster,
+}
+
+impl SettingsOperationScope {
+    fn domain(&self) -> SettingsOperationDomain {
+        match self {
+            Self::ConfigField(_) => SettingsOperationDomain::Config,
+            Self::Providers => SettingsOperationDomain::Providers,
+            Self::Agents => SettingsOperationDomain::Agents,
+            Self::Modules => SettingsOperationDomain::Modules,
+            Self::Skills => SettingsOperationDomain::Skills,
+            Self::Cluster => SettingsOperationDomain::Cluster,
+        }
+    }
+}
+
+struct SettingsInitialLoadResult {
+    settings: SettingsState,
+    server_generations: SettingsGenerations,
+    draft_generations: SettingsGenerations,
+}
+
+struct SettingsOperationLane {
+    tx: Sender<SettingsOperationRequest>,
+    rx: Receiver<SettingsOperationResult>,
+}
+
+struct SettingsOperationRequest {
+    request_id: u64,
+    scope: SettingsOperationScope,
+    draft_generation: u64,
+    backend: Backend,
+    operation: SettingsOperation,
+}
+
+enum SettingsOperation {
+    SetConfigValue {
+        key: String,
+        kind: ConfigEditKind,
+        raw: String,
+        draft_key: String,
+    },
+    SetConfigJson {
+        key: String,
+        value: Value,
+        saved_draft: Option<(String, String)>,
+    },
+    SetConfigBool {
+        key: String,
+        value: bool,
+    },
+    AddProvider {
+        provider: String,
+        account: String,
+        api_key: String,
+        model: String,
+        base_url: String,
+        uses_device_login: bool,
+    },
+    RefreshProviders,
+    SetProviderEnabled {
+        provider: String,
+        account: String,
+        enabled: bool,
+    },
+    SetProviderChatDefault {
+        provider: String,
+        account: String,
+    },
+    RemoveProvider {
+        provider: String,
+        account: String,
+    },
+    SetProviderField {
+        provider: String,
+        account: String,
+        field: ProviderField,
+        raw: String,
+        draft_key: String,
+    },
+    SetProviderEffort {
+        provider: String,
+        account: String,
+        effort_index: usize,
+    },
+    RefreshAgents {
+        selected_id: Option<String>,
+    },
+    SaveAgent {
+        definition: AgentDefinition,
+        previous_id: Option<String>,
+    },
+    DeleteAgent {
+        id: String,
+    },
+    RefreshModules {
+        selected_node_id: Option<String>,
+    },
+    SetClusterModuleDefault {
+        selected_node_id: Option<String>,
+        module_id: String,
+        enabled: bool,
+    },
+    SetNodeModuleOverride {
+        node_id: String,
+        module_id: String,
+        enabled: Option<bool>,
+    },
+    RefreshSkills {
+        include_all: bool,
+        selected: Option<(String, String)>,
+    },
+    ImportSkill {
+        path: PathBuf,
+    },
+    ExportSkill {
+        skill_id: String,
+        version: String,
+        output: PathBuf,
+        include_all: bool,
+    },
+    ActivateSkill {
+        skill_id: String,
+        version: String,
+        include_all: bool,
+    },
+    CreateClusterInvite,
+    LeaveCluster,
+    JoinCluster {
+        invite: String,
+    },
+}
+
+struct SettingsOperationResult {
+    request_id: u64,
+    scope: SettingsOperationScope,
+    draft_generation: u64,
+    payload: SettingsOperationPayload,
+}
+
+enum SettingsOperationPayload {
+    Config(Result<ConfigOperationSuccess, String>),
+    Providers(Result<ProviderOperationSuccess, String>),
+    Agents(Result<AgentOperationSuccess, String>),
+    Modules(Result<ModuleOperationSuccess, String>),
+    Skills(Result<SkillOperationSuccess, String>),
+    Cluster(Result<ClusterOperationSuccess, String>),
+}
+
+struct ConfigOperationSuccess {
+    items: Vec<ConfigItem>,
+    saved_draft: Option<(String, String)>,
+}
+
+struct ProviderOperationSuccess {
+    items: Vec<ConfigItem>,
+    forms: Vec<ProviderForm>,
+    chat_providers: Vec<ProviderSummary>,
+    effect: ProviderOperationEffect,
+}
+
+enum ProviderOperationEffect {
+    Refreshed,
+    Added {
+        provider: String,
+        account: String,
+        uses_device_login: bool,
+    },
+    Updated {
+        provider: String,
+        account: String,
+        message: String,
+        saved_draft: Option<(String, String)>,
+    },
+    Removed {
+        provider: String,
+        account: String,
+    },
+}
+
+struct AgentOperationSuccess {
+    snapshot: AgentConfigSnapshot,
+    chat_agents: Vec<AgentSummary>,
+    effect: AgentOperationEffect,
+}
+
+enum AgentOperationEffect {
+    Refreshed,
+    Saved(String),
+    Deleted(String),
+}
+
+struct ModuleOperationSuccess {
+    snapshot: ModuleConfigSnapshot,
+    message: Option<String>,
+}
+
+struct SkillOperationSuccess {
+    skills: Vec<SkillSummary>,
+    selected: Option<(String, String)>,
+    detail: Option<SkillDetail>,
+    message: Option<String>,
+}
+
+struct ClusterOperationSuccess {
+    status: AppClusterStatus,
+    snapshot: ClusterSnapshot,
+    effect: ClusterOperationEffect,
+}
+
+enum ClusterOperationEffect {
+    Invite(AppClusterInvite),
+    Left,
+    Joined,
+}
+
+#[derive(Default)]
+struct SettingsOperationEffects {
+    changed: bool,
+    chat_providers: Option<Vec<ProviderSummary>>,
+    chat_agents: Option<Vec<AgentSummary>>,
+    cluster_snapshot: Option<ClusterSnapshot>,
+    provider_device_login: Option<(String, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -484,6 +777,7 @@ impl SettingsState {
             cluster_action_error: cluster_status.error,
             cluster_action_status: None,
             leave_confirming: false,
+            join_confirming: false,
             version: env!("CARGO_PKG_VERSION").to_string(),
             selected: None,
             field_errors: std::collections::HashMap::new(),
@@ -516,8 +810,15 @@ impl SettingsState {
             skill_action_error,
             skill_action_status: None,
             skill_text_expanded: false,
+            field_drafts: HashMap::new(),
             initial_load_rx: None,
             initial_load_started: false,
+            operation_lane: None,
+            next_operation_request_id: 0,
+            pending_operations: HashMap::new(),
+            provider_refresh_needed: false,
+            server_generations: SettingsGenerations::default(),
+            draft_generations: SettingsGenerations::default(),
             connection_detail_expanded: Vec::new(),
             node_detail_expanded: false,
             advanced_detail_expanded: Vec::new(),
@@ -569,6 +870,7 @@ impl SettingsState {
             cluster_action_error: cluster_status.error,
             cluster_action_status: None,
             leave_confirming: false,
+            join_confirming: false,
             version: env!("CARGO_PKG_VERSION").to_string(),
             selected: None,
             field_errors: std::collections::HashMap::new(),
@@ -601,8 +903,15 @@ impl SettingsState {
             skill_action_error: None,
             skill_action_status: None,
             skill_text_expanded: false,
+            field_drafts: HashMap::new(),
             initial_load_rx: None,
             initial_load_started: false,
+            operation_lane: None,
+            next_operation_request_id: 0,
+            pending_operations: HashMap::new(),
+            provider_refresh_needed: false,
+            server_generations: SettingsGenerations::default(),
+            draft_generations: SettingsGenerations::default(),
             connection_detail_expanded: Vec::new(),
             node_detail_expanded: false,
             advanced_detail_expanded: Vec::new(),
@@ -617,11 +926,17 @@ impl SettingsState {
             return false;
         }
         let (tx, rx) = mpsc::channel();
+        let server_generations = self.server_generations;
+        let draft_generations = self.draft_generations;
         match thread::Builder::new()
             .name("sinomo-app-settings-load".to_string())
             .spawn(move || {
                 let settings = SettingsState::new(&backend);
-                let _ = tx.send(settings);
+                let _ = tx.send(SettingsInitialLoadResult {
+                    settings,
+                    server_generations,
+                    draft_generations,
+                });
                 if let Some(waker) = waker {
                     waker.wake();
                 }
@@ -640,21 +955,517 @@ impl SettingsState {
     }
 
     pub fn pump_initial_load(&mut self) -> bool {
-        let Some(rx) = self.initial_load_rx.as_ref() else {
+        let result = self
+            .initial_load_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok());
+        let Some(result) = result else {
             return false;
         };
-        let Ok(mut loaded) = rx.try_recv() else {
-            return false;
-        };
-        loaded.selected = self.selected;
-        loaded.connection_detail_expanded = self.connection_detail_expanded.clone();
-        loaded.node_detail_expanded = self.node_detail_expanded;
-        loaded.advanced_detail_expanded = self.advanced_detail_expanded.clone();
-        loaded.provider_detail_expanded = self.provider_detail_expanded.clone();
-        loaded.provider_storage_detail_expanded = self.provider_storage_detail_expanded;
-        loaded.initial_load_started = true;
-        *self = loaded;
+        self.initial_load_rx = None;
+        self.initial_load_started = true;
+        self.merge_initial_load(result);
         true
+    }
+
+    /// Rebind Settings after the connection state machine installs a new daemon backend. In-flight
+    /// calls cannot be cancelled while an RPC is blocked, so dropping the lane/result receiver is
+    /// the synchronization boundary: old results can finish, but can no longer mutate live UI
+    /// state. Drafts remain intact and affected actions become explicitly retryable.
+    pub(crate) fn rebind_backend(&mut self, backend: &Backend) {
+        let retry_message = "Connection changed before the action completed; retry it.";
+        let pending_scopes = self.pending_operations.keys().cloned().collect::<Vec<_>>();
+        for scope in &pending_scopes {
+            match scope {
+                SettingsOperationScope::ConfigField(key) => {
+                    self.field_errors
+                        .insert(key.clone(), retry_message.to_string());
+                }
+                SettingsOperationScope::Providers => {
+                    self.provider_action_error = Some(retry_message.to_string());
+                    self.provider_action_status = None;
+                }
+                SettingsOperationScope::Agents => {
+                    self.agent_action_error = Some(retry_message.to_string());
+                    self.agent_action_status = None;
+                }
+                SettingsOperationScope::Modules => {
+                    self.module_action_error = Some(retry_message.to_string());
+                    self.module_action_status = None;
+                }
+                SettingsOperationScope::Skills => {
+                    self.skill_action_error = Some(retry_message.to_string());
+                    self.skill_action_status = None;
+                }
+                SettingsOperationScope::Cluster => {
+                    self.set_cluster_action_error(retry_message);
+                }
+            }
+        }
+        self.pending_operations.clear();
+        self.operation_lane = None;
+        self.provider_refresh_needed = false;
+        self.initial_load_rx = None;
+        self.initial_load_started = false;
+        self.config = backend.config.clone();
+        self.config_error = Some("Refreshing Settings after reconnect…".to_string());
+        for domain in [
+            SettingsOperationDomain::Config,
+            SettingsOperationDomain::Providers,
+            SettingsOperationDomain::Agents,
+            SettingsOperationDomain::Modules,
+            SettingsOperationDomain::Skills,
+            SettingsOperationDomain::Cluster,
+        ] {
+            self.server_generations.bump(domain);
+        }
+    }
+
+    /// Merge only server-owned fields whose domain has not advanced since the preload began.
+    /// Drafts, confirmations, action feedback, expansion state, and the operation lane always stay
+    /// owned by the live state. This is deliberately field-wise: replacing `self` here used to
+    /// erase join links, agent edits, and completed action feedback entered while loading.
+    fn merge_initial_load(&mut self, result: SettingsInitialLoadResult) {
+        let loaded = result.settings;
+        self.mode_label = loaded.mode_label;
+        self.status_detail = loaded.status_detail;
+        self.node_id = loaded.node_id;
+        self.role = loaded.role;
+        self.version = loaded.version;
+
+        if self.server_generations.config == result.server_generations.config {
+            self.config_items = loaded.config_items;
+            self.config_error = loaded.config_error;
+        }
+        if self.server_generations.providers == result.server_generations.providers {
+            self.provider_forms = loaded.provider_forms;
+        }
+        if self.server_generations.cluster == result.server_generations.cluster {
+            self.clustered = loaded.clustered;
+            self.cluster_id = loaded.cluster_id;
+            self.cluster_node_id = loaded.cluster_node_id;
+            self.cluster_summary = loaded.cluster_summary;
+            if result.draft_generations.cluster == 0
+                && self.draft_generations.cluster == result.draft_generations.cluster
+                && self.cluster_action_error.is_none()
+                && self.cluster_action_status.is_none()
+            {
+                self.cluster_action_error = loaded.cluster_action_error;
+            }
+        }
+        if self.server_generations.agents == result.server_generations.agents {
+            self.agent_snapshot = loaded.agent_snapshot;
+            if result.draft_generations.agents == 0
+                && self.draft_generations.agents == result.draft_generations.agents
+            {
+                self.agent_selected_id = loaded.agent_selected_id;
+                self.agent_form = loaded.agent_form;
+            }
+        }
+        if self.server_generations.modules == result.server_generations.modules {
+            self.module_snapshot = loaded.module_snapshot;
+            if result.draft_generations.modules == 0
+                && self.draft_generations.modules == result.draft_generations.modules
+            {
+                self.module_selected_node_id = loaded.module_selected_node_id;
+            }
+        }
+        if self.server_generations.skills == result.server_generations.skills {
+            self.skills = loaded.skills;
+            if result.draft_generations.skills == 0
+                && self.draft_generations.skills == result.draft_generations.skills
+            {
+                self.skill_selected = loaded.skill_selected;
+                self.skill_detail = loaded.skill_detail;
+            }
+            if self.skill_action_error.is_none() {
+                self.skill_action_error = loaded.skill_action_error;
+            }
+        }
+    }
+
+    fn mark_draft_changed(&mut self, domain: SettingsOperationDomain) {
+        self.draft_generations.bump(domain);
+    }
+
+    fn set_field_draft(&mut self, domain: SettingsOperationDomain, key: String, value: String) {
+        self.field_drafts.insert(key, value);
+        self.mark_draft_changed(domain);
+    }
+
+    fn field_draft_or(&self, key: &str, fallback: impl FnOnce() -> String) -> String {
+        self.field_drafts.get(key).cloned().unwrap_or_else(fallback)
+    }
+
+    fn operation_pending(&self, scope: &SettingsOperationScope) -> bool {
+        self.pending_operations.contains_key(scope)
+    }
+
+    fn domain_pending(&self, domain: SettingsOperationDomain) -> bool {
+        self.pending_operations
+            .keys()
+            .any(|scope| scope.domain() == domain)
+    }
+
+    fn queue_operation(
+        &mut self,
+        backend: Backend,
+        waker: Option<sui::UiHandle>,
+        scope: SettingsOperationScope,
+        operation: SettingsOperation,
+    ) -> bool {
+        // One in-flight request owns a scope until its matching result arrives. In particular,
+        // ignore key-repeat/double-click activation of destructive actions instead of enqueueing a
+        // second mutation whose eventual "not found" could mask the first request's success.
+        if self.operation_pending(&scope) {
+            return false;
+        }
+        if self.operation_lane.is_none() {
+            let (request_tx, request_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            let worker_waker = waker;
+            let spawn = thread::Builder::new()
+                .name("sinomo-app-settings-operations".to_string())
+                .spawn(move || settings_operation_worker(request_rx, result_tx, worker_waker));
+            if let Err(error) = spawn {
+                self.apply_operation_queue_error(
+                    &scope,
+                    format!("could not start Settings operation: {error}"),
+                );
+                return false;
+            }
+            self.operation_lane = Some(SettingsOperationLane {
+                tx: request_tx,
+                rx: result_rx,
+            });
+        }
+
+        let request_id = self.next_operation_request_id;
+        self.next_operation_request_id = self.next_operation_request_id.wrapping_add(1);
+        let draft_generation = self.draft_generations.get(scope.domain());
+        self.mark_operation_pending(&operation);
+        self.pending_operations.insert(scope.clone(), request_id);
+        let request = SettingsOperationRequest {
+            request_id,
+            scope: scope.clone(),
+            draft_generation,
+            backend,
+            operation,
+        };
+        let sent = self
+            .operation_lane
+            .as_ref()
+            .is_some_and(|lane| lane.tx.send(request).is_ok());
+        if !sent {
+            self.pending_operations.remove(&scope);
+            self.operation_lane = None;
+            self.apply_operation_queue_error(
+                &scope,
+                "Settings background worker stopped; retry the action".to_string(),
+            );
+        }
+        sent
+    }
+
+    fn mark_operation_pending(&mut self, operation: &SettingsOperation) {
+        match operation {
+            SettingsOperation::SetConfigValue { draft_key, .. }
+            | SettingsOperation::SetConfigJson {
+                saved_draft: Some((draft_key, _)),
+                ..
+            } => {
+                self.field_errors
+                    .insert(draft_key.clone(), "Saving…".to_string());
+            }
+            SettingsOperation::SetConfigJson { .. } | SettingsOperation::SetConfigBool { .. } => {}
+            SettingsOperation::AddProvider { .. } => {
+                self.provider_add_error = None;
+                self.provider_action_error = None;
+                self.provider_action_status = None;
+            }
+            SettingsOperation::RefreshProviders => {}
+            SettingsOperation::SetProviderEnabled {
+                provider, account, ..
+            }
+            | SettingsOperation::SetProviderChatDefault { provider, account }
+            | SettingsOperation::RemoveProvider { provider, account }
+            | SettingsOperation::SetProviderField {
+                provider, account, ..
+            }
+            | SettingsOperation::SetProviderEffort {
+                provider, account, ..
+            } => {
+                self.provider_action_error = None;
+                self.set_provider_status(provider.clone(), account.clone(), "Saving…");
+            }
+            SettingsOperation::RefreshAgents { .. } => {
+                self.agent_action_error = None;
+                self.agent_action_status = Some("Refreshing agents…".to_string());
+            }
+            SettingsOperation::SaveAgent { .. } => {
+                self.agent_action_error = None;
+                self.agent_action_status = Some("Saving agent…".to_string());
+            }
+            SettingsOperation::DeleteAgent { .. } => {
+                self.agent_action_error = None;
+                self.agent_action_status = Some("Deleting agent…".to_string());
+            }
+            SettingsOperation::RefreshModules { .. } => {
+                self.module_action_error = None;
+                self.module_action_status = Some("Refreshing modules…".to_string());
+            }
+            SettingsOperation::SetClusterModuleDefault { .. }
+            | SettingsOperation::SetNodeModuleOverride { .. } => {
+                self.module_action_error = None;
+                self.module_action_status = Some("Saving module configuration…".to_string());
+            }
+            SettingsOperation::RefreshSkills { .. } => {
+                self.skill_action_error = None;
+                self.skill_action_status = Some("Refreshing skills…".to_string());
+            }
+            SettingsOperation::ImportSkill { .. } => {
+                self.skill_action_error = None;
+                self.skill_action_status = Some("Importing skill…".to_string());
+            }
+            SettingsOperation::ExportSkill { .. } => {
+                self.skill_action_error = None;
+                self.skill_action_status = Some("Exporting skill…".to_string());
+            }
+            SettingsOperation::ActivateSkill { .. } => {
+                self.skill_action_error = None;
+                self.skill_action_status = Some("Activating skill…".to_string());
+            }
+            SettingsOperation::CreateClusterInvite => {
+                self.cluster_action_error = None;
+                self.cluster_action_status = Some("Generating invitation…".to_string());
+            }
+            SettingsOperation::LeaveCluster => {
+                self.cluster_action_error = None;
+                self.cluster_action_status = Some("Leaving cluster…".to_string());
+            }
+            SettingsOperation::JoinCluster { .. } => {
+                self.cluster_action_error = None;
+                self.cluster_action_status = Some("Migrating to cluster…".to_string());
+            }
+        }
+    }
+
+    fn apply_operation_queue_error(&mut self, scope: &SettingsOperationScope, error: String) {
+        match scope.domain() {
+            SettingsOperationDomain::Config => {
+                if let SettingsOperationScope::ConfigField(key) = scope {
+                    self.field_errors.insert(key.clone(), error);
+                }
+            }
+            SettingsOperationDomain::Providers => {
+                self.provider_action_error = Some(error);
+                self.provider_action_status = None;
+            }
+            SettingsOperationDomain::Agents => {
+                self.agent_action_error = Some(error);
+                self.agent_action_status = None;
+            }
+            SettingsOperationDomain::Modules => {
+                self.module_action_error = Some(error);
+                self.module_action_status = None;
+            }
+            SettingsOperationDomain::Skills => {
+                self.skill_action_error = Some(error);
+                self.skill_action_status = None;
+            }
+            SettingsOperationDomain::Cluster => self.set_cluster_action_error(error),
+        }
+    }
+
+    fn pump_operations(&mut self) -> SettingsOperationEffects {
+        let results = match self.operation_lane.as_ref() {
+            Some(lane) => lane.rx.try_iter().collect::<Vec<_>>(),
+            None => return SettingsOperationEffects::default(),
+        };
+        let mut effects = SettingsOperationEffects::default();
+        for result in results {
+            if self.pending_operations.get(&result.scope) != Some(&result.request_id) {
+                continue;
+            }
+            self.pending_operations.remove(&result.scope);
+            effects.changed = true;
+            let domain = result.scope.domain();
+            match result.payload {
+                SettingsOperationPayload::Config(Ok(success)) => {
+                    self.server_generations
+                        .bump(SettingsOperationDomain::Config);
+                    self.config_items = success.items;
+                    self.config_error = None;
+                    if let Some((key, saved)) = success.saved_draft {
+                        if self.field_drafts.get(&key) == Some(&saved) {
+                            self.field_drafts.remove(&key);
+                        }
+                        self.field_errors.remove(&key);
+                    }
+                }
+                SettingsOperationPayload::Config(Err(error)) => {
+                    self.apply_operation_queue_error(&result.scope, error);
+                }
+                SettingsOperationPayload::Providers(Ok(success)) => {
+                    self.server_generations
+                        .bump(SettingsOperationDomain::Config);
+                    self.server_generations
+                        .bump(SettingsOperationDomain::Providers);
+                    self.config_items = success.items;
+                    self.config_error = None;
+                    self.provider_forms = success.forms;
+                    effects.chat_providers = Some(success.chat_providers);
+                    self.provider_action_error = None;
+                    self.provider_remove_confirming = None;
+                    match success.effect {
+                        ProviderOperationEffect::Refreshed => {}
+                        ProviderOperationEffect::Added {
+                            provider,
+                            account,
+                            uses_device_login,
+                        } => {
+                            if self.draft_generations.providers == result.draft_generation {
+                                self.close_provider_add();
+                                self.provider_add_account = "default".to_string();
+                                self.provider_add_api_key.clear();
+                                self.provider_add_base_url.clear();
+                                self.provider_add_model =
+                                    provider_default_model(self.provider_add_provider());
+                            }
+                            self.set_provider_status(
+                                provider.clone(),
+                                account.clone(),
+                                "Account added to lm.providers",
+                            );
+                            if uses_device_login {
+                                effects.provider_device_login = Some((provider, account));
+                            }
+                        }
+                        ProviderOperationEffect::Updated {
+                            provider,
+                            account,
+                            message,
+                            saved_draft,
+                        } => {
+                            if let Some((key, saved)) = saved_draft {
+                                if self.field_drafts.get(&key) == Some(&saved) {
+                                    self.field_drafts.remove(&key);
+                                }
+                                self.field_errors.remove(&key);
+                            }
+                            self.set_provider_status(provider, account, message);
+                        }
+                        ProviderOperationEffect::Removed { provider, account } => {
+                            if self.device_login.as_ref().is_some_and(|login| {
+                                login.provider == provider && login.account == account
+                            }) {
+                                self.device_login = None;
+                            }
+                            self.provider_action_status = None;
+                        }
+                    }
+                }
+                SettingsOperationPayload::Providers(Err(error)) => {
+                    self.apply_operation_queue_error(&result.scope, error);
+                }
+                SettingsOperationPayload::Agents(Ok(success)) => {
+                    self.server_generations
+                        .bump(SettingsOperationDomain::Agents);
+                    self.agent_snapshot = success.snapshot;
+                    if self.draft_generations.agents == result.draft_generation {
+                        self.agent_selected_id = self
+                            .agent_snapshot
+                            .selected_agent
+                            .as_ref()
+                            .map(|agent| agent.key().to_string());
+                        if let Some(definition) = self.agent_snapshot.selected_agent.clone() {
+                            self.agent_form = AgentForm::from_definition(definition);
+                        }
+                    }
+                    self.agent_action_error = None;
+                    self.agent_action_status = match success.effect {
+                        AgentOperationEffect::Refreshed => None,
+                        AgentOperationEffect::Saved(id) => Some(format!("Saved custom agent {id}")),
+                        AgentOperationEffect::Deleted(id) => {
+                            self.agent_delete_confirming = None;
+                            Some(format!("Deleted custom agent {id}"))
+                        }
+                    };
+                    effects.chat_agents = Some(success.chat_agents);
+                }
+                SettingsOperationPayload::Agents(Err(error)) => {
+                    self.apply_operation_queue_error(&result.scope, error);
+                }
+                SettingsOperationPayload::Modules(Ok(success)) => {
+                    self.server_generations
+                        .bump(SettingsOperationDomain::Modules);
+                    self.module_snapshot = success.snapshot;
+                    if self.draft_generations.modules == result.draft_generation {
+                        self.module_selected_node_id = self
+                            .module_snapshot
+                            .selected_node
+                            .as_ref()
+                            .map(|node| node.summary.node_id.clone());
+                    }
+                    self.module_action_error = None;
+                    self.module_action_status = success.message;
+                }
+                SettingsOperationPayload::Modules(Err(error)) => {
+                    self.apply_operation_queue_error(&result.scope, error);
+                }
+                SettingsOperationPayload::Skills(Ok(success)) => {
+                    self.server_generations
+                        .bump(SettingsOperationDomain::Skills);
+                    self.skills = success.skills;
+                    if self.draft_generations.skills == result.draft_generation {
+                        self.skill_selected = success.selected;
+                        self.skill_detail = success.detail;
+                    }
+                    self.skill_action_error = None;
+                    self.skill_action_status = success.message;
+                }
+                SettingsOperationPayload::Skills(Err(error)) => {
+                    self.apply_operation_queue_error(&result.scope, error);
+                }
+                SettingsOperationPayload::Cluster(Ok(success)) => {
+                    self.server_generations
+                        .bump(SettingsOperationDomain::Cluster);
+                    self.clustered = success.status.clustered;
+                    self.cluster_id = success.status.cluster_id;
+                    self.cluster_node_id = success.status.local_node_id;
+                    self.cluster_summary = success.status.summary;
+                    self.cluster_action_error = success.status.error;
+                    self.leave_confirming = false;
+                    effects.cluster_snapshot = Some(success.snapshot);
+                    match success.effect {
+                        ClusterOperationEffect::Invite(invite) => {
+                            self.invite_result = Some(invite);
+                            self.set_cluster_action_status("Invitation generated");
+                        }
+                        ClusterOperationEffect::Left => {
+                            self.invite_result = None;
+                            self.join_confirming = false;
+                            self.set_cluster_action_status("Started single-node cluster");
+                        }
+                        ClusterOperationEffect::Joined => {
+                            if self.draft_generations.cluster == result.draft_generation {
+                                self.join_invite.clear();
+                                self.join_confirming = false;
+                            }
+                            self.invite_result = None;
+                            self.set_cluster_action_status(
+                                "Joined cluster. If recovery is needed, run `sinomo cluster status` and restart the daemon; failed migrations restore the source cluster automatically.",
+                            );
+                        }
+                    }
+                }
+                SettingsOperationPayload::Cluster(Err(error)) => {
+                    self.apply_operation_queue_error(&result.scope, error);
+                }
+            }
+            debug_assert_eq!(domain, result.scope.domain());
+        }
+        effects
     }
 
     /// Open a section's detail page.
@@ -763,30 +1574,33 @@ impl SettingsState {
             .position(|agent| &agent.id == selected)
     }
 
-    fn select_agent_index(&mut self, backend: &Backend, index: usize) {
-        let Some(agent) = self.agent_snapshot.agents.get(index) else {
-            return;
-        };
-        self.agent_selected_id = Some(agent.id.clone());
+    fn prepare_agent_selection(&mut self, index: usize) -> Option<String> {
+        let id = self.agent_snapshot.agents.get(index)?.id.clone();
+        self.agent_selected_id = Some(id.clone());
         self.agent_action_error = None;
-        self.agent_action_status = None;
+        self.agent_action_status = Some("Loading agent…".to_string());
         self.agent_delete_confirming = None;
-        self.reload_agents(backend);
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
+        Some(id)
     }
 
-    fn reload_agents(&mut self, backend: &Backend) {
-        self.agent_snapshot = backend.agent_config_snapshot(self.agent_selected_id.as_deref());
-        self.agent_selected_id = self
-            .agent_snapshot
-            .selected_agent
-            .as_ref()
-            .map(|agent| agent.key().to_string());
-        if let Some(definition) = self.agent_snapshot.selected_agent.clone() {
-            self.agent_form = AgentForm::from_definition(definition);
-        }
+    fn agent_save_operation(&mut self) -> Option<SettingsOperation> {
+        let definition = match self.agent_form.to_definition() {
+            Ok(definition) => definition,
+            Err(error) => {
+                self.agent_action_error = Some(error);
+                self.agent_action_status = None;
+                return None;
+            }
+        };
+        Some(SettingsOperation::SaveAgent {
+            definition,
+            previous_id: self.agent_form.previous_id.clone(),
+        })
     }
 
     fn create_agent(&mut self) {
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
         let id = unique_agent_id(&self.agent_snapshot, "custom-agent");
         self.agent_form = AgentForm::new_custom(id.clone());
         self.agent_selected_id = Some(id);
@@ -806,6 +1620,7 @@ impl SettingsState {
             &format!("{}-custom", definition.key()),
         );
         self.agent_form = AgentForm::duplicate_from(definition, id.clone());
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_selected_id = Some(id);
         self.agent_action_error = None;
         self.agent_action_status = Some("Editing duplicated custom agent".to_string());
@@ -814,78 +1629,91 @@ impl SettingsState {
 
     fn set_agent_id(&mut self, value: String) {
         self.agent_form.id = value;
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_action_error = None;
         self.agent_action_status = None;
     }
 
     fn set_agent_name(&mut self, value: String) {
         self.agent_form.name = value;
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_action_error = None;
         self.agent_action_status = None;
     }
 
     fn set_agent_description(&mut self, value: String) {
         self.agent_form.description = value;
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_action_error = None;
         self.agent_action_status = None;
     }
 
     fn set_agent_role_index(&mut self, index: usize) {
         self.agent_form.role_index = index.min(AGENT_ROLE_OPTIONS.len().saturating_sub(1));
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_action_error = None;
         self.agent_action_status = None;
     }
 
     fn set_agent_system_prompt(&mut self, value: String) {
         self.agent_form.system_prompt = value;
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_action_error = None;
         self.agent_action_status = None;
     }
 
     fn set_agent_provider(&mut self, value: String) {
         self.agent_form.provider = value;
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_action_error = None;
         self.agent_action_status = None;
     }
 
     fn set_agent_model(&mut self, value: String) {
         self.agent_form.model = value;
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_action_error = None;
         self.agent_action_status = None;
     }
 
     fn set_agent_temperature(&mut self, value: String) {
         self.agent_form.temperature = value;
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_action_error = None;
         self.agent_action_status = None;
     }
 
     fn set_agent_max_output_tokens(&mut self, value: String) {
         self.agent_form.max_output_tokens = value;
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_action_error = None;
         self.agent_action_status = None;
     }
 
     fn set_agent_max_steps(&mut self, value: String) {
         self.agent_form.max_steps = value;
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_action_error = None;
         self.agent_action_status = None;
     }
 
     fn set_agent_max_tool_calls_per_step(&mut self, value: String) {
         self.agent_form.max_tool_calls_per_step = value;
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_action_error = None;
         self.agent_action_status = None;
     }
 
     fn set_agent_max_model_repair_attempts(&mut self, value: String) {
         self.agent_form.max_model_repair_attempts = value;
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_action_error = None;
         self.agent_action_status = None;
     }
 
     fn set_agent_sandbox_node_id(&mut self, value: String) {
         self.agent_form.sandbox_node_id = value;
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_action_error = None;
         self.agent_action_status = None;
     }
@@ -893,62 +1721,41 @@ impl SettingsState {
     fn set_agent_output_format_index(&mut self, index: usize) {
         self.agent_form.output_format_index =
             index.min(AGENT_OUTPUT_FORMAT_OPTIONS.len().saturating_sub(1));
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_action_error = None;
         self.agent_action_status = None;
     }
 
     fn set_agent_skills_text(&mut self, value: String) {
         self.agent_form.skills_text = value;
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_action_error = None;
         self.agent_action_status = None;
     }
 
     fn set_agent_visible_toolsets_text(&mut self, value: String) {
         self.agent_form.visible_toolsets_text = value;
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_action_error = None;
         self.agent_action_status = None;
     }
 
     fn set_agent_allow_tools_text(&mut self, value: String) {
         self.agent_form.allow_tools_text = value;
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_action_error = None;
         self.agent_action_status = None;
     }
 
     fn set_agent_deny_tools_text(&mut self, value: String) {
         self.agent_form.deny_tools_text = value;
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_action_error = None;
         self.agent_action_status = None;
     }
 
     fn agent_form_can_save(&self) -> bool {
         self.agent_form.can_save() && agent_definition_is_editable(&self.agent_form.definition)
-    }
-
-    fn save_agent_form(&mut self, backend: &Backend) -> bool {
-        let definition = match self.agent_form.to_definition() {
-            Ok(definition) => definition,
-            Err(error) => {
-                self.agent_action_error = Some(error);
-                self.agent_action_status = None;
-                return false;
-            }
-        };
-        let previous_id = self.agent_form.previous_id.clone();
-        match backend.save_custom_agent_definition(&definition, previous_id.as_deref()) {
-            Ok(()) => {
-                self.agent_action_error = None;
-                self.agent_action_status = Some(format!("Saved custom agent {}", definition.key()));
-                self.agent_selected_id = Some(definition.key().to_string());
-                self.reload_agents(backend);
-                true
-            }
-            Err(error) => {
-                self.agent_action_error = Some(error);
-                self.agent_action_status = None;
-                false
-            }
-        }
     }
 
     fn confirm_agent_delete(&mut self) {
@@ -964,114 +1771,12 @@ impl SettingsState {
         self.agent_action_error = None;
     }
 
-    fn delete_selected_agent(&mut self, backend: &Backend) -> bool {
-        let Some(id) = self.agent_selected_id.clone() else {
-            self.agent_action_error = Some("select a custom agent first".to_string());
-            self.agent_action_status = None;
-            return false;
-        };
-        match backend.delete_custom_agent_definition(&id) {
-            Ok(_) => {
-                self.agent_action_error = None;
-                self.agent_action_status = Some(format!("Deleted custom agent {id}"));
-                self.agent_delete_confirming = None;
-                self.agent_selected_id = None;
-                self.reload_agents(backend);
-                true
-            }
-            Err(error) => {
-                self.agent_action_error = Some(error);
-                self.agent_action_status = None;
-                false
-            }
-        }
-    }
-
     fn selected_module_node_index(&self) -> Option<usize> {
         let selected = self.module_selected_node_id.as_ref()?;
         self.module_snapshot
             .nodes
             .iter()
             .position(|node| &node.node_id == selected)
-    }
-
-    fn select_module_node_index(&mut self, backend: &Backend, index: usize) {
-        let Some(node) = self.module_snapshot.nodes.get(index) else {
-            return;
-        };
-        self.module_selected_node_id = Some(node.node_id.clone());
-        self.module_action_error = None;
-        self.module_action_status = None;
-        self.reload_modules(backend);
-    }
-
-    fn reload_modules(&mut self, backend: &Backend) {
-        self.module_snapshot =
-            backend.module_config_snapshot(self.module_selected_node_id.as_deref());
-        self.module_selected_node_id = self
-            .module_snapshot
-            .selected_node
-            .as_ref()
-            .map(|node| node.summary.node_id.clone());
-    }
-
-    fn set_cluster_module_default(
-        &mut self,
-        backend: &Backend,
-        module_id: &str,
-        enabled: bool,
-    ) -> bool {
-        match backend.set_cluster_module_default(module_id, enabled) {
-            Ok(()) => {
-                self.module_action_error = None;
-                self.module_action_status = Some(format!(
-                    "Cluster default saved for {}",
-                    module_display_id(module_id)
-                ));
-                self.reload_modules(backend);
-                true
-            }
-            Err(error) => {
-                self.module_action_error = Some(error);
-                self.module_action_status = None;
-                false
-            }
-        }
-    }
-
-    fn set_node_module_override(
-        &mut self,
-        backend: &Backend,
-        module_id: &str,
-        enabled: Option<bool>,
-    ) -> bool {
-        let Some(node_id) = self.module_selected_node_id.clone() else {
-            self.module_action_error = Some("select a node first".to_string());
-            self.module_action_status = None;
-            return false;
-        };
-        match backend.set_node_module_override(&node_id, module_id, enabled) {
-            Ok(()) => {
-                self.module_action_error = None;
-                self.module_action_status = Some(match enabled {
-                    Some(true) => {
-                        format!("Node override enabled for {}", module_display_id(module_id))
-                    }
-                    Some(false) => format!(
-                        "Node override disabled for {}",
-                        module_display_id(module_id)
-                    ),
-                    None => format!("Node override cleared for {}", module_display_id(module_id)),
-                });
-                self.reload_modules(backend);
-                true
-            }
-            Err(error) => {
-                self.module_action_error = Some(error);
-                self.module_action_status = None;
-                false
-            }
-        }
     }
 
     fn selected_skill_index(&self) -> Option<usize> {
@@ -1081,163 +1786,22 @@ impl SettingsState {
             .position(|skill| &skill.id == selected_id && &skill.version == selected_version)
     }
 
-    fn select_skill_index(&mut self, index: usize) {
-        let Some(skill) = self.skills.get(index) else {
-            return;
-        };
-        self.skill_selected = Some((skill.id.clone(), skill.version.clone()));
-        self.skill_action_error = None;
-        self.skill_text_expanded = false;
-        self.refresh_selected_skill_detail();
-    }
-
-    fn set_skills_include_all(&mut self, include_all: bool) {
-        if self.skills_include_all == include_all {
-            return;
-        }
-        self.skills_include_all = include_all;
-        self.reload_skills();
-    }
-
     fn set_skill_import_path(&mut self, value: String) {
         self.skill_import_path = value;
+        self.mark_draft_changed(SettingsOperationDomain::Skills);
         self.skill_action_error = None;
         self.skill_action_status = None;
     }
 
     fn set_skill_export_path(&mut self, value: String) {
         self.skill_export_path = value;
+        self.mark_draft_changed(SettingsOperationDomain::Skills);
         self.skill_action_error = None;
         self.skill_action_status = None;
     }
 
     fn toggle_skill_text(&mut self) {
         self.skill_text_expanded = !self.skill_text_expanded;
-    }
-
-    fn reload_skills(&mut self) {
-        let previous = self.skill_selected.clone();
-        match sinomo_cli::app_api::skill_summaries(self.data_dir.as_ref(), self.skills_include_all)
-        {
-            Ok(skills) => {
-                self.skills = skills;
-                self.skill_selected = previous
-                    .filter(|(id, version)| {
-                        self.skills
-                            .iter()
-                            .any(|skill| &skill.id == id && &skill.version == version)
-                    })
-                    .or_else(|| {
-                        self.skills
-                            .first()
-                            .map(|skill| (skill.id.clone(), skill.version.clone()))
-                    });
-                self.refresh_selected_skill_detail();
-            }
-            Err(error) => {
-                self.skills.clear();
-                self.skill_selected = None;
-                self.skill_detail = None;
-                self.skill_action_error = Some(error);
-            }
-        }
-    }
-
-    fn refresh_selected_skill_detail(&mut self) {
-        let Some((skill_id, version)) = self.skill_selected.clone() else {
-            self.skill_detail = None;
-            return;
-        };
-        match sinomo_cli::app_api::skill_detail(self.data_dir.as_ref(), &skill_id, Some(&version)) {
-            Ok(detail) => {
-                self.skill_detail = Some(detail);
-            }
-            Err(error) => {
-                self.skill_detail = None;
-                self.skill_action_error = Some(error);
-            }
-        }
-    }
-
-    fn import_skill_from_path(&mut self) -> bool {
-        let path = self.skill_import_path.trim();
-        if path.is_empty() {
-            self.skill_action_error = Some("enter a skill file or directory path".to_string());
-            self.skill_action_status = None;
-            return false;
-        }
-        let path = PathBuf::from(path);
-        match sinomo_cli::app_api::import_skill(self.data_dir.as_ref(), &path, None, None, true) {
-            Ok(result) => {
-                self.skills_include_all = true;
-                self.skill_selected = Some((result.skill.id.clone(), result.skill.version.clone()));
-                self.skill_action_status = Some(skill_mutation_message(&result));
-                self.skill_action_error = None;
-                self.skill_text_expanded = false;
-                self.reload_skills();
-                true
-            }
-            Err(error) => {
-                self.skill_action_error = Some(error);
-                self.skill_action_status = None;
-                false
-            }
-        }
-    }
-
-    fn export_selected_skill(&mut self) -> bool {
-        let Some((skill_id, version)) = self.skill_selected.clone() else {
-            self.skill_action_error = Some("select a skill to export".to_string());
-            self.skill_action_status = None;
-            return false;
-        };
-        let output = self.skill_export_path.trim();
-        if output.is_empty() {
-            self.skill_action_error = Some("enter an export path".to_string());
-            self.skill_action_status = None;
-            return false;
-        }
-        let output = PathBuf::from(output);
-        match sinomo_cli::app_api::export_skill(
-            self.data_dir.as_ref(),
-            &skill_id,
-            Some(&version),
-            Some(&output),
-        ) {
-            Ok(result) => {
-                self.skill_action_status = Some(skill_mutation_message(&result));
-                self.skill_action_error = None;
-                true
-            }
-            Err(error) => {
-                self.skill_action_error = Some(error);
-                self.skill_action_status = None;
-                false
-            }
-        }
-    }
-
-    fn activate_selected_skill(&mut self) -> bool {
-        let Some((skill_id, version)) = self.skill_selected.clone() else {
-            self.skill_action_error = Some("select a skill to activate".to_string());
-            self.skill_action_status = None;
-            return false;
-        };
-        match sinomo_cli::app_api::activate_skill(self.data_dir.as_ref(), &skill_id, Some(&version))
-        {
-            Ok(result) => {
-                self.skill_selected = Some((result.skill.id.clone(), result.skill.version.clone()));
-                self.skill_action_status = Some(skill_mutation_message(&result));
-                self.skill_action_error = None;
-                self.reload_skills();
-                true
-            }
-            Err(error) => {
-                self.skill_action_error = Some(error);
-                self.skill_action_status = None;
-                false
-            }
-        }
     }
 
     fn confirm_provider_remove(&mut self, index: usize) {
@@ -1277,64 +1841,31 @@ impl SettingsState {
         self.provider_add_model = provider_default_model(self.provider_add_provider());
         self.provider_add_api_key.clear();
         self.provider_add_error = None;
+        self.mark_draft_changed(SettingsOperationDomain::Providers);
     }
 
     fn set_provider_add_account(&mut self, value: String) {
         self.provider_add_account = value;
+        self.mark_draft_changed(SettingsOperationDomain::Providers);
         self.provider_add_error = None;
     }
 
     fn set_provider_add_api_key(&mut self, value: String) {
         self.provider_add_api_key = value;
+        self.mark_draft_changed(SettingsOperationDomain::Providers);
         self.provider_add_error = None;
     }
 
     fn set_provider_add_model(&mut self, value: String) {
         self.provider_add_model = value;
+        self.mark_draft_changed(SettingsOperationDomain::Providers);
         self.provider_add_error = None;
     }
 
     fn set_provider_add_base_url(&mut self, value: String) {
         self.provider_add_base_url = value;
+        self.mark_draft_changed(SettingsOperationDomain::Providers);
         self.provider_add_error = None;
-    }
-
-    fn add_provider_from_form(&mut self) -> Result<(String, String, bool), String> {
-        let provider = self.provider_add_provider().to_string();
-        let account = self.provider_add_account.trim().to_string();
-        let uses_device_login = self.provider_add_uses_device_login();
-        match add_provider_account(
-            self.config.as_ref(),
-            &provider,
-            &account,
-            &self.provider_add_api_key,
-            &self.provider_add_model,
-            &self.provider_add_base_url,
-        ) {
-            Ok(()) => {
-                let account = sinomo_lm::normalize_provider_account_name(Some(&account));
-                self.close_provider_add();
-                self.provider_action_error = None;
-                self.provider_remove_confirming = None;
-                self.provider_add_account = "default".to_string();
-                self.provider_add_api_key.clear();
-                self.provider_add_base_url.clear();
-                self.provider_add_model = provider_default_model(self.provider_add_provider());
-                self.reload();
-                self.set_provider_status(
-                    provider.clone(),
-                    account.clone(),
-                    "Account added to lm.providers",
-                );
-                Ok((provider, account, uses_device_login))
-            }
-            Err(error) => {
-                self.provider_add_error = Some(error.clone());
-                self.provider_action_error = None;
-                self.provider_action_status = None;
-                Err(error)
-            }
-        }
     }
 
     /// Return to the menu level (narrow layout).
@@ -1342,47 +1873,34 @@ impl SettingsState {
         self.selected = None;
     }
 
-    fn toggle_config(&mut self, index: usize) {
-        let Some(item) = self.config_items.get(index) else {
-            return;
-        };
-        let Some(current) = item.bool_value else {
-            return;
-        };
-        let key = item.key.clone();
-        if set_bool(self.config.as_ref(), &key, !current).is_ok() {
-            self.reload();
-        }
-    }
-
-    /// Reload config + provider state from the service (after a write).
-    fn reload(&mut self) {
-        self.config_items = resolve_items(self.config.as_ref());
-        self.provider_forms = provider_forms(self.config.as_ref());
-    }
-
     fn set_join_invite(&mut self, value: String) {
         self.join_invite = value;
+        self.join_confirming = false;
+        self.mark_draft_changed(SettingsOperationDomain::Cluster);
         self.cluster_action_error = None;
         self.cluster_action_status = None;
     }
 
-    fn apply_cluster_status(&mut self, status: AppClusterStatus) {
-        let previous_cluster_id = self.cluster_id.clone();
-        self.clustered = status.clustered;
-        self.cluster_id = status.cluster_id;
-        self.cluster_node_id = status.local_node_id;
-        self.cluster_summary = status.summary;
-        self.cluster_action_error = status.error;
-        self.leave_confirming = false;
-        if self.clustered {
-            self.join_invite.clear();
-            if previous_cluster_id != self.cluster_id {
-                self.invite_result = None;
+    fn confirm_join_cluster(&mut self) -> bool {
+        match cluster_join_preview(&self.join_invite) {
+            Ok(_) => {
+                self.join_confirming = true;
+                self.cluster_action_error = None;
+                self.cluster_action_status = None;
+                self.mark_draft_changed(SettingsOperationDomain::Cluster);
+                true
             }
-        } else {
-            self.invite_result = None;
+            Err(error) => {
+                self.join_confirming = false;
+                self.set_cluster_action_error(error);
+                false
+            }
         }
+    }
+
+    fn cancel_join_cluster(&mut self) {
+        self.join_confirming = false;
+        self.mark_draft_changed(SettingsOperationDomain::Cluster);
     }
 
     fn set_cluster_action_status(&mut self, message: impl Into<String>) {
@@ -1397,197 +1915,140 @@ impl SettingsState {
 
     fn confirm_leave_cluster(&mut self) {
         self.leave_confirming = true;
+        self.mark_draft_changed(SettingsOperationDomain::Cluster);
         self.cluster_action_error = None;
         self.cluster_action_status = None;
     }
 
     fn cancel_leave_cluster(&mut self) {
         self.leave_confirming = false;
+        self.mark_draft_changed(SettingsOperationDomain::Cluster);
     }
 
-    /// Write an edited (non-boolean) config value at `index`. On a parse error the prior value is
-    /// preserved and the error is recorded against the row (shown as an inline subtitle); the
-    /// `TextInput` keeps the user's text. On success the row's error is cleared. Does NOT reload on
-    /// every keystroke (that would re-resolve the whole catalog per character) — the field's own
-    /// text keeps it correct, and a reload happens on the next section open / external wake.
-    fn set_config_value(&mut self, index: usize, raw: &str) {
+    fn set_config_value_draft(&mut self, index: usize, raw: String) {
         let Some(item) = self.config_items.get(index) else {
             return;
         };
         if item.edit_kind == ConfigEditKind::Bool {
             return;
         }
-        let key = item.key.clone();
-        let kind = item.edit_kind;
-        match set_value(self.config.as_ref(), &key, kind, raw) {
-            Ok(()) => {
-                self.field_errors.remove(&config_field_key(&key));
-            }
-            Err(error) => {
-                self.field_errors.insert(config_field_key(&key), error);
-            }
+        let key = config_field_key(&item.key);
+        self.field_errors.remove(&key);
+        self.set_field_draft(SettingsOperationDomain::Config, key, raw);
+    }
+
+    fn config_value_operation(
+        &self,
+        index: usize,
+    ) -> Option<(SettingsOperationScope, SettingsOperation)> {
+        let item = self.config_items.get(index)?;
+        if item.edit_kind == ConfigEditKind::Bool {
+            return None;
         }
+        let draft_key = config_field_key(&item.key);
+        let raw = self
+            .field_drafts
+            .get(&draft_key)
+            .cloned()
+            .unwrap_or_else(|| item.edit_value.clone());
+        Some((
+            SettingsOperationScope::ConfigField(draft_key.clone()),
+            SettingsOperation::SetConfigValue {
+                key: item.key.clone(),
+                kind: item.edit_kind,
+                raw,
+                draft_key,
+            },
+        ))
     }
 
-    fn set_config_schema_bool(&mut self, index: usize, path: Vec<String>, value: bool) {
-        self.set_config_schema_value(index, path, Value::Bool(value));
-    }
-
-    fn set_config_schema_text(
+    fn set_config_schema_text_draft(
         &mut self,
         index: usize,
         path: Vec<String>,
         schema: ConfigSchemaValue,
-        raw: &str,
+        raw: String,
     ) {
-        match parse_schema_editor_value(&schema, raw) {
-            Ok(value) => self.set_config_schema_value(index, path, value),
-            Err(error) => {
-                if let Some(item) = self.config_items.get(index) {
-                    self.field_errors
-                        .insert(config_schema_field_key(&item.key, &path), error);
-                }
-            }
-        }
-    }
-
-    fn set_config_schema_value(&mut self, index: usize, path: Vec<String>, value: Value) {
         let Some(item) = self.config_items.get(index) else {
             return;
         };
-        let key = item.key.clone();
-        let mut next = item.raw_value.clone();
-        let error_key = config_schema_field_key(&key, &path);
-        if let Err(error) = set_json_path_value(&mut next, &path, value) {
-            self.field_errors.insert(error_key, error);
-            return;
-        }
-        match self
-            .config
-            .set(&key, next.clone(), ConfigWriteTarget::Auto)
-            .map_err(|error| error.to_string())
-        {
+        let key = config_schema_field_key(&item.key, &path);
+        match parse_schema_editor_value(&schema, &raw) {
             Ok(_) => {
-                if let Some(item) = self.config_items.get_mut(index) {
-                    item.update_value(next);
-                }
-                self.field_errors.remove(&error_key);
+                self.field_errors.remove(&key);
             }
             Err(error) => {
-                self.field_errors.insert(error_key, error);
+                self.field_errors.insert(key.clone(), error);
             }
         }
+        self.set_field_draft(SettingsOperationDomain::Config, key, raw);
     }
 
-    fn toggle_provider(&mut self, index: usize) -> bool {
-        let Some(form) = self.provider_forms.get(index) else {
-            return false;
-        };
-        let provider = form.provider.clone();
-        let account = form.account.clone();
-        let enabled = !form.enabled;
-        if set_provider_enabled(self.config.as_ref(), &provider, &account, enabled).is_ok() {
-            self.provider_action_error = None;
-            self.provider_remove_confirming = None;
-            self.reload();
-            self.set_provider_status(
-                provider,
-                account,
-                if enabled {
-                    "Provider enabled in lm.providers"
-                } else {
-                    "Provider disabled in lm.providers"
-                },
-            );
-            return true;
-        }
-        false
+    fn config_schema_text_operation(
+        &self,
+        index: usize,
+        path: Vec<String>,
+        schema: ConfigSchemaValue,
+    ) -> Result<(SettingsOperationScope, SettingsOperation), String> {
+        let item = self
+            .config_items
+            .get(index)
+            .ok_or_else(|| "configuration field is no longer available".to_string())?;
+        let draft_key = config_schema_field_key(&item.key, &path);
+        let raw = self
+            .field_drafts
+            .get(&draft_key)
+            .cloned()
+            .unwrap_or_else(|| {
+                config_value_at_path(&item.raw_value, &path)
+                    .map(|value| schema_scalar_edit_value(&schema, value))
+                    .unwrap_or_default()
+            });
+        let value = parse_schema_editor_value(&schema, &raw)?;
+        let mut next = item.raw_value.clone();
+        set_json_path_value(&mut next, &path, value)?;
+        Ok((
+            SettingsOperationScope::ConfigField(draft_key.clone()),
+            SettingsOperation::SetConfigJson {
+                key: item.key.clone(),
+                value: next,
+                saved_draft: Some((draft_key, raw)),
+            },
+        ))
     }
 
-    fn set_provider_chat_default(&mut self, index: usize) -> bool {
-        let Some(form) = self.provider_forms.get(index) else {
-            return false;
-        };
-        let provider = form.provider.clone();
-        let account = form.account.clone();
-        match set_provider_chat_default(self.config.as_ref(), &provider, &account) {
-            Ok(()) => {
-                self.provider_action_error = None;
-                self.provider_remove_confirming = None;
-                self.reload();
-                self.set_provider_status(provider, account, "Chat default saved to lm.providers");
-                true
-            }
-            Err(error) => {
-                self.provider_action_error = Some(error);
-                self.provider_action_status = None;
-                false
-            }
-        }
-    }
-
-    fn remove_provider(&mut self, index: usize) -> bool {
-        let Some(form) = self.provider_forms.get(index) else {
-            return false;
-        };
-        let provider = form.provider.clone();
-        let account = form.account.clone();
-        match remove_provider_account(self.config.as_ref(), &provider, &account) {
-            Ok(()) => {
-                if self
-                    .device_login
-                    .as_ref()
-                    .is_some_and(|login| login.provider == provider && login.account == account)
-                {
-                    self.device_login = None;
-                }
-                self.provider_action_error = None;
-                self.provider_action_status = None;
-                self.provider_remove_confirming = None;
-                self.reload();
-                true
-            }
-            Err(error) => {
-                self.provider_action_error = Some(error);
-                self.provider_action_status = None;
-                false
-            }
-        }
-    }
-
-    /// Write a provider text field (API key / model / base URL) at `index`. Like
-    /// [`set_config_value`](Self::set_config_value) this writes through on change but does NOT
-    /// reload per keystroke. Records any error against the provider+field row.
-    fn set_provider_field(&mut self, index: usize, field: ProviderField, raw: &str) {
+    fn set_provider_field_draft(&mut self, index: usize, field: ProviderField, raw: String) {
         let Some(form) = self.provider_forms.get(index) else {
             return;
         };
-        let provider = form.provider.clone();
-        let account = form.account.clone();
-        let result = match field {
-            ProviderField::ApiKey => {
-                set_provider_api_key(self.config.as_ref(), &provider, &account, raw)
-            }
-            ProviderField::Model => {
-                set_provider_model(self.config.as_ref(), &provider, &account, raw)
-            }
-            ProviderField::BaseUrl => {
-                set_provider_base_url(self.config.as_ref(), &provider, &account, raw)
-            }
-        };
-        let row = provider_field_key(&provider, &account, field);
-        match result {
-            Ok(()) => {
-                self.field_errors.remove(&row);
-                self.provider_action_error = None;
-                self.set_provider_status(provider, account, provider_field_saved_message(field));
-                self.provider_remove_confirming = None;
-            }
-            Err(error) => {
-                self.field_errors.insert(row, error);
-                self.provider_action_status = None;
-            }
-        }
+        let key = provider_field_key(&form.provider, &form.account, field);
+        self.field_errors.remove(&key);
+        self.set_field_draft(SettingsOperationDomain::Providers, key, raw);
+    }
+
+    fn provider_field_operation(
+        &self,
+        index: usize,
+        field: ProviderField,
+    ) -> Option<SettingsOperation> {
+        let form = self.provider_forms.get(index)?;
+        let draft_key = provider_field_key(&form.provider, &form.account, field);
+        let raw = self
+            .field_drafts
+            .get(&draft_key)
+            .cloned()
+            .unwrap_or_else(|| match field {
+                ProviderField::ApiKey => String::new(),
+                ProviderField::Model => form.default_model.clone(),
+                ProviderField::BaseUrl => form.api_base_url.clone(),
+            });
+        Some(SettingsOperation::SetProviderField {
+            provider: form.provider.clone(),
+            account: form.account.clone(),
+            field,
+            raw,
+            draft_key,
+        })
     }
 
     fn set_provider_status(
@@ -1601,34 +2062,6 @@ impl SettingsState {
             account: account.into(),
             message: message.into(),
         });
-    }
-
-    /// Cycle a provider's reasoning effort to the next option (legacy click-to-cycle path; retained
-    /// for callers that prefer it — the UI now uses [`set_provider_effort_at`](Self::set_provider_effort_at)).
-    #[allow(dead_code)]
-    fn cycle_provider_effort(&mut self, index: usize) {
-        let Some(form) = self.provider_forms.get(index) else {
-            return;
-        };
-        let provider = form.provider.clone();
-        let account = form.account.clone();
-        if cycle_provider_reasoning_effort(self.config.as_ref(), &provider, &account).is_ok() {
-            self.reload();
-        }
-    }
-
-    /// Set a provider's reasoning effort to the option at `effort_index` into
-    /// [`REASONING_EFFORT_OPTIONS`] (index 0 clears the override). Reloads on success.
-    fn set_provider_effort_at(&mut self, index: usize, effort_index: usize) {
-        let Some(form) = self.provider_forms.get(index) else {
-            return;
-        };
-        let provider = form.provider.clone();
-        let account = form.account.clone();
-        if set_provider_effort(self.config.as_ref(), &provider, &account, effort_index).is_ok() {
-            self.reload();
-            self.set_provider_status(provider, account, "Reasoning effort saved to lm.providers");
-        }
     }
 
     /// Start a provider's OAuth device-login flow on a background thread. Progress + the result
@@ -1717,14 +2150,439 @@ impl SettingsState {
             None
         };
         if done {
-            self.reload();
             if let Some((provider, account)) = done_account {
                 self.set_provider_status(provider, account, "Sign-in saved to lm.providers");
             }
+            self.provider_refresh_needed = true;
             self.device_login = None;
         }
         true
     }
+
+    fn config_schema_value_operation(
+        &self,
+        index: usize,
+        path: Vec<String>,
+        value: Value,
+    ) -> Result<(SettingsOperationScope, SettingsOperation), String> {
+        let item = self
+            .config_items
+            .get(index)
+            .ok_or_else(|| "configuration field is no longer available".to_string())?;
+        let error_key = config_schema_field_key(&item.key, &path);
+        let mut next = item.raw_value.clone();
+        set_json_path_value(&mut next, &path, value)?;
+        Ok((
+            SettingsOperationScope::ConfigField(error_key),
+            SettingsOperation::SetConfigJson {
+                key: item.key.clone(),
+                value: next,
+                saved_draft: None,
+            },
+        ))
+    }
+}
+
+fn settings_operation_worker(
+    request_rx: Receiver<SettingsOperationRequest>,
+    result_tx: Sender<SettingsOperationResult>,
+    waker: Option<sui::UiHandle>,
+) {
+    while let Ok(request) = request_rx.recv() {
+        let payload = execute_settings_operation(&request.backend, request.operation);
+        let result = SettingsOperationResult {
+            request_id: request.request_id,
+            scope: request.scope,
+            draft_generation: request.draft_generation,
+            payload,
+        };
+        if result_tx.send(result).is_err() {
+            break;
+        }
+        if let Some(waker) = waker.as_ref() {
+            waker.wake();
+        }
+    }
+}
+
+fn execute_settings_operation(
+    backend: &Backend,
+    operation: SettingsOperation,
+) -> SettingsOperationPayload {
+    match operation {
+        SettingsOperation::SetConfigValue {
+            key,
+            kind,
+            raw,
+            draft_key,
+        } => SettingsOperationPayload::Config((|| {
+            set_value(backend.config.as_ref(), &key, kind, &raw)?;
+            Ok(ConfigOperationSuccess {
+                items: resolve_items(backend.config.as_ref()),
+                saved_draft: Some((draft_key, raw)),
+            })
+        })()),
+        SettingsOperation::SetConfigJson {
+            key,
+            value,
+            saved_draft,
+        } => SettingsOperationPayload::Config((|| {
+            backend
+                .config
+                .set(&key, value, ConfigWriteTarget::Auto)
+                .map_err(|error| error.to_string())?;
+            Ok(ConfigOperationSuccess {
+                items: resolve_items(backend.config.as_ref()),
+                saved_draft,
+            })
+        })()),
+        SettingsOperation::SetConfigBool { key, value } => {
+            SettingsOperationPayload::Config((|| {
+                set_bool(backend.config.as_ref(), &key, value)?;
+                Ok(ConfigOperationSuccess {
+                    items: resolve_items(backend.config.as_ref()),
+                    saved_draft: None,
+                })
+            })())
+        }
+        SettingsOperation::AddProvider {
+            provider,
+            account,
+            api_key,
+            model,
+            base_url,
+            uses_device_login,
+        } => SettingsOperationPayload::Providers((|| {
+            add_provider_account(
+                backend.config.as_ref(),
+                &provider,
+                &account,
+                &api_key,
+                &model,
+                &base_url,
+            )?;
+            let account = sinomo_lm::normalize_provider_account_name(Some(&account));
+            provider_operation_success(
+                backend,
+                ProviderOperationEffect::Added {
+                    provider,
+                    account,
+                    uses_device_login,
+                },
+            )
+        })()),
+        SettingsOperation::RefreshProviders => SettingsOperationPayload::Providers(
+            provider_operation_success(backend, ProviderOperationEffect::Refreshed),
+        ),
+        SettingsOperation::SetProviderEnabled {
+            provider,
+            account,
+            enabled,
+        } => SettingsOperationPayload::Providers((|| {
+            set_provider_enabled(backend.config.as_ref(), &provider, &account, enabled)?;
+            provider_operation_success(
+                backend,
+                ProviderOperationEffect::Updated {
+                    provider,
+                    account,
+                    message: if enabled {
+                        "Provider enabled in lm.providers".to_string()
+                    } else {
+                        "Provider disabled in lm.providers".to_string()
+                    },
+                    saved_draft: None,
+                },
+            )
+        })()),
+        SettingsOperation::SetProviderChatDefault { provider, account } => {
+            SettingsOperationPayload::Providers((|| {
+                set_provider_chat_default(backend.config.as_ref(), &provider, &account)?;
+                provider_operation_success(
+                    backend,
+                    ProviderOperationEffect::Updated {
+                        provider,
+                        account,
+                        message: "Chat default saved to lm.providers".to_string(),
+                        saved_draft: None,
+                    },
+                )
+            })())
+        }
+        SettingsOperation::RemoveProvider { provider, account } => {
+            SettingsOperationPayload::Providers((|| {
+                remove_provider_account(backend.config.as_ref(), &provider, &account)?;
+                provider_operation_success(
+                    backend,
+                    ProviderOperationEffect::Removed { provider, account },
+                )
+            })())
+        }
+        SettingsOperation::SetProviderField {
+            provider,
+            account,
+            field,
+            raw,
+            draft_key,
+        } => SettingsOperationPayload::Providers((|| {
+            match field {
+                ProviderField::ApiKey => {
+                    set_provider_api_key(backend.config.as_ref(), &provider, &account, &raw)
+                }
+                ProviderField::Model => {
+                    set_provider_model(backend.config.as_ref(), &provider, &account, &raw)
+                }
+                ProviderField::BaseUrl => {
+                    set_provider_base_url(backend.config.as_ref(), &provider, &account, &raw)
+                }
+            }?;
+            provider_operation_success(
+                backend,
+                ProviderOperationEffect::Updated {
+                    provider,
+                    account,
+                    message: provider_field_saved_message(field).to_string(),
+                    saved_draft: Some((draft_key, raw)),
+                },
+            )
+        })()),
+        SettingsOperation::SetProviderEffort {
+            provider,
+            account,
+            effort_index,
+        } => SettingsOperationPayload::Providers((|| {
+            set_provider_effort(backend.config.as_ref(), &provider, &account, effort_index)?;
+            provider_operation_success(
+                backend,
+                ProviderOperationEffect::Updated {
+                    provider,
+                    account,
+                    message: "Reasoning effort saved to lm.providers".to_string(),
+                    saved_draft: None,
+                },
+            )
+        })()),
+        SettingsOperation::RefreshAgents { selected_id } => {
+            SettingsOperationPayload::Agents(Ok(agent_operation_success(
+                backend,
+                selected_id.as_deref(),
+                AgentOperationEffect::Refreshed,
+            )))
+        }
+        SettingsOperation::SaveAgent {
+            definition,
+            previous_id,
+        } => SettingsOperationPayload::Agents((|| {
+            backend.save_custom_agent_definition(&definition, previous_id.as_deref())?;
+            let id = definition.key().to_string();
+            Ok(agent_operation_success(
+                backend,
+                Some(&id),
+                AgentOperationEffect::Saved(id.clone()),
+            ))
+        })()),
+        SettingsOperation::DeleteAgent { id } => SettingsOperationPayload::Agents((|| {
+            backend.delete_custom_agent_definition(&id)?;
+            Ok(agent_operation_success(
+                backend,
+                None,
+                AgentOperationEffect::Deleted(id),
+            ))
+        })()),
+        SettingsOperation::RefreshModules { selected_node_id } => {
+            SettingsOperationPayload::Modules(Ok(ModuleOperationSuccess {
+                snapshot: backend.module_config_snapshot(selected_node_id.as_deref()),
+                message: None,
+            }))
+        }
+        SettingsOperation::SetClusterModuleDefault {
+            selected_node_id,
+            module_id,
+            enabled,
+        } => SettingsOperationPayload::Modules((|| {
+            backend.set_cluster_module_default(&module_id, enabled)?;
+            Ok(ModuleOperationSuccess {
+                snapshot: backend.module_config_snapshot(selected_node_id.as_deref()),
+                message: Some(format!(
+                    "Cluster default saved for {}",
+                    module_display_id(&module_id)
+                )),
+            })
+        })()),
+        SettingsOperation::SetNodeModuleOverride {
+            node_id,
+            module_id,
+            enabled,
+        } => SettingsOperationPayload::Modules((|| {
+            backend.set_node_module_override(&node_id, &module_id, enabled)?;
+            let message = match enabled {
+                Some(true) => format!(
+                    "Node override enabled for {}",
+                    module_display_id(&module_id)
+                ),
+                Some(false) => {
+                    format!(
+                        "Node override disabled for {}",
+                        module_display_id(&module_id)
+                    )
+                }
+                None => format!(
+                    "Node override cleared for {}",
+                    module_display_id(&module_id)
+                ),
+            };
+            Ok(ModuleOperationSuccess {
+                snapshot: backend.module_config_snapshot(Some(&node_id)),
+                message: Some(message),
+            })
+        })()),
+        SettingsOperation::RefreshSkills {
+            include_all,
+            selected,
+        } => SettingsOperationPayload::Skills(load_skill_operation_success(
+            backend.data_dir.as_ref(),
+            include_all,
+            selected,
+            None,
+        )),
+        SettingsOperation::ImportSkill { path } => SettingsOperationPayload::Skills((|| {
+            let result = sinomo_cli::app_api::import_skill(
+                backend.data_dir.as_ref(),
+                &path,
+                None,
+                None,
+                true,
+            )?;
+            load_skill_operation_success(
+                backend.data_dir.as_ref(),
+                true,
+                Some((result.skill.id.clone(), result.skill.version.clone())),
+                Some(skill_mutation_message(&result)),
+            )
+        })()),
+        SettingsOperation::ExportSkill {
+            skill_id,
+            version,
+            output,
+            include_all,
+        } => SettingsOperationPayload::Skills((|| {
+            let result = sinomo_cli::app_api::export_skill(
+                backend.data_dir.as_ref(),
+                &skill_id,
+                Some(&version),
+                Some(&output),
+            )?;
+            load_skill_operation_success(
+                backend.data_dir.as_ref(),
+                include_all,
+                Some((skill_id, version)),
+                Some(skill_mutation_message(&result)),
+            )
+        })()),
+        SettingsOperation::ActivateSkill {
+            skill_id,
+            version,
+            include_all,
+        } => SettingsOperationPayload::Skills((|| {
+            let result = sinomo_cli::app_api::activate_skill(
+                backend.data_dir.as_ref(),
+                &skill_id,
+                Some(&version),
+            )?;
+            load_skill_operation_success(
+                backend.data_dir.as_ref(),
+                include_all,
+                Some((result.skill.id.clone(), result.skill.version.clone())),
+                Some(skill_mutation_message(&result)),
+            )
+        })()),
+        SettingsOperation::CreateClusterInvite => SettingsOperationPayload::Cluster((|| {
+            let invite = backend.create_cluster_invite()?;
+            Ok(ClusterOperationSuccess {
+                status: backend.app_cluster_status(),
+                snapshot: backend.cluster_snapshot(),
+                effect: ClusterOperationEffect::Invite(invite),
+            })
+        })()),
+        SettingsOperation::LeaveCluster => SettingsOperationPayload::Cluster((|| {
+            let status = backend.leave_cluster()?;
+            Ok(ClusterOperationSuccess {
+                status,
+                snapshot: backend.cluster_snapshot(),
+                effect: ClusterOperationEffect::Left,
+            })
+        })()),
+        SettingsOperation::JoinCluster { invite } => SettingsOperationPayload::Cluster((|| {
+            let status = backend.join_cluster(&invite)?;
+            Ok(ClusterOperationSuccess {
+                status,
+                snapshot: backend.cluster_snapshot(),
+                effect: ClusterOperationEffect::Joined,
+            })
+        })(
+        )),
+    }
+}
+
+fn provider_operation_success(
+    backend: &Backend,
+    effect: ProviderOperationEffect,
+) -> Result<ProviderOperationSuccess, String> {
+    backend
+        .config
+        .catalog(None)
+        .map_err(|error| error.to_string())?;
+    Ok(ProviderOperationSuccess {
+        items: resolve_items(backend.config.as_ref()),
+        forms: provider_forms(backend.config.as_ref()),
+        chat_providers: cluster_provider_summaries(backend.config.as_ref()),
+        effect,
+    })
+}
+
+fn agent_operation_success(
+    backend: &Backend,
+    selected_id: Option<&str>,
+    effect: AgentOperationEffect,
+) -> AgentOperationSuccess {
+    AgentOperationSuccess {
+        snapshot: backend.agent_config_snapshot(selected_id),
+        chat_agents: agent_summaries(backend.data_dir.as_ref()),
+        effect,
+    }
+}
+
+fn load_skill_operation_success(
+    data_dir: &SinomoDataDir,
+    include_all: bool,
+    selected: Option<(String, String)>,
+    message: Option<String>,
+) -> Result<SkillOperationSuccess, String> {
+    let skills = sinomo_cli::app_api::skill_summaries(data_dir, include_all)?;
+    let selected = selected
+        .filter(|(id, version)| {
+            skills
+                .iter()
+                .any(|skill| &skill.id == id && &skill.version == version)
+        })
+        .or_else(|| {
+            skills
+                .first()
+                .map(|skill| (skill.id.clone(), skill.version.clone()))
+        });
+    let detail = match selected.as_ref() {
+        Some((id, version)) => Some(sinomo_cli::app_api::skill_detail(
+            data_dir,
+            id,
+            Some(version),
+        )?),
+        None => None,
+    };
+    Ok(SkillOperationSuccess {
+        skills,
+        selected,
+        detail,
+        message,
+    })
 }
 
 fn load_initial_skill_state(
@@ -2394,12 +3252,14 @@ fn cluster_section_key(shared: &Shared) -> String {
         })
         .unwrap_or_default();
     format!(
-        "clustered:{};summary:{:?};invite:{invite_key};error:{:?};status:{:?};leave:{}",
+        "clustered:{};summary:{:?};invite:{invite_key};join-draft:{};error:{:?};status:{:?};leave:{};join:{}",
         settings.clustered,
         settings.cluster_summary,
+        settings.join_invite.len(),
         settings.cluster_action_error,
         settings.cluster_action_status,
-        settings.leave_confirming
+        settings.leave_confirming,
+        settings.join_confirming
     )
 }
 
@@ -2576,6 +3436,49 @@ where
         .theme_when(clone_reader(reader))
 }
 
+/// An editable draft plus an explicit commit button. `on_change` is local-only; `on_save` queues
+/// the background write. This is the default for any field whose config client may be daemon RPC.
+fn text_save_row<C, S, P>(
+    reader: &ThemeReader,
+    name: &str,
+    label: &str,
+    value: impl Into<String>,
+    placeholder: &str,
+    on_change: C,
+    on_save: S,
+    pending_when: P,
+) -> FormRow
+where
+    C: FnMut(String) + 'static,
+    S: FnMut() + 'static,
+    P: Fn() -> bool + 'static,
+{
+    let input = TextInput::new(name)
+        .value(value)
+        .placeholder(placeholder)
+        .theme_when(clone_reader(reader))
+        .on_change(on_change);
+    let save = sui::Button::new("Save")
+        .icon(sui::IconGlyph::Check)
+        .theme_when(secondary_button_theme(reader))
+        .enabled_when(move || !pending_when())
+        .on_press(on_save);
+    FormRow::new(
+        label,
+        Stack::vertical()
+            .spacing(8.0)
+            .alignment(Alignment::Stretch)
+            .with_child(input)
+            .with_child(
+                Stack::horizontal()
+                    .alignment(Alignment::Start)
+                    .with_child(save),
+            ),
+    )
+    .stacked()
+    .theme_when(clone_reader(reader))
+}
+
 /// A dropdown row: `label` + a `Select` over `options`, its selection read reactively.
 fn select_row<S, C>(
     reader: &ThemeReader,
@@ -2599,64 +3502,70 @@ where
         .theme_when(clone_reader(reader))
 }
 
-fn ready_backend(shared: &Shared) -> Option<Backend> {
+fn queue_settings_operation(
+    shared: &Shared,
+    scope: SettingsOperationScope,
+    operation: SettingsOperation,
+) -> bool {
+    let (backend, waker) = {
+        let app = shared.borrow();
+        let Some(ready) = app.ready.as_ref() else {
+            drop(app);
+            let mut settings = shared.settings_mut();
+            settings.apply_operation_queue_error(&scope, "backend is not ready".to_string());
+            return false;
+        };
+        (ready.backend.clone(), app.waker.clone())
+    };
     shared
-        .borrow()
-        .ready
-        .as_ref()
-        .map(|ready| ready.backend.clone())
+        .settings_mut()
+        .queue_operation(backend, waker, scope, operation)
 }
 
-fn refresh_chat_provider_summaries(shared: &Shared) {
+pub(crate) fn pump_background_operations(shared: &Shared) -> bool {
+    let refresh_providers = {
+        let mut settings = shared.settings_mut();
+        std::mem::take(&mut settings.provider_refresh_needed)
+    };
+    if refresh_providers {
+        queue_settings_operation(
+            shared,
+            SettingsOperationScope::Providers,
+            SettingsOperation::RefreshProviders,
+        );
+    }
+    let effects = { shared.settings_mut().pump_operations() };
+    if !effects.changed {
+        if refresh_providers {
+            return true;
+        }
+        return false;
+    }
+    let waker = shared.borrow().waker.clone();
     let mut app = shared.borrow_mut();
-    if let Some(ready) = app.ready.as_mut() {
-        let providers = cluster_provider_summaries(ready.settings.config.as_ref());
+    let Some(ready) = app.ready.as_mut() else {
+        return true;
+    };
+    if let Some(providers) = effects.chat_providers {
         ready.chat.refresh_providers(providers);
     }
-}
-
-fn refresh_chat_agent_summaries(shared: &Shared) {
-    let mut app = shared.borrow_mut();
-    if let Some(ready) = app.ready.as_mut() {
-        let agents = agent_summaries(ready.settings.data_dir.as_ref());
+    if let Some(agents) = effects.chat_agents {
         ready.chat.refresh_agents(agents);
     }
-}
-
-fn apply_cluster_success(
-    shared: &Shared,
-    backend: &Backend,
-    status: AppClusterStatus,
-    message: impl Into<String>,
-) {
-    let snapshot = backend.cluster_snapshot();
-    let mut app = shared.borrow_mut();
-    if let Some(ready) = app.ready.as_mut() {
-        ready.settings.apply_cluster_status(status);
-        ready.settings.set_cluster_action_status(message);
+    if let Some(snapshot) = effects.cluster_snapshot {
         ready.cluster.snapshot = snapshot;
     }
-}
-
-fn apply_cluster_invite_success(shared: &Shared, backend: &Backend, invite: AppClusterInvite) {
-    let status = backend.app_cluster_status();
-    let snapshot = backend.cluster_snapshot();
-    let mut app = shared.borrow_mut();
-    if let Some(ready) = app.ready.as_mut() {
-        ready.settings.apply_cluster_status(status);
-        ready.settings.invite_result = Some(invite);
-        ready
+    if let Some((provider, account)) = effects.provider_device_login {
+        let index = ready
             .settings
-            .set_cluster_action_status("Invitation generated");
-        ready.cluster.snapshot = snapshot;
+            .provider_forms
+            .iter()
+            .position(|form| form.provider == provider && form.account == account);
+        if let Some(index) = index {
+            ready.settings.begin_device_login(index, waker);
+        }
     }
-}
-
-fn apply_cluster_error(shared: &Shared, error: impl Into<String>) {
-    let mut app = shared.borrow_mut();
-    if let Some(ready) = app.ready.as_mut() {
-        ready.settings.set_cluster_action_error(error);
-    }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -3026,6 +3935,32 @@ fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         .theme_when(clone_reader(reader))
 }
 
+struct ClusterJoinPreview {
+    target: String,
+    expires_at: String,
+    issuer: String,
+}
+
+fn cluster_join_preview(raw: &str) -> Result<ClusterJoinPreview, String> {
+    let invite = sinomo_runtime::cluster::extract_invite_from_join_command(raw.trim());
+    if invite.is_empty() {
+        return Err("enter an invitation link before joining".to_string());
+    }
+    let invite = sinomo_runtime::cluster::decode_cluster_join_invite(invite)
+        .map_err(|error| format!("invalid invitation: {error}"))?;
+    let cluster_id = invite.cluster_id.to_string();
+    let target = invite
+        .cluster_name
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| format!("{} · {}", name, short(&cluster_id, 18)))
+        .unwrap_or_else(|| short(&cluster_id, 30));
+    Ok(ClusterJoinPreview {
+        target,
+        expires_at: invite.expires_at.to_string(),
+        issuer: short(&invite.issuer_node_id.to_string(), 24),
+    })
+}
+
 fn section_cluster(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let s = shared.clone();
     let r = Rc::clone(reader);
@@ -3069,15 +4004,19 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             sui::Button::new("Generate invitation")
                 .icon(sui::IconGlyph::Link)
                 .theme_when(clone_reader(reader))
-                .on_press(move || {
-                    let Some(backend) = ready_backend(&s) else {
-                        apply_cluster_error(&s, "backend is not ready");
-                        return;
-                    };
-                    match backend.create_cluster_invite() {
-                        Ok(invite) => apply_cluster_invite_success(&s, &backend, invite),
-                        Err(error) => apply_cluster_error(&s, error),
+                .enabled_when({
+                    let s = s.clone();
+                    move || {
+                        !s.settings()
+                            .domain_pending(SettingsOperationDomain::Cluster)
                     }
+                })
+                .on_press(move || {
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::Cluster,
+                        SettingsOperation::CreateClusterInvite,
+                    );
                 })
         };
         body = body.with_child(
@@ -3110,22 +4049,19 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                 sui::Button::new("Confirm leave")
                     .icon(sui::IconGlyph::Trash)
                     .theme_when(danger_button_theme(reader))
-                    .on_press(move || {
-                        let Some(backend) = ready_backend(&s) else {
-                            apply_cluster_error(&s, "backend is not ready");
-                            return;
-                        };
-                        match backend.leave_cluster() {
-                            Ok(status) => {
-                                apply_cluster_success(
-                                    &s,
-                                    &backend,
-                                    status,
-                                    "Started single-node cluster",
-                                );
-                            }
-                            Err(error) => apply_cluster_error(&s, error),
+                    .enabled_when({
+                        let s = s.clone();
+                        move || {
+                            !s.settings()
+                                .domain_pending(SettingsOperationDomain::Cluster)
                         }
+                    })
+                    .on_press(move || {
+                        queue_settings_operation(
+                            &s,
+                            SettingsOperationScope::Cluster,
+                            SettingsOperation::LeaveCluster,
+                        );
                     })
             };
             let cancel = {
@@ -3182,54 +4118,9 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                 .inline()
                 .theme_when(clone_reader(reader)),
         );
-
-        let join_on_change = {
-            let s = shared.clone();
-            move |value: String| {
-                s.settings_mut().set_join_invite(value);
-            }
-        };
-        let join_value = shared.settings().join_invite.clone();
-        body = body.with_child(text_row(
-            reader,
-            "cluster-join-link",
-            "Join link",
-            join_value,
-            "sinomo cluster join ...",
-            join_on_change,
-        ));
-
-        let join = {
-            let s = shared.clone();
-            sui::Button::new("Join cluster")
-                .icon(sui::IconGlyph::Check)
-                .theme_when(clone_reader(reader))
-                .enabled_when({
-                    let s = s.clone();
-                    move || !s.settings().join_invite.trim().is_empty()
-                })
-                .on_press(move || {
-                    let invite = s.settings().join_invite.clone();
-                    if invite.trim().is_empty() {
-                        apply_cluster_error(&s, "enter an invitation link before joining");
-                        return;
-                    }
-                    let Some(backend) = ready_backend(&s) else {
-                        apply_cluster_error(&s, "backend is not ready");
-                        return;
-                    };
-                    match backend.join_cluster(&invite) {
-                        Ok(status) => apply_cluster_success(&s, &backend, status, "Joined cluster"),
-                        Err(error) => apply_cluster_error(&s, error),
-                    }
-                })
-        };
-        body = body.with_child(
-            FormRow::new("Join", join)
-                .inline()
-                .theme_when(clone_reader(reader)),
-        );
     }
+
+    body = body.with_child(cluster_join_controls(shared, reader, clustered));
 
     if let Some(error) = action_error {
         body = body.with_child(value_row(shared, reader, "Error", error));
@@ -3238,6 +4129,152 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
     }
 
     FormSection::new("Cluster", body).theme_when(clone_reader(reader))
+}
+
+fn cluster_join_controls(shared: &Shared, reader: &ThemeReader, clustered: bool) -> FormRow {
+    let (join_value, confirming, source_cluster) = {
+        let settings = shared.settings();
+        (
+            settings.join_invite.clone(),
+            settings.join_confirming,
+            settings
+                .cluster_id
+                .as_deref()
+                .map(|id| short(id, 24))
+                .unwrap_or_else(|| "local bootstrap state".to_string()),
+        )
+    };
+    let input = TextInput::new("cluster-join-link")
+        .value(join_value.clone())
+        .placeholder("sinomo://cluster/join/…")
+        .theme_when(clone_reader(reader))
+        .on_change({
+            let s = shared.clone();
+            move |value| s.settings_mut().set_join_invite(value)
+        });
+    let mut controls = Stack::vertical()
+        .spacing(8.0)
+        .alignment(Alignment::Stretch)
+        .with_child(input);
+
+    if confirming {
+        if let Ok(preview) = cluster_join_preview(&join_value) {
+            controls = controls
+                .with_child(value_row(shared, reader, "Target cluster", preview.target))
+                .with_child(value_row(
+                    shared,
+                    reader,
+                    "Invitation expires",
+                    preview.expires_at,
+                ))
+                .with_child(value_row(shared, reader, "Issued by", preview.issuer));
+        }
+        let impact = if clustered {
+            format!(
+                "This device will leave {source_cluster}, retain its node identity, quarantine the source cluster state, join the target, and import node-local configuration. Cluster-scoped data and membership do not move."
+            )
+        } else {
+            "This device will retain its node identity and join the target cluster. Local node configuration is preserved; cluster-scoped data remains owned by its current cluster."
+                .to_string()
+        };
+        controls = controls
+            .with_child(muted_label(shared, impact).font_size(11.0))
+            .with_child(
+                muted_label(
+                    shared,
+                    "Recovery: if the target join fails, Sinomo restores the source cluster automatically. After an interrupted migration, restart the daemon and run `sinomo cluster status` before retrying.",
+                )
+                .font_size(11.0),
+            );
+        let confirm = {
+            let s = shared.clone();
+            sui::Button::new(if clustered {
+                "Confirm migration"
+            } else {
+                "Confirm join"
+            })
+            .icon(sui::IconGlyph::Check)
+            .theme_when(danger_button_theme(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || {
+                    !s.settings()
+                        .domain_pending(SettingsOperationDomain::Cluster)
+                }
+            })
+            .on_press(move || {
+                let invite = s.settings().join_invite.clone();
+                if cluster_join_preview(&invite).is_err() {
+                    s.settings_mut()
+                        .set_cluster_action_error("the invitation changed; review it again");
+                    return;
+                }
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::Cluster,
+                    SettingsOperation::JoinCluster { invite },
+                );
+            })
+        };
+        let cancel = {
+            let s = shared.clone();
+            sui::Button::new("Cancel")
+                .icon(sui::IconGlyph::Close)
+                .theme_when(secondary_button_theme(reader))
+                .on_press(move || s.settings_mut().cancel_join_cluster())
+        };
+        controls = controls.with_child(
+            Stack::horizontal()
+                .spacing(8.0)
+                .alignment(Alignment::Start)
+                .with_child(confirm)
+                .with_child(cancel),
+        );
+    } else {
+        let review = {
+            let s = shared.clone();
+            sui::Button::new(if clustered {
+                "Review migration"
+            } else {
+                "Review join"
+            })
+            .icon(sui::IconGlyph::ChevronRight)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || {
+                    !s.settings().join_invite.trim().is_empty()
+                        && !s
+                            .settings()
+                            .domain_pending(SettingsOperationDomain::Cluster)
+                }
+            })
+            .on_press(move || {
+                s.settings_mut().confirm_join_cluster();
+            })
+        };
+        controls = controls
+            .with_child(muted_label(
+                shared,
+                if clustered {
+                    "Join another cluster without manually leaving first. You will review the target and migration impact before anything changes."
+                } else {
+                    "Review the target and impact before joining."
+                },
+            ))
+            .with_child(Stack::horizontal().with_child(review));
+    }
+
+    FormRow::new(
+        if clustered {
+            "Join another cluster"
+        } else {
+            "Join cluster"
+        },
+        controls,
+    )
+    .stacked()
+    .theme_when(clone_reader(reader))
 }
 
 fn cluster_dashboard_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -3329,14 +4366,22 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
     // Enable toggle as the panel's header action.
     let enable_switch = {
         let s = shared.clone();
+        let provider = form.provider.clone();
+        let account = form.account.clone();
+        let enabled = !form.enabled;
         Switch::new("")
             .on(form.enabled)
             .theme_when(clone_reader(reader))
             .on_toggle(move |_| {
-                let changed = { s.settings_mut().toggle_provider(index) };
-                if changed {
-                    refresh_chat_provider_summaries(&s);
-                }
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::Providers,
+                    SettingsOperation::SetProviderEnabled {
+                        provider: provider.clone(),
+                        account: account.clone(),
+                        enabled,
+                    },
+                );
             })
     };
 
@@ -3359,16 +4404,22 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
             .with_child(positive_label(shared, "Chat default"))
     } else {
         let s = shared.clone();
+        let provider = form.provider.clone();
+        let account = form.account.clone();
         let ready_for_chat = form.enabled && form.signed_in;
         let button = sui::Button::new("Use for chat")
             .icon(sui::IconGlyph::Check)
             .theme_when(secondary_button_theme(reader))
             .enabled(ready_for_chat)
             .on_press(move || {
-                let changed = { s.settings_mut().set_provider_chat_default(index) };
-                if changed {
-                    refresh_chat_provider_summaries(&s);
-                }
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::Providers,
+                    SettingsOperation::SetProviderChatDefault {
+                        provider: provider.clone(),
+                        account: account.clone(),
+                    },
+                );
             });
         Stack::horizontal()
             .alignment(Alignment::Center)
@@ -3394,17 +4445,39 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
     }
 
     // Default model.
-    body = body.with_child(text_row(
+    let model_key = provider_field_key(&form.provider, &form.account, ProviderField::Model);
+    let model_value = shared
+        .settings()
+        .field_draft_or(&model_key, || form.default_model.clone());
+    body = body.with_child(text_save_row(
         reader,
         &format!("provider-{index}-model"),
         "Default model",
-        form.default_model.clone(),
+        model_value,
         "Provider default",
         {
             let s = shared.clone();
             move |value: String| {
                 s.settings_mut()
-                    .set_provider_field(index, ProviderField::Model, &value);
+                    .set_provider_field_draft(index, ProviderField::Model, value);
+            }
+        },
+        {
+            let s = shared.clone();
+            move || {
+                let operation = s
+                    .settings()
+                    .provider_field_operation(index, ProviderField::Model);
+                if let Some(operation) = operation {
+                    queue_settings_operation(&s, SettingsOperationScope::Providers, operation);
+                }
+            }
+        },
+        {
+            let s = shared.clone();
+            move || {
+                s.settings()
+                    .domain_pending(SettingsOperationDomain::Providers)
             }
         },
     ));
@@ -3467,35 +4540,82 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
             } else {
                 "Not set"
             };
+            let api_key = provider_field_key(&form.provider, &form.account, ProviderField::ApiKey);
+            let api_value = shared.settings().field_draft_or(&api_key, String::new);
             let on_change = {
                 let s = shared.clone();
                 move |value: String| {
                     s.settings_mut()
-                        .set_provider_field(index, ProviderField::ApiKey, &value);
+                        .set_provider_field_draft(index, ProviderField::ApiKey, value);
                 }
             };
-            body = body.with_child(text_row(
+            body = body.with_child(text_save_row(
                 reader,
                 &format!("provider-{index}-api-key"),
                 "API key",
-                "",
+                api_value,
                 placeholder,
                 on_change,
+                {
+                    let s = shared.clone();
+                    move || {
+                        let operation = s
+                            .settings()
+                            .provider_field_operation(index, ProviderField::ApiKey);
+                        if let Some(operation) = operation {
+                            queue_settings_operation(
+                                &s,
+                                SettingsOperationScope::Providers,
+                                operation,
+                            );
+                        }
+                    }
+                },
+                {
+                    let s = shared.clone();
+                    move || {
+                        s.settings()
+                            .domain_pending(SettingsOperationDomain::Providers)
+                    }
+                },
             ));
         }
 
         // API base URL.
-        body = body.with_child(text_row(
+        let base_url_key =
+            provider_field_key(&form.provider, &form.account, ProviderField::BaseUrl);
+        let base_url_value = shared
+            .settings()
+            .field_draft_or(&base_url_key, || form.api_base_url.clone());
+        body = body.with_child(text_save_row(
             reader,
             &format!("provider-{index}-base-url"),
             "API base URL",
-            form.api_base_url.clone(),
+            base_url_value,
             "Provider default",
             {
                 let s = shared.clone();
                 move |value: String| {
                     s.settings_mut()
-                        .set_provider_field(index, ProviderField::BaseUrl, &value);
+                        .set_provider_field_draft(index, ProviderField::BaseUrl, value);
+                }
+            },
+            {
+                let s = shared.clone();
+                move || {
+                    let operation = s
+                        .settings()
+                        .provider_field_operation(index, ProviderField::BaseUrl);
+                    if let Some(operation) = operation {
+                        queue_settings_operation(&s, SettingsOperationScope::Providers, operation);
+                    }
+                }
+            },
+            {
+                let s = shared.clone();
+                move || {
+                    s.settings()
+                        .domain_pending(SettingsOperationDomain::Providers)
                 }
             },
         ));
@@ -3514,8 +4634,18 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
             };
             let on_change = {
                 let s = shared.clone();
+                let provider = form.provider.clone();
+                let account = form.account.clone();
                 move |idx: usize, _label: String| {
-                    s.settings_mut().set_provider_effort_at(index, idx);
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::Providers,
+                        SettingsOperation::SetProviderEffort {
+                            provider: provider.clone(),
+                            account: account.clone(),
+                            effort_index: idx,
+                        },
+                    );
                 }
             };
             body = body.with_child(select_row(
@@ -3569,14 +4699,27 @@ fn provider_management_row(
         };
         let remove = {
             let s = shared.clone();
+            let provider = form.provider.clone();
+            let account = form.account.clone();
             sui::Button::new("Remove account")
                 .icon(sui::IconGlyph::Trash)
                 .theme_when(danger_button_theme(reader))
-                .on_press(move || {
-                    let removed = { s.settings_mut().remove_provider(index) };
-                    if removed {
-                        refresh_chat_provider_summaries(&s);
+                .enabled_when({
+                    let s = s.clone();
+                    move || {
+                        !s.settings()
+                            .domain_pending(SettingsOperationDomain::Providers)
                     }
+                })
+                .on_press(move || {
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::Providers,
+                        SettingsOperation::RemoveProvider {
+                            provider: provider.clone(),
+                            account: account.clone(),
+                        },
+                    );
                 })
         };
         let controls = Stack::horizontal()
@@ -3774,7 +4917,10 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         (
             settings.provider_add_provider_index,
             settings.provider_add_uses_device_login(),
-            settings.provider_add_error.clone(),
+            settings
+                .provider_add_error
+                .clone()
+                .or_else(|| settings.provider_action_error.clone()),
         )
     };
     let provider_labels: Vec<String> = CONFIGURABLE_PROVIDERS
@@ -3889,27 +5035,26 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
-                move || s.settings().provider_add_can_submit()
+                move || {
+                    s.settings().provider_add_can_submit()
+                        && !s
+                            .settings()
+                            .domain_pending(SettingsOperationDomain::Providers)
+                }
             })
             .on_press(move || {
-                let result = { s.settings_mut().add_provider_from_form() };
-                let Ok((provider, account, uses_device_login)) = result else {
-                    return;
-                };
-                refresh_chat_provider_summaries(&s);
-                if uses_device_login {
-                    let waker = s.borrow().waker.clone();
-                    let index = {
-                        let settings = s.settings();
-                        settings
-                            .provider_forms
-                            .iter()
-                            .position(|form| form.provider == provider && form.account == account)
-                    };
-                    if let Some(index) = index {
-                        s.settings_mut().begin_device_login(index, waker);
+                let operation = {
+                    let settings = s.settings();
+                    SettingsOperation::AddProvider {
+                        provider: settings.provider_add_provider().to_string(),
+                        account: settings.provider_add_account.trim().to_string(),
+                        api_key: settings.provider_add_api_key.clone(),
+                        model: settings.provider_add_model.clone(),
+                        base_url: settings.provider_add_base_url.clone(),
+                        uses_device_login: settings.provider_add_uses_device_login(),
                     }
-                }
+                };
+                queue_settings_operation(&s, SettingsOperationScope::Providers, operation);
             })
     };
     let actions = Stack::horizontal()
@@ -4002,8 +5147,15 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
             })
             .theme_when(clone_reader(reader))
             .on_change(move |index, _| {
-                if let Some(backend) = ready_backend(&s) {
-                    s.settings_mut().select_agent_index(&backend, index);
+                let selected_id = s.settings_mut().prepare_agent_selection(index);
+                if let Some(selected_id) = selected_id {
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::Agents,
+                        SettingsOperation::RefreshAgents {
+                            selected_id: Some(selected_id),
+                        },
+                    );
                 }
             })
     };
@@ -4031,9 +5183,12 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
             .icon(sui::IconGlyph::Redo)
             .theme_when(secondary_button_theme(reader))
             .on_press(move || {
-                if let Some(backend) = ready_backend(&s) {
-                    s.settings_mut().reload_agents(&backend);
-                }
+                let selected_id = s.settings().agent_selected_id.clone();
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::Agents,
+                    SettingsOperation::RefreshAgents { selected_id },
+                );
             })
     };
 
@@ -4307,17 +5462,15 @@ fn agent_actions_row(shared: &Shared, reader: &ThemeReader) -> FormRow {
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
-                move || s.settings().agent_form_can_save()
+                move || {
+                    s.settings().agent_form_can_save()
+                        && !s.settings().domain_pending(SettingsOperationDomain::Agents)
+                }
             })
             .on_press(move || {
-                let saved = if let Some(backend) = ready_backend(&s) {
-                    s.settings_mut().save_agent_form(&backend)
-                } else {
-                    s.settings_mut().agent_action_error = Some("backend is not ready".to_string());
-                    false
-                };
-                if saved {
-                    refresh_chat_agent_summaries(&s);
+                let operation = s.settings_mut().agent_save_operation();
+                if let Some(operation) = operation {
+                    queue_settings_operation(&s, SettingsOperationScope::Agents, operation);
                 }
             })
     };
@@ -4357,16 +5510,21 @@ fn agent_delete_controls(shared: &Shared, reader: &ThemeReader) -> impl Widget +
             sui::Button::new("Confirm delete")
                 .icon(sui::IconGlyph::Trash)
                 .theme_when(danger_button_theme(reader))
+                .enabled_when({
+                    let s = s.clone();
+                    move || !s.settings().domain_pending(SettingsOperationDomain::Agents)
+                })
                 .on_press(move || {
-                    let deleted = if let Some(backend) = ready_backend(&s) {
-                        s.settings_mut().delete_selected_agent(&backend)
+                    let id = s.settings().agent_selected_id.clone();
+                    if let Some(id) = id {
+                        queue_settings_operation(
+                            &s,
+                            SettingsOperationScope::Agents,
+                            SettingsOperation::DeleteAgent { id },
+                        );
                     } else {
                         s.settings_mut().agent_action_error =
-                            Some("backend is not ready".to_string());
-                        false
-                    };
-                    if deleted {
-                        refresh_chat_agent_summaries(&s);
+                            Some("select a custom agent first".to_string());
                     }
                 })
         };
@@ -4683,8 +5841,25 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             })
             .theme_when(clone_reader(reader))
             .on_change(move |index, _label| {
-                if let Some(backend) = ready_backend(&s) {
-                    s.settings_mut().select_module_node_index(&backend, index);
+                let selected = s
+                    .settings()
+                    .module_snapshot
+                    .nodes
+                    .get(index)
+                    .map(|node| node.node_id.clone());
+                if let Some(selected_node_id) = selected {
+                    {
+                        let mut settings = s.settings_mut();
+                        settings.module_selected_node_id = Some(selected_node_id.clone());
+                        settings.mark_draft_changed(SettingsOperationDomain::Modules);
+                    }
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::Modules,
+                        SettingsOperation::RefreshModules {
+                            selected_node_id: Some(selected_node_id),
+                        },
+                    );
                 }
             })
     };
@@ -4694,9 +5869,12 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             .icon(sui::IconGlyph::Redo)
             .theme_when(secondary_button_theme(reader))
             .on_press(move || {
-                if let Some(backend) = ready_backend(&s) {
-                    s.settings_mut().reload_modules(&backend);
-                }
+                let selected_node_id = s.settings().module_selected_node_id.clone();
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::Modules,
+                    SettingsOperation::RefreshModules { selected_node_id },
+                );
             })
     };
 
@@ -4814,10 +5992,16 @@ fn module_config_section(
         let s = shared.clone();
         let module_id = module_id.clone();
         move |enabled| {
-            if let Some(backend) = ready_backend(&s) {
-                s.settings_mut()
-                    .set_cluster_module_default(&backend, &module_id, enabled);
-            }
+            let selected_node_id = s.settings().module_selected_node_id.clone();
+            queue_settings_operation(
+                &s,
+                SettingsOperationScope::Modules,
+                SettingsOperation::SetClusterModuleDefault {
+                    selected_node_id,
+                    module_id: module_id.clone(),
+                    enabled,
+                },
+            );
         }
     });
 
@@ -4851,12 +6035,19 @@ fn module_config_section(
                     2 => Some(false),
                     _ => None,
                 };
-                if let Some(backend) = ready_backend(&s) {
-                    s.settings_mut().set_node_module_override(
-                        &backend,
-                        &selected_module_id,
-                        enabled,
+                let node_id = s.settings().module_selected_node_id.clone();
+                if let Some(node_id) = node_id {
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::Modules,
+                        SettingsOperation::SetNodeModuleOverride {
+                            node_id,
+                            module_id: selected_module_id.clone(),
+                            enabled,
+                        },
                     );
+                } else {
+                    s.settings_mut().module_action_error = Some("select a node first".to_string());
                 }
             },
         )
@@ -4984,7 +6175,22 @@ fn section_skills_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         ))
         .with_child(switch_row(reader, "Show all versions", include_all, {
             let s = shared.clone();
-            move |on| s.settings_mut().set_skills_include_all(on)
+            move |on| {
+                let selected = {
+                    let mut settings = s.settings_mut();
+                    settings.skills_include_all = on;
+                    settings.mark_draft_changed(SettingsOperationDomain::Skills);
+                    settings.skill_selected.clone()
+                };
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::Skills,
+                    SettingsOperation::RefreshSkills {
+                        include_all: on,
+                        selected,
+                    },
+                );
+            }
         }))
         .with_child(text_row(
             reader,
@@ -5002,8 +6208,24 @@ fn section_skills_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         sui::Button::new("Import skill")
             .icon(sui::IconGlyph::Add)
             .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || !s.settings().domain_pending(SettingsOperationDomain::Skills)
+            })
             .on_press(move || {
-                s.settings_mut().import_skill_from_path();
+                let path = s.settings().skill_import_path.trim().to_string();
+                if path.is_empty() {
+                    s.settings_mut().skill_action_error =
+                        Some("enter a skill file or directory path".to_string());
+                    return;
+                }
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::Skills,
+                    SettingsOperation::ImportSkill {
+                        path: PathBuf::from(path),
+                    },
+                );
             })
     };
     let refresh = {
@@ -5011,8 +6233,23 @@ fn section_skills_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         sui::Button::new("Refresh")
             .icon(sui::IconGlyph::Redo)
             .theme_when(secondary_button_theme(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || !s.settings().domain_pending(SettingsOperationDomain::Skills)
+            })
             .on_press(move || {
-                s.settings_mut().reload_skills();
+                let (include_all, selected) = {
+                    let settings = s.settings();
+                    (settings.skills_include_all, settings.skill_selected.clone())
+                };
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::Skills,
+                    SettingsOperation::RefreshSkills {
+                        include_all,
+                        selected,
+                    },
+                );
             })
     };
     summary_body = summary_body.with_child(
@@ -5066,7 +6303,29 @@ fn section_skills_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
                     move || s.settings().selected_skill_index()
                 })
                 .on_change(move |index, _| {
-                    s.settings_mut().select_skill_index(index);
+                    let selected = s
+                        .settings()
+                        .skills
+                        .get(index)
+                        .map(|skill| (skill.id.clone(), skill.version.clone()));
+                    if let Some(selected) = selected {
+                        let include_all = {
+                            let mut settings = s.settings_mut();
+                            settings.skill_selected = Some(selected.clone());
+                            settings.skill_action_error = None;
+                            settings.skill_text_expanded = false;
+                            settings.mark_draft_changed(SettingsOperationDomain::Skills);
+                            settings.skills_include_all
+                        };
+                        queue_settings_operation(
+                            &s,
+                            SettingsOperationScope::Skills,
+                            SettingsOperation::RefreshSkills {
+                                include_all,
+                                selected: Some(selected),
+                            },
+                        );
+                    }
                 })
         };
         WidgetPod::new(
@@ -5185,14 +6444,32 @@ fn skill_detail_section(
         },
     ));
 
+    let already_active = summary.active;
     let activate = {
         let s = shared.clone();
         sui::Button::new("Activate")
             .icon(sui::IconGlyph::Check)
             .theme_when(clone_reader(reader))
-            .enabled(!summary.active)
+            .enabled_when({
+                let s = s.clone();
+                move || {
+                    !already_active && !s.settings().domain_pending(SettingsOperationDomain::Skills)
+                }
+            })
             .on_press(move || {
-                s.settings_mut().activate_selected_skill();
+                let selected = s.settings().skill_selected.clone();
+                let include_all = s.settings().skills_include_all;
+                if let Some((skill_id, version)) = selected {
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::Skills,
+                        SettingsOperation::ActivateSkill {
+                            skill_id,
+                            version,
+                            include_all,
+                        },
+                    );
+                }
             })
     };
     let export = {
@@ -5200,8 +6477,38 @@ fn skill_detail_section(
         sui::Button::new("Export skill")
             .icon(sui::IconGlyph::Download)
             .theme_when(secondary_button_theme(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || !s.settings().domain_pending(SettingsOperationDomain::Skills)
+            })
             .on_press(move || {
-                s.settings_mut().export_selected_skill();
+                let (selected, output, include_all) = {
+                    let settings = s.settings();
+                    (
+                        settings.skill_selected.clone(),
+                        settings.skill_export_path.trim().to_string(),
+                        settings.skills_include_all,
+                    )
+                };
+                let Some((skill_id, version)) = selected else {
+                    s.settings_mut().skill_action_error =
+                        Some("select a skill to export".to_string());
+                    return;
+                };
+                if output.is_empty() {
+                    s.settings_mut().skill_action_error = Some("enter an export path".to_string());
+                    return;
+                }
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::Skills,
+                    SettingsOperation::ExportSkill {
+                        skill_id,
+                        version,
+                        output: PathBuf::from(output),
+                        include_all,
+                    },
+                );
             })
     };
     let text = {
@@ -5308,8 +6615,16 @@ fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widge
         if edit_kind == ConfigEditKind::Bool {
             let on_toggle = {
                 let s = shared.clone();
-                move |_on: bool| {
-                    s.settings_mut().toggle_config(index);
+                let key = key.clone();
+                move |next: bool| {
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::ConfigField(config_field_key(&key)),
+                        SettingsOperation::SetConfigBool {
+                            key: key.clone(),
+                            value: next,
+                        },
+                    );
                 }
             };
             return PodHost::new(WidgetPod::new(switch_row(
@@ -5414,10 +6729,13 @@ fn config_detail_editor(
     index: usize,
     item: &ConfigItem,
 ) -> impl Widget + use<> {
-    let detail = config_detail_value(item);
+    let draft_key = config_field_key(&item.key);
+    let detail = shared
+        .settings()
+        .field_draft_or(&draft_key, || config_detail_value(item));
     let editable = !config_item_has_sensitive_detail(item);
     let note = if editable {
-        "Raw value is editable and writes through the config service."
+        "Edit the draft, then Save. The config service write runs in the background."
     } else {
         "Sensitive fields are redacted here. Use the dedicated settings section to update credentials."
     };
@@ -5428,16 +6746,37 @@ fn config_detail_editor(
     if editable {
         let s = shared.clone();
         editor = editor.on_change(move |value| {
-            s.settings_mut().set_config_value(index, &value);
+            s.settings_mut().set_config_value_draft(index, value);
         });
     } else {
         editor = editor.read_only();
     }
-    Stack::vertical()
+    let mut stack = Stack::vertical()
         .spacing(5.0)
         .alignment(Alignment::Stretch)
         .with_child(muted_label(shared, note).font_size(11.0))
-        .with_child(SizedBox::new().height(112.0).with_child(editor))
+        .with_child(SizedBox::new().height(112.0).with_child(editor));
+    if editable {
+        let save = {
+            let s = shared.clone();
+            let scope = SettingsOperationScope::ConfigField(draft_key);
+            sui::Button::new("Save raw value")
+                .icon(sui::IconGlyph::Check)
+                .theme_when(secondary_button_theme(reader))
+                .enabled_when({
+                    let s = s.clone();
+                    let scope = scope.clone();
+                    move || !s.settings().operation_pending(&scope)
+                })
+                .on_press(move || {
+                    if let Some((scope, operation)) = s.settings().config_value_operation(index) {
+                        queue_settings_operation(&s, scope, operation);
+                    }
+                })
+        };
+        stack = stack.with_child(Stack::horizontal().with_child(save));
+    }
+    stack
 }
 
 fn config_schema_editor(
@@ -5653,8 +6992,22 @@ fn config_schema_primitive_row(
                 let s = shared.clone();
                 let path = path.clone();
                 move |enabled| {
-                    s.settings_mut()
-                        .set_config_schema_bool(index, path.clone(), enabled);
+                    let operation = s.settings().config_schema_value_operation(
+                        index,
+                        path.clone(),
+                        Value::Bool(enabled),
+                    );
+                    match operation {
+                        Ok((scope, operation)) => {
+                            queue_settings_operation(&s, scope, operation);
+                        }
+                        Err(error) => {
+                            if let Some(item) = s.settings().config_items.get(index) {
+                                let key = config_schema_field_key(&item.key, &path);
+                                s.settings_mut().field_errors.insert(key, error);
+                            }
+                        }
+                    }
                 }
             });
             WidgetPod::new(row)
@@ -5689,11 +7042,14 @@ fn config_schema_primitive_row(
                     let choices = choices.clone();
                     move |choice_index, _label| {
                         if let Some(choice) = choices.get(choice_index) {
-                            s.settings_mut().set_config_schema_value(
+                            let operation = s.settings().config_schema_value_operation(
                                 index,
                                 path.clone(),
                                 Value::String(choice.value.clone()),
                             );
+                            if let Ok((scope, operation)) = operation {
+                                queue_settings_operation(&s, scope, operation);
+                            }
                         }
                     }
                 });
@@ -5718,29 +7074,6 @@ fn config_schema_primitive_row(
         | ConfigSchemaValue::I64 { .. }
         | ConfigSchemaValue::U64 { .. }
         | ConfigSchemaValue::F64 { .. } => {
-            let value_text = schema_scalar_edit_value(schema, value);
-            let mut body = Stack::vertical()
-                .spacing(4.0)
-                .alignment(Alignment::Stretch)
-                .with_child(
-                    TextInput::new(schema_control_name(index, &path))
-                        .value(value_text)
-                        .placeholder(schema_placeholder(schema))
-                        .theme_when(clone_reader(reader))
-                        .on_change({
-                            let s = shared.clone();
-                            let path = path.clone();
-                            let schema = schema.clone();
-                            move |raw| {
-                                s.settings_mut().set_config_schema_text(
-                                    index,
-                                    path.clone(),
-                                    schema.clone(),
-                                    &raw,
-                                );
-                            }
-                        }),
-                );
             let error_key = {
                 let settings = shared.settings();
                 settings
@@ -5748,6 +7081,73 @@ fn config_schema_primitive_row(
                     .get(index)
                     .map(|item| config_schema_field_key(&item.key, &path))
             };
+            let value_text = error_key
+                .as_ref()
+                .map(|key| {
+                    shared
+                        .settings()
+                        .field_draft_or(key, || schema_scalar_edit_value(schema, value))
+                })
+                .unwrap_or_else(|| schema_scalar_edit_value(schema, value));
+            let input = TextInput::new(schema_control_name(index, &path))
+                .value(value_text)
+                .placeholder(schema_placeholder(schema))
+                .theme_when(clone_reader(reader))
+                .on_change({
+                    let s = shared.clone();
+                    let path = path.clone();
+                    let schema = schema.clone();
+                    move |raw| {
+                        s.settings_mut().set_config_schema_text_draft(
+                            index,
+                            path.clone(),
+                            schema.clone(),
+                            raw,
+                        );
+                    }
+                });
+            let save = {
+                let s = shared.clone();
+                let path = path.clone();
+                let schema = schema.clone();
+                let scope = error_key.clone().map(SettingsOperationScope::ConfigField);
+                sui::Button::new("Save")
+                    .icon(sui::IconGlyph::Check)
+                    .theme_when(secondary_button_theme(reader))
+                    .enabled_when({
+                        let s = s.clone();
+                        let scope = scope.clone();
+                        move || {
+                            scope
+                                .as_ref()
+                                .is_none_or(|scope| !s.settings().operation_pending(scope))
+                        }
+                    })
+                    .on_press(move || {
+                        match s.settings().config_schema_text_operation(
+                            index,
+                            path.clone(),
+                            schema.clone(),
+                        ) {
+                            Ok((scope, operation)) => {
+                                queue_settings_operation(&s, scope, operation);
+                            }
+                            Err(error) => {
+                                if let Some(key) = scope.as_ref().and_then(|scope| match scope {
+                                    SettingsOperationScope::ConfigField(key) => Some(key.clone()),
+                                    _ => None,
+                                }) {
+                                    s.settings_mut().field_errors.insert(key, error);
+                                }
+                            }
+                        }
+                    })
+            };
+            let mut body = Stack::vertical()
+                .spacing(4.0)
+                .alignment(Alignment::Stretch)
+                .with_child(input)
+                .with_child(Stack::horizontal().with_child(save));
             let detail = error_key
                 .and_then(|key| shared.settings().field_errors.get(&key).cloned())
                 .unwrap_or_else(|| schema_field_detail(schema, description));
@@ -5783,36 +7183,83 @@ fn config_schema_json_row(
     label: &str,
     description: &str,
 ) -> WidgetPod {
-    let value_text = if value.is_null() {
+    let fallback_value = if value.is_null() {
         String::new()
     } else {
         serde_json::to_string_pretty(value).unwrap_or_default()
     };
+    let error_key = shared
+        .settings()
+        .config_items
+        .get(index)
+        .map(|item| config_schema_field_key(&item.key, &path));
+    let value_text = error_key
+        .as_ref()
+        .map(|key| {
+            shared
+                .settings()
+                .field_draft_or(key, || fallback_value.clone())
+        })
+        .unwrap_or(fallback_value);
+    let editor = TextArea::new(schema_control_name(index, &path))
+        .value(value_text)
+        .placeholder("JSON value")
+        .theme_when(clone_reader(reader))
+        .on_change({
+            let s = shared.clone();
+            let path = path.clone();
+            let schema = schema.clone();
+            move |raw| {
+                s.settings_mut().set_config_schema_text_draft(
+                    index,
+                    path.clone(),
+                    schema.clone(),
+                    raw,
+                );
+            }
+        });
+    let save = {
+        let s = shared.clone();
+        let path = path.clone();
+        let schema = schema.clone();
+        let scope = error_key.clone().map(SettingsOperationScope::ConfigField);
+        sui::Button::new("Save JSON")
+            .icon(sui::IconGlyph::Check)
+            .theme_when(secondary_button_theme(reader))
+            .enabled_when({
+                let s = s.clone();
+                let scope = scope.clone();
+                move || {
+                    scope
+                        .as_ref()
+                        .is_none_or(|scope| !s.settings().operation_pending(scope))
+                }
+            })
+            .on_press(move || {
+                match s
+                    .settings()
+                    .config_schema_text_operation(index, path.clone(), schema.clone())
+                {
+                    Ok((scope, operation)) => {
+                        queue_settings_operation(&s, scope, operation);
+                    }
+                    Err(error) => {
+                        if let Some(SettingsOperationScope::ConfigField(key)) = scope.as_ref() {
+                            s.settings_mut().field_errors.insert(key.clone(), error);
+                        }
+                    }
+                }
+            })
+    };
     let mut body = Stack::vertical()
         .spacing(4.0)
         .alignment(Alignment::Stretch)
-        .with_child(
-            SizedBox::new().height(92.0).with_child(
-                TextArea::new(schema_control_name(index, &path))
-                    .value(value_text)
-                    .placeholder("JSON value")
-                    .theme_when(clone_reader(reader))
-                    .on_change({
-                        let s = shared.clone();
-                        let path = path.clone();
-                        let schema = schema.clone();
-                        move |raw| {
-                            s.settings_mut().set_config_schema_text(
-                                index,
-                                path.clone(),
-                                schema.clone(),
-                                &raw,
-                            );
-                        }
-                    }),
-            ),
-        );
-    let detail = schema_field_detail(schema, description);
+        .with_child(SizedBox::new().height(92.0).with_child(editor))
+        .with_child(Stack::horizontal().with_child(save));
+    let detail = error_key
+        .as_ref()
+        .and_then(|key| shared.settings().field_errors.get(key).cloned())
+        .unwrap_or_else(|| schema_field_detail(schema, description));
     if !detail.trim().is_empty() {
         body = body.with_child(muted_label(shared, detail).font_size(11.0));
     }
@@ -6912,9 +8359,10 @@ impl Widget for SettingsView {
         // Belt-and-suspenders: on a redraw, catch any selection change driven from outside a pointer
         // gesture (e.g. an external wake) and relayout (diff-on-redraw, like the widget-book pattern).
         if matches!(event, Event::Window(WindowEvent::RedrawRequested)) {
+            let operations_changed = pump_background_operations(&self.shared);
             let current = self.shared.settings().selected;
             let issues_changed = self.sync_connection_issues();
-            if current != self.last_selected.get() || issues_changed {
+            if current != self.last_selected.get() || issues_changed || operations_changed {
                 self.last_selected.set(current);
                 ctx.request_measure();
                 ctx.request_arrange();
@@ -7001,6 +8449,40 @@ mod tests {
             .iter()
             .position(|item| item.edit_kind != ConfigEditKind::Bool)?;
         Some((state, idx))
+    }
+
+    fn reload_config_state(state: &mut SettingsState) {
+        state.config_items = resolve_items(state.config.as_ref());
+        state.provider_forms = provider_forms(state.config.as_ref());
+    }
+
+    fn apply_test_operation(
+        state: &mut SettingsState,
+        backend: &Backend,
+        scope: SettingsOperationScope,
+        operation: SettingsOperation,
+    ) -> SettingsOperationEffects {
+        let request_id = state.next_operation_request_id;
+        state.next_operation_request_id = request_id.wrapping_add(1);
+        let draft_generation = state.draft_generations.get(scope.domain());
+        state.mark_operation_pending(&operation);
+        state.pending_operations.insert(scope.clone(), request_id);
+        let payload = execute_settings_operation(backend, operation);
+        let (request_tx, _request_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        result_tx
+            .send(SettingsOperationResult {
+                request_id,
+                scope,
+                draft_generation,
+                payload,
+            })
+            .expect("settings result");
+        state.operation_lane = Some(SettingsOperationLane {
+            tx: request_tx,
+            rx: result_rx,
+        });
+        state.pump_operations()
     }
 
     #[test]
@@ -7100,6 +8582,164 @@ mod tests {
     }
 
     #[test]
+    fn preload_keeps_agent_draft_while_merging_server_catalog() {
+        let backend = Backend::local_fallback();
+        let mut live = SettingsState::new_lightweight(&backend);
+        let baseline_server = live.server_generations;
+        let baseline_drafts = live.draft_generations;
+        live.create_agent();
+        live.set_agent_id("draft-agent".to_string());
+        live.set_agent_name("Unsaved draft".to_string());
+
+        let loaded = SettingsState::new(&backend);
+        assert!(!loaded.agent_snapshot.agents.is_empty());
+        live.merge_initial_load(SettingsInitialLoadResult {
+            settings: loaded,
+            server_generations: baseline_server,
+            draft_generations: baseline_drafts,
+        });
+
+        assert!(!live.agent_snapshot.agents.is_empty());
+        assert_eq!(live.agent_form.id, "draft-agent");
+        assert_eq!(live.agent_form.name, "Unsaved draft");
+    }
+
+    #[test]
+    fn stale_operation_result_is_rejected_by_request_id() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+        let scope = SettingsOperationScope::ConfigField("test-field".to_string());
+        state.pending_operations.insert(scope.clone(), 2);
+        let (request_tx, _request_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        state.operation_lane = Some(SettingsOperationLane {
+            tx: request_tx,
+            rx: result_rx,
+        });
+
+        result_tx
+            .send(SettingsOperationResult {
+                request_id: 1,
+                scope: scope.clone(),
+                draft_generation: 0,
+                payload: SettingsOperationPayload::Config(Err("stale failure".to_string())),
+            })
+            .unwrap();
+        assert!(!state.pump_operations().changed);
+        assert_eq!(state.pending_operations.get(&scope), Some(&2));
+        assert!(!state.field_errors.contains_key("test-field"));
+
+        result_tx
+            .send(SettingsOperationResult {
+                request_id: 2,
+                scope: scope.clone(),
+                draft_generation: 0,
+                payload: SettingsOperationPayload::Config(Err("recoverable failure".to_string())),
+            })
+            .unwrap();
+        assert!(state.pump_operations().changed);
+        assert!(!state.pending_operations.contains_key(&scope));
+        assert_eq!(
+            state.field_errors.get("test-field").map(String::as_str),
+            Some("recoverable failure")
+        );
+    }
+
+    #[test]
+    fn duplicate_destructive_operation_is_ignored_while_scope_is_pending() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+        let scope = SettingsOperationScope::Agents;
+        let first_request_id = 41;
+        state
+            .pending_operations
+            .insert(scope.clone(), first_request_id);
+        state.agent_action_status = Some("Deleting agent…".to_string());
+        let next_request_id = state.next_operation_request_id;
+
+        let queued = state.queue_operation(
+            backend,
+            None,
+            scope.clone(),
+            SettingsOperation::DeleteAgent {
+                id: "already-pending".to_string(),
+            },
+        );
+
+        assert!(!queued);
+        assert_eq!(
+            state.pending_operations.get(&scope),
+            Some(&first_request_id)
+        );
+        assert_eq!(state.next_operation_request_id, next_request_id);
+        assert!(state.operation_lane.is_none());
+        assert_eq!(
+            state.agent_action_status.as_deref(),
+            Some("Deleting agent…")
+        );
+        assert!(state.agent_action_error.is_none());
+    }
+
+    #[test]
+    fn reconnect_rebind_invalidates_old_lane_and_preserves_drafts_for_retry() {
+        let old_backend = Backend::local_fallback();
+        let new_backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&old_backend);
+        let old_config = state.config.clone();
+        let draft_key = "config-draft".to_string();
+        state.set_field_draft(
+            SettingsOperationDomain::Config,
+            draft_key.clone(),
+            "unsaved value".to_string(),
+        );
+        state.create_agent();
+        state.set_agent_id("reconnect-draft".to_string());
+        state.set_agent_name("Keep across reconnect".to_string());
+        state
+            .pending_operations
+            .insert(SettingsOperationScope::ConfigField(draft_key.clone()), 7);
+        state
+            .pending_operations
+            .insert(SettingsOperationScope::Agents, 8);
+        let (request_tx, _request_rx) = mpsc::channel();
+        let (_result_tx, result_rx) = mpsc::channel();
+        state.operation_lane = Some(SettingsOperationLane {
+            tx: request_tx,
+            rx: result_rx,
+        });
+        state.initial_load_started = true;
+
+        state.rebind_backend(&new_backend);
+
+        assert!(!Arc::ptr_eq(&old_config, &state.config));
+        assert!(state.operation_lane.is_none());
+        assert!(state.pending_operations.is_empty());
+        assert!(!state.initial_load_started);
+        assert_eq!(
+            state.field_drafts.get(&draft_key).map(String::as_str),
+            Some("unsaved value")
+        );
+        assert_eq!(
+            state.field_errors.get(&draft_key).map(String::as_str),
+            Some("Connection changed before the action completed; retry it.")
+        );
+        assert_eq!(
+            state.agent_action_error.as_deref(),
+            Some("Connection changed before the action completed; retry it.")
+        );
+
+        let reconnect_server_generations = state.server_generations;
+        let reconnect_draft_generations = state.draft_generations;
+        state.merge_initial_load(SettingsInitialLoadResult {
+            settings: SettingsState::new(&new_backend),
+            server_generations: reconnect_server_generations,
+            draft_generations: reconnect_draft_generations,
+        });
+        assert_eq!(state.agent_form.id, "reconnect-draft");
+        assert_eq!(state.agent_form.name, "Keep across reconnect");
+    }
+
+    #[test]
     fn set_value_with_invalid_input_errors_and_preserves_prior_value() {
         // A typed (Number/Json) key: writing garbage returns Err and the stored value is unchanged.
         let backend = Backend::local_fallback();
@@ -7115,15 +8755,26 @@ mod tests {
         let key = state.config_items[idx].key.clone();
         let before = state.config_items[idx].edit_value.clone();
 
-        // Drive the value write the way the TextInput on_change would.
-        state.set_config_value(idx, "not-valid-json {{");
+        state.set_config_value_draft(idx, "not-valid-json {{".to_string());
+        let (scope, operation) = state
+            .config_value_operation(idx)
+            .expect("editable config operation");
+        apply_test_operation(&mut state, &backend, scope, operation);
         assert!(
             state.field_errors.contains_key(&config_field_key(&key)),
             "an invalid value records a parse error against the row"
         );
+        assert_eq!(
+            state
+                .field_drafts
+                .get(&config_field_key(&key))
+                .map(String::as_str),
+            Some("not-valid-json {{"),
+            "failed saves retain the editable draft for retry"
+        );
 
         // The service rejected the write, so a fresh resolve keeps the prior value.
-        state.reload();
+        reload_config_state(&mut state);
         assert_eq!(
             state.config_items[idx].edit_value, before,
             "a rejected value leaves the stored config unchanged"
@@ -7152,7 +8803,10 @@ mod tests {
             "observe".to_string(),
             "enabled".to_string(),
         ];
-        state.set_config_schema_bool(idx, path.clone(), true);
+        let (scope, operation) = state
+            .config_schema_value_operation(idx, path.clone(), Value::Bool(true))
+            .expect("schema operation");
+        apply_test_operation(&mut state, &backend, scope, operation);
         assert!(
             !state.field_errors.contains_key(&config_schema_field_key(
                 sinomo_runtime::module::MODULE_NODE_CONFIG_KEY,
@@ -7180,12 +8834,14 @@ mod tests {
 
     #[test]
     fn toggle_config_no_ops_on_a_non_bool_key() {
-        let Some((mut state, idx)) = editable_state() else {
+        let Some((state, idx)) = editable_state() else {
             return;
         };
         let before = state.config_items[idx].edit_value.clone();
-        // toggle_config only acts on booleans; on a text key it must be a no-op.
-        state.toggle_config(idx);
+        assert!(
+            state.config_items[idx].bool_value.is_none(),
+            "non-boolean config is not eligible for a toggle operation"
+        );
         assert_eq!(
             state.config_items[idx].edit_value, before,
             "toggling a non-boolean key changes nothing"
@@ -7204,7 +8860,7 @@ mod tests {
             .position(|item| item.edit_kind == ConfigEditKind::Bool)
         {
             let before = state.config_items[idx].value.clone();
-            state.set_config_value(idx, "true");
+            state.set_config_value_draft(idx, "true".to_string());
             assert!(
                 state.field_errors.is_empty(),
                 "a boolean key is not text-edited (no error recorded)"
@@ -7213,6 +8869,7 @@ mod tests {
                 state.config_items[idx].value, before,
                 "the boolean value is untouched by the text writer"
             );
+            assert!(state.config_value_operation(idx).is_none());
         }
     }
 
@@ -7236,7 +8893,15 @@ mod tests {
         assert!(state.skills.is_empty());
 
         state.set_skill_import_path(first_path.display().to_string());
-        assert!(state.import_skill_from_path());
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::Skills,
+            SettingsOperation::ImportSkill {
+                path: first_path.clone(),
+            },
+        );
+        assert!(state.skill_action_error.is_none());
         assert_eq!(state.skills.len(), 1);
         assert_eq!(
             state.skill_selected,
@@ -7259,13 +8924,35 @@ mod tests {
             false,
         )
         .expect("inactive skill version");
-        state.reload_skills();
+        let selected = state.skill_selected.clone();
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::Skills,
+            SettingsOperation::RefreshSkills {
+                include_all: true,
+                selected,
+            },
+        );
         let v2 = state
             .skills
             .iter()
             .position(|skill| skill.id == "shortcut-skill" && skill.version == "2.0.0")
             .expect("v2 skill");
-        state.select_skill_index(v2);
+        let selected = {
+            let skill = &state.skills[v2];
+            (skill.id.clone(), skill.version.clone())
+        };
+        state.skill_selected = Some(selected.clone());
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::Skills,
+            SettingsOperation::RefreshSkills {
+                include_all: true,
+                selected: Some(selected.clone()),
+            },
+        );
         assert!(
             !state
                 .skill_detail
@@ -7274,7 +8961,16 @@ mod tests {
                 .summary
                 .active
         );
-        assert!(state.activate_selected_skill());
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::Skills,
+            SettingsOperation::ActivateSkill {
+                skill_id: selected.0.clone(),
+                version: selected.1.clone(),
+                include_all: true,
+            },
+        );
         assert!(
             state
                 .skill_detail
@@ -7286,7 +8982,18 @@ mod tests {
 
         let export_path = root.join("exports").join("shortcut-skill.md");
         state.set_skill_export_path(export_path.display().to_string());
-        assert!(state.export_selected_skill());
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::Skills,
+            SettingsOperation::ExportSkill {
+                skill_id: selected.0,
+                version: selected.1,
+                output: export_path.clone(),
+                include_all: true,
+            },
+        );
+        assert!(state.skill_action_error.is_none());
         let exported = std::fs::read_to_string(&export_path).expect("exported skill");
         assert!(exported.contains("name: shortcut-skill"));
         assert!(exported.contains("beta-lane"));
@@ -7379,7 +9086,13 @@ mod tests {
         state.set_agent_max_steps("4".to_string());
         state.set_agent_skills_text("docs.skill\nreview.skill".to_string());
 
-        assert!(state.save_agent_form(&backend));
+        let operation = state.agent_save_operation().expect("save operation");
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::Agents,
+            operation,
+        );
         assert_eq!(
             state.agent_action_status.as_deref(),
             Some("Saved custom agent docs-agent")
@@ -7401,7 +9114,13 @@ mod tests {
         );
 
         state.set_agent_id("docs-agent-v2".to_string());
-        assert!(state.save_agent_form(&backend));
+        let operation = state.agent_save_operation().expect("rename operation");
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::Agents,
+            operation,
+        );
         let summaries = agent_summaries(backend.data_dir.as_ref());
         assert!(summaries.iter().any(|agent| agent.key == "docs-agent-v2"));
         assert!(
@@ -7410,7 +9129,14 @@ mod tests {
         );
 
         state.confirm_agent_delete();
-        assert!(state.delete_selected_agent(&backend));
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::Agents,
+            SettingsOperation::DeleteAgent {
+                id: "docs-agent-v2".to_string(),
+            },
+        );
         let summaries = agent_summaries(backend.data_dir.as_ref());
         assert!(!summaries.iter().any(|agent| agent.key == "docs-agent-v2"));
     }
@@ -7478,18 +9204,28 @@ mod tests {
     #[test]
     fn provider_model_edit_reports_saved_status_and_persists() {
         let backend = Backend::local_fallback();
-        let shared = Shared::new(AppState::ready(backend));
+        let shared = Shared::new(AppState::ready(backend.clone()));
         {
             let config = shared.settings().config.clone();
             add_provider_account(config.as_ref(), "openai", "work", "sk-work", "gpt-5", "")
                 .expect("add provider account");
         }
-        shared.settings_mut().reload();
+        reload_config_state(&mut shared.settings_mut());
         let before_signature = provider_section_signature(&shared);
 
-        shared
-            .settings_mut()
-            .set_provider_field(0, ProviderField::Model, "gpt-5.1");
+        {
+            let mut settings = shared.settings_mut();
+            settings.set_provider_field_draft(0, ProviderField::Model, "gpt-5.1".to_string());
+            let operation = settings
+                .provider_field_operation(0, ProviderField::Model)
+                .expect("provider field operation");
+            apply_test_operation(
+                &mut settings,
+                &backend,
+                SettingsOperationScope::Providers,
+                operation,
+            );
+        }
 
         assert_eq!(
             shared.settings().provider_action_status.clone(),
@@ -7538,10 +9274,19 @@ mod tests {
             "",
         )
         .expect("add deepseek provider account");
-        state.reload();
+        reload_config_state(&mut state);
         let before_signature = provider_section_signature_for_state(&state);
 
-        assert!(state.set_provider_chat_default(1));
+        let form = state.provider_forms[1].clone();
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::Providers,
+            SettingsOperation::SetProviderChatDefault {
+                provider: form.provider,
+                account: form.account,
+            },
+        );
 
         assert_eq!(
             state.provider_action_status.as_ref(),
@@ -7618,11 +9363,20 @@ mod tests {
             "module settings should include built-in module targets"
         );
 
-        assert!(state.set_node_module_override(
+        let node_id = state
+            .module_selected_node_id
+            .clone()
+            .expect("selected node id");
+        apply_test_operation(
+            &mut state,
             &backend,
-            sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID,
-            Some(true),
-        ));
+            SettingsOperationScope::Modules,
+            SettingsOperation::SetNodeModuleOverride {
+                node_id,
+                module_id: sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID.to_string(),
+                enabled: Some(true),
+            },
+        );
         let selected = state
             .module_snapshot
             .selected_node
@@ -7650,7 +9404,7 @@ mod tests {
             "",
         )
         .expect("add provider account");
-        state.reload();
+        reload_config_state(&mut state);
         assert_eq!(state.provider_forms.len(), 1);
         assert!(!state.provider_remove_confirming("openai", "work"));
 
@@ -7661,7 +9415,15 @@ mod tests {
         assert!(!state.provider_remove_confirming("openai", "work"));
 
         state.confirm_provider_remove(0);
-        assert!(state.remove_provider(0));
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::Providers,
+            SettingsOperation::RemoveProvider {
+                provider: "openai".to_string(),
+                account: "work".to_string(),
+            },
+        );
         assert!(state.provider_forms.is_empty());
         assert!(
             crate::backend::config::load_provider_config(state.config.as_ref())
@@ -7693,7 +9455,7 @@ mod tests {
             "",
         )
         .expect("add deepseek provider account");
-        state.reload();
+        reload_config_state(&mut state);
 
         assert_eq!(
             provider_accounts_summary(&state.provider_forms),
@@ -7708,7 +9470,7 @@ mod tests {
 
         set_provider_enabled(state.config.as_ref(), "openai", "work", false)
             .expect("disable default provider account");
-        state.reload();
+        reload_config_state(&mut state);
         assert_eq!(provider_ready_summary(&state.provider_forms), "1 ready");
         assert_eq!(
             provider_chat_default_summary(&state.provider_forms),
@@ -7729,7 +9491,7 @@ mod tests {
             let mut app = shared.borrow_mut();
             app.active_tab = Tab::Settings;
             let settings = &mut app.ready.as_mut().expect("ready state").settings;
-            settings.reload();
+            reload_config_state(settings);
             settings.open(SettingsSection::Providers);
         }
 
@@ -7781,7 +9543,7 @@ mod tests {
             let mut app = shared.borrow_mut();
             app.active_tab = Tab::Settings;
             let settings = &mut app.ready.as_mut().expect("ready state").settings;
-            settings.reload();
+            reload_config_state(settings);
             settings.open(SettingsSection::Providers);
         }
 
@@ -7803,10 +9565,23 @@ mod tests {
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Use for chat")
             .click()?;
-        window
-            .get_by_text("Chat default saved to lm.providers")
-            .expect()
-            .to_be_visible()?;
+        window.get_by_text("Saving…").expect().to_be_visible()?;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if pump_background_operations(&shared) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            shared
+                .settings()
+                .provider_action_status
+                .as_ref()
+                .map(|status| status.message.as_str()),
+            Some("Chat default saved to lm.providers")
+        );
 
         let config =
             crate::backend::config::load_provider_config(shared.settings().config.as_ref())
@@ -7831,7 +9606,7 @@ mod tests {
             let mut app = shared.borrow_mut();
             app.active_tab = Tab::Settings;
             let settings = &mut app.ready.as_mut().expect("ready state").settings;
-            settings.reload();
+            reload_config_state(settings);
             settings.open(SettingsSection::Providers);
         }
 
@@ -7904,7 +9679,7 @@ mod tests {
             let mut app = shared.borrow_mut();
             app.active_tab = Tab::Settings;
             let settings = &mut app.ready.as_mut().expect("ready state").settings;
-            settings.reload();
+            reload_config_state(settings);
             settings.open(SettingsSection::Providers);
             settings.set_provider_status("openai", "work", "Default model saved to lm.providers");
         }
@@ -8612,18 +10387,61 @@ mod tests {
     }
 
     #[test]
-    fn cluster_join_status_hides_join_input() {
+    fn clustered_settings_exposes_join_another_cluster_migration_flow() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            let settings = &mut app.ready.as_mut().expect("ready state").settings;
+            settings.clustered = true;
+            settings.cluster_id = Some("cluster_source".to_string());
+            settings.cluster_summary = Some("single-node source cluster".to_string());
+            settings.open(SettingsSection::Cluster);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings join another cluster")
+                    .root(view(shared)),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert!(window.get_by_text("Join another cluster").count()? >= 1);
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("cluster-join-link")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Review migration")
+            .expect()
+            .to_be_visible()?;
+        Ok(())
+    }
+
+    #[test]
+    fn settings_preload_merges_cluster_snapshot_without_erasing_join_draft() {
         let backend = Backend::local_fallback();
         let mut state = SettingsState::new(&backend);
         state.set_join_invite("sinomo://cluster/join/test".to_string());
+        state.join_confirming = true;
         state.leave_confirming = true;
-
-        state.apply_cluster_status(AppClusterStatus {
-            clustered: true,
-            cluster_id: Some("cluster_test".to_string()),
-            local_node_id: Some("node_test".to_string()),
-            summary: Some("cluster cluster_test · authorized".to_string()),
-            error: None,
+        let mut loaded = SettingsState::new(&backend);
+        loaded.clustered = true;
+        loaded.cluster_id = Some("cluster_test".to_string());
+        loaded.cluster_node_id = Some("node_test".to_string());
+        loaded.cluster_summary = Some("cluster cluster_test · authorized".to_string());
+        let server_generations = state.server_generations;
+        let baseline_drafts = SettingsGenerations::default();
+        state.merge_initial_load(SettingsInitialLoadResult {
+            settings: loaded,
+            server_generations,
+            draft_generations: baseline_drafts,
         });
 
         assert!(state.clustered);
@@ -8632,17 +10450,15 @@ mod tests {
             Some("cluster cluster_test · authorized")
         );
         assert!(
-            state.join_invite.is_empty(),
-            "joining hides and clears the join-link input"
+            state.join_invite == "sinomo://cluster/join/test",
+            "preload must preserve the live join-link draft"
         );
-        assert!(
-            !state.leave_confirming,
-            "status changes reset the leave confirmation"
-        );
+        assert!(state.join_confirming);
+        assert!(state.leave_confirming);
     }
 
     #[test]
-    fn cluster_leave_status_keeps_single_node_cluster_and_clears_invite() {
+    fn settings_preload_preserves_completed_cluster_action_state() {
         let backend = Backend::local_fallback();
         let mut state = SettingsState::new(&backend);
         state.clustered = true;
@@ -8653,20 +10469,24 @@ mod tests {
             expires_at: "2026-06-14T00:00:00Z".to_string(),
             persisted_key: "cluster/invitations/test".to_string(),
         });
-
-        state.apply_cluster_status(AppClusterStatus {
-            clustered: true,
-            cluster_id: Some("cluster_new".to_string()),
-            local_node_id: Some("node_test".to_string()),
-            summary: Some("cluster cluster_new · voter".to_string()),
-            error: None,
+        state.set_cluster_action_status("Invitation generated");
+        state
+            .server_generations
+            .bump(SettingsOperationDomain::Cluster);
+        let mut stale = SettingsState::new(&backend);
+        stale.cluster_id = Some("cluster_stale".to_string());
+        state.merge_initial_load(SettingsInitialLoadResult {
+            settings: stale,
+            server_generations: SettingsGenerations::default(),
+            draft_generations: SettingsGenerations::default(),
         });
 
         assert!(state.clustered);
-        assert_eq!(state.cluster_id.as_deref(), Some("cluster_new"));
-        assert!(
-            state.invite_result.is_none(),
-            "leaving clears generated invite details from the previous cluster"
+        assert_eq!(state.cluster_id.as_deref(), Some("cluster_old"));
+        assert!(state.invite_result.is_some());
+        assert_eq!(
+            state.cluster_action_status.as_deref(),
+            Some("Invitation generated")
         );
     }
 

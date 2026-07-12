@@ -6,26 +6,23 @@
 //! [`sui::Spinner`] child pod. The brand mark (logo [`Image`] + "Sinomo" wordmark) and
 //! the status pill stay as light custom paint so they can sit precisely in the title bar.
 //!
-//! The launch/runtime machinery is UNCHANGED: the connecting→ready state machine, the
-//! content hosting (a [`SwitchView`] of the tab views inside a [`WidgetPod`], built once the
-//! backend resolves), the loading screen, the [`Event::Custom`] external-wake handler that
-//! drives [`Shared::pump_connect`] + the provider device-login pump, and the measure/arrange
-//! that reserves the title-bar height and gives the rest to content. The TabBar drives the
-//! active tab through `shared.active_tab`, reads the same state back through `selected_when`, and
-//! the Shell detects that change on the next redraw (diff-on-redraw) to request the same relayout
-//! the old hand-painted strip did.
+//! Launch and runtime work stays asynchronous: the connecting-to-ready state machine builds tab
+//! content only after the backend resolves, while external wakes drain typed worker results. After
+//! launch, a short background-probe lane keeps daemon status live. The title-bar health control is
+//! a focusable widget with an accessible recovery popover; it never performs daemon or storage work
+//! on the UI thread.
 
 use std::cell::Cell;
 
 use sui::{
     ArrangeCtx, Constraints, Event, EventCtx, EventPhase, FontWeight, Image, ImageFit, ImageHandle,
-    Insets, MeasureCtx, PaintCtx, PointerButton, PointerEventKind, Rect, SemanticsAction,
-    SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, SingleChild, Size, Spinner,
-    SwitchView, TabBar, ThemeShadow, TimerToken, Widget, WidgetPod, WidgetPodMutVisitor,
+    Insets, KeyState, MeasureCtx, PaintCtx, Point, PointerButton, PointerEventKind, Rect,
+    SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, SingleChild, Size,
+    Spinner, SwitchView, TabBar, ThemeShadow, TimerToken, Widget, WidgetPod, WidgetPodMutVisitor,
     WidgetPodVisitor, WindowEvent, WindowRenderOptions,
 };
 
-use crate::state::{Shared, Tab};
+use crate::state::{ConnectionPhase, HealthIssue, HealthSurface, Shared, Tab};
 use crate::theme::Palette;
 use crate::ui::{chat, cluster, evolution, files, settings, widgets};
 
@@ -40,6 +37,15 @@ const STATUS_PILL_H: f32 = 24.0;
 const STATUS_PILL_W: f32 = 150.0;
 const COMPACT_CHROME_WIDTH: f32 = 620.0;
 const COMPACT_STATUS_PILL_W: f32 = 24.0;
+const HEALTH_POPOVER_W: f32 = 420.0;
+const HEALTH_POPOVER_GAP: f32 = 8.0;
+const HEALTH_HEADER_H: f32 = 54.0;
+const HEALTH_ISSUE_ROW_H: f32 = 96.0;
+const HEALTH_EMPTY_ROW_H: f32 = 66.0;
+const HEALTH_FOOTER_H: f32 = 42.0;
+const HEALTH_ACTION_H: f32 = 26.0;
+const HEALTH_ACTION_GAP: f32 = 6.0;
+const HEALTH_PROBE_INTERVAL_SECS: f64 = 5.0;
 /// Spinner shown in the connecting indicator / loading screen.
 const SPINNER_SIZE: f32 = 18.0;
 /// Loading screen: show the per-step elapsed time once a launch step has been in
@@ -62,6 +68,10 @@ pub struct Shell {
     tabs: WidgetPod,
     /// A spinner shown next to the status text while the backend connection resolves.
     spinner: WidgetPod,
+    /// Focusable status trigger plus the unified health/recovery popover. This is a real child
+    /// widget (rather than hand-painted shell chrome), so keyboard focus and UI Automation can
+    /// reach the trigger, issue rows, and recovery actions.
+    health_center: WidgetPod,
     /// The switchable tab content — built only once the backend connection resolves. `None`
     /// while connecting, when a loading screen is shown in its place.
     content: Option<WidgetPod>,
@@ -74,12 +84,12 @@ pub struct Shell {
     last_render_options: Cell<Option<WindowRenderOptions>>,
     bar_rect: Rect,
     tab_strip_rect: Rect,
-    status_pill_rect: Cell<Rect>,
-    status_pill_pressed: Cell<bool>,
     chat_session_timer: Cell<Option<TimerToken>>,
     /// Repaint driver for the loading screen: keeps the per-step elapsed time live
     /// while the backend connection resolves, so a stalled launch step is visible.
     connect_status_timer: Cell<Option<TimerToken>>,
+    /// Periodic live daemon observation; the probe itself always runs on a background thread.
+    health_probe_timer: Cell<Option<TimerToken>>,
     body_rect: Rect,
 }
 
@@ -102,6 +112,7 @@ impl Shell {
                     move || s.theme()
                 }),
         );
+        let health_center = WidgetPod::new(HealthCenter::new(shared.clone(), false));
 
         let initial_tab = shared.active_tab();
         let mut shell = Self {
@@ -109,16 +120,16 @@ impl Shell {
             logo,
             tabs,
             spinner,
+            health_center,
             content: None,
             last_tab: Cell::new(initial_tab),
             compact_tabs: Cell::new(false),
             last_render_options: Cell::new(None),
             bar_rect: Rect::ZERO,
             tab_strip_rect: Rect::ZERO,
-            status_pill_rect: Cell::new(Rect::ZERO),
-            status_pill_pressed: Cell::new(false),
             chat_session_timer: Cell::new(None),
             connect_status_timer: Cell::new(None),
+            health_probe_timer: Cell::new(None),
             body_rect: Rect::ZERO,
         };
         // Built already-ready (headless tooling / visual tests) → show the tabs immediately. The
@@ -173,6 +184,14 @@ impl Shell {
         self.connect_status_timer.set(Some(token));
     }
 
+    fn schedule_health_probe_timer(&self, ctx: &mut EventCtx) {
+        if !self.shared.is_ready() || self.health_probe_timer.get().is_some() {
+            return;
+        }
+        self.health_probe_timer
+            .set(Some(ctx.schedule_timer_after(HEALTH_PROBE_INTERVAL_SECS)));
+    }
+
     fn palette(&self) -> (sui::DefaultTheme, Palette) {
         let theme = self.shared.theme();
         let dark = widgets::theme_is_dark(&self.shared);
@@ -196,6 +215,7 @@ impl Shell {
         }
         self.compact_tabs.set(compact);
         self.tabs = WidgetPod::new(build_tab_bar(&self.shared, compact));
+        self.health_center = WidgetPod::new(HealthCenter::new(self.shared.clone(), compact));
     }
 
     fn sync_active_tab(&mut self, ctx: &mut EventCtx) {
@@ -220,14 +240,6 @@ impl Shell {
 
     fn pump_cluster_refresh(&self) -> bool {
         cluster::pump_refresh(&self.shared)
-    }
-
-    fn open_connection_settings(&self) {
-        let mut app = self.shared.borrow_mut();
-        app.active_tab = Tab::Settings;
-        if let Some(ready) = app.ready.as_mut() {
-            ready.settings.open(settings::SettingsSection::Connection);
-        }
     }
 }
 
@@ -310,6 +322,16 @@ impl Widget for Shell {
                 Size::new(SPINNER_SIZE + 4.0, SPINNER_SIZE + 4.0),
             ),
         );
+        self.health_center.measure(
+            ctx,
+            Constraints::new(
+                Size::new(COMPACT_STATUS_PILL_W, STATUS_PILL_H),
+                Size::new(
+                    (size.width - EDGE_PAD * 2.0).max(0.0),
+                    (size.height - TOPBAR_HEIGHT / 2.0).max(0.0),
+                ),
+            ),
+        );
 
         let body_h = (size.height - TOPBAR_HEIGHT).max(0.0);
         if let Some(content) = &mut self.content {
@@ -368,12 +390,22 @@ impl Widget for Shell {
                 if show_spinner { SPINNER_SIZE } else { 0.0 },
             ),
         );
-        self.status_pill_rect.set(Rect::new(
-            status_rect.x(),
-            status_rect.y(),
-            status_rect.width(),
-            status_rect.height(),
-        ));
+        let health_measured = self.health_center.measured_size();
+        let health_x = if compact {
+            status_rect.x()
+        } else {
+            bounds.max_x() - EDGE_PAD - health_measured.width
+        };
+        let available_w = (bounds.max_x() - EDGE_PAD - health_x).max(0.0);
+        self.health_center.arrange(
+            ctx,
+            Rect::new(
+                health_x,
+                status_rect.y(),
+                health_measured.width.min(available_w),
+                health_measured.height,
+            ),
+        );
 
         let body_y = bounds.y() + TOPBAR_HEIGHT;
         let body_h = (bounds.height() - TOPBAR_HEIGHT).max(0.0);
@@ -431,59 +463,12 @@ impl Widget for Shell {
         if connecting && !compact_chrome(self.bar_rect.width()) {
             self.spinner.paint(ctx);
         }
-        self.paint_status_pill(ctx, &theme, &pal, connecting);
+        self.health_center.paint(ctx);
     }
 
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
         if ctx.phase() != EventPhase::Target {
             return;
-        }
-        match event {
-            Event::Pointer(pointer)
-                if pointer.kind == PointerEventKind::Down
-                    && pointer.button == Some(PointerButton::Primary)
-                    && self.shared.is_ready()
-                    && self.status_pill_rect.get().contains(pointer.position) =>
-            {
-                self.status_pill_pressed.set(true);
-                ctx.request_paint();
-                ctx.request_semantics();
-                ctx.request_pointer_capture(pointer.pointer_id);
-                ctx.set_handled();
-                return;
-            }
-            Event::Pointer(pointer)
-                if pointer.kind == PointerEventKind::Up
-                    && pointer.button == Some(PointerButton::Primary)
-                    && self.status_pill_pressed.get() =>
-            {
-                let activate = self.status_pill_rect.get().contains(pointer.position);
-                self.status_pill_pressed.set(false);
-                ctx.release_pointer_capture(pointer.pointer_id);
-                if activate {
-                    self.open_connection_settings();
-                    self.sync_active_tab(ctx);
-                }
-                ctx.request_measure();
-                ctx.request_arrange();
-                ctx.request_semantics();
-                ctx.request_paint();
-                ctx.set_handled();
-                return;
-            }
-            Event::Pointer(pointer)
-                if matches!(
-                    pointer.kind,
-                    PointerEventKind::Cancel | PointerEventKind::Leave
-                ) && self.status_pill_pressed.get() =>
-            {
-                self.status_pill_pressed.set(false);
-                ctx.request_paint();
-                ctx.request_semantics();
-                ctx.set_handled();
-                return;
-            }
-            _ => {}
         }
         if let Event::Wake(sui::WakeEvent::Timer { token, .. }) = event
             && self.chat_session_timer.get() == Some(*token)
@@ -507,6 +492,16 @@ impl Widget for Shell {
                 ctx.request_paint();
                 self.schedule_connect_status_timer(ctx);
             }
+            return;
+        }
+        if let Event::Wake(sui::WakeEvent::Timer { token, .. }) = event
+            && self.health_probe_timer.get() == Some(*token)
+        {
+            self.health_probe_timer.set(None);
+            if self.shared.request_connection_probe(false) {
+                ctx.request_semantics();
+            }
+            self.schedule_health_probe_timer(ctx);
             return;
         }
         // The background connect thread wakes us via the sui external-wake mechanism; drain its
@@ -535,6 +530,7 @@ impl Widget for Shell {
                         chat.start_session_list_load(waker);
                     }
                     self.schedule_chat_session_timer(ctx);
+                    self.schedule_health_probe_timer(ctx);
                     self.start_cluster_refresh_if_active();
                     ctx.request_measure();
                     ctx.request_arrange();
@@ -551,6 +547,11 @@ impl Widget for Shell {
                 } else {
                     false
                 };
+                let settings_operations_changed = if self.shared.is_ready() {
+                    settings::pump_background_operations(&self.shared)
+                } else {
+                    false
+                };
                 let evolution_changed = if self.shared.is_ready() {
                     self.shared.evolution_mut().pump_dashboard_load()
                 } else {
@@ -561,6 +562,7 @@ impl Widget for Shell {
                 } else {
                     false
                 };
+                let connection_changed = self.shared.pump_connection_probe();
                 let cluster_changed = self.pump_cluster_refresh();
                 let chat_changed = if self.shared.is_ready() {
                     let mut chat = self.shared.chat_mut();
@@ -578,10 +580,14 @@ impl Widget for Shell {
                     false
                 };
                 self.schedule_chat_session_timer(ctx);
-                if files_changed
+                if device_changed
+                    || files_changed
+                    || connection_changed
                     || cluster_changed
                     || chat_changed
+                    || device_changed
                     || settings_changed
+                    || settings_operations_changed
                     || evolution_changed
                 {
                     ctx.request_measure();
@@ -589,8 +595,10 @@ impl Widget for Shell {
                     ctx.request_semantics();
                 }
                 if changed
+                    || connection_changed
                     || device_changed
                     || settings_changed
+                    || settings_operations_changed
                     || evolution_changed
                     || files_changed
                     || cluster_changed
@@ -609,6 +617,8 @@ impl Widget for Shell {
         // the relayout while preserving the TabBar instance and its selector animation.
         if matches!(event, Event::Window(WindowEvent::RedrawRequested)) {
             self.schedule_connect_status_timer(ctx);
+            self.schedule_health_probe_timer(ctx);
+            let connection_changed = self.shared.pump_connection_probe();
             let cluster_changed = self.pump_cluster_refresh();
             let chat_changed = if self.shared.is_ready() {
                 let mut chat = self.shared.chat_mut();
@@ -624,13 +634,24 @@ impl Widget for Shell {
             } else {
                 false
             };
+            let settings_operations_changed = if self.shared.is_ready() {
+                settings::pump_background_operations(&self.shared)
+            } else {
+                false
+            };
             let evolution_changed = if self.shared.is_ready() {
                 self.shared.evolution_mut().pump_dashboard_load()
             } else {
                 false
             };
             self.schedule_chat_session_timer(ctx);
-            if cluster_changed || chat_changed || settings_changed || evolution_changed {
+            if connection_changed
+                || cluster_changed
+                || chat_changed
+                || settings_changed
+                || settings_operations_changed
+                || evolution_changed
+            {
                 ctx.request_measure();
                 ctx.request_arrange();
                 ctx.request_semantics();
@@ -651,31 +672,7 @@ impl Widget for Shell {
         if !self.shared.is_ready() {
             self.spinner.semantics(ctx);
         }
-        let status = shell_status(&self.shared);
-        let ready = self.shared.is_ready();
-        let mut status_node = SemanticsNode::new(
-            sui::WidgetId::new(ctx.widget_id().get().wrapping_mul(31).wrapping_add(1_001)),
-            if ready {
-                SemanticsRole::Button
-            } else {
-                SemanticsRole::Text
-            },
-            self.status_pill_rect.get(),
-        );
-        status_node.name = Some(status.label);
-        status_node.description = Some(status.detail);
-        status_node.value = Some(SemanticsValue::Text(if status.degraded {
-            "degraded".to_string()
-        } else if ready {
-            "connected".to_string()
-        } else {
-            "connecting".to_string()
-        }));
-        if ready {
-            status_node.actions = vec![SemanticsAction::Activate];
-        }
-        status_node.state.selected = status.degraded;
-        ctx.push(status_node);
+        self.health_center.semantics(ctx);
         if let Some(content) = &self.content {
             content.semantics(ctx);
         }
@@ -690,6 +687,9 @@ impl Widget for Shell {
         if let Some(content) = &self.content {
             visitor.visit(content);
         }
+        // Health is painted last and must also be hit-tested last so its open popover receives
+        // actions instead of the tab content visually underneath it.
+        visitor.visit(&self.health_center);
     }
 
     fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
@@ -703,6 +703,7 @@ impl Widget for Shell {
         if let Some(content) = &mut self.content {
             visitor.visit(content);
         }
+        visitor.visit(&mut self.health_center);
     }
 }
 
@@ -765,16 +766,664 @@ impl Shell {
         });
         [stall, log_hint]
     }
+}
 
-    fn paint_status_pill(
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HealthActionKind {
+    Reconnect,
+    Retry(HealthSurface),
+    Authorize(HealthSurface),
+    Open(HealthSurface),
+    OpenLogs,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HealthActionItem {
+    kind: HealthActionKind,
+    label: String,
+    enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HealthHit {
+    Trigger,
+    Action(usize),
+}
+
+struct HealthLayout {
+    trigger: Rect,
+    popup: Option<Rect>,
+    header: Option<Rect>,
+    issue_rows: Vec<Rect>,
+    action_rows: Vec<(HealthActionItem, Rect)>,
+    empty_row: Option<Rect>,
+    action_error: Option<Rect>,
+}
+
+/// Focusable title-bar health affordance and its recovery popover. The widget owns no runtime
+/// authority: it starts typed background work or navigates to the owning surface, and each result
+/// is drained through the normal external-wake path.
+struct HealthCenter {
+    shared: Shared,
+    compact: bool,
+    open: bool,
+    focused_action: usize,
+    pressed: Option<HealthHit>,
+    last_issue_count: usize,
+    action_error: Option<String>,
+}
+
+impl HealthCenter {
+    fn new(shared: Shared, compact: bool) -> Self {
+        let last_issue_count = shared.health_issues().len();
+        Self {
+            shared,
+            compact,
+            open: false,
+            focused_action: 0,
+            pressed: None,
+            last_issue_count,
+            action_error: None,
+        }
+    }
+
+    fn trigger_width(&self) -> f32 {
+        if self.compact {
+            COMPACT_STATUS_PILL_W
+        } else {
+            STATUS_PILL_W
+        }
+    }
+
+    fn popup_height(&self, issue_count: usize) -> f32 {
+        let rows = if issue_count == 0 {
+            HEALTH_EMPTY_ROW_H
+        } else {
+            issue_count as f32 * HEALTH_ISSUE_ROW_H
+        };
+        HEALTH_HEADER_H
+            + rows
+            + HEALTH_FOOTER_H
+            + if self.action_error.is_some() {
+                24.0
+            } else {
+                0.0
+            }
+    }
+
+    fn actions_for_issue(&self, issue: &HealthIssue) -> Vec<HealthActionItem> {
+        let pending = self.shared.connection_health().is_pending();
+        let mut actions = match issue.surface {
+            HealthSurface::Connection => vec![
+                HealthActionItem {
+                    kind: HealthActionKind::Reconnect,
+                    label: if pending {
+                        "Reconnecting…".to_string()
+                    } else {
+                        "Reconnect".to_string()
+                    },
+                    enabled: !pending,
+                },
+                HealthActionItem {
+                    kind: HealthActionKind::Open(HealthSurface::Settings(
+                        settings::SettingsSection::Connection,
+                    )),
+                    label: "Connection settings".to_string(),
+                    enabled: true,
+                },
+            ],
+            HealthSurface::Chat => vec![
+                HealthActionItem {
+                    kind: HealthActionKind::Retry(HealthSurface::Chat),
+                    label: "Retry Chat".to_string(),
+                    enabled: true,
+                },
+                HealthActionItem {
+                    kind: HealthActionKind::Open(HealthSurface::Chat),
+                    label: "Open Chat".to_string(),
+                    enabled: true,
+                },
+            ],
+            HealthSurface::Files => vec![
+                HealthActionItem {
+                    kind: HealthActionKind::Retry(HealthSurface::Files),
+                    label: "Retry Files".to_string(),
+                    enabled: true,
+                },
+                HealthActionItem {
+                    kind: HealthActionKind::Open(HealthSurface::Files),
+                    label: "Open Files".to_string(),
+                    enabled: true,
+                },
+            ],
+            HealthSurface::Cluster => vec![
+                HealthActionItem {
+                    kind: HealthActionKind::Retry(HealthSurface::Cluster),
+                    label: "Retry Cluster".to_string(),
+                    enabled: true,
+                },
+                HealthActionItem {
+                    kind: HealthActionKind::Open(HealthSurface::Cluster),
+                    label: "Open Cluster".to_string(),
+                    enabled: true,
+                },
+            ],
+            HealthSurface::Evolution => {
+                let pending = self.shared.evolution().dashboard_refresh_pending();
+                vec![
+                    HealthActionItem {
+                        kind: HealthActionKind::Retry(HealthSurface::Evolution),
+                        label: if pending {
+                            "Retrying Evolution…".to_string()
+                        } else {
+                            "Retry Evolution".to_string()
+                        },
+                        enabled: !pending,
+                    },
+                    HealthActionItem {
+                        kind: HealthActionKind::Open(HealthSurface::Evolution),
+                        label: "Open Evolution".to_string(),
+                        enabled: true,
+                    },
+                ]
+            }
+            HealthSurface::Settings(section) => vec![HealthActionItem {
+                kind: HealthActionKind::Open(HealthSurface::Settings(section)),
+                label: format!("Open {}", section.title()),
+                enabled: true,
+            }],
+        };
+        if issue.needs_authorization() {
+            let label = match issue.surface {
+                HealthSurface::Connection => "Authorize Connection".to_string(),
+                HealthSurface::Chat => "Authorize Chat".to_string(),
+                HealthSurface::Files => "Authorize Files".to_string(),
+                HealthSurface::Cluster => "Authorize Cluster".to_string(),
+                HealthSurface::Evolution => "Authorize Evolution".to_string(),
+                HealthSurface::Settings(settings::SettingsSection::Providers) => {
+                    "Authorize Provider".to_string()
+                }
+                HealthSurface::Settings(section) => {
+                    format!("Authorize {}", section.title())
+                }
+            };
+            actions.insert(
+                actions.len().saturating_sub(1),
+                HealthActionItem {
+                    kind: HealthActionKind::Authorize(issue.surface),
+                    label,
+                    enabled: true,
+                },
+            );
+        }
+        actions
+    }
+
+    fn layout(&self, bounds: Rect, issues: &[HealthIssue]) -> HealthLayout {
+        let trigger_x = if self.compact {
+            bounds.x()
+        } else {
+            bounds.max_x() - self.trigger_width()
+        };
+        let trigger = Rect::new(
+            trigger_x,
+            bounds.y(),
+            self.trigger_width().min(bounds.width()),
+            if self.compact {
+                COMPACT_STATUS_PILL_W
+            } else {
+                STATUS_PILL_H
+            },
+        );
+        if !self.open {
+            return HealthLayout {
+                trigger,
+                popup: None,
+                header: None,
+                issue_rows: Vec::new(),
+                action_rows: Vec::new(),
+                empty_row: None,
+                action_error: None,
+            };
+        }
+
+        let popup = Rect::new(
+            bounds.x(),
+            trigger.max_y() + HEALTH_POPOVER_GAP,
+            bounds.width(),
+            (bounds.max_y() - trigger.max_y() - HEALTH_POPOVER_GAP).max(0.0),
+        );
+        let header = Rect::new(popup.x(), popup.y(), popup.width(), HEALTH_HEADER_H);
+        let mut issue_rows = Vec::new();
+        let mut action_rows = Vec::new();
+        let mut y = header.max_y();
+        let empty_row = if issues.is_empty() {
+            let row = Rect::new(
+                popup.x() + 12.0,
+                y,
+                popup.width() - 24.0,
+                HEALTH_EMPTY_ROW_H,
+            );
+            y += HEALTH_EMPTY_ROW_H;
+            Some(row)
+        } else {
+            for issue in issues {
+                let row = Rect::new(
+                    popup.x() + 12.0,
+                    y,
+                    popup.width() - 24.0,
+                    HEALTH_ISSUE_ROW_H,
+                );
+                let actions = self.actions_for_issue(issue);
+                let count = actions.len().max(1) as f32;
+                let available = (row.width() - 24.0 - HEALTH_ACTION_GAP * (count - 1.0)).max(0.0);
+                let action_w = available / count;
+                for (index, action) in actions.into_iter().enumerate() {
+                    action_rows.push((
+                        action,
+                        Rect::new(
+                            row.x() + 12.0 + index as f32 * (action_w + HEALTH_ACTION_GAP),
+                            row.max_y() - HEALTH_ACTION_H - 8.0,
+                            action_w,
+                            HEALTH_ACTION_H,
+                        ),
+                    ));
+                }
+                issue_rows.push(row);
+                y += HEALTH_ISSUE_ROW_H;
+            }
+            None
+        };
+        let action_error = self.action_error.as_ref().map(|_| {
+            let rect = Rect::new(popup.x() + 12.0, y, popup.width() - 24.0, 24.0);
+            y += 24.0;
+            rect
+        });
+        action_rows.push((
+            HealthActionItem {
+                kind: HealthActionKind::OpenLogs,
+                label: "Open app log".to_string(),
+                enabled: true,
+            },
+            Rect::new(
+                popup.x() + 12.0,
+                y + 8.0,
+                (popup.width() - 24.0).min(128.0),
+                HEALTH_ACTION_H,
+            ),
+        ));
+
+        HealthLayout {
+            trigger,
+            popup: Some(popup),
+            header: Some(header),
+            issue_rows,
+            action_rows,
+            empty_row,
+            action_error,
+        }
+    }
+
+    fn hit_test(&self, bounds: Rect, position: Point) -> Option<HealthHit> {
+        let issues = self.shared.health_issues();
+        let layout = self.layout(bounds, &issues);
+        if layout.trigger.contains(position) {
+            return Some(HealthHit::Trigger);
+        }
+        layout
+            .action_rows
+            .iter()
+            .position(|(_, rect)| rect.contains(position))
+            .map(HealthHit::Action)
+    }
+
+    fn open_surface(&self, surface: HealthSurface) {
+        let mut app = self.shared.borrow_mut();
+        match surface {
+            HealthSurface::Connection => {
+                app.active_tab = Tab::Settings;
+                if let Some(ready) = app.ready.as_mut() {
+                    ready.settings.open(settings::SettingsSection::Connection);
+                }
+            }
+            HealthSurface::Chat => app.active_tab = Tab::Sinomo,
+            HealthSurface::Files => app.active_tab = Tab::Files,
+            HealthSurface::Cluster => app.active_tab = Tab::Cluster,
+            HealthSurface::Evolution => app.active_tab = Tab::Evolution,
+            HealthSurface::Settings(section) => {
+                app.active_tab = Tab::Settings;
+                if let Some(ready) = app.ready.as_mut() {
+                    ready.settings.open(section);
+                }
+            }
+        }
+    }
+
+    fn retry_surface(&self, surface: HealthSurface) {
+        match surface {
+            HealthSurface::Connection => {
+                self.shared.request_connection_probe(true);
+            }
+            HealthSurface::Chat => {
+                let waker = { self.shared.borrow().waker.clone() };
+                self.shared.chat_mut().start_session_list_load(waker);
+            }
+            HealthSurface::Files => {
+                let waker = { self.shared.borrow().waker.clone() };
+                self.shared.files_mut().retry(waker);
+            }
+            HealthSurface::Cluster => {
+                cluster::request_refresh(&self.shared);
+            }
+            HealthSurface::Evolution => {
+                let (data_dir, waker) = {
+                    let app = self.shared.borrow();
+                    let Some(ready) = app.ready.as_ref() else {
+                        return;
+                    };
+                    (ready.backend.data_dir.clone(), app.waker.clone())
+                };
+                self.shared
+                    .evolution_mut()
+                    .retry_dashboard_refresh(data_dir, waker);
+            }
+            HealthSurface::Settings(_) => {
+                self.open_surface(surface);
+            }
+        }
+    }
+
+    fn authorize_surface(&self, surface: HealthSurface) {
+        let section = match surface {
+            HealthSurface::Settings(settings::SettingsSection::Providers) => {
+                settings::SettingsSection::Providers
+            }
+            _ => settings::SettingsSection::Connection,
+        };
+        self.open_surface(HealthSurface::Settings(section));
+    }
+
+    /// Returns whether navigation occurred and the popover should close.
+    fn activate_action(&mut self, action: HealthActionItem) -> bool {
+        if !action.enabled {
+            return false;
+        }
+        self.action_error = None;
+        match action.kind {
+            HealthActionKind::Reconnect => {
+                self.shared.request_connection_probe(true);
+                false
+            }
+            HealthActionKind::Retry(surface) => {
+                self.retry_surface(surface);
+                matches!(surface, HealthSurface::Settings(_))
+            }
+            HealthActionKind::Authorize(surface) => {
+                self.authorize_surface(surface);
+                true
+            }
+            HealthActionKind::Open(surface) => {
+                self.open_surface(surface);
+                true
+            }
+            HealthActionKind::OpenLogs => {
+                if let Err(error) = open_app_log(&self.shared) {
+                    tracing::warn!(%error, "failed to open app log");
+                    self.action_error = Some(error);
+                }
+                false
+            }
+        }
+    }
+
+    fn set_open(&mut self, ctx: &mut EventCtx, open: bool) {
+        if self.open == open {
+            return;
+        }
+        self.open = open;
+        self.focused_action = 0;
+        self.pressed = None;
+        if !open {
+            self.action_error = None;
+        }
+        ctx.request_measure();
+        ctx.request_arrange();
+        ctx.request_semantics();
+        ctx.request_paint();
+    }
+
+    fn move_action_focus(&mut self, delta: isize, action_count: usize) {
+        if action_count == 0 {
+            self.focused_action = 0;
+            return;
+        }
+        self.focused_action =
+            (self.focused_action as isize + delta).rem_euclid(action_count as isize) as usize;
+    }
+
+    fn paint_action(
         &self,
         ctx: &mut PaintCtx,
         theme: &sui::DefaultTheme,
         pal: &Palette,
-        connecting: bool,
+        index: usize,
+        action: &HealthActionItem,
+        rect: Rect,
     ) {
+        let focused = ctx.is_focused() && self.open && self.focused_action == index;
+        let pressed = self.pressed == Some(HealthHit::Action(index));
+        let fill = if !action.enabled {
+            pal.panel
+        } else if pressed {
+            pal.surface_3
+        } else if focused {
+            pal.accent_soft
+        } else {
+            pal.surface_2
+        };
+        let border = if focused {
+            pal.focus
+        } else if action.enabled {
+            pal.border
+        } else {
+            pal.border_subtle
+        };
+        widgets::round_panel(ctx, rect, fill, border, 5.0);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(rect.x() + 8.0, rect.y(), rect.width() - 16.0, rect.height()),
+            &action.label,
+            pal.text_style(
+                theme,
+                11.0,
+                FontWeight::MEDIUM,
+                if action.enabled {
+                    pal.text
+                } else {
+                    pal.text_disabled
+                },
+            ),
+        );
+    }
+}
+
+impl Widget for HealthCenter {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        if ctx.phase() != EventPhase::Target {
+            return;
+        }
+        match event {
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Down
+                    && pointer.button == Some(PointerButton::Primary) =>
+            {
+                if let Some(hit) = self.hit_test(ctx.bounds(), pointer.position) {
+                    if hit == HealthHit::Trigger && !self.shared.is_ready() {
+                        return;
+                    }
+                    self.pressed = Some(hit);
+                    ctx.request_pointer_capture(pointer.pointer_id);
+                    ctx.request_focus();
+                    ctx.request_paint();
+                    ctx.set_handled();
+                }
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Up
+                    && pointer.button == Some(PointerButton::Primary)
+                    && self.pressed.is_some() =>
+            {
+                let pressed = self.pressed.take();
+                let released = self.hit_test(ctx.bounds(), pointer.position);
+                ctx.release_pointer_capture(pointer.pointer_id);
+                if pressed == released {
+                    match released {
+                        Some(HealthHit::Trigger) => self.set_open(ctx, !self.open),
+                        Some(HealthHit::Action(index)) => {
+                            let issues = self.shared.health_issues();
+                            let layout = self.layout(ctx.bounds(), &issues);
+                            if let Some((action, _)) = layout.action_rows.get(index).cloned() {
+                                let close = self.activate_action(action);
+                                if close {
+                                    self.set_open(ctx, false);
+                                } else {
+                                    ctx.request_measure();
+                                    ctx.request_arrange();
+                                    ctx.request_semantics();
+                                    ctx.request_paint();
+                                }
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                ctx.request_paint();
+                ctx.set_handled();
+            }
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Cancel => {
+                if self.pressed.take().is_some() {
+                    ctx.release_pointer_capture(pointer.pointer_id);
+                    ctx.request_paint();
+                    ctx.set_handled();
+                }
+            }
+            Event::Keyboard(key) if ctx.is_focused() && key.state == KeyState::Pressed => {
+                if !self.open {
+                    if matches!(key.key.as_str(), "Enter" | " ") && self.shared.is_ready() {
+                        self.set_open(ctx, true);
+                        ctx.set_handled();
+                    }
+                    return;
+                }
+                let issues = self.shared.health_issues();
+                let layout = self.layout(ctx.bounds(), &issues);
+                let action_count = layout.action_rows.len();
+                match key.key.as_str() {
+                    "Escape" => self.set_open(ctx, false),
+                    "ArrowDown" | "ArrowRight" => {
+                        self.move_action_focus(1, action_count);
+                        ctx.request_paint();
+                        ctx.request_semantics();
+                    }
+                    "ArrowUp" | "ArrowLeft" => {
+                        self.move_action_focus(-1, action_count);
+                        ctx.request_paint();
+                        ctx.request_semantics();
+                    }
+                    "Home" => {
+                        self.focused_action = 0;
+                        ctx.request_paint();
+                        ctx.request_semantics();
+                    }
+                    "End" => {
+                        self.focused_action = action_count.saturating_sub(1);
+                        ctx.request_paint();
+                        ctx.request_semantics();
+                    }
+                    "Enter" | " " => {
+                        if let Some((action, _)) =
+                            layout.action_rows.get(self.focused_action).cloned()
+                        {
+                            let close = self.activate_action(action);
+                            if close {
+                                self.set_open(ctx, false);
+                            } else {
+                                ctx.request_measure();
+                                ctx.request_arrange();
+                                ctx.request_semantics();
+                                ctx.request_paint();
+                            }
+                        }
+                    }
+                    _ => return,
+                }
+                ctx.set_handled();
+            }
+            Event::Custom(_) | Event::Window(WindowEvent::RedrawRequested) if self.open => {
+                let count = self.shared.health_issues().len();
+                if count != self.last_issue_count {
+                    self.last_issue_count = count;
+                    self.focused_action = 0;
+                    ctx.request_measure();
+                    ctx.request_arrange();
+                    ctx.request_semantics();
+                }
+                ctx.request_paint();
+            }
+            _ => {}
+        }
+    }
+
+    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let issue_count = self.shared.health_issues().len();
+        self.last_issue_count = issue_count;
+        let width = if self.open {
+            HEALTH_POPOVER_W
+        } else {
+            self.trigger_width()
+        };
+        let trigger_h = if self.compact {
+            COMPACT_STATUS_PILL_W
+        } else {
+            STATUS_PILL_H
+        };
+        let height = if self.open {
+            trigger_h + HEALTH_POPOVER_GAP + self.popup_height(issue_count)
+        } else {
+            trigger_h
+        };
+        constraints.clamp(Size::new(width, height))
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let theme = self.shared.theme();
+        let dark = widgets::theme_is_dark(&self.shared);
+        let pal = Palette::from_theme(&theme, dark);
         let status = shell_status(&self.shared);
-        let label = status.label;
+        let issues = self.shared.health_issues();
+        let layout = self.layout(ctx.bounds(), &issues);
+        let trigger_pressed = self.pressed == Some(HealthHit::Trigger);
+        let trigger_border = if ctx.is_focused() {
+            pal.focus
+        } else if status.degraded {
+            pal.warn
+        } else {
+            pal.border
+        };
+        let trigger_fill = if status.degraded {
+            pal.warn_soft
+        } else if trigger_pressed || self.open {
+            pal.surface_3
+        } else {
+            pal.surface_2
+        };
+        widgets::round_panel(
+            ctx,
+            layout.trigger,
+            trigger_fill,
+            trigger_border,
+            layout.trigger.height() / 2.0,
+        );
         let dot = if status.degraded {
             pal.warn
         } else if status.connected_daemon {
@@ -782,97 +1431,347 @@ impl Shell {
         } else {
             pal.accent
         };
-
-        let style = pal.text_style(
-            theme,
-            12.0,
-            FontWeight::MEDIUM,
-            if status.degraded {
-                pal.warn_text
-            } else {
-                pal.text_muted
-            },
-        );
-        let tw = ctx
-            .measure_text(label.clone(), style.clone())
-            .map(|m| m.width)
-            .unwrap_or(60.0);
-
-        // While connecting, drop the leading dot (the spinner to the left conveys the activity) and
-        // show just the status text in a pill; once ready, the pill has a status dot.
-        let compact = compact_chrome(self.bar_rect.width());
-        let pill_w = if connecting {
-            tw + 14.0 * 2.0
-        } else {
-            tw + 16.0 + 14.0
-        };
-        let pill_h = STATUS_PILL_H;
-        let (pill_x, pill_y, pill_w, pill_h) = if compact {
-            let rect = self.status_pill_rect.get();
-            (rect.x(), rect.y(), rect.width(), rect.height())
-        } else {
-            (
-                self.bar_rect.x() + self.bar_rect.width() - EDGE_PAD - pill_w,
-                self.bar_rect.y() + (TOPBAR_HEIGHT - pill_h) / 2.0,
-                pill_w,
-                pill_h,
-            )
-        };
-        let pill = Rect::new(pill_x, pill_y, pill_w, pill_h);
-        self.status_pill_rect.set(pill);
-        let pressed = self.status_pill_pressed.get();
-        // Mesh chip: quiet surface-2 fill with a hairline; a degraded mesh
-        // rides the warning wash so the state reads without shouting.
-        let bg = if status.degraded {
-            pal.warn_soft
-        } else if pressed {
-            pal.surface_3
-        } else {
-            pal.surface_2
-        };
-        widgets::round_panel(
-            ctx,
-            pill,
-            bg,
-            if status.degraded {
-                pal.warn
-            } else {
-                pal.border
-            },
-            pill_h / 2.0,
-        );
-
-        if compact {
-            let r = 4.0;
+        if self.compact {
             ctx.fill(
                 sui::Path::circle(
-                    sui::Point::new(pill_x + pill_w / 2.0, pill_y + pill_h / 2.0),
-                    r,
+                    Point::new(
+                        layout.trigger.x() + layout.trigger.width() / 2.0,
+                        layout.trigger.y() + layout.trigger.height() / 2.0,
+                    ),
+                    4.0,
                 ),
                 dot,
             );
-        } else if connecting {
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(pill_x + 14.0, pill_y, pill_w - 14.0, pill_h),
-                &label,
-                style,
-            );
         } else {
-            // status dot
-            let r = 4.0;
             ctx.fill(
-                sui::Path::circle(sui::Point::new(pill_x + 12.0, pill_y + pill_h / 2.0), r),
+                sui::Path::circle(
+                    Point::new(
+                        layout.trigger.x() + 12.0,
+                        layout.trigger.y() + layout.trigger.height() / 2.0,
+                    ),
+                    4.0,
+                ),
                 dot,
             );
             widgets::draw_text_in(
                 ctx,
-                Rect::new(pill_x + 22.0, pill_y, pill_w - 22.0, pill_h),
-                &label,
-                style,
+                Rect::new(
+                    layout.trigger.x() + 22.0,
+                    layout.trigger.y(),
+                    layout.trigger.width() - 30.0,
+                    layout.trigger.height(),
+                ),
+                &status.label,
+                pal.text_style(
+                    &theme,
+                    12.0,
+                    FontWeight::MEDIUM,
+                    if status.degraded {
+                        pal.warn_text
+                    } else {
+                        pal.text_muted
+                    },
+                ),
             );
         }
+
+        let Some(popup) = layout.popup else {
+            return;
+        };
+        sui::paint_theme_shadow(ctx, popup, [8.0; 4], &theme.shadows.box_shadow.lg);
+        widgets::round_panel(ctx, popup, pal.overlay, pal.border_strong, 8.0);
+        if let Some(header) = layout.header {
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(
+                    header.x() + 14.0,
+                    header.y() + 5.0,
+                    header.width() - 28.0,
+                    22.0,
+                ),
+                "Health and recovery",
+                pal.text_style(&theme, 14.0, FontWeight::SEMIBOLD, pal.text),
+            );
+            let summary = if issues.is_empty() {
+                self.shared.status_detail()
+            } else {
+                format!(
+                    "{} affected {}",
+                    issues.len(),
+                    if issues.len() == 1 {
+                        "surface"
+                    } else {
+                        "surfaces"
+                    }
+                )
+            };
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(
+                    header.x() + 14.0,
+                    header.y() + 27.0,
+                    header.width() - 28.0,
+                    19.0,
+                ),
+                &compact_health_line(&summary, 64),
+                pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_muted),
+            );
+            widgets::hairline_bottom(ctx, header, pal.border_subtle);
+        }
+
+        for (issue, row) in issues.iter().zip(layout.issue_rows.iter().copied()) {
+            widgets::round_panel(
+                ctx,
+                row.inflate(-2.0, -3.0),
+                pal.panel,
+                pal.border_subtle,
+                6.0,
+            );
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(row.x() + 12.0, row.y() + 5.0, row.width() - 24.0, 20.0),
+                &issue.title,
+                pal.text_style(&theme, 12.0, FontWeight::SEMIBOLD, pal.text),
+            );
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(row.x() + 12.0, row.y() + 26.0, row.width() - 24.0, 22.0),
+                &compact_health_line(&issue.detail, 62),
+                pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_muted),
+            );
+        }
+        if let Some(row) = layout.empty_row {
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(row.x() + 4.0, row.y() + 4.0, row.width() - 8.0, 22.0),
+                "All monitored surfaces are operational.",
+                pal.text_style(&theme, 12.0, FontWeight::MEDIUM, pal.ok_text),
+            );
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(row.x() + 4.0, row.y() + 27.0, row.width() - 8.0, 22.0),
+                &compact_health_line(&self.shared.status_detail(), 62),
+                pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_muted),
+            );
+        }
+        if let (Some(error), Some(rect)) = (&self.action_error, layout.action_error) {
+            widgets::draw_text_in(
+                ctx,
+                rect,
+                &compact_health_line(error, 66),
+                pal.text_style(&theme, 11.0, FontWeight::MEDIUM, pal.danger_text),
+            );
+        }
+        for (index, (action, rect)) in layout.action_rows.iter().enumerate() {
+            self.paint_action(ctx, &theme, &pal, index, action, *rect);
+        }
     }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let status = shell_status(&self.shared);
+        let issues = self.shared.health_issues();
+        let layout = self.layout(ctx.bounds(), &issues);
+        let ready = self.shared.is_ready();
+        let base = ctx.widget_id().get().wrapping_mul(131);
+
+        let root_role = if !ready {
+            SemanticsRole::Text
+        } else if self.open {
+            SemanticsRole::Popover
+        } else {
+            SemanticsRole::Button
+        };
+        let mut root = SemanticsNode::new(ctx.widget_id(), root_role, ctx.bounds());
+        root.name = Some(if self.open {
+            "Health and recovery".to_string()
+        } else {
+            status.label.clone()
+        });
+        root.description = Some(if self.open {
+            status.detail.clone()
+        } else {
+            format!("Open Health and recovery. {}", status.detail)
+        });
+        root.value = Some(SemanticsValue::Text(if status.degraded {
+            "needs attention".to_string()
+        } else if ready {
+            "connected".to_string()
+        } else {
+            "connecting".to_string()
+        }));
+        root.state.focused = ctx.is_focused();
+        root.state.expanded = Some(self.open);
+        root.state.selected = status.degraded;
+        root.state.busy = self.shared.connection_health().phase == ConnectionPhase::Reconnecting;
+        root.actions = if ready && self.open {
+            vec![SemanticsAction::Focus, SemanticsAction::Collapse]
+        } else if ready {
+            vec![SemanticsAction::Focus, SemanticsAction::Activate]
+        } else {
+            Vec::new()
+        };
+        ctx.push(root);
+
+        if !self.open {
+            return;
+        }
+        if let Some(header) = layout.header {
+            let health = self.shared.connection_health();
+            let mut progress = SemanticsNode::new(
+                sui::WidgetId::new(base.wrapping_add(2)),
+                SemanticsRole::Text,
+                header,
+            );
+            progress.name = Some("Connection status".to_string());
+            progress.description = Some(health.detail.clone());
+            progress.value = Some(SemanticsValue::Text(health.label.clone()));
+            progress.state.busy = health.is_pending();
+            progress.parent = Some(ctx.widget_id());
+            ctx.push(progress);
+        }
+        let list_bounds = layout
+            .popup
+            .map(|popup| {
+                Rect::new(
+                    popup.x(),
+                    popup.y() + HEALTH_HEADER_H,
+                    popup.width(),
+                    popup.height() - HEALTH_HEADER_H,
+                )
+            })
+            .unwrap_or(Rect::ZERO);
+        let list_id = sui::WidgetId::new(base.wrapping_add(3));
+        let mut list = SemanticsNode::new(list_id, SemanticsRole::List, list_bounds);
+        list.name = Some("Affected surfaces".to_string());
+        list.value = Some(SemanticsValue::Text(issues.len().to_string()));
+        list.parent = Some(ctx.widget_id());
+        ctx.push(list);
+        for (index, (issue, row)) in issues
+            .iter()
+            .zip(layout.issue_rows.iter().copied())
+            .enumerate()
+        {
+            let mut node = SemanticsNode::new(
+                sui::WidgetId::new(base.wrapping_add(100 + index as u64)),
+                SemanticsRole::ListItem,
+                row,
+            );
+            node.name = Some(issue.title.clone());
+            node.description = Some(issue.detail.clone());
+            node.parent = Some(list_id);
+            ctx.push(node);
+        }
+        if let Some(row) = layout.empty_row {
+            let mut node = SemanticsNode::new(
+                sui::WidgetId::new(base.wrapping_add(90)),
+                SemanticsRole::ListItem,
+                row,
+            );
+            node.name = Some("All systems operational".to_string());
+            node.description = Some(self.shared.status_detail());
+            node.parent = Some(list_id);
+            ctx.push(node);
+        }
+        for (index, (action, rect)) in layout.action_rows.iter().enumerate() {
+            let mut node = SemanticsNode::new(
+                sui::WidgetId::new(base.wrapping_add(1_000 + index as u64)),
+                SemanticsRole::Button,
+                *rect,
+            );
+            node.name = Some(action.label.clone());
+            node.state.disabled = !action.enabled;
+            node.state.focused = ctx.is_focused() && self.focused_action == index;
+            node.state.selected = self.focused_action == index;
+            node.parent = Some(ctx.widget_id());
+            if action.enabled {
+                node.actions = vec![SemanticsAction::Focus, SemanticsAction::Activate];
+            }
+            ctx.push(node);
+        }
+        if let (Some(error), Some(rect)) = (&self.action_error, layout.action_error) {
+            let mut node = SemanticsNode::new(
+                sui::WidgetId::new(base.wrapping_add(9_000)),
+                SemanticsRole::Text,
+                rect,
+            );
+            node.name = Some("Recovery action failed".to_string());
+            node.description = Some(error.clone());
+            node.parent = Some(ctx.widget_id());
+            ctx.push(node);
+        }
+    }
+
+    fn accepts_focus(&self) -> bool {
+        self.shared.is_ready()
+    }
+
+    fn focus_changed(&mut self, ctx: &mut EventCtx, focused: bool) {
+        if !focused && self.open {
+            self.set_open(ctx, false);
+        } else {
+            ctx.request_paint();
+            ctx.request_semantics();
+        }
+    }
+}
+
+fn compact_health_line(text: &str, max_chars: usize) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    let mut compact = text
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    compact.push('…');
+    compact
+}
+
+fn open_app_log(shared: &Shared) -> Result<(), String> {
+    let path = {
+        let state = shared.borrow();
+        state.data_dir.root().join("logs").join("app.log")
+    };
+    open_log_path(&path)
+}
+
+#[cfg(target_os = "windows")]
+fn open_log_path(path: &std::path::Path) -> Result<(), String> {
+    let argument = format!("/select,{}", path.display());
+    std::process::Command::new("explorer.exe")
+        .arg(argument)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("failed to open {}: {error}", path.display()))
+}
+
+#[cfg(target_os = "macos")]
+fn open_log_path(path: &std::path::Path) -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("failed to reveal {}: {error}", path.display()))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_log_path(path: &std::path::Path) -> Result<(), String> {
+    let parent = path.parent().unwrap_or(path);
+    std::process::Command::new("xdg-open")
+        .arg(parent)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("failed to open {}: {error}", parent.display()))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+fn open_log_path(path: &std::path::Path) -> Result<(), String> {
+    Err(format!(
+        "opening log files is not supported on this platform: {}",
+        path.display()
+    ))
 }
 
 /// A subtle title-bar drop shadow: a soft outer layer cast downward onto the content so the flat
@@ -947,7 +1846,7 @@ struct ShellStatus {
 
 fn shell_status(shared: &Shared) -> ShellStatus {
     let state = shared.borrow();
-    let Some(ready) = state.ready.as_ref() else {
+    let Some(_) = state.ready.as_ref() else {
         let status = state.status.clone();
         return ShellStatus {
             label: status.clone(),
@@ -956,25 +1855,16 @@ fn shell_status(shared: &Shared) -> ShellStatus {
             connected_daemon: false,
         };
     };
-
-    let mut issues = Vec::new();
-    if let Some(detail) = ready.backend.connection_issue_detail() {
-        issues.push(detail);
-    } else {
-        if let Some(detail) = ready.chat.connection_attention_detail() {
-            issues.push(detail);
-        }
-        if let Some(error) = ready.files.error.as_deref().filter(|text| !text.is_empty()) {
-            issues.push(format!("SIFS unavailable: {error}"));
-        }
-    }
+    let health = state.connection_health.clone();
+    drop(state);
+    let issues = shared.health_issues();
 
     if issues.is_empty() {
         ShellStatus {
-            label: ready.backend.mode_label(),
-            detail: ready.backend.status_detail(),
+            label: health.label,
+            detail: health.detail,
             degraded: false,
-            connected_daemon: ready.backend.connection.is_daemon(),
+            connected_daemon: health.phase.is_connected(),
         }
     } else {
         let count = issues.len();
@@ -985,15 +1875,19 @@ fn shell_status(shared: &Shared) -> ShellStatus {
                 format!("{count} issues")
             },
             detail: if count == 1 {
-                issues.join(" · ")
+                issues[0].detail.clone()
             } else {
                 format!(
                     "{count} app surfaces need attention: {}",
-                    issues.join(" · ")
+                    issues
+                        .iter()
+                        .map(|issue| format!("{}: {}", issue.title, issue.detail))
+                        .collect::<Vec<_>>()
+                        .join(" · ")
                 )
             },
             degraded: true,
-            connected_daemon: ready.backend.connection.is_daemon(),
+            connected_daemon: health.phase.is_connected(),
         }
     }
 }
@@ -1050,6 +1944,18 @@ mod tests {
         shared.chat_mut().sessions.clear();
 
         let _shell = Shell::new(shared.clone());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !shared
+            .chat()
+            .sessions
+            .iter()
+            .any(|session| session.id == session_id && session.title == "Ready shell history")
+            && std::time::Instant::now() < deadline
+        {
+            shared.chat_mut().pump_session_list();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
 
         assert!(
             shared
@@ -1193,7 +2099,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_status_pill_opens_connection_settings() -> sui::Result<()> {
+    fn attention_status_opens_recovery_center_and_authorize_deep_links() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let mut state = AppState::ready(backend);
         state.active_tab = Tab::Sinomo;
@@ -1216,6 +2122,73 @@ mod tests {
             .with_name("Needs attention")
             .click()?;
 
+        assert_eq!(shared.borrow().active_tab, Tab::Sinomo);
+        let snapshot = window.snapshot()?;
+        let health_center = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Popover
+                    && node.name.as_deref() == Some("Health and recovery")
+            })
+            .expect("health center semantics");
+        assert_eq!(health_center.state.expanded, Some(true));
+        let connection_status = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Text
+                    && node.name.as_deref() == Some("Connection status")
+            })
+            .expect("connection progress semantics");
+        assert_eq!(connection_status.parent, Some(health_center.id));
+        let affected = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::List
+                    && node.name.as_deref() == Some("Affected surfaces")
+            })
+            .expect("affected surfaces list");
+        assert_eq!(affected.parent, Some(health_center.id));
+        let files_issue = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::ListItem
+                    && node.name.as_deref() == Some("Files · SIFS")
+                    && node
+                        .description
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("authorization"))
+            })
+            .expect("Files issue semantics");
+        assert_eq!(files_issue.parent, Some(affected.id));
+        for action in [
+            "Retry Files",
+            "Authorize Files",
+            "Open Files",
+            "Open app log",
+        ] {
+            let node = snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.role == SemanticsRole::Button && node.name.as_deref() == Some(action)
+                })
+                .unwrap_or_else(|| panic!("missing recovery action {action}"));
+            assert_eq!(node.parent, Some(health_center.id));
+        }
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Authorize Files")
+            .click()?;
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
         assert_eq!(
             shared.settings().selected,
@@ -1306,6 +2279,84 @@ mod tests {
     }
 
     #[test]
+    fn health_center_supports_escape_enter_and_arrow_navigation() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.error = Some("device authorization was denied".to_string());
+        }
+
+        let runtime = crate::build_runtime(shared)?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let trigger = window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Needs attention");
+
+        trigger.click()?;
+        let health_center = window
+            .get_by_role(SemanticsRole::Popover)
+            .with_name("Health and recovery");
+        health_center.press("Escape")?;
+        let snapshot = window.snapshot()?;
+        assert!(snapshot.accessibility.nodes.iter().any(|node| {
+            node.role == SemanticsRole::Button
+                && node.name.as_deref() == Some("Needs attention")
+                && node.state.expanded == Some(false)
+        }));
+
+        trigger.press("Enter")?;
+        health_center.press("ArrowDown")?;
+        let snapshot = window.snapshot()?;
+        let authorize = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Button
+                    && node.name.as_deref() == Some("Authorize Files")
+            })
+            .expect("authorize action");
+        assert!(
+            authorize.state.selected,
+            "ArrowDown should move the recovery action cursor"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn health_center_exposes_evolution_retry_and_deep_link() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        shared.evolution_mut().dashboard.error =
+            Some("Evolution dashboard refresh failed: worker stopped".to_string());
+
+        let runtime = crate::build_runtime(shared)?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Needs attention")
+            .click()?;
+
+        for action in ["Retry Evolution", "Open Evolution"] {
+            assert_eq!(
+                window
+                    .get_by_role(SemanticsRole::Button)
+                    .with_name(action)
+                    .count()?,
+                1,
+                "missing {action}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn loading_screen_surfaces_stalled_step_and_log_hint() {
         let shared = Shared::new(AppState::connecting());
         {
@@ -1362,7 +2413,11 @@ mod tests {
 
         let status = shell_status(&shared);
 
-        assert_eq!(status.label, "Needs attention");
+        assert!(
+            status.label == "Needs attention" || status.label.ends_with(" issues"),
+            "unexpected aggregate label: {}",
+            status.label
+        );
         assert!(status.degraded);
         assert!(!status.connected_daemon);
         assert!(status.detail.contains("embedded daemon failed"));

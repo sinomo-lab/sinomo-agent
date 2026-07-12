@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use sinomo_runtime::api::{
     DaemonApiClient, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
-    RemoteConfigClient, probe_daemon_status,
+    RemoteConfigClient, probe_daemon_status, probe_daemon_status_at_address,
 };
 use sinomo_runtime::cluster::ClusterControlInitRequest;
 use sinomo_runtime::config::{ConfigClient, ConfigRegistry, ConfigStore, LocalConfigClient};
@@ -286,9 +286,70 @@ impl Backend {
         })
     }
 
+    /// Apply a live daemon observation and rebuild connection-bound clients as one backend update.
+    ///
+    /// An in-process classification is retained only when the probe reached the exact process this
+    /// backend started and still owns. If a replacement process appears at the same address, it is
+    /// an external daemon from this app surface's perspective.
+    pub(crate) fn apply_live_daemon_status(&mut self, status: DaemonStatus) -> bool {
+        let binding_changed = !matches!(
+            &self.connection,
+            Connection::Daemon(previous) | Connection::InProcessDaemon(previous)
+                if previous.pid == status.pid && previous.address == status.address
+        );
+        let remains_in_process = self._daemon.is_some()
+            && matches!(
+                &self.connection,
+                Connection::InProcessDaemon(previous)
+                    if previous.pid == status.pid && previous.address == status.address
+            );
+        self.connection = if remains_in_process {
+            Connection::InProcessDaemon(Box::new(status))
+        } else {
+            Connection::Daemon(Box::new(status))
+        };
+        if binding_changed {
+            self.config =
+                build_config_client(&self.connection, &self.data_dir, self.app_runtime.handle());
+        }
+        binding_changed
+    }
+
     /// Whether the runtime is healthy enough to talk to.
     pub fn is_online(&self) -> bool {
         true
+    }
+}
+
+/// Probe the live daemon endpoint without consulting or mutating application UI state.
+///
+/// The preferred address is tried first so an attached daemon remains observable even if its
+/// status file is briefly stale. The data-directory probe is the recovery path: it can discover a
+/// replacement daemon after the endpoint used at startup disappears. This function is blocking by
+/// design and must only be called from the app's background connection-operation lane.
+pub(crate) fn probe_runtime_connection(
+    data_dir: &SinomoDataDir,
+    preferred_address: Option<&str>,
+) -> Result<DaemonStatus, String> {
+    if let Some(address) = preferred_address
+        && let Some(status) = probe_daemon_status_at_address(address, DAEMON_PROBE_TIMEOUT)
+    {
+        return Ok(status);
+    }
+
+    let paths = DaemonPaths::new(data_dir);
+    match probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT) {
+        DaemonProbeStatus::Running(status) => Ok(status),
+        DaemonProbeStatus::Locked {
+            status: Some(status),
+        } => Err(format!(
+            "daemon at {} is not responding; its process lock is still present",
+            status.address
+        )),
+        DaemonProbeStatus::Locked { status: None } => {
+            Err("daemon is not responding; its process lock is still present".to_string())
+        }
+        DaemonProbeStatus::NotRunning => Err("no daemon is currently running".to_string()),
     }
 }
 
@@ -577,6 +638,51 @@ mod tests {
         assert!(
             !root.exists(),
             "fallback test data dir should be removed when the backend drops"
+        );
+    }
+
+    #[test]
+    fn live_daemon_status_rebinds_config_and_classifies_process_ownership() {
+        let mut backend = Backend::local_fallback();
+        let paths = DaemonPaths::new(backend.data_dir.as_ref());
+        let status = DaemonStatus::new(&DaemonRunOptions::default(), &paths, None);
+        let old_config = backend.config.clone();
+
+        assert!(backend.apply_live_daemon_status(status.clone()));
+
+        assert!(matches!(backend.connection, Connection::Daemon(_)));
+        assert!(
+            !Arc::ptr_eq(&old_config, &backend.config),
+            "connection-bound config client must be rebuilt after recovery"
+        );
+        assert_eq!(
+            backend.connection.daemon_address(),
+            Some(status.address.as_str())
+        );
+
+        let rebound_config = backend.config.clone();
+        assert!(!backend.apply_live_daemon_status(status.clone()));
+        assert!(
+            Arc::ptr_eq(&rebound_config, &backend.config),
+            "a healthy same-process probe must not churn connection-bound clients"
+        );
+
+        backend.connection = Connection::InProcessDaemon(Box::new(status.clone()));
+        backend._daemon = Some(Arc::new(InProcessDaemon {
+            _thread: thread::spawn(|| {}),
+        }));
+        assert!(!backend.apply_live_daemon_status(status.clone()));
+        assert!(
+            matches!(backend.connection, Connection::InProcessDaemon(_)),
+            "the exact daemon process still owned by this backend remains in-process"
+        );
+
+        let mut replacement = status;
+        replacement.pid = replacement.pid.wrapping_add(1);
+        assert!(backend.apply_live_daemon_status(replacement));
+        assert!(
+            matches!(backend.connection, Connection::Daemon(_)),
+            "a replacement process at the same address is external to this app surface"
         );
     }
 
