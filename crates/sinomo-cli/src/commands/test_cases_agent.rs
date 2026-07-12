@@ -18,6 +18,7 @@ use sinomo_agent::{
     AgentSessionTerminalResultsRequest, AgentSessionTerminalResultsResponse,
     AgentTaskLifecycleStatus, AgentTaskRef, AgentTaskSnapshot, FileAgentSessionStore, TaskId,
 };
+use sinomo_runtime::api::DaemonApiClient;
 use sinomo_runtime::cluster;
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
@@ -453,9 +454,7 @@ fn run_agent_channel_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         ))
     })?;
     let source_node_id = cluster_state.local_node_id.to_string();
-    let store = SifsAgentChannelStore::open(&data_dir).map_err(|detail| {
-        SinomoTestError::failed(format!("cannot open SIFS agent channel store: {detail}"))
-    })?;
+    let (_runtime, store) = open_daemon_agent_channel_store()?;
     let (mut channel, channel_created) =
         match store.load_channel(&channel_id).map_err(|source| {
             SinomoTestError::failed(format!("cannot load agent channel {channel_id}: {source}"))
@@ -523,10 +522,7 @@ fn run_agent_channel_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let timeout = agent_channel_expect_timeout(ctx)?;
     let started = Instant::now();
     let deadline = started + timeout;
-    let data_dir = SinomoDataDir::new(ctx.data_dir());
-    let store = SifsAgentChannelStore::open(&data_dir).map_err(|detail| {
-        SinomoTestError::failed(format!("cannot open SIFS agent channel store: {detail}"))
-    })?;
+    let (_runtime, store) = open_daemon_agent_channel_store()?;
     let mut last_state: String;
 
     ctx.record("channel", &channel_parameter);
@@ -588,6 +584,32 @@ fn run_agent_channel_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         }
         std::thread::sleep(AGENT_CHANNEL_EXPECT_POLL_INTERVAL.min(deadline.duration_since(now)));
     }
+}
+
+fn open_daemon_agent_channel_store()
+-> Result<(tokio::runtime::Runtime, SifsAgentChannelStore), SinomoTestError> {
+    let daemon_client = DaemonApiClient::connect().map_err(|source| {
+        SinomoTestError::failed(format!(
+            "cannot connect to the local daemon for agent channel storage: {source}"
+        ))
+    })?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|source| {
+            SinomoTestError::failed(format!("cannot create agent channel RPC runtime: {source}"))
+        })?;
+    let store = SifsAgentChannelStore::open_daemon_on_runtime(
+        daemon_client.address().to_string(),
+        runtime.handle(),
+    )
+    .map_err(|detail| {
+        SinomoTestError::failed(format!(
+            "cannot open daemon-backed SIFS agent channel store: {detail}"
+        ))
+    })?;
+    Ok((runtime, store))
 }
 
 fn parse_agent_channel_probe_id(raw: &str) -> Result<SessionId, SinomoTestError> {
