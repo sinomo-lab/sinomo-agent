@@ -1,13 +1,14 @@
 //! "Cluster" tab - network-topology graph of known cluster nodes.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
 use sui::{
-    ArrangeCtx, Color, Constraints, Event, EventCtx, FontWeight, IconGlyph, MeasureCtx, PaintCtx,
-    Path, PathBuilder, Point, PointerButton, PointerEventKind, Rect, SemanticsAction, SemanticsCtx,
-    SemanticsNode, SemanticsRole, Size, StrokeStyle, Widget, WindowEvent, draw_glyph,
+    ArrangeCtx, Color, Constraints, Event, EventCtx, FontWeight, IconGlyph, KeyState, MeasureCtx,
+    PaintCtx, Path, PathBuilder, Point, PointerButton, PointerEventKind, Rect, SemanticsAction,
+    SemanticsCtx, SemanticsNode, SemanticsRole, Size, StrokeStyle, Widget, WindowEvent, draw_glyph,
 };
 
 use crate::backend::Backend;
@@ -83,6 +84,19 @@ impl ClusterState {
         }
     }
 
+    /// Drop any result tied to the previous daemon identity and immediately refresh through the
+    /// newly-bound backend. The last good topology remains visible while the replacement snapshot
+    /// is loading.
+    pub(crate) fn rebind_backend(
+        &mut self,
+        backend: Backend,
+        waker: Option<sui::UiHandle>,
+    ) -> bool {
+        self.refresh_rx = None;
+        self.refreshing = false;
+        self.begin_refresh(backend, waker)
+    }
+
     pub fn pump_refresh(&mut self) -> bool {
         let snapshot = match self.refresh_rx.as_ref().map(|rx| rx.try_recv()) {
             Some(Ok(snapshot)) => snapshot,
@@ -142,10 +156,17 @@ struct GraphVertex {
     public_reachable: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GraphVertexKind {
     Node,
     LanSegment,
+}
+
+fn graph_vertex_selection(vertex: &GraphVertex) -> ClusterSelection {
+    match vertex.kind {
+        GraphVertexKind::Node => ClusterSelection::Node(vertex.id.clone()),
+        GraphVertexKind::LanSegment => ClusterSelection::LanSegment(vertex.id.clone()),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -194,6 +215,7 @@ pub fn view(shared: Shared) -> impl Widget {
 struct ClusterView {
     shared: Shared,
     bounds: Rect,
+    keyboard_focus: RefCell<Option<ClusterSelection>>,
 }
 
 impl ClusterView {
@@ -201,6 +223,7 @@ impl ClusterView {
         Self {
             shared,
             bounds: Rect::ZERO,
+            keyboard_focus: RefCell::new(None),
         }
     }
 
@@ -217,11 +240,85 @@ impl ClusterView {
             ready.settings.open(SettingsSection::Connection);
         }
     }
+
+    fn focused_vertex_index(&self, topology: &Topology) -> Option<usize> {
+        self.keyboard_focus
+            .borrow()
+            .as_ref()
+            .and_then(|focused| {
+                topology
+                    .vertices
+                    .iter()
+                    .position(|vertex| graph_vertex_selection(vertex) == *focused)
+            })
+            .or_else(|| {
+                let selected = self.shared.cluster().selected.clone()?;
+                topology
+                    .vertices
+                    .iter()
+                    .position(|vertex| graph_vertex_selection(vertex) == selected)
+            })
+            .or_else(|| (!topology.vertices.is_empty()).then_some(0))
+    }
+
+    fn move_keyboard_focus(&self, topology: &Topology, delta: isize) -> bool {
+        if topology.vertices.is_empty() {
+            *self.keyboard_focus.borrow_mut() = None;
+            return false;
+        }
+        let current = self.focused_vertex_index(topology).unwrap_or(0);
+        let len = topology.vertices.len() as isize;
+        let next = (current as isize + delta).rem_euclid(len) as usize;
+        *self.keyboard_focus.borrow_mut() = topology.vertices.get(next).map(graph_vertex_selection);
+        true
+    }
+
+    fn activate_keyboard_vertex(&self, topology: &Topology) -> bool {
+        let Some(index) = self.focused_vertex_index(topology) else {
+            return false;
+        };
+        let Some(vertex) = topology.vertices.get(index) else {
+            return false;
+        };
+        let selection = graph_vertex_selection(vertex);
+        *self.keyboard_focus.borrow_mut() = Some(selection.clone());
+        let mut cluster = self.shared.cluster_mut();
+        if cluster.selected != Some(selection.clone()) {
+            cluster.diagnostics_open = false;
+        }
+        cluster.selected = Some(selection);
+        true
+    }
 }
 
 impl Widget for ClusterView {
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
         match event {
+            Event::Keyboard(key) if key.state == KeyState::Pressed && ctx.is_focused() => {
+                let snapshot = self.shared.cluster().snapshot.clone();
+                let topology = build_topology(&snapshot);
+                let handled = match key.key.as_str() {
+                    "ArrowRight" | "ArrowDown" => self.move_keyboard_focus(&topology, 1),
+                    "ArrowLeft" | "ArrowUp" => self.move_keyboard_focus(&topology, -1),
+                    "Home" if !topology.vertices.is_empty() => {
+                        *self.keyboard_focus.borrow_mut() =
+                            topology.vertices.first().map(graph_vertex_selection);
+                        true
+                    }
+                    "End" if !topology.vertices.is_empty() => {
+                        *self.keyboard_focus.borrow_mut() =
+                            topology.vertices.last().map(graph_vertex_selection);
+                        true
+                    }
+                    "Enter" | " " => self.activate_keyboard_vertex(&topology),
+                    _ => false,
+                };
+                if handled {
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                    ctx.set_handled();
+                }
+            }
             Event::Pointer(pointer)
                 if pointer.kind == PointerEventKind::Up
                     && pointer.button == Some(PointerButton::Primary)
@@ -250,6 +347,7 @@ impl Widget for ClusterView {
                 {
                     self.open_connection_settings();
                     ctx.request_paint();
+                    ctx.request_semantics();
                     ctx.set_handled();
                     return;
                 }
@@ -277,6 +375,7 @@ impl Widget for ClusterView {
                 {
                     self.open_connection_settings();
                     ctx.request_paint();
+                    ctx.request_semantics();
                     ctx.set_handled();
                     return;
                 }
@@ -290,6 +389,7 @@ impl Widget for ClusterView {
                     let open = self.shared.cluster().diagnostics_open;
                     self.shared.cluster_mut().diagnostics_open = !open;
                     ctx.request_paint();
+                    ctx.request_semantics();
                     ctx.set_handled();
                     return;
                 }
@@ -298,18 +398,23 @@ impl Widget for ClusterView {
                     let open = self.shared.cluster().diagnostics_open;
                     self.shared.cluster_mut().diagnostics_open = !open;
                     ctx.request_paint();
+                    ctx.request_semantics();
                     ctx.set_handled();
                     return;
                 }
                 let graph = graph_rect(ctx.bounds());
                 let layout = layout_vertices(&topology, graph);
                 let selection = hit_test(&layout, pointer.position);
+                *self.keyboard_focus.borrow_mut() = selection.clone();
                 let mut cluster = self.shared.cluster_mut();
                 if cluster.selected != selection {
                     cluster.diagnostics_open = false;
                 }
                 cluster.selected = selection;
+                drop(cluster);
+                ctx.request_focus();
                 ctx.request_paint();
+                ctx.request_semantics();
                 ctx.set_handled();
             }
             Event::Window(WindowEvent::RedrawRequested) => {
@@ -353,6 +458,16 @@ impl Widget for ClusterView {
 
         paint_edges(ctx, &pal, &topology, &layout);
         paint_vertices(ctx, &theme, &pal, &layout, &selected);
+        if ctx.is_focused()
+            && let Some(index) = self.focused_vertex_index(&topology)
+            && let Some(vertex) = layout.get(index)
+        {
+            ctx.stroke(
+                Path::circle(vertex.center, vertex.radius + 5.0),
+                theme.palette.focus_ring,
+                StrokeStyle::new(2.0),
+            );
+        }
         paint_legend(ctx, &theme, &pal, bounds);
         paint_detail_panel(
             ctx,
@@ -368,13 +483,49 @@ impl Widget for ClusterView {
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let mut node = SemanticsNode::new(
-            ctx.widget_id(),
-            SemanticsRole::GenericContainer,
-            ctx.bounds(),
+        let snapshot = self.shared.cluster().snapshot.clone();
+        let topology = build_topology(&snapshot);
+        let layout = layout_vertices(&topology, graph_rect(ctx.bounds()));
+        let focused_index = self.focused_vertex_index(&topology);
+        let selected_vertex = self.shared.cluster().selected.clone();
+        let mut node = SemanticsNode::new(ctx.widget_id(), SemanticsRole::List, ctx.bounds());
+        node.name = Some("Cluster nodes and LAN segments".to_string());
+        node.description = Some(
+            "Use arrow keys to move between topology items and Enter or Space to select one"
+                .to_string(),
         );
-        node.name = Some("Cluster topology. Select a node or LAN segment for details.".to_string());
+        node.state.focused = ctx.is_focused();
+        node.actions = vec![SemanticsAction::Focus];
         ctx.push(node);
+
+        for (index, vertex) in layout.iter().enumerate() {
+            let selection = graph_vertex_selection(&vertex.vertex);
+            let mut item = SemanticsNode::new(
+                cluster_vertex_widget_id(ctx.widget_id(), &vertex.vertex),
+                SemanticsRole::ListItem,
+                Rect::new(
+                    vertex.center.x - vertex.radius,
+                    vertex.center.y - vertex.radius,
+                    vertex.radius * 2.0,
+                    vertex.radius * 2.0,
+                ),
+            );
+            item.parent = Some(ctx.widget_id());
+            item.name = Some(vertex.vertex.label.clone());
+            item.description = Some(format!(
+                "{}; {}; {}",
+                match vertex.vertex.kind {
+                    GraphVertexKind::Node => "Cluster node",
+                    GraphVertexKind::LanSegment => "LAN segment",
+                },
+                vertex.vertex.detail,
+                vertex.vertex.availability
+            ));
+            item.state.selected = selected_vertex.as_ref() == Some(&selection);
+            item.state.focused = ctx.is_focused() && focused_index == Some(index);
+            item.actions = vec![SemanticsAction::Focus, SemanticsAction::Activate];
+            ctx.push(item);
+        }
 
         let (
             show_warning_action,
@@ -476,6 +627,15 @@ impl Widget for ClusterView {
             action.actions = vec![SemanticsAction::Activate];
             ctx.push(action);
         }
+    }
+
+    fn accepts_focus(&self) -> bool {
+        true
+    }
+
+    fn focus_changed(&mut self, ctx: &mut EventCtx, _focused: bool) {
+        ctx.request_paint();
+        ctx.request_semantics();
     }
 }
 
@@ -1476,6 +1636,26 @@ fn cluster_detail_toggle_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
     sui::WidgetId::new(parent.get().wrapping_mul(41).wrapping_add(9_307))
 }
 
+fn cluster_vertex_widget_id(parent: sui::WidgetId, vertex: &GraphVertex) -> sui::WidgetId {
+    // A stable FNV-1a key keeps UIA identity attached to the node/LAN rather than its current
+    // position in a freshly-sorted topology snapshot.
+    let mut key = match vertex.kind {
+        GraphVertexKind::Node => 0xcbf2_9ce4_8422_2325_u64,
+        GraphVertexKind::LanSegment => 0x8422_2325_cbf2_9ce4_u64,
+    };
+    for byte in vertex.id.as_bytes() {
+        key ^= u64::from(*byte);
+        key = key.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    sui::WidgetId::new(
+        parent
+            .get()
+            .wrapping_mul(67)
+            .wrapping_add(12_101)
+            .wrapping_add(key),
+    )
+}
+
 fn paint_detail_toggle(
     ctx: &mut PaintCtx,
     theme: &sui::DefaultTheme,
@@ -1968,6 +2148,40 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_and_semantic_identity_follow_node_id_across_refresh_reordering() {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let view = ClusterView::new(shared);
+        let before = build_topology(&ClusterSnapshot {
+            nodes: vec![node("node-a"), node("node-b")],
+            ..ClusterSnapshot::default()
+        });
+        let after = build_topology(&ClusterSnapshot {
+            nodes: vec![node("node-b"), node("node-c")],
+            ..ClusterSnapshot::default()
+        });
+        *view.keyboard_focus.borrow_mut() = Some(ClusterSelection::Node("node-b".to_string()));
+
+        assert_eq!(view.focused_vertex_index(&before), Some(1));
+        assert_eq!(view.focused_vertex_index(&after), Some(0));
+        let before_node = before
+            .vertices
+            .iter()
+            .find(|vertex| vertex.id == "node-b")
+            .expect("node-b before refresh");
+        let after_node = after
+            .vertices
+            .iter()
+            .find(|vertex| vertex.id == "node-b")
+            .expect("node-b after refresh");
+        let parent = sui::WidgetId::new(77);
+        assert_eq!(
+            cluster_vertex_widget_id(parent, before_node),
+            cluster_vertex_widget_id(parent, after_node),
+            "semantic identity must not depend on the row index"
+        );
+    }
+
+    #[test]
     fn topology_collapses_three_node_lan_clique() {
         let snapshot = ClusterSnapshot {
             nodes: vec![node("node-a"), node("node-b"), node("node-c")],
@@ -1995,6 +2209,43 @@ mod tests {
                 .iter()
                 .all(|edge| edge.virtual_lan || edge.public_ip)
         );
+    }
+
+    #[test]
+    fn rendered_cluster_nodes_are_semantic_and_keyboard_selectable() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        shared.cluster_mut().snapshot = ClusterSnapshot {
+            nodes: vec![node("node-a"), node("node-b")],
+            ..ClusterSnapshot::default()
+        };
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Cluster keyboard navigation")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        app.run_until_idle()?;
+        assert_eq!(
+            window.get_by_role(SemanticsRole::ListItem).count()?,
+            2,
+            "each topology vertex should be exposed as a semantic row"
+        );
+        let topology = window
+            .get_by_role(SemanticsRole::List)
+            .with_name("Cluster nodes and LAN segments");
+        topology.press("ArrowDown")?;
+        topology.press("Enter")?;
+        app.run_until_idle()?;
+
+        assert_eq!(
+            shared.cluster().selected,
+            Some(ClusterSelection::Node("node-b".to_string()))
+        );
+        Ok(())
     }
 
     #[test]

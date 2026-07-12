@@ -1,6 +1,7 @@
 //! "Evolution" tab - self-evolution launch, candidate evidence, and rollout readiness.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
@@ -8,9 +9,10 @@ use std::thread;
 
 use sui::{
     ArrangeCtx, Button, Color, Constraints, DefaultTheme, Event, EventCtx, FontWeight, IconGlyph,
-    KeyState, MeasureCtx, PaintCtx, Path, PointerButton, PointerEventKind, Rect, Select,
-    SemanticsCtx, SemanticsNode, SemanticsRole, Size, StrokeStyle, TextInput, Widget, WidgetPod,
-    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
+    KeyState, MeasureCtx, PaintCtx, Path, PointerButton, PointerEventKind, Rect, ScrollDelta,
+    Select, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Size,
+    StrokeStyle, TextInput, Widget, WidgetId, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    WindowEvent,
 };
 
 use crate::backend::Backend;
@@ -47,14 +49,65 @@ const QUEUE_W: f32 = 306.0;
 const RAIL_W: f32 = 318.0;
 const QUEUE_HEADER_H: f32 = 48.0;
 const ROW_H: f32 = 78.0;
+const QUEUE_SCROLLBAR_W: f32 = 3.0;
 const SECTION_GAP: f32 = 16.0;
 const DECISION_SECTION_H: f32 = 146.0;
+const NARROW_ACTION_BAR_H: f32 = 72.0;
 /// Decision actions use the Mesh control height (`--sm-ctl-h`).
 const DECISION_BUTTON_H: f32 = 28.0;
 const READINESS_DETAIL_BUTTON_W: f32 = 136.0;
 const OBJECTIVE_PLACEHOLDER: &str = "Describe the improvement or task";
 const SCOPE_PLACEHOLDER: &str = "Optional: path globs, comma-separated";
 const EVOLUTION_EMPTY_SUBTITLE: &str = "Describe an objective above, then Start.";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct EvolutionDashboardRequestId(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EvolutionDashboardRefreshReason {
+    InitialLoad,
+    JobStarted,
+    JobFinished,
+    DecisionFinished,
+    Retry,
+}
+
+impl EvolutionDashboardRefreshReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::InitialLoad => "initial dashboard load",
+            Self::JobStarted => "job start refresh",
+            Self::JobFinished => "completed job refresh",
+            Self::DecisionFinished => "decision refresh",
+            Self::Retry => "dashboard retry",
+        }
+    }
+
+    fn pending_label(self) -> &'static str {
+        match self {
+            Self::InitialLoad => "Loading candidate queue in the background",
+            Self::JobStarted => "Refreshing the new evolution job",
+            Self::JobFinished => "Refreshing completed evolution evidence",
+            Self::DecisionFinished => "Refreshing the recorded decision",
+            Self::Retry => "Retrying candidate queue refresh",
+        }
+    }
+}
+
+struct EvolutionDashboardRefreshRequest {
+    id: EvolutionDashboardRequestId,
+    reason: EvolutionDashboardRefreshReason,
+    prefer_newest: bool,
+    data_dir: Arc<SinomoDataDir>,
+    waker: Option<sui::UiHandle>,
+}
+
+struct EvolutionDashboardRefreshResult {
+    id: EvolutionDashboardRequestId,
+    reason: EvolutionDashboardRefreshReason,
+    prefer_newest: bool,
+    dashboard: EvolutionDashboard,
+}
 
 pub struct EvolutionState {
     pub dashboard: EvolutionDashboard,
@@ -72,8 +125,14 @@ pub struct EvolutionState {
     pub decision_error: Option<String>,
     decision_action: Option<EvolutionDecisionAction>,
     decision_rx: Option<Receiver<EvolutionDecisionEvent>>,
-    dashboard_load_rx: Option<Receiver<EvolutionDashboard>>,
-    dashboard_load_started: bool,
+    dashboard_load_rx: Option<Receiver<EvolutionDashboardRefreshResult>>,
+    queued_dashboard_refresh: Option<EvolutionDashboardRefreshRequest>,
+    next_dashboard_request_id: u64,
+    requested_dashboard_id: Option<EvolutionDashboardRequestId>,
+    completed_dashboard_id: Option<EvolutionDashboardRequestId>,
+    dashboard_refresh_reason: Option<EvolutionDashboardRefreshReason>,
+    dashboard_refresh_pending: bool,
+    dashboard_refresh_error: Option<String>,
     scope_revision: u64,
 }
 
@@ -115,7 +174,13 @@ impl EvolutionState {
             decision_action: None,
             decision_rx: None,
             dashboard_load_rx: None,
-            dashboard_load_started: false,
+            queued_dashboard_refresh: None,
+            next_dashboard_request_id: 0,
+            requested_dashboard_id: None,
+            completed_dashboard_id: None,
+            dashboard_refresh_reason: None,
+            dashboard_refresh_pending: false,
+            dashboard_refresh_error: None,
             scope_revision: 0,
         }
     }
@@ -125,73 +190,158 @@ impl EvolutionState {
         data_dir: Arc<SinomoDataDir>,
         waker: Option<sui::UiHandle>,
     ) -> bool {
-        if self.dashboard_load_started || self.dashboard_load_rx.is_some() {
+        if self.requested_dashboard_id.is_some() {
             return false;
         }
-        let (tx, rx) = mpsc::channel();
-        match thread::Builder::new()
-            .name("sinomo-app-evolution-load".to_string())
-            .spawn(move || {
-                let dashboard = load_evolution_dashboard(data_dir.as_ref());
-                let _ = tx.send(dashboard);
-                if let Some(waker) = waker {
-                    waker.wake();
-                }
-            }) {
-            Ok(_) => {
-                self.dashboard_load_rx = Some(rx);
-                self.dashboard_load_started = true;
-                true
-            }
-            Err(error) => {
-                self.dashboard.error = Some(format!("Evolution data failed to load: {error}"));
-                self.dashboard_load_started = false;
-                false
-            }
+        self.request_dashboard_refresh(
+            data_dir,
+            waker,
+            false,
+            EvolutionDashboardRefreshReason::InitialLoad,
+        )
+    }
+
+    pub(crate) fn retry_dashboard_refresh(
+        &mut self,
+        data_dir: Arc<SinomoDataDir>,
+        waker: Option<sui::UiHandle>,
+    ) -> bool {
+        if self.dashboard_refresh_pending() {
+            return false;
         }
+        self.request_dashboard_refresh(
+            data_dir,
+            waker,
+            false,
+            EvolutionDashboardRefreshReason::Retry,
+        )
     }
 
     pub fn pump_dashboard_load(&mut self) -> bool {
         let Some(rx) = self.dashboard_load_rx.as_ref() else {
             return false;
         };
-        let dashboard = match rx.try_recv() {
-            Ok(dashboard) => dashboard,
+        let result = match rx.try_recv() {
+            Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return false,
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.dashboard_load_rx = None;
-                self.dashboard_load_started = false;
-                self.dashboard.error =
-                    Some("Evolution data failed to load: worker exited".to_string());
+                if let Some(request) = self.queued_dashboard_refresh.take() {
+                    self.start_dashboard_refresh(request);
+                } else {
+                    self.dashboard_refresh_pending = false;
+                    let reason = self
+                        .dashboard_refresh_reason
+                        .map(EvolutionDashboardRefreshReason::label)
+                        .unwrap_or("dashboard refresh");
+                    self.dashboard_refresh_error =
+                        Some(format!("{reason} failed: background worker exited"));
+                }
                 return true;
             }
         };
         self.dashboard_load_rx = None;
+        let _applied = self.apply_dashboard_refresh_result(result);
+        if let Some(request) = self.queued_dashboard_refresh.take() {
+            self.start_dashboard_refresh(request);
+        } else {
+            self.dashboard_refresh_pending = false;
+            self.dashboard_refresh_reason = None;
+        }
+        true
+    }
+
+    fn request_dashboard_refresh(
+        &mut self,
+        data_dir: Arc<SinomoDataDir>,
+        waker: Option<sui::UiHandle>,
+        prefer_newest: bool,
+        reason: EvolutionDashboardRefreshReason,
+    ) -> bool {
+        self.next_dashboard_request_id = self.next_dashboard_request_id.wrapping_add(1).max(1);
+        let id = EvolutionDashboardRequestId(self.next_dashboard_request_id);
+        let request = EvolutionDashboardRefreshRequest {
+            id,
+            reason,
+            prefer_newest,
+            data_dir,
+            waker,
+        };
+        self.requested_dashboard_id = Some(id);
+        self.dashboard_refresh_reason = Some(reason);
+        self.dashboard_refresh_pending = true;
+        self.dashboard_refresh_error = None;
+
+        if self.dashboard_load_rx.is_some() {
+            // The lane is intentionally single-flight. A newer request replaces any queued
+            // request; the in-flight result carries its ID and will be rejected as stale.
+            self.queued_dashboard_refresh = Some(request);
+            true
+        } else {
+            self.start_dashboard_refresh(request)
+        }
+    }
+
+    fn start_dashboard_refresh(&mut self, request: EvolutionDashboardRefreshRequest) -> bool {
+        let (tx, rx) = mpsc::channel();
+        let EvolutionDashboardRefreshRequest {
+            id,
+            reason,
+            prefer_newest,
+            data_dir,
+            waker,
+        } = request;
+        match thread::Builder::new()
+            .name(format!("sinomo-app-evolution-refresh-{}", id.0))
+            .spawn(move || {
+                let dashboard = load_evolution_dashboard(data_dir.as_ref());
+                let _ = tx.send(EvolutionDashboardRefreshResult {
+                    id,
+                    reason,
+                    prefer_newest,
+                    dashboard,
+                });
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            }) {
+            Ok(_) => {
+                self.dashboard_load_rx = Some(rx);
+                true
+            }
+            Err(error) => {
+                self.dashboard_refresh_pending = false;
+                self.dashboard_refresh_error =
+                    Some(format!("{} failed to start: {error}", reason.label()));
+                false
+            }
+        }
+    }
+
+    fn apply_dashboard_refresh_result(&mut self, result: EvolutionDashboardRefreshResult) -> bool {
+        if self.requested_dashboard_id != Some(result.id) {
+            return false;
+        }
+        self.completed_dashboard_id = Some(result.id);
+        if let Some(error) = result.dashboard.error.as_deref() {
+            self.dashboard_refresh_error =
+                Some(format!("{} failed: {error}", result.reason.label()));
+            if self.dashboard.jobs.is_empty() {
+                self.dashboard = result.dashboard;
+            }
+            return true;
+        }
+        self.dashboard_refresh_error = None;
+        self.apply_dashboard(result.dashboard, result.prefer_newest);
+        true
+    }
+
+    fn apply_dashboard(&mut self, dashboard: EvolutionDashboard, prefer_newest: bool) {
         let selected_id = self
             .selected
             .and_then(|index| self.dashboard.jobs.get(index))
             .map(|job| job.id.clone());
         self.dashboard = dashboard;
-        self.selected = selected_id
-            .and_then(|id| self.dashboard.jobs.iter().position(|job| job.id == id))
-            .or(match self.selected {
-                Some(index) if index < self.dashboard.jobs.len() => Some(index),
-                _ if !self.dashboard.jobs.is_empty() => Some(0),
-                _ => None,
-            });
-        true
-    }
-
-    pub fn reload(&mut self, backend: &Backend) {
-        self.reload_with_selection(backend, false);
-    }
-
-    fn reload_with_selection(&mut self, backend: &Backend, prefer_newest: bool) {
-        let selected_id = self
-            .selected
-            .and_then(|index| self.dashboard.jobs.get(index))
-            .map(|job| job.id.clone());
-        self.dashboard = load_evolution_dashboard(&backend.data_dir);
         self.selected = if prefer_newest {
             (!self.dashboard.jobs.is_empty()).then_some(0)
         } else {
@@ -203,6 +353,23 @@ impl EvolutionState {
                     _ => None,
                 })
         };
+    }
+
+    pub fn dashboard_refresh_pending(&self) -> bool {
+        self.dashboard_refresh_pending
+    }
+
+    pub fn dashboard_refresh_error(&self) -> Option<&str> {
+        self.dashboard_refresh_error.as_deref()
+    }
+
+    fn dashboard_refresh_pending_label(&self) -> Option<&'static str> {
+        self.dashboard_refresh_pending
+            .then(|| {
+                self.dashboard_refresh_reason
+                    .map(|reason| reason.pending_label())
+            })
+            .flatten()
     }
 
     pub fn set_objective_draft(&mut self, value: String) {
@@ -274,7 +441,7 @@ impl EvolutionState {
         self.start_rx = Some(spawn_evolution_job(request));
     }
 
-    pub fn pump_start_events(&mut self, backend: &Backend) -> bool {
+    pub fn pump_start_events(&mut self, backend: &Backend, waker: Option<sui::UiHandle>) -> bool {
         let events = self
             .start_rx
             .as_ref()
@@ -305,8 +472,13 @@ impl EvolutionState {
         if finished {
             self.start_rx = None;
         }
-        if changed || self.is_starting() {
-            self.reload_with_selection(backend, true);
+        if changed {
+            let reason = if finished {
+                EvolutionDashboardRefreshReason::JobFinished
+            } else {
+                EvolutionDashboardRefreshReason::JobStarted
+            };
+            self.request_dashboard_refresh(backend.data_dir.clone(), waker, true, reason);
         }
         changed
     }
@@ -337,7 +509,11 @@ impl EvolutionState {
         self.decision_rx = Some(spawn_evolution_decision(request));
     }
 
-    pub fn pump_decision_events(&mut self, backend: &Backend) -> bool {
+    pub fn pump_decision_events(
+        &mut self,
+        backend: &Backend,
+        waker: Option<sui::UiHandle>,
+    ) -> bool {
         let events = self
             .decision_rx
             .as_ref()
@@ -375,7 +551,12 @@ impl EvolutionState {
         if finished {
             self.decision_rx = None;
             self.decision_action = None;
-            self.reload_with_selection(backend, false);
+            self.request_dashboard_refresh(
+                backend.data_dir.clone(),
+                waker,
+                false,
+                EvolutionDashboardRefreshReason::DecisionFinished,
+            );
         }
         changed
     }
@@ -391,6 +572,42 @@ impl EvolutionState {
     pub fn selected_job(&self) -> Option<&EvolutionJobSummary> {
         self.selected
             .and_then(|index| self.dashboard.jobs.get(index))
+    }
+
+    fn progress_announcement(&self) -> String {
+        if let Some(error) = self.decision_error.as_deref() {
+            return format!("Evolution decision failed: {error}");
+        }
+        if let Some(error) = self.start_error.as_deref() {
+            return format!("Evolution job failed: {error}");
+        }
+        if let Some(error) = self.dashboard_refresh_error() {
+            return format!("Candidate queue refresh failed. {error}. Press R to retry.");
+        }
+        if let Some(status) = self.decision_status.as_deref() {
+            return status.to_string();
+        }
+        if let Some(status) = self.start_status.as_deref() {
+            return status.to_string();
+        }
+        if let Some(status) = self.dashboard_refresh_pending_label() {
+            return status.to_string();
+        }
+        let active = self.dashboard.active_count();
+        if active == 1 {
+            return "1 evolution job in progress".to_string();
+        }
+        if active > 1 {
+            return format!("{active} evolution jobs in progress");
+        }
+        "Evolution is idle".to_string()
+    }
+
+    fn progress_busy(&self) -> bool {
+        self.is_starting()
+            || self.is_deciding()
+            || self.dashboard_refresh_pending()
+            || self.dashboard.active_count() > 0
     }
 }
 
@@ -631,6 +848,9 @@ struct EvolutionView {
     approve: WidgetPod,
     reject: WidgetPod,
     pump_alive: Cell<bool>,
+    queue_scroll_y: Cell<f32>,
+    focused_job_id: RefCell<Option<String>>,
+    seen_dashboard_id: Cell<Option<EvolutionDashboardRequestId>>,
     bounds: Rect,
 }
 
@@ -704,6 +924,9 @@ impl EvolutionView {
             approve: WidgetPod::new(approve),
             reject: WidgetPod::new(reject),
             pump_alive: Cell::new(false),
+            queue_scroll_y: Cell::new(0.0),
+            focused_job_id: RefCell::new(None),
+            seen_dashboard_id: Cell::new(None),
             bounds: Rect::ZERO,
         }
     }
@@ -726,19 +949,153 @@ impl EvolutionView {
         let Some(backend) = ready_backend(&self.shared) else {
             return;
         };
+        let waker = self.shared.borrow().waker.clone();
+        let has_external_waker = waker.is_some();
         let changed = {
             let mut evolution = self.shared.evolution_mut();
-            let start_changed = evolution.pump_start_events(&backend);
-            let decision_changed = evolution.pump_decision_events(&backend);
-            start_changed || decision_changed
+            let start_changed = evolution.pump_start_events(&backend, waker.clone());
+            let decision_changed = evolution.pump_decision_events(&backend, waker);
+            let dashboard_changed = evolution.pump_dashboard_load();
+            start_changed || decision_changed || dashboard_changed
         };
         if changed {
             ctx.request_paint();
+            ctx.request_semantics();
         }
-        if self.shared.evolution().has_pending_worker() {
+        let keep_polling = {
+            let evolution = self.shared.evolution();
+            evolution.has_pending_worker()
+                || (!has_external_waker && evolution.dashboard_refresh_pending())
+        };
+        if keep_polling {
             ctx.request_animation_frame();
             self.pump_alive.set(true);
         }
+    }
+
+    fn queue_scroll_limit(&self, queue: Rect, job_count: usize) -> f32 {
+        queue_scroll_limit(queue, job_count)
+    }
+
+    fn set_queue_scroll(&self, queue: Rect, job_count: usize, scroll_y: f32) -> bool {
+        let next = scroll_y.clamp(0.0, self.queue_scroll_limit(queue, job_count));
+        if (next - self.queue_scroll_y.get()).abs() <= f32::EPSILON {
+            return false;
+        }
+        self.queue_scroll_y.set(next);
+        true
+    }
+
+    fn ensure_job_visible(&self, queue: Rect, job_count: usize, index: usize) {
+        let viewport_h = queue_viewport(queue).height();
+        if viewport_h <= 0.0 || index >= job_count {
+            return;
+        }
+        let mut scroll_y = self
+            .queue_scroll_y
+            .get()
+            .clamp(0.0, self.queue_scroll_limit(queue, job_count));
+        let row_top = index as f32 * ROW_H;
+        let row_bottom = row_top + ROW_H;
+        if row_top < scroll_y {
+            scroll_y = row_top;
+        } else if row_bottom > scroll_y + viewport_h {
+            scroll_y = row_bottom - viewport_h;
+        }
+        self.queue_scroll_y
+            .set(scroll_y.clamp(0.0, self.queue_scroll_limit(queue, job_count)));
+    }
+
+    fn move_job_focus(&self, ctx: &mut EventCtx, delta: isize) {
+        let (job_count, next, next_id, advanced_open) = {
+            let evolution = self.shared.evolution();
+            let job_count = evolution.dashboard.jobs.len();
+            if job_count == 0 {
+                return;
+            }
+            let current = self
+                .focused_job_index(&evolution.dashboard, evolution.selected)
+                .unwrap_or(0) as isize;
+            let next = (current + delta).clamp(0, job_count as isize - 1) as usize;
+            (
+                job_count,
+                next,
+                evolution.dashboard.jobs[next].id.clone(),
+                evolution.start_advanced_open,
+            )
+        };
+        *self.focused_job_id.borrow_mut() = Some(next_id);
+        let layout = layout_for(ctx.bounds(), advanced_open);
+        self.ensure_job_visible(layout.queue, job_count, next);
+        ctx.request_paint();
+        ctx.request_semantics();
+        ctx.set_handled();
+    }
+
+    fn focused_job_index(
+        &self,
+        dashboard: &EvolutionDashboard,
+        selected: Option<usize>,
+    ) -> Option<usize> {
+        let resolved = self
+            .focused_job_id
+            .borrow()
+            .as_ref()
+            .and_then(|focused_id| dashboard.jobs.iter().position(|job| job.id == *focused_id));
+        if resolved.is_some() {
+            return resolved;
+        }
+        let fallback = selected.filter(|index| *index < dashboard.jobs.len());
+        *self.focused_job_id.borrow_mut() = fallback
+            .and_then(|index| dashboard.jobs.get(index))
+            .map(|job| job.id.clone());
+        fallback
+    }
+
+    fn focus_job_index(&self, index: usize) -> bool {
+        let job_id = self
+            .shared
+            .evolution()
+            .dashboard
+            .jobs
+            .get(index)
+            .map(|job| job.id.clone());
+        if job_id.is_none() {
+            return false;
+        }
+        *self.focused_job_id.borrow_mut() = job_id;
+        true
+    }
+
+    fn reconcile_focus_after_refresh(
+        &self,
+        queue: Rect,
+        dashboard: &EvolutionDashboard,
+        selected: Option<usize>,
+        completed_id: Option<EvolutionDashboardRequestId>,
+    ) -> Option<usize> {
+        let focused = self.focused_job_index(dashboard, selected);
+        if self.seen_dashboard_id.get() != completed_id {
+            self.seen_dashboard_id.set(completed_id);
+            if let Some(index) = focused {
+                self.ensure_job_visible(queue, dashboard.jobs.len(), index);
+            }
+        }
+        focused
+    }
+
+    fn activate_focused_job(&self, ctx: &mut EventCtx) {
+        let index = {
+            let evolution = self.shared.evolution();
+            self.focused_job_index(&evolution.dashboard, evolution.selected)
+        };
+        let Some(index) = index else {
+            return;
+        };
+        self.shared.evolution_mut().select(index);
+        ctx.request_paint();
+        ctx.request_semantics();
+        ctx.set_handled();
     }
 }
 
@@ -1181,24 +1538,127 @@ impl Widget for EvolutionView {
 
         match event {
             Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Scroll
+                    && queue_viewport(
+                        layout_for(ctx.bounds(), self.shared.evolution().start_advanced_open).queue,
+                    )
+                    .contains(pointer.position) =>
+            {
+                let advanced_open = self.shared.evolution().start_advanced_open;
+                let layout = layout_for(ctx.bounds(), advanced_open);
+                let job_count = self.shared.evolution().dashboard.jobs.len();
+                let delta_y = pointer
+                    .scroll_delta
+                    .map(|delta| match delta {
+                        ScrollDelta::Lines(vector) => vector.y * 48.0,
+                        ScrollDelta::Pixels(vector) => vector.y,
+                    })
+                    .unwrap_or(pointer.delta.y);
+                if self.set_queue_scroll(
+                    layout.queue,
+                    job_count,
+                    self.queue_scroll_y.get() - delta_y,
+                ) {
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                    ctx.set_handled();
+                }
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Down
+                    && pointer.button == Some(PointerButton::Primary) =>
+            {
+                let advanced_open = self.shared.evolution().start_advanced_open;
+                let layout = layout_for(ctx.bounds(), advanced_open);
+                let job_count = self.shared.evolution().dashboard.jobs.len();
+                if let Some(index) = queue_index_at(
+                    layout.queue,
+                    self.queue_scroll_y.get(),
+                    job_count,
+                    pointer.position,
+                ) && self.focus_job_index(index)
+                {
+                    ctx.request_focus();
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                    ctx.set_handled();
+                }
+            }
+            Event::Pointer(pointer)
                 if pointer.kind == PointerEventKind::Up
                     && pointer.button == Some(PointerButton::Primary)
                     && ctx.bounds().contains(pointer.position) =>
             {
                 let advanced_open = self.shared.evolution().start_advanced_open;
                 let layout = layout_for(ctx.bounds(), advanced_open);
-                if layout.queue.contains(pointer.position) {
-                    let row_start = layout.queue.y() + QUEUE_HEADER_H;
-                    let index = ((pointer.position.y - row_start) / ROW_H).floor() as isize;
-                    let job_count = self.shared.evolution().dashboard.jobs.len();
-                    if index >= 0 && (index as usize) < job_count {
-                        self.shared.evolution_mut().select(index as usize);
-                        ctx.request_paint();
-                        ctx.set_handled();
-                    }
+                let job_count = self.shared.evolution().dashboard.jobs.len();
+                if let Some(index) = queue_index_at(
+                    layout.queue,
+                    self.queue_scroll_y.get(),
+                    job_count,
+                    pointer.position,
+                ) {
+                    self.focus_job_index(index);
+                    self.shared.evolution_mut().select(index);
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                    ctx.set_handled();
                 }
                 if self.shared.evolution().has_pending_worker() {
                     self.ensure_pump(ctx);
+                }
+            }
+            Event::Keyboard(key) if ctx.is_focused() && key.state == KeyState::Pressed => {
+                match key.key.as_str() {
+                    "ArrowUp" => self.move_job_focus(ctx, -1),
+                    "ArrowDown" => self.move_job_focus(ctx, 1),
+                    "Home" => {
+                        let job_count = self.shared.evolution().dashboard.jobs.len();
+                        if job_count > 0 {
+                            self.focus_job_index(0);
+                            let advanced_open = self.shared.evolution().start_advanced_open;
+                            self.ensure_job_visible(
+                                layout_for(ctx.bounds(), advanced_open).queue,
+                                job_count,
+                                0,
+                            );
+                            ctx.request_paint();
+                            ctx.request_semantics();
+                            ctx.set_handled();
+                        }
+                    }
+                    "End" => {
+                        let job_count = self.shared.evolution().dashboard.jobs.len();
+                        if job_count > 0 {
+                            let index = job_count - 1;
+                            self.focus_job_index(index);
+                            let advanced_open = self.shared.evolution().start_advanced_open;
+                            self.ensure_job_visible(
+                                layout_for(ctx.bounds(), advanced_open).queue,
+                                job_count,
+                                index,
+                            );
+                            ctx.request_paint();
+                            ctx.request_semantics();
+                            ctx.set_handled();
+                        }
+                    }
+                    "Enter" | " " => self.activate_focused_job(ctx),
+                    "r" | "R"
+                        if self.shared.evolution().dashboard_refresh_error().is_some()
+                            && !self.shared.evolution().dashboard_refresh_pending() =>
+                    {
+                        if let Some(backend) = ready_backend(&self.shared) {
+                            let waker = self.shared.borrow().waker.clone();
+                            self.shared
+                                .evolution_mut()
+                                .retry_dashboard_refresh(backend.data_dir.clone(), waker);
+                            ctx.request_paint();
+                            ctx.request_semantics();
+                            ctx.set_handled();
+                        }
+                    }
+                    _ => {}
                 }
             }
             Event::Window(WindowEvent::RedrawRequested) => {
@@ -1206,6 +1666,10 @@ impl Widget for EvolutionView {
             }
             _ => {}
         }
+    }
+
+    fn accepts_focus(&self) -> bool {
+        true
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
@@ -1245,7 +1709,7 @@ impl Widget for EvolutionView {
             self.readiness_hide
                 .measure(ctx, Constraints::tight(Size::ZERO));
         }
-        if let Some((approve, reject)) = layout.rail.and_then(decision_button_layout) {
+        if let Some((approve, reject)) = layout_decision_buttons(layout) {
             self.approve
                 .measure(ctx, Constraints::tight(rect_size(approve)));
             self.reject
@@ -1285,7 +1749,7 @@ impl Widget for EvolutionView {
             self.readiness_show.arrange(ctx, Rect::ZERO);
             self.readiness_hide.arrange(ctx, Rect::ZERO);
         }
-        if let Some((approve, reject)) = layout.rail.and_then(decision_button_layout) {
+        if let Some((approve, reject)) = layout_decision_buttons(layout) {
             self.approve.arrange(ctx, approve);
             self.reject.arrange(ctx, reject);
         } else {
@@ -1297,7 +1761,17 @@ impl Widget for EvolutionView {
     fn paint(&self, ctx: &mut PaintCtx) {
         let (theme, pal) = self.palette();
         let bounds = ctx.bounds();
-        let (dashboard, selected, advanced_open, readiness_details_open, start_ready, starting) = {
+        let (
+            dashboard,
+            selected,
+            advanced_open,
+            readiness_details_open,
+            start_ready,
+            starting,
+            refresh_pending,
+            refresh_error,
+            completed_dashboard_id,
+        ) = {
             let state = self.shared.evolution();
             (
                 state.dashboard.clone(),
@@ -1306,13 +1780,36 @@ impl Widget for EvolutionView {
                 state.readiness_details_open,
                 state.can_start(),
                 state.is_starting(),
+                state.dashboard_refresh_pending(),
+                state.dashboard_refresh_error().map(str::to_string),
+                state.completed_dashboard_id,
             )
         };
         let layout = layout_for(bounds, advanced_open);
         let selected_job = selected.and_then(|index| dashboard.jobs.get(index));
+        let job_count = dashboard.jobs.len();
+        let focused_job = self.reconcile_focus_after_refresh(
+            layout.queue,
+            &dashboard,
+            selected,
+            completed_dashboard_id,
+        );
+        let queue_scroll_y = self
+            .queue_scroll_y
+            .get()
+            .clamp(0.0, queue_scroll_limit(layout.queue, job_count));
+        self.queue_scroll_y.set(queue_scroll_y);
 
         ctx.fill_bounds(pal.window);
-        paint_header(ctx, &theme, &pal, layout.header, &dashboard);
+        paint_header(
+            ctx,
+            &theme,
+            &pal,
+            layout.header,
+            &dashboard,
+            refresh_pending,
+            refresh_error.as_deref(),
+        );
         paint_start_panel(
             ctx,
             &theme,
@@ -1324,7 +1821,17 @@ impl Widget for EvolutionView {
             advanced_open,
         );
         self.start.paint(ctx);
-        paint_queue(ctx, &theme, &pal, layout.queue, &dashboard, selected);
+        paint_queue(
+            ctx,
+            &theme,
+            &pal,
+            layout.queue,
+            &dashboard,
+            selected,
+            focused_job,
+            ctx.is_focused(),
+            queue_scroll_y,
+        );
         paint_detail(
             ctx,
             &theme,
@@ -1365,24 +1872,130 @@ impl Widget for EvolutionView {
                 self.reject.paint(ctx);
             }
         }
+        if let Some(action_bar) = layout.action_bar {
+            let action = {
+                let state = self.shared.evolution();
+                DecisionActionStatus {
+                    status: state.decision_status.clone(),
+                    error: state.decision_error.clone(),
+                    deciding: state.is_deciding(),
+                }
+            };
+            paint_narrow_action_bar(ctx, &theme, &pal, action_bar, selected_job, &action);
+            self.approve.paint(ctx);
+            self.reject.paint(ctx);
+        }
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let (
+            dashboard,
+            selected,
+            readiness_details_open,
+            advanced_open,
+            progress,
+            progress_busy,
+            completed_dashboard_id,
+        ) = {
+            let state = self.shared.evolution();
+            (
+                state.dashboard.clone(),
+                state.selected,
+                state.readiness_details_open,
+                state.start_advanced_open,
+                state.progress_announcement(),
+                state.progress_busy(),
+                state.completed_dashboard_id,
+            )
+        };
+        let layout = layout_for(ctx.bounds(), advanced_open);
+        let focused = self.reconcile_focus_after_refresh(
+            layout.queue,
+            &dashboard,
+            selected,
+            completed_dashboard_id,
+        );
+        let focused_job = focused.and_then(|index| dashboard.jobs.get(index));
         let mut node = SemanticsNode::new(
             ctx.widget_id(),
             SemanticsRole::GenericContainer,
             ctx.bounds(),
         );
         node.name = Some("Evolution dashboard".to_string());
-        ctx.push(node);
-        let (dashboard, selected, readiness_details_open) = {
-            let state = self.shared.evolution();
-            (
-                state.dashboard.clone(),
-                state.selected,
-                state.readiness_details_open,
+        node.description = Some(if let Some(job) = focused_job {
+            format!(
+                "Start supervised evolution jobs and review candidate evidence. Keyboard focus: {}; {}.",
+                job.objective, job.status_label
             )
-        };
+        } else {
+            "Start supervised evolution jobs and review candidate evidence".to_string()
+        });
+        node.value = focused_job
+            .map(|job| SemanticsValue::Text(format!("{}; {}", job.objective, job.status_label)));
+        node.state.focused = ctx.is_focused();
+        node.actions = vec![SemanticsAction::Focus];
+        ctx.push(node);
+        let scroll_y = self
+            .queue_scroll_y
+            .get()
+            .clamp(0.0, queue_scroll_limit(layout.queue, dashboard.jobs.len()));
+        self.queue_scroll_y.set(scroll_y);
+        let queue_id = evolution_queue_widget_id(ctx.widget_id());
+        let viewport = queue_viewport(layout.queue);
+        let mut queue = SemanticsNode::new(queue_id, SemanticsRole::List, viewport);
+        queue.parent = Some(ctx.widget_id());
+        queue.name = Some("Evolution candidate queue".to_string());
+        queue.description = Some(
+            "Use the arrow keys to move focus and Enter or Space to select a candidate".to_string(),
+        );
+        queue.state.focused = ctx.is_focused();
+        queue.value = focused
+            .and_then(|index| dashboard.jobs.get(index))
+            .map(|job| SemanticsValue::Text(job.objective.clone()));
+        queue.actions = vec![SemanticsAction::Focus, SemanticsAction::SetValue];
+        ctx.push(queue);
+        for index in visible_queue_range(layout.queue, dashboard.jobs.len(), scroll_y) {
+            let Some(job) = dashboard.jobs.get(index) else {
+                continue;
+            };
+            let Some(row) = queue_row_rect(layout.queue, index, scroll_y).intersection(viewport)
+            else {
+                continue;
+            };
+            let mut item = SemanticsNode::new(
+                evolution_job_widget_id(ctx.widget_id(), &job.id, index),
+                SemanticsRole::ListItem,
+                row,
+            );
+            item.parent = Some(queue_id);
+            item.name = Some(if job.objective.trim().is_empty() {
+                format!("Evolution candidate {}", job.short_id)
+            } else {
+                job.objective.clone()
+            });
+            item.description = Some(format!(
+                "{}; candidate {}; target {}; {} required gates",
+                job.status_label, job.short_id, job.target_ring, job.required_gate_count
+            ));
+            item.value = Some(SemanticsValue::Text(job.status_label.clone()));
+            item.state.selected = selected == Some(index);
+            item.state.focused = ctx.is_focused() && focused == Some(index);
+            item.actions = vec![SemanticsAction::Activate];
+            ctx.push(item);
+        }
+
+        let mut status = SemanticsNode::new(
+            evolution_progress_widget_id(ctx.widget_id()),
+            SemanticsRole::BusyIndicator,
+            layout.header,
+        );
+        status.parent = Some(ctx.widget_id());
+        status.name = Some("Evolution progress".to_string());
+        status.description = Some(progress.clone());
+        status.value = Some(SemanticsValue::Text(progress));
+        status.state.busy = progress_busy;
+        ctx.push(status);
+
         let selected_job = selected.and_then(|index| dashboard.jobs.get(index));
         if readiness_detail_toggle_visible(&dashboard, selected_job) {
             if readiness_details_open {
@@ -1421,6 +2034,7 @@ struct EvolutionLayout {
     queue: Rect,
     detail: Rect,
     rail: Option<Rect>,
+    action_bar: Option<Rect>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1458,15 +2072,26 @@ fn layout_for(bounds: Rect, advanced_open: bool) -> EvolutionLayout {
             queue,
             detail,
             rail: Some(rail),
+            action_bar: None,
         }
     } else {
-        let queue_h = (body.height() * 0.36).clamp(170.0, 260.0);
+        let action_bar_h = NARROW_ACTION_BAR_H.min(body.height());
+        let action_bar = Rect::new(
+            body.x(),
+            body.max_y() - action_bar_h,
+            body.width(),
+            action_bar_h,
+        );
+        let content_h = (action_bar.y() - body.y()).max(0.0);
+        let queue_h = (content_h * 0.36)
+            .clamp(170.0, 260.0)
+            .min((content_h - GAP).max(0.0));
         let queue = Rect::new(body.x(), body.y(), body.width(), queue_h);
         let detail = Rect::new(
             body.x(),
             queue.max_y() + GAP,
             body.width(),
-            (body.max_y() - queue.max_y() - GAP).max(0.0),
+            (action_bar.y() - queue.max_y() - GAP).max(0.0),
         );
         EvolutionLayout {
             header,
@@ -1475,6 +2100,7 @@ fn layout_for(bounds: Rect, advanced_open: bool) -> EvolutionLayout {
             queue,
             detail,
             rail: None,
+            action_bar: Some(action_bar),
         }
     }
 }
@@ -1495,6 +2121,24 @@ fn decision_button_layout(rail: Rect) -> Option<(Rect, Rect)> {
     let approve = Rect::new(section.x() + 12.0, button_y, button_w, DECISION_BUTTON_H);
     let reject = Rect::new(approve.max_x() + 8.0, button_y, button_w, DECISION_BUTTON_H);
     Some((approve, reject))
+}
+
+fn narrow_decision_button_layout(action_bar: Rect) -> Option<(Rect, Rect)> {
+    if action_bar.width() <= PAD * 2.0 || action_bar.height() < DECISION_BUTTON_H {
+        return None;
+    }
+    let button_y = action_bar.max_y() - 10.0 - DECISION_BUTTON_H;
+    let button_w = ((action_bar.width() - PAD * 2.0 - 8.0) / 2.0).max(0.0);
+    let approve = Rect::new(action_bar.x() + PAD, button_y, button_w, DECISION_BUTTON_H);
+    let reject = Rect::new(approve.max_x() + 8.0, button_y, button_w, DECISION_BUTTON_H);
+    Some((approve, reject))
+}
+
+fn layout_decision_buttons(layout: EvolutionLayout) -> Option<(Rect, Rect)> {
+    layout
+        .rail
+        .and_then(decision_button_layout)
+        .or_else(|| layout.action_bar.and_then(narrow_decision_button_layout))
 }
 
 fn readiness_section_height(details_open: bool) -> f32 {
@@ -1556,6 +2200,8 @@ fn paint_header(
     pal: &Palette,
     rect: Rect,
     dashboard: &EvolutionDashboard,
+    refresh_pending: bool,
+    refresh_error: Option<&str>,
 ) {
     ctx.fill_rect(rect, pal.window);
     let title = pal.text_style(theme, 20.0, FontWeight::SEMIBOLD, pal.text);
@@ -1566,7 +2212,8 @@ fn paint_header(
         title,
     );
 
-    let subtitle = evolution_header_subtitle(dashboard);
+    let subtitle =
+        evolution_header_subtitle_with_refresh(dashboard, refresh_pending, refresh_error);
     widgets::draw_text_in(
         ctx,
         Rect::new(
@@ -1762,6 +2409,9 @@ fn paint_queue(
     rect: Rect,
     dashboard: &EvolutionDashboard,
     selected: Option<usize>,
+    focused: Option<usize>,
+    list_focused: bool,
+    scroll_y: f32,
 ) {
     ctx.fill_rect(rect, pal.sidebar);
     widgets::hairline_right(ctx, rect, pal.border);
@@ -1815,10 +2465,13 @@ fn paint_queue(
         return;
     }
 
-    let mut y = rect.y() + QUEUE_HEADER_H;
-    let max_rows = ((rect.max_y() - y) / ROW_H).floor().max(0.0) as usize;
-    for (index, job) in dashboard.jobs.iter().take(max_rows).enumerate() {
-        let row = Rect::new(rect.x(), y, rect.width(), ROW_H);
+    let viewport = queue_viewport(rect);
+    ctx.push_clip_rect(viewport);
+    for index in visible_queue_range(rect, dashboard.jobs.len(), scroll_y) {
+        let Some(job) = dashboard.jobs.get(index) else {
+            continue;
+        };
+        let row = queue_row_rect(rect, index, scroll_y);
         let selected_here = selected == Some(index);
         if selected_here {
             // Mesh selected row: accent wash plus a 2px accent rail.
@@ -1826,9 +2479,114 @@ fn paint_queue(
             ctx.fill_rect(Rect::new(row.x(), row.y(), 2.0, row.height()), pal.accent);
         }
         paint_queue_row(ctx, theme, pal, row, job, selected_here);
+        if list_focused && focused == Some(index) {
+            ctx.stroke(
+                Path::rounded_rect(row.inflate(-3.0, -3.0), 5.0),
+                pal.accent,
+                StrokeStyle::new(1.5),
+            );
+        }
         widgets::hairline_bottom(ctx, row, pal.border_subtle);
-        y += ROW_H;
     }
+    ctx.pop_clip();
+    paint_queue_scrollbar(ctx, pal, viewport, dashboard.jobs.len(), scroll_y);
+}
+
+fn queue_viewport(queue: Rect) -> Rect {
+    Rect::new(
+        queue.x(),
+        queue.y() + QUEUE_HEADER_H,
+        queue.width(),
+        (queue.height() - QUEUE_HEADER_H).max(0.0),
+    )
+}
+
+fn queue_scroll_limit(queue: Rect, job_count: usize) -> f32 {
+    (job_count as f32 * ROW_H - queue_viewport(queue).height()).max(0.0)
+}
+
+fn visible_queue_range(queue: Rect, job_count: usize, scroll_y: f32) -> Range<usize> {
+    if job_count == 0 || queue_viewport(queue).height() <= 0.0 {
+        return 0..0;
+    }
+    let scroll_y = scroll_y.clamp(0.0, queue_scroll_limit(queue, job_count));
+    let first = (scroll_y / ROW_H).floor() as usize;
+    let visible_bottom = scroll_y + queue_viewport(queue).height();
+    let end = ((visible_bottom / ROW_H).ceil() as usize)
+        .max(first + 1)
+        .min(job_count);
+    first.min(job_count)..end
+}
+
+fn queue_row_rect(queue: Rect, index: usize, scroll_y: f32) -> Rect {
+    let viewport = queue_viewport(queue);
+    Rect::new(
+        viewport.x(),
+        viewport.y() + index as f32 * ROW_H - scroll_y,
+        viewport.width(),
+        ROW_H,
+    )
+}
+
+fn queue_index_at(
+    queue: Rect,
+    scroll_y: f32,
+    job_count: usize,
+    position: sui::Point,
+) -> Option<usize> {
+    let viewport = queue_viewport(queue);
+    if !viewport.contains(position) {
+        return None;
+    }
+    let scroll_y = scroll_y.clamp(0.0, queue_scroll_limit(queue, job_count));
+    let index = ((position.y - viewport.y() + scroll_y) / ROW_H).floor() as usize;
+    (index < job_count).then_some(index)
+}
+
+fn evolution_queue_widget_id(parent: WidgetId) -> WidgetId {
+    WidgetId::new(parent.get().wrapping_mul(131).wrapping_add(31_337))
+}
+
+fn evolution_progress_widget_id(parent: WidgetId) -> WidgetId {
+    WidgetId::new(parent.get().wrapping_mul(131).wrapping_add(31_339))
+}
+
+fn evolution_job_widget_id(parent: WidgetId, job_id: &str, index: usize) -> WidgetId {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in job_id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    if job_id.is_empty() {
+        hash ^= index as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    WidgetId::new(parent.get().wrapping_mul(131).wrapping_add(hash).max(1))
+}
+
+fn paint_queue_scrollbar(
+    ctx: &mut PaintCtx,
+    pal: &Palette,
+    viewport: Rect,
+    job_count: usize,
+    scroll_y: f32,
+) {
+    let content_h = job_count as f32 * ROW_H;
+    if viewport.height() <= 0.0 || content_h <= viewport.height() {
+        return;
+    }
+    let thumb_h =
+        (viewport.height() * viewport.height() / content_h).clamp(24.0, viewport.height());
+    let max_scroll = (content_h - viewport.height()).max(1.0);
+    let travel = (viewport.height() - thumb_h).max(0.0);
+    let thumb_y = viewport.y() + travel * (scroll_y / max_scroll).clamp(0.0, 1.0);
+    let thumb = Rect::new(
+        viewport.max_x() - QUEUE_SCROLLBAR_W - 3.0,
+        thumb_y,
+        QUEUE_SCROLLBAR_W,
+        thumb_h,
+    );
+    ctx.fill(Path::rounded_rect(thumb, 2.0), pal.text_faint);
 }
 
 fn paint_queue_row(
@@ -2285,6 +3043,51 @@ fn paint_section_title(
     );
 }
 
+fn paint_narrow_action_bar(
+    ctx: &mut PaintCtx,
+    theme: &sui::DefaultTheme,
+    pal: &Palette,
+    rect: Rect,
+    job: Option<&EvolutionJobSummary>,
+    action: &DecisionActionStatus,
+) {
+    ctx.fill_rect(rect, pal.sidebar);
+    widgets::hairline_top(ctx, rect, pal.border);
+    let (label, color) = if let Some(error) = action.error.as_deref() {
+        (format!("Decision failed - {error}"), pal.bad)
+    } else if let Some(status) = action.status.as_deref() {
+        (
+            status.to_string(),
+            if action.deciding {
+                pal.accent
+            } else {
+                pal.text_muted
+            },
+        )
+    } else if let Some(job) = job {
+        (
+            format!("{} - {}", job.short_id, job.status_label),
+            tone_color(pal, job.phase),
+        )
+    } else {
+        ("Select a candidate to review".to_string(), pal.text_muted)
+    };
+    widgets::draw_text_in(
+        ctx,
+        Rect::new(
+            rect.x() + PAD,
+            rect.y() + 7.0,
+            (rect.width() - PAD * 2.0).max(0.0),
+            18.0,
+        ),
+        &compact(
+            &label,
+            ((rect.width() - PAD * 2.0) / 7.2).max(16.0) as usize,
+        ),
+        pal.text_style(theme, 11.0, FontWeight::MEDIUM, color),
+    );
+}
+
 fn paint_rail(
     ctx: &mut PaintCtx,
     theme: &sui::DefaultTheme,
@@ -2654,6 +3457,25 @@ fn evolution_header_subtitle(dashboard: &EvolutionDashboard) -> String {
     }
 }
 
+fn evolution_header_subtitle_with_refresh(
+    dashboard: &EvolutionDashboard,
+    refresh_pending: bool,
+    refresh_error: Option<&str>,
+) -> String {
+    if let Some(error) = refresh_error {
+        return format!(
+            "Refresh failed - showing saved candidates - {} - press R to retry",
+            compact(error, 66)
+        );
+    }
+    let subtitle = evolution_header_subtitle(dashboard);
+    if refresh_pending {
+        format!("{} - updating in background", compact(&subtitle, 92))
+    } else {
+        subtitle
+    }
+}
+
 fn tail_path(path: &str, max: usize) -> String {
     if path.chars().count() <= max {
         path.to_string()
@@ -2693,6 +3515,313 @@ mod tests {
     use super::*;
     use crate::backend::Backend;
     use crate::state::{AppState, Shared};
+
+    fn candidate(index: usize) -> EvolutionJobSummary {
+        EvolutionJobSummary {
+            id: format!("candidate-{index:02}"),
+            short_id: format!("candidate-{index:02}"),
+            objective: format!("Candidate objective {index:02}"),
+            status_key: "awaiting-approval".to_string(),
+            status_label: "awaiting approval".to_string(),
+            phase: EvolutionPhase::AwaitingDecision,
+            target_ring: "R1".to_string(),
+            required_gate_count: 3,
+            ..EvolutionJobSummary::default()
+        }
+    }
+
+    fn test_window<W: Widget + 'static>(
+        title: &str,
+        root: W,
+        size: Size,
+    ) -> sui::Result<sui_testing::TestWindow> {
+        let runtime = sui::Application::new()
+            .window(sui::WindowBuilder::new().title(title).root(root))
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        window
+            .root()
+            .dispatch_event(Event::Window(WindowEvent::Resized(size)))?;
+        window.run_until_idle()?;
+        Ok(window)
+    }
+
+    #[test]
+    fn dashboard_refresh_rejects_stale_results_and_keeps_last_good_data_on_error() {
+        let mut state = EvolutionState::from_dashboard(EvolutionDashboard {
+            source: "old".to_string(),
+            jobs: vec![candidate(1)],
+            error: None,
+        });
+        state.requested_dashboard_id = Some(EvolutionDashboardRequestId(2));
+
+        assert!(
+            !state.apply_dashboard_refresh_result(EvolutionDashboardRefreshResult {
+                id: EvolutionDashboardRequestId(1),
+                reason: EvolutionDashboardRefreshReason::JobStarted,
+                prefer_newest: true,
+                dashboard: EvolutionDashboard {
+                    source: "stale".to_string(),
+                    jobs: vec![candidate(9)],
+                    error: None,
+                },
+            })
+        );
+        assert_eq!(state.dashboard.jobs[0].id, "candidate-01");
+        assert_eq!(state.completed_dashboard_id, None);
+
+        assert!(
+            state.apply_dashboard_refresh_result(EvolutionDashboardRefreshResult {
+                id: EvolutionDashboardRequestId(2),
+                reason: EvolutionDashboardRefreshReason::JobFinished,
+                prefer_newest: false,
+                dashboard: EvolutionDashboard {
+                    source: "fresh".to_string(),
+                    jobs: vec![candidate(2), candidate(1)],
+                    error: None,
+                },
+            })
+        );
+        assert_eq!(
+            state.selected,
+            Some(1),
+            "selection follows the stable job ID"
+        );
+        assert_eq!(
+            state.completed_dashboard_id,
+            Some(EvolutionDashboardRequestId(2))
+        );
+
+        state.requested_dashboard_id = Some(EvolutionDashboardRequestId(3));
+        assert!(
+            state.apply_dashboard_refresh_result(EvolutionDashboardRefreshResult {
+                id: EvolutionDashboardRequestId(3),
+                reason: EvolutionDashboardRefreshReason::Retry,
+                prefer_newest: false,
+                dashboard: EvolutionDashboard {
+                    source: "fresh".to_string(),
+                    jobs: Vec::new(),
+                    error: Some("temporary read failure".to_string()),
+                },
+            })
+        );
+        assert_eq!(state.dashboard.jobs.len(), 2);
+        assert!(
+            state
+                .dashboard_refresh_error()
+                .is_some_and(|error| error.contains("temporary read failure"))
+        );
+    }
+
+    #[test]
+    fn start_events_schedule_dashboard_refresh_without_sync_reload() {
+        let backend = Backend::local_fallback();
+        let mut state = EvolutionState::from_dashboard(EvolutionDashboard {
+            source: "existing".to_string(),
+            jobs: vec![candidate(4)],
+            error: None,
+        });
+        let (tx, rx) = mpsc::channel();
+        state.start_rx = Some(rx);
+        tx.send(EvolutionStartEvent::Started).unwrap();
+
+        assert!(state.pump_start_events(&backend, None));
+        assert_eq!(state.dashboard.jobs[0].id, "candidate-04");
+        assert!(state.dashboard_refresh_pending());
+        assert_eq!(
+            state.dashboard_refresh_reason,
+            Some(EvolutionDashboardRefreshReason::JobStarted)
+        );
+        assert_eq!(
+            state.requested_dashboard_id,
+            Some(EvolutionDashboardRequestId(1))
+        );
+    }
+
+    #[test]
+    fn virtual_queue_window_tracks_scroll_and_hit_testing() {
+        let queue = Rect::new(0.0, 0.0, 300.0, QUEUE_HEADER_H + ROW_H * 2.5);
+        let scroll_y = ROW_H * 7.0 + 10.0;
+
+        assert_eq!(visible_queue_range(queue, 40, scroll_y), 7..10);
+        assert_eq!(
+            queue_index_at(
+                queue,
+                scroll_y,
+                40,
+                sui::Point::new(40.0, QUEUE_HEADER_H + 5.0),
+            ),
+            Some(7)
+        );
+        let bottom = queue_scroll_limit(queue, 40);
+        let bottom_range = visible_queue_range(queue, 40, bottom);
+        assert_eq!(bottom_range.end, 40);
+        assert!(
+            bottom_range.len() < 40,
+            "only viewport rows are materialized"
+        );
+    }
+
+    #[test]
+    fn queue_focus_tracks_job_id_across_refresh_reordering() {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut evolution = shared.evolution_mut();
+            evolution.dashboard.jobs = vec![candidate(0), candidate(1), candidate(2)];
+            evolution.selected = Some(0);
+        }
+        let view = EvolutionView::new(shared.clone());
+        *view.focused_job_id.borrow_mut() = Some("candidate-02".to_string());
+        view.queue_scroll_y.set(ROW_H * 2.0);
+        let queue = Rect::new(0.0, 0.0, 300.0, QUEUE_HEADER_H + ROW_H);
+
+        let (dashboard, selected, completed_id) = {
+            let mut evolution = shared.evolution_mut();
+            evolution.dashboard.jobs = vec![candidate(2), candidate(0), candidate(1)];
+            evolution.selected = Some(1);
+            evolution.completed_dashboard_id = Some(EvolutionDashboardRequestId(7));
+            (
+                evolution.dashboard.clone(),
+                evolution.selected,
+                evolution.completed_dashboard_id,
+            )
+        };
+        assert_eq!(
+            view.reconcile_focus_after_refresh(queue, &dashboard, selected, completed_id),
+            Some(0)
+        );
+        assert_eq!(view.queue_scroll_y.get(), 0.0);
+        assert_eq!(
+            view.focused_job_id.borrow().as_deref(),
+            Some("candidate-02")
+        );
+
+        let (dashboard, selected, completed_id) = {
+            let mut evolution = shared.evolution_mut();
+            evolution.dashboard.jobs = vec![candidate(0), candidate(1)];
+            evolution.selected = Some(1);
+            evolution.completed_dashboard_id = Some(EvolutionDashboardRequestId(8));
+            (
+                evolution.dashboard.clone(),
+                evolution.selected,
+                evolution.completed_dashboard_id,
+            )
+        };
+        assert_eq!(
+            view.reconcile_focus_after_refresh(queue, &dashboard, selected, completed_id),
+            Some(1)
+        );
+        assert_eq!(
+            view.focused_job_id.borrow().as_deref(),
+            Some("candidate-01")
+        );
+    }
+
+    #[test]
+    fn narrow_layout_keeps_decision_actions_sticky() {
+        let bounds = Rect::new(0.0, 0.0, 760.0, 760.0);
+        let layout = layout_for(bounds, false);
+        let bar = layout.action_bar.expect("narrow action bar");
+        let (approve, reject) = layout_decision_buttons(layout).expect("decision buttons");
+
+        assert!(layout.rail.is_none());
+        assert_eq!(bar.max_y(), bounds.max_y());
+        assert!(layout.detail.max_y() <= bar.y());
+        assert!(bar.contains(sui::Point::new(
+            approve.x() + approve.width() / 2.0,
+            approve.y() + approve.height() / 2.0,
+        )));
+        assert!(bar.contains(sui::Point::new(
+            reject.x() + reject.width() / 2.0,
+            reject.y() + reject.height() / 2.0,
+        )));
+        assert!(approve.width() > 0.0 && reject.width() > 0.0);
+    }
+
+    #[test]
+    fn candidate_rows_support_keyboard_navigation_and_live_progress_semantics() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut evolution = shared.evolution_mut();
+            let mut jobs = (0..12).map(candidate).collect::<Vec<_>>();
+            jobs[0].phase = EvolutionPhase::Active;
+            jobs[0].status_key = "mutation-started".to_string();
+            jobs[0].status_label = "mutation started".to_string();
+            evolution.dashboard = EvolutionDashboard {
+                source: "test".to_string(),
+                jobs,
+                error: None,
+            };
+            evolution.selected = Some(0);
+        }
+        let window = test_window(
+            "Evolution keyboard queue",
+            view(shared.clone()),
+            Size::new(760.0, 760.0),
+        )?;
+
+        let snapshot = window.snapshot()?;
+        let visible_rows = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .filter(|node| node.role == SemanticsRole::ListItem)
+            .count();
+        assert!(visible_rows > 0 && visible_rows < 12);
+        let progress = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::BusyIndicator
+                    && node.name.as_deref() == Some("Evolution progress")
+            })
+            .expect("live evolution progress node");
+        assert!(progress.state.busy);
+        assert_eq!(
+            progress.value,
+            Some(SemanticsValue::Text(
+                "1 evolution job in progress".to_string()
+            ))
+        );
+
+        let root = window
+            .get_by_role(SemanticsRole::GenericContainer)
+            .with_name("Evolution dashboard");
+        window
+            .get_by_role(SemanticsRole::ListItem)
+            .with_name("Candidate objective 00")
+            .click()?;
+        root.press("ArrowDown")?;
+        assert_eq!(shared.evolution().selected, Some(0));
+        root.expect()
+            .to_have_value("Candidate objective 01; awaiting approval")?;
+        root.press(" ")?;
+        assert_eq!(shared.evolution().selected, Some(1));
+        root.press("End")?;
+        window
+            .get_by_role(SemanticsRole::ListItem)
+            .with_name("Candidate objective 11")
+            .expect()
+            .to_be_visible()?;
+        root.press("Enter")?;
+        assert_eq!(shared.evolution().selected, Some(11));
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Approve")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Reject")
+            .expect()
+            .to_be_visible()?;
+        Ok(())
+    }
 
     #[test]
     fn wide_start_controls_collapse_advanced_fields_by_default() {

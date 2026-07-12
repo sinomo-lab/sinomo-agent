@@ -54,16 +54,16 @@ use sui::{
     PointerButton, PointerEventKind, RebuildOnChange, RebuildOnConstraints, Rect,
     RichTextSourceMap, ScrollBar, ScrollDelta, ScrollState, ScrollView, SectionLabel,
     SectionPanelPaint, SegmentedControl, SegmentedControlItem, SelectionScope, SemanticRegion,
-    SemanticTone, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, Separator,
-    SignalMeter, Size, SizedBox, Stack, StackHostOptions, StatusBadge, Surface, SurfaceBorder,
-    SurfaceRole, SwitchView, TextArea, TextBlockPaint, TextCellPaint, TextCommand, TextDocument,
-    TextInput, TextLayout, TextLayoutRequest, TextParagraph, TextParagraphStyle, TextSpan,
-    TextStyle, TextWrap, TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    containers::Padding as WidgetPadding, draw_glyph, paint_action_tile, paint_callout,
-    paint_code_lines, paint_code_panel, paint_command_button, paint_disclosure_button,
-    paint_empty_state, paint_icon_button, paint_rounded_panel, paint_rounded_rect,
-    paint_section_label_detail, paint_section_panel, paint_text_block, paint_text_cell,
-    wrap_text_lines,
+    SemanticTone, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue,
+    Separator, SignalMeter, Size, SizedBox, Stack, StackHostOptions, StatusBadge, Surface,
+    SurfaceBorder, SurfaceRole, SwitchView, TextArea, TextBlockPaint, TextCellPaint, TextCommand,
+    TextDocument, TextInput, TextLayout, TextLayoutRequest, TextParagraph, TextParagraphStyle,
+    TextSpan, TextStyle, TextWrap, TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, containers::Padding as WidgetPadding, draw_glyph, paint_action_tile,
+    paint_callout, paint_code_lines, paint_code_panel, paint_command_button,
+    paint_disclosure_button, paint_empty_state, paint_icon_button, paint_rounded_panel,
+    paint_rounded_rect, paint_section_label_detail, paint_section_panel, paint_text_block,
+    paint_text_cell, wrap_text_lines,
 };
 
 #[cfg(test)]
@@ -98,6 +98,7 @@ use crate::ui::widgets;
 /// Below this content width the sidebar collapses away (transcript + composer only).
 const WIDE_THRESHOLD: f32 = 620.0;
 const SIDEBAR_W: f32 = 250.0;
+const COMPACT_HEADER_H: f32 = 54.0;
 const MEDIA_CALL_H: f32 = 156.0;
 const MEDIA_CALL_COMPACT_H: f32 = 46.0;
 const PAD: f32 = 16.0;
@@ -891,6 +892,7 @@ struct ConversationTimelineLoad {
 /// State backing the chat tab.
 pub struct ChatState {
     pub data_dir: Arc<SinomoDataDir>,
+    daemon_address: Option<String>,
     sifs_daemon: Option<SifsDaemonAccess>,
     ui_waker: Option<sui::UiHandle>,
     pub handle: ChatHandle,
@@ -941,6 +943,14 @@ pub struct ChatState {
     session_edit_details_open: bool,
     session_title_draft: String,
     session_delete_confirm_id: Option<String>,
+    next_session_rename_request_id: u64,
+    pending_session_rename: Option<PendingSessionRename>,
+    session_rename_rx: Option<Receiver<SessionRenameWorkerResult>>,
+    session_rename_error: Option<SessionRenameError>,
+    next_channel_config_request_id: u64,
+    pending_channel_config: Option<PendingChannelConfig>,
+    channel_config_rx: Option<Receiver<ChannelConfigWorkerResult>>,
+    channel_config_error: Option<ChannelConfigError>,
     pending_delete_id: Option<String>,
     delete_rx: Option<Receiver<DeleteWorkerResult>>,
     channel_create_rx: Option<Receiver<ChannelCreateWorkerResult>>,
@@ -956,7 +966,12 @@ pub struct ChatState {
     session_list_started_at: Option<Instant>,
     session_list_slow_notice_shown: bool,
     session_list_details_open: bool,
+    session_list_refresh_queued: bool,
     channel_agent_idx: usize,
+    /// Narrow-layout access to the agents/conversations surface. This is kept
+    /// separately from session-edit state so opening a row editor can replace
+    /// the drawer without losing the edit request.
+    compact_drawer_open: bool,
 }
 
 struct DeleteWorkerResult {
@@ -968,6 +983,60 @@ struct DeleteWorkerResult {
 struct ChannelCreateWorkerResult {
     session: SessionRef,
     result: Result<SessionListWorkerResult, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingSessionRename {
+    request_id: u64,
+    session_id: String,
+    kind: ConversationKind,
+    title: String,
+}
+
+struct SessionRenameWorkerResult {
+    request_id: u64,
+    session_id: String,
+    kind: ConversationKind,
+    title: String,
+    result: Result<(), String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionRenameError {
+    session_id: String,
+    detail: String,
+}
+
+enum ChannelConfigOperation {
+    AddAgent {
+        agent_key: String,
+        agent_name: String,
+        tool_runtime: ChatToolRuntimeSelection,
+    },
+    RemoveAgent {
+        participant_id: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingChannelConfig {
+    request_id: u64,
+    channel_id: String,
+    action: String,
+}
+
+struct ChannelConfigWorkerResult {
+    request_id: u64,
+    channel_id: String,
+    action: String,
+    success_notice: String,
+    result: Result<(), String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChannelConfigError {
+    channel_id: String,
+    detail: String,
 }
 
 struct TranscriptLoadWorkerResult {
@@ -1035,6 +1104,7 @@ impl ChatState {
         let efforts = reasoning_efforts();
         let effort_idx = efforts.iter().position(|e| e == "medium").unwrap_or(0);
         let sifs_daemon = daemon_address
+            .as_deref()
             .map(|address| SifsDaemonAccess::new(address, backend.app_runtime.handle()));
         let (sessions, session_list_error) = if sifs_daemon.is_some() {
             (Vec::new(), None)
@@ -1044,6 +1114,7 @@ impl ChatState {
 
         let mut state = Self {
             data_dir: backend.data_dir.clone(),
+            daemon_address,
             sifs_daemon,
             ui_waker: waker,
             handle,
@@ -1091,6 +1162,14 @@ impl ChatState {
             session_edit_details_open: false,
             session_title_draft: String::new(),
             session_delete_confirm_id: None,
+            next_session_rename_request_id: 0,
+            pending_session_rename: None,
+            session_rename_rx: None,
+            session_rename_error: None,
+            next_channel_config_request_id: 0,
+            pending_channel_config: None,
+            channel_config_rx: None,
+            channel_config_error: None,
             pending_delete_id: None,
             delete_rx: None,
             channel_create_rx: None,
@@ -1106,7 +1185,9 @@ impl ChatState {
             session_list_started_at: None,
             session_list_slow_notice_shown: false,
             session_list_details_open: false,
+            session_list_refresh_queued: false,
             channel_agent_idx: 0,
+            compact_drawer_open: false,
         };
         if let Some(detail) = session_list_error {
             state.notice = Some(format!("chat list failed: {detail}"));
@@ -1123,6 +1204,125 @@ impl ChatState {
             state.maybe_fetch_models();
         }
         state
+    }
+
+    /// Rebind every daemon-backed chat surface after the live connection moves to a new
+    /// endpoint. The visible transcript/drafts stay in place; only endpoint-bound workers and
+    /// SIFS access are replaced. A same-address health probe is a no-op.
+    pub(crate) fn rebind_backend(&mut self, backend: &Backend) -> bool {
+        let daemon_address = backend.connection.daemon_address().map(str::to_string);
+        if self.daemon_address == daemon_address {
+            return false;
+        }
+
+        let history = self.current_history();
+        let session_id = self.session_id.clone();
+        let agent = self.info.agent.clone();
+        let provider = self.info.provider.clone();
+        let model = self.info.model.clone();
+        let account = self
+            .info
+            .account
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        let sandbox_node_id = self.tool_runtime.sandbox_node_id.clone();
+        let sifs_storage = daemon_address
+            .as_deref()
+            .map(|address| AgentChatSifsStorage::new(address, backend.app_runtime.handle()));
+        let event_wake: Option<ChatEventWake> = self.ui_waker.as_ref().map(|waker| {
+            let waker = waker.clone();
+            Arc::new(move || waker.wake()) as ChatEventWake
+        });
+        let handle = ChatHandle::spawn(
+            (*backend.data_dir).clone(),
+            backend.connection.is_daemon(),
+            backend.agent_runtime_control.clone(),
+            sifs_storage,
+            event_wake,
+        );
+
+        self.handle = handle;
+        self.daemon_address = daemon_address.clone();
+        self.sifs_daemon = daemon_address
+            .map(|address| SifsDaemonAccess::new(address, backend.app_runtime.handle()));
+        self.streaming = false;
+        self.control = ChatControlOverview::default();
+        self.models_loading = false;
+        self.delete_rx = None;
+        self.channel_create_rx = None;
+        self.transcript_load_rx = None;
+        self.transcript_load_mode = None;
+        self.transcript_load_started_at = None;
+        self.provider_list_rx = None;
+        self.providers_loading = false;
+        self.session_list_rx = None;
+        self.session_list_loading = false;
+        self.session_list_started_at = None;
+        self.session_list_refresh_queued = false;
+        if let Some(pending) = self.pending_session_rename.take() {
+            self.session_rename_error = Some(SessionRenameError {
+                session_id: pending.session_id,
+                detail: "Connection changed before the rename completed; retry it.".to_string(),
+            });
+        }
+        self.session_rename_rx = None;
+        if let Some(pending) = self.pending_channel_config.take() {
+            let detail = format!(
+                "Connection changed before {} completed; retry the channel update.",
+                pending.action
+            );
+            self.channel_config_error = Some(ChannelConfigError {
+                channel_id: pending.channel_id,
+                detail: detail.clone(),
+            });
+            self.notice = Some(format!("channel config failed: {detail}"));
+        }
+        self.channel_config_rx = None;
+        if self
+            .notice
+            .as_deref()
+            .is_some_and(text_mentions_connection_problem)
+        {
+            self.notice = None;
+        }
+        self.activity.retain(|entry| {
+            !matches!(entry.tone, ActivityTone::Warn | ActivityTone::Bad)
+                || !text_mentions_connection_problem(&entry.detail)
+        });
+
+        if !session_id.trim().is_empty() {
+            if agent.trim().is_empty() {
+                self.handle.send_command(ChatCommand::Resume {
+                    session_id: session_id.clone(),
+                    history: history.clone(),
+                });
+            } else {
+                self.handle.send_command(ChatCommand::SetAgent {
+                    session_id: session_id.clone(),
+                    key: agent,
+                    history: history.clone(),
+                });
+            }
+        }
+        if !provider.trim().is_empty() && !model.trim().is_empty() {
+            self.handle.send_command(ChatCommand::SetModel {
+                provider,
+                model,
+                account,
+            });
+        }
+        self.handle
+            .send_command(ChatCommand::SetToolRuntime { sandbox_node_id });
+        self.replace_activity(
+            "connection",
+            "Daemon connection restored; chat runtime rebound to the live endpoint",
+            ActivityTone::Good,
+        );
+
+        let waker = self.ui_waker.clone();
+        self.start_provider_list_load(backend.config.clone(), waker.clone());
+        self.start_session_list_load(waker);
+        true
     }
 
     fn title_from_messages(messages: &[ChatMessage]) -> String {
@@ -1201,22 +1401,14 @@ impl ChatState {
         })
     }
 
-    fn refresh_sessions(&mut self) {
-        let (sessions, error) =
-            list_conversations_with_error(&self.data_dir, self.sifs_daemon.as_ref());
-        self.apply_session_list_result(SessionListWorkerResult {
-            sessions,
-            error,
-            complete: true,
-        });
-    }
-
+    /// Refresh the SIFS-backed conversation catalog on a worker for every connection mode.
+    /// Local/fallback SIFS can block on the same storage recovery paths as daemon-backed access,
+    /// so it must never be special-cased back onto the UI thread.
     pub fn start_session_list_load(&mut self, waker: Option<sui::UiHandle>) {
-        if self.sifs_daemon.is_none() {
-            self.refresh_sessions();
-            return;
-        }
         if self.session_list_loading {
+            // Coalesce state changes that arrive while the catalog is being read. The current
+            // snapshot may have been taken before a just-finished background chat was persisted.
+            self.session_list_refresh_queued = true;
             return;
         }
         self.session_list_slow_notice_shown = false;
@@ -1271,6 +1463,7 @@ impl ChatState {
             self.session_list_started_at = None;
             self.session_list_slow_notice_shown = false;
             self.session_list_details_open = false;
+            self.session_list_refresh_queued = false;
             return;
         }
 
@@ -1327,6 +1520,9 @@ impl ChatState {
                         "worker stopped before loading chats from SIFS".to_string(),
                         ActivityTone::Warn,
                     );
+                    if std::mem::take(&mut self.session_list_refresh_queued) {
+                        self.start_session_list_load(self.ui_waker.clone());
+                    }
                     return true;
                 }
             };
@@ -1339,18 +1535,23 @@ impl ChatState {
                 self.session_list_started_at = None;
                 self.session_list_slow_notice_shown = false;
                 self.session_list_details_open = false;
+                if std::mem::take(&mut self.session_list_refresh_queued) {
+                    self.start_session_list_load(self.ui_waker.clone());
+                }
                 return true;
             }
         }
     }
 
     pub fn pump_worker_events(&mut self) -> bool {
+        let rename_changed = self.pump_session_rename();
+        let channel_config_changed = self.pump_channel_config();
         let events = self.handle.drain();
         let changed = !events.is_empty();
         for event in events {
             self.apply_event(event);
         }
-        changed
+        changed || rename_changed || channel_config_changed
     }
 
     fn apply_session_list_result(&mut self, result: SessionListWorkerResult) {
@@ -1386,44 +1587,30 @@ impl ChatState {
         sort_conversations(&mut self.sessions);
     }
 
-    #[cfg(test)]
-    fn retry_chat_list(&mut self) {
-        self.refresh_sessions();
-    }
-
     fn reset_session_list_load(&mut self) {
         self.session_list_rx = None;
         self.session_list_loading = false;
         self.session_list_started_at = None;
         self.session_list_slow_notice_shown = false;
         self.session_list_details_open = false;
+        self.session_list_refresh_queued = false;
     }
 
     fn retry_chat_list_with_waker(&mut self, waker: Option<sui::UiHandle>) {
         self.reset_session_list_load();
+        if self
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.starts_with("chat list failed:"))
+        {
+            self.notice = None;
+        }
+        self.activity.retain(|entry| entry.title != "chat list");
         self.start_session_list_load(waker);
-    }
-
-    fn rename_chat_record(&self, session_id: &str, title: &str) -> std::io::Result<()> {
-        rename_chat_channel(&self.data_dir, self.sifs_daemon.as_ref(), session_id, title)
     }
 
     fn agent_channel_store(&self) -> std::io::Result<SifsAgentChannelStore> {
         open_agent_channel_store(&self.data_dir, self.sifs_daemon.as_ref())
-    }
-
-    fn rename_channel(&self, id: &str, title: &str) -> std::io::Result<()> {
-        let channel_id = parse_channel_id(id)?;
-        let store = self.agent_channel_store()?;
-        let mut channel = store
-            .load_channel(&channel_id)
-            .map_err(channel_store_io_error)?
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotFound, "channel not found")
-            })?;
-        channel.channel_kind = AgentChannelKind::Channel;
-        channel.rename(title);
-        store.save_channel(&channel).map_err(channel_store_io_error)
     }
 
     fn channel_agent_refs(&self, id: &str) -> Vec<ChannelAgentRef> {
@@ -2030,7 +2217,7 @@ impl ChatState {
         }
 
         if matches!(event, ChatEvent::TurnDone { .. } | ChatEvent::Error { .. }) {
-            self.refresh_sessions();
+            self.start_session_list_load(self.ui_waker.clone());
         }
         true
     }
@@ -2385,9 +2572,11 @@ impl ChatState {
             return;
         };
         self.session_edit_id = Some(session.id);
+        self.compact_drawer_open = false;
         self.session_edit_details_open = false;
         self.session_title_draft = session.title;
         self.session_delete_confirm_id = None;
+        self.session_rename_error = None;
     }
 
     fn begin_edit_current_session(&mut self) {
@@ -2410,6 +2599,13 @@ impl ChatState {
 
     fn set_session_title_draft(&mut self, title: String) {
         self.session_title_draft = title;
+        if self
+            .session_rename_error
+            .as_ref()
+            .is_some_and(|error| self.session_edit_id.as_deref() == Some(error.session_id.as_str()))
+        {
+            self.session_rename_error = None;
+        }
     }
 
     fn set_session_filter(&mut self, filter: String) {
@@ -2420,10 +2616,27 @@ impl ChatState {
         self.session_kind_filter = filter;
     }
 
+    fn set_compact_drawer_open(&mut self, open: bool) {
+        self.compact_drawer_open = open;
+        if open {
+            // A modal row editor and the compact navigation drawer should
+            // never compete for focus.
+            self.close_session_edit();
+        }
+    }
+
+    fn toggle_compact_drawer(&mut self) {
+        let open = !self.compact_drawer_open;
+        self.set_compact_drawer_open(open);
+    }
+
     fn can_save_session_title(&self) -> bool {
         let Some(edit_id) = self.session_edit_id.as_deref() else {
             return false;
         };
+        if self.pending_session_rename.is_some() {
+            return false;
+        }
         let title = self.session_title_draft.trim();
         !title.is_empty()
             && self
@@ -2434,6 +2647,9 @@ impl ChatState {
     }
 
     fn save_session_title(&mut self) {
+        if self.pending_session_rename.is_some() {
+            return;
+        }
         let Some(edit_id) = self.session_edit_id.clone() else {
             return;
         };
@@ -2448,26 +2664,129 @@ impl ChatState {
             self.notice = Some("chat title cannot be empty".to_string());
             return;
         }
-        let result = match kind {
-            ConversationKind::Chat => self.rename_chat_record(&edit_id, &title),
-            ConversationKind::Channel => self.rename_channel(&edit_id, &title),
+
+        self.next_session_rename_request_id =
+            self.next_session_rename_request_id.wrapping_add(1).max(1);
+        let request_id = self.next_session_rename_request_id;
+        let pending = PendingSessionRename {
+            request_id,
+            session_id: edit_id.clone(),
+            kind,
+            title: title.clone(),
         };
-        match result {
-            Ok(()) => {
-                self.session_title_draft = title;
-                self.refresh_sessions();
-            }
+        let (tx, rx) = mpsc::channel();
+        let data_dir = self.data_dir.clone();
+        let sifs_daemon = self.sifs_daemon.clone();
+        let worker_session_id = edit_id.clone();
+        let worker_title = title.clone();
+        let worker_waker = self.ui_waker.clone();
+        let label = conversation_kind_label(kind);
+
+        self.pending_session_rename = Some(pending);
+        self.session_rename_error = None;
+        self.notice = Some(format!("renaming {label}…"));
+        self.replace_activity(
+            format!("{label} rename"),
+            "Saving title to SIFS".to_string(),
+            ActivityTone::Running,
+        );
+
+        let spawn = thread::Builder::new()
+            .name(format!("sinomo-app-{label}-rename-{request_id}"))
+            .spawn(move || {
+                let result = rename_session_in_store(
+                    data_dir.as_ref(),
+                    sifs_daemon.as_ref(),
+                    kind,
+                    &worker_session_id,
+                    &worker_title,
+                )
+                .map_err(|error| error.to_string());
+                let _ = tx.send(SessionRenameWorkerResult {
+                    request_id,
+                    session_id: worker_session_id,
+                    kind,
+                    title: worker_title,
+                    result,
+                });
+                if let Some(waker) = worker_waker {
+                    waker.wake();
+                }
+            });
+        match spawn {
+            Ok(_) => self.session_rename_rx = Some(rx),
             Err(error) => {
-                let detail = error.to_string();
-                let label = if kind == ConversationKind::Channel {
-                    "channel"
-                } else {
-                    "chat"
-                };
+                self.pending_session_rename = None;
+                self.session_rename_rx = None;
+                let detail = format!("could not start rename worker: {error}");
+                self.session_rename_error = Some(SessionRenameError {
+                    session_id: edit_id,
+                    detail: detail.clone(),
+                });
                 self.notice = Some(format!("{label} rename failed: {detail}"));
-                self.push_activity(format!("{label} rename"), detail, ActivityTone::Warn);
+                self.replace_activity(format!("{label} rename"), detail, ActivityTone::Warn);
             }
         }
+    }
+
+    fn pump_session_rename(&mut self) -> bool {
+        let result = match self.session_rename_rx.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(result)) => result,
+            Some(Err(TryRecvError::Empty)) | None => return false,
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.session_rename_rx = None;
+                let Some(pending) = self.pending_session_rename.take() else {
+                    return false;
+                };
+                let label = conversation_kind_label(pending.kind);
+                let detail =
+                    "rename worker stopped before returning a result; retry the rename".to_string();
+                self.session_rename_error = Some(SessionRenameError {
+                    session_id: pending.session_id,
+                    detail: detail.clone(),
+                });
+                self.notice = Some(format!("{label} rename failed: {detail}"));
+                self.replace_activity(format!("{label} rename"), detail, ActivityTone::Warn);
+                return true;
+            }
+        };
+
+        if self
+            .pending_session_rename
+            .as_ref()
+            .is_none_or(|pending| pending.request_id != result.request_id)
+        {
+            // A rebind or newer request owns the UI now. Keep its receiver/pending state intact.
+            return false;
+        }
+        self.session_rename_rx = None;
+        self.pending_session_rename = None;
+        let label = conversation_kind_label(result.kind);
+        match result.result {
+            Ok(()) => {
+                if let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == result.session_id)
+                {
+                    session.title = result.title.clone();
+                }
+                self.session_rename_error = None;
+                self.notice = Some(format!("renamed {label} to {}", result.title));
+                self.activity
+                    .retain(|entry| entry.title != format!("{label} rename"));
+                self.start_session_list_load(self.ui_waker.clone());
+            }
+            Err(detail) => {
+                self.session_rename_error = Some(SessionRenameError {
+                    session_id: result.session_id,
+                    detail: detail.clone(),
+                });
+                self.notice = Some(format!("{label} rename failed: {detail}"));
+                self.replace_activity(format!("{label} rename"), detail, ActivityTone::Warn);
+            }
+        }
+        true
     }
 
     fn request_delete_session(&mut self, session_id: &str) {
@@ -2714,6 +3033,7 @@ impl ChatState {
         let Some(session) = self.sessions.get(index).cloned() else {
             return;
         };
+        self.compact_drawer_open = false;
         self.session_id = session.id.clone();
         self.messages = vec![transcript_loading_message(&session)];
         self.timeline = ConversationTimelineState::default();
@@ -4144,6 +4464,7 @@ impl ChatState {
         let Some(agent) = self.agents.get(index) else {
             return;
         };
+        self.compact_drawer_open = false;
         if self.current_is_channel() {
             self.channel_agent_idx = index;
             self.begin_edit_current_session();
@@ -4194,6 +4515,7 @@ impl ChatState {
 
     /// Start a fresh session from the sidebar "New chat" action.
     fn new_session(&mut self) {
+        self.compact_drawer_open = false;
         self.persist();
         let interrupted_session_id = self.session_id.clone();
         let session_id = SessionId::generate().to_string();
@@ -4215,6 +4537,7 @@ impl ChatState {
             self.notice = Some("wait for the current channel to finish creating".to_string());
             return;
         }
+        self.compact_drawer_open = false;
         self.persist();
         let interrupted_session_id = self.session_id.clone();
         let session_id = SessionId::generate().to_string();
@@ -4330,6 +4653,9 @@ impl ChatState {
     }
 
     fn add_selected_agent_to_channel(&mut self) {
+        if self.pending_channel_config.is_some() {
+            return;
+        }
         let Some(channel_id) = self.session_edit_id.clone() else {
             return;
         };
@@ -4346,91 +4672,159 @@ impl ChatState {
         let agent_key = agent.key.clone();
         let agent_name = agent.name.clone();
         let tool_runtime = agent.tool_runtime.clone();
-        let store = match self.agent_channel_store() {
-            Ok(store) => store,
-            Err(error) => {
-                let detail = error.to_string();
-                self.notice = Some(format!("channel config failed: {detail}"));
-                self.push_activity("channel config", detail, ActivityTone::Warn);
-                return;
-            }
-        };
-        let Ok(parsed_channel_id) = channel_id.parse::<SessionId>() else {
-            self.notice = Some("channel config failed: invalid channel id".to_string());
+        self.start_channel_config(
+            channel_id,
+            format!("adding {agent_name}"),
+            format!("added {agent_name} to channel"),
+            ChannelConfigOperation::AddAgent {
+                agent_key,
+                agent_name,
+                tool_runtime,
+            },
+        );
+    }
+
+    fn remove_channel_agent(&mut self, channel_id: &str, participant_id: &str) {
+        if self.pending_channel_config.is_some() {
             return;
+        }
+        self.start_channel_config(
+            channel_id.to_string(),
+            "removing agent".to_string(),
+            "removed agent from channel".to_string(),
+            ChannelConfigOperation::RemoveAgent {
+                participant_id: participant_id.to_string(),
+            },
+        );
+    }
+
+    fn start_channel_config(
+        &mut self,
+        channel_id: String,
+        action: String,
+        success_notice: String,
+        operation: ChannelConfigOperation,
+    ) {
+        if self.pending_channel_config.is_some() {
+            return;
+        }
+        self.next_channel_config_request_id =
+            self.next_channel_config_request_id.wrapping_add(1).max(1);
+        let request_id = self.next_channel_config_request_id;
+        let pending = PendingChannelConfig {
+            request_id,
+            channel_id: channel_id.clone(),
+            action: action.clone(),
         };
-        let mut channel = match store.load_channel(&parsed_channel_id) {
-            Ok(Some(channel)) => channel,
-            Ok(None) => AgentChannel::new_channel(parsed_channel_id, "New channel"),
+        let (tx, rx) = mpsc::channel();
+        let data_dir = self.data_dir.clone();
+        let sifs_daemon = self.sifs_daemon.clone();
+        let worker_channel_id = channel_id.clone();
+        let worker_action = action.clone();
+        let worker_waker = self.ui_waker.clone();
+
+        self.pending_channel_config = Some(pending);
+        self.channel_config_error = None;
+        self.notice = Some(format!("{action} in channel…"));
+        self.replace_activity(
+            "channel config",
+            format!("{action} in SIFS"),
+            ActivityTone::Running,
+        );
+
+        let spawn = thread::Builder::new()
+            .name(format!("sinomo-app-channel-config-{request_id}"))
+            .spawn(move || {
+                let result = update_channel_membership_in_store(
+                    data_dir.as_ref(),
+                    sifs_daemon.as_ref(),
+                    &worker_channel_id,
+                    operation,
+                )
+                .map_err(|error| error.to_string());
+                let _ = tx.send(ChannelConfigWorkerResult {
+                    request_id,
+                    channel_id: worker_channel_id,
+                    action: worker_action,
+                    success_notice,
+                    result,
+                });
+                if let Some(waker) = worker_waker {
+                    waker.wake();
+                }
+            });
+
+        match spawn {
+            Ok(_) => self.channel_config_rx = Some(rx),
             Err(error) => {
-                let detail = error.to_string();
+                self.pending_channel_config = None;
+                self.channel_config_rx = None;
+                let detail = format!("could not start channel config worker: {error}");
+                self.channel_config_error = Some(ChannelConfigError {
+                    channel_id,
+                    detail: detail.clone(),
+                });
                 self.notice = Some(format!("channel config failed: {detail}"));
-                self.push_activity("channel config", detail, ActivityTone::Warn);
-                return;
-            }
-        };
-        channel.channel_kind = AgentChannelKind::Channel;
-        let participant_id = channel.ensure_participant(agent_key, agent_name.clone());
-        set_channel_participant_tool_runtime(&mut channel, &participant_id, &tool_runtime);
-        match store.save_channel(&channel) {
-            Ok(()) => {
-                self.refresh_sessions();
-                self.notice = Some(format!("added {agent_name} to channel"));
-            }
-            Err(error) => {
-                let detail = error.to_string();
-                self.notice = Some(format!("channel config failed: {detail}"));
-                self.push_activity("channel config", detail, ActivityTone::Warn);
+                self.replace_activity("channel config", detail, ActivityTone::Warn);
             }
         }
     }
 
-    fn remove_channel_agent(&mut self, channel_id: &str, participant_id: &str) {
-        let Ok(parsed_channel_id) = channel_id.parse::<SessionId>() else {
-            self.notice = Some("channel config failed: invalid channel id".to_string());
-            return;
-        };
-        let Ok(parsed_participant_id) = participant_id.parse::<sinomo_agent::TaskId>() else {
-            self.notice = Some("channel config failed: invalid participant id".to_string());
-            return;
-        };
-        let store = match self.agent_channel_store() {
-            Ok(store) => store,
-            Err(error) => {
-                let detail = error.to_string();
+    fn pump_channel_config(&mut self) -> bool {
+        let result = match self.channel_config_rx.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(result)) => result,
+            Some(Err(TryRecvError::Empty)) | None => return false,
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.channel_config_rx = None;
+                let Some(pending) = self.pending_channel_config.take() else {
+                    return false;
+                };
+                let detail = format!(
+                    "worker stopped before {} completed; retry the channel update",
+                    pending.action
+                );
+                self.channel_config_error = Some(ChannelConfigError {
+                    channel_id: pending.channel_id,
+                    detail: detail.clone(),
+                });
                 self.notice = Some(format!("channel config failed: {detail}"));
-                self.push_activity("channel config", detail, ActivityTone::Warn);
-                return;
+                self.replace_activity("channel config", detail, ActivityTone::Warn);
+                return true;
             }
         };
-        let mut channel = match store.load_channel(&parsed_channel_id) {
-            Ok(Some(channel)) => channel,
-            Ok(None) => {
-                self.notice = Some("channel config failed: channel not found".to_string());
-                return;
-            }
-            Err(error) => {
-                let detail = error.to_string();
-                self.notice = Some(format!("channel config failed: {detail}"));
-                self.push_activity("channel config", detail, ActivityTone::Warn);
-                return;
-            }
-        };
-        if !channel.disable_participant(&parsed_participant_id) {
-            self.notice = Some("channel config failed: agent not found".to_string());
-            return;
+
+        if self
+            .pending_channel_config
+            .as_ref()
+            .is_none_or(|pending| pending.request_id != result.request_id)
+        {
+            // A reconnect or newer channel edit owns the UI now.
+            return false;
         }
-        match store.save_channel(&channel) {
+        self.channel_config_rx = None;
+        self.pending_channel_config = None;
+        match result.result {
             Ok(()) => {
-                self.refresh_sessions();
-                self.notice = Some("removed agent from channel".to_string());
+                self.channel_config_error = None;
+                self.notice = Some(result.success_notice);
+                self.activity
+                    .retain(|entry| entry.title != "channel config");
+                self.start_session_list_load(self.ui_waker.clone());
             }
-            Err(error) => {
-                let detail = error.to_string();
+            Err(detail) => {
+                self.channel_config_error = Some(ChannelConfigError {
+                    channel_id: result.channel_id,
+                    detail: detail.clone(),
+                });
                 self.notice = Some(format!("channel config failed: {detail}"));
-                self.push_activity("channel config", detail, ActivityTone::Warn);
+                self.replace_activity(
+                    "channel config",
+                    format!("{} failed: {detail}", result.action),
+                    ActivityTone::Warn,
+                );
             }
         }
+        true
     }
 
     /// Push the current provider/model selection to the worker.
@@ -5133,6 +5527,89 @@ fn open_agent_channel_store(
             .map_err(|detail| std::io::Error::new(std::io::ErrorKind::Other, detail)),
         None => open_local_agent_channel_store(data_dir),
     }
+}
+
+fn conversation_kind_label(kind: ConversationKind) -> &'static str {
+    match kind {
+        ConversationKind::Chat => "chat",
+        ConversationKind::Channel => "channel",
+    }
+}
+
+fn rename_session_in_store(
+    data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&SifsDaemonAccess>,
+    kind: ConversationKind,
+    session_id: &str,
+    title: &str,
+) -> std::io::Result<()> {
+    match kind {
+        ConversationKind::Chat => rename_chat_channel(data_dir, sifs_daemon, session_id, title),
+        ConversationKind::Channel => {
+            let channel_id = parse_channel_id(session_id)?;
+            let store = open_agent_channel_store(data_dir, sifs_daemon)?;
+            let mut channel = store
+                .load_channel(&channel_id)
+                .map_err(channel_store_io_error)?
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "channel not found")
+                })?;
+            channel.channel_kind = AgentChannelKind::Channel;
+            channel.rename(title);
+            store.save_channel(&channel).map_err(channel_store_io_error)
+        }
+    }
+}
+
+fn update_channel_membership_in_store(
+    data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&SifsDaemonAccess>,
+    channel_id: &str,
+    operation: ChannelConfigOperation,
+) -> std::io::Result<()> {
+    let parsed_channel_id = parse_channel_id(channel_id)?;
+    let store = open_agent_channel_store(data_dir, sifs_daemon)?;
+    let mut channel = match &operation {
+        ChannelConfigOperation::AddAgent { .. } => store
+            .load_channel(&parsed_channel_id)
+            .map_err(channel_store_io_error)?
+            .unwrap_or_else(|| AgentChannel::new_channel(parsed_channel_id, "New channel")),
+        ChannelConfigOperation::RemoveAgent { .. } => store
+            .load_channel(&parsed_channel_id)
+            .map_err(channel_store_io_error)?
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "channel not found")
+            })?,
+    };
+    channel.channel_kind = AgentChannelKind::Channel;
+    match operation {
+        ChannelConfigOperation::AddAgent {
+            agent_key,
+            agent_name,
+            tool_runtime,
+        } => {
+            let participant_id = channel.ensure_participant(agent_key, agent_name);
+            set_channel_participant_tool_runtime(&mut channel, &participant_id, &tool_runtime);
+        }
+        ChannelConfigOperation::RemoveAgent { participant_id } => {
+            let parsed_participant_id =
+                participant_id
+                    .parse::<sinomo_agent::TaskId>()
+                    .map_err(|error| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("invalid participant id: {error}"),
+                        )
+                    })?;
+            if !channel.disable_participant(&parsed_participant_id) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "agent not found",
+                ));
+            }
+        }
+    }
+    store.save_channel(&channel).map_err(channel_store_io_error)
 }
 
 fn open_local_agent_channel_store(
@@ -7259,6 +7736,8 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         agent_status,
         agent_keys,
         agent_options,
+        rename_pending,
+        rename_error,
     ) = {
         let chat = shared.chat();
         let edit_id = chat.session_edit_id.as_deref()?;
@@ -7276,8 +7755,21 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         if session.kind == ConversationKind::Channel && participants.is_empty() {
             participants = ChatState::fallback_channel_agent_refs(&session, &chat.agents);
         }
-        let agent_status =
-            channel_agents_store_status(&participants, creating_channel, chat.notice.as_deref());
+        let agent_status = if chat
+            .pending_channel_config
+            .as_ref()
+            .is_some_and(|pending| pending.channel_id == edit_id)
+        {
+            Some(ChannelAgentsStoreStatus::Saving)
+        } else if let Some(error) = chat
+            .channel_config_error
+            .as_ref()
+            .filter(|error| error.channel_id == edit_id)
+        {
+            Some(ChannelAgentsStoreStatus::Failed(error.detail.clone()))
+        } else {
+            channel_agents_store_status(&participants, creating_channel, chat.notice.as_deref())
+        };
         let agent_keys = chat
             .agents
             .iter()
@@ -7288,6 +7780,15 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             .iter()
             .map(|agent| agent.name.clone())
             .collect::<Vec<_>>();
+        let rename_pending = chat
+            .pending_session_rename
+            .as_ref()
+            .is_some_and(|pending| pending.session_id == edit_id);
+        let rename_error = chat
+            .session_rename_error
+            .as_ref()
+            .filter(|error| error.session_id == edit_id)
+            .map(|error| error.detail.clone());
         (
             session,
             chat.session_title_draft.clone(),
@@ -7297,6 +7798,8 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             agent_status,
             agent_keys,
             agent_options,
+            rename_pending,
+            rename_error,
         )
     };
     let session_id = session.id.clone();
@@ -7345,7 +7848,7 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     };
     let save = {
         let s = shared.clone();
-        sui::Button::new("Save")
+        sui::Button::new(if rename_pending { "Saving…" } else { "Save" })
             .icon(IconGlyph::Check)
             .theme_when(clone_reader(reader))
             .enabled_when({
@@ -7400,6 +7903,15 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             muted_label(
                 shared,
                 "Untitled channel. Rename it so it is easy to recognize in the sidebar.",
+            )
+            .font_size(11.0),
+        );
+    }
+    if let Some(error) = rename_error {
+        body = body.with_child(
+            muted_label(
+                shared,
+                format!("Rename failed: {error}. Edit the title or retry Save."),
             )
             .font_size(11.0),
         );
@@ -7571,6 +8083,7 @@ fn channel_agents_editor(
     agent_keys: Vec<String>,
     agent_options: Vec<String>,
 ) -> impl Widget + use<> {
+    let mutation_pending = shared.chat().pending_channel_config.is_some();
     let participant_count = participants.len();
     let assigned_agent_keys = participants
         .iter()
@@ -7623,10 +8136,12 @@ fn channel_agents_editor(
                     .theme_when(clone_reader(reader))
             } else {
                 let s = shared.clone();
+                let enabled_shared = shared.clone();
                 IconButton::new(IconGlyph::Trash, format!("Remove {remove_label}"))
                     .size(26.0)
                     .icon_size(14.0)
                     .theme_when(clone_reader(reader))
+                    .enabled_when(move || enabled_shared.chat().pending_channel_config.is_none())
                     .on_press_with_ctx(move |ctx| {
                         s.chat_mut()
                             .remove_channel_agent(&row_channel_id, &participant_id);
@@ -7694,28 +8209,35 @@ fn channel_agents_editor(
     };
     let add = {
         let s = shared.clone();
-        sui::Button::new("Add agent")
-            .icon(IconGlyph::Add)
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                let agent_keys = agent_keys.clone();
-                let assigned_agent_keys = assigned_agent_keys.clone();
-                move || {
-                    let chat = s.chat();
-                    let Some(agent_key) = agent_keys.get(chat.channel_agent_idx) else {
-                        return false;
-                    };
-                    !assigned_agent_keys
-                        .iter()
-                        .any(|assigned_key| assigned_key == agent_key)
+        sui::Button::new(if mutation_pending {
+            "Updating…"
+        } else {
+            "Add agent"
+        })
+        .icon(IconGlyph::Add)
+        .theme_when(clone_reader(reader))
+        .enabled_when({
+            let s = s.clone();
+            let agent_keys = agent_keys.clone();
+            let assigned_agent_keys = assigned_agent_keys.clone();
+            move || {
+                let chat = s.chat();
+                if chat.pending_channel_config.is_some() {
+                    return false;
                 }
-            })
-            .on_press_with_ctx(move |ctx| {
-                s.chat_mut().add_selected_agent_to_channel();
-                ctx.request_measure();
-                ctx.request_paint();
-            })
+                let Some(agent_key) = agent_keys.get(chat.channel_agent_idx) else {
+                    return false;
+                };
+                !assigned_agent_keys
+                    .iter()
+                    .any(|assigned_key| assigned_key == agent_key)
+            }
+        })
+        .on_press_with_ctx(move |ctx| {
+            s.chat_mut().add_selected_agent_to_channel();
+            ctx.request_measure();
+            ctx.request_paint();
+        })
     };
 
     Stack::vertical()
@@ -7795,6 +8317,8 @@ struct SessionEditPopup {
     body_content_height: f32,
     body_scroll_y: f32,
     close_hovered: bool,
+    close_semantic_name: String,
+    close_semantic_description: String,
     on_dismiss: Option<Box<dyn FnMut()>>,
 }
 
@@ -7821,8 +8345,17 @@ impl SessionEditPopup {
             body_content_height: 0.0,
             body_scroll_y: 0.0,
             close_hovered: false,
+            close_semantic_name: "Close edit dialog".to_string(),
+            close_semantic_description: "Dismiss this editor without saving pending title changes"
+                .to_string(),
             on_dismiss: None,
         }
+    }
+
+    fn close_semantics(mut self, name: impl Into<String>, description: impl Into<String>) -> Self {
+        self.close_semantic_name = name.into();
+        self.close_semantic_description = description.into();
+        self
     }
 
     fn on_dismiss<F>(mut self, on_dismiss: F) -> Self
@@ -8055,9 +8588,8 @@ impl Widget for SessionEditPopup {
             self.close_rect(),
         );
         close.parent = Some(dialog_id);
-        close.name = Some("Close edit dialog".to_string());
-        close.description =
-            Some("Dismiss this editor without saving pending title changes".to_string());
+        close.name = Some(self.close_semantic_name.clone());
+        close.description = Some(self.close_semantic_description.clone());
         close.actions = vec![SemanticsAction::Activate];
         close.state.hovered = self.close_hovered;
         ctx.push(close);
@@ -8089,8 +8621,32 @@ fn session_edit_dialog_signature(shared: &Shared) -> String {
         })
         .collect::<Vec<_>>()
         .join("\u{1f}");
+    let pending_rename = chat
+        .pending_session_rename
+        .as_ref()
+        .filter(|pending| pending.session_id == edit_id)
+        .map(|pending| format!("{}:{}", pending.request_id, pending.title))
+        .unwrap_or_default();
+    let rename_error = chat
+        .session_rename_error
+        .as_ref()
+        .filter(|error| error.session_id == edit_id)
+        .map(|error| error.detail.as_str())
+        .unwrap_or_default();
+    let pending_channel_config = chat
+        .pending_channel_config
+        .as_ref()
+        .filter(|pending| pending.channel_id == edit_id)
+        .map(|pending| format!("{}:{}", pending.request_id, pending.action))
+        .unwrap_or_default();
+    let channel_config_error = chat
+        .channel_config_error
+        .as_ref()
+        .filter(|error| error.channel_id == edit_id)
+        .map(|error| error.detail.as_str())
+        .unwrap_or_default();
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         edit_id,
         chat.session_delete_confirm_id
             .as_deref()
@@ -8100,8 +8656,52 @@ fn session_edit_dialog_signature(shared: &Shared) -> String {
         chat.agents.len(),
         chat.channel_create_rx.is_some(),
         chat.notice.as_deref().unwrap_or_default(),
+        pending_rename,
+        rename_error,
+        pending_channel_config,
+        channel_config_error,
         sessions
     )
+}
+
+fn compact_chat_drawer(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
+    if !shared.chat().compact_drawer_open || shared.chat().session_edit_id.is_some() {
+        return None;
+    }
+    let scroll_state = ScrollState::new();
+    let body = SizedBox::new()
+        .height(520.0)
+        .with_child(sidebar(shared, reader, &scroll_state));
+    let dismiss_shared = shared.clone();
+    Some(WidgetPod::new(
+        SessionEditPopup::new("Conversations and agents", body, shared.theme())
+            .close_semantics(
+                "Close conversation drawer",
+                "Return to the active conversation",
+            )
+            .on_dismiss(move || {
+                dismiss_shared.chat_mut().set_compact_drawer_open(false);
+            }),
+    ))
+}
+
+fn chat_overlay_signature(shared: &Shared) -> String {
+    let edit = session_edit_dialog_signature(shared);
+    if !edit.is_empty() {
+        return format!("edit|{edit}");
+    }
+    if shared.chat().compact_drawer_open {
+        return format!("drawer|{:?}", sidebar_signature(shared));
+    }
+    String::new()
+}
+
+fn chat_overlay(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
+    if shared.chat().session_edit_id.is_some() {
+        session_edit_dialog(shared, reader)
+    } else {
+        compact_chat_drawer(shared, reader)
+    }
 }
 
 struct ChatDialogHost {
@@ -8129,18 +8729,18 @@ impl ChatDialogHost {
     }
 
     fn sync_dialog(&mut self) {
-        let signature = session_edit_dialog_signature(&self.shared);
+        let signature = chat_overlay_signature(&self.shared);
         if signature == self.dialog_signature {
             return;
         }
         self.dialog_signature = signature;
-        self.dialog = session_edit_dialog(&self.shared, &self.reader);
+        self.dialog = chat_overlay(&self.shared, &self.reader);
     }
 }
 
 impl Widget for ChatDialogHost {
     fn event(&mut self, ctx: &mut EventCtx, _event: &Event) {
-        let signature = session_edit_dialog_signature(&self.shared);
+        let signature = chat_overlay_signature(&self.shared);
         if signature != self.dialog_signature {
             ctx.request_measure();
             ctx.request_paint();
@@ -9292,6 +9892,21 @@ struct TranscriptMessageSource {
     source_map: RichTextSourceMap,
 }
 
+/// The accessibility projection is intentionally limited to messages that
+/// intersect the viewport. Long channel windows can retain hundreds of
+/// messages for smooth scrolling, while UI Automation still receives useful
+/// row text without building an unbounded semantic tree.
+#[derive(Clone, Debug)]
+struct TranscriptMessageSemantic {
+    message_key: u64,
+    bounds: Rect,
+    speaker: String,
+    text: String,
+    position: usize,
+    total: usize,
+    busy: bool,
+}
+
 /// Selection key for a message: the backend sequence when present, otherwise a
 /// high-bit key derived from the transcript position (local/streaming tail
 /// messages), so refs stay distinct and survive appends.
@@ -9327,6 +9942,7 @@ struct TranscriptView {
     runtime_actions: RefCell<Vec<(RuntimeTranscriptAction, Rect)>>,
     transcript_text_hits: RefCell<Vec<TranscriptTextHit>>,
     transcript_message_sources: RefCell<Vec<TranscriptMessageSource>>,
+    transcript_message_semantics: RefCell<Vec<TranscriptMessageSemantic>>,
     selection: Cell<Option<(TranscriptTextPoint, TranscriptTextPoint)>>,
     dragging_selection: Cell<bool>,
     menu_target_key: Cell<Option<u64>>,
@@ -9350,6 +9966,7 @@ impl TranscriptView {
             runtime_actions: RefCell::new(Vec::new()),
             transcript_text_hits: RefCell::new(Vec::new()),
             transcript_message_sources: RefCell::new(Vec::new()),
+            transcript_message_semantics: RefCell::new(Vec::new()),
             selection: Cell::new(None),
             dragging_selection: Cell::new(false),
             menu_target_key: Cell::new(None),
@@ -9933,6 +10550,23 @@ impl TranscriptView {
                 .wrapping_mul(43)
                 .wrapping_add(9_501 + slot as u64),
         )
+    }
+
+    fn message_widget_id(parent: sui::WidgetId, message_key: u64) -> sui::WidgetId {
+        // Sequence-backed keys are stable across appends and scrolling. Mix the
+        // high/low halves so generated local keys remain distinct too.
+        let mixed = message_key ^ message_key.rotate_left(29);
+        sui::WidgetId::new(
+            parent
+                .get()
+                .wrapping_mul(59)
+                .wrapping_add(11_003)
+                .wrapping_add(mixed),
+        )
+    }
+
+    fn progress_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
+        sui::WidgetId::new(parent.get().wrapping_mul(61).wrapping_add(11_401))
     }
 
     fn transcript_text_style(
@@ -11212,6 +11846,7 @@ impl Widget for TranscriptView {
         if chat.messages.is_empty() {
             self.transcript_text_hits.borrow_mut().clear();
             self.transcript_message_sources.borrow_mut().clear();
+            self.transcript_message_semantics.borrow_mut().clear();
             self.selection.set(None);
             self.paint_empty_state(ctx, &theme, &pal, area, &chat);
             return;
@@ -11295,9 +11930,12 @@ impl Widget for TranscriptView {
         }
         *self.transcript_text_hits.borrow_mut() = text_hits;
 
-        // Draw pass: only mutable ctx ops here.
+        // Draw pass: only mutable ctx ops here. Keep a bounded semantic
+        // projection beside the visible paint rows so native accessibility
+        // receives the same message text and geometry users see.
         let mut action_rects = Vec::new();
         let mut runtime_action_rects = Vec::new();
+        let mut message_semantics = Vec::new();
         let mut y = area.y() + PAD - scroll;
         if let Some(summary) = timeline_summary.as_deref() {
             if y + timeline_header_h >= area.y() && y <= area.y() + area.height() {
@@ -11307,6 +11945,36 @@ impl Widget for TranscriptView {
         }
         for (index, (message, item)) in chat.messages.iter().zip(&laid).enumerate() {
             if y + item.bubble_h >= area.y() && y <= area.y() + area.height() {
+                let (row_bounds, _, _, _) =
+                    Self::message_content_geometry(area, item, y, layout_mode);
+                let speaker = match message.source {
+                    ChatMessageSource::User => "You".to_string(),
+                    ChatMessageSource::System => "System".to_string(),
+                    ChatMessageSource::Model => chat
+                        .agents
+                        .iter()
+                        .find(|agent| agent.key == chat.info.agent || agent.name == chat.info.agent)
+                        .map(|agent| agent.name.clone())
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            if chat.info.agent.trim().is_empty() {
+                                "Sinomo".to_string()
+                            } else {
+                                chat.info.agent.clone()
+                            }
+                        }),
+                };
+                message_semantics.push(TranscriptMessageSemantic {
+                    message_key: transcript_message_selection_key(index, message),
+                    bounds: row_bounds,
+                    speaker,
+                    text: transcript_message_display_text(message),
+                    position: index + 1,
+                    total: chat.messages.len(),
+                    busy: chat.streaming
+                        && index + 1 == chat.messages.len()
+                        && message.source == ChatMessageSource::Model,
+                });
                 self.paint_laid_message(
                     ctx,
                     &pal,
@@ -11334,6 +12002,7 @@ impl Widget for TranscriptView {
         }
         *self.transcript_recovery_actions.borrow_mut() = action_rects;
         *self.runtime_actions.borrow_mut() = runtime_action_rects;
+        *self.transcript_message_semantics.borrow_mut() = message_semantics;
         ctx.pop_clip();
 
         // Streaming / typing notice, pinned to the bottom of the transcript.
@@ -11360,7 +12029,7 @@ impl Widget for TranscriptView {
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let (messages_empty, target) = {
+        let (messages_empty, target, streaming) = {
             let chat = self.shared.chat();
             (
                 chat.messages.is_empty(),
@@ -11368,8 +12037,33 @@ impl Widget for TranscriptView {
                     .is_empty()
                     .then(|| chat.runtime_recovery_target())
                     .flatten(),
+                chat.streaming,
             )
         };
+        let visible_message_count = self.transcript_message_semantics.borrow().len();
+        let mut transcript = SemanticsNode::new(ctx.widget_id(), SemanticsRole::List, ctx.bounds());
+        transcript.name = Some("Conversation messages".to_string());
+        transcript.description = Some(if messages_empty {
+            "No visible messages; conversation actions are available below".to_string()
+        } else {
+            format!(
+                "{} visible message{}; use the transcript for selection and copy",
+                visible_message_count,
+                if visible_message_count == 1 { "" } else { "s" }
+            )
+        });
+        transcript.state.focused = ctx.is_focused();
+        transcript.state.busy = streaming;
+        transcript.actions = if messages_empty {
+            vec![SemanticsAction::Focus]
+        } else {
+            vec![
+                SemanticsAction::Focus,
+                SemanticsAction::SetSelection,
+                SemanticsAction::Copy,
+            ]
+        };
+        ctx.push(transcript);
         if target.is_none() {
             if messages_empty {
                 let (title, hint, context) = {
@@ -11417,6 +12111,54 @@ impl Widget for TranscriptView {
                     ctx.push(node);
                 }
                 return;
+            }
+            let notice = {
+                let chat = self.shared.chat();
+                chat.notice.clone()
+            };
+            let semantics = self.transcript_message_semantics.borrow();
+            for message in semantics.iter() {
+                let mut node = SemanticsNode::new(
+                    Self::message_widget_id(ctx.widget_id(), message.message_key),
+                    SemanticsRole::ListItem,
+                    message.bounds,
+                );
+                node.parent = Some(ctx.widget_id());
+                node.name = Some(format!("{}: {}", message.speaker, message.text));
+                node.description = Some(format!(
+                    "Message {} of {}{}",
+                    message.position,
+                    message.total,
+                    if message.busy {
+                        "; response in progress"
+                    } else {
+                        ""
+                    }
+                ));
+                node.value = Some(SemanticsValue::Text(message.text.clone()));
+                node.state.busy = message.busy;
+                ctx.push(node);
+            }
+            drop(semantics);
+            if streaming {
+                let progress_text = notice
+                    .filter(|notice| !notice.trim().is_empty())
+                    .unwrap_or_else(|| "Agent response in progress".to_string());
+                let mut progress = SemanticsNode::new(
+                    Self::progress_widget_id(ctx.widget_id()),
+                    SemanticsRole::BusyIndicator,
+                    Rect::new(
+                        ctx.bounds().x() + PAD,
+                        ctx.bounds().max_y() - 24.0,
+                        (ctx.bounds().width() - PAD * 2.0).max(1.0),
+                        22.0,
+                    ),
+                );
+                progress.parent = Some(ctx.widget_id());
+                progress.name = Some(progress_text.clone());
+                progress.value = Some(SemanticsValue::Text(progress_text));
+                progress.state.busy = true;
+                ctx.push(progress);
             }
             let timeline_summary = {
                 let chat = self.shared.chat();
@@ -13135,6 +13877,102 @@ fn chat_work_area(
     main_column(shared, reader, selection)
 }
 
+fn compact_chat_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let theme = shared.theme();
+    let pal = palette(shared);
+
+    let open_drawer = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::Chat, "Open conversations and agents")
+            .size(34.0)
+            .icon_size(16.0)
+            .theme_when(secondary_button_theme(reader))
+            .selected_when({
+                let s = s.clone();
+                move || s.chat().compact_drawer_open
+            })
+            .on_press_with_ctx(move |ctx| {
+                s.chat_mut().toggle_compact_drawer();
+                request_chat_window_relayout(ctx);
+            })
+    };
+    let title = {
+        let s = shared.clone();
+        Label::dynamic("Conversation", move || {
+            let chat = s.chat();
+            chat.current_session_ref()
+                .map(|session| session.title.clone())
+                .unwrap_or_else(|| chat.empty_conversation_title())
+        })
+        .semantic_name("Current conversation")
+        .style(pal.text_style(&theme, 13.0, FontWeight::SEMIBOLD, pal.text))
+    };
+    let agent = {
+        let s = shared.clone();
+        Label::dynamic("Agent", move || {
+            let chat = s.chat();
+            let display = chat
+                .agents
+                .iter()
+                .find(|agent| agent.key == chat.info.agent || agent.name == chat.info.agent)
+                .map(|agent| agent.name.as_str())
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if chat.info.agent.trim().is_empty() {
+                        "Sinomo"
+                    } else {
+                        chat.info.agent.as_str()
+                    }
+                });
+            format!("Agent · {display}")
+        })
+        .semantic_name("Current agent")
+        .style(pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_muted))
+    };
+    let edit = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::MoreHorizontal, "Edit current conversation")
+            .size(34.0)
+            .icon_size(16.0)
+            .theme_when(secondary_button_theme(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || s.chat().current_session_ref().is_some()
+            })
+            .on_press_with_ctx(move |ctx| {
+                s.chat_mut().begin_edit_current_session();
+                request_chat_window_relayout(ctx);
+            })
+    };
+
+    let labels = Stack::vertical()
+        .spacing(0.0)
+        .alignment(Alignment::Stretch)
+        .with_child(title)
+        .with_child(agent);
+    let row = Flex::horizontal()
+        .main_gap(8.0)
+        .align_items(Alignment::Center)
+        .with_item(open_drawer, FlexItem::new().no_shrink())
+        .with_item(labels, FlexItem::fill().min_width(80.0))
+        .with_item(edit, FlexItem::new().no_shrink());
+    Surface::new(
+        SurfaceRole::Titlebar,
+        WidgetPadding::new(
+            Insets {
+                left: 10.0,
+                top: 8.0,
+                right: 10.0,
+                bottom: 8.0,
+            },
+            row,
+        ),
+    )
+    .border(SurfaceBorder::Bottom)
+    .fill_width()
+    .theme_when(clone_reader(reader))
+}
+
 fn wide_pod(
     shared: &Shared,
     reader: &ThemeReader,
@@ -13158,15 +13996,18 @@ fn wide_pod(
 }
 
 fn narrow_pod(shared: &Shared, reader: &ThemeReader, selection: &SelectionScope) -> WidgetPod {
+    let body = Dock::new(main_column(shared, reader, selection))
+        .top(COMPACT_HEADER_H, compact_chat_header(shared, reader));
+    let dialog_host = ChatDialogHost::new(body, shared.clone(), Rc::clone(reader));
     WidgetPod::new(
-        Surface::window(main_column(shared, reader, selection))
+        Surface::window(dialog_host)
             .fill()
             .theme_when(clone_reader(reader)),
     )
 }
 
 /// The chat tab: a thin responsive host owning two pre-built pods (wide split with sidebar / narrow
-/// transcript-only) and delegating to the one chosen by the available width. The choice is made in
+/// compact-header + transcript) and delegating to the one chosen by the available width. The choice is made in
 /// `measure` (constraints-driven) and cached so `arrange`/`paint`/event routing stay in sync.
 /// Mirrors the Settings / Files hosts.
 ///
@@ -13262,6 +14103,7 @@ impl ChatView {
         ctx.request(InvalidationRequest::new(window, InvalidationKind::Measure));
         ctx.request(InvalidationRequest::new(window, InvalidationKind::Arrange));
         ctx.request_paint();
+        ctx.request_semantics();
     }
 
     /// One pump tick: drain the worker, apply events, and relayout/repaint as needed; keep the loop
@@ -13301,6 +14143,9 @@ impl ChatView {
             self.force_window_relayout(ctx);
         } else if changed {
             ctx.request_paint();
+            // Transcript rows and the busy indicator are live semantic
+            // content, not paint-only decoration.
+            ctx.request_semantics();
         }
 
         if changed || sig_changed {
@@ -13389,6 +14234,7 @@ fn view_signature(shared: &Shared) -> u64 {
     chat.session_edit_id.hash(&mut h);
     chat.session_delete_confirm_id.hash(&mut h);
     chat.session_edit_details_open.hash(&mut h);
+    chat.compact_drawer_open.hash(&mut h);
     chat.channel_agent_idx.hash(&mut h);
     chat.channel_create_rx.is_some().hash(&mut h);
     chat.visible_session_has_started().hash(&mut h);
@@ -13474,6 +14320,9 @@ impl Widget for ChatView {
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
         let use_wide = constraints.max.width >= WIDE_THRESHOLD;
+        if use_wide && !self.use_wide.get() {
+            self.shared.chat_mut().compact_drawer_open = false;
+        }
         self.use_wide.set(use_wide);
         self.last_sig.set(view_signature(&self.shared));
         self.active_mut().measure(ctx, constraints)
@@ -14435,6 +15284,97 @@ mod tests {
         (backend, state)
     }
 
+    #[test]
+    fn compact_chat_header_opens_conversation_and_agent_drawer() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let reader: ThemeReader = {
+            let s = shared.clone();
+            Rc::new(move || s.theme())
+        };
+        let body = SizedBox::new()
+            .height(COMPACT_HEADER_H)
+            .with_child(compact_chat_header(&shared, &reader));
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Compact chat navigation")
+                    .root(ChatDialogHost::new(
+                        body,
+                        shared.clone(),
+                        Rc::clone(&reader),
+                    )),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        app.run_until_idle()?;
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Open conversations and agents")
+            .click()?;
+        app.run_until_idle()?;
+
+        assert!(shared.chat().compact_drawer_open);
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Dialog)
+                .with_name("Conversations and agents")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::List)
+                .with_name("chat-agents")
+                .count()?,
+            1,
+            "agent access must remain available below the sidebar breakpoint"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transcript_semantics_include_message_text_and_live_progress() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut chat = shared.chat_mut();
+            chat.messages = vec![
+                ChatMessage::user("Please inspect the cluster"),
+                ChatMessage::model("Inspecting routes"),
+            ];
+            chat.info.agent = "main-agent".to_string();
+            chat.streaming = true;
+            chat.notice = Some("Checking cluster routes".to_string());
+        }
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat semantics")
+                    .root(TranscriptView::new(shared, SelectionScope::new())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        app.run_until_idle()?;
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::ListItem)
+                .with_name("main-agent: Inspecting routes")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::BusyIndicator)
+                .with_name("Checking cluster routes")
+                .count()?,
+            1
+        );
+        Ok(())
+    }
+
     fn mock_chunked_timeline_shared(
         title: &str,
         total_messages: u64,
@@ -14507,7 +15447,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_chunked_timeline_window_exposes_overview_without_message_semantics()
+    fn rendered_chunked_timeline_window_exposes_overview_and_visible_message_semantics()
     -> sui::Result<()> {
         let shared = mock_chunked_timeline_shared("Chunked timeline", 1_024, 401, 800, 8);
         let runtime = sui::Application::new()
@@ -14538,12 +15478,14 @@ mod tests {
         assert!(summary.contains("span 1-1024"));
         assert!(summary.contains("older/newer available"));
         assert!(
-            !snapshot.accessibility.nodes.iter().any(|node| {
-                node.name
-                    .as_deref()
-                    .is_some_and(|name| name.contains("chunked message 401"))
+            snapshot.accessibility.nodes.iter().any(|node| {
+                node.role == SemanticsRole::ListItem
+                    && node
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.contains("chunked message 401"))
             }),
-            "message text should stay paint-only instead of creating one semantic node per row"
+            "the visible transcript must expose message text to accessibility"
         );
         assert!(
             !snapshot.accessibility.nodes.iter().any(|node| {
@@ -14551,7 +15493,7 @@ mod tests {
                     .as_deref()
                     .is_some_and(|name| name.contains("chunked message 800"))
             }),
-            "large chunked windows should not expose every rendered message as accessibility text"
+            "offscreen rows should stay out of the bounded accessibility projection"
         );
 
         Ok(())
@@ -14602,9 +15544,13 @@ mod tests {
                     .is_some_and(|name| name.contains("chunked message "))
             })
             .count();
-        assert_eq!(
-            message_semantics, 0,
-            "loaded transcript windows must not allocate semantic nodes for every message"
+        assert!(
+            message_semantics > 0,
+            "visible messages should be semantic rows"
+        );
+        assert!(
+            message_semantics < 40,
+            "loaded transcript windows should expose only viewport rows, got {message_semantics}"
         );
 
         Ok(())
@@ -14745,32 +15691,32 @@ mod tests {
         let (_backend, mut state) = isolated_chat_state("open-session-older-page");
         seed_default_provider(&mut state);
         let channel_id = SessionId::generate();
-        let messages = (0..(VISIBLE_TRANSCRIPT_RECENT_LIMIT + 25))
-            .map(|index| ChatMessage::user(format!("message {index}")))
-            .collect::<Vec<_>>();
-        seed_backend_chat(&state.data_dir, &channel_id, "Long chat", &messages);
         let session_id = channel_id.to_string();
-        state.sessions = vec![SessionRef {
+        let session = SessionRef {
             id: session_id.clone(),
             title: "Long chat".to_string(),
             kind: ConversationKind::Chat,
             updated_unix: 1,
             participant_count: 1,
             participant_names: Vec::new(),
-        }];
-
-        state.open_session(0);
-        wait_for(&mut state, Duration::from_secs(30), |state| {
-            !state.transcript_load_pending()
-                && state.messages.len() == VISIBLE_TRANSCRIPT_RECENT_LIMIT
-        });
-        assert_eq!(state.messages[0].text, "message 25");
-        assert_eq!(state.timeline.loaded_start_sequence, Some(26));
-        assert_eq!(
-            state.timeline.total_messages,
-            (VISIBLE_TRANSCRIPT_RECENT_LIMIT + 25) as u64
-        );
-        assert!(state.timeline.has_older);
+        };
+        state.session_id = session_id;
+        state.sessions = vec![session.clone()];
+        let total_messages = (VISIBLE_TRANSCRIPT_RECENT_LIMIT + 25) as u64;
+        state.messages = (26..=total_messages)
+            .map(|sequence| {
+                ChatMessage::user(format!("message {}", sequence - 1)).with_sequence(sequence)
+            })
+            .collect();
+        state.timeline = ConversationTimelineState {
+            total_messages,
+            chunk_size: VISIBLE_TRANSCRIPT_RECENT_LIMIT as u64,
+            loaded_start_sequence: Some(26),
+            loaded_end_sequence: Some(total_messages),
+            has_older: true,
+            has_newer: false,
+            overview: Vec::new(),
+        };
 
         state.set_draft("follow up while history loads".to_string());
         assert!(state.maybe_start_older_transcript_load());
@@ -14778,7 +15724,40 @@ mod tests {
             state.can_send(),
             "older page loads should not block the composer"
         );
-        wait_for(&mut state, Duration::from_secs(30), |state| {
+
+        // Replace the real SIFS worker receiver with a deterministic older-page result. Storage
+        // integration is covered separately; this regression targets the nonblocking UI merge.
+        let mode = TranscriptLoadMode::Older {
+            before_sequence: 26,
+        };
+        let (tx, rx) = mpsc::channel();
+        state.transcript_load_rx = Some(rx);
+        state.transcript_load_mode = Some(mode);
+        tx.send(TranscriptLoadWorkerResult {
+            session,
+            mode,
+            result: Ok(ConversationTimelineLoad {
+                messages: (1..=25)
+                    .map(|sequence| {
+                        ChatMessage::user(format!("message {}", sequence - 1))
+                            .with_sequence(sequence)
+                    })
+                    .collect(),
+                page: AgentChannelMessagePage {
+                    channel_id,
+                    messages: Vec::new(),
+                    start_sequence: Some(1),
+                    end_sequence: Some(25),
+                    has_older: false,
+                    has_newer: true,
+                    total_messages,
+                    chunk_size: VISIBLE_TRANSCRIPT_RECENT_LIMIT as u64,
+                },
+                overview: None,
+            }),
+        })
+        .expect("queue older transcript page");
+        wait_for(&mut state, Duration::from_secs(5), |state| {
             !state.transcript_load_pending()
                 && state.messages.len() == VISIBLE_TRANSCRIPT_RECENT_LIMIT + 25
         });
@@ -15109,6 +16088,11 @@ mod tests {
         state.set_session_title_draft("Renamed chat".to_string());
         assert!(state.can_save_session_title());
         state.save_session_title();
+        assert!(state.pending_session_rename.is_some());
+        assert_eq!(state.session_title_draft, "Renamed chat");
+        wait_for(&mut state, Duration::from_secs(5), |state| {
+            state.pending_session_rename.is_none()
+        });
 
         assert_eq!(state.session_edit_id.as_deref(), Some(session_id.as_str()));
         assert_eq!(
@@ -15138,6 +16122,67 @@ mod tests {
                 .map(|session| session.title.as_str()),
             Some("Renamed chat")
         );
+    }
+
+    #[test]
+    fn session_rename_ignores_stale_result_and_preserves_draft_on_failure() {
+        let (_backend, mut state) = isolated_chat_state("rename-request-id");
+        let session_id = SessionId::generate().to_string();
+        state.sessions = vec![SessionRef {
+            id: session_id.clone(),
+            title: "Original".to_string(),
+            kind: ConversationKind::Chat,
+            updated_unix: 1,
+            participant_count: 1,
+            participant_names: Vec::new(),
+        }];
+        state.session_edit_id = Some(session_id.clone());
+        state.session_title_draft = "Keep this draft".to_string();
+        state.pending_session_rename = Some(PendingSessionRename {
+            request_id: 2,
+            session_id: session_id.clone(),
+            kind: ConversationKind::Chat,
+            title: "Keep this draft".to_string(),
+        });
+        let (tx, rx) = mpsc::channel();
+        state.session_rename_rx = Some(rx);
+        tx.send(SessionRenameWorkerResult {
+            request_id: 1,
+            session_id: session_id.clone(),
+            kind: ConversationKind::Chat,
+            title: "Stale title".to_string(),
+            result: Ok(()),
+        })
+        .expect("stale result");
+        tx.send(SessionRenameWorkerResult {
+            request_id: 2,
+            session_id: session_id.clone(),
+            kind: ConversationKind::Chat,
+            title: "Keep this draft".to_string(),
+            result: Err("recoverable SIFS failure".to_string()),
+        })
+        .expect("current result");
+
+        assert!(!state.pump_session_rename());
+        assert_eq!(
+            state
+                .pending_session_rename
+                .as_ref()
+                .map(|pending| pending.request_id),
+            Some(2)
+        );
+        assert_eq!(state.session_title_draft, "Keep this draft");
+        assert!(state.pump_session_rename());
+        assert!(state.pending_session_rename.is_none());
+        assert_eq!(state.session_title_draft, "Keep this draft");
+        assert_eq!(
+            state
+                .session_rename_error
+                .as_ref()
+                .map(|error| error.detail.as_str()),
+            Some("recoverable SIFS failure")
+        );
+        assert_eq!(state.sessions[0].title, "Original");
     }
 
     #[test]
@@ -15300,6 +16345,10 @@ mod tests {
 
         state.set_channel_agent_idx(1);
         state.add_selected_agent_to_channel();
+        assert!(state.pending_channel_config.is_some());
+        wait_for(&mut state, Duration::from_secs(5), |state| {
+            state.pending_channel_config.is_none() && !state.session_list_loading
+        });
 
         let parsed = channel_id.parse::<SessionId>().expect("channel id");
         let channel = state
@@ -15352,6 +16401,9 @@ mod tests {
         let channel_id = state.session_id.clone();
         state.set_channel_agent_idx(1);
         state.add_selected_agent_to_channel();
+        wait_for(&mut state, Duration::from_secs(5), |state| {
+            state.pending_channel_config.is_none() && !state.session_list_loading
+        });
 
         let coding_participant_id = state
             .channel_agent_refs(&channel_id)
@@ -15361,6 +16413,10 @@ mod tests {
             .expect("coding participant listed");
 
         state.remove_channel_agent(&channel_id, &coding_participant_id);
+        assert!(state.pending_channel_config.is_some());
+        wait_for(&mut state, Duration::from_secs(5), |state| {
+            state.pending_channel_config.is_none() && !state.session_list_loading
+        });
 
         let parsed = channel_id.parse::<SessionId>().expect("channel id");
         let channel = state
@@ -15383,6 +16439,59 @@ mod tests {
                 .find(|session| session.id == channel_id)
                 .map(|session| session.participant_count),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn channel_config_ignores_stale_result_and_surfaces_current_error() {
+        let (_backend, mut state) = isolated_chat_state("channel-config-request-id");
+        let channel_id = SessionId::generate().to_string();
+        state.pending_channel_config = Some(PendingChannelConfig {
+            request_id: 9,
+            channel_id: channel_id.clone(),
+            action: "adding coding-agent".to_string(),
+        });
+        let (tx, rx) = mpsc::channel();
+        state.channel_config_rx = Some(rx);
+        tx.send(ChannelConfigWorkerResult {
+            request_id: 8,
+            channel_id: channel_id.clone(),
+            action: "removing old-agent".to_string(),
+            success_notice: "stale success".to_string(),
+            result: Ok(()),
+        })
+        .expect("stale result");
+        tx.send(ChannelConfigWorkerResult {
+            request_id: 9,
+            channel_id: channel_id.clone(),
+            action: "adding coding-agent".to_string(),
+            success_notice: "current success".to_string(),
+            result: Err("authorization can be retried".to_string()),
+        })
+        .expect("current result");
+
+        assert!(!state.pump_channel_config());
+        assert_eq!(
+            state
+                .pending_channel_config
+                .as_ref()
+                .map(|pending| pending.request_id),
+            Some(9)
+        );
+        assert!(state.pump_channel_config());
+        assert!(state.pending_channel_config.is_none());
+        assert_eq!(
+            state
+                .channel_config_error
+                .as_ref()
+                .map(|error| error.detail.as_str()),
+            Some("authorization can be retried")
+        );
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("authorization can be retried"))
         );
     }
 
@@ -18054,8 +19163,11 @@ mod tests {
 
         state.retry_chat_list_with_waker(None);
 
-        assert!(!state.session_list_loading);
-        assert!(state.session_list_rx.is_none());
+        assert!(state.session_list_loading);
+        assert!(state.session_list_rx.is_some());
+        wait_for(&mut state, Duration::from_secs(5), |state| {
+            !state.session_list_loading
+        });
         assert!(state.session_list_started_at.is_none());
         assert!(!state.session_list_slow_notice_shown);
         assert!(!state.session_list_details_open);
@@ -18068,6 +19180,32 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_chat_list_refresh_uses_worker_and_coalesces_background_completion() {
+        let (_backend, mut state) = isolated_chat_state("local-list-worker");
+        state.session_id = SessionId::generate().to_string();
+        let background_session_id = SessionId::generate().to_string();
+
+        state.start_session_list_load(None);
+        assert!(state.session_list_loading);
+        assert!(state.session_list_rx.is_some());
+        assert!(state.route_background_session_event(
+            &background_session_id,
+            ChatEvent::TurnDone {
+                session_id: background_session_id.clone(),
+            },
+        ));
+        assert!(
+            state.session_list_refresh_queued,
+            "background completion should coalesce a follow-up worker refresh"
+        );
+
+        wait_for(&mut state, Duration::from_secs(5), |state| {
+            !state.session_list_loading && !state.session_list_refresh_queued
+        });
+        assert!(state.session_list_rx.is_none());
     }
 
     #[test]
@@ -19339,7 +20477,10 @@ mod tests {
             ActivityTone::Warn,
         );
 
-        state.retry_chat_list();
+        state.retry_chat_list_with_waker(None);
+        wait_for(&mut state, Duration::from_secs(5), |state| {
+            !state.session_list_loading
+        });
 
         assert!(state.notice.is_none());
         assert!(
@@ -19387,7 +20528,15 @@ mod tests {
             .with_name("Retry chat list")
             .click()?;
 
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shared.chat().session_list_loading && Instant::now() < deadline {
+            shared.chat_mut().pump_session_list();
+            app.run_until_idle()?;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
         let chat = shared.chat();
+        assert!(!chat.session_list_loading, "retry worker should complete");
         assert!(chat.notice.is_none());
         assert!(chat.activity.iter().all(|entry| entry.title != "chat list"));
         assert_eq!(chat.runtime_recovery_target(), None);
@@ -20879,6 +22028,8 @@ mod tests {
             state.pump_session_list();
             state.pump_transcript_load();
             state.pump_channel_create();
+            state.pump_session_rename();
+            state.pump_channel_config();
             state.pump_delete();
             if predicate(state) {
                 return;

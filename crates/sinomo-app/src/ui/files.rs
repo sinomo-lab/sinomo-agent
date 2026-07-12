@@ -392,6 +392,12 @@ enum FilesOperationFailure {
 
 type FilesOperationResult = Result<FilesOperationOutcome, FilesOperationFailure>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompactFilesOverlay {
+    Commands,
+    Inspector,
+}
+
 // ---------------------------------------------------------------------------
 // State (data layer) — SIFS-backed browser snapshot + async load worker.
 // ---------------------------------------------------------------------------
@@ -435,6 +441,7 @@ pub struct FilesState {
     pending_select_path: Option<String>,
     pub scroll: f32,
     pub inspector_details_open: bool,
+    compact_overlay: Option<CompactFilesOverlay>,
     worker_tx: Option<Sender<FilesWorkerCommand>>,
     worker_rx: Option<Receiver<FilesWorkerResult>>,
     worker_result_tx: Option<Sender<FilesWorkerResult>>,
@@ -489,6 +496,7 @@ impl FilesState {
             pending_select_path: None,
             scroll: 0.0,
             inspector_details_open: false,
+            compact_overlay: None,
             worker_tx: None,
             worker_rx: None,
             worker_result_tx: None,
@@ -522,6 +530,35 @@ impl FilesState {
                 task.source == FilesSourceKind::Sifs && task.state == FilesTaskState::Failed
             })
             .map(|task| format!("{} failed: {}", task.title, task.detail))
+    }
+
+    /// Replace endpoint-bound SIFS state after the daemon connection recovers or moves. Local
+    /// browsing remains untouched; an already-open SIFS surface immediately retries on the new
+    /// worker while a never-opened surface stays lazy.
+    pub(crate) fn rebind_backend(
+        &mut self,
+        backend: &Backend,
+        waker: Option<sui::UiHandle>,
+    ) -> bool {
+        let daemon_address = backend.connection.daemon_address().map(str::to_string);
+        let daemon_unavailable_detail = backend.connection_issue_detail();
+        let clustered = backend.connection.is_clustered();
+        if self.daemon_address == daemon_address
+            && self.daemon_unavailable_detail == daemon_unavailable_detail
+            && self.clustered == clustered
+        {
+            return false;
+        }
+
+        let reopen_sifs = self.source == FilesSourceKind::Sifs && self.loaded;
+        self.daemon_address = daemon_address;
+        self.daemon_unavailable_detail = daemon_unavailable_detail;
+        self.clustered = clustered;
+        self.reset_for_retry();
+        if reopen_sifs {
+            self.ensure_loaded(waker);
+        }
+        true
     }
 
     fn ensure_loaded(&mut self, waker: Option<sui::UiHandle>) {
@@ -703,7 +740,7 @@ impl FilesState {
         }
     }
 
-    fn retry(&mut self, waker: Option<sui::UiHandle>) {
+    pub(crate) fn retry(&mut self, waker: Option<sui::UiHandle>) {
         self.reset_for_retry();
         self.ensure_loaded(waker);
     }
@@ -1361,6 +1398,7 @@ impl FilesState {
     }
 
     fn open_action_prompt(&mut self, kind: FileActionPromptKind) {
+        self.compact_overlay = None;
         let targets = if file_prompt_uses_marked_targets(kind) {
             self.marked_targets()
         } else {
@@ -1433,6 +1471,15 @@ impl FilesState {
 
     fn close_action_prompt(&mut self) {
         self.action_prompt = None;
+    }
+
+    fn open_compact_overlay(&mut self, overlay: CompactFilesOverlay) {
+        self.action_prompt = None;
+        self.compact_overlay = Some(overlay);
+    }
+
+    fn close_compact_overlay(&mut self) {
+        self.compact_overlay = None;
     }
 
     fn set_action_prompt_input(&mut self, input: String) {
@@ -6098,6 +6145,84 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .with_child(SizedBox::new().height(HEADER_PAD_Y))
 }
 
+/// Narrow file-manager chrome keeps the essential navigation controls visible
+/// and moves the remaining commands plus the hidden wide inspector into
+/// explicit, keyboard-focusable overlays.
+fn compact_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let back = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::ChevronLeft, "Back")
+            .size(30.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || s.files().can_go_back()
+            })
+            .on_press(move || {
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut().go_back(waker);
+            })
+    };
+    let up = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::ChevronUp, "Up")
+            .size(30.0)
+            .theme_when(clone_reader(reader))
+            .on_press(move || s.files_mut().go_up())
+    };
+    let location = {
+        let files = shared.files();
+        let theme = shared.theme();
+        let pal = palette(shared);
+        Label::new(format!("{} · {}", files.source.label(), files.path))
+            .semantic_name(format!(
+                "Current {} path {}",
+                files.source.label(),
+                files.path
+            ))
+            .style(pal.text_style(&theme, 12.0, FontWeight::MEDIUM, pal.text))
+    };
+    let commands = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::MoreHorizontal, "More file commands")
+            .size(30.0)
+            .theme_when(clone_reader(reader))
+            .selected_when({
+                let s = s.clone();
+                move || s.files().compact_overlay == Some(CompactFilesOverlay::Commands)
+            })
+            .on_press_with_ctx(move |ctx| {
+                s.files_mut()
+                    .open_compact_overlay(CompactFilesOverlay::Commands);
+                request_files_overlay_rebuild(ctx);
+            })
+    };
+    let inspector = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::FileText, "Open file inspector")
+            .size(30.0)
+            .theme_when(clone_reader(reader))
+            .selected_when({
+                let s = s.clone();
+                move || s.files().compact_overlay == Some(CompactFilesOverlay::Inspector)
+            })
+            .on_press_with_ctx(move |ctx| {
+                s.files_mut()
+                    .open_compact_overlay(CompactFilesOverlay::Inspector);
+                request_files_overlay_rebuild(ctx);
+            })
+    };
+
+    Flex::horizontal()
+        .main_gap(4.0)
+        .align_items(Alignment::Center)
+        .with_item(back, FlexItem::new().no_shrink())
+        .with_item(up, FlexItem::new().no_shrink())
+        .with_item(location, FlexItem::fill().min_width(72.0))
+        .with_item(commands, FlexItem::new().no_shrink())
+        .with_item(inspector, FlexItem::new().no_shrink())
+}
+
 // ---------------------------------------------------------------------------
 // File listing — rebuilt on navigation by `RebuildOnChange`.
 // ---------------------------------------------------------------------------
@@ -9293,6 +9418,20 @@ impl Widget for InspectorView {
             )
         };
 
+        let mut root = SemanticsNode::new(
+            ctx.widget_id(),
+            SemanticsRole::GenericContainer,
+            ctx.bounds(),
+        );
+        root.name = Some("File inspector".to_string());
+        root.description = Some(
+            selected_entry
+                .as_ref()
+                .map(|entry| format!("Actions and storage details for {}", entry.path))
+                .unwrap_or_else(|| "File actions and storage details".to_string()),
+        );
+        ctx.push(root);
+
         if let Some(entry) = &selected_entry {
             for (index, action) in selected_actions.into_iter().enumerate() {
                 let mut node = SemanticsNode::new(
@@ -9811,6 +9950,27 @@ fn header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     WidgetPadding::horizontal(CONTENT_PAD, rebuilt).fill_child_height()
 }
 
+fn compact_header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    let rebuilt = RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || {
+                let files = s.files();
+                (
+                    files.source,
+                    files.path.clone(),
+                    files.history_back.len(),
+                    files.loading,
+                )
+            }
+        },
+        move |_key| WidgetPod::new(compact_header(&s, &r)),
+    );
+    WidgetPadding::horizontal(8.0, rebuilt).fill_child_height()
+}
+
 /// The file-list column wrapped so it rebuilds (rows) whenever the path changes. A shared
 /// `scroll_state` is threaded so the position is consistent across the wide/narrow swap.
 fn list_column(
@@ -9881,14 +10041,15 @@ fn wide_pod(
     )
 }
 
-/// Narrow: header docked on top, list-only body fills (the inspector is hidden).
+/// Narrow: compact header + list body. Commands and the inspector remain
+/// reachable through overlays owned by `FilesDialogHost`.
 fn narrow_pod(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -> WidgetPod {
     let header = Stack::vertical()
         .alignment(Alignment::Stretch)
         .with_child(
             SizedBox::new()
                 .height(HEADER_H)
-                .with_child(header_bar(shared, reader)),
+                .with_child(compact_header_bar(shared, reader)),
         )
         .with_child(Separator::horizontal().theme_when(clone_reader(reader)));
     WidgetPod::new(
@@ -9896,6 +10057,301 @@ fn narrow_pod(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState)
             .top(HEADER_H + 1.0, header)
             .bottom(FILES_STATUS_H, files_status_bar(shared, reader)),
     )
+}
+
+fn compact_command_button<E, F>(
+    label: impl Into<String>,
+    reader: &ThemeReader,
+    enabled: E,
+    on_press: F,
+) -> sui::Button
+where
+    E: Fn() -> bool + 'static,
+    F: FnMut(&mut EventCtx) + 'static,
+{
+    sui::Button::new(label)
+        .min_height(34.0)
+        .theme_when(clone_reader(reader))
+        .enabled_when(enabled)
+        .on_press_with_ctx(on_press)
+}
+
+fn compact_files_commands(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let forward = {
+        let enabled = shared.clone();
+        let action = shared.clone();
+        compact_command_button(
+            "Forward",
+            reader,
+            move || enabled.files().can_go_forward(),
+            move |ctx| {
+                let waker = { action.borrow().waker.clone() };
+                let mut files = action.files_mut();
+                files.close_compact_overlay();
+                files.go_forward(waker);
+                drop(files);
+                request_files_overlay_rebuild(ctx);
+            },
+        )
+    };
+    let refresh = {
+        let enabled = shared.clone();
+        let action = shared.clone();
+        compact_command_button(
+            "Refresh current folder",
+            reader,
+            move || !enabled.files().loading,
+            move |ctx| {
+                let waker = { action.borrow().waker.clone() };
+                let mut files = action.files_mut();
+                files.close_compact_overlay();
+                files.refresh(waker);
+                drop(files);
+                request_files_overlay_rebuild(ctx);
+            },
+        )
+    };
+    let browse_sifs = {
+        let enabled = shared.clone();
+        let action = shared.clone();
+        compact_command_button(
+            "Browse SIFS",
+            reader,
+            move || {
+                let files = enabled.files();
+                files.source != FilesSourceKind::Sifs && !files.loading
+            },
+            move |ctx| {
+                let waker = { action.borrow().waker.clone() };
+                let mut files = action.files_mut();
+                files.close_compact_overlay();
+                files.switch_source(FilesSourceKind::Sifs, waker);
+                drop(files);
+                request_files_overlay_rebuild(ctx);
+            },
+        )
+    };
+    let browse_local = {
+        let enabled = shared.clone();
+        let action = shared.clone();
+        compact_command_button(
+            "Browse local files",
+            reader,
+            move || {
+                let files = enabled.files();
+                files.source != FilesSourceKind::Local && !files.loading
+            },
+            move |ctx| {
+                let waker = { action.borrow().waker.clone() };
+                let mut files = action.files_mut();
+                files.close_compact_overlay();
+                files.switch_source(FilesSourceKind::Local, waker);
+                drop(files);
+                request_files_overlay_rebuild(ctx);
+            },
+        )
+    };
+    let go_to = {
+        let enabled = shared.clone();
+        let action = shared.clone();
+        compact_command_button(
+            "Go to path",
+            reader,
+            move || !enabled.files().loading,
+            move |ctx| {
+                action
+                    .files_mut()
+                    .open_action_prompt(FileActionPromptKind::GoTo);
+                request_files_overlay_rebuild(ctx);
+            },
+        )
+    };
+    let new_file = {
+        let enabled = shared.clone();
+        let action = shared.clone();
+        compact_command_button(
+            "New file",
+            reader,
+            move || enabled.files().can_modify_current_location(),
+            move |ctx| {
+                action
+                    .files_mut()
+                    .open_action_prompt(FileActionPromptKind::NewFile);
+                request_files_overlay_rebuild(ctx);
+            },
+        )
+    };
+    let new_folder = {
+        let enabled = shared.clone();
+        let action = shared.clone();
+        compact_command_button(
+            "New folder",
+            reader,
+            move || enabled.files().can_modify_current_location(),
+            move |ctx| {
+                action
+                    .files_mut()
+                    .open_action_prompt(FileActionPromptKind::NewFolder);
+                request_files_overlay_rebuild(ctx);
+            },
+        )
+    };
+    let copy = {
+        let enabled = shared.clone();
+        let action = shared.clone();
+        compact_command_button(
+            "Copy to",
+            reader,
+            move || {
+                let files = enabled.files();
+                files.can_modify_current_location()
+                    && (files.marked_count() > 0 || files.selected_entry().is_some())
+            },
+            move |ctx| {
+                let kind = if action.files().marked_count() > 0 {
+                    FileActionPromptKind::CopySelected
+                } else {
+                    FileActionPromptKind::Copy
+                };
+                action.files_mut().open_action_prompt(kind);
+                request_files_overlay_rebuild(ctx);
+            },
+        )
+    };
+    let move_to = {
+        let enabled = shared.clone();
+        let action = shared.clone();
+        compact_command_button(
+            "Move to",
+            reader,
+            move || {
+                let files = enabled.files();
+                files.can_modify_current_location()
+                    && (files.marked_count() > 0 || files.selected_entry().is_some())
+            },
+            move |ctx| {
+                let kind = if action.files().marked_count() > 0 {
+                    FileActionPromptKind::MoveSelected
+                } else {
+                    FileActionPromptKind::Move
+                };
+                action.files_mut().open_action_prompt(kind);
+                request_files_overlay_rebuild(ctx);
+            },
+        )
+    };
+    let refresh_placement = {
+        let enabled = shared.clone();
+        let action = shared.clone();
+        compact_command_button(
+            "Refresh placement",
+            reader,
+            move || {
+                let files = enabled.files();
+                files.source == FilesSourceKind::Sifs
+                    && files.can_modify_current_location()
+                    && files.selected_entry().is_some()
+            },
+            move |ctx| {
+                let waker = { action.borrow().waker.clone() };
+                let mut files = action.files_mut();
+                files.close_compact_overlay();
+                files.start_placement_refresh(waker);
+                drop(files);
+                request_files_overlay_rebuild(ctx);
+            },
+        )
+    };
+    let repair = {
+        let enabled = shared.clone();
+        let action = shared.clone();
+        compact_command_button(
+            "Repair replicas",
+            reader,
+            move || {
+                let files = enabled.files();
+                files.source == FilesSourceKind::Sifs
+                    && files.can_modify_current_location()
+                    && files.selected_entry().is_some()
+            },
+            move |ctx| {
+                let waker = { action.borrow().waker.clone() };
+                let mut files = action.files_mut();
+                files.close_compact_overlay();
+                files.start_replica_repair(waker);
+                drop(files);
+                request_files_overlay_rebuild(ctx);
+            },
+        )
+    };
+    let rename = {
+        let enabled = shared.clone();
+        let action = shared.clone();
+        compact_command_button(
+            "Rename",
+            reader,
+            move || {
+                let files = enabled.files();
+                files.can_modify_current_location() && files.selected_entry().is_some()
+            },
+            move |ctx| {
+                action
+                    .files_mut()
+                    .open_action_prompt(FileActionPromptKind::Rename);
+                request_files_overlay_rebuild(ctx);
+            },
+        )
+    };
+    let delete = {
+        let enabled = shared.clone();
+        let action = shared.clone();
+        compact_command_button(
+            "Delete selected item",
+            reader,
+            move || {
+                let files = enabled.files();
+                files.can_modify_current_location()
+                    && (files.marked_count() > 0 || files.selected_entry().is_some())
+            },
+            move |ctx| {
+                let kind = if action.files().marked_count() > 0 {
+                    FileActionPromptKind::DeleteSelected
+                } else {
+                    FileActionPromptKind::Delete
+                };
+                action.files_mut().open_action_prompt(kind);
+                request_files_overlay_rebuild(ctx);
+            },
+        )
+    };
+
+    let content = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(6.0)
+        .with_child(forward)
+        .with_child(refresh)
+        .with_child(browse_sifs)
+        .with_child(browse_local)
+        .with_child(go_to)
+        .with_child(new_file)
+        .with_child(new_folder)
+        .with_child(copy)
+        .with_child(move_to)
+        .with_child(refresh_placement)
+        .with_child(repair)
+        .with_child(rename)
+        .with_child(delete);
+    ScrollView::vertical(WidgetPadding::new(
+        Insets {
+            left: 2.0,
+            top: 2.0,
+            right: 8.0,
+            bottom: 2.0,
+        },
+        content,
+    ))
+    .name("Compact file command overflow")
+    .viewport_width_hint(true)
 }
 
 fn files_action_dialog_signature(shared: &Shared) -> String {
@@ -10088,6 +10544,73 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     ))
 }
 
+fn files_dialog_signature(shared: &Shared) -> String {
+    let action = files_action_dialog_signature(shared);
+    if action != "closed" {
+        return format!("action|{action}");
+    }
+    let files = shared.files();
+    let Some(overlay) = files.compact_overlay else {
+        return "closed".to_string();
+    };
+    format!(
+        "compact|{overlay:?}|{:?}|{}|{}|{:?}|{}|{}|{}",
+        files.source,
+        files.path,
+        files.list_revision,
+        files.selected,
+        files.details_loading,
+        files.preview_loading,
+        files.inspector_details_open
+    )
+}
+
+fn compact_files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
+    let overlay = shared.files().compact_overlay?;
+    let (title, description, selected) = match overlay {
+        CompactFilesOverlay::Commands => (
+            "File commands",
+            "Commands hidden from the compact file toolbar",
+            0,
+        ),
+        CompactFilesOverlay::Inspector => (
+            "File inspector",
+            "Preview, placement, metadata, recovery actions, and file tasks",
+            1,
+        ),
+    };
+    let inspector_scroll_state = ScrollState::new();
+    let body = SwitchView::new()
+        .selected(selected)
+        .with_child(
+            SizedBox::new()
+                .height(500.0)
+                .with_child(compact_files_commands(shared, reader)),
+        )
+        .with_child(SizedBox::new().height(520.0).with_child(inspector(
+            shared,
+            reader,
+            &inspector_scroll_state,
+        )));
+    let dismiss_shared = shared.clone();
+    Some(WidgetPod::new(
+        sui::Dialog::new(title, body)
+            .theme(shared.theme())
+            .description(description)
+            .max_width(560.0)
+            .dismiss_on_scrim(true)
+            .on_dismiss(move || dismiss_shared.files_mut().close_compact_overlay()),
+    ))
+}
+
+fn files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
+    if shared.files().action_prompt.is_some() {
+        files_action_dialog(shared, reader)
+    } else {
+        compact_files_dialog(shared, reader)
+    }
+}
+
 struct FilesDialogHost {
     shared: Shared,
     reader: ThemeReader,
@@ -10113,18 +10636,18 @@ impl FilesDialogHost {
     }
 
     fn sync_dialog(&mut self) {
-        let signature = files_action_dialog_signature(&self.shared);
+        let signature = files_dialog_signature(&self.shared);
         if signature == self.dialog_signature {
             return;
         }
         self.dialog_signature = signature;
-        self.dialog = files_action_dialog(&self.shared, &self.reader);
+        self.dialog = files_dialog(&self.shared, &self.reader);
     }
 }
 
 impl Widget for FilesDialogHost {
     fn event(&mut self, ctx: &mut EventCtx, _event: &Event) {
-        let signature = files_action_dialog_signature(&self.shared);
+        let signature = files_dialog_signature(&self.shared);
         if signature != self.dialog_signature {
             ctx.request_measure();
             ctx.request_paint();
@@ -10369,6 +10892,99 @@ mod tests {
             metadata_shard_count: 3,
             repair_attempt_count: 18,
         }
+    }
+
+    #[test]
+    fn compact_files_header_opens_command_overflow() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let reader: ThemeReader = {
+            let s = shared.clone();
+            Rc::new(move || s.theme())
+        };
+        let body = SizedBox::new()
+            .height(HEADER_H)
+            .with_child(compact_header_bar(&shared, &reader));
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Compact files commands")
+                    .root(FilesDialogHost::new(
+                        body,
+                        shared.clone(),
+                        Rc::clone(&reader),
+                    )),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        app.run_until_idle()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("More file commands")
+            .click()?;
+        app.run_until_idle()?;
+
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Dialog)
+                .with_name("File commands")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Browse local files")
+                .count()?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compact_files_header_opens_preview_and_inspector_sheet() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let reader: ThemeReader = {
+            let s = shared.clone();
+            Rc::new(move || s.theme())
+        };
+        let body = SizedBox::new()
+            .height(HEADER_H)
+            .with_child(compact_header_bar(&shared, &reader));
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Compact files inspector")
+                    .root(FilesDialogHost::new(body, shared, Rc::clone(&reader))),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        app.run_until_idle()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open file inspector")
+            .click()?;
+        app.run_until_idle()?;
+
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Dialog)
+                .with_name("File inspector")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::ScrollView)
+                .with_name("File inspector")
+                .count()?,
+            1,
+            "compact inspector sheet should expose the same preview and recovery surface"
+        );
+        Ok(())
     }
 
     #[test]
