@@ -52,25 +52,8 @@ pub fn open_mounted_sifs_service_with_cancellation(
             message: source.to_string(),
         })?,
     };
-    data_dir
-        .ensure_root_layout()
-        .map_err(|source| DfsError::Metadata {
-            message: source.to_string(),
-        })?;
-    let cluster_paths = ClusterPaths::new(&data_dir);
-    let cluster_state = if cluster_paths.state.exists() {
-        sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths).ok()
-    } else {
-        None
-    };
-    let local_node_id = cluster_state
-        .as_ref()
-        .map(|state| state.local_node_id.clone())
-        .unwrap_or_else(fallback_dfs_node_id);
-    let peer_node_ids = cluster_state
-        .as_ref()
-        .map(cluster_dfs_peer_node_ids)
-        .unwrap_or_default();
+    let (cluster_paths, cluster_state, local_node_id, peer_node_ids) =
+        mounted_sifs_cluster_context(&data_dir)?;
     let peer_transport = Arc::new(MountedSifsPeerTransport {
         data_dir: data_dir.clone(),
         cluster_paths: cluster_paths.clone(),
@@ -85,9 +68,94 @@ pub fn open_mounted_sifs_service_with_cancellation(
     } else {
         None
     };
-    let mut service = open_cluster_dfs_service_with_peer_transports_for_nodes(
+    open_mounted_sifs_service_from_context(
         &data_dir,
         &cluster_paths,
+        cluster_state.as_ref(),
+        local_node_id,
+        peer_node_ids,
+        sync_peer_transport,
+        async_peer_transport,
+        control_plane,
+        cancellation,
+    )
+}
+
+/// Opens mounted SIFS with caller-owned DFS peer transports.
+///
+/// Daemon hosts use this entry point so browser operations share the daemon's
+/// established cluster router instead of constructing a second router inside
+/// the daemon process. Any authorized cluster node remains a DFS client; shard
+/// ownership only selects the target node for the request.
+pub fn open_mounted_sifs_service_with_peer_transports(
+    data_dir: SinomoDataDir,
+    sync_peer_transport: Arc<dyn DfsPeerTransport>,
+    async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+) -> Result<OpenedMountedSifsService, DfsError> {
+    let (cluster_paths, cluster_state, local_node_id, peer_node_ids) =
+        mounted_sifs_cluster_context(&data_dir)?;
+    open_mounted_sifs_service_from_context(
+        &data_dir,
+        &cluster_paths,
+        cluster_state.as_ref(),
+        local_node_id,
+        peer_node_ids,
+        sync_peer_transport,
+        async_peer_transport,
+        control_plane,
+        None,
+    )
+}
+
+fn mounted_sifs_cluster_context(
+    data_dir: &SinomoDataDir,
+) -> Result<
+    (
+        ClusterPaths,
+        Option<ClusterBootstrapState>,
+        NodeId,
+        Vec<NodeId>,
+    ),
+    DfsError,
+> {
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| DfsError::Metadata {
+            message: source.to_string(),
+        })?;
+    let cluster_paths = ClusterPaths::new(data_dir);
+    let cluster_state = if cluster_paths.state.exists() {
+        sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths).ok()
+    } else {
+        None
+    };
+    let local_node_id = cluster_state
+        .as_ref()
+        .map(|state| state.local_node_id.clone())
+        .unwrap_or_else(fallback_dfs_node_id);
+    let peer_node_ids = cluster_state
+        .as_ref()
+        .map(cluster_dfs_peer_node_ids)
+        .unwrap_or_default();
+    Ok((cluster_paths, cluster_state, local_node_id, peer_node_ids))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_mounted_sifs_service_from_context(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    cluster_state: Option<&ClusterBootstrapState>,
+    local_node_id: NodeId,
+    peer_node_ids: Vec<NodeId>,
+    sync_peer_transport: Arc<dyn DfsPeerTransport>,
+    async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    cancellation: Option<crate::DfsCancellationFlag>,
+) -> Result<OpenedMountedSifsService, DfsError> {
+    let mut service = open_cluster_dfs_service_with_peer_transports_for_nodes(
+        data_dir,
+        cluster_paths,
         local_node_id.clone(),
         peer_node_ids,
         sync_peer_transport,
@@ -105,36 +173,94 @@ pub fn open_mounted_sifs_service_with_cancellation(
         })?;
     Ok(OpenedMountedSifsService {
         service,
-        replica_candidates: mounted_sifs_replica_candidates(
-            &cluster_paths,
-            cluster_state.as_ref(),
+        replica_candidates: mounted_sifs_replica_candidates_from_context(
+            cluster_paths,
+            cluster_state,
             local_node_id,
         ),
     })
 }
 
-fn mounted_sifs_replica_candidates(
+fn mounted_sifs_replica_candidates_from_context(
     cluster_paths: &ClusterPaths,
     cluster_state: Option<&ClusterBootstrapState>,
     local_node_id: NodeId,
 ) -> Vec<DfsNodeId> {
-    let mut candidates = vec![local_node_id];
-    if cluster_state.is_some()
-        && let Ok(entries) = sinomo_core::kv::read_cluster_kv_prefix_entries(
-            &cluster_paths.kv_paths(),
-            content_services_prefix(),
-        )
-    {
-        for advertisement in entries
+    if cluster_state.is_none() {
+        return vec![local_node_id];
+    }
+    let advertisements = sinomo_core::kv::read_cluster_kv_prefix_entries(
+        &cluster_paths.kv_paths(),
+        content_services_prefix(),
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .filter_map(|entry| entry.decode::<DfsNodeAdvertisement>().ok());
+    mounted_sifs_content_replica_candidates(advertisements)
+}
+
+/// Returns the current content-service nodes eligible to store SIFS replicas.
+///
+/// Cluster membership grants client access but does not make a node a storage
+/// target. In an initialized cluster this therefore returns only nodes with a
+/// current `accepts_content` service advertisement. An unclustered standalone
+/// mount keeps its local-only behavior.
+pub fn discover_mounted_sifs_content_replica_candidates(
+    data_dir: &SinomoDataDir,
+) -> Result<Vec<DfsNodeId>, DfsError> {
+    let cluster_paths = ClusterPaths::new(data_dir);
+    if !cluster_paths.state.exists() {
+        return Ok(vec![fallback_dfs_node_id()]);
+    }
+    let _state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+        .map_err(DfsError::from_network)?;
+    let entries = sinomo_core::kv::read_cluster_kv_prefix_entries(
+        &cluster_paths.kv_paths(),
+        content_services_prefix(),
+    )
+    .map_err(DfsError::from)?;
+    Ok(mounted_sifs_content_replica_candidates(
+        entries
             .into_iter()
-            .filter_map(|entry| entry.decode::<DfsNodeAdvertisement>().ok())
-        {
-            if advertisement.accepts_content && !candidates.contains(&advertisement.node_id) {
-                candidates.push(advertisement.node_id);
-            }
+            .filter_map(|entry| entry.decode::<DfsNodeAdvertisement>().ok()),
+    ))
+}
+
+fn mounted_sifs_content_replica_candidates(
+    advertisements: impl IntoIterator<Item = DfsNodeAdvertisement>,
+) -> Vec<DfsNodeId> {
+    let mut candidates = Vec::new();
+    for advertisement in advertisements {
+        if advertisement.accepts_content && !candidates.contains(&advertisement.node_id) {
+            candidates.push(advertisement.node_id);
         }
     }
     candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_replica_candidates_exclude_client_only_nodes() {
+        let client = NodeId::from_legacy_named("node_mounted_sifs_client").expect("client");
+        let first_server =
+            NodeId::from_legacy_named("node_mounted_sifs_content_a").expect("first server");
+        let second_server =
+            NodeId::from_legacy_named("node_mounted_sifs_content_b").expect("second server");
+        let mut client_advertisement = DfsNodeAdvertisement::metadata(client);
+        client_advertisement.accepts_content = false;
+
+        assert_eq!(
+            mounted_sifs_content_replica_candidates([
+                client_advertisement,
+                DfsNodeAdvertisement::content(first_server.clone()),
+                DfsNodeAdvertisement::content(second_server.clone()),
+            ]),
+            vec![first_server, second_server]
+        );
+    }
 }
 
 #[derive(Clone, Debug)]
