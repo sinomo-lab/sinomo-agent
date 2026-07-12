@@ -40,8 +40,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -49,21 +50,22 @@ use sui::{
     ActionTilePaint, Alignment, ArrangeCtx, CalloutPaint, CodePanelPaint, CodeTextLine,
     CodeTextPaint, CodeTextSpan, Color, CommandButtonPaint, Constraints, ContextMenu, CustomEvent,
     DefaultTheme, DisclosureButtonPaint, Dock, EmptyStatePaint, Event, EventCtx, FixedPaneSplit,
-    Flex, FlexItem, FlexWrap, FontWeight, Icon, IconButton, IconButtonPaint, IconGlyph, Insets,
-    KeyState, Label, ListItem, ListView, MeasureCtx, MeasuredBottomDock, MenuItem, PaintCtx, Point,
-    PointerButton, PointerEventKind, RebuildOnChange, RebuildOnConstraints, Rect,
-    RichTextSourceMap, ScrollBar, ScrollDelta, ScrollState, ScrollView, SectionLabel,
-    SectionPanelPaint, SegmentedControl, SegmentedControlItem, SelectionScope, SemanticRegion,
-    SemanticTone, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue,
-    Separator, SignalMeter, Size, SizedBox, Stack, StackHostOptions, StatusBadge, Surface,
-    SurfaceBorder, SurfaceRole, SwitchView, TextArea, TextBlockPaint, TextCellPaint, TextCommand,
-    TextDocument, TextInput, TextLayout, TextLayoutRequest, TextParagraph, TextParagraphStyle,
-    TextSpan, TextStyle, TextWrap, TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor,
-    WidgetPodVisitor, containers::Padding as WidgetPadding, draw_glyph, paint_action_tile,
-    paint_callout, paint_code_lines, paint_code_panel, paint_command_button,
-    paint_disclosure_button, paint_empty_state, paint_icon_button, paint_rounded_panel,
-    paint_rounded_rect, paint_section_label_detail, paint_section_panel, paint_text_block,
-    paint_text_cell, wrap_text_lines,
+    Flex, FlexItem, FlexWrap, FontWeight, Icon, IconButton, IconButtonPaint, IconGlyph,
+    ImageHandle, ImageSource, Insets, KeyState, Label, ListItem, ListView, MeasureCtx,
+    MeasuredBottomDock, MenuItem, PaintCtx, Path, Point, PointerButton, PointerEventKind,
+    RebuildOnChange, RebuildOnConstraints, Rect, RegisteredImage, RichTextSourceMap, ScrollBar,
+    ScrollDelta, ScrollState, ScrollView, SectionLabel, SectionPanelPaint, SegmentedControl,
+    SegmentedControlItem, SelectionScope, SemanticRegion, SemanticTone, SemanticsAction,
+    SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Separator, SignalMeter, Size,
+    SizedBox, Stack, StackHostOptions, StatusBadge, Surface, SurfaceBorder, SurfaceRole,
+    SwitchView, TextArea, TextBlockPaint, TextCellPaint, TextCommand, TextDocument, TextInput,
+    TextLayout, TextLayoutRequest, TextParagraph, TextParagraphStyle, TextSpan, TextStyle,
+    TextWrap, TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    containers::Padding as WidgetPadding, draw_glyph, paint_action_tile, paint_callout,
+    paint_code_lines, paint_code_panel, paint_command_button, paint_disclosure_button,
+    paint_empty_state, paint_icon_button, paint_rounded_panel, paint_rounded_rect,
+    paint_section_label_detail, paint_section_panel, paint_text_block, paint_text_cell,
+    wrap_text_lines,
 };
 
 #[cfg(test)]
@@ -92,6 +94,10 @@ use crate::theme::Palette;
 use crate::ui::chat_render::{
     self, ChatCodeBlock, ChatMarkdownRender, ChatMarkdownStyles, ChatRichRenderBlock,
 };
+use crate::ui::media_setup::{
+    MediaAccessKind, MediaAccessState, MediaCameraPreview, MediaDeviceSelection,
+    MediaSetupShutdown, MediaSetupState, SpeakerTestState,
+};
 use crate::ui::settings::SettingsSection;
 use crate::ui::widgets;
 
@@ -99,8 +105,11 @@ use crate::ui::widgets;
 const WIDE_THRESHOLD: f32 = 620.0;
 const SIDEBAR_W: f32 = 250.0;
 const COMPACT_HEADER_H: f32 = 54.0;
-const MEDIA_CALL_H: f32 = 156.0;
+const MEDIA_CALL_H: f32 = 380.0;
 const MEDIA_CALL_COMPACT_H: f32 = 46.0;
+const CHAT_MEDIA_DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(65);
+#[cfg(not(test))]
+static CHAT_MEDIA_CAMERA_OPEN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 const PAD: f32 = 16.0;
 const SIDEBAR_ROW_H: f32 = 36.0;
 const SIDEBAR_ROW_EDIT_W: f32 = 26.0;
@@ -495,6 +504,8 @@ pub struct ChatMediaCallState {
     pub input_audio_chunks: u64,
     pub input_video_frames: u64,
     pub output_audio_chunks: u64,
+    pub microphone_level: f32,
+    pub camera_preview: Option<MediaCameraPreview>,
     pub notice: Option<String>,
 }
 
@@ -502,18 +513,46 @@ pub struct ChatMediaCallState {
 struct ChatNativeMediaRuntime {
     control_tx: mpsc::Sender<ChatMediaCallControl>,
     event_rx: Receiver<ChatMediaCallWorkerEvent>,
+    snapshots: Arc<Mutex<ChatMediaSnapshots>>,
+    cancelled: Arc<AtomicBool>,
+    microphone_enabled: Arc<AtomicBool>,
+    camera_enabled: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 #[cfg_attr(test, allow(dead_code))]
 impl ChatNativeMediaRuntime {
     fn send_control(&self, control: ChatMediaCallControl) {
+        match &control {
+            ChatMediaCallControl::SetMicEnabled(enabled) => {
+                self.microphone_enabled.store(*enabled, Ordering::Release);
+            }
+            ChatMediaCallControl::SetCameraEnabled(enabled) => {
+                self.camera_enabled.store(*enabled, Ordering::Release);
+            }
+            ChatMediaCallControl::Stop => {
+                self.cancelled.store(true, Ordering::Release);
+            }
+        }
         let _ = self.control_tx.send(control);
     }
 }
 
 impl Drop for ChatNativeMediaRuntime {
     fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
         let _ = self.control_tx.send(ChatMediaCallControl::Stop);
+        if let Some(worker) = self.worker.take() {
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                let _ = thread::Builder::new()
+                    .name("sinomo-app-media-call-reaper".to_string())
+                    .spawn(move || {
+                        let _ = worker.join();
+                    });
+            }
+        }
     }
 }
 
@@ -529,12 +568,102 @@ enum ChatMediaCallControl {
 #[derive(Debug)]
 enum ChatMediaCallWorkerEvent {
     Ready(String),
-    InputAudioChunk,
-    InputVideoFrame,
-    OutputAudioChunk,
-    Notice(String),
+    DeviceAccess(MediaAccessKind, MediaAccessState),
     Error(String),
     Done(String),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ChatMediaControlDrain {
+    stop: bool,
+    microphone_enable_requested: bool,
+    microphone_disable_requested: bool,
+    camera_enable_requested: bool,
+    camera_disable_requested: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ChatMediaDeviceTransition {
+    release: bool,
+    mark_idle: bool,
+    open: bool,
+}
+
+#[derive(Default)]
+struct ChatMediaVideoSequence {
+    next: u64,
+}
+
+impl ChatMediaVideoSequence {
+    fn assign(&mut self) -> u64 {
+        let sequence = self.next;
+        self.next = self.next.saturating_add(1);
+        sequence
+    }
+}
+
+fn chat_media_requested_input_available(
+    microphone_requested: bool,
+    microphone_open: bool,
+    camera_requested: bool,
+    camera_open: bool,
+) -> bool {
+    (microphone_requested && microphone_open)
+        || (camera_requested && camera_open)
+        || (!microphone_requested && !camera_requested)
+}
+
+fn chat_media_device_transition(
+    enabled: bool,
+    is_open: bool,
+    enable_requested: bool,
+    disable_requested: bool,
+) -> ChatMediaDeviceTransition {
+    let release = is_open && (!enabled || disable_requested);
+    ChatMediaDeviceTransition {
+        release,
+        mark_idle: disable_requested || release,
+        open: enabled && enable_requested && (!is_open || release),
+    }
+}
+
+#[derive(Default)]
+struct ChatMediaSnapshots {
+    input_audio_chunks: u64,
+    input_video_frames: u64,
+    output_audio_chunks: u64,
+    microphone_level: Option<f32>,
+    camera_preview: Option<MediaCameraPreview>,
+    notice: Option<String>,
+}
+
+impl ChatMediaSnapshots {
+    fn take(&mut self) -> Self {
+        Self {
+            input_audio_chunks: std::mem::take(&mut self.input_audio_chunks),
+            input_video_frames: std::mem::take(&mut self.input_video_frames),
+            output_audio_chunks: std::mem::take(&mut self.output_audio_chunks),
+            microphone_level: self.microphone_level.take(),
+            camera_preview: self.camera_preview.take(),
+            notice: self.notice.take(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.input_audio_chunks == 0
+            && self.input_video_frames == 0
+            && self.output_audio_chunks == 0
+            && self.microphone_level.is_none()
+            && self.camera_preview.is_none()
+            && self.notice.is_none()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatMediaCallStartConfig {
+    devices: MediaDeviceSelection,
+    mic_enabled: bool,
+    camera_enabled: bool,
 }
 
 impl Default for ChatMediaCallState {
@@ -549,6 +678,8 @@ impl Default for ChatMediaCallState {
             input_audio_chunks: 0,
             input_video_frames: 0,
             output_audio_chunks: 0,
+            microphone_level: 0.0,
+            camera_preview: None,
             notice: None,
         }
     }
@@ -920,6 +1051,8 @@ pub struct ChatState {
     expanded_tool_details: BTreeSet<String>,
     pub control: ChatControlOverview,
     pub media_call: ChatMediaCallState,
+    pub media_setup: MediaSetupState,
+    media_preview_registration: Arc<MediaPreviewRegistration>,
     media_call_runtime: Option<ChatNativeMediaRuntime>,
     media_call_details_open: bool,
     activity_panel_open: bool,
@@ -1106,6 +1239,11 @@ impl ChatState {
         let sifs_daemon = daemon_address
             .as_deref()
             .map(|address| SifsDaemonAccess::new(address, backend.app_runtime.handle()));
+        let media_setup = MediaSetupState::new(
+            backend.data_dir.clone(),
+            backend.node.node_id.clone(),
+            waker.clone(),
+        );
         let (sessions, session_list_error) = if sifs_daemon.is_some() {
             (Vec::new(), None)
         } else {
@@ -1140,6 +1278,8 @@ impl ChatState {
             expanded_tool_details: BTreeSet::new(),
             control: ChatControlOverview::default(),
             media_call: ChatMediaCallState::default(),
+            media_setup,
+            media_preview_registration: Arc::new(MediaPreviewRegistration::default()),
             media_call_runtime: None,
             media_call_details_open: false,
             activity_panel_open: false,
@@ -2320,6 +2460,15 @@ impl ChatState {
         self.session_id.clone()
     }
 
+    fn reset_session_media(&mut self) {
+        self.media_setup.stop();
+        self.media_setup.set_microphone_enabled(true);
+        self.media_setup.set_camera_enabled(true);
+        self.media_call_runtime = None;
+        self.media_call = ChatMediaCallState::default();
+        self.media_call_details_open = false;
+    }
+
     fn reset_visible_session(&mut self, session_id: String) {
         let preserved_notice = self
             .notice
@@ -2356,9 +2505,7 @@ impl ChatState {
         self.tool_chain_expanded = false;
         self.expanded_tool_details.clear();
         self.control = ChatControlOverview::default();
-        self.media_call = ChatMediaCallState::default();
-        self.media_call_runtime = None;
-        self.media_call_details_open = false;
+        self.reset_session_media();
         self.activity_panel_open = false;
         self.composer_popup = None;
         self.scroll = 0.0;
@@ -3047,9 +3194,7 @@ impl ChatState {
         self.tool_chain_expanded = false;
         self.expanded_tool_details.clear();
         self.control = ChatControlOverview::default();
-        self.media_call = ChatMediaCallState::default();
-        self.media_call_runtime = None;
-        self.media_call_details_open = false;
+        self.reset_session_media();
         self.scroll = f32::MAX;
         self.stick_bottom = true;
         self.session_edit_id = None;
@@ -3365,6 +3510,12 @@ impl ChatState {
             self.media_call.active = false;
             self.media_call.started_at = None;
             self.media_call_runtime = None;
+            self.media_setup.stop();
+            self.media_call.microphone_level = 0.0;
+            self.media_call.camera_preview = None;
+            self.media_setup.microphone_access = MediaAccessState::Idle;
+            self.media_setup.speaker_access = MediaAccessState::Idle;
+            self.media_setup.camera_access = MediaAccessState::Idle;
             self.media_call_details_open = false;
             self.media_call.notice = Some("call ended".to_string());
             self.notice = Some("media call ended".to_string());
@@ -3387,7 +3538,9 @@ impl ChatState {
             return;
         }
 
-        let (started, native_notice) = self.start_native_media_call_runtime(&provider, &model);
+        let setup_shutdown = self.media_setup.begin_shutdown();
+        let (started, native_notice) =
+            self.start_native_media_call_runtime(&provider, &model, setup_shutdown);
         if !started {
             self.media_call.active = false;
             self.media_call.started_at = None;
@@ -3395,6 +3548,7 @@ impl ChatState {
             self.media_call.notice = Some(native_notice.clone());
             self.notice = Some(format!("media call failed: {native_notice}"));
             self.push_activity("media call", native_notice, ActivityTone::Warn);
+            self.media_setup.start();
             return;
         }
 
@@ -3406,6 +3560,19 @@ impl ChatState {
         self.media_call.input_audio_chunks = 0;
         self.media_call.input_video_frames = 0;
         self.media_call.output_audio_chunks = 0;
+        self.media_call.microphone_level = 0.0;
+        self.media_call.camera_preview = None;
+        self.media_setup.microphone_access = if self.media_call.mic_enabled {
+            MediaAccessState::Checking
+        } else {
+            MediaAccessState::Idle
+        };
+        self.media_setup.speaker_access = MediaAccessState::Checking;
+        self.media_setup.camera_access = if self.media_call.camera_enabled {
+            MediaAccessState::Checking
+        } else {
+            MediaAccessState::Idle
+        };
         self.media_call.notice = Some(native_notice.clone());
         self.notice = Some("media call started".to_string());
         self.push_activity(
@@ -3415,10 +3582,16 @@ impl ChatState {
         );
     }
 
-    fn start_native_media_call_runtime(&mut self, provider: &str, model: &str) -> (bool, String) {
+    fn start_native_media_call_runtime(
+        &mut self,
+        provider: &str,
+        model: &str,
+        setup_shutdown: Option<MediaSetupShutdown>,
+    ) -> (bool, String) {
+        let start_config = self.media_call_start_config();
         #[cfg(test)]
         {
-            let _ = (provider, model);
+            let _ = (provider, model, start_config, setup_shutdown);
             self.media_call_runtime = None;
             return (true, "native media disabled in tests".to_string());
         }
@@ -3436,16 +3609,43 @@ impl ChatState {
             };
             let (event_tx, event_rx) = mpsc::channel();
             let (control_tx, control_rx) = mpsc::channel();
+            let snapshots = Arc::new(Mutex::new(ChatMediaSnapshots::default()));
+            let worker_snapshots = snapshots.clone();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let worker_cancelled = cancelled.clone();
+            let microphone_enabled = Arc::new(AtomicBool::new(start_config.mic_enabled));
+            let worker_microphone_enabled = microphone_enabled.clone();
+            let camera_enabled = Arc::new(AtomicBool::new(start_config.camera_enabled));
+            let worker_camera_enabled = camera_enabled.clone();
             let data_dir = self.data_dir.clone();
+            let worker_waker = self.ui_waker.clone();
             match thread::Builder::new()
                 .name("sinomo-app-media-call".to_string())
                 .spawn(move || {
-                    run_chat_media_call_worker(data_dir, provider_id, model, event_tx, control_rx);
+                    run_chat_media_call_worker(
+                        data_dir,
+                        provider_id,
+                        model,
+                        start_config,
+                        setup_shutdown,
+                        event_tx,
+                        control_rx,
+                        worker_snapshots,
+                        worker_cancelled,
+                        worker_microphone_enabled,
+                        worker_camera_enabled,
+                        worker_waker,
+                    );
                 }) {
-                Ok(_worker) => {
+                Ok(worker) => {
                     self.media_call_runtime = Some(ChatNativeMediaRuntime {
                         control_tx,
                         event_rx,
+                        snapshots,
+                        cancelled,
+                        microphone_enabled,
+                        camera_enabled,
+                        worker: Some(worker),
                     });
                     (true, "native media connecting".to_string())
                 }
@@ -3460,15 +3660,61 @@ impl ChatState {
         }
     }
 
-    fn pump_media_call_runtime(&mut self) -> bool {
+    fn media_call_start_config(&self) -> ChatMediaCallStartConfig {
+        ChatMediaCallStartConfig {
+            devices: self.media_setup.selection(),
+            mic_enabled: self.media_call.mic_enabled,
+            camera_enabled: self.media_call.camera_enabled,
+        }
+    }
+
+    pub(crate) fn pump_media_call_runtime(&mut self) -> bool {
+        let mut setup_changed = self.media_setup.pump();
         if !self.media_call.active {
-            return false;
+            return setup_changed;
         }
         let Some(runtime) = self.media_call_runtime.as_mut() else {
-            return false;
+            return setup_changed;
         };
+        let snapshots = runtime
+            .snapshots
+            .lock()
+            .map(|mut snapshots| snapshots.take())
+            .unwrap_or_default();
         let mut changed = false;
         let mut ended = false;
+        if !snapshots.is_empty() {
+            self.media_call.input_audio_chunks = self
+                .media_call
+                .input_audio_chunks
+                .saturating_add(snapshots.input_audio_chunks);
+            self.media_call.input_video_frames = self
+                .media_call
+                .input_video_frames
+                .saturating_add(snapshots.input_video_frames);
+            self.media_call.output_audio_chunks = self
+                .media_call
+                .output_audio_chunks
+                .saturating_add(snapshots.output_audio_chunks);
+            if let Some(level) = snapshots.microphone_level {
+                if self.media_call.mic_enabled
+                    && matches!(self.media_setup.microphone_access, MediaAccessState::Ready)
+                {
+                    self.media_call.microphone_level = level.clamp(0.0, 1.0);
+                }
+            }
+            if let Some(preview) = snapshots.camera_preview {
+                if self.media_call.camera_enabled
+                    && matches!(self.media_setup.camera_access, MediaAccessState::Ready)
+                {
+                    self.media_call.camera_preview = Some(preview);
+                }
+            }
+            if let Some(notice) = snapshots.notice {
+                self.media_call.notice = Some(notice);
+            }
+            changed = true;
+        }
         loop {
             let event = match runtime.event_rx.try_recv() {
                 Ok(event) => event,
@@ -3480,35 +3726,65 @@ impl ChatState {
             };
             changed = true;
             match event {
-                ChatMediaCallWorkerEvent::Ready(detail)
-                | ChatMediaCallWorkerEvent::Notice(detail) => {
+                ChatMediaCallWorkerEvent::Ready(detail) => {
                     self.media_call.notice = Some(detail);
                 }
-                ChatMediaCallWorkerEvent::InputAudioChunk => {
-                    self.media_call.input_audio_chunks =
-                        self.media_call.input_audio_chunks.saturating_add(1);
-                }
-                ChatMediaCallWorkerEvent::InputVideoFrame => {
-                    self.media_call.input_video_frames =
-                        self.media_call.input_video_frames.saturating_add(1);
-                }
-                ChatMediaCallWorkerEvent::OutputAudioChunk => {
-                    self.media_call.output_audio_chunks =
-                        self.media_call.output_audio_chunks.saturating_add(1);
+                ChatMediaCallWorkerEvent::DeviceAccess(kind, state) => {
+                    let ready = matches!(state, MediaAccessState::Ready);
+                    let failed = matches!(
+                        &state,
+                        MediaAccessState::PermissionDenied(_)
+                            | MediaAccessState::Busy(_)
+                            | MediaAccessState::Unavailable(_)
+                            | MediaAccessState::Unsupported(_)
+                    );
+                    match kind {
+                        MediaAccessKind::Microphone => {
+                            if failed {
+                                self.media_call.mic_enabled = false;
+                                self.media_setup.set_microphone_enabled(false);
+                            }
+                            self.media_setup.microphone_access = state;
+                            if !ready {
+                                self.media_call.microphone_level = 0.0;
+                            }
+                        }
+                        MediaAccessKind::Speaker => {
+                            self.media_setup.speaker_access = state;
+                        }
+                        MediaAccessKind::Camera => {
+                            if failed {
+                                self.media_call.camera_enabled = false;
+                                self.media_setup.set_camera_enabled(false);
+                            }
+                            self.media_setup.camera_access = state;
+                            if !ready {
+                                self.media_call.camera_preview = None;
+                            }
+                        }
+                    }
                 }
                 ChatMediaCallWorkerEvent::Error(detail) => {
                     self.media_call.active = false;
                     self.media_call.started_at = None;
+                    self.media_call.microphone_level = 0.0;
+                    self.media_call.camera_preview = None;
                     self.media_call_details_open = true;
                     self.media_call.notice = Some(format!("media call failed: {detail}"));
                     self.notice = Some(format!("media call failed: {detail}"));
                     self.push_activity("media call", detail, ActivityTone::Warn);
+                    self.media_setup.start();
                     ended = true;
                     break;
                 }
                 ChatMediaCallWorkerEvent::Done(detail) => {
                     self.media_call.active = false;
                     self.media_call.started_at = None;
+                    self.media_call.microphone_level = 0.0;
+                    self.media_call.camera_preview = None;
+                    self.media_setup.microphone_access = MediaAccessState::Idle;
+                    self.media_setup.speaker_access = MediaAccessState::Idle;
+                    self.media_setup.camera_access = MediaAccessState::Idle;
                     self.media_call_details_open = false;
                     self.media_call.notice = Some(detail);
                     ended = true;
@@ -3519,15 +3795,28 @@ impl ChatState {
         if ended {
             self.media_call_runtime = None;
         }
-        changed
+        setup_changed |= changed;
+        setup_changed
     }
 
     pub fn toggle_media_call_mic(&mut self) {
         self.media_call.mic_enabled = !self.media_call.mic_enabled;
+        self.media_setup
+            .set_microphone_enabled(self.media_call.mic_enabled);
         if let Some(runtime) = &self.media_call_runtime {
             runtime.send_control(ChatMediaCallControl::SetMicEnabled(
                 self.media_call.mic_enabled,
             ));
+        }
+        if !self.media_call.mic_enabled {
+            self.media_call.microphone_level = 0.0;
+        }
+        if self.media_call.active {
+            self.media_setup.microphone_access = if self.media_call.mic_enabled {
+                MediaAccessState::Checking
+            } else {
+                MediaAccessState::Idle
+            };
         }
         let detail = if self.media_call.mic_enabled {
             "microphone enabled"
@@ -3540,10 +3829,22 @@ impl ChatState {
 
     pub fn toggle_media_call_camera(&mut self) {
         self.media_call.camera_enabled = !self.media_call.camera_enabled;
+        self.media_setup
+            .set_camera_enabled(self.media_call.camera_enabled);
         if let Some(runtime) = &self.media_call_runtime {
             runtime.send_control(ChatMediaCallControl::SetCameraEnabled(
                 self.media_call.camera_enabled,
             ));
+        }
+        if !self.media_call.camera_enabled {
+            self.media_call.camera_preview = None;
+        }
+        if self.media_call.active {
+            self.media_setup.camera_access = if self.media_call.camera_enabled {
+                MediaAccessState::Checking
+            } else {
+                MediaAccessState::Idle
+            };
         }
         let detail = if self.media_call.camera_enabled {
             "camera enabled"
@@ -3556,6 +3857,41 @@ impl ChatState {
 
     pub fn toggle_media_call_details(&mut self) {
         self.media_call_details_open = !self.media_call_details_open;
+        if !self.media_call.active {
+            if self.media_call_details_open {
+                self.media_setup.start();
+            } else {
+                self.media_setup.stop();
+            }
+        }
+    }
+
+    pub(crate) fn sync_media_setup_visibility(&mut self, chat_visible: bool) -> bool {
+        if self.media_call.active {
+            return false;
+        }
+        let should_run = chat_visible && self.media_call_details_open;
+        if should_run == self.media_setup.is_running() {
+            return false;
+        }
+        if should_run {
+            self.media_setup.start();
+        } else {
+            self.media_setup.stop();
+        }
+        true
+    }
+
+    /// The composer voice affordance opens a preflight setup before the first
+    /// call, and remains a one-click hang-up while a call is live.
+    pub fn activate_media_call_control(&mut self) {
+        if self.media_call.active {
+            self.toggle_media_call();
+        } else {
+            self.media_call_details_open = true;
+            self.media_call.notice = Some("choose devices, check levels, then start".to_string());
+            self.media_setup.start();
+        }
     }
 
     fn media_call_details_visible(&self) -> bool {
@@ -5750,9 +6086,36 @@ fn run_chat_media_call_worker(
     data_dir: Arc<SinomoDataDir>,
     provider_id: String,
     model: String,
+    mut start_config: ChatMediaCallStartConfig,
+    setup_shutdown: Option<MediaSetupShutdown>,
     event_tx: mpsc::Sender<ChatMediaCallWorkerEvent>,
     control_rx: Receiver<ChatMediaCallControl>,
+    snapshots: Arc<Mutex<ChatMediaSnapshots>>,
+    cancelled: Arc<AtomicBool>,
+    microphone_requested: Arc<AtomicBool>,
+    camera_requested: Arc<AtomicBool>,
+    waker: Option<sui::UiHandle>,
 ) {
+    if let Some(shutdown) = setup_shutdown {
+        shutdown.wait();
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return;
+    }
+    if drain_chat_media_controls(
+        &control_rx,
+        &mut start_config.mic_enabled,
+        &mut start_config.camera_enabled,
+    )
+    .stop
+    {
+        let _ = send_chat_media_call_event(
+            &event_tx,
+            &waker,
+            ChatMediaCallWorkerEvent::Done("call ended".to_string()),
+        );
+        return;
+    }
     let result_tx = event_tx.clone();
     let result = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -5763,18 +6126,176 @@ fn run_chat_media_call_worker(
                 data_dir,
                 provider_id,
                 model,
+                start_config,
                 event_tx,
                 control_rx,
+                snapshots,
+                cancelled,
+                microphone_requested,
+                camera_requested,
+                waker.clone(),
             ))
         });
     match result {
         Ok(()) => {
-            let _ = result_tx.send(ChatMediaCallWorkerEvent::Done("call ended".to_string()));
+            let _ = send_chat_media_call_event(
+                &result_tx,
+                &waker,
+                ChatMediaCallWorkerEvent::Done("call ended".to_string()),
+            );
         }
         Err(error) => {
-            let _ = result_tx.send(ChatMediaCallWorkerEvent::Error(error));
+            let _ = send_chat_media_call_event(
+                &result_tx,
+                &waker,
+                ChatMediaCallWorkerEvent::Error(error),
+            );
         }
     }
+}
+
+#[cfg(not(test))]
+async fn await_chat_media_operation<F, T, W>(
+    future: F,
+    cancelled: &AtomicBool,
+    mut on_wait: W,
+) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+    W: FnMut(),
+{
+    tokio::pin!(future);
+    loop {
+        on_wait();
+        if cancelled.load(Ordering::Acquire) {
+            return None;
+        }
+        tokio::select! {
+            result = &mut future => return Some(result),
+            _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+        }
+    }
+}
+
+/// Run a potentially blocking OS device/permission open away from the call
+/// worker. Cancellation drops the result receiver immediately; a late device
+/// handle is then dropped on the opener thread instead of reviving a closed
+/// call. The underlying native camera permission wait is itself bounded.
+enum ChatMediaDeviceOpen<T> {
+    Completed(Result<T, String>),
+    Disabled,
+    Cancelled,
+}
+
+async fn await_chat_media_device_open<T, F, W>(
+    label: &'static str,
+    cancelled: &AtomicBool,
+    device_requested: Option<&AtomicBool>,
+    open: F,
+    mut on_wait: W,
+) -> ChatMediaDeviceOpen<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    W: FnMut(),
+{
+    on_wait();
+    if cancelled.load(Ordering::Acquire) {
+        return ChatMediaDeviceOpen::Cancelled;
+    }
+    if device_requested.is_some_and(|requested| !requested.load(Ordering::Acquire)) {
+        return ChatMediaDeviceOpen::Disabled;
+    }
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    if let Err(error) = thread::Builder::new()
+        .name(format!("sinomo-app-{label}-open"))
+        .spawn(move || {
+            let _ = result_tx.send(open());
+        })
+    {
+        if cancelled.load(Ordering::Acquire) {
+            return ChatMediaDeviceOpen::Cancelled;
+        }
+        if device_requested.is_some_and(|requested| !requested.load(Ordering::Acquire)) {
+            return ChatMediaDeviceOpen::Disabled;
+        }
+        return ChatMediaDeviceOpen::Completed(Err(format!(
+            "{label} open worker failed to start: {error}"
+        )));
+    }
+
+    let started = Instant::now();
+    loop {
+        on_wait();
+        if cancelled.load(Ordering::Acquire) {
+            return ChatMediaDeviceOpen::Cancelled;
+        }
+        if device_requested.is_some_and(|requested| !requested.load(Ordering::Acquire)) {
+            return ChatMediaDeviceOpen::Disabled;
+        }
+        match result_rx.try_recv() {
+            Ok(result) => {
+                on_wait();
+                if cancelled.load(Ordering::Acquire) {
+                    drop(result);
+                    return ChatMediaDeviceOpen::Cancelled;
+                }
+                if device_requested.is_some_and(|requested| !requested.load(Ordering::Acquire)) {
+                    drop(result);
+                    return ChatMediaDeviceOpen::Disabled;
+                }
+                return ChatMediaDeviceOpen::Completed(result);
+            }
+            Err(TryRecvError::Disconnected) => {
+                return ChatMediaDeviceOpen::Completed(Err(format!("{label} open worker stopped")));
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+        if started.elapsed() >= CHAT_MEDIA_DEVICE_OPEN_TIMEOUT {
+            return ChatMediaDeviceOpen::Completed(Err(format!("{label} open timed out")));
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn open_chat_media_device<T, F, W>(
+    kind: MediaAccessKind,
+    label: &'static str,
+    cancelled: &AtomicBool,
+    device_requested: Option<&AtomicBool>,
+    event_tx: &mpsc::Sender<ChatMediaCallWorkerEvent>,
+    waker: &Option<sui::UiHandle>,
+    open: F,
+    on_wait: W,
+) -> ChatMediaDeviceOpen<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    W: FnMut(),
+{
+    let _ = send_chat_media_call_event(
+        event_tx,
+        waker,
+        ChatMediaCallWorkerEvent::DeviceAccess(kind, MediaAccessState::Checking),
+    );
+    let outcome =
+        await_chat_media_device_open(label, cancelled, device_requested, open, on_wait).await;
+    let state = match &outcome {
+        ChatMediaDeviceOpen::Completed(Ok(_)) => Some(MediaAccessState::Ready),
+        ChatMediaDeviceOpen::Completed(Err(detail)) => {
+            Some(chat_media_access_failure(detail.clone()))
+        }
+        ChatMediaDeviceOpen::Disabled => Some(MediaAccessState::Idle),
+        ChatMediaDeviceOpen::Cancelled => None,
+    };
+    if let Some(state) = state {
+        let _ = send_chat_media_call_event(
+            event_tx,
+            waker,
+            ChatMediaCallWorkerEvent::DeviceAccess(kind, state),
+        );
+    }
+    outcome
 }
 
 #[cfg(not(test))]
@@ -5782,9 +6303,20 @@ async fn run_chat_media_call_async(
     data_dir: Arc<SinomoDataDir>,
     provider_id: String,
     model: String,
+    start_config: ChatMediaCallStartConfig,
     event_tx: mpsc::Sender<ChatMediaCallWorkerEvent>,
     control_rx: Receiver<ChatMediaCallControl>,
+    snapshots: Arc<Mutex<ChatMediaSnapshots>>,
+    cancelled: Arc<AtomicBool>,
+    microphone_requested: Arc<AtomicBool>,
+    camera_requested: Arc<AtomicBool>,
+    waker: Option<sui::UiHandle>,
 ) -> Result<(), String> {
+    let ChatMediaCallStartConfig {
+        devices: device_selection,
+        mut mic_enabled,
+        mut camera_enabled,
+    } = start_config;
     let provider = sinomo_lm::RealtimeAudioProvider::from_id(&provider_id)
         .ok_or_else(|| format!("unsupported realtime provider `{provider_id}`"))?;
     let model = if model.trim().is_empty() {
@@ -5796,93 +6328,348 @@ async fn run_chat_media_call_async(
     config.turn_detection = sinomo_lm::RealtimeAudioTurnDetection::SemanticVad;
     config.api_key = chat_media_realtime_api_key(&data_dir, provider)?;
 
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    if drain_chat_media_controls(&control_rx, &mut mic_enabled, &mut camera_enabled).stop {
+        return Ok(());
+    }
+
+    let mut microphone_config = sinomo_audio::NativeAudioCaptureConfig::new(
+        config.input_sample_rate_hz,
+        app_native_audio_format(config.input_format),
+    );
+    microphone_config.device = device_selection.microphone.clone();
+    let camera_config = sinomo_video::NativeVideoCaptureConfig {
+        device: device_selection.camera.clone(),
+        ..Default::default()
+    };
+    let mut speaker_config = sinomo_audio::NativeSpeakerPlaybackConfig::new(
+        config.output_sample_rate_hz,
+        app_native_audio_format(config.output_format),
+    );
+    speaker_config.device = device_selection.speaker;
+
     let mut issues = Vec::new();
-    let mut microphone = {
-        let capture_config = sinomo_audio::NativeAudioCaptureConfig::new(
-            config.input_sample_rate_hz,
-            app_native_audio_format(config.input_format),
-        );
-        match sinomo_audio::start_native_microphone_capture(capture_config) {
-            Ok(capture) => Some(capture),
-            Err(error) => {
-                issues.push(format!("mic unavailable: {error}"));
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let mut microphone = if mic_enabled {
+        let open_config = microphone_config.clone();
+        match open_chat_media_device(
+            MediaAccessKind::Microphone,
+            "microphone",
+            &cancelled,
+            Some(&microphone_requested),
+            &event_tx,
+            &waker,
+            move || open_chat_media_microphone(&open_config),
+            || {},
+        )
+        .await
+        {
+            ChatMediaDeviceOpen::Cancelled => return Ok(()),
+            ChatMediaDeviceOpen::Disabled => {
+                mic_enabled = false;
+                None
+            }
+            ChatMediaDeviceOpen::Completed(Ok(capture)) => Some(capture),
+            ChatMediaDeviceOpen::Completed(Err(detail)) => {
+                issues.push(detail);
                 None
             }
         }
+    } else {
+        let _ = send_chat_media_call_event(
+            &event_tx,
+            &waker,
+            ChatMediaCallWorkerEvent::DeviceAccess(
+                MediaAccessKind::Microphone,
+                MediaAccessState::Idle,
+            ),
+        );
+        None
     };
-    let mut camera = match sinomo_video::start_native_camera_capture(Default::default()) {
-        Ok(capture) => Some(capture),
-        Err(error) => {
-            issues.push(format!("camera unavailable: {error}"));
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let mut camera = if camera_enabled {
+        let open_config = camera_config.clone();
+        match open_chat_media_device(
+            MediaAccessKind::Camera,
+            "camera",
+            &cancelled,
+            Some(&camera_requested),
+            &event_tx,
+            &waker,
+            move || open_chat_media_camera(&open_config),
+            || {
+                release_chat_media_microphone_if_unrequested(
+                    &microphone_requested,
+                    &mut microphone,
+                    &event_tx,
+                    &snapshots,
+                    &waker,
+                );
+            },
+        )
+        .await
+        {
+            ChatMediaDeviceOpen::Cancelled => return Ok(()),
+            ChatMediaDeviceOpen::Disabled => {
+                camera_enabled = false;
+                None
+            }
+            ChatMediaDeviceOpen::Completed(Ok(capture)) => Some(capture),
+            ChatMediaDeviceOpen::Completed(Err(detail)) => {
+                issues.push(detail);
+                None
+            }
+        }
+    } else {
+        let _ = send_chat_media_call_event(
+            &event_tx,
+            &waker,
+            ChatMediaCallWorkerEvent::DeviceAccess(MediaAccessKind::Camera, MediaAccessState::Idle),
+        );
+        None
+    };
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let speaker = match open_chat_media_device(
+        MediaAccessKind::Speaker,
+        "speaker",
+        &cancelled,
+        None,
+        &event_tx,
+        &waker,
+        move || open_chat_media_speaker(&speaker_config),
+        || {
+            release_chat_media_microphone_if_unrequested(
+                &microphone_requested,
+                &mut microphone,
+                &event_tx,
+                &snapshots,
+                &waker,
+            );
+            release_chat_media_camera_if_unrequested(
+                &camera_requested,
+                &mut camera,
+                &event_tx,
+                &snapshots,
+                &waker,
+            );
+        },
+    )
+    .await
+    {
+        ChatMediaDeviceOpen::Cancelled => return Ok(()),
+        ChatMediaDeviceOpen::Disabled => None,
+        ChatMediaDeviceOpen::Completed(Ok(playback)) => Some(playback),
+        ChatMediaDeviceOpen::Completed(Err(detail)) => {
+            issues.push(detail);
             None
         }
     };
-    let speaker = {
-        let playback_config = sinomo_audio::NativeSpeakerPlaybackConfig::new(
-            config.output_sample_rate_hz,
-            app_native_audio_format(config.output_format),
-        );
-        match sinomo_audio::start_native_speaker_playback(playback_config) {
-            Ok(playback) => Some(playback),
-            Err(error) => {
-                issues.push(format!("speaker unavailable: {error}"));
-                None
-            }
-        }
-    };
-    if microphone.is_none() && camera.is_none() {
+    let controls = drain_chat_media_controls(&control_rx, &mut mic_enabled, &mut camera_enabled);
+    if controls.stop {
+        return Ok(());
+    }
+    if !reconcile_chat_media_devices(
+        controls,
+        mic_enabled,
+        camera_enabled,
+        &microphone_config,
+        &camera_config,
+        &mut microphone,
+        &mut camera,
+        &event_tx,
+        &snapshots,
+        &cancelled,
+        &microphone_requested,
+        &camera_requested,
+        &waker,
+    )
+    .await
+    {
+        return Ok(());
+    }
+    let microphone_requested_now = microphone_requested.load(Ordering::Acquire);
+    let camera_requested_now = camera_requested.load(Ordering::Acquire);
+    let requested_input_available = chat_media_requested_input_available(
+        microphone_requested_now,
+        microphone.is_some(),
+        camera_requested_now,
+        camera.is_some(),
+    );
+    if !requested_input_available {
         return Err(format!(
             "native mic/camera unavailable: {}",
             issues.join("; ")
         ));
     }
-    if camera.is_some() {
-        config.input_video = Some(sinomo_lm::RealtimeVideoInputConfig {
-            frame_format: sinomo_lm::RealtimeVideoFrameFormat::Jpeg,
-            detail: sinomo_lm::RealtimeVideoFrameDetail::Auto,
-            max_frame_rate_hz: Some(2),
-        });
-    }
+    config.input_video = Some(sinomo_lm::RealtimeVideoInputConfig {
+        frame_format: sinomo_lm::RealtimeVideoFrameFormat::Jpeg,
+        detail: sinomo_lm::RealtimeVideoFrameDetail::Auto,
+        max_frame_rate_hz: Some(2),
+    });
 
-    let _ = event_tx.send(ChatMediaCallWorkerEvent::Ready(chat_media_ready_notice(
-        microphone.is_some(),
-        camera.is_some(),
-        speaker.is_some(),
-        &issues,
-    )));
-    let mut mic_enabled = true;
-    let mut camera_enabled = true;
-    if drain_chat_media_controls(&control_rx, &mut mic_enabled, &mut camera_enabled) {
+    let _ = send_chat_media_call_event(
+        &event_tx,
+        &waker,
+        ChatMediaCallWorkerEvent::Ready(chat_media_ready_notice(
+            microphone.is_some(),
+            camera.is_some(),
+            speaker.is_some(),
+            &issues,
+        )),
+    );
+    let Some(connect_result) = await_chat_media_operation(
+        sinomo_lm::RealtimeAudioSession::connect(config.clone()),
+        &cancelled,
+        || {
+            release_chat_media_microphone_if_unrequested(
+                &microphone_requested,
+                &mut microphone,
+                &event_tx,
+                &snapshots,
+                &waker,
+            );
+            release_chat_media_camera_if_unrequested(
+                &camera_requested,
+                &mut camera,
+                &event_tx,
+                &snapshots,
+                &waker,
+            );
+        },
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    let mut session =
+        connect_result.map_err(|error| format!("realtime connect failed: {error}"))?;
+    let controls = drain_chat_media_controls(&control_rx, &mut mic_enabled, &mut camera_enabled);
+    if controls.stop {
         return Ok(());
     }
+    if !reconcile_chat_media_devices(
+        controls,
+        mic_enabled,
+        camera_enabled,
+        &microphone_config,
+        &camera_config,
+        &mut microphone,
+        &mut camera,
+        &event_tx,
+        &snapshots,
+        &cancelled,
+        &microphone_requested,
+        &camera_requested,
+        &waker,
+    )
+    .await
+    {
+        return Ok(());
+    }
+    publish_chat_media_notice(&snapshots, &waker, "realtime session connected".to_string());
+    let mut first_video_capture_unix_ms = None;
+    let mut video_sequence = ChatMediaVideoSequence::default();
 
-    let mut session = sinomo_lm::RealtimeAudioSession::connect(config.clone())
+    loop {
+        let controls =
+            drain_chat_media_controls(&control_rx, &mut mic_enabled, &mut camera_enabled);
+        if controls.stop {
+            break;
+        }
+        if !reconcile_chat_media_devices(
+            controls,
+            mic_enabled,
+            camera_enabled,
+            &microphone_config,
+            &camera_config,
+            &mut microphone,
+            &mut camera,
+            &event_tx,
+            &snapshots,
+            &cancelled,
+            &microphone_requested,
+            &camera_requested,
+            &waker,
+        )
         .await
-        .map_err(|error| format!("realtime connect failed: {error}"))?;
-    let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(
-        "realtime session connected".to_string(),
-    ));
-
-    while !drain_chat_media_controls(&control_rx, &mut mic_enabled, &mut camera_enabled) {
+        {
+            return Ok(());
+        }
         let mut progressed = false;
         let mut microphone_stopped = false;
-        if mic_enabled && let Some(capture) = microphone.as_ref() {
+        if microphone.is_some() {
             for _ in 0..4 {
-                match capture.recv_timeout(Duration::ZERO) {
+                let capture_result = match microphone.as_ref() {
+                    Some(capture) => capture.recv_timeout(Duration::ZERO),
+                    None => break,
+                };
+                match capture_result {
                     Ok(Some(chunk)) => {
-                        let input = sinomo_lm::RealtimeAudioInputChunk::new(chunk.audio);
-                        session
-                            .send_audio(&input)
+                        if mic_enabled && microphone_requested.load(Ordering::Acquire) {
+                            let level = sinomo_audio::normalized_audio_meter_level(
+                                &chunk.audio,
+                                chunk.sample_format,
+                            );
+                            publish_chat_media_snapshot(&snapshots, &waker, |snapshots| {
+                                snapshots.microphone_level = Some(level);
+                            });
+                            let input = sinomo_lm::RealtimeAudioInputChunk::new(chunk.audio);
+                            let Some(send_result) = await_chat_media_operation(
+                                session.send_audio(&input),
+                                &cancelled,
+                                || {
+                                    release_chat_media_microphone_if_unrequested(
+                                        &microphone_requested,
+                                        &mut microphone,
+                                        &event_tx,
+                                        &snapshots,
+                                        &waker,
+                                    );
+                                    release_chat_media_camera_if_unrequested(
+                                        &camera_requested,
+                                        &mut camera,
+                                        &event_tx,
+                                        &snapshots,
+                                        &waker,
+                                    );
+                                },
+                            )
                             .await
-                            .map_err(|error| format!("realtime audio send failed: {error}"))?;
-                        let _ = event_tx.send(ChatMediaCallWorkerEvent::InputAudioChunk);
+                            else {
+                                return Ok(());
+                            };
+                            send_result
+                                .map_err(|error| format!("realtime audio send failed: {error}"))?;
+                            publish_chat_media_snapshot(&snapshots, &waker, |snapshots| {
+                                snapshots.input_audio_chunks =
+                                    snapshots.input_audio_chunks.saturating_add(1);
+                            });
+                        }
                         progressed = true;
                     }
                     Ok(None) => break,
                     Err(error) => {
-                        let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(format!(
-                            "microphone stopped: {error}"
-                        )));
+                        let detail = format!("microphone stopped: {error}");
+                        publish_chat_media_snapshot(&snapshots, &waker, |snapshots| {
+                            snapshots.microphone_level = None;
+                            snapshots.notice = Some(detail.clone());
+                        });
+                        let _ = send_chat_media_call_event(
+                            &event_tx,
+                            &waker,
+                            ChatMediaCallWorkerEvent::DeviceAccess(
+                                MediaAccessKind::Microphone,
+                                chat_media_access_failure(detail),
+                            ),
+                        );
                         microphone_stopped = true;
                         progressed = true;
                         break;
@@ -5895,29 +6682,87 @@ async fn run_chat_media_call_async(
         }
 
         let mut camera_stopped = false;
-        if camera_enabled && let Some(capture) = camera.as_ref() {
+        if camera.is_some() {
             for _ in 0..2 {
-                match capture.recv_timeout(Duration::ZERO) {
+                let capture_result = match camera.as_ref() {
+                    Some(capture) => capture.recv_timeout(Duration::ZERO),
+                    None => break,
+                };
+                match capture_result {
                     Ok(Some(frame)) => {
-                        let mut input = sinomo_lm::RealtimeVideoFrameInput::new(
-                            frame.bytes,
-                            sinomo_lm::RealtimeVideoFrameFormat::Jpeg,
-                            frame.sequence,
-                        );
-                        input.detail = sinomo_lm::RealtimeVideoFrameDetail::Auto;
-                        input.timestamp_ms = Some(frame.sequence.saturating_mul(500));
-                        session
-                            .send_video_frame(&input)
+                        if camera_enabled && camera_requested.load(Ordering::Acquire) {
+                            let sequence = video_sequence.assign();
+                            if let Ok(preview) = sinomo_video::decode_native_video_preview(&frame) {
+                                publish_chat_media_snapshot(&snapshots, &waker, |snapshots| {
+                                    snapshots.camera_preview = Some(MediaCameraPreview::new(
+                                        sequence,
+                                        preview.width,
+                                        preview.height,
+                                        preview.rgba,
+                                    ));
+                                });
+                            }
+                            let capture_started_unix_ms = *first_video_capture_unix_ms
+                                .get_or_insert(frame.captured_at_unix_ms);
+                            let timestamp_ms = chat_media_capture_timestamp_ms(
+                                frame.captured_at_unix_ms,
+                                capture_started_unix_ms,
+                            );
+                            let mut input = sinomo_lm::RealtimeVideoFrameInput::new(
+                                frame.bytes,
+                                sinomo_lm::RealtimeVideoFrameFormat::Jpeg,
+                                sequence,
+                            );
+                            input.detail = sinomo_lm::RealtimeVideoFrameDetail::Auto;
+                            input.timestamp_ms = Some(timestamp_ms);
+                            let Some(send_result) = await_chat_media_operation(
+                                session.send_video_frame(&input),
+                                &cancelled,
+                                || {
+                                    release_chat_media_microphone_if_unrequested(
+                                        &microphone_requested,
+                                        &mut microphone,
+                                        &event_tx,
+                                        &snapshots,
+                                        &waker,
+                                    );
+                                    release_chat_media_camera_if_unrequested(
+                                        &camera_requested,
+                                        &mut camera,
+                                        &event_tx,
+                                        &snapshots,
+                                        &waker,
+                                    );
+                                },
+                            )
                             .await
-                            .map_err(|error| format!("realtime video send failed: {error}"))?;
-                        let _ = event_tx.send(ChatMediaCallWorkerEvent::InputVideoFrame);
+                            else {
+                                return Ok(());
+                            };
+                            send_result
+                                .map_err(|error| format!("realtime video send failed: {error}"))?;
+                            publish_chat_media_snapshot(&snapshots, &waker, |snapshots| {
+                                snapshots.input_video_frames =
+                                    snapshots.input_video_frames.saturating_add(1);
+                            });
+                        }
                         progressed = true;
                     }
                     Ok(None) => break,
                     Err(error) => {
-                        let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(format!(
-                            "camera stopped: {error}"
-                        )));
+                        let detail = format!("camera stopped: {error}");
+                        publish_chat_media_snapshot(&snapshots, &waker, |snapshots| {
+                            snapshots.camera_preview = None;
+                            snapshots.notice = Some(detail.clone());
+                        });
+                        let _ = send_chat_media_call_event(
+                            &event_tx,
+                            &waker,
+                            ChatMediaCallWorkerEvent::DeviceAccess(
+                                MediaAccessKind::Camera,
+                                chat_media_access_failure(detail),
+                            ),
+                        );
                         camera_stopped = true;
                         progressed = true;
                         break;
@@ -5928,16 +6773,18 @@ async fn run_chat_media_call_async(
         if camera_stopped {
             camera = None;
         }
-        if microphone.is_none() && camera.is_none() {
-            return Err("native mic/camera input stopped".to_string());
-        }
-
         match session
             .receive_event_with_timeout(Duration::from_millis(1))
             .await
         {
             Ok(event) => {
-                if handle_chat_media_realtime_event(event, speaker.as_ref(), &event_tx)? {
+                if handle_chat_media_realtime_event(
+                    event,
+                    speaker.as_ref(),
+                    &event_tx,
+                    &snapshots,
+                    &waker,
+                )? {
                     break;
                 }
                 progressed = true;
@@ -5950,24 +6797,272 @@ async fn run_chat_media_call_async(
         }
     }
 
-    let _ = session.close().await;
+    drop(microphone);
+    drop(camera);
+    drop(speaker);
+    if let Some(close_result) = await_chat_media_operation(session.close(), &cancelled, || {}).await
+    {
+        let _ = close_result;
+    }
     Ok(())
 }
 
-#[cfg(not(test))]
 fn drain_chat_media_controls(
     control_rx: &Receiver<ChatMediaCallControl>,
     mic_enabled: &mut bool,
     camera_enabled: &mut bool,
-) -> bool {
+) -> ChatMediaControlDrain {
+    let mut drained = ChatMediaControlDrain::default();
     loop {
         match control_rx.try_recv() {
-            Ok(ChatMediaCallControl::Stop) | Err(TryRecvError::Disconnected) => return true,
-            Ok(ChatMediaCallControl::SetMicEnabled(enabled)) => *mic_enabled = enabled,
-            Ok(ChatMediaCallControl::SetCameraEnabled(enabled)) => *camera_enabled = enabled,
-            Err(TryRecvError::Empty) => return false,
+            Ok(ChatMediaCallControl::Stop) | Err(TryRecvError::Disconnected) => {
+                drained.stop = true;
+                return drained;
+            }
+            Ok(ChatMediaCallControl::SetMicEnabled(enabled)) => {
+                *mic_enabled = enabled;
+                if enabled {
+                    drained.microphone_enable_requested = true;
+                } else {
+                    drained.microphone_disable_requested = true;
+                }
+            }
+            Ok(ChatMediaCallControl::SetCameraEnabled(enabled)) => {
+                *camera_enabled = enabled;
+                if enabled {
+                    drained.camera_enable_requested = true;
+                } else {
+                    drained.camera_disable_requested = true;
+                }
+            }
+            Err(TryRecvError::Empty) => return drained,
         }
     }
+}
+
+#[cfg(not(test))]
+fn release_chat_media_microphone_if_unrequested(
+    requested: &AtomicBool,
+    microphone: &mut Option<sinomo_audio::NativeAudioCapture>,
+    event_tx: &mpsc::Sender<ChatMediaCallWorkerEvent>,
+    snapshots: &Arc<Mutex<ChatMediaSnapshots>>,
+    waker: &Option<sui::UiHandle>,
+) {
+    if requested.load(Ordering::Acquire) || microphone.take().is_none() {
+        return;
+    }
+    publish_chat_media_snapshot(snapshots, waker, |snapshots| {
+        snapshots.microphone_level = None;
+    });
+    let _ = send_chat_media_call_event(
+        event_tx,
+        waker,
+        ChatMediaCallWorkerEvent::DeviceAccess(MediaAccessKind::Microphone, MediaAccessState::Idle),
+    );
+}
+
+#[cfg(not(test))]
+fn release_chat_media_camera_if_unrequested(
+    requested: &AtomicBool,
+    camera: &mut Option<sinomo_video::NativeVideoCapture>,
+    event_tx: &mpsc::Sender<ChatMediaCallWorkerEvent>,
+    snapshots: &Arc<Mutex<ChatMediaSnapshots>>,
+    waker: &Option<sui::UiHandle>,
+) {
+    if requested.load(Ordering::Acquire) || camera.take().is_none() {
+        return;
+    }
+    publish_chat_media_snapshot(snapshots, waker, |snapshots| {
+        snapshots.camera_preview = None;
+    });
+    let _ = send_chat_media_call_event(
+        event_tx,
+        waker,
+        ChatMediaCallWorkerEvent::DeviceAccess(MediaAccessKind::Camera, MediaAccessState::Idle),
+    );
+}
+
+#[cfg(not(test))]
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_chat_media_devices(
+    controls: ChatMediaControlDrain,
+    mic_enabled: bool,
+    camera_enabled: bool,
+    microphone_config: &sinomo_audio::NativeAudioCaptureConfig,
+    camera_config: &sinomo_video::NativeVideoCaptureConfig,
+    microphone: &mut Option<sinomo_audio::NativeAudioCapture>,
+    camera: &mut Option<sinomo_video::NativeVideoCapture>,
+    event_tx: &mpsc::Sender<ChatMediaCallWorkerEvent>,
+    snapshots: &Arc<Mutex<ChatMediaSnapshots>>,
+    cancelled: &AtomicBool,
+    microphone_requested: &AtomicBool,
+    camera_requested: &AtomicBool,
+    waker: &Option<sui::UiHandle>,
+) -> bool {
+    let microphone_transition = chat_media_device_transition(
+        mic_enabled,
+        microphone.is_some(),
+        controls.microphone_enable_requested,
+        controls.microphone_disable_requested,
+    );
+    if microphone_transition.release {
+        drop(microphone.take());
+    }
+    if microphone_transition.mark_idle {
+        publish_chat_media_snapshot(snapshots, waker, |snapshots| {
+            snapshots.microphone_level = None;
+        });
+        let _ = send_chat_media_call_event(
+            event_tx,
+            waker,
+            ChatMediaCallWorkerEvent::DeviceAccess(
+                MediaAccessKind::Microphone,
+                MediaAccessState::Idle,
+            ),
+        );
+    }
+    if microphone_transition.open {
+        let open_config = microphone_config.clone();
+        match open_chat_media_device(
+            MediaAccessKind::Microphone,
+            "microphone",
+            cancelled,
+            Some(microphone_requested),
+            event_tx,
+            waker,
+            move || open_chat_media_microphone(&open_config),
+            || {
+                release_chat_media_camera_if_unrequested(
+                    camera_requested,
+                    camera,
+                    event_tx,
+                    snapshots,
+                    waker,
+                );
+            },
+        )
+        .await
+        {
+            ChatMediaDeviceOpen::Cancelled => return false,
+            ChatMediaDeviceOpen::Disabled => {}
+            ChatMediaDeviceOpen::Completed(Ok(capture)) => *microphone = Some(capture),
+            ChatMediaDeviceOpen::Completed(Err(detail)) => {
+                publish_chat_media_notice(snapshots, waker, detail);
+            }
+        }
+    }
+
+    let camera_transition = chat_media_device_transition(
+        camera_enabled,
+        camera.is_some(),
+        controls.camera_enable_requested,
+        controls.camera_disable_requested,
+    );
+    if camera_transition.release {
+        drop(camera.take());
+    }
+    if camera_transition.mark_idle {
+        publish_chat_media_snapshot(snapshots, waker, |snapshots| {
+            snapshots.camera_preview = None;
+        });
+        let _ = send_chat_media_call_event(
+            event_tx,
+            waker,
+            ChatMediaCallWorkerEvent::DeviceAccess(MediaAccessKind::Camera, MediaAccessState::Idle),
+        );
+    }
+    if camera_transition.open {
+        let open_config = camera_config.clone();
+        match open_chat_media_device(
+            MediaAccessKind::Camera,
+            "camera",
+            cancelled,
+            Some(camera_requested),
+            event_tx,
+            waker,
+            move || open_chat_media_camera(&open_config),
+            || {
+                release_chat_media_microphone_if_unrequested(
+                    microphone_requested,
+                    microphone,
+                    event_tx,
+                    snapshots,
+                    waker,
+                );
+            },
+        )
+        .await
+        {
+            ChatMediaDeviceOpen::Cancelled => return false,
+            ChatMediaDeviceOpen::Disabled => {}
+            ChatMediaDeviceOpen::Completed(Ok(capture)) => *camera = Some(capture),
+            ChatMediaDeviceOpen::Completed(Err(detail)) => {
+                publish_chat_media_notice(snapshots, waker, detail);
+            }
+        }
+    }
+    true
+}
+
+#[cfg(not(test))]
+fn open_chat_media_microphone(
+    config: &sinomo_audio::NativeAudioCaptureConfig,
+) -> Result<sinomo_audio::NativeAudioCapture, String> {
+    sinomo_audio::start_native_microphone_capture(config.clone())
+        .map_err(|error| format!("microphone unavailable: {error}"))
+}
+
+#[cfg(not(test))]
+struct ChatMediaCameraOpenGuard;
+
+#[cfg(not(test))]
+impl Drop for ChatMediaCameraOpenGuard {
+    fn drop(&mut self) {
+        CHAT_MEDIA_CAMERA_OPEN_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(not(test))]
+fn open_chat_media_camera(
+    config: &sinomo_video::NativeVideoCaptureConfig,
+) -> Result<sinomo_video::NativeVideoCapture, String> {
+    if CHAT_MEDIA_CAMERA_OPEN_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err("camera access is already being checked; retry shortly".to_string());
+    }
+    let _open_guard = ChatMediaCameraOpenGuard;
+    sinomo_video::start_native_camera_capture(config.clone())
+        .map_err(|error| format!("camera unavailable: {error}"))
+}
+
+#[cfg(not(test))]
+fn open_chat_media_speaker(
+    config: &sinomo_audio::NativeSpeakerPlaybackConfig,
+) -> Result<sinomo_audio::NativeSpeakerPlayback, String> {
+    sinomo_audio::start_native_speaker_playback(config.clone())
+        .map_err(|error| format!("speaker unavailable: {error}"))
+}
+
+fn chat_media_access_failure(detail: String) -> MediaAccessState {
+    match sinomo_runtime::device::NativeDeviceFailureKind::classify_detail(&detail) {
+        sinomo_runtime::device::NativeDeviceFailureKind::PermissionDenied => {
+            MediaAccessState::PermissionDenied(detail)
+        }
+        sinomo_runtime::device::NativeDeviceFailureKind::Busy => MediaAccessState::Busy(detail),
+        sinomo_runtime::device::NativeDeviceFailureKind::Unsupported => {
+            MediaAccessState::Unsupported(detail)
+        }
+        sinomo_runtime::device::NativeDeviceFailureKind::NotFound
+        | sinomo_runtime::device::NativeDeviceFailureKind::Other => {
+            MediaAccessState::Unavailable(detail)
+        }
+    }
+}
+
+fn chat_media_capture_timestamp_ms(captured_at_unix_ms: u128, started_at_unix_ms: u128) -> u64 {
+    u64::try_from(captured_at_unix_ms.saturating_sub(started_at_unix_ms)).unwrap_or(u64::MAX)
 }
 
 #[cfg(not(test))]
@@ -5975,6 +7070,8 @@ fn handle_chat_media_realtime_event(
     event: sinomo_lm::RealtimeAudioEvent,
     speaker: Option<&sinomo_audio::NativeSpeakerPlayback>,
     event_tx: &mpsc::Sender<ChatMediaCallWorkerEvent>,
+    snapshots: &Arc<Mutex<ChatMediaSnapshots>>,
+    waker: &Option<sui::UiHandle>,
 ) -> Result<bool, String> {
     match event {
         sinomo_lm::RealtimeAudioEvent::SessionQueued {
@@ -5988,51 +7085,53 @@ fn handle_chat_media_realtime_event(
                 (Some(position), None) => format!("realtime queued: position {position}"),
                 _ => "realtime queued".to_string(),
             };
-            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(detail));
+            publish_chat_media_notice(snapshots, waker, detail);
         }
         sinomo_lm::RealtimeAudioEvent::SessionCreated { .. } => {
-            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(
-                "realtime session ready".to_string(),
-            ));
+            publish_chat_media_notice(snapshots, waker, "realtime session ready".to_string());
         }
         sinomo_lm::RealtimeAudioEvent::SessionUpdated => {}
         sinomo_lm::RealtimeAudioEvent::Listening { .. } => {
-            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(
-                "model listening".to_string(),
-            ));
+            publish_chat_media_notice(snapshots, waker, "model listening".to_string());
         }
         sinomo_lm::RealtimeAudioEvent::InputSpeechStarted => {
-            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(
-                "speech detected".to_string(),
-            ));
+            publish_chat_media_notice(snapshots, waker, "speech detected".to_string());
         }
         sinomo_lm::RealtimeAudioEvent::InputSpeechStopped => {
-            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice("speech ended".to_string()));
+            publish_chat_media_notice(snapshots, waker, "speech ended".to_string());
         }
         sinomo_lm::RealtimeAudioEvent::OutputAudioDelta { audio, .. } => {
             if !audio.is_empty() {
                 if let Some(speaker) = speaker {
-                    speaker
-                        .write(&audio)
-                        .map_err(|error| format!("speaker playback failed: {error}"))?;
+                    if let Err(error) = speaker.write(&audio) {
+                        let detail = format!("speaker playback failed: {error}");
+                        let _ = send_chat_media_call_event(
+                            event_tx,
+                            waker,
+                            ChatMediaCallWorkerEvent::DeviceAccess(
+                                MediaAccessKind::Speaker,
+                                chat_media_access_failure(detail.clone()),
+                            ),
+                        );
+                        publish_chat_media_notice(snapshots, waker, detail.clone());
+                        return Err(detail);
+                    }
                 }
-                let _ = event_tx.send(ChatMediaCallWorkerEvent::OutputAudioChunk);
+                publish_chat_media_snapshot(snapshots, waker, |snapshots| {
+                    snapshots.output_audio_chunks = snapshots.output_audio_chunks.saturating_add(1);
+                });
             }
         }
         sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta { delta } => {
             if !delta.trim().is_empty() {
-                let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(delta));
+                publish_chat_media_notice(snapshots, waker, delta);
             }
         }
         sinomo_lm::RealtimeAudioEvent::ResponseDone => {
-            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(
-                "response complete".to_string(),
-            ));
+            publish_chat_media_notice(snapshots, waker, "response complete".to_string());
         }
         sinomo_lm::RealtimeAudioEvent::Closed { reason } => {
-            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(format!(
-                "realtime closed: {reason}"
-            )));
+            publish_chat_media_notice(snapshots, waker, format!("realtime closed: {reason}"));
             return Ok(true);
         }
         sinomo_lm::RealtimeAudioEvent::Error { code, message } => {
@@ -6041,6 +7140,43 @@ fn handle_chat_media_realtime_event(
         sinomo_lm::RealtimeAudioEvent::Raw { .. } => {}
     }
     Ok(false)
+}
+
+fn send_chat_media_call_event(
+    event_tx: &mpsc::Sender<ChatMediaCallWorkerEvent>,
+    waker: &Option<sui::UiHandle>,
+    event: ChatMediaCallWorkerEvent,
+) -> bool {
+    let sent = event_tx.send(event).is_ok();
+    if sent && let Some(waker) = waker {
+        waker.wake();
+    }
+    sent
+}
+
+#[cfg(not(test))]
+fn publish_chat_media_snapshot(
+    snapshots: &Arc<Mutex<ChatMediaSnapshots>>,
+    waker: &Option<sui::UiHandle>,
+    update: impl FnOnce(&mut ChatMediaSnapshots),
+) {
+    if let Ok(mut snapshots) = snapshots.lock() {
+        update(&mut snapshots);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn publish_chat_media_notice(
+    snapshots: &Arc<Mutex<ChatMediaSnapshots>>,
+    waker: &Option<sui::UiHandle>,
+    notice: String,
+) {
+    publish_chat_media_snapshot(snapshots, waker, |snapshots| {
+        snapshots.notice = Some(notice);
+    });
 }
 
 #[cfg(not(test))]
@@ -8818,6 +9954,23 @@ struct MediaCallPanelSignature {
     camera_enabled: bool,
     provider: String,
     model: String,
+    microphones: Vec<String>,
+    speakers: Vec<String>,
+    cameras: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MediaSetupAccessSignature {
+    microphone: MediaAccessState,
+    speaker: MediaAccessState,
+    camera: MediaAccessState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MediaSpeakerTestSignature {
+    active: bool,
+    access: MediaAccessState,
+    state: SpeakerTestState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8847,6 +10000,9 @@ fn media_call_panel_signature(shared: &Shared) -> MediaCallPanelSignature {
         camera_enabled: call.camera_enabled,
         provider,
         model,
+        microphones: chat.media_setup.microphone_labels(),
+        speakers: chat.media_setup.speaker_labels(),
+        cameras: chat.media_setup.camera_labels(),
     }
 }
 
@@ -8935,20 +10091,39 @@ fn media_call_expanded_body(
         .align_items(Alignment::Stretch)
         .with_item(
             media_call_video_tile(shared, reader, signature, MediaCallTile::Remote),
-            FlexItem::flex(1.0).min_width(96.0).min_height(54.0),
+            FlexItem::flex(1.0).min_width(84.0).min_height(140.0),
         )
         .with_item(
             media_call_video_tile(shared, reader, signature, MediaCallTile::Local),
-            FlexItem::fixed(122.0).min_height(54.0),
+            FlexItem::fixed(168.0).min_height(140.0),
         );
 
     let body = Stack::vertical()
-        .spacing(4.0)
+        .spacing(3.0)
         .alignment(Alignment::Stretch)
-        .with_child(header)
-        .with_child(SizedBox::new().height(54.0).with_child(tiles))
-        .with_child(media_call_metrics_label(shared))
-        .with_child(media_call_controls_row(shared, reader, signature));
+        .with_child(SizedBox::new().height(26.0).with_child(header))
+        .with_child(SizedBox::new().height(140.0).with_child(tiles))
+        .with_child(
+            SizedBox::new()
+                .height(26.0)
+                .with_child(media_setup_access_row(shared, reader)),
+        )
+        .with_child(
+            SizedBox::new()
+                .height(42.0)
+                .with_child(media_setup_device_selectors(shared, reader, signature)),
+        )
+        .with_child(
+            SizedBox::new()
+                .height(26.0)
+                .with_child(media_setup_test_row(shared, reader)),
+        )
+        .with_child(
+            SizedBox::new()
+                .height(22.0)
+                .with_child(media_setup_recovery_row(shared, reader)),
+        );
+    let body = Dock::new(body).bottom(30.0, media_call_controls_row(shared, reader, signature));
 
     WidgetPadding::symmetric(PAD, 7.0, body).fill_child()
 }
@@ -9048,35 +10223,13 @@ fn media_call_summary_text(shared: &Shared) -> String {
     }
 }
 
-fn media_call_metrics_label(shared: &Shared) -> Label {
-    let text_shared = shared.clone();
-    let color_shared = shared.clone();
-    Label::dynamic("media stream counters", move || {
-        let chat = text_shared.chat();
-        let call = &chat.media_call;
-        compact_line(
-            &format!(
-                "{} · in {} audio / {} frames · out {} audio",
-                chat.media_call_status_summary(),
-                call.input_audio_chunks,
-                call.input_video_frames,
-                call.output_audio_chunks
-            ),
-            96,
-        )
-    })
-    .font_size(10.0)
-    .line_height(14.0)
-    .color_when(move || palette(&color_shared).text_faint)
-}
-
 fn media_call_video_tile(
     shared: &Shared,
     reader: &ThemeReader,
     signature: &MediaCallPanelSignature,
     tile: MediaCallTile,
 ) -> impl Widget + use<> {
-    let (icon, title, subtitle, status, tone, signal_active, signal_name, signal_description) =
+    let (icon, title, _subtitle, status, tone, signal_active, signal_name, signal_description) =
         match tile {
             MediaCallTile::Remote => (
                 if signature.active {
@@ -9087,7 +10240,7 @@ fn media_call_video_tile(
                 compact_line(&signature.model, 36),
                 compact_line(&signature.provider, 32),
                 if signature.active {
-                    "duplex audio/video"
+                    "realtime response audio"
                 } else {
                     "standby"
                 },
@@ -9099,7 +10252,7 @@ fn media_call_video_tile(
                 signature.active,
                 "Remote media signal",
                 if signature.active {
-                    "Remote realtime audio and video are active"
+                    "Remote realtime response audio is active"
                 } else {
                     "Remote realtime media is standing by"
                 },
@@ -9143,9 +10296,27 @@ fn media_call_video_tile(
                 },
             ),
         };
+    let signal = SwitchView::new()
+        .selected(match tile {
+            MediaCallTile::Remote => 0,
+            MediaCallTile::Local => 1,
+        })
+        .with_child(
+            SignalMeter::new(signal_name)
+                .description(signal_description)
+                .active(signal_active)
+                .tone(tone)
+                .bars(12)
+                .size(Size::new(1024.0, 20.0))
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            SizedBox::new()
+                .height(84.0)
+                .with_child(MediaCameraPreviewWidget::new(shared.clone())),
+        );
     let icon_shared = shared.clone();
     let title_shared = shared.clone();
-    let subtitle_shared = shared.clone();
     let status = StatusBadge::new(status)
         .tone(tone)
         .min_width(70.0)
@@ -9170,27 +10341,467 @@ fn media_call_video_tile(
                         .color_when(move || palette(&title_shared).text),
                 ),
         )
-        .with_child(
-            Label::new(subtitle)
-                .font_size(9.5)
-                .line_height(12.0)
-                .color_when(move || palette(&subtitle_shared).text_faint),
-        )
-        .with_child(
-            SignalMeter::new(signal_name)
-                .description(signal_description)
-                .active(signal_active)
-                .tone(tone)
-                .bars(12)
-                .size(Size::new(1024.0, 12.0))
-                .theme_when(clone_reader(reader)),
-        )
+        .with_child(signal)
         .spacer()
         .with_child(status);
 
     Surface::field(WidgetPadding::symmetric(8.0, 6.0, content).fill_child())
         .fill()
         .theme_when(clone_reader(reader))
+}
+
+#[derive(Default)]
+struct MediaPreviewRegistration {
+    handle: AtomicU64,
+    revision: AtomicU64,
+}
+
+impl MediaPreviewRegistration {
+    fn handle(&self) -> Option<ImageHandle> {
+        let handle = self.handle.load(Ordering::Acquire);
+        (handle != 0).then(|| ImageHandle::new(handle))
+    }
+
+    fn revision(&self) -> Option<u64> {
+        let revision = self.revision.load(Ordering::Acquire);
+        (revision != 0).then_some(revision)
+    }
+
+    fn image_handle(&self, ctx: &PaintCtx) -> ImageHandle {
+        if let Some(handle) = self.handle() {
+            return handle;
+        }
+        let candidate = ctx.widget_image_handle(0);
+        match self
+            .handle
+            .compare_exchange(0, candidate.get(), Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => candidate,
+            Err(handle) => ImageHandle::new(handle),
+        }
+    }
+}
+
+struct MediaCameraPreviewWidget {
+    shared: Shared,
+    registration: Arc<MediaPreviewRegistration>,
+}
+
+impl MediaCameraPreviewWidget {
+    fn new(shared: Shared) -> Self {
+        let registration = shared.chat().media_preview_registration.clone();
+        Self {
+            shared,
+            registration,
+        }
+    }
+
+    fn preview(&self) -> Option<MediaCameraPreview> {
+        let chat = self.shared.chat();
+        if !chat.media_call.camera_enabled {
+            return None;
+        }
+        let preview = if chat.media_call.active {
+            chat.media_call.camera_preview.clone()
+        } else {
+            chat.media_setup.camera_preview.clone()
+        }?;
+        let expected_len = (preview.width as usize)
+            .checked_mul(preview.height as usize)?
+            .checked_mul(4)?;
+        (preview.width > 0 && preview.height > 0 && preview.rgba.len() == expected_len)
+            .then_some(preview)
+    }
+}
+
+impl Widget for MediaCameraPreviewWidget {
+    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        constraints.clamp(Size::new(132.0, 28.0))
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let bounds = ctx.bounds();
+        let pal = palette(&self.shared);
+        paint_rounded_rect(ctx, bounds, pal.field, 5.0);
+        let Some(preview) = self.preview() else {
+            draw_glyph(
+                ctx,
+                IconGlyph::CameraOff,
+                centered_rect(bounds, Size::new(16.0, 16.0)),
+                pal.text_faint,
+            );
+            return;
+        };
+        let handle = self.registration.image_handle(ctx);
+        if self.registration.revision() != Some(preview.revision) || !ctx.image_registered(handle) {
+            if let Ok(image) = RegisteredImage::from_rgba8(
+                preview.width,
+                preview.height,
+                preview.rgba.as_ref().clone(),
+            ) {
+                ctx.register_image(handle, image);
+                self.registration
+                    .revision
+                    .store(preview.revision, Ordering::Release);
+            } else {
+                draw_glyph(
+                    ctx,
+                    IconGlyph::CameraOff,
+                    centered_rect(bounds, Size::new(16.0, 16.0)),
+                    pal.text_faint,
+                );
+                return;
+            }
+        }
+        if !ctx.image_registered(handle) {
+            draw_glyph(
+                ctx,
+                IconGlyph::CameraOff,
+                centered_rect(bounds, Size::new(16.0, 16.0)),
+                pal.text_faint,
+            );
+            return;
+        }
+        let source = Size::new(preview.width as f32, preview.height as f32);
+        let image_rect = media_preview_cover_rect(bounds, source);
+        ctx.push_clip(Path::rounded_rect(bounds, 5.0));
+        ctx.draw_image_source(image_rect, ImageSource::new(handle));
+        ctx.pop_clip();
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let mut node = SemanticsNode::new(ctx.widget_id(), SemanticsRole::Image, ctx.bounds());
+        node.name = Some("Camera preview".to_string());
+        node.description = Some(if self.preview().is_some() {
+            "Live preview from the selected local camera".to_string()
+        } else {
+            "Camera preview is unavailable or paused".to_string()
+        });
+        ctx.push(node);
+    }
+}
+
+fn media_preview_cover_rect(bounds: Rect, source: Size) -> Rect {
+    if source.width <= 0.0 || source.height <= 0.0 {
+        return bounds;
+    }
+    let scale = (bounds.width() / source.width)
+        .max(bounds.height() / source.height)
+        .max(0.0);
+    let size = Size::new(source.width * scale, source.height * scale);
+    centered_rect(bounds, size)
+}
+
+fn centered_rect(bounds: Rect, size: Size) -> Rect {
+    Rect::from_origin_size(
+        Point::new(
+            bounds.x() + (bounds.width() - size.width) * 0.5,
+            bounds.y() + (bounds.height() - size.height) * 0.5,
+        ),
+        size,
+    )
+}
+
+fn media_setup_access_row(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let key_shared = shared.clone();
+    let build_shared = shared.clone();
+    let build_reader = Rc::clone(reader);
+    RebuildOnChange::new(
+        move || {
+            let chat = key_shared.chat();
+            MediaSetupAccessSignature {
+                microphone: chat.media_setup.microphone_access.clone(),
+                speaker: chat.media_setup.speaker_access.clone(),
+                camera: chat.media_setup.camera_access.clone(),
+            }
+        },
+        move |signature| {
+            WidgetPod::new(media_setup_access_row_body(
+                &build_shared,
+                &build_reader,
+                signature,
+            ))
+        },
+    )
+}
+
+fn media_setup_access_row_body(
+    shared: &Shared,
+    reader: &ThemeReader,
+    signature: &MediaSetupAccessSignature,
+) -> impl Widget + use<> {
+    let retry_shared = shared.clone();
+    let retry = IconButton::new(IconGlyph::History, "Retry media device access")
+        .description("Check devices again after allowing microphone or camera access")
+        .size(26.0)
+        .icon_size(14.0)
+        .theme_when(secondary_button_theme(reader))
+        .enabled_when({
+            let enabled_shared = shared.clone();
+            move || {
+                let chat = enabled_shared.chat();
+                !chat.media_call.active && !chat.media_setup.inventory_loading
+            }
+        })
+        .on_press(move || retry_shared.chat_mut().media_setup.retry_access());
+    Flex::horizontal()
+        .gap(4.0)
+        .align_items(Alignment::Center)
+        .with_item(
+            media_setup_access_badge("Mic", &signature.microphone, reader),
+            FlexItem::fixed(68.0).min_height(24.0),
+        )
+        .with_item(
+            media_setup_access_badge("Out", &signature.speaker, reader),
+            FlexItem::fixed(68.0).min_height(24.0),
+        )
+        .with_item(
+            media_setup_access_badge("Cam", &signature.camera, reader),
+            FlexItem::fixed(68.0).min_height(24.0),
+        )
+        .spacer()
+        .with_item(retry, FlexItem::fixed(26.0).min_height(26.0))
+}
+
+fn media_setup_access_badge(
+    prefix: &str,
+    state: &MediaAccessState,
+    reader: &ThemeReader,
+) -> StatusBadge {
+    StatusBadge::new(format!(
+        "{prefix} {}",
+        media_setup_access_compact_label(state)
+    ))
+    .tone(media_setup_access_tone(state))
+    .min_width(68.0)
+    .theme_when(clone_reader(reader))
+}
+
+fn media_setup_access_compact_label(state: &MediaAccessState) -> &'static str {
+    match state {
+        MediaAccessState::Idle => "Idle",
+        MediaAccessState::Checking => "Check",
+        MediaAccessState::Ready => "Ready",
+        MediaAccessState::PermissionDenied(_) => "Allow",
+        MediaAccessState::Busy(_) => "Busy",
+        MediaAccessState::Unavailable(_) => "Missing",
+        MediaAccessState::Unsupported(_) => "N/A",
+    }
+}
+
+fn media_setup_access_tone(state: &MediaAccessState) -> SemanticTone {
+    match state {
+        MediaAccessState::Ready => SemanticTone::Success,
+        MediaAccessState::Checking => SemanticTone::Accent,
+        MediaAccessState::PermissionDenied(_)
+        | MediaAccessState::Busy(_)
+        | MediaAccessState::Unavailable(_) => SemanticTone::Warning,
+        MediaAccessState::Idle | MediaAccessState::Unsupported(_) => SemanticTone::Neutral,
+    }
+}
+
+fn media_setup_device_selectors(
+    shared: &Shared,
+    reader: &ThemeReader,
+    signature: &MediaCallPanelSignature,
+) -> impl Widget + use<> {
+    let microphone = {
+        let selected_shared = shared.clone();
+        let change_shared = shared.clone();
+        media_setup_device_selector(
+            "Microphone",
+            "Microphone device",
+            signature.microphones.clone(),
+            move || Some(selected_shared.chat().media_setup.microphone_index),
+            move |index, _| {
+                change_shared
+                    .chat_mut()
+                    .media_setup
+                    .select_microphone(index)
+            },
+            reader,
+        )
+    };
+    let speaker = {
+        let selected_shared = shared.clone();
+        let change_shared = shared.clone();
+        media_setup_device_selector(
+            "Speaker",
+            "Speaker device",
+            signature.speakers.clone(),
+            move || Some(selected_shared.chat().media_setup.speaker_index),
+            move |index, _| change_shared.chat_mut().media_setup.select_speaker(index),
+            reader,
+        )
+    };
+    let camera = {
+        let selected_shared = shared.clone();
+        let change_shared = shared.clone();
+        media_setup_device_selector(
+            "Camera",
+            "Camera device",
+            signature.cameras.clone(),
+            move || Some(selected_shared.chat().media_setup.camera_index),
+            move |index, _| change_shared.chat_mut().media_setup.select_camera(index),
+            reader,
+        )
+    };
+    Flex::horizontal()
+        .gap(8.0)
+        .align_items(Alignment::Stretch)
+        .with_item(microphone, FlexItem::flex(1.0).min_width(84.0))
+        .with_item(speaker, FlexItem::flex(1.0).min_width(84.0))
+        .with_item(camera, FlexItem::flex(1.0).min_width(84.0))
+}
+
+fn media_setup_device_selector<S, C>(
+    label: &'static str,
+    name: &'static str,
+    options: Vec<String>,
+    selected_when: S,
+    on_change: C,
+    reader: &ThemeReader,
+) -> impl Widget + use<S, C>
+where
+    S: Fn() -> Option<usize> + 'static,
+    C: FnMut(usize, String) + 'static,
+{
+    Stack::vertical()
+        .spacing(2.0)
+        .alignment(Alignment::Stretch)
+        .with_child(Label::new(label).font_size(9.5).line_height(12.0))
+        .with_child(
+            SizedBox::new().height(28.0).with_child(
+                sui::Select::new(name)
+                    .options(options)
+                    .selected_when(selected_when)
+                    .theme_when(clone_reader(reader))
+                    .on_change(on_change),
+            ),
+        )
+}
+
+fn media_setup_test_row(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let meter_shared = shared.clone();
+    let active_shared = shared.clone();
+    Flex::horizontal()
+        .gap(8.0)
+        .align_items(Alignment::Center)
+        .with_item(
+            SignalMeter::new("Microphone input level")
+                .description("Live microphone input level")
+                .active_when(move || {
+                    let chat = active_shared.chat();
+                    if chat.media_call.active {
+                        chat.media_call.mic_enabled
+                    } else {
+                        matches!(chat.media_setup.microphone_access, MediaAccessState::Ready)
+                    }
+                })
+                .level_when(move || {
+                    let chat = meter_shared.chat();
+                    if chat.media_call.active {
+                        chat.media_call.microphone_level
+                    } else {
+                        chat.media_setup.microphone_level
+                    }
+                })
+                .bars(18)
+                .size(Size::new(1024.0, 14.0))
+                .theme_when(clone_reader(reader)),
+            FlexItem::flex(1.0).min_width(120.0).min_height(20.0),
+        )
+        .with_item(
+            media_setup_speaker_test_button(shared, reader),
+            FlexItem::fixed(118.0).min_height(26.0),
+        )
+}
+
+fn media_setup_speaker_test_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let key_shared = shared.clone();
+    let build_shared = shared.clone();
+    let build_reader = Rc::clone(reader);
+    RebuildOnChange::new(
+        move || {
+            let chat = key_shared.chat();
+            MediaSpeakerTestSignature {
+                active: chat.media_call.active,
+                access: chat.media_setup.speaker_access.clone(),
+                state: chat.media_setup.speaker_test.clone(),
+            }
+        },
+        move |signature| {
+            let press_shared = build_shared.clone();
+            let detail = match &signature.state {
+                SpeakerTestState::Failed(detail) => {
+                    format!("Speaker test failed: {detail}. Activate to try again.")
+                }
+                SpeakerTestState::Passed => {
+                    "The selected speaker played the test tone.".to_string()
+                }
+                SpeakerTestState::Testing => {
+                    "The test tone is playing through the selected speaker.".to_string()
+                }
+                SpeakerTestState::Idle => {
+                    "Play a short tone through the selected speaker.".to_string()
+                }
+            };
+            WidgetPod::new(
+                sui::Button::new(signature.state.label())
+                    .semantic_name("Test selected speaker")
+                    .description(detail)
+                    .icon(IconGlyph::AudioLines)
+                    .min_height(26.0)
+                    .theme_when(secondary_button_theme(&build_reader))
+                    .enabled(
+                        !signature.active
+                            && matches!(signature.access, MediaAccessState::Ready)
+                            && !matches!(signature.state, SpeakerTestState::Testing),
+                    )
+                    .on_press(move || press_shared.chat_mut().media_setup.test_speaker()),
+            )
+        },
+    )
+}
+
+fn media_setup_recovery_row(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let text_shared = shared.clone();
+    let color_shared = shared.clone();
+    let label = Label::dynamic("Allow access in system settings, then retry.", move || {
+        let chat = text_shared.chat();
+        if chat.media_call.active {
+            "Device changes are saved on this node and apply to the next call.".to_string()
+        } else {
+            chat.media_setup
+                .recovery_detail()
+                .unwrap_or_else(|| "Selections are saved on this node.".to_string())
+        }
+    })
+    .font_size(9.5)
+    .line_height(12.0)
+    .color_when(move || palette(&color_shared).text_faint);
+    let settings_shared = shared.clone();
+    let enabled_shared = shared.clone();
+    let settings = sui::Button::new("Privacy settings")
+        .semantic_name("Open media privacy settings")
+        .description("Open operating system microphone and camera privacy settings")
+        .icon(IconGlyph::Lock)
+        .min_height(22.0)
+        .theme_when(secondary_button_theme(reader))
+        .enabled_when(move || {
+            let chat = enabled_shared.chat();
+            !chat.media_call.active && chat.media_setup.permission_settings_available()
+        })
+        .on_press(move || {
+            settings_shared
+                .chat_mut()
+                .media_setup
+                .open_permission_settings()
+        });
+    TrailingSlotRow::new(label, settings)
+        .trailing_width(126.0)
+        .trailing_height(22.0)
+        .gap(8.0)
 }
 
 fn media_call_controls_row(
@@ -9265,6 +10876,7 @@ fn media_call_mic_button(shared: &Shared, reader: &ThemeReader, enabled: bool) -
 
 fn media_call_toggle_button(shared: &Shared, reader: &ThemeReader, active: bool) -> sui::Button {
     let s = shared.clone();
+    let enabled_shared = shared.clone();
     let (label, semantic_name, icon) = if active {
         ("End", "End media call", IconGlyph::PhoneOff)
     } else {
@@ -9283,10 +10895,12 @@ fn media_call_toggle_button(shared: &Shared, reader: &ThemeReader, active: bool)
     } else {
         button.theme_when(clone_reader(reader))
     };
-    button.on_press_with_ctx(move |ctx| {
-        s.chat_mut().toggle_media_call();
-        request_chat_window_relayout(ctx);
-    })
+    button
+        .enabled_when(move || active || enabled_shared.chat().media_setup.access_check_complete())
+        .on_press_with_ctx(move |ctx| {
+            s.chat_mut().toggle_media_call();
+            request_chat_window_relayout(ctx);
+        })
 }
 
 fn media_call_camera_button(shared: &Shared, reader: &ThemeReader, enabled: bool) -> sui::Button {
@@ -13385,7 +14999,7 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
             if media_active {
                 "Voice link on — tap to end"
             } else {
-                "Start voice link"
+                "Set up voice link"
             },
         )
         .size(COMPOSER_GHOST_BUTTON_SIZE)
@@ -13396,7 +15010,7 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
             move || s.chat().media_call.active
         })
         .on_press_with_ctx(move |ctx| {
-            s.chat_mut().toggle_media_call();
+            s.chat_mut().activate_media_call_control();
             request_chat_window_relayout(ctx);
         })
     };
@@ -15650,10 +17264,21 @@ mod tests {
             participant_names: Vec::new(),
         }];
         state.set_draft("follow up".to_string());
+        state.media_call_details_open = true;
+        state.media_setup.start();
+        state.toggle_media_call_mic();
+        state.toggle_media_call_camera();
+        assert!(state.media_setup.is_running());
 
         state.open_session(0);
 
         assert_eq!(state.session_id, session_id);
+        assert!(!state.media_setup.is_running());
+        assert!(state.media_setup.microphone_enabled());
+        assert!(state.media_setup.camera_enabled());
+        assert!(state.media_call.mic_enabled);
+        assert!(state.media_call.camera_enabled);
+        assert!(!state.media_call_details_open);
         assert!(state.transcript_load_pending());
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].source, ChatMessageSource::System);
@@ -18329,6 +19954,11 @@ mod tests {
         state.streaming = true;
         state.notice = Some("thinking…".to_string());
         state.control.active_turn = true;
+        state.media_call_details_open = true;
+        state.media_setup.start();
+        state.toggle_media_call_mic();
+        state.toggle_media_call_camera();
+        assert!(state.media_setup.is_running());
 
         state.new_session();
         let new_session_id = state.session_id.clone();
@@ -18339,6 +19969,12 @@ mod tests {
         );
         assert!(state.input.is_empty(), "New chat clears the composer draft");
         assert!(!state.streaming, "New chat leaves the visible chat idle");
+        assert!(!state.media_setup.is_running());
+        assert!(state.media_setup.microphone_enabled());
+        assert!(state.media_setup.camera_enabled());
+        assert!(state.media_call.mic_enabled);
+        assert!(state.media_call.camera_enabled);
+        assert!(!state.media_call_details_open);
         assert!(
             state.notice.is_none(),
             "New chat clears transient per-turn notices"
@@ -19410,10 +21046,19 @@ mod tests {
         assert!(state.media_call_status_summary().contains("mic on"));
         assert!(state.media_call_status_summary().contains("camera on"));
 
+        state.media_setup.microphone_access = MediaAccessState::Ready;
+        state.media_setup.camera_access = MediaAccessState::Ready;
+        state.media_call.microphone_level = 0.75;
+        state.media_call.camera_preview =
+            Some(MediaCameraPreview::new(3, 1, 1, vec![0, 0, 0, 255]));
         state.toggle_media_call_mic();
         state.toggle_media_call_camera();
         assert!(!state.media_call.mic_enabled);
         assert!(!state.media_call.camera_enabled);
+        assert_eq!(state.media_call.microphone_level, 0.0);
+        assert!(state.media_call.camera_preview.is_none());
+        assert_eq!(state.media_setup.microphone_access, MediaAccessState::Idle);
+        assert_eq!(state.media_setup.camera_access, MediaAccessState::Idle);
         assert!(state.media_call_status_summary().contains("mic muted"));
         assert!(state.media_call_status_summary().contains("camera paused"));
 
@@ -19424,7 +21069,472 @@ mod tests {
     }
 
     #[test]
-    fn rendered_voice_link_button_starts_media_call_and_opens_controls() -> sui::Result<()> {
+    fn media_call_control_drain_records_release_and_explicit_reopen() {
+        let (control_tx, control_rx) = mpsc::channel();
+        control_tx
+            .send(ChatMediaCallControl::SetMicEnabled(false))
+            .expect("queue mic mute");
+        control_tx
+            .send(ChatMediaCallControl::SetMicEnabled(true))
+            .expect("queue mic reopen");
+        control_tx
+            .send(ChatMediaCallControl::SetCameraEnabled(false))
+            .expect("queue camera pause");
+        let mut mic_enabled = true;
+        let mut camera_enabled = true;
+
+        let drained = drain_chat_media_controls(&control_rx, &mut mic_enabled, &mut camera_enabled);
+
+        assert!(!drained.stop);
+        assert!(mic_enabled);
+        assert!(!camera_enabled);
+        assert!(drained.microphone_disable_requested);
+        assert!(drained.microphone_enable_requested);
+        assert!(drained.camera_disable_requested);
+        assert!(!drained.camera_enable_requested);
+        assert_eq!(
+            chat_media_device_transition(
+                mic_enabled,
+                true,
+                drained.microphone_enable_requested,
+                drained.microphone_disable_requested,
+            ),
+            ChatMediaDeviceTransition {
+                release: true,
+                mark_idle: true,
+                open: true,
+            }
+        );
+        assert_eq!(
+            chat_media_device_transition(
+                camera_enabled,
+                true,
+                drained.camera_enable_requested,
+                drained.camera_disable_requested,
+            ),
+            ChatMediaDeviceTransition {
+                release: true,
+                mark_idle: true,
+                open: false,
+            }
+        );
+    }
+
+    #[test]
+    fn media_call_device_transition_opens_only_after_explicit_enable() {
+        assert_eq!(
+            chat_media_device_transition(true, false, false, false),
+            ChatMediaDeviceTransition::default()
+        );
+        assert_eq!(
+            chat_media_device_transition(true, false, true, false),
+            ChatMediaDeviceTransition {
+                release: false,
+                mark_idle: false,
+                open: true,
+            }
+        );
+        assert_eq!(
+            chat_media_device_transition(false, false, false, false),
+            ChatMediaDeviceTransition::default()
+        );
+    }
+
+    #[test]
+    fn media_call_accepts_current_all_inputs_disabled_intent() {
+        assert!(chat_media_requested_input_available(
+            false, false, false, false
+        ));
+        assert!(!chat_media_requested_input_available(
+            true, false, false, false
+        ));
+        assert!(chat_media_requested_input_available(
+            false, false, true, true
+        ));
+    }
+
+    #[test]
+    fn media_call_uses_captured_timestamp_and_saturates_to_wire_width() {
+        assert_eq!(chat_media_capture_timestamp_ms(1_042, 1_000), 42);
+        assert_eq!(chat_media_capture_timestamp_ms(999, 1_000), 0);
+        assert_eq!(
+            chat_media_capture_timestamp_ms(u128::from(u64::MAX) + 2, 1),
+            u64::MAX
+        );
+        assert!(matches!(
+            chat_media_access_failure("microphone permission denied".to_string()),
+            MediaAccessState::PermissionDenied(_)
+        ));
+    }
+
+    #[test]
+    fn media_video_sequence_stays_monotonic_across_camera_reopen() {
+        let mut sequence = ChatMediaVideoSequence::default();
+        assert_eq!(sequence.assign(), 0);
+        assert_eq!(sequence.assign(), 1);
+
+        // Reopening the native camera does not replace this call-scoped state.
+        assert_eq!(sequence.assign(), 2);
+    }
+
+    #[test]
+    fn dropping_media_runtime_cancels_network_waits_and_queues_stop() {
+        let (control_tx, control_rx) = mpsc::channel();
+        let (_event_tx, event_rx) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let runtime = ChatNativeMediaRuntime {
+            control_tx,
+            event_rx,
+            snapshots: Arc::new(Mutex::new(ChatMediaSnapshots::default())),
+            cancelled: cancelled.clone(),
+            microphone_enabled: Arc::new(AtomicBool::new(true)),
+            camera_enabled: Arc::new(AtomicBool::new(true)),
+            worker: None,
+        };
+
+        drop(runtime);
+
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(matches!(
+            control_rx.try_recv(),
+            Ok(ChatMediaCallControl::Stop)
+        ));
+    }
+
+    #[test]
+    fn cancelled_device_open_returns_promptly_and_drops_late_handle() {
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_from_thread = cancelled.clone();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_from_open = dropped.clone();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let canceller = thread::spawn(move || {
+            started_rx.recv().expect("device open started");
+            cancel_from_thread.store(true, Ordering::Release);
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+        let started = Instant::now();
+
+        let result = runtime.block_on(await_chat_media_device_open(
+            "test-device",
+            &cancelled,
+            None,
+            move || {
+                started_tx.send(()).expect("signal device open");
+                thread::sleep(Duration::from_millis(75));
+                Ok(DropProbe(dropped_from_open))
+            },
+            || {},
+        ));
+
+        canceller.join().expect("cancel thread");
+        assert!(matches!(result, ChatMediaDeviceOpen::Cancelled));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !dropped.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn disabling_device_open_emits_idle_and_never_publishes_late_ready() {
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let cancelled = AtomicBool::new(false);
+        let requested = Arc::new(AtomicBool::new(true));
+        let requested_from_thread = requested.clone();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_from_open = dropped.clone();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let disabler = thread::spawn(move || {
+            started_rx.recv().expect("device open started");
+            requested_from_thread.store(false, Ordering::Release);
+        });
+        let (event_tx, event_rx) = mpsc::channel();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+
+        let result = runtime.block_on(open_chat_media_device(
+            MediaAccessKind::Camera,
+            "test-camera",
+            &cancelled,
+            Some(&requested),
+            &event_tx,
+            &None,
+            move || {
+                started_tx.send(()).expect("signal device open");
+                thread::sleep(Duration::from_millis(75));
+                Ok(DropProbe(dropped_from_open))
+            },
+            || {},
+        ));
+
+        disabler.join().expect("disable thread");
+        assert!(matches!(result, ChatMediaDeviceOpen::Disabled));
+        assert!(matches!(
+            event_rx.recv().expect("checking event"),
+            ChatMediaCallWorkerEvent::DeviceAccess(
+                MediaAccessKind::Camera,
+                MediaAccessState::Checking
+            )
+        ));
+        assert!(matches!(
+            event_rx.recv().expect("idle event"),
+            ChatMediaCallWorkerEvent::DeviceAccess(MediaAccessKind::Camera, MediaAccessState::Idle)
+        ));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !dropped.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(matches!(event_rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn pending_device_open_polls_other_device_intent() {
+        let cancelled = AtomicBool::new(false);
+        let microphone_requested = Arc::new(AtomicBool::new(true));
+        let microphone_from_thread = microphone_requested.clone();
+        let release_observed = Arc::new(AtomicBool::new(false));
+        let release_from_wait = release_observed.clone();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let disabler = thread::spawn(move || {
+            started_rx.recv().expect("camera open started");
+            microphone_from_thread.store(false, Ordering::Release);
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+
+        let result = runtime.block_on(await_chat_media_device_open(
+            "test-camera",
+            &cancelled,
+            None,
+            move || {
+                started_tx.send(()).expect("signal camera open");
+                thread::sleep(Duration::from_millis(75));
+                Ok(7_u8)
+            },
+            || {
+                if !microphone_requested.load(Ordering::Acquire) {
+                    release_from_wait.store(true, Ordering::Release);
+                }
+            },
+        ));
+
+        disabler.join().expect("disable thread");
+        assert!(matches!(result, ChatMediaDeviceOpen::Completed(Ok(7))));
+        assert!(release_observed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn media_call_snapshots_coalesce_notice_and_live_values() {
+        let mut snapshots = ChatMediaSnapshots {
+            microphone_level: Some(0.5),
+            notice: Some("latest notice".to_string()),
+            ..Default::default()
+        };
+
+        let taken = snapshots.take();
+
+        assert_eq!(taken.microphone_level, Some(0.5));
+        assert_eq!(taken.notice.as_deref(), Some("latest notice"));
+        assert!(snapshots.is_empty());
+    }
+
+    #[test]
+    fn media_call_access_event_clears_snapshot_taken_before_device_stop() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.media_call.active = true;
+        state.media_setup.microphone_access = MediaAccessState::Ready;
+        state.media_setup.camera_access = MediaAccessState::Ready;
+        let (control_tx, _control_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let snapshots = Arc::new(Mutex::new(ChatMediaSnapshots {
+            microphone_level: Some(0.9),
+            camera_preview: Some(MediaCameraPreview::new(7, 1, 1, vec![0, 0, 0, 255])),
+            ..Default::default()
+        }));
+        state.media_call_runtime = Some(ChatNativeMediaRuntime {
+            control_tx,
+            event_rx,
+            snapshots,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            microphone_enabled: Arc::new(AtomicBool::new(true)),
+            camera_enabled: Arc::new(AtomicBool::new(true)),
+            worker: None,
+        });
+        event_tx
+            .send(ChatMediaCallWorkerEvent::DeviceAccess(
+                MediaAccessKind::Microphone,
+                MediaAccessState::Idle,
+            ))
+            .expect("queue microphone stop");
+        event_tx
+            .send(ChatMediaCallWorkerEvent::DeviceAccess(
+                MediaAccessKind::Camera,
+                MediaAccessState::Idle,
+            ))
+            .expect("queue camera stop");
+
+        assert!(state.pump_media_call_runtime());
+
+        assert_eq!(state.media_call.microphone_level, 0.0);
+        assert!(state.media_call.camera_preview.is_none());
+        assert_eq!(state.media_setup.microphone_access, MediaAccessState::Idle);
+        assert_eq!(state.media_setup.camera_access, MediaAccessState::Idle);
+
+        event_tx
+            .send(ChatMediaCallWorkerEvent::DeviceAccess(
+                MediaAccessKind::Microphone,
+                MediaAccessState::Unavailable("microphone disconnected".to_string()),
+            ))
+            .expect("queue microphone failure");
+        event_tx
+            .send(ChatMediaCallWorkerEvent::DeviceAccess(
+                MediaAccessKind::Camera,
+                MediaAccessState::Busy("camera is in use".to_string()),
+            ))
+            .expect("queue camera failure");
+        assert!(state.pump_media_call_runtime());
+        assert!(!state.media_call.mic_enabled);
+        assert!(!state.media_call.camera_enabled);
+    }
+
+    #[test]
+    fn media_call_start_config_snapshots_selected_devices_and_initial_toggles() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state
+            .media_setup
+            .microphones
+            .push(crate::ui::media_setup::MediaDeviceOption {
+                native_id: Some("mic-selected".to_string()),
+                display_name: "Selected microphone".to_string(),
+                is_default: false,
+            });
+        state
+            .media_setup
+            .speakers
+            .push(crate::ui::media_setup::MediaDeviceOption {
+                native_id: Some("speaker-selected".to_string()),
+                display_name: "Selected speaker".to_string(),
+                is_default: false,
+            });
+        state
+            .media_setup
+            .cameras
+            .push(crate::ui::media_setup::MediaDeviceOption {
+                native_id: Some("camera-selected".to_string()),
+                display_name: "Selected camera".to_string(),
+                is_default: false,
+            });
+        state.media_setup.microphone_index = 1;
+        state.media_setup.speaker_index = 1;
+        state.media_setup.camera_index = 1;
+        state.media_call.mic_enabled = false;
+        state.media_call.camera_enabled = true;
+
+        let config = state.media_call_start_config();
+
+        assert_eq!(config.devices.microphone.as_deref(), Some("mic-selected"));
+        assert_eq!(config.devices.speaker.as_deref(), Some("speaker-selected"));
+        assert_eq!(config.devices.camera.as_deref(), Some("camera-selected"));
+        assert!(!config.mic_enabled);
+        assert!(config.camera_enabled);
+    }
+
+    #[test]
+    fn inactive_preflight_releases_devices_off_tab_and_resumes_on_return() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.media_call_details_open = true;
+        state.media_setup.start();
+        assert!(state.media_setup.is_running());
+
+        assert!(state.sync_media_setup_visibility(false));
+        assert!(!state.media_setup.is_running());
+        assert!(state.sync_media_setup_visibility(true));
+        assert!(state.media_setup.is_running());
+
+        state.media_setup.stop();
+        state.media_call.active = true;
+        assert!(!state.sync_media_setup_visibility(false));
+        assert!(!state.media_setup.is_running());
+    }
+
+    #[test]
+    fn inactive_preflight_toggles_release_and_explicitly_reopen_capture_devices() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.media_call_details_open = true;
+        state.media_setup.start();
+        state.media_setup.microphone_level = 0.8;
+        state.media_setup.camera_preview =
+            Some(MediaCameraPreview::new(4, 1, 1, vec![0, 0, 0, 255]));
+
+        state.toggle_media_call_mic();
+        state.toggle_media_call_camera();
+
+        assert!(state.media_setup.is_running());
+        assert!(!state.media_setup.microphone_enabled());
+        assert!(!state.media_setup.camera_enabled());
+        assert_eq!(state.media_setup.microphone_access, MediaAccessState::Idle);
+        assert_eq!(state.media_setup.camera_access, MediaAccessState::Idle);
+        assert_eq!(state.media_setup.microphone_level, 0.0);
+        assert!(state.media_setup.camera_preview.is_none());
+
+        state.toggle_media_call_mic();
+        state.toggle_media_call_camera();
+
+        assert!(state.media_setup.microphone_enabled());
+        assert!(state.media_setup.camera_enabled());
+        assert_eq!(state.media_setup.microphone_access, MediaAccessState::Ready);
+        assert_eq!(state.media_setup.camera_access, MediaAccessState::Ready);
+    }
+
+    #[test]
+    fn device_selection_index_does_not_replace_the_media_panel_tree() {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        shared
+            .chat_mut()
+            .media_setup
+            .microphones
+            .push(crate::ui::media_setup::MediaDeviceOption {
+                native_id: Some("desk-mic".to_string()),
+                display_name: "Desk microphone".to_string(),
+                is_default: false,
+            });
+        let before = media_call_panel_signature(&shared);
+
+        shared.chat_mut().media_setup.microphone_index = 1;
+
+        assert_eq!(media_call_panel_signature(&shared), before);
+    }
+
+    #[test]
+    fn rendered_voice_link_button_opens_setup_before_starting_media_call() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -19448,7 +21558,7 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("Start voice link")
+                .with_name("Set up voice link")
                 .count()?,
             1
         );
@@ -19471,9 +21581,9 @@ mod tests {
 
         window
             .get_by_role(SemanticsRole::Button)
-            .with_name("Start voice link")
+            .with_name("Set up voice link")
             .click()?;
-        assert!(shared.chat().media_call.active);
+        assert!(!shared.chat().media_call.active);
         assert!(shared.chat().media_call_details_visible());
         assert_eq!(
             window
@@ -19481,6 +21591,54 @@ mod tests {
                 .with_name("Hide media controls")
                 .count()?,
             1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Start media call")
+                .count()?,
+            1
+        );
+        for name in ["Microphone device", "Speaker device", "Camera device"] {
+            assert_eq!(
+                window
+                    .get_by_role(SemanticsRole::ComboBox)
+                    .with_name(name)
+                    .count()?,
+                1,
+                "setup should expose the {name} selector"
+            );
+        }
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Retry media device access")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Open media privacy settings")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Test selected speaker")
+                .count()?,
+            1
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Start media call")
+            .click()?;
+        assert!(
+            shared.chat().media_call.active,
+            "start button should activate the call; notice={:?}",
+            shared.chat().media_call.notice
         );
         assert_eq!(
             window
@@ -19579,6 +21737,148 @@ mod tests {
                 .with_name("End media call")
                 .count()?,
             1
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_media_setup_stays_separated_at_320px_and_bad_preview_falls_back() -> sui::Result<()>
+    {
+        use sui::{Event, WindowEvent};
+
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.models_loading = false;
+            chat.media_call_details_open = true;
+            chat.media_setup.start();
+            chat.media_setup.camera_preview = Some(MediaCameraPreview::new(7, 2, 2, vec![255; 3]));
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Compact media setup")
+                    .root(view(shared)),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        window
+            .root()
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(320.0, 720.0))))?;
+        app.run_until_idle()?;
+
+        let snapshot = window.snapshot()?;
+        let combos = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .filter(|node| node.role == SemanticsRole::ComboBox)
+            .filter(|node| {
+                matches!(
+                    node.name.as_deref(),
+                    Some("Microphone device" | "Speaker device" | "Camera device")
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(combos.len(), 3);
+        assert!(combos.iter().all(|node| {
+            node.bounds.x() >= 0.0 && node.bounds.max_x() <= 320.0 && node.bounds.width() > 0.0
+        }));
+        let selector_y = combos
+            .iter()
+            .map(|node| node.bounds.y())
+            .fold(f32::INFINITY, f32::min);
+        let retry = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Button
+                    && node.name.as_deref() == Some("Retry media device access")
+            })
+            .expect("retry access button");
+        assert!(
+            retry.bounds.max_y() <= selector_y + 0.5,
+            "access controls must not overlap selectors: retry={:?}, selector_y={selector_y}",
+            retry.bounds
+        );
+        let preview = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Image && node.name.as_deref() == Some("Camera preview")
+            })
+            .expect("camera preview semantics");
+        assert!(preview.bounds.height() >= 80.0);
+        assert!((1.6..=2.0).contains(&(preview.bounds.width() / preview.bounds.height())));
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_camera_preview_refreshes_same_sequence_and_reuses_image_handle() -> sui::Result<()>
+    {
+        use sui::{Event, WindowEvent};
+
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let first = MediaCameraPreview::new(0, 2, 1, vec![255, 0, 0, 255, 255, 0, 0, 255]);
+        {
+            let mut chat = shared.chat_mut();
+            chat.media_call_details_open = true;
+            chat.media_setup.start();
+            chat.media_setup.camera_preview = Some(first.clone());
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Stable camera preview resource")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        window.snapshot()?;
+        let handle = shared
+            .chat()
+            .media_preview_registration
+            .handle()
+            .expect("preview image handle");
+        assert_eq!(
+            shared.chat().media_preview_registration.revision(),
+            Some(first.revision)
+        );
+
+        let replacement = MediaCameraPreview::new(0, 2, 1, vec![0, 0, 255, 255, 0, 0, 255, 255]);
+        shared.chat_mut().media_setup.camera_preview = Some(replacement.clone());
+        window
+            .root()
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(800.0, 600.0))))?;
+        app.run_until_idle()?;
+        window.snapshot()?;
+        assert_eq!(
+            shared.chat().media_preview_registration.revision(),
+            Some(replacement.revision),
+            "a restarted capture can reuse sequence zero without drawing the stale frame"
+        );
+
+        shared.chat_mut().media_call.mic_enabled = false;
+        window
+            .root()
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(801.0, 600.0))))?;
+        app.run_until_idle()?;
+        window.snapshot()?;
+        assert_eq!(
+            shared.chat().media_preview_registration.handle(),
+            Some(handle),
+            "panel rebuilds must overwrite one stable image resource"
         );
 
         Ok(())

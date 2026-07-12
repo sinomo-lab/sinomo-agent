@@ -201,6 +201,11 @@ pub struct NativeSpeakerPlayback {
 }
 
 impl NativeSpeakerPlayback {
+    pub fn check_health(&self) -> Result<(), NativeAudioError> {
+        self.raw.check_health()?;
+        Ok(())
+    }
+
     pub fn write(&self, bytes: &[u8]) -> Result<(), NativeAudioError> {
         let output_format = self.raw.format();
         let encoded = convert_model_audio_to_raw_output(
@@ -264,6 +269,52 @@ pub fn start_native_speaker_playback(
         input_sample_rate_hz: config.input_sample_rate_hz,
         input_sample_format: config.input_sample_format,
     })
+}
+
+/// Convert mono PCM into a stable 0..=1 microphone meter value. The logarithmic
+/// mapping keeps ordinary speech visible while silence remains at zero.
+pub fn normalized_audio_meter_level(bytes: &[u8], format: NativeAudioSampleFormat) -> f32 {
+    let samples = decode_audio_samples(bytes, format);
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mean_square = samples
+        .iter()
+        .map(|sample| sample.clamp(-1.0, 1.0).powi(2))
+        .sum::<f32>()
+        / samples.len() as f32;
+    let rms = mean_square.sqrt();
+    if !rms.is_finite() || rms <= f32::EPSILON {
+        return 0.0;
+    }
+    let dbfs = 20.0 * rms.log10();
+    ((dbfs + 60.0) / 60.0).clamp(0.0, 1.0)
+}
+
+/// Generate a short, softly faded tone in the same mono format accepted by
+/// [`NativeSpeakerPlayback`]. The caller owns playback lifetime and completion.
+pub fn speaker_test_tone(
+    sample_rate_hz: u32,
+    format: NativeAudioSampleFormat,
+    duration: Duration,
+) -> Vec<u8> {
+    let sample_rate_hz = sample_rate_hz.max(1);
+    let sample_count = (duration.as_secs_f64() * sample_rate_hz as f64)
+        .round()
+        .max(1.0) as usize;
+    let fade_samples = ((sample_rate_hz as f32 * 0.025).round() as usize)
+        .max(1)
+        .min((sample_count / 2).max(1));
+    let mut out = Vec::with_capacity(sample_count * format.bytes_per_sample());
+    for index in 0..sample_count {
+        let attack = (index as f32 / fade_samples.max(1) as f32).clamp(0.0, 1.0);
+        let release =
+            ((sample_count - 1 - index) as f32 / fade_samples.max(1) as f32).clamp(0.0, 1.0);
+        let envelope = attack.min(release);
+        let phase = std::f32::consts::TAU * 440.0 * index as f32 / sample_rate_hz as f32;
+        encode_audio_sample(phase.sin() * 0.24 * envelope, format, &mut out);
+    }
+    out
 }
 
 struct AudioCaptureState {
@@ -658,5 +709,51 @@ mod tests {
             first < 32_768,
             "negative model audio maps below unsigned silence"
         );
+    }
+
+    #[test]
+    fn normalized_audio_meter_level_handles_silence_and_full_scale_pcm16() {
+        assert_eq!(
+            normalized_audio_meter_level(&[0, 0, 0, 0], NativeAudioSampleFormat::Pcm16Le),
+            0.0
+        );
+        let mut full_scale = Vec::new();
+        for sample in [i16::MAX, i16::MIN, i16::MAX, i16::MIN] {
+            full_scale.extend_from_slice(&sample.to_le_bytes());
+        }
+        assert!(normalized_audio_meter_level(&full_scale, NativeAudioSampleFormat::Pcm16Le) > 0.99);
+    }
+
+    #[test]
+    fn normalized_audio_meter_level_handles_f32_and_invalid_boundaries() {
+        let mut speech = Vec::new();
+        for sample in [0.1_f32, -0.1, 0.1, -0.1] {
+            speech.extend_from_slice(&sample.to_le_bytes());
+        }
+        let level = normalized_audio_meter_level(&speech, NativeAudioSampleFormat::F32Le);
+        assert!(
+            (0.6..0.8).contains(&level),
+            "unexpected speech level {level}"
+        );
+        assert_eq!(
+            normalized_audio_meter_level(&[], NativeAudioSampleFormat::F32Le),
+            0.0
+        );
+    }
+
+    #[test]
+    fn speaker_test_tone_has_expected_duration_amplitude_and_fades() {
+        let tone = speaker_test_tone(
+            24_000,
+            NativeAudioSampleFormat::Pcm16Le,
+            Duration::from_millis(500),
+        );
+        assert_eq!(tone.len(), 24_000);
+        let samples = decode_audio_samples(&tone, NativeAudioSampleFormat::Pcm16Le);
+        assert_eq!(samples.len(), 12_000);
+        assert!(samples.iter().all(|sample| sample.abs() <= 0.25));
+        assert_eq!(samples[0], 0.0);
+        assert!(samples[samples.len() - 1].abs() < 0.001);
+        assert!(samples.iter().any(|sample| sample.abs() > 0.2));
     }
 }

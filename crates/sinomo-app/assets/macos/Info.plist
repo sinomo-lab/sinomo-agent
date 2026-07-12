@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key>
+    <string>Sinomo</string>
+    <key>CFBundleIdentifier</key>
+    <string>net.sinomo.app</string>
+    <key>CFBundleName</key>
+    <string>Sinomo</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Sinomo uses the selected camera for local previews and realtime video calls.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Sinomo uses the selected microphone for input levels and realtime audio calls.</string>
+</dict>
+</plist>
