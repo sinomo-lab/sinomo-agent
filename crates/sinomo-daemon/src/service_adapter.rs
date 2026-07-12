@@ -1737,6 +1737,15 @@ static DAEMON_DFS_BROWSER_BACKENDS: OnceLock<
     Mutex<HashMap<PathBuf, Arc<DaemonDfsBrowserBackend>>>,
 > = OnceLock::new();
 
+// Browser reads run on blocking workers because the DFS POSIX surface is
+// synchronous. A remote content fetch can consume the full 30-second POSIX
+// deadline while holding the shared service lock. Do not let the other browser
+// workers park behind that request: ordinary short local operations still get
+// a small handoff window, while degraded remote reads fail fast and let their
+// callers retry without building an in-process queue. This is an admission
+// bound only; it does not impose an end-to-end timeout on an admitted DFS read.
+const DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT: Duration = Duration::from_millis(100);
+
 impl DaemonDfsBrowserBackend {
     fn open(
         data_dir: SinomoDataDir,
@@ -1795,6 +1804,34 @@ impl DaemonDfsBrowserBackend {
         })
     }
 
+    fn lock_service_for_read(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, sinomo_dfs::MountedSifsService>, ServiceError> {
+        let started = Instant::now();
+        loop {
+            match self.service.try_lock() {
+                Ok(service) => return Ok(service),
+                Err(std::sync::TryLockError::Poisoned(source)) => {
+                    return Err(ServiceError::Service(format!(
+                        "DFS browser service lock failed: {source}"
+                    )));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let Some(remaining) = DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT
+                        .checked_sub(started.elapsed())
+                        .filter(|remaining| !remaining.is_zero())
+                    else {
+                        return Err(ServiceError::Service(format!(
+                            "DFS browser service is busy after waiting {}ms; retry the read",
+                            DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT.as_millis()
+                        )));
+                    };
+                    std::thread::sleep(Duration::from_millis(1).min(remaining));
+                }
+            }
+        }
+    }
+
     fn refresh_peer_targets(&self, service: &mut sinomo_dfs::MountedSifsService) {
         let now = Instant::now();
         if let Ok(mut refreshed_at) = self.peer_targets_refreshed_at.lock() {
@@ -1822,7 +1859,7 @@ impl DaemonDfsBrowserBackend {
     }
 
     fn node_id(&self) -> Result<String, ServiceError> {
-        Ok(self.lock_service()?.node_id().to_string())
+        Ok(self.lock_service_for_read()?.node_id().to_string())
     }
 
     fn health_summary(&self) -> Result<crate::DaemonDfsBrowserHealthSummary, ServiceError> {
@@ -1837,7 +1874,7 @@ impl DaemonDfsBrowserBackend {
         request: crate::DaemonDfsBrowserListRequest,
     ) -> Result<crate::DaemonDfsBrowserListResponse, ServiceError> {
         let path = normalize_sifs_browser_path(&request.path)?;
-        let mut service = self.lock_service()?;
+        let mut service = self.lock_service_for_read()?;
         self.refresh_peer_targets(&mut service);
         let mut entries: Vec<_> = match service.posix_list_dir_distributed(&path) {
             Ok(entries) => entries,
@@ -1876,7 +1913,7 @@ impl DaemonDfsBrowserBackend {
         request: crate::DaemonDfsBrowserStatRequest,
     ) -> Result<crate::DaemonDfsBrowserStatResponse, ServiceError> {
         let path = normalize_sifs_browser_path(&request.path)?;
-        let mut service = self.lock_service()?;
+        let mut service = self.lock_service_for_read()?;
         self.refresh_peer_targets(&mut service);
         let stat = service
             .posix_stat_distributed(&path)
@@ -1928,7 +1965,7 @@ impl DaemonDfsBrowserBackend {
         request: crate::DaemonDfsBrowserReadFileRequest,
     ) -> Result<crate::DaemonDfsBrowserReadFileResponse, ServiceError> {
         let path = normalize_sifs_browser_path(&request.path)?;
-        let mut service = self.lock_service()?;
+        let mut service = self.lock_service_for_read()?;
         self.refresh_peer_targets(&mut service);
         let bytes = service
             .posix_read_file_distributed(&path)
@@ -1944,7 +1981,7 @@ impl DaemonDfsBrowserBackend {
             .map_err(|source| ServiceError::Service(source.to_string()))?;
         let version = sinomo_dfs::DfsVersion::new(&request.version)
             .map_err(|source| ServiceError::Service(source.to_string()))?;
-        let mut service = self.lock_service()?;
+        let mut service = self.lock_service_for_read()?;
         self.refresh_peer_targets(&mut service);
         let bytes = service
             .read_object_version_content(
@@ -1963,7 +2000,7 @@ impl DaemonDfsBrowserBackend {
     ) -> Result<crate::DaemonDfsBrowserReadFilePrefixResponse, ServiceError> {
         let path = normalize_sifs_browser_path(&request.path)?;
         let max_bytes = usize::try_from(request.max_bytes).unwrap_or(usize::MAX);
-        let mut service = self.lock_service()?;
+        let mut service = self.lock_service_for_read()?;
         self.refresh_peer_targets(&mut service);
         let stat = service
             .posix_stat_distributed(&path)
@@ -1987,7 +2024,7 @@ impl DaemonDfsBrowserBackend {
             .into_iter()
             .map(|path| normalize_sifs_browser_path(&path).map(|normalized| (path, normalized)))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut service = self.lock_service()?;
+        let mut service = self.lock_service_for_read()?;
         self.refresh_peer_targets(&mut service);
         let files = paths
             .into_iter()
@@ -4654,6 +4691,80 @@ mod tests {
 
         assert_eq!(options.replica_candidates, vec![first, second]);
         assert!(!options.foreground_replica_repair);
+    }
+
+    #[test]
+    fn dfs_browser_reads_do_not_queue_behind_busy_service() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-dfs-browser-read-contention");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let backend = Arc::new(
+            DaemonDfsBrowserBackend::open(SinomoDataDir::new(&root), runtime.handle())
+                .expect("open DFS browser backend"),
+        );
+        let held_service = backend.lock_service().expect("hold DFS browser service");
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+        let list_backend = Arc::clone(&backend);
+        let list_tx = result_tx.clone();
+        let list_worker = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = list_backend
+                .list(crate::DaemonDfsBrowserListRequest {
+                    path: "/".to_string(),
+                    shallow: true,
+                    missing_is_empty: true,
+                    sort_key: crate::DaemonDfsBrowserSortKey::default(),
+                    sort_direction: crate::DaemonDfsBrowserSortDirection::default(),
+                    offset: 0,
+                    limit: None,
+                })
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            list_tx
+                .send(("list", started.elapsed(), result))
+                .expect("report list result");
+        });
+
+        let read_backend = Arc::clone(&backend);
+        let read_worker = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = read_backend
+                .read_files(crate::DaemonDfsBrowserReadFilesRequest {
+                    paths: vec!["/missing.json".to_string()],
+                })
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            result_tx
+                .send(("read-files", started.elapsed(), result))
+                .expect("report read-files result");
+        });
+
+        for _ in 0..2 {
+            let (operation, elapsed, result) = result_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("contending browser read must not wait for the held service lock");
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "{operation} remained queued for {elapsed:?}"
+            );
+            let error = result.expect_err("contending browser read should report busy");
+            assert!(
+                error.contains("DFS browser service is busy") && error.contains("retry the read"),
+                "unexpected {operation} error: {error}"
+            );
+        }
+
+        drop(held_service);
+        list_worker.join().expect("join list worker");
+        read_worker.join().expect("join read-files worker");
+        assert!(
+            backend.node_id().is_ok(),
+            "a busy result must not poison or retain the service lock"
+        );
     }
 
     struct TestStopService;
