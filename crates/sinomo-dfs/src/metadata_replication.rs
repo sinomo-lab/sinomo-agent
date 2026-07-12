@@ -548,6 +548,23 @@ where
     true
 }
 
+pub fn schedule_dfs_metadata_publish_async_on_runtime<P, Fut, R, E>(
+    scheduler: &'static DfsMetadataPublishScheduler,
+    runtime: tokio::runtime::Handle,
+    options: DfsMetadataPublishScheduleOptions,
+    publish: P,
+    on_report: R,
+    on_error: E,
+) -> DfsMetadataPublishScheduleStart
+where
+    P: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<DfsMetadataJournalReplicationReport, String>> + Send + 'static,
+    R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
+    E: FnMut(String) + Send + 'static,
+{
+    scheduler.request_publish_async_on_runtime(runtime, options, publish, on_report, on_error)
+}
+
 pub fn schedule_dfs_metadata_publish_after_events_async_on_runtime<P, Fut, R, E>(
     scheduler: &'static DfsMetadataPublishScheduler,
     runtime: tokio::runtime::Handle,
@@ -563,14 +580,38 @@ where
     R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
     E: FnMut(String) + Send + 'static,
 {
-    if !dfs_events_should_publish_metadata(events) {
-        return None;
-    }
-    Some(scheduler.request_publish_async_on_runtime(runtime, options, publish, on_report, on_error))
+    dfs_events_should_publish_metadata(events).then(|| {
+        schedule_dfs_metadata_publish_async_on_runtime(
+            scheduler, runtime, options, publish, on_report, on_error,
+        )
+    })
 }
 
 static DEFAULT_DFS_METADATA_PUBLISH_SCHEDULER: DfsMetadataPublishScheduler =
     DfsMetadataPublishScheduler::new();
+
+pub fn schedule_default_dfs_metadata_publish_async_on_runtime<P, Fut, R, E>(
+    runtime: tokio::runtime::Handle,
+    options: DfsMetadataPublishScheduleOptions,
+    publish: P,
+    on_report: R,
+    on_error: E,
+) -> DfsMetadataPublishScheduleStart
+where
+    P: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<DfsMetadataJournalReplicationReport, String>> + Send + 'static,
+    R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
+    E: FnMut(String) + Send + 'static,
+{
+    schedule_dfs_metadata_publish_async_on_runtime(
+        &DEFAULT_DFS_METADATA_PUBLISH_SCHEDULER,
+        runtime,
+        options,
+        publish,
+        on_report,
+        on_error,
+    )
+}
 
 pub fn schedule_default_dfs_metadata_publish_after_events_async_on_runtime<P, Fut, R, E>(
     runtime: tokio::runtime::Handle,
@@ -586,15 +627,11 @@ where
     R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
     E: FnMut(String) + Send + 'static,
 {
-    schedule_dfs_metadata_publish_after_events_async_on_runtime(
-        &DEFAULT_DFS_METADATA_PUBLISH_SCHEDULER,
-        runtime,
-        events,
-        options,
-        publish,
-        on_report,
-        on_error,
-    )
+    dfs_events_should_publish_metadata(events).then(|| {
+        schedule_default_dfs_metadata_publish_async_on_runtime(
+            runtime, options, publish, on_report, on_error,
+        )
+    })
 }
 
 pub fn run_cluster_dfs_metadata_publish_after_events<R, E>(
@@ -684,25 +721,23 @@ where
     .await
 }
 
-pub fn schedule_cluster_dfs_metadata_publish_after_events_async_on_runtime<R, E>(
+pub fn schedule_cluster_dfs_metadata_publish_async_on_runtime<R, E>(
     runtime: tokio::runtime::Handle,
     data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
     metadata_sender: AsyncDfsMetadataJournalBatchSender,
     snapshot_sender: AsyncDfsMetadataSnapshotInstallSender,
-    events: &[NetworkedDfsServiceEvent],
     schedule_options: DfsMetadataPublishScheduleOptions,
     replication_options: DfsMetadataJournalReplicationOptions,
     on_report: R,
     on_error: E,
-) -> Option<DfsMetadataPublishScheduleStart>
+) -> DfsMetadataPublishScheduleStart
 where
     R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
     E: FnMut(String) + Send + 'static,
 {
-    schedule_default_dfs_metadata_publish_after_events_async_on_runtime(
+    schedule_default_dfs_metadata_publish_async_on_runtime(
         runtime,
-        events,
         schedule_options,
         move || {
             let data_dir = data_dir.clone();
@@ -726,6 +761,64 @@ where
     )
 }
 
+pub fn schedule_cluster_dfs_metadata_publish_after_events_async_on_runtime<R, E>(
+    runtime: tokio::runtime::Handle,
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    metadata_sender: AsyncDfsMetadataJournalBatchSender,
+    snapshot_sender: AsyncDfsMetadataSnapshotInstallSender,
+    events: &[NetworkedDfsServiceEvent],
+    schedule_options: DfsMetadataPublishScheduleOptions,
+    replication_options: DfsMetadataJournalReplicationOptions,
+    on_report: R,
+    on_error: E,
+) -> Option<DfsMetadataPublishScheduleStart>
+where
+    R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
+    E: FnMut(String) + Send + 'static,
+{
+    dfs_events_should_publish_metadata(events).then(|| {
+        schedule_cluster_dfs_metadata_publish_async_on_runtime(
+            runtime,
+            data_dir,
+            cluster_paths,
+            metadata_sender,
+            snapshot_sender,
+            schedule_options,
+            replication_options,
+            on_report,
+            on_error,
+        )
+    })
+}
+
+pub fn schedule_cluster_dfs_metadata_publish_with_async_peer_transport_on_runtime<R, E>(
+    runtime: tokio::runtime::Handle,
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    schedule_options: DfsMetadataPublishScheduleOptions,
+    replication_options: DfsMetadataJournalReplicationOptions,
+    on_report: R,
+    on_error: E,
+) -> DfsMetadataPublishScheduleStart
+where
+    R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
+    E: FnMut(String) + Send + 'static,
+{
+    schedule_cluster_dfs_metadata_publish_async_on_runtime(
+        runtime,
+        data_dir,
+        cluster_paths,
+        async_dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
+        schedule_options,
+        replication_options,
+        on_report,
+        on_error,
+    )
+}
+
 pub fn schedule_cluster_dfs_metadata_publish_after_events_with_async_peer_transport_on_runtime<
     R,
     E,
@@ -744,39 +837,37 @@ where
     R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
     E: FnMut(String) + Send + 'static,
 {
-    schedule_cluster_dfs_metadata_publish_after_events_async_on_runtime(
-        runtime,
-        data_dir,
-        cluster_paths,
-        async_dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
-        async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
-        events,
-        schedule_options,
-        replication_options,
-        on_report,
-        on_error,
-    )
+    dfs_events_should_publish_metadata(events).then(|| {
+        schedule_cluster_dfs_metadata_publish_with_async_peer_transport_on_runtime(
+            runtime,
+            data_dir,
+            cluster_paths,
+            peer_transport,
+            schedule_options,
+            replication_options,
+            on_report,
+            on_error,
+        )
+    })
 }
 
-pub fn schedule_cluster_dfs_metadata_publish_after_events_with_peer_transports_on_runtime<R, E>(
+pub fn schedule_cluster_dfs_metadata_publish_with_peer_transports_on_runtime<R, E>(
     runtime: tokio::runtime::Handle,
     data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
     sync_peer_transport: Arc<dyn DfsPeerTransport>,
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
-    events: &[NetworkedDfsServiceEvent],
     schedule_options: DfsMetadataPublishScheduleOptions,
     replication_options: DfsMetadataJournalReplicationOptions,
     on_report: R,
     on_error: E,
-) -> Option<DfsMetadataPublishScheduleStart>
+) -> DfsMetadataPublishScheduleStart
 where
     R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
     E: FnMut(String) + Send + 'static,
 {
-    schedule_default_dfs_metadata_publish_after_events_async_on_runtime(
+    schedule_default_dfs_metadata_publish_async_on_runtime(
         runtime,
-        events,
         schedule_options,
         move || {
             let data_dir = data_dir.clone();
@@ -798,6 +889,37 @@ where
         on_report,
         on_error,
     )
+}
+
+pub fn schedule_cluster_dfs_metadata_publish_after_events_with_peer_transports_on_runtime<R, E>(
+    runtime: tokio::runtime::Handle,
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    sync_peer_transport: Arc<dyn DfsPeerTransport>,
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    events: &[NetworkedDfsServiceEvent],
+    schedule_options: DfsMetadataPublishScheduleOptions,
+    replication_options: DfsMetadataJournalReplicationOptions,
+    on_report: R,
+    on_error: E,
+) -> Option<DfsMetadataPublishScheduleStart>
+where
+    R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
+    E: FnMut(String) + Send + 'static,
+{
+    dfs_events_should_publish_metadata(events).then(|| {
+        schedule_cluster_dfs_metadata_publish_with_peer_transports_on_runtime(
+            runtime,
+            data_dir,
+            cluster_paths,
+            sync_peer_transport,
+            peer_transport,
+            schedule_options,
+            replication_options,
+            on_report,
+            on_error,
+        )
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -825,6 +947,48 @@ pub enum DfsMetadataPublishScheduleStart {
 pub struct DfsMetadataPublishScheduler {
     pending: AtomicBool,
     running: AtomicBool,
+}
+
+struct DfsMetadataPublishRunGuard {
+    scheduler: &'static DfsMetadataPublishScheduler,
+    owns_running: bool,
+}
+
+impl DfsMetadataPublishRunGuard {
+    fn new(scheduler: &'static DfsMetadataPublishScheduler) -> Self {
+        Self {
+            scheduler,
+            owns_running: true,
+        }
+    }
+
+    fn release_or_reclaim_pending(&mut self) -> bool {
+        debug_assert!(self.owns_running);
+        // Disarm before publishing the idle state so this guard cannot clear a
+        // concurrent request's newly acquired claim when the loop exits.
+        self.owns_running = false;
+        self.scheduler.running.store(false, Ordering::Release);
+        if self.scheduler.pending.load(Ordering::Acquire)
+            && self
+                .scheduler
+                .running
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            self.owns_running = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for DfsMetadataPublishRunGuard {
+    fn drop(&mut self) {
+        if self.owns_running {
+            self.scheduler.running.store(false, Ordering::Release);
+        }
+    }
 }
 
 impl Default for DfsMetadataPublishScheduler {
@@ -870,8 +1034,9 @@ impl DfsMetadataPublishScheduler {
     {
         let start = self.claim_publish_start();
         if start == DfsMetadataPublishScheduleStart::Started {
+            let run_guard = DfsMetadataPublishRunGuard::new(self);
             runtime.spawn(async move {
-                self.run_publish_loop_async(options, publish, on_report, on_error)
+                self.run_publish_loop_async(options, publish, on_report, on_error, run_guard)
                     .await;
             });
         }
@@ -884,6 +1049,7 @@ impl DfsMetadataPublishScheduler {
         mut publish: P,
         mut on_report: R,
         mut on_error: E,
+        mut run_guard: DfsMetadataPublishRunGuard,
     ) where
         P: FnMut() -> Fut,
         Fut: Future<Output = Result<DfsMetadataJournalReplicationReport, String>>,
@@ -913,18 +1079,202 @@ impl DfsMetadataPublishScheduler {
                 tokio::time::sleep(options.retry_delay).await;
                 continue;
             }
-            self.running.store(false, Ordering::Release);
-            if self.pending.load(Ordering::Acquire)
-                && self
-                    .running
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
+            if run_guard.release_or_reclaim_pending() {
                 retry_rounds = 0;
                 continue;
             }
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod publish_scheduler_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn unconditional_publish_runs_and_coalesces_pending_requests() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let scheduler = Box::leak(Box::new(DfsMetadataPublishScheduler::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let discarded_calls = Arc::new(AtomicUsize::new(0));
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let (report_sender, report_receiver) = std::sync::mpsc::channel();
+
+        let publish_calls = Arc::clone(&calls);
+        let publish_started = Arc::clone(&first_started);
+        let publish_release = Arc::clone(&release_first);
+        let start = schedule_dfs_metadata_publish_async_on_runtime(
+            scheduler,
+            runtime.handle().clone(),
+            DfsMetadataPublishScheduleOptions {
+                max_retry_rounds: 0,
+                retry_delay: Duration::ZERO,
+            },
+            move || {
+                let call = publish_calls.fetch_add(1, Ordering::SeqCst);
+                let publish_started = Arc::clone(&publish_started);
+                let publish_release = Arc::clone(&publish_release);
+                async move {
+                    publish_started.notify_one();
+                    if call == 0 {
+                        publish_release.notified().await;
+                    }
+                    Ok(DfsMetadataJournalReplicationReport {
+                        outcomes: Vec::new(),
+                    })
+                }
+            },
+            move |report| {
+                report_sender.send(report).expect("report receiver");
+            },
+            |_| {},
+        );
+        assert_eq!(start, DfsMetadataPublishScheduleStart::Started);
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), first_started.notified())
+                .await
+                .expect("first publish started");
+        });
+
+        let second_publish_calls = Arc::clone(&discarded_calls);
+        let second_start = schedule_dfs_metadata_publish_async_on_runtime(
+            scheduler,
+            runtime.handle().clone(),
+            DfsMetadataPublishScheduleOptions::default(),
+            move || {
+                second_publish_calls.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Ok(DfsMetadataJournalReplicationReport {
+                        outcomes: Vec::new(),
+                    })
+                }
+            },
+            |_| {},
+            |_| {},
+        );
+        assert_eq!(
+            second_start,
+            DfsMetadataPublishScheduleStart::AlreadyRunning
+        );
+
+        release_first.notify_one();
+        report_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first report");
+        report_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("coalesced report");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(discarded_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cancelled_publish_task_releases_running_claim() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let scheduler = Box::leak(Box::new(DfsMetadataPublishScheduler::new()));
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+
+        let start = schedule_dfs_metadata_publish_async_on_runtime(
+            scheduler,
+            runtime.handle().clone(),
+            DfsMetadataPublishScheduleOptions {
+                max_retry_rounds: 0,
+                retry_delay: Duration::ZERO,
+            },
+            move || {
+                let started_sender = started_sender.clone();
+                async move {
+                    started_sender.send(()).expect("start receiver");
+                    std::future::pending::<Result<DfsMetadataJournalReplicationReport, String>>()
+                        .await
+                }
+            },
+            |_| {},
+            |_| {},
+        );
+        assert_eq!(start, DfsMetadataPublishScheduleStart::Started);
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("publish task started");
+
+        drop(runtime);
+        assert!(!scheduler.running.load(Ordering::Acquire));
+
+        let recovery_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("recovery runtime");
+        let (report_sender, report_receiver) = std::sync::mpsc::channel();
+        let recovery_start = schedule_dfs_metadata_publish_async_on_runtime(
+            scheduler,
+            recovery_runtime.handle().clone(),
+            DfsMetadataPublishScheduleOptions {
+                max_retry_rounds: 0,
+                retry_delay: Duration::ZERO,
+            },
+            || async {
+                Ok(DfsMetadataJournalReplicationReport {
+                    outcomes: Vec::new(),
+                })
+            },
+            move |report| report_sender.send(report).expect("report receiver"),
+            |_| {},
+        );
+        assert_eq!(recovery_start, DfsMetadataPublishScheduleStart::Started);
+        recovery_runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if let Ok(report) = report_receiver.try_recv() {
+                        break report;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("recovery publish report");
+        });
+    }
+
+    #[test]
+    fn event_gated_scheduler_skips_non_publishing_events() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let scheduler = Box::leak(Box::new(DfsMetadataPublishScheduler::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let publish_calls = Arc::clone(&calls);
+
+        let start = schedule_dfs_metadata_publish_after_events_async_on_runtime(
+            scheduler,
+            runtime.handle().clone(),
+            &[],
+            DfsMetadataPublishScheduleOptions::default(),
+            move || {
+                publish_calls.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Ok(DfsMetadataJournalReplicationReport {
+                        outcomes: Vec::new(),
+                    })
+                }
+            },
+            |_| {},
+            |_| {},
+        );
+
+        assert_eq!(start, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }
 

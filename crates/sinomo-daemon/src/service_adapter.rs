@@ -582,6 +582,19 @@ impl Service for DaemonControlService {
                     let _: crate::DaemonClusterMaintenanceRefreshRequest = request.decode_body()?;
                     crate::control::request_daemon_cluster_maintenance_refresh();
                     crate::dfs::notify_daemon_dfs_maintenance_work();
+                    if let Some(runtime) = runtime.as_ref() {
+                        if let Err(error) =
+                            crate::dfs::schedule_daemon_dfs_metadata_publish_on_runtime(
+                                &paths,
+                                runtime,
+                                request.traceparent().map(ToString::to_string),
+                            )
+                        {
+                            tracing::warn!(
+                                "sinomo daemon DFS metadata publish could not be scheduled after maintenance refresh: {error}"
+                            );
+                        }
+                    }
                     tracing::info!("sinomo daemon cluster maintenance refresh requested by RPC");
                     (
                         ObjectRpcResponse::encode_body(
@@ -2449,12 +2462,11 @@ impl Service for DaemonDfsBrowserService {
                         },
                     )
                     .await?;
-                    publish_daemon_sifs_metadata(
+                    schedule_daemon_sifs_metadata_publish(
                         publish_data_dir.as_ref(),
                         runtime.as_ref(),
                         request_traceparent.as_deref(),
-                    )
-                    .await?;
+                    );
                     ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, &result)?
                 }
                 DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE => {
@@ -2473,12 +2485,11 @@ impl Service for DaemonDfsBrowserService {
                         },
                     )
                     .await?;
-                    publish_daemon_sifs_metadata(
+                    schedule_daemon_sifs_metadata_publish(
                         publish_data_dir.as_ref(),
                         runtime.as_ref(),
                         request_traceparent.as_deref(),
-                    )
-                    .await?;
+                    );
                     ObjectRpcResponse::encode_body(
                         DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
                         &result,
@@ -2497,12 +2508,11 @@ impl Service for DaemonDfsBrowserService {
                             })
                         })
                         .await?;
-                    publish_daemon_sifs_metadata(
+                    schedule_daemon_sifs_metadata_publish(
                         publish_data_dir.as_ref(),
                         runtime.as_ref(),
                         request_traceparent.as_deref(),
-                    )
-                    .await?;
+                    );
                     ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_RENAME_ROUTE, &result)?
                 }
                 DAEMON_DFS_BROWSER_DELETE_ROUTE => {
@@ -2518,12 +2528,11 @@ impl Service for DaemonDfsBrowserService {
                             })
                         })
                         .await?;
-                    publish_daemon_sifs_metadata(
+                    schedule_daemon_sifs_metadata_publish(
                         publish_data_dir.as_ref(),
                         runtime.as_ref(),
                         request_traceparent.as_deref(),
-                    )
-                    .await?;
+                    );
                     ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_DELETE_ROUTE, &result)?
                 }
                 DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE => {
@@ -2783,87 +2792,35 @@ fn daemon_dfs_browser_object_health(
     })
 }
 
-async fn publish_daemon_sifs_metadata(
+fn schedule_daemon_sifs_metadata_publish(
     data_dir: &SinomoDataDir,
     runtime: Option<&tokio::runtime::Handle>,
     traceparent: Option<&str>,
-) -> Result<(), ServiceError> {
-    let trace_started = std::time::Instant::now();
-    let runtime = require_service_runtime(runtime, "DFS browser metadata publish")?.clone();
+) {
+    crate::dfs::notify_daemon_dfs_maintenance_work();
+    let Some(runtime) = runtime else {
+        tracing::warn!(
+            "sinomo daemon DFS browser metadata publish has no runtime; maintenance will retry"
+        );
+        return;
+    };
     let daemon_paths = crate::DaemonPaths::new(data_dir);
-    let batch_runtime = runtime.clone();
-    let batch_paths = daemon_paths.clone();
-    let batch_sender: sinomo_dfs::AsyncDfsMetadataJournalBatchSender =
-        Arc::new(move |target_node_id, command, connect_timeout| {
-            let runtime = batch_runtime.clone();
-            let paths = batch_paths.clone();
-            Box::pin(async move {
-                let request = sinomo_dfs::dfs_metadata_journal_batch_rpc_request(command).map_err(
-                    |source| sinomo_dfs::DfsMetadataPeerTransportError::new(source.to_string()),
-                )?;
-                let response = crate::client::send_object_rpc_to_target_async_with_daemon_paths(
-                    &paths,
-                    target_node_id,
-                    &request,
-                    connect_timeout,
-                    &runtime,
-                    false,
-                )
-                .await
-                .map_err(|source| {
-                    sinomo_dfs::DfsMetadataPeerTransportError::new(source.to_string())
-                })?;
-                sinomo_dfs::decode_dfs_metadata_journal_batch_rpc_response(&response).map_err(
-                    |source| sinomo_dfs::DfsMetadataPeerTransportError::new(source.to_string()),
-                )
-            })
-        });
-    let snapshot_runtime = runtime;
-    let snapshot_paths = daemon_paths;
-    let snapshot_sender: sinomo_dfs::AsyncDfsMetadataSnapshotInstallSender =
-        Arc::new(move |target_node_id, command, connect_timeout| {
-            let runtime = snapshot_runtime.clone();
-            let paths = snapshot_paths.clone();
-            Box::pin(async move {
-                let request = sinomo_dfs::dfs_metadata_snapshot_install_rpc_request(command)
-                    .map_err(|source| {
-                        sinomo_dfs::DfsMetadataPeerTransportError::new(source.to_string())
-                    })?;
-                let response = crate::client::send_object_rpc_to_target_async_with_daemon_paths(
-                    &paths,
-                    target_node_id,
-                    &request,
-                    connect_timeout,
-                    &runtime,
-                    false,
-                )
-                .await
-                .map_err(|source| {
-                    sinomo_dfs::DfsMetadataPeerTransportError::new(source.to_string())
-                })?;
-                sinomo_dfs::decode_dfs_metadata_snapshot_install_rpc_response(&response).map_err(
-                    |source| sinomo_dfs::DfsMetadataPeerTransportError::new(source.to_string()),
-                )
-            })
-        });
-    let cluster_paths = ClusterPaths::new(data_dir);
-    let report = sinomo_dfs::publish_cluster_dfs_metadata_journal_async(
-        data_dir,
-        &cluster_paths,
-        batch_sender,
-        snapshot_sender,
-        sinomo_dfs::DfsMetadataJournalReplicationOptions::default(),
-    )
-    .await
-    .map_err(dfs_browser_service_error)?;
-    tracing::trace!(
-        target: "sinomo.dfs.perf",
-        traceparent = %traceparent.unwrap_or_default(),
-        outcomes = report.outcomes.len(),
-        total_ms = trace_started.elapsed().as_millis(),
-        "dfs-browser-metadata-publish"
-    );
-    Ok(())
+    match crate::dfs::schedule_daemon_dfs_metadata_publish_on_runtime(
+        &daemon_paths,
+        runtime,
+        traceparent.map(ToString::to_string),
+    ) {
+        Ok(start) => tracing::trace!(
+            target: "sinomo.dfs.perf",
+            traceparent = %traceparent.unwrap_or_default(),
+            ?start,
+            "dfs-browser-metadata-publish-scheduled"
+        ),
+        Err(error) => tracing::warn!(
+            traceparent = %traceparent.unwrap_or_default(),
+            "sinomo daemon DFS browser metadata publish could not be scheduled; maintenance will retry: {error}"
+        ),
+    }
 }
 
 fn sifs_browser_write_options(

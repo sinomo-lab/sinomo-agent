@@ -37,9 +37,10 @@ use super::{
     load_tui_model_runtime_config, main_agent_config_tool_registry,
     main_agent_handler_for_tui_with_data_dir, main_agent_tool_registry_for_workspace,
     managed_source_status, model_config_uses_cluster, models_default_with_data_dir,
-    normalize_model_provider, open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command,
-    parse_cli_invocation, parse_cluster_command, parse_cluster_join_invite_argument,
-    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
+    normalize_model_provider, observe_cli_rpc_via_daemon,
+    open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
+    parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
+    parse_dfs_command, parse_install_options, parse_model_default_options,
     parse_model_options_command, parse_models_list_options, parse_models_runtime_command,
     parse_provider_command, parse_rollout_command, parse_slash_command, parse_test_command,
     parse_uninstall_options, parse_usage_options, read_cluster_rollout_status,
@@ -941,6 +942,62 @@ fn top_level_cli_parser_routes_subcommands() {
             })
     ));
     assert!(parse_cli_command(&["evolve".to_string()]).is_err());
+}
+
+#[test]
+fn observe_rpc_keeps_local_calls_direct_and_forwards_remote_calls_through_the_daemon() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-observe-rpc-dispatch");
+    let data_dir = SinomoDataDir::new(&root);
+    let local_node_id = NodeId::generate();
+    let remote_node_id = NodeId::generate();
+    let status = DaemonStatus::new(
+        &DaemonRunOptions::default(),
+        &DaemonPaths::new(&data_dir),
+        Some(DaemonClusterStatus {
+            cluster_id: ClusterId::generate(),
+            node_id: local_node_id.clone(),
+            process: super::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
+            member_role: ClusterMemberRole::Voter,
+            member_state: ClusterMemberState::Active,
+        }),
+    );
+    let request =
+        network::ObjectRpcRequest::from_encoded_body("/observe/traces", "observe", vec![1, 2, 3]);
+
+    let local_response = observe_cli_rpc_via_daemon(
+        &status,
+        Some(local_node_id.as_str()),
+        &request,
+        |address, actual_request| {
+            assert_eq!(address, status.address);
+            assert_eq!(actual_request, &request);
+            Ok(network::ObjectRpcResponse::from_encoded_body(
+                actual_request.route.clone(),
+                b"local".to_vec(),
+            ))
+        },
+        |_, _, _| panic!("the local observe target must not use daemon forwarding"),
+    )
+    .expect("local observe rpc");
+    assert_eq!(local_response.body, b"local");
+
+    let remote_response = observe_cli_rpc_via_daemon(
+        &status,
+        Some(remote_node_id.as_str()),
+        &request,
+        |_, _| panic!("the remote observe target must not use the direct daemon route"),
+        |address, actual_target, actual_request| {
+            assert_eq!(address, status.address);
+            assert_eq!(actual_target, &remote_node_id);
+            assert_eq!(actual_request, &request);
+            Ok(network::ObjectRpcResponse::from_encoded_body(
+                actual_request.route.clone(),
+                b"forwarded".to_vec(),
+            ))
+        },
+    )
+    .expect("remote observe rpc");
+    assert_eq!(remote_response.body, b"forwarded");
 }
 
 #[test]

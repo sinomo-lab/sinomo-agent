@@ -146,7 +146,6 @@ use sinomo_runtime::daemon::{
     send_daemon_rpc_to_endpoint as daemon_send_daemon_rpc_to_endpoint,
     send_daemon_rpc_with_timeouts as daemon_send_daemon_rpc_with_timeouts,
     send_daemon_shutdown_request,
-    send_object_rpc_to_target_with_options as daemon_send_object_rpc_to_target_with_options,
     send_object_rpc_to_target_with_timeouts as daemon_send_object_rpc_to_target_with_timeouts,
     shadow_main_binary_from_env as daemon_shadow_main_binary_from_env,
     shadow_main_options_from_env as daemon_shadow_main_options_from_env,
@@ -1344,23 +1343,61 @@ fn observe_cli_rpc(
     request: network::ObjectRpcRequest,
 ) -> Result<network::ObjectRpcResponse, String> {
     const OBSERVE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+    let status = daemon_default_main_daemon_status(OBSERVE_RPC_TIMEOUT)
+        .map_err(|source| source.to_string())?
+        .ok_or_else(|| "observe live queries require the local daemon to be running".to_string())?;
+    observe_cli_rpc_via_daemon(
+        &status,
+        target_node_id,
+        &request,
+        |address, request| {
+            daemon_send_daemon_rpc(address, request, OBSERVE_RPC_TIMEOUT)
+                .map_err(|source| source.to_string())
+        },
+        |address, target_node_id, request| {
+            DaemonApiClient::at_address(address.to_string())
+                .object_rpc_to_target_with_deadline(
+                    target_node_id,
+                    request,
+                    OBSERVE_RPC_TIMEOUT,
+                    Some(OBSERVE_RPC_TIMEOUT),
+                    true,
+                )
+                .map_err(|source| source.to_string())
+        },
+    )
+}
+
+fn observe_cli_rpc_via_daemon<DirectRpc, ForwardRpc>(
+    status: &DaemonStatus,
+    target_node_id: Option<&str>,
+    request: &network::ObjectRpcRequest,
+    direct_rpc: DirectRpc,
+    forward_rpc: ForwardRpc,
+) -> Result<network::ObjectRpcResponse, String>
+where
+    DirectRpc:
+        FnOnce(&str, &network::ObjectRpcRequest) -> Result<network::ObjectRpcResponse, String>,
+    ForwardRpc: FnOnce(
+        &str,
+        &NodeId,
+        &network::ObjectRpcRequest,
+    ) -> Result<network::ObjectRpcResponse, String>,
+{
     if let Some(target_node_id) = target_node_id {
         let target_node_id = NodeId::new(target_node_id.to_string()).map_err(|source| {
             format!("invalid observe target node id `{target_node_id}`: {source}")
         })?;
-        return daemon_send_object_rpc_to_target_with_options(
-            &target_node_id,
-            &request,
-            network::ClusterObjectRpcOptions::default().with_overall_timeout(OBSERVE_RPC_TIMEOUT),
-            true,
-        )
-        .map_err(|source| source.to_string());
+        if status
+            .cluster
+            .as_ref()
+            .is_some_and(|cluster| cluster.node_id == target_node_id)
+        {
+            return direct_rpc(&status.address, request);
+        }
+        return forward_rpc(&status.address, &target_node_id, request);
     }
-    let status = daemon_default_main_daemon_status(OBSERVE_RPC_TIMEOUT)
-        .map_err(|source| source.to_string())?
-        .ok_or_else(|| "observe live queries require the local daemon to be running".to_string())?;
-    daemon_send_daemon_rpc(&status.address, &request, OBSERVE_RPC_TIMEOUT)
-        .map_err(|source| source.to_string())
+    direct_rpc(&status.address, request)
 }
 
 fn observe_cli_cluster_targets() -> Result<Vec<String>, String> {

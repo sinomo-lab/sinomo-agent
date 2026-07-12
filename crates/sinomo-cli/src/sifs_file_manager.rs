@@ -246,20 +246,19 @@ impl SifsFileManagerBackend {
         operation_deadline: Option<Instant>,
     ) -> Result<(), String> {
         self.prepare_metadata_after_mutation(operation_deadline)?;
-        sifs_operation_remaining(operation_deadline, "metadata publication")?;
-        let result = publish_sifs_metadata_journal_from_data_dir(
-            &self.data_dir,
-            &self.rpc_runtime,
+        handoff_or_publish_sifs_metadata(
             operation_deadline,
+            |timeout| request_sifs_daemon_maintenance_refresh(&self.data_dir, timeout),
+            || {
+                publish_sifs_metadata_journal_from_data_dir(
+                    &self.data_dir,
+                    &self.rpc_runtime,
+                    operation_deadline,
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+            },
         )
-        .map(|_| ())
-        .map_err(|error| error.to_string());
-        if operation_deadline.is_none() {
-            let _ = request_sifs_daemon_maintenance_refresh(&self.data_dir);
-        }
-        result?;
-        sifs_operation_remaining(operation_deadline, "metadata publication")?;
-        Ok(())
     }
 
     pub(crate) fn publish_metadata_after_mutation_report(
@@ -269,7 +268,10 @@ impl SifsFileManagerBackend {
         let report =
             publish_sifs_metadata_journal_from_data_dir(&self.data_dir, &self.rpc_runtime, None)
                 .map_err(|error| error.to_string())?;
-        let _ = request_sifs_daemon_maintenance_refresh(&self.data_dir);
+        let _ = request_sifs_daemon_maintenance_refresh(
+            &self.data_dir,
+            SIFS_MAINTENANCE_REFRESH_TIMEOUT,
+        );
         Ok(report)
     }
 
@@ -1905,7 +1907,48 @@ fn sifs_foreground_metadata_publish_options_with_deadline(
     Ok(options)
 }
 
-fn request_sifs_daemon_maintenance_refresh(data_dir: &SinomoDataDir) -> bool {
+fn handoff_or_publish_sifs_metadata<R, P>(
+    operation_deadline: Option<Instant>,
+    request_refresh: R,
+    publish: P,
+) -> Result<(), String>
+where
+    R: FnOnce(Duration) -> bool,
+    P: FnOnce() -> Result<(), String>,
+{
+    let refresh_timeout = match sifs_operation_remaining(
+        operation_deadline,
+        "daemon metadata publication handoff",
+    ) {
+        Ok(remaining) => remaining
+            .map(|remaining| remaining.min(SIFS_MAINTENANCE_REFRESH_TIMEOUT))
+            .unwrap_or(SIFS_MAINTENANCE_REFRESH_TIMEOUT),
+        Err(error) => {
+            eprintln!(
+                "warning: skipping SIFS metadata publication after a committed mutation because its operation budget expired: {error}"
+            );
+            return Ok(());
+        }
+    };
+    if request_refresh(refresh_timeout) {
+        return Ok(());
+    }
+
+    if let Err(error) = sifs_operation_remaining(operation_deadline, "metadata publication") {
+        eprintln!(
+            "warning: skipping foreground SIFS metadata publication after a committed mutation because its operation budget expired: {error}"
+        );
+        return Ok(());
+    }
+    if let Err(error) = publish() {
+        eprintln!(
+            "warning: foreground SIFS metadata publication failed after a committed mutation; durable metadata maintenance will retry: {error}"
+        );
+    }
+    Ok(())
+}
+
+fn request_sifs_daemon_maintenance_refresh(data_dir: &SinomoDataDir, timeout: Duration) -> bool {
     let paths = sinomo_runtime::daemon::DaemonPaths::new(data_dir);
     if !paths.lock.exists() {
         return false;
@@ -1913,15 +1956,7 @@ fn request_sifs_daemon_maintenance_refresh(data_dir: &SinomoDataDir) -> bool {
     let Ok(status) = sinomo_runtime::daemon::read_daemon_status(&paths) else {
         return false;
     };
-    let address = status.address;
-    std::thread::Builder::new()
-        .name("sifs-maintenance-refresh".to_string())
-        .spawn(move || {
-            let _ = sinomo_runtime::daemon::send_daemon_cluster_maintenance_refresh(
-                &address,
-                SIFS_MAINTENANCE_REFRESH_TIMEOUT,
-            );
-        })
+    sinomo_runtime::daemon::send_daemon_cluster_maintenance_refresh(&status.address, timeout)
         .is_ok()
 }
 
@@ -2527,6 +2562,90 @@ mod tests {
         assert_eq!(options.max_batches_per_target, 1);
         assert_eq!(options.attempt_timeout, network::DEFAULT_NETWORK_TIMEOUT);
         assert_eq!(options.target_timeout, network::DEFAULT_NETWORK_TIMEOUT);
+    }
+
+    #[test]
+    fn acknowledged_daemon_metadata_handoff_skips_foreground_publish() {
+        let refresh_requests = std::cell::Cell::new(0);
+        let foreground_publishes = std::cell::Cell::new(0);
+
+        handoff_or_publish_sifs_metadata(
+            None,
+            |timeout| {
+                refresh_requests.set(refresh_requests.get() + 1);
+                assert_eq!(timeout, SIFS_MAINTENANCE_REFRESH_TIMEOUT);
+                true
+            },
+            || {
+                foreground_publishes.set(foreground_publishes.get() + 1);
+                Ok(())
+            },
+        )
+        .expect("acknowledged daemon handoff");
+
+        assert_eq!(refresh_requests.get(), 1);
+        assert_eq!(foreground_publishes.get(), 0);
+    }
+
+    #[test]
+    fn failed_daemon_metadata_handoff_falls_back_to_foreground_publish() {
+        let refresh_requests = std::cell::Cell::new(0);
+        let foreground_publishes = std::cell::Cell::new(0);
+
+        handoff_or_publish_sifs_metadata(
+            None,
+            |_| {
+                refresh_requests.set(refresh_requests.get() + 1);
+                false
+            },
+            || {
+                foreground_publishes.set(foreground_publishes.get() + 1);
+                Ok(())
+            },
+        )
+        .expect("foreground metadata publication fallback");
+
+        assert_eq!(refresh_requests.get(), 1);
+        assert_eq!(foreground_publishes.get(), 1);
+    }
+
+    #[test]
+    fn failed_foreground_metadata_fallback_does_not_misreport_committed_mutation() {
+        let foreground_publishes = std::cell::Cell::new(0);
+
+        handoff_or_publish_sifs_metadata(
+            None,
+            |_| false,
+            || {
+                foreground_publishes.set(foreground_publishes.get() + 1);
+                Err("simulated WAN publication failure".to_string())
+            },
+        )
+        .expect("metadata publication failure must not fail a committed mutation");
+
+        assert_eq!(foreground_publishes.get(), 1);
+    }
+
+    #[test]
+    fn expired_publication_budget_does_not_misreport_committed_mutation() {
+        let refresh_requests = std::cell::Cell::new(0);
+        let foreground_publishes = std::cell::Cell::new(0);
+
+        handoff_or_publish_sifs_metadata(
+            Some(Instant::now() - Duration::from_millis(1)),
+            |_| {
+                refresh_requests.set(refresh_requests.get() + 1);
+                true
+            },
+            || {
+                foreground_publishes.set(foreground_publishes.get() + 1);
+                Ok(())
+            },
+        )
+        .expect("expired publication budget must not fail a committed mutation");
+
+        assert_eq!(refresh_requests.get(), 0);
+        assert_eq!(foreground_publishes.get(), 0);
     }
 
     fn healthy_connectivity_record(

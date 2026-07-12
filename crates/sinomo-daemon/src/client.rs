@@ -1710,6 +1710,7 @@ pub async fn send_object_rpc_to_target_async_with_options(
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn send_object_rpc_to_target_async_with_daemon_paths(
     daemon_paths: &DaemonPaths,
     target_node_id: &NodeId,

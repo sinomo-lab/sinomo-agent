@@ -298,9 +298,14 @@ pub use metadata_replication::{
     schedule_cluster_dfs_metadata_publish_after_events_async_on_runtime,
     schedule_cluster_dfs_metadata_publish_after_events_with_async_peer_transport_on_runtime,
     schedule_cluster_dfs_metadata_publish_after_events_with_peer_transports_on_runtime,
+    schedule_cluster_dfs_metadata_publish_async_on_runtime,
+    schedule_cluster_dfs_metadata_publish_with_async_peer_transport_on_runtime,
+    schedule_cluster_dfs_metadata_publish_with_peer_transports_on_runtime,
     schedule_default_dfs_metadata_publish_after_events_async_on_runtime,
+    schedule_default_dfs_metadata_publish_async_on_runtime,
     schedule_dfs_metadata_publish_after_events_async_on_runtime,
-    validate_dfs_metadata_journal_batch_source, validate_dfs_metadata_snapshot_install_source,
+    schedule_dfs_metadata_publish_async_on_runtime, validate_dfs_metadata_journal_batch_source,
+    validate_dfs_metadata_snapshot_install_source,
 };
 pub(crate) use metadata_replication::{
     async_dfs_metadata_journal_batch_sender_from_peer_transport,

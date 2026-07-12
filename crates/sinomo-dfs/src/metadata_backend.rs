@@ -35,7 +35,7 @@ use crate::metadata_limits::{
 };
 use crate::metadata_lock::{MetadataWriteLock, metadata_write_lock};
 use crate::metadata_namespace_transaction::{
-    plan_namespace_transaction_recovery_table_ops,
+    namespace_transaction_recovery_is_complete, plan_namespace_transaction_recovery_table_ops,
     plan_namespace_transaction_table_ops as namespace_transaction_table_ops,
     validate_namespace_transaction_preconditions,
 };
@@ -132,6 +132,7 @@ fn metadata_backend_perf_trace(args: std::fmt::Arguments<'_>) {
 #[cfg(test)]
 thread_local! {
     static METADATA_BEGIN_WRITE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static NAMESPACE_RECOVERY_PLANNER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -142,6 +143,16 @@ fn reset_metadata_begin_write_calls() {
 #[cfg(test)]
 fn metadata_begin_write_calls() -> usize {
     METADATA_BEGIN_WRITE_CALLS.get()
+}
+
+#[cfg(test)]
+fn reset_namespace_recovery_planner_calls() {
+    NAMESPACE_RECOVERY_PLANNER_CALLS.set(0);
+}
+
+#[cfg(test)]
+fn namespace_recovery_planner_calls() -> usize {
+    NAMESPACE_RECOVERY_PLANNER_CALLS.get()
 }
 
 /// Shard-local SOBJ metadata backend.
@@ -2603,16 +2614,39 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
 
 impl LocalSobjMetadataBackend {
     fn recover_namespace_transactions(&mut self) -> Result<()> {
+        let trace_started = Instant::now();
         let _lock = self.begin_metadata_write()?;
-        for transaction in self
+        let transactions_scanned = self.tables.namespace_transactions.len();
+        let scan_started = Instant::now();
+        let recovery_candidates = self
             .tables
             .namespace_transactions
             .values()
+            .filter(|transaction| {
+                !namespace_transaction_recovery_is_complete(&self.tables, transaction)
+            })
             .cloned()
-            .collect::<Vec<_>>()
-        {
-            self.materialize_namespace_transaction_for_recovery(&transaction)?;
+            .collect::<Vec<_>>();
+        let scan_ms = scan_started.elapsed().as_millis();
+        let recovery_candidate_count = recovery_candidates.len();
+        let mut transactions_applied = 0usize;
+        for transaction in recovery_candidates {
+            if self.materialize_namespace_transaction_for_recovery(&transaction)? {
+                transactions_applied = transactions_applied.saturating_add(1);
+            }
         }
+        let traceparent = crate::current_dfs_traceparent().unwrap_or_default();
+        tracing::trace!(
+            target: "sinomo.dfs.perf",
+            traceparent = %traceparent,
+            shard = %self.shard_id.0,
+            transactions_scanned,
+            recovery_candidates = recovery_candidate_count,
+            transactions_applied,
+            scan_ms,
+            total_ms = trace_started.elapsed().as_millis(),
+            "metadata-namespace-recovery"
+        );
         Ok(())
     }
 
@@ -2632,6 +2666,9 @@ impl LocalSobjMetadataBackend {
         &mut self,
         transaction: &DfsNamespaceTransaction,
     ) -> Result<bool> {
+        #[cfg(test)]
+        NAMESPACE_RECOVERY_PLANNER_CALLS
+            .set(NAMESPACE_RECOVERY_PLANNER_CALLS.get().saturating_add(1));
         let sequence = self.next_sequence.saturating_sub(1);
         let table_ops = plan_namespace_transaction_recovery_table_ops(&self.tables, transaction);
         if table_ops.is_empty() {
@@ -9383,9 +9420,15 @@ mod tests {
         let journal_len = backend.journal_since(0).expect("journal").len();
         drop(backend);
 
+        reset_namespace_recovery_planner_calls();
         let reopened = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopened backend");
 
+        assert_eq!(
+            namespace_recovery_planner_calls(),
+            0,
+            "healthy transaction history must not clone tables through the recovery planner"
+        );
         assert_eq!(
             reopened.journal_since(0).expect("journal").len(),
             journal_len,

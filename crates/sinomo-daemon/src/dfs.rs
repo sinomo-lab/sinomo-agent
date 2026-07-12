@@ -28,9 +28,10 @@ use sinomo_dfs::{
     DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions, DfsMaintenanceTickOptions,
     DfsMessageCommand, DfsMessageProcessResult, DfsMessageResponse, DfsMetadataBackend,
     DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
-    DfsMetadataPublishScheduleOptions, DfsNodeServedMessageTransport, DfsNodeTransport,
-    DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError, NetworkedDfsService,
-    default_dfs_repair_attempt_snapshot_path, read_dfs_repair_attempt_snapshot,
+    DfsMetadataPublishScheduleOptions, DfsMetadataPublishScheduleStart,
+    DfsNodeServedMessageTransport, DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport,
+    DfsPeerTransportError, NetworkedDfsService, default_dfs_repair_attempt_snapshot_path,
+    read_dfs_repair_attempt_snapshot,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -1203,6 +1204,47 @@ fn log_dfs_metadata_replication_report(report: DfsMetadataJournalReplicationRepo
     for line in sinomo_dfs::dfs_metadata_replication_notice_lines(&report) {
         tracing::warn!("sinomo daemon {line}");
     }
+}
+
+pub(crate) fn schedule_daemon_dfs_metadata_publish_on_runtime(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+    traceparent: Option<String>,
+) -> Result<DfsMetadataPublishScheduleStart, DaemonError> {
+    let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(&data_dir, runtime);
+    let async_peer_transport = daemon_dfs_async_peer_transport(&data_dir, runtime);
+    let report_traceparent = traceparent.clone();
+    let error_traceparent = traceparent;
+    Ok(
+        sinomo_dfs::schedule_cluster_dfs_metadata_publish_with_peer_transports_on_runtime(
+            runtime.clone(),
+            data_dir,
+            cluster_paths,
+            peer_transport,
+            async_peer_transport,
+            daemon_dfs_metadata_publish_schedule_options(),
+            daemon_dfs_metadata_replication_options(),
+            move |report| {
+                daemon_dfs_perf_trace_with_traceparent(
+                    report_traceparent.as_deref(),
+                    format_args!(
+                        "dfs-metadata-publish-complete outcomes={}",
+                        report.outcomes.len()
+                    ),
+                );
+                log_dfs_metadata_replication_report(report);
+            },
+            move |error| {
+                daemon_dfs_perf_trace_with_traceparent(
+                    error_traceparent.as_deref(),
+                    format_args!("dfs-metadata-publish-failed error={error}"),
+                );
+                tracing::warn!("sinomo daemon DFS scheduled metadata publish failed: {error}");
+            },
+        ),
+    )
 }
 
 #[cfg(test)]

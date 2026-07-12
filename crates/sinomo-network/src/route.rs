@@ -39,6 +39,7 @@ const CLUSTER_RELAY_OUTCOME_UNKNOWN_METADATA_VALUE: &str = "terminal";
 const CLUSTER_RELAY_DEFAULT_TTL: u8 = 8;
 const CLUSTER_RELAY_MAX_FAILURE_DETAILS: usize = 8;
 const CLUSTER_RELAY_FAILURE_DETAIL_MAX_CHARS: usize = 512;
+const CLUSTER_OBJECT_RPC_TRACE_FAILURE_DETAIL_MAX_CHARS: usize = 256;
 // App/control RPCs stay on the short routing budget. Data-plane requests that
 // explicitly opt into a full response budget may wait for bounded remote durable
 // work, but never beyond the 60-second total transfer deadline. Active stream
@@ -2464,6 +2465,180 @@ struct ClusterObjectRpcRouteContext<'a> {
     paths: &'a ClusterPaths,
 }
 
+#[derive(Clone, Copy)]
+struct ClusterObjectRpcAttemptStartTrace<'a> {
+    traceparent: &'a str,
+    request: &'a ObjectRpcRequest,
+    target_node_id: &'a NodeId,
+    next_hop: &'a NodeId,
+    endpoint: &'a ClusterEndpointRecord,
+    final_hop: bool,
+    route_attempt: usize,
+    route_attempt_limit: usize,
+    send_attempt: usize,
+    endpoint_attempt: usize,
+    endpoint_attempt_limit: usize,
+    remaining_budget_ms: u64,
+    connect_budget_ms: u64,
+    attempt_budget_ms: u64,
+    stream: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClusterObjectRpcAttemptTraceDetail {
+    None,
+    RelayOutcomeUnknown,
+    FreshOriginSignatureRequired,
+    RelayRoutingError,
+    EndpointAuthenticationDenied,
+    ResponderMismatch,
+    ApplicationError,
+    TransportTimeoutRoute,
+    TransportTimeoutSigning,
+    TransportTimeoutConnect,
+    TransportTimeoutWrite,
+    TransportTimeoutFirstByte,
+    TransportTimeoutIdle,
+    TransportTimeoutOverall,
+    TransportOutcomeUnknown,
+    TransportStalePooledConnection,
+    TransportRetryExhausted,
+    TransportDeliveryFailed,
+    TransportIo,
+    TransportOther,
+}
+
+impl ClusterObjectRpcAttemptTraceDetail {
+    fn for_transport_error(error: &NetworkError) -> Self {
+        match error {
+            NetworkError::Timeout { phase, .. } => match phase {
+                NetworkTimeoutPhase::Route => Self::TransportTimeoutRoute,
+                NetworkTimeoutPhase::Signing => Self::TransportTimeoutSigning,
+                NetworkTimeoutPhase::Connect => Self::TransportTimeoutConnect,
+                NetworkTimeoutPhase::Write => Self::TransportTimeoutWrite,
+                NetworkTimeoutPhase::FirstByte => Self::TransportTimeoutFirstByte,
+                NetworkTimeoutPhase::Idle => Self::TransportTimeoutIdle,
+                NetworkTimeoutPhase::Overall => Self::TransportTimeoutOverall,
+            },
+            NetworkError::OutcomeUnknown { .. } => Self::TransportOutcomeUnknown,
+            NetworkError::StalePooledConnection { .. } => Self::TransportStalePooledConnection,
+            NetworkError::RetryExhausted { .. } => Self::TransportRetryExhausted,
+            NetworkError::DeliveryFailed { .. } => Self::TransportDeliveryFailed,
+            NetworkError::Io { .. } => Self::TransportIo,
+            _ => Self::TransportOther,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::RelayOutcomeUnknown => "relay_outcome_unknown",
+            Self::FreshOriginSignatureRequired => "fresh_origin_signature_required",
+            Self::RelayRoutingError => "relay_routing_error",
+            Self::EndpointAuthenticationDenied => "endpoint_authentication_denied",
+            Self::ResponderMismatch => "responder_mismatch",
+            Self::ApplicationError => "application_error_detail_redacted",
+            Self::TransportTimeoutRoute => "transport_timeout_route",
+            Self::TransportTimeoutSigning => "transport_timeout_signing",
+            Self::TransportTimeoutConnect => "transport_timeout_connect",
+            Self::TransportTimeoutWrite => "transport_timeout_write",
+            Self::TransportTimeoutFirstByte => "transport_timeout_first_byte",
+            Self::TransportTimeoutIdle => "transport_timeout_idle",
+            Self::TransportTimeoutOverall => "transport_timeout_overall",
+            Self::TransportOutcomeUnknown => "transport_outcome_unknown",
+            Self::TransportStalePooledConnection => "transport_stale_pooled_connection",
+            Self::TransportRetryExhausted => "transport_retry_exhausted",
+            Self::TransportDeliveryFailed => "transport_delivery_failed",
+            Self::TransportIo => "transport_io",
+            Self::TransportOther => "transport_other",
+        }
+    }
+}
+
+impl ClusterObjectRpcAttemptStartTrace<'_> {
+    fn record(&self) {
+        tracing::debug!(
+            target: "sinomo.network.object_rpc",
+            traceparent = %self.traceparent,
+            route = %self.request.route,
+            category = %self.request.category,
+            target_node_id = %self.target_node_id,
+            next_hop = %self.next_hop,
+            endpoint = %self.endpoint.address,
+            transport = ?self.endpoint.transport,
+            final_hop = self.final_hop,
+            route_attempt = self.route_attempt,
+            route_attempt_limit = self.route_attempt_limit,
+            send_attempt = self.send_attempt,
+            endpoint_attempt = self.endpoint_attempt,
+            endpoint_attempt_limit = self.endpoint_attempt_limit,
+            remaining_budget_ms = self.remaining_budget_ms,
+            connect_budget_ms = self.connect_budget_ms,
+            attempt_budget_ms = self.attempt_budget_ms,
+            delivery_state = "definitely_not_sent",
+            retry_decision = "pending",
+            outcome = "attempt_started",
+            stream = self.stream,
+            "cluster object rpc attempt started"
+        );
+    }
+}
+
+struct ClusterObjectRpcAttemptTrace<'a> {
+    start: ClusterObjectRpcAttemptStartTrace<'a>,
+    sign_us: u64,
+    plan_us: u64,
+    outer_build_us: u64,
+    outer_sign_us: u64,
+    send_us: u64,
+    attempt_us: u64,
+    total_us: u64,
+}
+
+impl ClusterObjectRpcAttemptTrace<'_> {
+    fn record(
+        &self,
+        outcome: &'static str,
+        delivery_state: &'static str,
+        retry_decision: &'static str,
+        detail: ClusterObjectRpcAttemptTraceDetail,
+    ) {
+        let start = &self.start;
+        tracing::debug!(
+            target: "sinomo.network.object_rpc",
+            traceparent = %start.traceparent,
+            route = %start.request.route,
+            category = %start.request.category,
+            target_node_id = %start.target_node_id,
+            next_hop = %start.next_hop,
+            endpoint = %start.endpoint.address,
+            transport = ?start.endpoint.transport,
+            final_hop = start.final_hop,
+            route_attempt = start.route_attempt,
+            route_attempt_limit = start.route_attempt_limit,
+            send_attempt = start.send_attempt,
+            endpoint_attempt = start.endpoint_attempt,
+            endpoint_attempt_limit = start.endpoint_attempt_limit,
+            remaining_budget_ms = start.remaining_budget_ms,
+            connect_budget_ms = start.connect_budget_ms,
+            attempt_budget_ms = start.attempt_budget_ms,
+            delivery_state,
+            retry_decision,
+            outcome,
+            detail = detail.as_str(),
+            sign_us = self.sign_us,
+            plan_us = self.plan_us,
+            outer_build_us = self.outer_build_us,
+            outer_sign_us = self.outer_sign_us,
+            send_us = self.send_us,
+            attempt_us = self.attempt_us,
+            total_us = self.total_us,
+            stream = start.stream,
+            "cluster object rpc attempt completed"
+        );
+    }
+}
+
 /// Cluster object-RPC client facade.
 ///
 /// `call_target` is the canonical routed API: callers name a target node and
@@ -2592,7 +2767,7 @@ where
             NetworkDeliveryState::PossiblyApplied,
             &[],
         );
-        cluster_object_rpc_call_with_deadline(
+        let result = cluster_object_rpc_call_with_deadline(
             self.call_target_from_paths(
                 context.runtime,
                 context.paths,
@@ -2606,7 +2781,26 @@ where
             deadline,
             timeout_error,
         )
-        .await
+        .await;
+        if let Err(error @ NetworkError::Timeout { .. }) = &result {
+            let (outcome, retry_decision) = cluster_object_rpc_timeout_trace_classification(
+                deadline.checked_remaining().is_none(),
+            );
+            tracing::debug!(
+                target: "sinomo.network.object_rpc",
+                traceparent = %request.traceparent().unwrap_or_default(),
+                route = %request.route,
+                category = %request.category,
+                %target_node_id,
+                route_timeout_ms = route_timeout.map(duration_millis_u64).unwrap_or_default(),
+                delivery_state = cluster_object_rpc_error_delivery_state_name(error),
+                retry_decision,
+                outcome,
+                detail = ClusterObjectRpcAttemptTraceDetail::for_transport_error(error).as_str(),
+                "cluster object rpc target call timed out"
+            );
+        }
+        result
     }
 
     pub async fn call_target_stream(
@@ -2633,7 +2827,7 @@ where
             NetworkDeliveryState::PossiblyApplied,
             &[],
         );
-        let response = cluster_object_rpc_call_with_deadline(
+        let result = cluster_object_rpc_call_with_deadline(
             self.call_target_stream_from_paths(
                 context.runtime,
                 context.paths,
@@ -2647,7 +2841,27 @@ where
             deadline,
             timeout_error,
         )
-        .await?;
+        .await;
+        if let Err(error @ NetworkError::Timeout { .. }) = &result {
+            let (outcome, retry_decision) = cluster_object_rpc_timeout_trace_classification(
+                deadline.checked_remaining().is_none(),
+            );
+            tracing::debug!(
+                target: "sinomo.network.object_rpc",
+                traceparent = %request.traceparent().unwrap_or_default(),
+                route = %request.route,
+                category = %request.category,
+                %target_node_id,
+                route_timeout_ms = route_timeout.map(duration_millis_u64).unwrap_or_default(),
+                delivery_state = cluster_object_rpc_error_delivery_state_name(error),
+                retry_decision,
+                outcome,
+                detail = ClusterObjectRpcAttemptTraceDetail::for_transport_error(error).as_str(),
+                stream = true,
+                "cluster object rpc stream target call timed out"
+            );
+        }
+        let response = result?;
         Ok(response.with_deadline(options.stream_deadline(deadline)))
     }
 
@@ -2802,7 +3016,8 @@ where
             "cluster object rpc route start"
         );
 
-        'route_attempts: for _ in 0..max_route_attempts {
+        'route_attempts: for route_attempt_index in 0..max_route_attempts {
+            let route_attempt = route_attempt_index.saturating_add(1);
             let plan_started_at = Instant::now();
             let Some(route_plan) = cluster_delivery_route_plan_async(
                 runtime,
@@ -2825,8 +3040,37 @@ where
             )
             .record(plan_us as f64);
             if route_plan.endpoints.is_empty() {
+                let detail = format!("{}: no usable route", route_plan.next_hop);
+                tracing::debug!(
+                    target: "sinomo.network.object_rpc",
+                    %traceparent,
+                    route = %request.route,
+                    category = %request.category,
+                    %target_node_id,
+                    next_hop = %route_plan.next_hop,
+                    route_attempt,
+                    route_attempt_limit = max_route_attempts,
+                    send_attempts,
+                    endpoint_count = 0,
+                    remaining_budget_ms = deadline
+                        .checked_remaining()
+                        .flatten()
+                        .map(duration_millis_u64)
+                        .unwrap_or_default(),
+                    delivery_state = cluster_object_rpc_delivery_state_name(
+                        cluster_object_rpc_delivery_state(possibly_applied),
+                    ),
+                    retry_decision = cluster_object_rpc_replan_retry_decision(
+                        route_attempt_index,
+                        max_route_attempts,
+                    ),
+                    outcome = "empty_endpoint_plan",
+                    detail,
+                    plan_us,
+                    "cluster object rpc route attempt completed"
+                );
                 failed_edges.try_insert(&state.local_node_id, &route_plan.next_hop)?;
-                failures.push(format!("{}: no usable route", route_plan.next_hop));
+                failures.push(detail);
                 continue;
             }
             tracing::trace!(
@@ -2836,6 +3080,8 @@ where
                 category = %request.category,
                 %target_node_id,
                 next_hop = %route_plan.next_hop,
+                route_attempt,
+                route_attempt_limit = max_route_attempts,
                 plan_us,
                 endpoints = %cluster_object_rpc_endpoint_trace_list(&route_plan.endpoints),
                 "cluster object rpc route plan selected"
@@ -2932,6 +3178,37 @@ where
                     )
                 };
                 let attempt_deadline = deadline.capped_by(hop_attempt_budget);
+                let endpoint_attempt = endpoint_index.saturating_add(1);
+                let remaining_budget_ms = remaining.map(duration_millis_u64).unwrap_or_default();
+                let connect_budget_ms = endpoint_attempt_budget
+                    .map(duration_millis_u64)
+                    .unwrap_or_default();
+                let attempt_budget_ms = hop_attempt_budget
+                    .map(duration_millis_u64)
+                    .unwrap_or_default();
+                let attempt_trace_start = ClusterObjectRpcAttemptStartTrace {
+                    traceparent: &traceparent,
+                    request,
+                    target_node_id,
+                    next_hop: &route_plan.next_hop,
+                    endpoint: &endpoint,
+                    final_hop,
+                    route_attempt,
+                    route_attempt_limit: max_route_attempts,
+                    send_attempt: send_attempts.saturating_add(1),
+                    endpoint_attempt,
+                    endpoint_attempt_limit: route_endpoint_count,
+                    remaining_budget_ms,
+                    connect_budget_ms,
+                    attempt_budget_ms,
+                    stream: false,
+                };
+                if cluster_object_rpc_attempt_may_reach_route_deadline(
+                    remaining,
+                    hop_attempt_budget,
+                ) {
+                    attempt_trace_start.record();
+                }
                 let sign_started_at = Instant::now();
                 let request_auth = cluster_object_rpc_sign_with_deadline(
                     self.host.sign_object_rpc_request_async(request),
@@ -3020,17 +3297,52 @@ where
                         response,
                     )
                 };
+                let attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at);
+                let total_us = cluster_object_rpc_elapsed_us(call_started_at);
+                let attempt_trace = ClusterObjectRpcAttemptTrace {
+                    start: ClusterObjectRpcAttemptStartTrace {
+                        send_attempt: send_attempts,
+                        ..attempt_trace_start
+                    },
+                    sign_us: request_sign_us,
+                    plan_us,
+                    outer_build_us,
+                    outer_sign_us,
+                    send_us,
+                    attempt_us,
+                    total_us,
+                };
                 match response {
                     Ok(response) if relay_response_reports_outcome_unknown(&response) => {
+                        let detail = relay_response_outcome_unknown_detail(&response);
+                        attempt_trace.record(
+                            "relay_outcome_unknown",
+                            "possibly_applied",
+                            "outcome_unknown",
+                            ClusterObjectRpcAttemptTraceDetail::RelayOutcomeUnknown,
+                        );
                         return Err(cluster_object_rpc_outcome_unknown(
                             target_node_id,
                             request,
-                            relay_response_outcome_unknown_detail(&response),
+                            detail,
                         ));
                     }
                     Ok(response) if relay_response_requires_fresh_origin_signature(&response) => {
                         let detail = relay_response_routing_error_detail(&response);
                         possibly_applied = true;
+                        let retry_decision = if !request.is_response_retry_safe() {
+                            "outcome_unknown"
+                        } else if route_attempt < max_route_attempts {
+                            "fresh_origin_signature"
+                        } else {
+                            "retry_exhausted"
+                        };
+                        attempt_trace.record(
+                            "fresh_origin_signature_required",
+                            "possibly_applied",
+                            retry_decision,
+                            ClusterObjectRpcAttemptTraceDetail::FreshOriginSignatureRequired,
+                        );
                         if !request.is_response_retry_safe() {
                             return Err(cluster_object_rpc_outcome_unknown(
                                 target_node_id,
@@ -3051,23 +3363,21 @@ where
                             "category" => request.category.clone()
                         )
                         .increment(1);
-                        tracing::debug!(
-                            target: "sinomo.network.object_rpc",
-                            %traceparent,
-                            route = %request.route,
-                            category = %request.category,
-                            %target_node_id,
-                            next_hop = %route_plan.next_hop,
-                            endpoint = %endpoint.address,
-                            transport = ?endpoint.transport,
-                            final_hop,
-                            "cluster object rpc relay returned routing error"
+                        let detail = relay_response_routing_error_detail(&response);
+                        attempt_trace.record(
+                            "relay_routing_error",
+                            cluster_object_rpc_delivery_state_name(
+                                cluster_object_rpc_delivery_state(possibly_applied),
+                            ),
+                            cluster_object_rpc_replan_retry_decision(
+                                route_attempt_index,
+                                max_route_attempts,
+                            ),
+                            ClusterObjectRpcAttemptTraceDetail::RelayRoutingError,
                         );
                         failures.push(format!(
-                            "{} ({:?}) returned routing error: {}",
-                            endpoint.address,
-                            endpoint.transport,
-                            relay_response_routing_error_detail(&response)
+                            "{} ({:?}) returned routing error: {detail}",
+                            endpoint.address, endpoint.transport
                         ));
                         break;
                     }
@@ -3082,18 +3392,18 @@ where
                                 "outcome" => "endpoint_error"
                             )
                             .record(cluster_object_rpc_elapsed_us(attempt_started_at) as f64);
-                            tracing::debug!(
-                                target: "sinomo.network.object_rpc",
-                                %traceparent,
-                                route = %request.route,
-                                category = %request.category,
-                                %target_node_id,
-                                next_hop = %route_plan.next_hop,
-                                endpoint = %endpoint.address,
-                                transport = ?endpoint.transport,
-                                final_hop,
-                                error = %detail,
-                                "cluster object rpc endpoint returned retryable error"
+                            attempt_trace.record(
+                                "endpoint_error_response",
+                                cluster_object_rpc_delivery_state_name(
+                                    cluster_object_rpc_delivery_state(possibly_applied),
+                                ),
+                                cluster_object_rpc_endpoint_retry_decision(
+                                    endpoint_index,
+                                    route_endpoint_count,
+                                    route_attempt_index,
+                                    max_route_attempts,
+                                ),
+                                ClusterObjectRpcAttemptTraceDetail::EndpointAuthenticationDenied,
                             );
                             failures.push(format!(
                                 "{} ({:?}) returned endpoint error: {detail}",
@@ -3110,27 +3420,6 @@ where
                                 "category" => request.category.clone()
                             )
                             .increment(1);
-                            tracing::debug!(
-                                target: "sinomo.network.object_rpc",
-                                %traceparent,
-                                route = %request.route,
-                                category = %request.category,
-                                %target_node_id,
-                                next_hop = %route_plan.next_hop,
-                                endpoint = %endpoint.address,
-                                transport = ?endpoint.transport,
-                                final_hop,
-                                expected = %target_node_id,
-                                got = %responder_node_id,
-                                sign_us = request_sign_us,
-                                plan_us,
-                                outer_build_us,
-                                outer_sign_us,
-                                send_us,
-                                attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at),
-                                total_us = cluster_object_rpc_elapsed_us(call_started_at),
-                                "cluster object rpc responder mismatch"
-                            );
                             let failure = if final_hop {
                                 record_cluster_delivery_endpoint_identity_mismatch(
                                     paths, state, &endpoint,
@@ -3152,6 +3441,21 @@ where
                                 )
                             };
                             possibly_applied = true;
+                            attempt_trace.record(
+                                "responder_mismatch",
+                                "possibly_applied",
+                                if request.is_response_retry_safe() {
+                                    cluster_object_rpc_endpoint_retry_decision(
+                                        endpoint_index,
+                                        route_endpoint_count,
+                                        route_attempt_index,
+                                        max_route_attempts,
+                                    )
+                                } else {
+                                    "outcome_unknown"
+                                },
+                                ClusterObjectRpcAttemptTraceDetail::ResponderMismatch,
+                            );
                             if !request.is_response_retry_safe() {
                                 return Err(cluster_object_rpc_outcome_unknown(
                                     target_node_id,
@@ -3163,10 +3467,14 @@ where
                             continue;
                         }
                         if let Err(error) = response.error_detail() {
+                            attempt_trace.record(
+                                "application_error_response",
+                                "confirmed_response",
+                                "do_not_retry",
+                                ClusterObjectRpcAttemptTraceDetail::ApplicationError,
+                            );
                             return Err(error);
                         }
-                        let attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at);
-                        let total_us = cluster_object_rpc_elapsed_us(call_started_at);
                         metrics::histogram!(
                             "sinomo.object_rpc.target.attempt.us",
                             "route" => request.route.clone(),
@@ -3181,24 +3489,11 @@ where
                             "outcome" => "ok"
                         )
                         .record(total_us as f64);
-                        tracing::debug!(
-                            target: "sinomo.network.object_rpc",
-                            %traceparent,
-                            route = %request.route,
-                            category = %request.category,
-                            %target_node_id,
-                            next_hop = %route_plan.next_hop,
-                            endpoint = %endpoint.address,
-                            transport = ?endpoint.transport,
-                            final_hop,
-                            sign_us = request_sign_us,
-                            plan_us,
-                            outer_build_us,
-                            outer_sign_us,
-                            send_us,
-                            attempt_us,
-                            total_us,
-                            "cluster object rpc delivered"
+                        attempt_trace.record(
+                            "delivered",
+                            "confirmed_response",
+                            "complete",
+                            ClusterObjectRpcAttemptTraceDetail::None,
                         );
                         return Ok(response);
                     }
@@ -3212,8 +3507,6 @@ where
                                 )
                                 .await;
                         }
-                        let attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at);
-                        let total_us = cluster_object_rpc_elapsed_us(call_started_at);
                         metrics::histogram!(
                             "sinomo.object_rpc.target.attempt.us",
                             "route" => request.route.clone(),
@@ -3228,31 +3521,38 @@ where
                             "outcome" => "error"
                         )
                         .record(total_us as f64);
-                        tracing::debug!(
-                            target: "sinomo.network.object_rpc",
-                            %traceparent,
-                            route = %request.route,
-                            category = %request.category,
-                            %target_node_id,
-                            next_hop = %route_plan.next_hop,
-                            endpoint = %endpoint.address,
-                            transport = ?endpoint.transport,
-                            final_hop,
-                            sign_us = request_sign_us,
-                            plan_us,
-                            outer_build_us,
-                            outer_sign_us,
-                            send_us,
-                            attempt_us,
-                            total_us,
-                            error = %error,
-                            "cluster object rpc attempt failed"
-                        );
                         let delivery_state = error
                             .delivery_state()
                             .unwrap_or(NetworkDeliveryState::PossiblyApplied);
                         let allows_fresh_connection_retry =
                             cluster_object_rpc_error_allows_fresh_connection_retry(request, &error);
+                        let outcome_unknown = delivery_state
+                            == NetworkDeliveryState::PossiblyApplied
+                            && !request.is_response_retry_safe();
+                        let fresh_connection_retry =
+                            allows_fresh_connection_retry && !fresh_connection_retry_used;
+                        let retry_decision = if outcome_unknown {
+                            "outcome_unknown"
+                        } else if fresh_connection_retry {
+                            if route_attempt < max_route_attempts {
+                                "fresh_connection"
+                            } else {
+                                "retry_exhausted"
+                            }
+                        } else {
+                            cluster_object_rpc_endpoint_retry_decision(
+                                endpoint_index,
+                                route_endpoint_count,
+                                route_attempt_index,
+                                max_route_attempts,
+                            )
+                        };
+                        attempt_trace.record(
+                            "transport_error",
+                            cluster_object_rpc_delivery_state_name(delivery_state),
+                            retry_decision,
+                            ClusterObjectRpcAttemptTraceDetail::for_transport_error(&error),
+                        );
                         if delivery_state == NetworkDeliveryState::PossiblyApplied {
                             possibly_applied = true;
                             if !request.is_response_retry_safe() {
@@ -3267,7 +3567,7 @@ where
                             "{} ({:?}): {error}",
                             endpoint.address, endpoint.transport
                         ));
-                        if allows_fresh_connection_retry && !fresh_connection_retry_used {
+                        if fresh_connection_retry {
                             fresh_connection_retry_used = true;
                             continue 'route_attempts;
                         }
@@ -3277,14 +3577,32 @@ where
             failed_edges.try_insert(&state.local_node_id, &route_plan.next_hop)?;
         }
 
+        let delivery_state = cluster_object_rpc_delivery_state(possibly_applied);
+        let last_failure = cluster_object_rpc_trace_last_failure(&failures);
+        tracing::debug!(
+            target: "sinomo.network.object_rpc",
+            %traceparent,
+            route = %request.route,
+            category = %request.category,
+            %target_node_id,
+            route_attempt_limit = max_route_attempts,
+            send_attempts,
+            remaining_budget_ms = deadline
+                .checked_remaining()
+                .flatten()
+                .map(duration_millis_u64)
+                .unwrap_or_default(),
+            delivery_state = cluster_object_rpc_delivery_state_name(delivery_state),
+            retry_decision = "retry_exhausted",
+            failure_count = failures.len(),
+            last_failure,
+            total_us = cluster_object_rpc_elapsed_us(call_started_at),
+            "cluster object rpc retries exhausted"
+        );
         Err(NetworkError::RetryExhausted {
             operation: format!("cluster target rpc to {target_node_id}"),
             attempts: send_attempts,
-            delivery_state: if possibly_applied {
-                NetworkDeliveryState::PossiblyApplied
-            } else {
-                NetworkDeliveryState::DefinitelyNotSent
-            },
+            delivery_state,
             detail: format!(
                 "route to target node {target_node_id} failed{}",
                 if failures.is_empty() {
@@ -3333,7 +3651,8 @@ where
             "cluster object rpc stream route start"
         );
 
-        'route_attempts: for _ in 0..max_route_attempts {
+        'route_attempts: for route_attempt_index in 0..max_route_attempts {
+            let route_attempt = route_attempt_index.saturating_add(1);
             let plan_started_at = Instant::now();
             let Some(route_plan) = cluster_delivery_route_plan_async(
                 runtime,
@@ -3356,8 +3675,38 @@ where
             )
             .record(plan_us as f64);
             if route_plan.endpoints.is_empty() {
+                let detail = format!("{}: no usable route", route_plan.next_hop);
+                tracing::debug!(
+                    target: "sinomo.network.object_rpc",
+                    %traceparent,
+                    route = %request.route,
+                    category = %request.category,
+                    %target_node_id,
+                    next_hop = %route_plan.next_hop,
+                    route_attempt,
+                    route_attempt_limit = max_route_attempts,
+                    send_attempts,
+                    endpoint_count = 0,
+                    remaining_budget_ms = deadline
+                        .checked_remaining()
+                        .flatten()
+                        .map(duration_millis_u64)
+                        .unwrap_or_default(),
+                    delivery_state = cluster_object_rpc_delivery_state_name(
+                        cluster_object_rpc_delivery_state(possibly_applied),
+                    ),
+                    retry_decision = cluster_object_rpc_replan_retry_decision(
+                        route_attempt_index,
+                        max_route_attempts,
+                    ),
+                    outcome = "empty_endpoint_plan",
+                    detail,
+                    plan_us,
+                    stream = true,
+                    "cluster object rpc stream route attempt completed"
+                );
                 failed_edges.try_insert(&state.local_node_id, &route_plan.next_hop)?;
-                failures.push(format!("{}: no usable route", route_plan.next_hop));
+                failures.push(detail);
                 continue;
             }
             tracing::trace!(
@@ -3367,6 +3716,8 @@ where
                 category = %request.category,
                 %target_node_id,
                 next_hop = %route_plan.next_hop,
+                route_attempt,
+                route_attempt_limit = max_route_attempts,
                 plan_us,
                 endpoints = %cluster_object_rpc_endpoint_trace_list(&route_plan.endpoints),
                 stream = true,
@@ -3461,6 +3812,37 @@ where
                     )
                 };
                 let attempt_deadline = deadline.capped_by(hop_attempt_budget);
+                let endpoint_attempt = endpoint_index.saturating_add(1);
+                let remaining_budget_ms = remaining.map(duration_millis_u64).unwrap_or_default();
+                let connect_budget_ms = endpoint_attempt_budget
+                    .map(duration_millis_u64)
+                    .unwrap_or_default();
+                let attempt_budget_ms = hop_attempt_budget
+                    .map(duration_millis_u64)
+                    .unwrap_or_default();
+                let attempt_trace_start = ClusterObjectRpcAttemptStartTrace {
+                    traceparent: &traceparent,
+                    request,
+                    target_node_id,
+                    next_hop: &route_plan.next_hop,
+                    endpoint: &endpoint,
+                    final_hop,
+                    route_attempt,
+                    route_attempt_limit: max_route_attempts,
+                    send_attempt: send_attempts.saturating_add(1),
+                    endpoint_attempt,
+                    endpoint_attempt_limit: route_endpoint_count,
+                    remaining_budget_ms,
+                    connect_budget_ms,
+                    attempt_budget_ms,
+                    stream: true,
+                };
+                if cluster_object_rpc_attempt_may_reach_route_deadline(
+                    remaining,
+                    hop_attempt_budget,
+                ) {
+                    attempt_trace_start.record();
+                }
                 let sign_started_at = Instant::now();
                 let request_auth = cluster_object_rpc_sign_with_deadline(
                     self.host.sign_object_rpc_request_async(request),
@@ -3549,12 +3931,34 @@ where
                         response,
                     )
                 };
+                let attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at);
+                let total_us = cluster_object_rpc_elapsed_us(call_started_at);
+                let attempt_trace = ClusterObjectRpcAttemptTrace {
+                    start: ClusterObjectRpcAttemptStartTrace {
+                        send_attempt: send_attempts,
+                        ..attempt_trace_start
+                    },
+                    sign_us: request_sign_us,
+                    plan_us,
+                    outer_build_us,
+                    outer_sign_us,
+                    send_us,
+                    attempt_us,
+                    total_us,
+                };
                 match response {
                     Ok(response) if relay_response_reports_outcome_unknown(&response.response) => {
+                        let detail = relay_response_outcome_unknown_detail(&response.response);
+                        attempt_trace.record(
+                            "relay_outcome_unknown",
+                            "possibly_applied",
+                            "outcome_unknown",
+                            ClusterObjectRpcAttemptTraceDetail::RelayOutcomeUnknown,
+                        );
                         return Err(cluster_object_rpc_outcome_unknown(
                             target_node_id,
                             request,
-                            relay_response_outcome_unknown_detail(&response.response),
+                            detail,
                         ));
                     }
                     Ok(response)
@@ -3562,6 +3966,19 @@ where
                     {
                         let detail = relay_response_routing_error_detail(&response.response);
                         possibly_applied = true;
+                        let retry_decision = if !request.is_response_retry_safe() {
+                            "outcome_unknown"
+                        } else if route_attempt < max_route_attempts {
+                            "fresh_origin_signature"
+                        } else {
+                            "retry_exhausted"
+                        };
+                        attempt_trace.record(
+                            "fresh_origin_signature_required",
+                            "possibly_applied",
+                            retry_decision,
+                            ClusterObjectRpcAttemptTraceDetail::FreshOriginSignatureRequired,
+                        );
                         if !request.is_response_retry_safe() {
                             return Err(cluster_object_rpc_outcome_unknown(
                                 target_node_id,
@@ -3582,24 +3999,21 @@ where
                             "category" => request.category.clone()
                         )
                         .increment(1);
-                        tracing::debug!(
-                            target: "sinomo.network.object_rpc",
-                            %traceparent,
-                            route = %request.route,
-                            category = %request.category,
-                            %target_node_id,
-                            next_hop = %route_plan.next_hop,
-                            endpoint = %endpoint.address,
-                            transport = ?endpoint.transport,
-                            final_hop,
-                            stream = true,
-                            "cluster object rpc stream relay returned routing error"
+                        let detail = relay_response_routing_error_detail(&response.response);
+                        attempt_trace.record(
+                            "relay_routing_error",
+                            cluster_object_rpc_delivery_state_name(
+                                cluster_object_rpc_delivery_state(possibly_applied),
+                            ),
+                            cluster_object_rpc_replan_retry_decision(
+                                route_attempt_index,
+                                max_route_attempts,
+                            ),
+                            ClusterObjectRpcAttemptTraceDetail::RelayRoutingError,
                         );
                         failures.push(format!(
-                            "{} ({:?}) returned routing error: {}",
-                            endpoint.address,
-                            endpoint.transport,
-                            relay_response_routing_error_detail(&response.response)
+                            "{} ({:?}) returned routing error: {detail}",
+                            endpoint.address, endpoint.transport
                         ));
                         break;
                     }
@@ -3614,19 +4028,18 @@ where
                                 "outcome" => "endpoint_error"
                             )
                             .record(cluster_object_rpc_elapsed_us(attempt_started_at) as f64);
-                            tracing::debug!(
-                                target: "sinomo.network.object_rpc",
-                                %traceparent,
-                                route = %request.route,
-                                category = %request.category,
-                                %target_node_id,
-                                next_hop = %route_plan.next_hop,
-                                endpoint = %endpoint.address,
-                                transport = ?endpoint.transport,
-                                final_hop,
-                                stream = true,
-                                error = %detail,
-                                "cluster object rpc stream endpoint returned retryable error"
+                            attempt_trace.record(
+                                "endpoint_error_response",
+                                cluster_object_rpc_delivery_state_name(
+                                    cluster_object_rpc_delivery_state(possibly_applied),
+                                ),
+                                cluster_object_rpc_endpoint_retry_decision(
+                                    endpoint_index,
+                                    route_endpoint_count,
+                                    route_attempt_index,
+                                    max_route_attempts,
+                                ),
+                                ClusterObjectRpcAttemptTraceDetail::EndpointAuthenticationDenied,
                             );
                             failures.push(format!(
                                 "{} ({:?}) returned endpoint error: {detail}",
@@ -3644,28 +4057,6 @@ where
                                 "category" => request.category.clone()
                             )
                             .increment(1);
-                            tracing::debug!(
-                                target: "sinomo.network.object_rpc",
-                                %traceparent,
-                                route = %request.route,
-                                category = %request.category,
-                                %target_node_id,
-                                next_hop = %route_plan.next_hop,
-                                endpoint = %endpoint.address,
-                                transport = ?endpoint.transport,
-                                final_hop,
-                                expected = %target_node_id,
-                                got = %responder_node_id,
-                                sign_us = request_sign_us,
-                                plan_us,
-                                outer_build_us,
-                                outer_sign_us,
-                                send_us,
-                                attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at),
-                                total_us = cluster_object_rpc_elapsed_us(call_started_at),
-                                stream = true,
-                                "cluster object rpc stream responder mismatch"
-                            );
                             let failure = if final_hop {
                                 record_cluster_delivery_endpoint_identity_mismatch(
                                     paths, state, &endpoint,
@@ -3687,6 +4078,21 @@ where
                                 )
                             };
                             possibly_applied = true;
+                            attempt_trace.record(
+                                "responder_mismatch",
+                                "possibly_applied",
+                                if request.is_response_retry_safe() {
+                                    cluster_object_rpc_endpoint_retry_decision(
+                                        endpoint_index,
+                                        route_endpoint_count,
+                                        route_attempt_index,
+                                        max_route_attempts,
+                                    )
+                                } else {
+                                    "outcome_unknown"
+                                },
+                                ClusterObjectRpcAttemptTraceDetail::ResponderMismatch,
+                            );
                             if !request.is_response_retry_safe() {
                                 return Err(cluster_object_rpc_outcome_unknown(
                                     target_node_id,
@@ -3698,10 +4104,14 @@ where
                             continue;
                         }
                         if let Err(error) = response.response.error_detail() {
+                            attempt_trace.record(
+                                "application_error_response",
+                                "confirmed_response",
+                                "do_not_retry",
+                                ClusterObjectRpcAttemptTraceDetail::ApplicationError,
+                            );
                             return Err(error);
                         }
-                        let attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at);
-                        let total_us = cluster_object_rpc_elapsed_us(call_started_at);
                         metrics::histogram!(
                             "sinomo.object_rpc.target.attempt.us",
                             "route" => request.route.clone(),
@@ -3716,25 +4126,11 @@ where
                             "outcome" => "ok"
                         )
                         .record(total_us as f64);
-                        tracing::debug!(
-                            target: "sinomo.network.object_rpc",
-                            %traceparent,
-                            route = %request.route,
-                            category = %request.category,
-                            %target_node_id,
-                            next_hop = %route_plan.next_hop,
-                            endpoint = %endpoint.address,
-                            transport = ?endpoint.transport,
-                            final_hop,
-                            sign_us = request_sign_us,
-                            plan_us,
-                            outer_build_us,
-                            outer_sign_us,
-                            send_us,
-                            attempt_us,
-                            total_us,
-                            stream = true,
-                            "cluster object rpc stream delivered"
+                        attempt_trace.record(
+                            "delivered",
+                            "confirmed_response",
+                            "complete",
+                            ClusterObjectRpcAttemptTraceDetail::None,
                         );
                         return Ok(response);
                     }
@@ -3748,8 +4144,6 @@ where
                                 )
                                 .await;
                         }
-                        let attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at);
-                        let total_us = cluster_object_rpc_elapsed_us(call_started_at);
                         metrics::histogram!(
                             "sinomo.object_rpc.target.attempt.us",
                             "route" => request.route.clone(),
@@ -3764,32 +4158,38 @@ where
                             "outcome" => "error"
                         )
                         .record(total_us as f64);
-                        tracing::debug!(
-                            target: "sinomo.network.object_rpc",
-                            %traceparent,
-                            route = %request.route,
-                            category = %request.category,
-                            %target_node_id,
-                            next_hop = %route_plan.next_hop,
-                            endpoint = %endpoint.address,
-                            transport = ?endpoint.transport,
-                            final_hop,
-                            sign_us = request_sign_us,
-                            plan_us,
-                            outer_build_us,
-                            outer_sign_us,
-                            send_us,
-                            attempt_us,
-                            total_us,
-                            error = %error,
-                            stream = true,
-                            "cluster object rpc stream attempt failed"
-                        );
                         let delivery_state = error
                             .delivery_state()
                             .unwrap_or(NetworkDeliveryState::PossiblyApplied);
                         let allows_fresh_connection_retry =
                             cluster_object_rpc_error_allows_fresh_connection_retry(request, &error);
+                        let outcome_unknown = delivery_state
+                            == NetworkDeliveryState::PossiblyApplied
+                            && !request.is_response_retry_safe();
+                        let fresh_connection_retry =
+                            allows_fresh_connection_retry && !fresh_connection_retry_used;
+                        let retry_decision = if outcome_unknown {
+                            "outcome_unknown"
+                        } else if fresh_connection_retry {
+                            if route_attempt < max_route_attempts {
+                                "fresh_connection"
+                            } else {
+                                "retry_exhausted"
+                            }
+                        } else {
+                            cluster_object_rpc_endpoint_retry_decision(
+                                endpoint_index,
+                                route_endpoint_count,
+                                route_attempt_index,
+                                max_route_attempts,
+                            )
+                        };
+                        attempt_trace.record(
+                            "transport_error",
+                            cluster_object_rpc_delivery_state_name(delivery_state),
+                            retry_decision,
+                            ClusterObjectRpcAttemptTraceDetail::for_transport_error(&error),
+                        );
                         if delivery_state == NetworkDeliveryState::PossiblyApplied {
                             possibly_applied = true;
                             if !request.is_response_retry_safe() {
@@ -3804,7 +4204,7 @@ where
                             "{} ({:?}): {error}",
                             endpoint.address, endpoint.transport
                         ));
-                        if allows_fresh_connection_retry && !fresh_connection_retry_used {
+                        if fresh_connection_retry {
                             fresh_connection_retry_used = true;
                             continue 'route_attempts;
                         }
@@ -3814,14 +4214,33 @@ where
             failed_edges.try_insert(&state.local_node_id, &route_plan.next_hop)?;
         }
 
+        let delivery_state = cluster_object_rpc_delivery_state(possibly_applied);
+        let last_failure = cluster_object_rpc_trace_last_failure(&failures);
+        tracing::debug!(
+            target: "sinomo.network.object_rpc",
+            %traceparent,
+            route = %request.route,
+            category = %request.category,
+            %target_node_id,
+            route_attempt_limit = max_route_attempts,
+            send_attempts,
+            remaining_budget_ms = deadline
+                .checked_remaining()
+                .flatten()
+                .map(duration_millis_u64)
+                .unwrap_or_default(),
+            delivery_state = cluster_object_rpc_delivery_state_name(delivery_state),
+            retry_decision = "retry_exhausted",
+            failure_count = failures.len(),
+            last_failure,
+            total_us = cluster_object_rpc_elapsed_us(call_started_at),
+            stream = true,
+            "cluster object rpc stream retries exhausted"
+        );
         Err(NetworkError::RetryExhausted {
             operation: format!("cluster target stream rpc to {target_node_id}"),
             attempts: send_attempts,
-            delivery_state: if possibly_applied {
-                NetworkDeliveryState::PossiblyApplied
-            } else {
-                NetworkDeliveryState::DefinitelyNotSent
-            },
+            delivery_state,
             detail: format!(
                 "route to target node {target_node_id} failed{}",
                 if failures.is_empty() {
@@ -3831,6 +4250,92 @@ where
                 }
             ),
         })
+    }
+}
+
+fn cluster_object_rpc_delivery_state(possibly_applied: bool) -> NetworkDeliveryState {
+    if possibly_applied {
+        NetworkDeliveryState::PossiblyApplied
+    } else {
+        NetworkDeliveryState::DefinitelyNotSent
+    }
+}
+
+fn cluster_object_rpc_delivery_state_name(delivery_state: NetworkDeliveryState) -> &'static str {
+    match delivery_state {
+        NetworkDeliveryState::DefinitelyNotSent => "definitely_not_sent",
+        NetworkDeliveryState::PossiblyApplied => "possibly_applied",
+    }
+}
+
+fn cluster_object_rpc_error_delivery_state_name(error: &NetworkError) -> &'static str {
+    cluster_object_rpc_delivery_state_name(
+        error
+            .delivery_state()
+            .unwrap_or(NetworkDeliveryState::PossiblyApplied),
+    )
+}
+
+fn cluster_object_rpc_timeout_trace_classification(
+    route_deadline_exhausted: bool,
+) -> (&'static str, &'static str) {
+    if route_deadline_exhausted {
+        ("route_deadline_exhausted", "deadline_exhausted")
+    } else {
+        ("inner_timeout", "propagated_timeout")
+    }
+}
+
+/// Completion records cover ordinary endpoint timeouts. Emit a start record only
+/// when the outer route deadline can cancel the attempt before that record runs.
+fn cluster_object_rpc_attempt_may_reach_route_deadline(
+    remaining_route_budget: Option<Duration>,
+    attempt_budget: Option<Duration>,
+) -> bool {
+    matches!(
+        (remaining_route_budget, attempt_budget),
+        (Some(remaining_route_budget), Some(attempt_budget))
+            if attempt_budget >= remaining_route_budget
+    )
+}
+
+fn cluster_object_rpc_trace_last_failure(failures: &[String]) -> String {
+    let Some(detail) = failures.last() else {
+        return String::new();
+    };
+    let mut chars = detail.chars();
+    let truncated: String = chars
+        .by_ref()
+        .take(CLUSTER_OBJECT_RPC_TRACE_FAILURE_DETAIL_MAX_CHARS)
+        .collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn cluster_object_rpc_endpoint_retry_decision(
+    endpoint_index: usize,
+    endpoint_count: usize,
+    route_attempt_index: usize,
+    max_route_attempts: usize,
+) -> &'static str {
+    if endpoint_index.saturating_add(1) < endpoint_count {
+        "next_endpoint"
+    } else {
+        cluster_object_rpc_replan_retry_decision(route_attempt_index, max_route_attempts)
+    }
+}
+
+fn cluster_object_rpc_replan_retry_decision(
+    route_attempt_index: usize,
+    max_route_attempts: usize,
+) -> &'static str {
+    if route_attempt_index.saturating_add(1) < max_route_attempts {
+        "replan_route"
+    } else {
+        "retry_exhausted"
     }
 }
 
@@ -5813,6 +6318,124 @@ fn relay_response_routing_error_detail(response: &ObjectRpcResponse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_rpc_retry_trace_decisions_match_route_control_flow() {
+        assert_eq!(
+            cluster_object_rpc_endpoint_retry_decision(0, 2, 0, 3),
+            "next_endpoint"
+        );
+        assert_eq!(
+            cluster_object_rpc_endpoint_retry_decision(1, 2, 0, 3),
+            "replan_route"
+        );
+        assert_eq!(
+            cluster_object_rpc_endpoint_retry_decision(1, 2, 2, 3),
+            "retry_exhausted"
+        );
+        assert_eq!(
+            cluster_object_rpc_delivery_state_name(NetworkDeliveryState::DefinitelyNotSent),
+            "definitely_not_sent"
+        );
+        assert_eq!(
+            cluster_object_rpc_delivery_state_name(NetworkDeliveryState::PossiblyApplied),
+            "possibly_applied"
+        );
+    }
+
+    #[test]
+    fn object_rpc_timeout_trace_start_and_last_failure_are_bounded() {
+        assert_eq!(
+            cluster_object_rpc_timeout_trace_classification(true),
+            ("route_deadline_exhausted", "deadline_exhausted")
+        );
+        assert_eq!(
+            cluster_object_rpc_timeout_trace_classification(false),
+            ("inner_timeout", "propagated_timeout")
+        );
+        assert!(cluster_object_rpc_attempt_may_reach_route_deadline(
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(5)),
+        ));
+        assert!(!cluster_object_rpc_attempt_may_reach_route_deadline(
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(2)),
+        ));
+        assert!(!cluster_object_rpc_attempt_may_reach_route_deadline(
+            None,
+            Some(Duration::from_secs(5)),
+        ));
+
+        assert_eq!(cluster_object_rpc_trace_last_failure(&[]), "");
+        assert_eq!(
+            cluster_object_rpc_trace_last_failure(&["first".to_string(), "last".to_string()]),
+            "last"
+        );
+        let long = "x".repeat(CLUSTER_OBJECT_RPC_TRACE_FAILURE_DETAIL_MAX_CHARS + 1);
+        let truncated = cluster_object_rpc_trace_last_failure(&[long]);
+        assert_eq!(
+            truncated.chars().count(),
+            CLUSTER_OBJECT_RPC_TRACE_FAILURE_DETAIL_MAX_CHARS + 3
+        );
+        assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn object_rpc_attempt_trace_details_are_finite_and_do_not_copy_errors() {
+        let private_text = "credential=super-secret-token";
+        let application_error = NetworkError::ObjectRpc {
+            route: "/private".to_string(),
+            detail: private_text.to_string(),
+        };
+        assert!(application_error.to_string().contains(private_text));
+        assert_eq!(
+            ClusterObjectRpcAttemptTraceDetail::ApplicationError.as_str(),
+            "application_error_detail_redacted"
+        );
+        assert!(
+            !ClusterObjectRpcAttemptTraceDetail::ApplicationError
+                .as_str()
+                .contains(private_text)
+        );
+
+        let transport_error = NetworkError::Io {
+            operation: private_text.to_string(),
+            detail: private_text.to_string(),
+        };
+        let transport_detail =
+            ClusterObjectRpcAttemptTraceDetail::for_transport_error(&transport_error).as_str();
+        assert_eq!(transport_detail, "transport_io");
+        assert!(!transport_detail.contains(private_text));
+
+        let details = [
+            ClusterObjectRpcAttemptTraceDetail::None,
+            ClusterObjectRpcAttemptTraceDetail::RelayOutcomeUnknown,
+            ClusterObjectRpcAttemptTraceDetail::FreshOriginSignatureRequired,
+            ClusterObjectRpcAttemptTraceDetail::RelayRoutingError,
+            ClusterObjectRpcAttemptTraceDetail::EndpointAuthenticationDenied,
+            ClusterObjectRpcAttemptTraceDetail::ResponderMismatch,
+            ClusterObjectRpcAttemptTraceDetail::ApplicationError,
+            ClusterObjectRpcAttemptTraceDetail::TransportTimeoutRoute,
+            ClusterObjectRpcAttemptTraceDetail::TransportTimeoutSigning,
+            ClusterObjectRpcAttemptTraceDetail::TransportTimeoutConnect,
+            ClusterObjectRpcAttemptTraceDetail::TransportTimeoutWrite,
+            ClusterObjectRpcAttemptTraceDetail::TransportTimeoutFirstByte,
+            ClusterObjectRpcAttemptTraceDetail::TransportTimeoutIdle,
+            ClusterObjectRpcAttemptTraceDetail::TransportTimeoutOverall,
+            ClusterObjectRpcAttemptTraceDetail::TransportOutcomeUnknown,
+            ClusterObjectRpcAttemptTraceDetail::TransportStalePooledConnection,
+            ClusterObjectRpcAttemptTraceDetail::TransportRetryExhausted,
+            ClusterObjectRpcAttemptTraceDetail::TransportDeliveryFailed,
+            ClusterObjectRpcAttemptTraceDetail::TransportIo,
+            ClusterObjectRpcAttemptTraceDetail::TransportOther,
+        ];
+        assert!(details.iter().all(|detail| detail.as_str().len() <= 48));
+        assert!(
+            details
+                .iter()
+                .all(|detail| !detail.as_str().contains(private_text))
+        );
+    }
 
     #[derive(Default)]
     struct RecordingRelayHost {

@@ -198,6 +198,100 @@ pub(crate) fn plan_namespace_transaction_recovery_table_ops(
     table_ops
 }
 
+/// Return true when recovery planning is guaranteed to produce no table ops.
+///
+/// This mirrors the recovery planner's decisions without cloning the complete
+/// metadata table set. The check stops at the first missing materialization;
+/// callers must run the full scratch-table planner in that case because later
+/// operations in a multi-object transaction can depend on earlier repairs.
+pub(crate) fn namespace_transaction_recovery_is_complete(
+    tables: &DfsMetadataTables,
+    transaction: &DfsNamespaceTransaction,
+) -> bool {
+    let transaction_object_ids = transaction
+        .objects
+        .iter()
+        .map(|object| object.object_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut transaction_authoritative_object_ids = BTreeSet::new();
+
+    for object in transaction
+        .objects
+        .iter()
+        .filter(|object| object.kind == DfsObjectKind::Tombstone)
+    {
+        if !namespace_transaction_object_recovery_is_complete(
+            tables,
+            object,
+            &transaction_object_ids,
+            &mut transaction_authoritative_object_ids,
+        ) {
+            return false;
+        }
+    }
+    for object in transaction
+        .objects
+        .iter()
+        .filter(|object| object.kind != DfsObjectKind::Tombstone)
+    {
+        if !namespace_transaction_object_recovery_is_complete(
+            tables,
+            object,
+            &transaction_object_ids,
+            &mut transaction_authoritative_object_ids,
+        ) {
+            return false;
+        }
+    }
+
+    if transaction.versions.iter().any(|version| {
+        let version = normalized_version_record(version);
+        !tables
+            .versions
+            .contains_key(&(version.object_id, version.version))
+    }) {
+        return false;
+    }
+
+    transaction.advisory_lock_states.iter().all(|state| {
+        match tables.advisory_lock_states.get(&state.object_id) {
+            None => false,
+            Some(existing) if existing == state => true,
+            Some(existing) => {
+                !transaction_authoritative_object_ids.contains(&state.object_id)
+                    || advisory_lock_state_descends_from(existing, state)
+            }
+        }
+    })
+}
+
+fn namespace_transaction_object_recovery_is_complete(
+    tables: &DfsMetadataTables,
+    transaction_object: &DfsObjectMetadata,
+    transaction_object_ids: &BTreeSet<DfsObjectId>,
+    transaction_authoritative_object_ids: &mut BTreeSet<DfsObjectId>,
+) -> bool {
+    if tables.compacted_tombstone_matches(transaction_object) {
+        return true;
+    }
+    let current = tables.objects.get(&transaction_object.object_id);
+    let transaction_is_authoritative = current.is_none_or(|current| {
+        transaction_object_recovers_over_current(transaction_object, current)
+    });
+    let object = if transaction_is_authoritative {
+        transaction_object
+    } else {
+        current.expect("a non-authoritative transaction object has a current record")
+    };
+    if object_path_has_external_owner(tables, object, transaction_object_ids) {
+        return true;
+    }
+    if transaction_is_authoritative {
+        transaction_authoritative_object_ids.insert(transaction_object.object_id.clone());
+    }
+    object_indexes_are_materialized(tables, object)
+}
+
 fn validate_advisory_lock_state_preconditions(
     tables: &DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
@@ -488,6 +582,48 @@ mod tests {
     }
 
     #[test]
+    fn completed_transaction_skips_scratch_table_recovery_plan() {
+        let live = object(
+            object_id("obj_namespace_complete_live"),
+            "/docs/complete.md",
+            DfsObjectKind::File,
+        );
+        let tombstone = object(
+            object_id("obj_namespace_complete_tombstone"),
+            "/docs/replaced.md",
+            DfsObjectKind::Tombstone,
+        );
+        let transaction = DfsNamespaceTransaction {
+            transaction_id: "txn_namespace_complete".to_string(),
+            file_system_id: file_system_id(),
+            objects: vec![live.clone(), tombstone],
+            versions: vec![version_record(&live)],
+            advisory_lock_states: Vec::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let mut tables = DfsMetadataTables::default();
+        for op in plan_namespace_transaction_table_ops(&tables, &transaction) {
+            tables.apply(op);
+        }
+
+        assert!(namespace_transaction_recovery_is_complete(
+            &tables,
+            &transaction
+        ));
+        assert!(plan_namespace_transaction_recovery_table_ops(&tables, &transaction).is_empty());
+
+        let live_path = path_record_for_object(&live);
+        tables
+            .paths
+            .remove(&(live.file_system_id.clone(), live_path.path.clone()));
+        assert!(
+            !namespace_transaction_recovery_is_complete(&tables, &transaction),
+            "a missing object index must fall back to scratch-table recovery planning"
+        );
+        assert!(!plan_namespace_transaction_recovery_table_ops(&tables, &transaction).is_empty());
+    }
+
+    #[test]
     fn recovery_plan_skips_path_owned_outside_transaction() {
         let existing = object(
             object_id("obj_namespace_existing"),
@@ -565,6 +701,11 @@ mod tests {
         });
 
         let ops = plan_namespace_transaction_recovery_table_ops(&tables, &transaction);
+
+        assert!(namespace_transaction_recovery_is_complete(
+            &tables,
+            &transaction
+        ));
 
         assert!(
             !ops.iter().any(|op| matches!(
@@ -768,6 +909,10 @@ mod tests {
             .insert(later_state.object_id.clone(), later_state.clone());
 
         let ops = plan_namespace_transaction_recovery_table_ops(&tables, &transaction);
+        assert!(namespace_transaction_recovery_is_complete(
+            &tables,
+            &transaction
+        ));
 
         assert!(!ops.iter().any(|op| matches!(
             op,
@@ -795,6 +940,10 @@ mod tests {
         }
 
         let ops = plan_namespace_transaction_recovery_table_ops(&tables, &transaction);
+        assert!(namespace_transaction_recovery_is_complete(
+            &tables,
+            &transaction
+        ));
         for op in ops {
             tables.apply(op);
         }
