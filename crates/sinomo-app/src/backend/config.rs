@@ -11,13 +11,15 @@
 use serde_json::Value;
 use sinomo_cli::app_api::ProviderSummary;
 use sinomo_lm::{
-    DEFAULT_PROVIDER_ACCOUNT, LM_PROVIDER_CONFIG_KEY, LanguageModelProviderOptions, ModelConfig,
-    ProviderAccountConfig, ProviderReasoningEffort, model_supports_reasoning_effort,
-    normalize_model_provider, normalize_provider_account_name, upsert_provider_account_config,
+    DEFAULT_PROVIDER_ACCOUNT, LM_PROVIDER_CONFIG_KEY, LanguageModelProviderOptions,
+    LanguageModelProviderUsage, ModelConfig, ProviderAccountConfig, ProviderReasoningEffort,
+    ProviderTextVerbosity, model_supports_reasoning_effort, normalize_model_provider,
+    normalize_provider_account_name, upsert_provider_account_config,
 };
 use sinomo_runtime::config::{
     ConfigClient, ConfigSchema, ConfigStore, ConfigValueSource, ConfigValueType, ConfigWriteTarget,
 };
+use sinomo_runtime::local::SinomoDataDir;
 
 /// How a config value is edited in the Advanced settings UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -402,6 +404,37 @@ mod tests {
                 .any(|form| form.account == "work" && !form.is_default)
         );
     }
+
+    #[test]
+    fn provider_options_round_trip_through_settings_helpers() {
+        let (client, _root) = test_client("provider-options");
+        add_provider_account(
+            &client,
+            "anthropic",
+            "default",
+            "sk-test",
+            "claude-sonnet-4-20250514",
+            "",
+        )
+        .expect("add provider");
+
+        set_provider_effort(&client, "anthropic", "default", 4).expect("effort");
+        set_provider_reasoning_budget(&client, "anthropic", "default", "8192").expect("budget");
+        set_provider_text_verbosity(&client, "anthropic", "default", 2).expect("verbosity");
+        set_provider_vendor_options(
+            &client,
+            "anthropic",
+            "default",
+            r#"{"metadata.trace":"enabled"}"#,
+        )
+        .expect("vendor options");
+
+        let form = provider_forms(&client).pop().expect("provider form");
+        assert_eq!(form.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(form.reasoning_budget_tokens, Some(8192));
+        assert_eq!(form.text_verbosity.as_deref(), Some("medium"));
+        assert_eq!(form.vendor_options, r#"{"metadata.trace":"enabled"}"#);
+    }
 }
 
 /// Resolve the `lm.providers` config object into a `ModelConfig` via the client.
@@ -473,6 +506,9 @@ pub struct ProviderForm {
     pub api_base_url: String,
     /// The configured reasoning effort (e.g. "high"), or `None` for the provider default.
     pub reasoning_effort: Option<String>,
+    pub reasoning_budget_tokens: Option<u32>,
+    pub text_verbosity: Option<String>,
+    pub vendor_options: String,
     /// Whether reasoning effort applies to this provider/model at all.
     pub supports_reasoning: bool,
     /// Whether an API-key credential is stored for this account.
@@ -541,12 +577,86 @@ pub fn provider_forms(client: &dyn ConfigClient) -> Vec<ProviderForm> {
                 .options
                 .reasoning_effort
                 .map(|e| e.as_config_value().to_string()),
+            reasoning_budget_tokens: account.options.reasoning_budget_tokens,
+            text_verbosity: account
+                .options
+                .text_verbosity
+                .map(|value| value.as_config_value().to_string()),
+            vendor_options: serde_json::to_string(&account.options.vendor_options)
+                .unwrap_or_else(|_| "{}".to_string()),
             has_api_key,
             uses_device_login,
             signed_in,
         });
     }
     forms
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderHealthCheck {
+    pub provider: String,
+    pub account: String,
+    pub verified_at_unix: i64,
+    pub models: Vec<String>,
+    pub model_discovery_error: Option<String>,
+    pub usage: Option<LanguageModelProviderUsage>,
+    pub usage_error: Option<String>,
+}
+
+pub fn test_provider_connection(
+    data_dir: &SinomoDataDir,
+    client: &dyn ConfigClient,
+    provider: &str,
+    account: &str,
+) -> Result<ProviderHealthCheck, String> {
+    let provider = normalize_configurable_provider(provider)?;
+    let account_name = normalize_provider_account_name(Some(account));
+    let config = load_provider_config(client).unwrap_or_default();
+    let account_config = config.accounts.iter().find(|candidate| {
+        normalize_model_provider(&candidate.provider).as_deref() == Some(provider.as_str())
+            && normalize_provider_account_name(Some(&candidate.account)) == account_name
+    });
+    let account_config = account_config.ok_or_else(|| {
+        format!(
+            "{} account {} was not found",
+            provider_display_name(&provider),
+            account_name
+        )
+    })?;
+
+    sinomo_lm::test_provider_account_credentials_in_data_dir(
+        data_dir,
+        &provider,
+        Some(account_config),
+    )
+    .map_err(|error| error.to_string())?;
+    let (models, model_discovery_error) =
+        match sinomo_lm::provider_available_model_ids_for_account_in_data_dir(
+            data_dir,
+            &provider,
+            Some(account_config),
+        ) {
+            Ok(models) => (models, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
+    let (usage, usage_error) =
+        if sinomo_lm::subscription_usage_provider_ids().contains(&provider.as_str()) {
+            match sinomo_lm::provider_usage_in_data_dir(data_dir, &provider) {
+                Ok(usage) => (Some(usage), None),
+                Err(error) => (None, Some(error.to_string())),
+            }
+        } else {
+            (None, None)
+        };
+    Ok(ProviderHealthCheck {
+        provider,
+        account: account_name,
+        verified_at_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
+        models,
+        model_discovery_error,
+        usage,
+        usage_error,
+    })
 }
 
 /// Run a provider's OAuth device-login flow (codex / github-copilot). Blocks while polling — call
@@ -718,6 +828,18 @@ pub const REASONING_EFFORT_OPTIONS: &[&str] = &[
     "default", "minimal", "low", "medium", "high", "xhigh", "max",
 ];
 
+pub const TEXT_VERBOSITY_OPTIONS: &[&str] = &["default", "low", "medium", "high"];
+
+pub fn text_verbosity_index(verbosity: Option<&str>) -> usize {
+    verbosity
+        .and_then(|value| {
+            TEXT_VERBOSITY_OPTIONS
+                .iter()
+                .position(|option| *option == value)
+        })
+        .unwrap_or(0)
+}
+
 /// Resolve a provider form's current reasoning effort to its index into
 /// [`REASONING_EFFORT_OPTIONS`] (0 = default / unset).
 pub fn reasoning_effort_index(effort: Option<&str>) -> usize {
@@ -744,6 +866,64 @@ pub fn set_provider_effort(
     };
     update_provider_account(client, provider, account, move |account| {
         account.options.reasoning_effort = effort;
+    })
+}
+
+pub fn set_provider_text_verbosity(
+    client: &dyn ConfigClient,
+    provider: &str,
+    account: &str,
+    index: usize,
+) -> Result<(), String> {
+    let verbosity = match TEXT_VERBOSITY_OPTIONS.get(index) {
+        Some(&"default") | None => None,
+        Some(value) => Some(value.parse::<ProviderTextVerbosity>()?),
+    };
+    update_provider_account(client, provider, account, move |account| {
+        account.options.text_verbosity = verbosity;
+    })
+}
+
+pub fn set_provider_reasoning_budget(
+    client: &dyn ConfigClient,
+    provider: &str,
+    account: &str,
+    raw: &str,
+) -> Result<(), String> {
+    let value = raw.trim();
+    let budget = if value.is_empty() {
+        None
+    } else {
+        Some(
+            value
+                .parse::<u32>()
+                .map_err(|_| "reasoning budget must be a positive whole number".to_string())?,
+        )
+    };
+    if budget == Some(0) {
+        return Err("reasoning budget must be greater than zero".to_string());
+    }
+    update_provider_account(client, provider, account, move |account| {
+        account.options.reasoning_budget_tokens = budget;
+    })
+}
+
+pub fn set_provider_vendor_options(
+    client: &dyn ConfigClient,
+    provider: &str,
+    account: &str,
+    raw: &str,
+) -> Result<(), String> {
+    let value = raw.trim();
+    let options = if value.is_empty() {
+        std::collections::BTreeMap::new()
+    } else {
+        serde_json::from_str::<std::collections::BTreeMap<String, String>>(value).map_err(
+            |error| format!("provider options must be a JSON object of strings: {error}"),
+        )?
+    };
+    update_provider_account(client, provider, account, move |account| {
+        account.options.vendor_options = options;
     })
 }
 

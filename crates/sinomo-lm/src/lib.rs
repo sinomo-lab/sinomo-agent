@@ -1828,6 +1828,174 @@ pub fn provider_available_model_ids(provider: &str) -> Result<Vec<String>, Langu
     }
 }
 
+/// Resolve picker-visible models using a configured provider account.
+///
+/// Subscription providers use their authenticated remote catalogs. API-key
+/// providers use the account's credential/base URL and expose the provider's
+/// known catalog, including a configured custom default model.
+pub fn provider_available_model_ids_for_account(
+    provider: &str,
+    account: Option<&ProviderAccountConfig>,
+) -> Result<Vec<String>, LanguageModelError> {
+    let configured_model = account
+        .and_then(|account| account.default_model.as_deref())
+        .filter(|model| !model.trim().is_empty())
+        .map(str::to_string);
+    let mut models = match provider {
+        AnthropicProvider::PROVIDER_ID => {
+            let mut config = AnthropicConfig::default();
+            apply_account_to_api_config(
+                account,
+                &mut config.api_base_url,
+                &mut config.default_model,
+                &mut config.api_key,
+            );
+            let provider = AnthropicProvider::new(config.clone());
+            provider.api_key()?;
+            vec![config.default_model]
+        }
+        OpenAiProvider::PROVIDER_ID => {
+            let mut config = OpenAiConfig::default();
+            apply_account_to_api_config(
+                account,
+                &mut config.api_base_url,
+                &mut config.default_model,
+                &mut config.api_key,
+            );
+            let provider = OpenAiProvider::new(config.clone());
+            provider.api_key()?;
+            vec![config.default_model]
+        }
+        DeepSeekProvider::PROVIDER_ID => {
+            let mut config = DeepSeekConfig::default();
+            apply_account_to_api_config(
+                account,
+                &mut config.api_base_url,
+                &mut config.default_model,
+                &mut config.api_key,
+            );
+            DeepSeekProvider::new(config).list_models()?
+        }
+        GeminiProvider::PROVIDER_ID => {
+            let mut config = GeminiConfig::default();
+            apply_account_to_api_config(
+                account,
+                &mut config.api_base_url,
+                &mut config.default_model,
+                &mut config.api_key,
+            );
+            let provider = GeminiProvider::new(config.clone());
+            provider.api_key()?;
+            vec![config.default_model]
+        }
+        NvidiaProvider::PROVIDER_ID => {
+            let mut config = NvidiaConfig::default();
+            apply_account_to_api_config(
+                account,
+                &mut config.api_base_url,
+                &mut config.default_model,
+                &mut config.api_key,
+            );
+            NvidiaProvider::new(config).list_models()?
+        }
+        _ => provider_available_model_ids(provider)?,
+    };
+    if let Some(model) = configured_model
+        && !models.contains(&model)
+    {
+        models.push(model);
+    }
+    models.sort();
+    models.dedup();
+    Ok(models)
+}
+
+pub fn provider_available_model_ids_for_account_in_data_dir(
+    data_dir: &SinomoDataDir,
+    provider: &str,
+    account: Option<&ProviderAccountConfig>,
+) -> Result<Vec<String>, LanguageModelError> {
+    let mut models = match provider {
+        CODEX_PROVIDER_ID => {
+            let mut config = OpenAiResponsesCodexConfig::default();
+            config.credentials_path = Some(data_dir.provider_credentials_file(CODEX_PROVIDER_ID));
+            if let Some(account) = account {
+                if let Some(base_url) = account.api_base_url.as_deref() {
+                    config.api_base_url = base_url.to_string();
+                }
+                if let Some(model) = account.default_model.as_deref() {
+                    config.default_model = model.to_string();
+                }
+            }
+            OpenAiResponsesCodexClient::new(config).list_models()?
+        }
+        ClaudeProvider::PROVIDER_ID => {
+            let mut config = ClaudeConfig::default();
+            config.credentials_path =
+                Some(data_dir.provider_credentials_file(ClaudeProvider::PROVIDER_ID));
+            ClaudeProvider::new(config).list_models()?
+        }
+        GitHubCopilotProvider::PROVIDER_ID => {
+            let mut config = GitHubCopilotConfig::default();
+            config.token_store_path =
+                Some(data_dir.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID));
+            if let Some(account) = account {
+                if let Some(base_url) = account.api_base_url.as_deref() {
+                    config.api_base_url = base_url.to_string();
+                }
+                if let Some(model) = account.default_model.as_deref() {
+                    config.default_model = model.to_string();
+                }
+            }
+            GitHubCopilotProvider::new(config).list_models()?
+        }
+        _ => provider_available_model_ids_for_account(provider, account)?,
+    };
+    if let Some(model) = account
+        .and_then(|account| account.default_model.as_deref())
+        .filter(|model| !model.trim().is_empty())
+        .map(str::to_string)
+        && !models.contains(&model)
+    {
+        models.push(model);
+    }
+    models.sort();
+    models.dedup();
+    Ok(models)
+}
+
+fn apply_account_to_api_config(
+    account: Option<&ProviderAccountConfig>,
+    api_base_url: &mut String,
+    default_model: &mut String,
+    api_key: &mut Option<String>,
+) {
+    let Some(account) = account else {
+        return;
+    };
+    if let Some(value) = account
+        .api_base_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        *api_base_url = value.trim().to_string();
+    }
+    if let Some(value) = account
+        .default_model
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        *default_model = value.trim().to_string();
+    }
+    if let Some(value) = account
+        .api_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        *api_key = Some(value.trim().to_string());
+    }
+}
+
 /// Whether a reasoning-effort setting is meaningful for `provider`/`model`.
 ///
 /// This is the single source of truth for reasoning-effort applicability and is kept
@@ -1901,6 +2069,32 @@ pub fn provider_usage(provider: &str) -> Result<LanguageModelProviderUsage, Lang
             model: PROVIDER_DEFAULT_MODEL.to_string(),
             detail: format!("provider `{provider}` does not expose subscription usage"),
         }),
+    }
+}
+
+pub fn provider_usage_in_data_dir(
+    data_dir: &SinomoDataDir,
+    provider: &str,
+) -> Result<LanguageModelProviderUsage, LanguageModelError> {
+    match provider {
+        CODEX_PROVIDER_ID => {
+            let mut config = OpenAiResponsesCodexConfig::default();
+            config.credentials_path = Some(data_dir.provider_credentials_file(CODEX_PROVIDER_ID));
+            OpenAiResponsesCodexClient::new(config).usage()
+        }
+        ClaudeProvider::PROVIDER_ID => {
+            let mut config = ClaudeConfig::default();
+            config.credentials_path =
+                Some(data_dir.provider_credentials_file(ClaudeProvider::PROVIDER_ID));
+            ClaudeProvider::new(config).usage()
+        }
+        GitHubCopilotProvider::PROVIDER_ID => {
+            let mut config = GitHubCopilotConfig::default();
+            config.token_store_path =
+                Some(data_dir.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID));
+            GitHubCopilotProvider::new(config).usage()
+        }
+        _ => provider_usage(provider),
     }
 }
 
@@ -2881,14 +3075,22 @@ pub fn test_provider_account_credentials(
     provider: &str,
     account: Option<&ProviderAccountConfig>,
 ) -> Result<(), LanguageModelError> {
-    let model = account
-        .and_then(|account| account.default_model.as_deref())
-        .unwrap_or(PROVIDER_DEFAULT_MODEL);
     let data_dir =
         SinomoDataDir::from_env_or_home().map_err(|source| LanguageModelError::ConfigStore {
             path: "<data-dir>".to_string(),
             detail: source.to_string(),
         })?;
+    test_provider_account_credentials_in_data_dir(&data_dir, provider, account)
+}
+
+pub fn test_provider_account_credentials_in_data_dir(
+    data_dir: &SinomoDataDir,
+    provider: &str,
+    account: Option<&ProviderAccountConfig>,
+) -> Result<(), LanguageModelError> {
+    let model = account
+        .and_then(|account| account.default_model.as_deref())
+        .unwrap_or(PROVIDER_DEFAULT_MODEL);
     let request = LanguageModelRequest {
         provider: provider.to_string(),
         model: model.to_string(),
@@ -2906,7 +3108,7 @@ pub fn test_provider_account_credentials(
         metadata: serde_json::Value::Null,
     };
     complete_configured_model_request_with_account(
-        &data_dir, provider, model, account, None, &request,
+        data_dir, provider, model, account, None, &request,
     )
     .map(|_| ())
 }
@@ -4155,6 +4357,26 @@ mod tests {
             LanguageModelError::ProviderInvocationFailed { provider, .. }
                 if provider == "unknown-provider"
         ));
+    }
+
+    #[test]
+    fn account_model_catalog_uses_inline_credential_and_custom_model() {
+        let account = ProviderAccountConfig {
+            provider: OpenAiProvider::PROVIDER_ID.to_string(),
+            account: DEFAULT_PROVIDER_ACCOUNT.to_string(),
+            default_model: Some("gpt-5.5-custom".to_string()),
+            api_base_url: Some("https://example.invalid/v1".to_string()),
+            api_key: Some("sk-test".to_string()),
+            enabled: true,
+            options: LanguageModelProviderOptions::default(),
+            model_options: Vec::new(),
+        };
+
+        assert_eq!(
+            provider_available_model_ids_for_account(OpenAiProvider::PROVIDER_ID, Some(&account),)
+                .expect("account catalog"),
+            vec!["gpt-5.5-custom".to_string()]
+        );
     }
 
     #[test]

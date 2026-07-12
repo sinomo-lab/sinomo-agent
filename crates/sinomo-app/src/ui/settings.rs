@@ -49,11 +49,13 @@ use crate::backend::agents::{
 use crate::backend::cluster::{AppClusterInvite, AppClusterStatus, ClusterSnapshot};
 use crate::backend::config::{
     CONFIGURABLE_PROVIDERS, ConfigEditKind, ConfigItem, ProviderForm, REASONING_EFFORT_OPTIONS,
-    add_provider_account, cluster_provider_summaries, provider_default_model,
-    provider_display_name, provider_forms, reasoning_effort_index, remove_provider_account,
-    resolve_items, run_provider_device_login, set_bool, set_provider_api_key,
-    set_provider_base_url, set_provider_chat_default, set_provider_effort, set_provider_enabled,
-    set_provider_model, set_value,
+    TEXT_VERBOSITY_OPTIONS, add_provider_account, cluster_provider_summaries,
+    provider_default_model, provider_display_name, provider_forms, reasoning_effort_index,
+    remove_provider_account, resolve_items, run_provider_device_login, set_bool,
+    set_provider_api_key, set_provider_base_url, set_provider_chat_default, set_provider_effort,
+    set_provider_enabled, set_provider_model, set_provider_reasoning_budget,
+    set_provider_text_verbosity, set_provider_vendor_options, set_value, test_provider_connection,
+    text_verbosity_index,
 };
 use crate::backend::modules::ModuleConfigSnapshot;
 use crate::rendering::AppRenderMode;
@@ -168,6 +170,7 @@ pub struct SettingsState {
     pub provider_add_error: Option<String>,
     pub provider_action_error: Option<String>,
     pub provider_action_status: Option<ProviderActionStatus>,
+    provider_health: HashMap<String, ProviderHealthState>,
     pub agent_snapshot: AgentConfigSnapshot,
     pub agent_selected_id: Option<String>,
     pub agent_form: AgentForm,
@@ -346,6 +349,15 @@ enum SettingsOperation {
         account: String,
         effort_index: usize,
     },
+    SetProviderVerbosity {
+        provider: String,
+        account: String,
+        verbosity_index: usize,
+    },
+    TestProviderConnection {
+        provider: String,
+        account: String,
+    },
     RefreshAgents {
         selected_id: Option<String>,
     },
@@ -404,10 +416,17 @@ struct SettingsOperationResult {
 enum SettingsOperationPayload {
     Config(Result<ConfigOperationSuccess, String>),
     Providers(Result<ProviderOperationSuccess, String>),
+    ProviderHealth(ProviderHealthOperationResult),
     Agents(Result<AgentOperationSuccess, String>),
     Modules(Result<ModuleOperationSuccess, String>),
     Skills(Result<SkillOperationSuccess, String>),
     Cluster(Result<ClusterOperationSuccess, String>),
+}
+
+struct ProviderHealthOperationResult {
+    provider: String,
+    account: String,
+    result: Result<crate::backend::config::ProviderHealthCheck, String>,
 }
 
 struct ConfigOperationSuccess {
@@ -434,6 +453,7 @@ enum ProviderOperationEffect {
         account: String,
         message: String,
         saved_draft: Option<(String, String)>,
+        invalidates_health: bool,
     },
     Removed {
         provider: String,
@@ -516,6 +536,21 @@ pub enum ProviderField {
     ApiKey,
     Model,
     BaseUrl,
+    ReasoningBudget,
+    VendorOptions,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProviderHealthState {
+    checking: bool,
+    last_verified_at_unix: Option<i64>,
+    last_checked_at_unix: Option<i64>,
+    error: Option<String>,
+    models: Vec<String>,
+    model_discovery_error: Option<String>,
+    usage: Option<sinomo_lm::LanguageModelProviderUsage>,
+    usage_error: Option<String>,
+    stale: bool,
 }
 
 /// An in-progress provider OAuth device-login flow (codex / github-copilot), driven on a
@@ -791,6 +826,7 @@ impl SettingsState {
             provider_add_error: None,
             provider_action_error: None,
             provider_action_status: None,
+            provider_health: HashMap::new(),
             agent_snapshot,
             agent_selected_id,
             agent_form,
@@ -884,6 +920,7 @@ impl SettingsState {
             provider_add_error: None,
             provider_action_error: None,
             provider_action_status: None,
+            provider_health: HashMap::new(),
             agent_snapshot: AgentConfigSnapshot::default(),
             agent_selected_id: None,
             agent_form: AgentForm::new_custom("custom-agent".to_string()),
@@ -1194,9 +1231,22 @@ impl SettingsState {
             }
             | SettingsOperation::SetProviderEffort {
                 provider, account, ..
+            }
+            | SettingsOperation::SetProviderVerbosity {
+                provider, account, ..
             } => {
                 self.provider_action_error = None;
                 self.set_provider_status(provider.clone(), account.clone(), "Saving…");
+            }
+            SettingsOperation::TestProviderConnection { provider, account } => {
+                self.provider_action_error = None;
+                self.provider_action_status = None;
+                let health = self
+                    .provider_health
+                    .entry(provider_account_key(provider, account))
+                    .or_default();
+                health.checking = true;
+                health.error = None;
             }
             SettingsOperation::RefreshAgents { .. } => {
                 self.agent_action_error = None;
@@ -1346,12 +1396,16 @@ impl SettingsState {
                             account,
                             message,
                             saved_draft,
+                            invalidates_health,
                         } => {
                             if let Some((key, saved)) = saved_draft {
                                 if self.field_drafts.get(&key) == Some(&saved) {
                                     self.field_drafts.remove(&key);
                                 }
                                 self.field_errors.remove(&key);
+                            }
+                            if invalidates_health {
+                                self.invalidate_provider_health(&provider, &account);
                             }
                             self.set_provider_status(provider, account, message);
                         }
@@ -1361,12 +1415,41 @@ impl SettingsState {
                             }) {
                                 self.device_login = None;
                             }
+                            self.provider_health
+                                .remove(&provider_account_key(&provider, &account));
                             self.provider_action_status = None;
                         }
                     }
                 }
                 SettingsOperationPayload::Providers(Err(error)) => {
                     self.apply_operation_queue_error(&result.scope, error);
+                }
+                SettingsOperationPayload::ProviderHealth(health_result) => {
+                    let key = provider_account_key(&health_result.provider, &health_result.account);
+                    let health = self.provider_health.entry(key).or_default();
+                    health.checking = false;
+                    health.last_checked_at_unix = Some(current_settings_unix_timestamp());
+                    match health_result.result {
+                        Ok(snapshot) => {
+                            health.last_verified_at_unix = Some(snapshot.verified_at_unix);
+                            health.last_checked_at_unix = Some(snapshot.verified_at_unix);
+                            health.error = None;
+                            health.models = snapshot.models;
+                            health.model_discovery_error = snapshot.model_discovery_error;
+                            health.usage = snapshot.usage;
+                            health.usage_error = snapshot.usage_error;
+                            health.stale = false;
+                            self.set_provider_status(
+                                snapshot.provider,
+                                snapshot.account,
+                                "Connection verified",
+                            );
+                        }
+                        Err(error) => {
+                            health.error = Some(error);
+                            health.stale = health.last_verified_at_unix.is_some();
+                        }
+                    }
                 }
                 SettingsOperationPayload::Agents(Ok(success)) => {
                     self.server_generations
@@ -2041,6 +2124,11 @@ impl SettingsState {
                 ProviderField::ApiKey => String::new(),
                 ProviderField::Model => form.default_model.clone(),
                 ProviderField::BaseUrl => form.api_base_url.clone(),
+                ProviderField::ReasoningBudget => form
+                    .reasoning_budget_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                ProviderField::VendorOptions => form.vendor_options.clone(),
             });
         Some(SettingsOperation::SetProviderField {
             provider: form.provider.clone(),
@@ -2062,6 +2150,21 @@ impl SettingsState {
             account: account.into(),
             message: message.into(),
         });
+    }
+
+    fn provider_health(&self, provider: &str, account: &str) -> ProviderHealthState {
+        self.provider_health
+            .get(&provider_account_key(provider, account))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn invalidate_provider_health(&mut self, provider: &str, account: &str) {
+        let health = self
+            .provider_health
+            .entry(provider_account_key(provider, account))
+            .or_default();
+        health.stale = health.last_verified_at_unix.is_some();
     }
 
     /// Start a provider's OAuth device-login flow on a background thread. Progress + the result
@@ -2151,6 +2254,7 @@ impl SettingsState {
         };
         if done {
             if let Some((provider, account)) = done_account {
+                self.invalidate_provider_health(&provider, &account);
                 self.set_provider_status(provider, account, "Sign-in saved to lm.providers");
             }
             self.provider_refresh_needed = true;
@@ -2291,6 +2395,7 @@ fn execute_settings_operation(
                         "Provider disabled in lm.providers".to_string()
                     },
                     saved_draft: None,
+                    invalidates_health: false,
                 },
             )
         })()),
@@ -2304,6 +2409,7 @@ fn execute_settings_operation(
                         account,
                         message: "Chat default saved to lm.providers".to_string(),
                         saved_draft: None,
+                        invalidates_health: false,
                     },
                 )
             })())
@@ -2334,6 +2440,15 @@ fn execute_settings_operation(
                 ProviderField::BaseUrl => {
                     set_provider_base_url(backend.config.as_ref(), &provider, &account, &raw)
                 }
+                ProviderField::ReasoningBudget => set_provider_reasoning_budget(
+                    backend.config.as_ref(),
+                    &provider,
+                    &account,
+                    &raw,
+                ),
+                ProviderField::VendorOptions => {
+                    set_provider_vendor_options(backend.config.as_ref(), &provider, &account, &raw)
+                }
             }?;
             provider_operation_success(
                 backend,
@@ -2342,6 +2457,7 @@ fn execute_settings_operation(
                     account,
                     message: provider_field_saved_message(field).to_string(),
                     saved_draft: Some((draft_key, raw)),
+                    invalidates_health: true,
                 },
             )
         })()),
@@ -2358,9 +2474,45 @@ fn execute_settings_operation(
                     account,
                     message: "Reasoning effort saved to lm.providers".to_string(),
                     saved_draft: None,
+                    invalidates_health: true,
                 },
             )
         })()),
+        SettingsOperation::SetProviderVerbosity {
+            provider,
+            account,
+            verbosity_index,
+        } => SettingsOperationPayload::Providers((|| {
+            set_provider_text_verbosity(
+                backend.config.as_ref(),
+                &provider,
+                &account,
+                verbosity_index,
+            )?;
+            provider_operation_success(
+                backend,
+                ProviderOperationEffect::Updated {
+                    provider,
+                    account,
+                    message: "Text verbosity saved to lm.providers".to_string(),
+                    saved_draft: None,
+                    invalidates_health: true,
+                },
+            )
+        })()),
+        SettingsOperation::TestProviderConnection { provider, account } => {
+            let result = test_provider_connection(
+                backend.data_dir.as_ref(),
+                backend.config.as_ref(),
+                &provider,
+                &account,
+            );
+            SettingsOperationPayload::ProviderHealth(ProviderHealthOperationResult {
+                provider,
+                account,
+                result,
+            })
+        }
         SettingsOperation::RefreshAgents { selected_id } => {
             SettingsOperationPayload::Agents(Ok(agent_operation_success(
                 backend,
@@ -2699,6 +2851,8 @@ fn provider_field_key(provider: &str, account: &str, field: ProviderField) -> St
         ProviderField::ApiKey => "api_key",
         ProviderField::Model => "model",
         ProviderField::BaseUrl => "base_url",
+        ProviderField::ReasoningBudget => "reasoning_budget_tokens",
+        ProviderField::VendorOptions => "vendor_options",
     };
     format!("provider:{provider}:{account}:{suffix}")
 }
@@ -2708,6 +2862,8 @@ fn provider_field_saved_message(field: ProviderField) -> &'static str {
         ProviderField::ApiKey => "API key saved to lm.providers",
         ProviderField::Model => "Default model saved to lm.providers",
         ProviderField::BaseUrl => "API base URL saved to lm.providers",
+        ProviderField::ReasoningBudget => "Reasoning budget saved to lm.providers",
+        ProviderField::VendorOptions => "Provider options saved to lm.providers",
     }
 }
 
@@ -4359,6 +4515,9 @@ fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 /// details disclosure.
 fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widget + use<> {
     let form = shared.settings().provider_forms[index].clone();
+    let health = shared
+        .settings()
+        .provider_health(&form.provider, &form.account);
     let expanded = shared
         .settings()
         .provider_detail_expanded(&form.provider, &form.account);
@@ -4398,6 +4557,58 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         "Authentication",
         provider_auth_summary(&form),
     ));
+    body = body.with_child(value_row(
+        shared,
+        reader,
+        "Connection",
+        provider_connection_summary(&health),
+    ));
+    let test_button = {
+        let s = shared.clone();
+        let provider = form.provider.clone();
+        let account = form.account.clone();
+        sui::Button::new(if health.checking {
+            "Testing…"
+        } else {
+            "Test connection"
+        })
+        .icon(sui::IconGlyph::Check)
+        .theme_when(secondary_button_theme(reader))
+        .enabled(form.signed_in && !health.checking)
+        .on_press(move || {
+            queue_settings_operation(
+                &s,
+                SettingsOperationScope::Providers,
+                SettingsOperation::TestProviderConnection {
+                    provider: provider.clone(),
+                    account: account.clone(),
+                },
+            );
+        })
+    };
+    body = body.with_child(
+        FormRow::new(
+            "Verification",
+            Stack::horizontal()
+                .alignment(Alignment::Start)
+                .with_child(test_button),
+        )
+        .inline()
+        .theme_when(clone_reader(reader)),
+    );
+    body = body.with_child(value_row(
+        shared,
+        reader,
+        "Last verified",
+        provider_last_verified_label(&health),
+    ));
+    if let Some(error) = health.error.clone() {
+        body = body.with_child(
+            FormRow::new("Connection error", muted_label(shared, error))
+                .stacked()
+                .theme_when(clone_reader(reader)),
+        );
+    }
     let chat_default_control = if form.is_default {
         Stack::horizontal()
             .alignment(Alignment::Center)
@@ -4440,6 +4651,61 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         body = body.with_child(
             FormRow::new("Last change", positive_label(shared, message))
                 .inline()
+                .theme_when(clone_reader(reader)),
+        );
+    }
+
+    if !health.models.is_empty() {
+        let models = health.models.clone();
+        let selected_model = form.default_model.clone();
+        let model_select = {
+            let s = shared.clone();
+            let provider = form.provider.clone();
+            let account = form.account.clone();
+            let options = models.clone();
+            Select::new(format!("provider-{index}-discovered-model"))
+                .options(options.clone())
+                .selected_when(move || {
+                    options
+                        .iter()
+                        .position(|model| model == &selected_model)
+                        .or(Some(0))
+                })
+                .theme_when(clone_reader(reader))
+                .on_change(move |_index, model| {
+                    let draft_key = provider_field_key(&provider, &account, ProviderField::Model);
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::Providers,
+                        SettingsOperation::SetProviderField {
+                            provider: provider.clone(),
+                            account: account.clone(),
+                            field: ProviderField::Model,
+                            raw: model.clone(),
+                            draft_key,
+                        },
+                    );
+                })
+        };
+        body = body.with_child(
+            FormRow::new("Discovered model", model_select)
+                .inline()
+                .theme_when(clone_reader(reader)),
+        );
+    } else if let Some(error) = health.model_discovery_error.clone() {
+        body = body.with_child(
+            FormRow::new("Model discovery", muted_label(shared, error))
+                .stacked()
+                .theme_when(clone_reader(reader)),
+        );
+    }
+
+    if let Some(usage) = health.usage.as_ref() {
+        body = body.with_child(provider_usage_row(shared, reader, usage));
+    } else if let Some(error) = health.usage_error.clone() {
+        body = body.with_child(
+            FormRow::new("Usage", muted_label(shared, error))
+                .stacked()
                 .theme_when(clone_reader(reader)),
         );
     }
@@ -4657,6 +4923,138 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
                 on_change,
             ));
         }
+        if provider_supports_reasoning_budget(&form.provider) {
+            let budget_key = provider_field_key(
+                &form.provider,
+                &form.account,
+                ProviderField::ReasoningBudget,
+            );
+            let budget_value = shared.settings().field_draft_or(&budget_key, || {
+                form.reasoning_budget_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
+            });
+            body = body.with_child(text_save_row(
+                reader,
+                &format!("provider-{index}-reasoning-budget"),
+                "Reasoning budget",
+                budget_value,
+                "Provider default",
+                {
+                    let s = shared.clone();
+                    move |value| {
+                        s.settings_mut().set_provider_field_draft(
+                            index,
+                            ProviderField::ReasoningBudget,
+                            value,
+                        );
+                    }
+                },
+                {
+                    let s = shared.clone();
+                    move || {
+                        if let Some(operation) = s
+                            .settings()
+                            .provider_field_operation(index, ProviderField::ReasoningBudget)
+                        {
+                            queue_settings_operation(
+                                &s,
+                                SettingsOperationScope::Providers,
+                                operation,
+                            );
+                        }
+                    }
+                },
+                {
+                    let s = shared.clone();
+                    move || {
+                        s.settings()
+                            .domain_pending(SettingsOperationDomain::Providers)
+                    }
+                },
+            ));
+        }
+        if provider_supports_text_verbosity(&form.provider) {
+            let selected_when = {
+                let s = shared.clone();
+                move || {
+                    s.settings()
+                        .provider_forms
+                        .get(index)
+                        .map(|form| text_verbosity_index(form.text_verbosity.as_deref()))
+                }
+            };
+            let on_change = {
+                let s = shared.clone();
+                let provider = form.provider.clone();
+                let account = form.account.clone();
+                move |verbosity_index, _label| {
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::Providers,
+                        SettingsOperation::SetProviderVerbosity {
+                            provider: provider.clone(),
+                            account: account.clone(),
+                            verbosity_index,
+                        },
+                    );
+                }
+            };
+            body = body.with_child(select_row(
+                reader,
+                &format!("provider-{index}-verbosity"),
+                "Text verbosity",
+                TEXT_VERBOSITY_OPTIONS,
+                selected_when,
+                on_change,
+            ));
+        }
+        if provider_supports_vendor_options(&form.provider) {
+            let options_key =
+                provider_field_key(&form.provider, &form.account, ProviderField::VendorOptions);
+            let options_value = shared
+                .settings()
+                .field_draft_or(&options_key, || form.vendor_options.clone());
+            body = body.with_child(text_save_row(
+                reader,
+                &format!("provider-{index}-vendor-options"),
+                "Provider options",
+                options_value,
+                "{}",
+                {
+                    let s = shared.clone();
+                    move |value| {
+                        s.settings_mut().set_provider_field_draft(
+                            index,
+                            ProviderField::VendorOptions,
+                            value,
+                        );
+                    }
+                },
+                {
+                    let s = shared.clone();
+                    move || {
+                        if let Some(operation) = s
+                            .settings()
+                            .provider_field_operation(index, ProviderField::VendorOptions)
+                        {
+                            queue_settings_operation(
+                                &s,
+                                SettingsOperationScope::Providers,
+                                operation,
+                            );
+                        }
+                    }
+                },
+                {
+                    let s = shared.clone();
+                    move || {
+                        s.settings()
+                            .domain_pending(SettingsOperationDomain::Providers)
+                    }
+                },
+            ));
+        }
         body = body.with_child(provider_management_row(shared, reader, index, &form));
     }
 
@@ -4668,14 +5066,126 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
 fn provider_auth_summary(form: &ProviderForm) -> &'static str {
     if form.uses_device_login {
         if form.signed_in {
-            "Signed in"
+            "Credential stored"
         } else {
             "Sign-in required"
         }
     } else if form.has_api_key {
-        "API key configured"
+        "API key stored"
     } else {
         "API key required"
+    }
+}
+
+fn provider_connection_summary(health: &ProviderHealthState) -> String {
+    if health.checking {
+        return "Testing…".to_string();
+    }
+    if health.error.is_some() {
+        return "Connection failed".to_string();
+    }
+    if health.last_verified_at_unix.is_some() {
+        if health.stale {
+            "Verified previously · configuration changed".to_string()
+        } else {
+            "Verified".to_string()
+        }
+    } else {
+        "Not verified".to_string()
+    }
+}
+
+fn provider_last_verified_label(health: &ProviderHealthState) -> String {
+    let Some(timestamp) = health.last_verified_at_unix else {
+        return "Never".to_string();
+    };
+    let value = format_settings_timestamp(timestamp);
+    if health.stale {
+        format!("{value} · stale")
+    } else {
+        value
+    }
+}
+
+fn format_settings_timestamp(timestamp: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(timestamp)
+        .ok()
+        .and_then(|value| {
+            value
+                .format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| timestamp.to_string())
+}
+
+fn current_settings_unix_timestamp() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
+fn provider_supports_reasoning_budget(provider: &str) -> bool {
+    provider == "anthropic"
+}
+
+fn provider_supports_text_verbosity(provider: &str) -> bool {
+    matches!(provider, "openai" | "codex")
+}
+
+fn provider_supports_vendor_options(provider: &str) -> bool {
+    matches!(provider, "anthropic" | "openai" | "codex")
+}
+
+fn provider_usage_row(
+    shared: &Shared,
+    reader: &ThemeReader,
+    usage: &sinomo_lm::LanguageModelProviderUsage,
+) -> FormRow {
+    let mut stack = Stack::vertical().spacing(4.0).alignment(Alignment::Stretch);
+    if let Some(plan) = usage.plan.as_deref() {
+        stack = stack.with_child(positive_label(shared, format!("Plan: {plan}")));
+    }
+    if usage.limits.is_empty() {
+        stack = stack.with_child(muted_label(shared, "No usage limits reported"));
+    } else {
+        for limit in &usage.limits {
+            stack = stack.with_child(muted_label(shared, provider_usage_limit_label(limit)));
+        }
+    }
+    if let Some(credits) = usage.credits.as_ref()
+        && let Some(balance) = credits.balance.as_deref()
+    {
+        stack = stack.with_child(muted_label(shared, format!("Credits: {balance}")));
+    }
+    FormRow::new("Usage and limits", stack)
+        .stacked()
+        .theme_when(clone_reader(reader))
+}
+
+fn provider_usage_limit_label(limit: &sinomo_lm::LanguageModelUsageLimit) -> String {
+    let name = limit.name.as_deref().unwrap_or(&limit.id);
+    let mut details = Vec::new();
+    if limit.unlimited == Some(true) {
+        details.push("unlimited".to_string());
+    } else if let Some(remaining) = limit.remaining {
+        if let Some(entitlement) = limit.entitlement {
+            details.push(format!("{remaining:.0} of {entitlement:.0} remaining"));
+        } else {
+            details.push(format!("{remaining:.0} remaining"));
+        }
+    } else if let Some(remaining) = limit.remaining_percent {
+        details.push(format!("{remaining:.0}% remaining"));
+    } else if let Some(used) = limit.used_percent {
+        details.push(format!("{used:.0}% used"));
+    }
+    if limit.exhausted == Some(true) {
+        details.push("exhausted".to_string());
+    }
+    if let Some(reset) = limit.reset_at_unix {
+        details.push(format!("resets {}", format_settings_timestamp(reset)));
+    }
+    if details.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}: {}", details.join(" · "))
     }
 }
 
@@ -4794,15 +5304,21 @@ fn provider_section_signature(shared: &Shared) -> String {
         ),
     ];
     parts.extend(settings.provider_forms.iter().map(|form| {
+        let health = settings.provider_health(&form.provider, &form.account);
         format!(
-            "{}@{}:{}:{}:{}:{}:{}",
+            "{}@{}:{}:{}:{}:{}:{}:{:?}:{:?}:{}:{}:{:?}",
             form.provider,
             form.account,
             form.enabled,
             form.signed_in,
             form.is_default,
             form.default_model,
-            form.display_name
+            form.display_name,
+            form.reasoning_budget_tokens,
+            form.text_verbosity,
+            form.vendor_options,
+            health.checking,
+            health
         )
     }));
     parts.join("\u{1f}")
@@ -8883,6 +9399,89 @@ mod tests {
     }
 
     #[test]
+    fn provider_health_result_controls_verified_state_and_catalog() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+        let provider = "openai".to_string();
+        let account = "default".to_string();
+        state.mark_operation_pending(&SettingsOperation::TestProviderConnection {
+            provider: provider.clone(),
+            account: account.clone(),
+        });
+        assert!(state.provider_health(&provider, &account).checking);
+
+        let (request_tx, _request_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        state.operation_lane = Some(SettingsOperationLane {
+            tx: request_tx,
+            rx: result_rx,
+        });
+        state
+            .pending_operations
+            .insert(SettingsOperationScope::Providers, 41);
+        result_tx
+            .send(SettingsOperationResult {
+                request_id: 41,
+                scope: SettingsOperationScope::Providers,
+                draft_generation: 0,
+                payload: SettingsOperationPayload::ProviderHealth(ProviderHealthOperationResult {
+                    provider: provider.clone(),
+                    account: account.clone(),
+                    result: Ok(crate::backend::config::ProviderHealthCheck {
+                        provider: provider.clone(),
+                        account: account.clone(),
+                        verified_at_unix: 1_750_000_000,
+                        models: vec!["gpt-5.5".to_string()],
+                        model_discovery_error: None,
+                        usage: Some(sinomo_lm::LanguageModelProviderUsage {
+                            provider: provider.clone(),
+                            plan: Some("pro".to_string()),
+                            captured_at_unix: 1_750_000_000,
+                            limits: Vec::new(),
+                            credits: None,
+                        }),
+                        usage_error: None,
+                    }),
+                }),
+            })
+            .expect("health result");
+
+        assert!(state.pump_operations().changed);
+        let health = state.provider_health(&provider, &account);
+        assert!(!health.checking);
+        assert_eq!(health.last_verified_at_unix, Some(1_750_000_000));
+        assert_eq!(health.models, vec!["gpt-5.5".to_string()]);
+        assert_eq!(provider_connection_summary(&health), "Verified");
+        assert_eq!(
+            health.usage.and_then(|usage| usage.plan),
+            Some("pro".to_string())
+        );
+    }
+
+    #[test]
+    fn stored_credential_is_not_described_as_verified() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+        add_provider_account(
+            state.config.as_ref(),
+            "openai",
+            "default",
+            "sk-test",
+            "gpt-5.2-codex",
+            "",
+        )
+        .expect("provider account");
+        state.provider_forms = provider_forms(state.config.as_ref());
+        let form = state.provider_forms.first().expect("provider form");
+
+        assert_eq!(provider_auth_summary(form), "API key stored");
+        assert_eq!(
+            provider_connection_summary(&state.provider_health(&form.provider, &form.account)),
+            "Not verified"
+        );
+    }
+
+    #[test]
     fn skills_state_imports_exports_and_activates_versions() {
         let (backend, root) = temp_skill_backend("skills-state");
         let first_path = write_skill_file(&root, "shortcut-skill", "The shortcut is alpha-lane.");
@@ -9516,6 +10115,19 @@ mod tests {
         assert!(
             window.get_by_text("OpenAI (work) / gpt-5").count()? >= 1,
             "provider overview should report the chat default and model"
+        );
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Test connection")
+            .expect()
+            .to_be_visible()?;
+        assert!(
+            window.get_by_text("Not verified").count()? >= 1,
+            "credential presence must not be presented as verified health"
+        );
+        assert!(
+            window.get_by_text("API key stored").count()? >= 1,
+            "the authentication row should report credential presence separately"
         );
 
         Ok(())
