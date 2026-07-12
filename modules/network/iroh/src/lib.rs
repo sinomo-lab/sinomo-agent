@@ -273,7 +273,7 @@ impl IrohNetworkRpcStream {
         let result = match self.no_progress_timeout {
             Some(timeout) => self
                 .runtime
-                .block_on(tokio::time::timeout(timeout, read))
+                .block_on(async { tokio::time::timeout(timeout, read).await })
                 .map_err(|_| {
                     NetworkError::timeout(
                         "read iroh RPC stream",
@@ -305,7 +305,7 @@ impl IrohNetworkRpcStream {
         let result = match self.no_progress_timeout {
             Some(timeout) => self
                 .runtime
-                .block_on(tokio::time::timeout(timeout, write))
+                .block_on(async { tokio::time::timeout(timeout, write).await })
                 .map_err(|_| {
                     NetworkError::timeout(
                         "write iroh RPC stream",
@@ -1277,6 +1277,109 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("destroy must not panic or hang on a current-thread Tokio worker");
         worker.join().expect("destroy regression worker");
+    }
+
+    #[test]
+    fn timed_iroh_stream_read_and_write_work_without_an_ambient_tokio_reactor() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build private iroh runtime");
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .expect("bind daemon fixture");
+        let daemon_address = listener
+            .local_addr()
+            .expect("daemon fixture address")
+            .to_string();
+        let fixture = runtime.spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept daemon fixture");
+            let mut request = Vec::new();
+            stream
+                .read_to_end(&mut request)
+                .await
+                .expect("read daemon fixture request");
+            assert_eq!(request, b"plain-thread request");
+            stream
+                .write_all(b"plain-thread response")
+                .await
+                .expect("write daemon fixture response");
+        });
+
+        let root = sinomo_testdir::TestDir::new("sinomo-network-iroh-plain-thread-stream");
+        let paths = ClusterPaths::new(&sinomo_core::local::SinomoDataDir::new(&root));
+        paths.ensure().expect("cluster paths");
+        let proxy = runtime
+            .block_on(proxy::start_iroh_daemon_proxy(
+                runtime.handle().clone(),
+                proxy::IrohProxyConfig {
+                    paths,
+                    cluster_id: ClusterId::from_legacy_named("cluster_iroh_plain_thread_stream")
+                        .expect("cluster"),
+                    node_id: NodeId::from_legacy_named("node_iroh_plain_thread_stream")
+                        .expect("node"),
+                    daemon_forward_address: daemon_address,
+                },
+            ))
+            .expect("start iroh proxy");
+        let dialer = dial::IrohDaemonDialer::new();
+        let (send, recv) = runtime
+            .block_on(dialer.open_daemon_stream_async(
+                &proxy.record().endpoint().address,
+                DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5)),
+            ))
+            .expect("open raw iroh daemon stream");
+        let stream = IrohNetworkRpcStream {
+            runtime: runtime.handle().clone(),
+            recv: Mutex::new(Some(recv)),
+            send: Mutex::new(Some(send)),
+            no_progress_timeout: Some(Duration::from_secs(5)),
+        };
+
+        let worker = thread::Builder::new()
+            .name("iroh-timed-stream-plain-thread-regression".to_string())
+            .spawn(move || {
+                assert!(
+                    tokio::runtime::Handle::try_current().is_err(),
+                    "regression worker must not have an ambient Tokio reactor"
+                );
+                let request = b"plain-thread request";
+                let mut written = 0;
+                while written < request.len() {
+                    written += stream
+                        .write(&request[written..])
+                        .expect("timed write from plain thread");
+                }
+                stream.shutdown_write().expect("finish request stream");
+
+                let mut response = Vec::new();
+                let mut buffer = [0_u8; 64];
+                loop {
+                    let read = stream
+                        .read(&mut buffer)
+                        .expect("timed read from plain thread");
+                    if read == 0 {
+                        break;
+                    }
+                    response.extend_from_slice(&buffer[..read]);
+                }
+                response
+            })
+            .expect("spawn plain-thread stream worker");
+        let response = worker.join();
+
+        runtime.block_on(async {
+            dialer.shutdown().await;
+            proxy.shutdown().await;
+            fixture.await.expect("daemon fixture");
+        });
+        assert_eq!(
+            response.expect("plain-thread stream worker"),
+            b"plain-thread response"
+        );
     }
 
     #[test]
