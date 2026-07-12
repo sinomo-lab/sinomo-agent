@@ -47,10 +47,10 @@ fn fuse_mount_options(
         MountOption::FSName(options.mount_name.clone()),
         MountOption::DefaultPermissions,
     ];
-    // fuser routes AutoUnmount mounts directly through fusermount. Omit it when
-    // no executable helper exists so privileged/systemd services can use the
-    // kernel /dev/fuse mount path instead.
-    if mount_helper_available {
+    // fuser implements AutoUnmount through fusermount by implicitly enabling
+    // `allow_other`. Only request it when a helper is available and the caller
+    // explicitly opted in, keeping default foreground mounts owner-only.
+    if mount_helper_available && options.allow_other {
         mount_options.push(MountOption::AutoUnmount);
     }
     if options.read_only {
@@ -2488,14 +2488,30 @@ mod errno_tests {
     }
 
     #[test]
-    fn fuse_mount_without_helper_keeps_direct_mount_available() {
+    fn owner_only_foreground_mount_omits_auto_unmount_and_allow_other() {
         let options = DfsFuseMountOptions::new("/mnt/sinomo");
 
         let direct_options = fuse_mount_options(&options, false);
         assert!(!direct_options.contains(&MountOption::AutoUnmount));
+        assert!(!direct_options.contains(&MountOption::AllowOther));
+
+        let helper_options = fuse_mount_options(&options, true);
+        assert!(!helper_options.contains(&MountOption::AutoUnmount));
+        assert!(!helper_options.contains(&MountOption::AllowOther));
+    }
+
+    #[test]
+    fn allow_other_mount_retains_helper_auto_unmount() {
+        let mut options = DfsFuseMountOptions::new("/mnt/sinomo");
+        options.allow_other = true;
+
+        let direct_options = fuse_mount_options(&options, false);
+        assert!(!direct_options.contains(&MountOption::AutoUnmount));
+        assert!(direct_options.contains(&MountOption::AllowOther));
 
         let helper_options = fuse_mount_options(&options, true);
         assert!(helper_options.contains(&MountOption::AutoUnmount));
+        assert!(helper_options.contains(&MountOption::AllowOther));
     }
 
     fn test_object_id(name: &str) -> dfs::DfsObjectId {
