@@ -38,6 +38,7 @@ module dfs_local_first_namespace_safety {
     localStageDecision(decision),
     decision == BranchManifestSealed,
     decision == ReconcilePlanPrepared,
+    decision == ReconcileGatewayProgressed,
     decision == StalePlanRejected,
     decision == IdempotentRetry,
   }
@@ -63,6 +64,7 @@ module dfs_local_first_namespace_safety {
     match decision {
       | BranchManifestSealed => LocalDurabilityStep
       | ReconcilePlanPrepared => ReconcilePlanningStep
+      | ReconcileGatewayProgressed => ReconcilePlanningStep
       | StalePlanRejected => ReconcilePlanningStep
       | IdempotentRetry => ReconcilePlanningStep
       | StrongUnrelatedCommitted => StrongCanonicalCommitStep

@@ -60,7 +60,8 @@ The model inventory is split by subsystem:
   lock-holding operation recovery across partitions, opt-in local-first file
   branches and same-shard namespace reconciliation, a local directory
   durability companion, a typed one-shard reconciliation publication gateway,
-  local failover-target selection,
+  direct file/namespace terminal-action compositions with that gateway, local
+  failover-target selection,
   namespace transaction publication, sharded namespace routing,
   namespace-command replay and cancellation, metadata journal source
   validation, repair authorization, replication policy, no-conflict
@@ -70,7 +71,8 @@ The model inventory is split by subsystem:
   advisory-lock fencing, file-sync recovery, directory-generation barriers,
   complete-holder/quorum-repair partitions, local-first reconciliation,
   local directory-durability recovery, reconciliation-gateway crash/fencing,
-  and retry-exhaustion traces live under `scenarios/dfs/`.
+  composed branch/gateway crash and outcome traces, and retry-exhaustion traces
+  live under `scenarios/dfs/`.
 
 This maps to the repository boundary documented in
 `docs/clustering-architecture.md` and `docs/network-architecture.md`:
@@ -708,12 +710,16 @@ predecessor head, and successor journal index. The atomic publication envelope
 must agree with the plan's canonical delta, result digest, and optional
 conflict descriptor. `canonicalEvidenceFromPermit` is the sole adapter back to
 the seven-field projection contract; none of its fields is asserted directly.
-The focused local-first branch models are not yet directly composed with this
-gateway or with the canonical advisory-lock, `fsync`, partition-recovery,
-no-conflict, or Raft transition systems. Given either the assumed focused
-evidence or the derived gateway permit, a publication advances one authority
-journal record while preserving one visible authority, one visible head, and
-zero canonical conflicts.
+The standalone local-first branch models retain that assume/guarantee surface.
+The file and namespace composition modules now replace it at their terminal
+boundary: every branch action is paired with exactly one gateway action, and a
+branch terminal result is created only in the same transition as the matching
+gateway journal commit. The compositions are not yet connected to the
+canonical advisory-lock, `fsync`, partition-recovery, no-conflict, or Raft
+transition systems. Given either the standalone assumed evidence or the
+composed derived permit, a publication advances one authority journal record
+while preserving one visible authority, one visible head, and zero canonical
+conflicts.
 
 The `dfs_local_first_file_branch_safety.safety` invariant covers a bounded
 regular-file branch:
@@ -768,8 +774,8 @@ projection. This slice does not distinguish file `fdatasync` from file
 to reconciliation publication.
 
 The `dfs_local_first_reconcile_gateway_safety.safety` invariant covers one
-shard, one active reconciliation request id, two payload digests, and all three
-file-level publication outcomes:
+shard, one active reconciliation request id, nine finite symbolic payload
+digests, and four publication outcomes:
 
 - a typed permit cannot be built until quorum acknowledgements, at least two
   symbolic content-holder receipts, and a metadata-prepare quorum exist for the
@@ -786,9 +792,36 @@ file-level publication outcomes:
 - recovery materializes exactly that committed envelope, and an exact retry
   can read the journal result without repeating the effect while a changed
   payload is rejected; and
-- Apply advances the object revision once, Converged and Conflict preserve it,
-  and Conflict creates only a disjoint sidecar descriptor while the canonical
-  conflict count stays zero.
+- Apply advances the object revision once; Converged, Conflict, and Superseded
+  preserve it; Conflict alone creates a disjoint sidecar descriptor while the
+  canonical conflict count stays zero.
+
+The file and namespace gateway-composition safety suites prove the direct
+terminal boundary:
+
+- the branch journal head and composition revision remain aligned with the
+  gateway canonical state;
+- the file action surface stays inside its two one-sync manifests, and every
+  nonterminal namespace state retains one bounded gateway journal slot for the
+  terminal entry;
+- gateway plans and committed envelopes name the exact admitted finite
+  manifest, classification, predecessor head, and target revision;
+- branch terminal state exists exactly when the gateway journal entry is
+  committed, and both transitions occur together at the gateway linearization
+  point;
+- a precommit crash cannot create a result or sidecar, stale plans are rejected
+  on both sides, and postcommit recovery materializes the exact durable
+  envelope;
+- file apply, converge, and conflict are covered, while namespace applicable,
+  converged, conflict, and superseded are distinct; and
+- Conflict alone creates a sidecar. Applicable alone changes the composed data
+  revision; nonapplying outcomes preserve the canonical winner.
+
+The namespace bridge uses one composition-owned mutation revision because the
+gateway's generic object revision is not the namespace stamp total. Unrelated
+strong namespace work advances only the common journal head; namespace-changing
+strong work advances both counters. These are finite one-branch refinements,
+not a proof that symbolic digest labels are collision-resistant hashes.
 
 The gateway's content certificate is a finite receipt-set abstraction, not a
 byte-level storage proof. Its strong-head and authority changes are bounded
@@ -803,9 +836,10 @@ content preservation, an outcome-unknown reply, process restart, and exact
 replay.
 `scenarios/dfs/local_first_namespace_reconcile.qnt` explores the four terminal
 namespace classifications, including stale-plan reclassification and
-idempotent terminal retry. Unlike the file slice, the namespace slice does not
-key that retry by and validate a complete immutable payload. These are
-target-hardening specifications.
+idempotent terminal retry. The composed namespace slice binds all seven
+reachable one-operation manifest shapes to distinct labels, but still fixes a
+single request identity rather than modeling a general payload-keyed replay
+table. These are target-hardening specifications.
 
 `scenarios/dfs/local_first_namespace_durability_recovery.qnt` deterministically
 loses an unsynced mutation, replays it with the same bounded mutation identity,
@@ -814,7 +848,10 @@ image. `scenarios/dfs/local_first_reconcile_gateway_recovery.qnt` contains a
 crash-boundary trace and a fencing trace. The first discards an uncommitted
 append, then recovers a committed outcome-unknown conflict and checks exact and
 changed retries. The second separately rejects a stale-head append and a
-stale-epoch append. The slices do not yet model hardlinks, symlinks,
+stale-epoch append. `scenarios/dfs/local_first_gateway_composition.qnt`
+crosses both file gateway crash boundaries through the composed actions and
+explores all four namespace terminal classifications through the paired commit.
+The slices do not yet model hardlinks, symlinks,
 cross-shard local work, branch gossip, service-defined semantic merge,
 arbitrary byte offsets,
 concrete byte-validated retention receipts, POSIX rename replacement, or Rust
@@ -1052,7 +1089,7 @@ witness predicates; coverage mode raises the sample count and fails if any
 registered witness is not reached:
 
 ```bash
-QUINT_CASE_FILTER=raft-protocol,network-route-cache,network-delivery,network-attempt-budget,network-timed-delivery,membership-raft-config,dfs-posix-cross-shard,dfs-posix-advisory-locks,dfs-posix-fsync,dfs-posix-partitioned-operation,dfs-pending-requests,dfs-namespace-command-replay \
+QUINT_CASE_FILTER=raft-protocol,network-route-cache,network-delivery,network-attempt-budget,network-timed-delivery,membership-raft-config,dfs-posix-cross-shard,dfs-posix-advisory-locks,dfs-posix-fsync,dfs-posix-partitioned-operation,dfs-local-first-file-gateway-composition,dfs-local-first-namespace-gateway-composition,dfs-pending-requests,dfs-namespace-command-replay \
   QUINT_COVERAGE_MAX_SAMPLES=5000 \
   bash scripts/formal/check-quint.sh coverage
 ```
@@ -1149,6 +1186,14 @@ checks use
 `QUINT_DFS_LOCAL_FIRST_NAMESPACE_DURABILITY_VERIFY_MAX_STEPS`, defaulting to
 8. The typed reconciliation gateway uses
 `QUINT_DFS_LOCAL_FIRST_RECONCILE_GATEWAY_VERIFY_MAX_STEPS`, defaulting to 4.
+The direct file and namespace composition checks use
+`QUINT_DFS_LOCAL_FIRST_FILE_GATEWAY_COMPOSITION_VERIFY_MAX_STEPS` and
+`QUINT_DFS_LOCAL_FIRST_NAMESPACE_GATEWAY_COMPOSITION_VERIFY_MAX_STEPS`, both
+defaulting to 4. Their deterministic full-causal drivers run file apply at
+depth 17 for both admitted manifests, file converge/conflict at depth 12, and
+each namespace terminal classification and finite manifest at depth 11. The
+namespace Applicable driver also runs in the fast tier so terminal atomicity is
+not left beyond its routine depth-4 exploration bound.
 On this checkout the focused file, namespace, and namespace-durability runs
 passed in about 36, 59, and 7 seconds. The file conflict/restart/mismatch,
 apply, and converge drivers passed at depths 19, 15, and 11 in about 32, 37,
@@ -1159,7 +1204,7 @@ at depths 8, 12, and 16. On this checkout its nondeterministic depth-4 check
 passed in about 116 seconds and the three full-causal drivers passed in about
 100, 106, and 109 seconds. A 5,000-trace local-first coverage run reached every
 currently registered local-first witness. The harness also registers separate
-branch and gateway reconciliation smoke scenarios.
+branch, gateway, and direct branch/gateway composition smoke scenarios.
 A fixed-seed 5,000-trace coverage run reached the other then-registered witnesses,
 and deterministic lock-fence, file-sync recovery, directory-generation sync,
 partition-winner, and cross-shard exhaustion scenarios reached their clean
@@ -1241,11 +1286,11 @@ This slice does not yet model:
   byte-range and multi-object application lock cycles, open-handle behavior
   across rename/unlink, multi-operation local branch dependency graphs,
   hardlink/symlink and cross-shard local-first reconciliation, branch gossip,
-  service-defined semantic merge, payload-keyed namespace replay, POSIX rename
-  replacement, concrete byte-validated retained-content/subtree receipts,
-  direct composition of branch reconciliation with the typed gateway, and
-  direct gateway composition with the canonical lock, sync, no-conflict, and
-  Raft models.
+  service-defined semantic merge, arbitrary request identities and multiple
+  reconciliation entries, general payload-keyed namespace replay, POSIX rename
+  replacement, concrete byte-validated retained-content/subtree receipts, and
+  direct gateway composition with the canonical lock, sync, partition,
+  no-conflict, and Raft models or the Rust journal.
 
 Future models should remain layered instead of expanding one state machine.
 The active verification backlog is maintained in the

@@ -104,6 +104,7 @@ module dfs_local_first_file_branch {
     | LocalAuthorityRestored
     | CanonicalConcurrentWrite
     | ReconcilePlanCreated
+    | ReconcileGatewayProgressed
     | StaleReconcilePlanRejected
     | ReconcileApplied
     | ReconcileConverged
@@ -258,6 +259,7 @@ module dfs_local_first_file_branch {
       decision == CanonicalQuorumRestored,
       decision == SealedContentRetained,
       decision == LocalAuthorityRestored,
+      decision == ReconcileGatewayProgressed,
       decision == ReconcileProcessRestarted,
     }
 
@@ -750,6 +752,33 @@ module dfs_local_first_file_branch {
     }
   }
 
+  /// The composed gateway owns publication progress between branch planning
+  /// and commit. These steps must not terminalize the branch or mutate either
+  /// its canonical head or durable result maps.
+  action awaitReconcileGateway: bool = all {
+    lfPhase == BranchPlanned,
+    lfPolicy' = lfPolicy,
+    lfPhase' = lfPhase,
+    lfLocalAuthorityReachable' = lfLocalAuthorityReachable,
+    lfCanonicalQuorumAvailable' = lfCanonicalQuorumAvailable,
+    lfCanonicalHead' = lfCanonicalHead,
+    lfBranchBase' = lfBranchBase,
+    lfOverlayContent' = lfOverlayContent,
+    lfDurableOverlayContent' = lfDurableOverlayContent,
+    lfLocalSyncGeneration' = lfLocalSyncGeneration,
+    lfSealedPayload' = lfSealedPayload,
+    lfRetainedContent' = lfRetainedContent,
+    lfPlan' = lfPlan,
+    lfResultRecords' = lfResultRecords,
+    lfConflictRecord' = lfConflictRecord,
+    lfEffectCount' = lfEffectCount,
+    lfLastResponse' = lfLastResponse,
+    lfLastDecision' = ReconcileGatewayProgressed,
+    lfLastAudit' = currentAudit,
+    lfLastReconcileId' = lfLastReconcileId,
+    lfLastSuppliedPayload' = lfLastSuppliedPayload,
+  }
+
   /// The only local-first transition that changes the canonical projection.
   /// It is one fresh, quorum-authorized canonical publication.
   action applyFreshPlan(deliverReply: bool): bool = {
@@ -826,7 +855,7 @@ module dfs_local_first_file_branch {
       lfRetainedContent' = lfRetainedContent,
       lfPlan' = lfPlan,
       lfConflictRecord' = lfConflictRecord,
-      lfEffectCount' = lfEffectCount,
+      lfEffectCount' = lfEffectCount + 1,
       lfLastResponse' =
         if (deliverReply) {
           ReconcileResultReturned({

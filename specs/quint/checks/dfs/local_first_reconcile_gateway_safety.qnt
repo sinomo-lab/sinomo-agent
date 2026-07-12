@@ -155,6 +155,21 @@ module dfs_local_first_reconcile_gateway_safety {
         gatewayCanonical.canonicalConflictCount
           == gatewayAudit.canonicalBefore.canonicalConflictCount,
       }
+    } else if (gatewayLastDecision == GatewayStrongHeadOnlyAdvanced) {
+      all {
+        hasQuorum(gatewayAudit.onlineBefore),
+        gatewayCanonical.primary == gatewayAudit.canonicalBefore.primary,
+        gatewayCanonical.authorityEpoch
+          == gatewayAudit.canonicalBefore.authorityEpoch,
+        gatewayCanonical.configRevision
+          == gatewayAudit.canonicalBefore.configRevision,
+        gatewayCanonical.journalHead
+          == gatewayAudit.canonicalBefore.journalHead + 1,
+        gatewayCanonical.objectRevision
+          == gatewayAudit.canonicalBefore.objectRevision,
+        gatewayCanonical.canonicalConflictCount
+          == gatewayAudit.canonicalBefore.canonicalConflictCount,
+      }
     } else if (gatewayLastDecision == GatewayAuthorityEpochAdvanced) {
       all {
         hasQuorum(gatewayAudit.onlineBefore),
@@ -357,6 +372,10 @@ module dfs_local_first_reconcile_gateway_safety {
         == gatewayAudit.materializedBefore.conflictArtifact,
     }
 
+  def headOnlyStrongCommitDoesNotChangeMaterializedData: bool =
+    gatewayLastDecision == GatewayStrongHeadOnlyAdvanced implies
+      gatewayMaterialized == gatewayAudit.materializedBefore
+
   def witnessPermitBuilt: bool =
     gatewayLastDecision == GatewayPermitBuilt
 
@@ -374,6 +393,13 @@ module dfs_local_first_reconcile_gateway_safety {
     committedGatewayDecision(gatewayLastDecision),
     currentEntry.permit.publication.outcome == PublishConflict,
     currentEntry.permit.publication.conflictArtifact != None,
+  }
+
+  def witnessSupersededCommitted: bool = all {
+    committedGatewayDecision(gatewayLastDecision),
+    currentEntry.permit.publication.outcome == PublishSuperseded,
+    currentEntry.permit.publication.resultDigest == ResultSuperseded,
+    currentEntry.permit.publication.conflictArtifact == None,
   }
 
   def witnessUncommittedAppendDiscardedByCrash: bool = all {
@@ -537,5 +563,6 @@ module dfs_local_first_reconcile_gateway_safety {
     changedPayloadRetryIsRejectedWithoutNewEffects,
     staleAndInsufficientRejectionsCannotPublish,
     strongHeadMaterializationMovesWithEnvironmentCommit,
+    headOnlyStrongCommitDoesNotChangeMaterializedData,
   }
 }

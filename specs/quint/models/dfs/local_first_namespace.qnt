@@ -80,6 +80,7 @@ module dfs_local_first_namespace {
     | StrongSameObjectAbaCommitted
     | StrongDirectoryChildCommitted
     | ReconcilePlanPrepared
+    | ReconcileGatewayProgressed
     | StalePlanRejected
     | ApplicableCommitted
     | ConvergedCommitted
@@ -923,6 +924,39 @@ module dfs_local_first_namespace {
     terminalConflictBranches' = terminalConflictBranches,
     terminalPreservedObjects' = terminalPreservedObjects,
     lastDecision' = StalePlanRejected,
+  }
+
+  /// The composed typed gateway may collect evidence, append, crash, restart,
+  /// or materialize while the namespace branch waits. Neither a planned nor a
+  /// terminal branch may gain another namespace effect from those steps.
+  action awaitReconcileGateway: bool = all {
+    any {
+      branchPhase == BranchPlanned,
+      branchPhase == BranchTerminal,
+    },
+    canonicalNamespace' = canonicalNamespace,
+    localNamespace' = localNamespace,
+    beforeCanonicalNamespace' = canonicalNamespace,
+    beforeLocalNamespace' = localNamespace,
+    branchPhase' = branchPhase,
+    branchOperation' = branchOperation,
+    sourceEntry' = sourceEntry,
+    destinationEntry' = destinationEntry,
+    baseSourceBinding' = baseSourceBinding,
+    baseDestinationBinding' = baseDestinationBinding,
+    baseChildBinding' = baseChildBinding,
+    canonicalHead' = canonicalHead,
+    beforeCanonicalHead' = canonicalHead,
+    planHead' = planHead,
+    planOutcome' = planOutcome,
+    branchResult' = branchResult,
+    conflictBranches' = conflictBranches,
+    preservedObjects' = preservedObjects,
+    terminalCanonicalNamespace' = terminalCanonicalNamespace,
+    terminalCanonicalHead' = terminalCanonicalHead,
+    terminalConflictBranches' = terminalConflictBranches,
+    terminalPreservedObjects' = terminalPreservedObjects,
+    lastDecision' = ReconcileGatewayProgressed,
   }
 
   action commitReconcilePlan: bool = {
