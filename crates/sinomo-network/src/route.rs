@@ -2473,6 +2473,8 @@ where
             data_dir,
             expected_public_key,
         )
+        .await?
+        .restore_large_buffered_response_body()
         .await
     }
 
@@ -2519,6 +2521,8 @@ where
             data_dir.clone(),
             expected_public_key,
         )
+        .await?
+        .restore_large_buffered_response_body()
         .await
     }
 
@@ -2744,6 +2748,8 @@ where
             deadline,
             timeout_error,
         )
+        .await?
+        .restore_large_buffered_response_body()
         .await
     }
 
@@ -5796,6 +5802,7 @@ mod tests {
         signed_requests: Vec<ObjectRpcRequest>,
         session_peers: Vec<tokio::io::DuplexStream>,
         session_server_data_dir: Option<sinomo_local::SinomoDataDir>,
+        session_response_body: Option<Vec<u8>>,
         fail_first_send: bool,
         timeout_first_send: bool,
         timeout_second_send: bool,
@@ -5851,6 +5858,7 @@ mod tests {
         ) -> ClusterSignedObjectRpcFuture<'a, Box<dyn NetworkDuplexStream>> {
             let (client, peer) = tokio::io::duplex(1024);
             if let Some(data_dir) = self.session_server_data_dir.clone() {
+                let response_body = self.session_response_body.clone();
                 tokio::spawn(async move {
                     let (request, responder) = crate::accept_object_rpc_server_session(
                         Box::new(peer),
@@ -5860,11 +5868,17 @@ mod tests {
                     )
                     .await
                     .expect("accept test loopback session");
-                    let response = ObjectRpcResponse::encode_body(
-                        request.request.route.clone(),
-                        &"loopback-ok",
-                    )
-                    .expect("encode test loopback response");
+                    let response = match response_body {
+                        Some(body) => ObjectRpcResponse::from_encoded_body(
+                            request.request.route.clone(),
+                            body,
+                        ),
+                        None => ObjectRpcResponse::encode_body(
+                            request.request.route.clone(),
+                            &"loopback-ok",
+                        )
+                        .expect("encode test loopback response"),
+                    };
                     responder
                         .respond(crate::ObjectRpcSessionResponse::buffered(response))
                         .await
@@ -6165,6 +6179,36 @@ mod tests {
         assert_eq!(body, "loopback-ok");
         drop(client);
         assert_eq!(host.signed_requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn loopback_session_restores_large_buffered_response_at_origin() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-large-loopback-response");
+        let data_dir = sinomo_local::SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir layout");
+        let expected = vec![0x5a_u8; 237_451];
+        let request =
+            ObjectRpcRequest::encode_body("/test/large-loopback-response", "test", &"request")
+                .expect("request");
+        let mut host = RecordingSignedHost {
+            session_server_data_dir: Some(data_dir.clone()),
+            session_response_body: Some(expected.clone()),
+            ..RecordingSignedHost::default()
+        };
+        let mut client = ClusterObjectRpcClient::endpoint_only(&mut host);
+
+        let result = client
+            .call_loopback_session(
+                &data_dir,
+                "127.0.0.1:21353",
+                ObjectRpcSessionCall::buffered(request),
+                ClusterObjectRpcOptions::default(),
+            )
+            .await
+            .expect("large loopback response");
+
+        assert_eq!(result.response.body, expected);
+        assert!(result.body.is_empty());
     }
 
     #[tokio::test]

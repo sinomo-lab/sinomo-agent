@@ -1658,7 +1658,7 @@ where
                 };
                 let mut response = inner.call(request).await?;
                 if let Some(permit) = permit
-                    && !response.body.is_empty()
+                    && (!response.body.is_empty() || !response.response.body.is_empty())
                 {
                     response.body.hold_lifetime_guard(permit)?;
                 }
@@ -2016,5 +2016,56 @@ mod tests {
         call_object_rpc_session_service_async(&mut service, request())
             .await
             .expect("permit released with body");
+    }
+
+    #[tokio::test]
+    async fn route_concurrency_permit_is_held_for_buffered_response_that_may_spill() {
+        let descriptor = ObjectRouteDescriptor::new(
+            "/test/buffered-permit",
+            "test",
+            "buffered permit",
+            "Head",
+            "Head",
+        )
+        .with_concurrency_limit(1);
+        let registry = ObjectRpcRouteRegistry::builder()
+            .register_session_route(descriptor, |request| async move {
+                Ok(ObjectRpcSessionResponse::buffered(
+                    ObjectRpcResponse::from_encoded_body(
+                        request.request.route,
+                        vec![0x5a; 237_451],
+                    ),
+                ))
+            })
+            .build();
+        let router = ObjectRpcRouter::from_route_registry(registry).expect("router");
+        let mut service = ObjectRpcRoutePolicyLayer::new(router.catalog())
+            .expect("policy")
+            .layer(router);
+        let request = || {
+            ObjectRpcSessionRequest::buffered(ObjectRpcRequest::from_encoded_body(
+                "/test/buffered-permit",
+                "test",
+                Vec::new(),
+            ))
+        };
+
+        let first = call_object_rpc_session_service_async(&mut service, request())
+            .await
+            .expect("first response");
+        let second = call_object_rpc_session_service_async(&mut service, request())
+            .await
+            .expect_err("permit remains attached to spillable buffered response");
+        assert!(matches!(
+            second,
+            NetworkError::ObjectRpcRouteSaturated {
+                concurrency_limit: 1,
+                ..
+            }
+        ));
+        drop(first);
+        call_object_rpc_session_service_async(&mut service, request())
+            .await
+            .expect("permit released with buffered response");
     }
 }
