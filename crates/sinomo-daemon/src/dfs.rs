@@ -531,7 +531,7 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsAsyncPeerTransport {
     }
 }
 
-fn daemon_dfs_blocking_peer_transport_on_runtime(
+pub(crate) fn daemon_dfs_blocking_peer_transport_on_runtime(
     data_dir: &SinomoDataDir,
     runtime: &tokio::runtime::Handle,
 ) -> Arc<dyn DfsPeerTransport> {
@@ -541,7 +541,7 @@ fn daemon_dfs_blocking_peer_transport_on_runtime(
     })
 }
 
-fn daemon_dfs_async_peer_transport(
+pub(crate) fn daemon_dfs_async_peer_transport(
     data_dir: &SinomoDataDir,
     runtime: &tokio::runtime::Handle,
 ) -> Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> {
