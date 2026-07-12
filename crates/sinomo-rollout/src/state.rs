@@ -3,6 +3,7 @@ use crate::{
     RolloutAction, RolloutDecision, RolloutError, RolloutRuntimeState, RolloutStage,
     SelfRolloutPaths, executable_name,
 };
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sinomo_config::{
     ConfigClusterMode, ConfigDefinition, ConfigError, ConfigRegistry, ConfigRegistryBuilder,
@@ -13,7 +14,8 @@ use sinomo_core::local::SinomoDataDir;
 use sinomo_core::node::NodeId;
 use sinomo_core::object::{LengthMode, serde_ext};
 use sinomo_core::{ClusterNodeRolloutStatus, HotSwapState, Id};
-use std::fs;
+use std::collections::BTreeSet;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
@@ -33,6 +35,8 @@ pub struct RolloutMainActivation {
     pub staged_shadow_binary: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_main_binary: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_dylib_loader_rollback_generation: Option<String>,
     #[serde(default = "default_rollout_main_host")]
     pub main_host: String,
     #[serde(default = "default_rollout_main_port")]
@@ -53,6 +57,8 @@ pub struct PendingShadowRollout {
     pub staged_shadow_binary: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_main_binary: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_dylib_loader_rollback_generation: Option<String>,
     pub previous_shadow_binary: PathBuf,
     pub main_host: String,
     pub main_port: u16,
@@ -61,6 +67,27 @@ pub struct PendingShadowRollout {
     pub requested_at: String,
     pub main_healthy_at: String,
     pub mode: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativeDylibLoaderStateRollback {
+    pub generation: String,
+    pub captured_at: String,
+    /// Lifecycle of this pre-mutation rollback intent. Older records did not
+    /// carry the field; treating them as unresolved is the fail-safe migration
+    /// because the associated loader mutation may already have happened.
+    #[serde(default)]
+    pub lifecycle: NativeDylibLoaderRollbackLifecycle,
+    pub states: Vec<sinomo_module::NativeDylibModuleLoaderState>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeDylibLoaderRollbackLifecycle {
+    #[default]
+    Unresolved,
+    Restored,
+    Accepted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -179,6 +206,486 @@ pub fn rollout_main_activation_path(paths: &SelfRolloutPaths) -> PathBuf {
 
 pub fn rollout_shadow_finalize_path(paths: &SelfRolloutPaths) -> PathBuf {
     paths.root.join("pending-shadow-rollout.sobj")
+}
+
+pub fn rollout_activation_lock_path(paths: &SelfRolloutPaths) -> PathBuf {
+    paths.root.join("activation.lock")
+}
+
+/// Exclusive admission guard for node-local rollout activation and module mutation.
+///
+/// The OS releases the advisory lock if the process exits, while the persistent
+/// lock path gives every process on the node one coordination point. Acquisition
+/// is non-blocking so a competing request fails clearly instead of waiting behind
+/// an unbounded activation. Callers must acquire it before writing shared staged
+/// binary paths and hold it through the durable pending-activation write. Build or
+/// upload work may remain outside the guard when it does not touch shared paths.
+#[derive(Debug)]
+pub struct RolloutActivationGuard {
+    file: fs::File,
+    path: PathBuf,
+}
+
+impl RolloutActivationGuard {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for RolloutActivationGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+pub fn acquire_rollout_activation_guard(
+    paths: &SelfRolloutPaths,
+) -> Result<RolloutActivationGuard, RolloutError> {
+    let guard = acquire_rollout_activation_file_guard(paths)?;
+    ensure_rollout_activation_admission(paths)?;
+    Ok(guard)
+}
+
+fn acquire_rollout_activation_file_guard(
+    paths: &SelfRolloutPaths,
+) -> Result<RolloutActivationGuard, RolloutError> {
+    fs::create_dir_all(&paths.root).map_err(|source| RolloutError::Io {
+        path: paths.root.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let path = rollout_activation_lock_path(paths);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|source| RolloutError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
+            return Err(RolloutError::InvalidTransition {
+                detail: format!(
+                    "another rollout activation or module mutation holds {}",
+                    path.display()
+                ),
+            });
+        }
+        Err(source) => {
+            return Err(RolloutError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            });
+        }
+    }
+    Ok(RolloutActivationGuard { file, path })
+}
+
+fn ensure_rollout_activation_admission(paths: &SelfRolloutPaths) -> Result<(), RolloutError> {
+    for (label, pending_path) in [
+        ("main", rollout_main_activation_path(paths)),
+        ("shadow", rollout_shadow_finalize_path(paths)),
+    ] {
+        if pending_path.exists() {
+            return Err(RolloutError::InvalidTransition {
+                detail: format!(
+                    "cannot mutate native modules while a pending {label} rollout exists at {}",
+                    pending_path.display()
+                ),
+            });
+        }
+    }
+    if let Some((path, rollback)) = native_dylib_loader_rollback_records(paths)?
+        .into_iter()
+        .find(|(_, rollback)| rollback.lifecycle == NativeDylibLoaderRollbackLifecycle::Unresolved)
+    {
+        return Err(RolloutError::InvalidTransition {
+            detail: format!(
+                "cannot mutate native modules while unresolved pre-mutation intent {} exists at {}; restart the daemon to recover it",
+                rollback.generation,
+                path.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Compatibility alias for module command paths that share rollout admission.
+pub type NativeDylibRolloutGuard = RolloutActivationGuard;
+
+pub fn native_dylib_rollout_lock_path(paths: &SelfRolloutPaths) -> PathBuf {
+    rollout_activation_lock_path(paths)
+}
+
+pub fn acquire_native_dylib_rollout_guard(
+    paths: &SelfRolloutPaths,
+) -> Result<NativeDylibRolloutGuard, RolloutError> {
+    acquire_rollout_activation_guard(paths)
+}
+
+pub fn rollout_native_dylib_loader_rollback_dir(paths: &SelfRolloutPaths) -> PathBuf {
+    paths.root.join("native-loader-rollback")
+}
+
+pub fn rollout_native_dylib_loader_rollback_path(
+    paths: &SelfRolloutPaths,
+    generation: &str,
+) -> Result<PathBuf, RolloutError> {
+    validate_rollout_generation(generation)?;
+    Ok(rollout_native_dylib_loader_rollback_dir(paths).join(format!("{generation}.sobj")))
+}
+
+fn native_dylib_loader_rollback_records(
+    rollout_paths: &SelfRolloutPaths,
+) -> Result<Vec<(PathBuf, NativeDylibLoaderStateRollback)>, RolloutError> {
+    let dir = rollout_native_dylib_loader_rollback_dir(rollout_paths);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = fs::read_dir(&dir)
+        .map_err(|source| RolloutError::Io {
+            path: dir.display().to_string(),
+            detail: source.to_string(),
+        })?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|source| RolloutError::Io {
+                    path: dir.display().to_string(),
+                    detail: source.to_string(),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    paths.sort();
+
+    let mut records = Vec::new();
+    for path in paths {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("sobj") {
+            continue;
+        }
+        let rollback: NativeDylibLoaderStateRollback = read_object(&path)?;
+        let file_generation = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| RolloutError::InvalidArtifact {
+                detail: format!(
+                    "native loader rollback record has invalid file name {}",
+                    path.display()
+                ),
+            })?;
+        if rollback.generation != file_generation {
+            return Err(RolloutError::InvalidArtifact {
+                detail: format!(
+                    "native loader rollback generation mismatch at {}: file names {file_generation}, record names {}",
+                    path.display(),
+                    rollback.generation
+                ),
+            });
+        }
+        records.push((path, rollback));
+    }
+    Ok(records)
+}
+
+/// Returns every content-addressed native module artifact referenced by a
+/// rollback generation that has not yet been finalized and removed. A malformed
+/// rollback record fails closed so callers defer pruning instead of deleting a
+/// potentially required artifact.
+pub fn unresolved_native_dylib_loader_rollback_artifacts(
+    data_dir: &Path,
+    rollout_paths: &SelfRolloutPaths,
+) -> Result<BTreeSet<PathBuf>, RolloutError> {
+    let mut artifacts = BTreeSet::new();
+    for (_, rollback) in native_dylib_loader_rollback_records(rollout_paths)? {
+        if rollback.lifecycle != NativeDylibLoaderRollbackLifecycle::Unresolved {
+            continue;
+        }
+        for state in rollback.states {
+            artifacts.insert(sinomo_module::native_module_cache_path(
+                data_dir,
+                &state.cache_key,
+                &state.content_hash,
+                &state.library_name,
+            ));
+        }
+    }
+    Ok(artifacts)
+}
+
+fn validate_rollout_generation(generation: &str) -> Result<(), RolloutError> {
+    if generation.is_empty()
+        || !generation
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(RolloutError::InvalidArtifact {
+            detail: format!("invalid native loader rollback generation `{generation}`"),
+        });
+    }
+    Ok(())
+}
+
+pub fn stage_native_dylib_loader_state_rollback(
+    data_dir: &Path,
+    rollout_paths: &SelfRolloutPaths,
+    activation: &mut RolloutMainActivation,
+) -> Result<String, RolloutError> {
+    if let Some(generation) = activation.native_dylib_loader_rollback_generation.as_ref() {
+        let rollback_path = rollout_native_dylib_loader_rollback_path(rollout_paths, generation)?;
+        let rollback: NativeDylibLoaderStateRollback = read_object(&rollback_path)?;
+        if rollback.generation != *generation
+            || rollback.lifecycle != NativeDylibLoaderRollbackLifecycle::Unresolved
+        {
+            return Err(RolloutError::InvalidTransition {
+                detail: format!("native loader pre-mutation intent {generation} is not unresolved"),
+            });
+        }
+        return Ok(generation.clone());
+    }
+    let generation = crate::rollout_artifact_suffix();
+    let mut states = sinomo_module::read_native_dylib_module_loader_states(data_dir)?;
+    states.sort_by(|left, right| left.module_id.cmp(&right.module_id));
+    for state in &states {
+        let active_path = sinomo_module::native_module_cache_path(
+            data_dir,
+            &state.cache_key,
+            &state.content_hash,
+            &state.library_name,
+        );
+        if !active_path.is_file() {
+            return Err(RolloutError::MissingArtifact {
+                artifact: format!(
+                    "active native module cache artifact {} for {}",
+                    active_path.display(),
+                    state.module_id
+                ),
+            });
+        }
+    }
+    let rollback = NativeDylibLoaderStateRollback {
+        generation: generation.clone(),
+        captured_at: format_now(),
+        lifecycle: NativeDylibLoaderRollbackLifecycle::Unresolved,
+        states,
+    };
+    let rollback_path = rollout_native_dylib_loader_rollback_path(rollout_paths, &generation)?;
+    if let Err(error) = write_rollout_object_durable(&rollback_path, &rollback) {
+        let _ = fs::remove_file(&rollback_path);
+        return Err(error);
+    }
+    activation.native_dylib_loader_rollback_generation = Some(generation.clone());
+    Ok(generation)
+}
+
+pub fn restore_native_dylib_loader_state_rollback(
+    data_dir: &Path,
+    rollout_paths: &SelfRolloutPaths,
+    generation: &str,
+) -> Result<bool, RolloutError> {
+    let rollback_path = rollout_native_dylib_loader_rollback_path(rollout_paths, generation)?;
+    if !rollback_path.exists() {
+        return Err(RolloutError::MissingArtifact {
+            artifact: format!(
+                "native loader rollback record {} for generation {generation}",
+                rollback_path.display()
+            ),
+        });
+    }
+    let mut rollback: NativeDylibLoaderStateRollback = read_object(&rollback_path)?;
+    if rollback.generation != generation {
+        return Err(RolloutError::InvalidArtifact {
+            detail: format!(
+                "native loader rollback generation mismatch: expected {generation}, found {}",
+                rollback.generation
+            ),
+        });
+    }
+    if rollback.lifecycle != NativeDylibLoaderRollbackLifecycle::Unresolved {
+        return Ok(false);
+    }
+
+    for state in &rollback.states {
+        let active_path = sinomo_module::native_module_cache_path(
+            data_dir,
+            &state.cache_key,
+            &state.content_hash,
+            &state.library_name,
+        );
+        if !active_path.is_file() {
+            return Err(RolloutError::MissingArtifact {
+                artifact: format!(
+                    "retained native module cache artifact {} for rollback generation {generation}",
+                    active_path.display()
+                ),
+            });
+        }
+    }
+
+    sinomo_module::replace_native_dylib_module_loader_states_transactionally(
+        data_dir,
+        &rollback.states,
+    )?;
+    rollback.lifecycle = NativeDylibLoaderRollbackLifecycle::Restored;
+    write_rollout_object_durable(&rollback_path, &rollback)?;
+    Ok(true)
+}
+
+pub fn restore_native_dylib_loader_state_for_activation(
+    data_dir: &Path,
+    rollout_paths: &SelfRolloutPaths,
+    activation: &RolloutMainActivation,
+) -> Result<bool, RolloutError> {
+    let Some(generation) = activation
+        .native_dylib_loader_rollback_generation
+        .as_deref()
+    else {
+        return Ok(false);
+    };
+    restore_native_dylib_loader_state_rollback(data_dir, rollout_paths, generation)
+}
+
+/// Recovers the single orphaned pre-mutation intent left by a process crash.
+///
+/// Startup calls this while no native module registry has been loaded. Pending
+/// main/shadow activation records own their intent and deliberately suppress
+/// orphan recovery. More than one unresolved intent is ambiguous and fails
+/// closed rather than guessing at rollback ordering.
+pub fn recover_unresolved_native_dylib_loader_rollback_intents(
+    data_dir: &Path,
+    rollout_paths: &SelfRolloutPaths,
+) -> Result<Vec<String>, RolloutError> {
+    // Candidate main/shadow startup can occur while the rollout request still
+    // owns the activation lock. Its durable marker makes the intent non-orphaned,
+    // so avoid contending with that owner. Recheck after taking the lock in the
+    // no-marker case to close the admission race.
+    if rollout_main_activation_path(rollout_paths).exists()
+        || rollout_shadow_finalize_path(rollout_paths).exists()
+    {
+        return Ok(Vec::new());
+    }
+    let _guard = acquire_rollout_activation_file_guard(rollout_paths)?;
+    if rollout_main_activation_path(rollout_paths).exists()
+        || rollout_shadow_finalize_path(rollout_paths).exists()
+    {
+        return Ok(Vec::new());
+    }
+
+    let unresolved = native_dylib_loader_rollback_records(rollout_paths)?
+        .into_iter()
+        .filter(|(_, rollback)| {
+            rollback.lifecycle == NativeDylibLoaderRollbackLifecycle::Unresolved
+        })
+        .collect::<Vec<_>>();
+    if unresolved.len() > 1 {
+        return Err(RolloutError::InvalidTransition {
+            detail: format!(
+                "multiple unresolved native loader pre-mutation intents require operator recovery: {}",
+                unresolved
+                    .iter()
+                    .map(|(path, rollback)| format!("{} ({})", rollback.generation, path.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        });
+    }
+    let Some((_, rollback)) = unresolved.into_iter().next() else {
+        return Ok(Vec::new());
+    };
+    let generation = rollback.generation;
+    restore_native_dylib_loader_state_rollback(data_dir, rollout_paths, &generation)?;
+    Ok(vec![generation])
+}
+
+pub fn remove_native_dylib_loader_state_rollback(
+    rollout_paths: &SelfRolloutPaths,
+    generation: &str,
+) -> Result<bool, RolloutError> {
+    if !mark_native_dylib_loader_state_rollback_accepted(rollout_paths, generation)? {
+        return Ok(false);
+    }
+    let rollback_path = rollout_native_dylib_loader_rollback_path(rollout_paths, generation)?;
+    match fs::remove_file(&rollback_path) {
+        Ok(()) => {
+            sync_rollout_dir(&rollout_native_dylib_loader_rollback_dir(rollout_paths))?;
+            Ok(true)
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(RolloutError::Io {
+            path: rollback_path.display().to_string(),
+            detail: source.to_string(),
+        }),
+    }
+}
+
+fn mark_native_dylib_loader_state_rollback_accepted(
+    rollout_paths: &SelfRolloutPaths,
+    generation: &str,
+) -> Result<bool, RolloutError> {
+    let rollback_path = rollout_native_dylib_loader_rollback_path(rollout_paths, generation)?;
+    if !rollback_path.exists() {
+        return Ok(false);
+    }
+    let mut rollback: NativeDylibLoaderStateRollback = read_object(&rollback_path)?;
+    if rollback.generation != generation {
+        return Err(RolloutError::InvalidArtifact {
+            detail: format!(
+                "native loader rollback generation mismatch: expected {generation}, found {}",
+                rollback.generation
+            ),
+        });
+    }
+    // Persist acceptance before unlinking. If either write or fsync fails the
+    // rollback remains fail-closed; if unlink or its directory fsync fails,
+    // startup sees an accepted record and will never replay it.
+    if rollback.lifecycle != NativeDylibLoaderRollbackLifecycle::Accepted {
+        rollback.lifecycle = NativeDylibLoaderRollbackLifecycle::Accepted;
+        write_rollout_object_durable(&rollback_path, &rollback)?;
+    }
+    Ok(true)
+}
+
+fn write_rollout_object_durable<T: Serialize>(path: &Path, value: &T) -> Result<(), RolloutError> {
+    let bytes =
+        serde_ext::to_bytes(value, ROLLOUT_OBJECT_VERSION, LengthMode::U32).map_err(|source| {
+            RolloutError::Object {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            }
+        })?;
+    sinomo_core::storage::durable_file::write_file_atomic(
+        path,
+        &bytes,
+        sinomo_core::storage::durable_file::DurableAtomicFileOptions::new(
+            "rollout.sobj",
+            "durable",
+        )
+        .sync_all(),
+    )
+    .map_err(|source| RolloutError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+#[cfg(unix)]
+fn sync_rollout_dir(path: &Path) -> Result<(), RolloutError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| RolloutError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_rollout_dir(_path: &Path) -> Result<(), RolloutError> {
+    Ok(())
 }
 
 pub fn rollout_main_exit_path(paths: &SelfRolloutPaths) -> PathBuf {
@@ -302,6 +809,7 @@ pub fn rollout_diagnostics_report(
         "pending shadow",
         &rollout_shadow_finalize_path(rollout_paths),
     )?;
+    append_native_loader_rollback_diagnostics(&mut output, rollout_paths)?;
     append_rollout_diagnostic_file(
         &mut output,
         "runtime state",
@@ -342,6 +850,36 @@ pub fn rollout_diagnostics_report(
     }
 
     Ok(output)
+}
+
+fn append_native_loader_rollback_diagnostics(
+    output: &mut String,
+    rollout_paths: &SelfRolloutPaths,
+) -> Result<(), RolloutError> {
+    let dir = rollout_native_dylib_loader_rollback_dir(rollout_paths);
+    output.push_str(&format!("\n[native loader rollbacks] {}\n", dir.display()));
+    if !dir.exists() {
+        output.push_str("<missing>\n");
+        return Ok(());
+    }
+    let mut paths = fs::read_dir(&dir)
+        .map_err(|source| RolloutError::Io {
+            path: dir.display().to_string(),
+            detail: source.to_string(),
+        })?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("sobj"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    if paths.is_empty() {
+        output.push_str("<empty>\n");
+    } else {
+        for path in paths {
+            output.push_str(&format!("{}\n", path.display()));
+        }
+    }
+    Ok(())
 }
 
 pub fn append_rollout_status_diagnostic(
@@ -471,6 +1009,9 @@ pub fn stage_pending_shadow_rollout(
         staged_main_binary: activation.staged_main_binary.clone(),
         staged_shadow_binary: activation.staged_shadow_binary.clone(),
         previous_main_binary: pending.previous_main_binary().map(Path::to_path_buf),
+        native_dylib_loader_rollback_generation: activation
+            .native_dylib_loader_rollback_generation
+            .clone(),
         previous_shadow_binary: pending.previous_shadow_binary().to_path_buf(),
         main_host: pending.main_host().to_string(),
         main_port: pending.main_port(),
@@ -480,14 +1021,14 @@ pub fn stage_pending_shadow_rollout(
         main_healthy_at: format_now(),
         mode: activation.mode.clone(),
     };
-    write_object(&rollout_shadow_finalize_path(rollout_paths), &finalize)
+    write_rollout_object_durable(&rollout_shadow_finalize_path(rollout_paths), &finalize)
 }
 
 pub fn write_main_activation(
     rollout_paths: &SelfRolloutPaths,
     activation: &RolloutMainActivation,
 ) -> Result<(), RolloutError> {
-    write_object(&rollout_main_activation_path(rollout_paths), activation)
+    write_rollout_object_durable(&rollout_main_activation_path(rollout_paths), activation)
 }
 
 pub fn record_main_activation_staged(
@@ -1139,6 +1680,544 @@ mod tests {
         assert_eq!(read_rollout_status(&paths).expect("status"), None);
         assert!(rollout_shadow_finalize_path(&paths).exists());
         assert!(!clear_rollout_status(&paths).expect("clear missing"));
+    }
+
+    #[test]
+    fn rollout_activation_guard_rejects_concurrent_staging_without_waiting() {
+        let root = unique_temp("sinomo-rollout-activation-guard-concurrent");
+        let paths = SelfRolloutPaths::new(&root);
+        let guard = acquire_rollout_activation_guard(&paths).expect("first guard");
+        assert_eq!(guard.path(), rollout_activation_lock_path(&paths));
+        let staged_main = rollout_staged_main_binary(&paths);
+        fs::create_dir_all(staged_main.parent().expect("staged parent")).expect("staged parent");
+        fs::write(&staged_main, b"first-candidate").expect("first staged candidate");
+
+        let contender_paths = paths.clone();
+        let contender_staged_main = staged_main.clone();
+        let contender =
+            std::thread::spawn(
+                move || match acquire_rollout_activation_guard(&contender_paths) {
+                    Ok(_guard) => {
+                        fs::write(&contender_staged_main, b"second-candidate")
+                            .expect("second staged candidate");
+                        "unexpected admission".to_string()
+                    }
+                    Err(error) => error.to_string(),
+                },
+            );
+        let detail = contender.join().expect("contender thread");
+        assert!(detail.contains("another rollout activation or module mutation"));
+        assert_eq!(
+            fs::read(&staged_main).expect("staged candidate after rejection"),
+            b"first-candidate",
+            "a rejected contender must not overwrite fixed staged paths"
+        );
+
+        drop(guard);
+        acquire_rollout_activation_guard(&paths).expect("guard is released on drop");
+    }
+
+    #[test]
+    fn rollout_activation_guard_rejects_pending_main_and_shadow_admission() {
+        let root = unique_temp("sinomo-rollout-activation-guard-pending");
+        let paths = SelfRolloutPaths::new(&root);
+        fs::create_dir_all(&paths.root).expect("rollout root");
+
+        let pending_main = rollout_main_activation_path(&paths);
+        fs::write(&pending_main, b"pending-main").expect("pending main marker");
+        let main_error = acquire_rollout_activation_guard(&paths)
+            .expect_err("pending main must block admission")
+            .to_string();
+        assert!(main_error.contains("pending main rollout"));
+        fs::remove_file(&pending_main).expect("remove pending main");
+
+        let pending_shadow = rollout_shadow_finalize_path(&paths);
+        fs::write(&pending_shadow, b"pending-shadow").expect("pending shadow marker");
+        let shadow_error = acquire_rollout_activation_guard(&paths)
+            .expect_err("pending shadow must block admission")
+            .to_string();
+        assert!(shadow_error.contains("pending shadow rollout"));
+        fs::remove_file(&pending_shadow).expect("remove pending shadow");
+
+        acquire_rollout_activation_guard(&paths)
+            .expect("admission succeeds after pending markers clear");
+    }
+
+    #[test]
+    fn orphaned_native_loader_intent_before_mutation_is_recovered_idempotently() {
+        let root = unique_temp("sinomo-rollout-native-loader-intent-before-mutation");
+        let paths = SelfRolloutPaths::new(&root);
+        let previous = test_native_loader_state("before-mutation", "test:previous");
+        write_test_native_loader_state(&root, &previous);
+        let mut activation = test_native_loader_activation(&root);
+
+        let generation = stage_native_dylib_loader_state_rollback(&root, &paths, &mut activation)
+            .expect("write pre-mutation intent");
+
+        let admission = acquire_rollout_activation_guard(&paths)
+            .expect_err("unresolved intent must block a second mutation")
+            .to_string();
+        assert!(admission.contains("unresolved pre-mutation intent"));
+        assert_eq!(
+            recover_unresolved_native_dylib_loader_rollback_intents(&root, &paths)
+                .expect("startup recovery"),
+            vec![generation.clone()]
+        );
+        assert_eq!(
+            sinomo_module::read_native_dylib_module_loader_state(&root, &previous.module_id)
+                .expect("read loader state"),
+            Some(previous)
+        );
+        let rollback: NativeDylibLoaderStateRollback = read_object(
+            &rollout_native_dylib_loader_rollback_path(&paths, &generation).expect("rollback path"),
+        )
+        .expect("rollback record");
+        assert_eq!(
+            rollback.lifecycle,
+            NativeDylibLoaderRollbackLifecycle::Restored
+        );
+        assert!(
+            recover_unresolved_native_dylib_loader_rollback_intents(&root, &paths)
+                .expect("idempotent second recovery")
+                .is_empty()
+        );
+        acquire_rollout_activation_guard(&paths)
+            .expect("restored history must no longer block admission");
+    }
+
+    #[test]
+    fn native_loader_intent_lifecycle_defaults_to_unresolved_for_legacy_records() {
+        #[derive(Serialize)]
+        struct LegacyNativeDylibLoaderStateRollback {
+            generation: String,
+            captured_at: String,
+            states: Vec<sinomo_module::NativeDylibModuleLoaderState>,
+        }
+
+        let root = unique_temp("sinomo-rollout-native-loader-legacy-intent");
+        let paths = SelfRolloutPaths::new(&root);
+        let generation = "legacy-generation";
+        let path =
+            rollout_native_dylib_loader_rollback_path(&paths, generation).expect("rollback path");
+        write_object(
+            &path,
+            &LegacyNativeDylibLoaderStateRollback {
+                generation: generation.to_string(),
+                captured_at: "2026-07-12T00:00:00Z".to_string(),
+                states: Vec::new(),
+            },
+        )
+        .expect("legacy rollback record");
+
+        let decoded: NativeDylibLoaderStateRollback =
+            read_object(&path).expect("decode legacy rollback record");
+        assert_eq!(
+            decoded.lifecycle,
+            NativeDylibLoaderRollbackLifecycle::Unresolved
+        );
+    }
+
+    #[test]
+    fn orphaned_native_loader_intent_after_mutation_before_activation_marker_restores_snapshot() {
+        let root = unique_temp("sinomo-rollout-native-loader-intent-after-mutation");
+        let paths = SelfRolloutPaths::new(&root);
+        let previous = test_native_loader_state("pre-crash", "test:previous");
+        write_test_native_loader_state(&root, &previous);
+        let mut activation = test_native_loader_activation(&root);
+        let generation = stage_native_dylib_loader_state_rollback(&root, &paths, &mut activation)
+            .expect("write pre-mutation intent");
+
+        let candidate = test_native_loader_state("candidate", "test:candidate");
+        write_test_native_loader_state(&root, &candidate);
+        assert!(!rollout_main_activation_path(&paths).exists());
+        assert!(!rollout_shadow_finalize_path(&paths).exists());
+
+        assert_eq!(
+            recover_unresolved_native_dylib_loader_rollback_intents(&root, &paths)
+                .expect("startup recovery"),
+            vec![generation]
+        );
+        assert_eq!(
+            sinomo_module::read_native_dylib_module_loader_state(&root, &previous.module_id)
+                .expect("read restored loader state"),
+            Some(previous)
+        );
+    }
+
+    #[test]
+    fn startup_recovery_defers_intent_owned_by_pending_activation() {
+        let root = unique_temp("sinomo-rollout-native-loader-pending-owner");
+        let paths = SelfRolloutPaths::new(&root);
+        let previous = test_native_loader_state("pending-previous", "test:previous");
+        write_test_native_loader_state(&root, &previous);
+        let mut activation = test_native_loader_activation(&root);
+        let generation = stage_native_dylib_loader_state_rollback(&root, &paths, &mut activation)
+            .expect("pre-mutation intent");
+        let candidate = test_native_loader_state("pending-candidate", "test:candidate");
+        write_test_native_loader_state(&root, &candidate);
+        write_main_activation(&paths, &activation).expect("pending activation marker");
+
+        assert!(
+            recover_unresolved_native_dylib_loader_rollback_intents(&root, &paths)
+                .expect("pending activation owns intent")
+                .is_empty()
+        );
+        assert_eq!(
+            sinomo_module::read_native_dylib_module_loader_state(&root, &candidate.module_id)
+                .expect("candidate remains visible"),
+            Some(candidate)
+        );
+
+        remove_main_activation(&paths);
+        assert_eq!(
+            recover_unresolved_native_dylib_loader_rollback_intents(&root, &paths)
+                .expect("orphan recovery after marker removal"),
+            vec![generation]
+        );
+        assert_eq!(
+            sinomo_module::read_native_dylib_module_loader_state(&root, &previous.module_id)
+                .expect("previous state restored"),
+            Some(previous)
+        );
+    }
+
+    #[test]
+    fn restored_native_loader_history_never_replays_over_newer_accepted_state() {
+        let root = unique_temp("sinomo-rollout-native-loader-restored-history");
+        let paths = SelfRolloutPaths::new(&root);
+        let previous = test_native_loader_state("historical", "test:historical");
+        write_test_native_loader_state(&root, &previous);
+        let mut activation = test_native_loader_activation(&root);
+        let generation = stage_native_dylib_loader_state_rollback(&root, &paths, &mut activation)
+            .expect("write pre-mutation intent");
+        let failed_candidate = test_native_loader_state("failed", "test:failed");
+        write_test_native_loader_state(&root, &failed_candidate);
+        assert!(
+            restore_native_dylib_loader_state_rollback(&root, &paths, &generation)
+                .expect("explicit restore")
+        );
+
+        let newer_accepted = test_native_loader_state("accepted", "test:accepted");
+        write_test_native_loader_state(&root, &newer_accepted);
+        assert!(
+            recover_unresolved_native_dylib_loader_rollback_intents(&root, &paths)
+                .expect("startup recovery ignores restored history")
+                .is_empty()
+        );
+        assert_eq!(
+            sinomo_module::read_native_dylib_module_loader_state(&root, &newer_accepted.module_id,)
+                .expect("read accepted loader state"),
+            Some(newer_accepted)
+        );
+    }
+
+    #[test]
+    fn accepted_native_loader_intent_surviving_unlink_is_never_replayed() {
+        let root = unique_temp("sinomo-rollout-native-loader-accepted-intent");
+        let paths = SelfRolloutPaths::new(&root);
+        let previous = test_native_loader_state("accepted-previous", "test:previous");
+        write_test_native_loader_state(&root, &previous);
+        let mut activation = test_native_loader_activation(&root);
+        let generation = stage_native_dylib_loader_state_rollback(&root, &paths, &mut activation)
+            .expect("write pre-mutation intent");
+        let accepted = test_native_loader_state("accepted-current", "test:accepted");
+        write_test_native_loader_state(&root, &accepted);
+
+        assert!(
+            mark_native_dylib_loader_state_rollback_accepted(&paths, &generation)
+                .expect("durable accepted lifecycle")
+        );
+        assert!(
+            rollout_native_dylib_loader_rollback_path(&paths, &generation)
+                .expect("rollback path")
+                .exists(),
+            "test simulates a crash before accepted-record unlink"
+        );
+        assert!(
+            recover_unresolved_native_dylib_loader_rollback_intents(&root, &paths)
+                .expect("startup ignores accepted record")
+                .is_empty()
+        );
+        assert_eq!(
+            sinomo_module::read_native_dylib_module_loader_state(&root, &accepted.module_id)
+                .expect("read accepted loader state"),
+            Some(accepted)
+        );
+    }
+
+    #[test]
+    fn multiple_unresolved_native_loader_intents_fail_startup_recovery_closed() {
+        let root = unique_temp("sinomo-rollout-native-loader-ambiguous-intents");
+        let paths = SelfRolloutPaths::new(&root);
+        write_test_native_loader_state(&root, &test_native_loader_state("first", "test:first"));
+        let mut first = test_native_loader_activation(&root);
+        stage_native_dylib_loader_state_rollback(&root, &paths, &mut first).expect("first intent");
+        write_test_native_loader_state(&root, &test_native_loader_state("second", "test:second"));
+        let mut second = test_native_loader_activation(&root);
+        stage_native_dylib_loader_state_rollback(&root, &paths, &mut second)
+            .expect("second intent");
+
+        let error = recover_unresolved_native_dylib_loader_rollback_intents(&root, &paths)
+            .expect_err("ambiguous rollback chain must fail closed")
+            .to_string();
+        assert!(error.contains("multiple unresolved native loader pre-mutation intents"));
+    }
+
+    #[test]
+    fn native_loader_rollback_survives_prune_and_restores_load_address() {
+        let root = unique_temp("sinomo-rollout-native-loader-rollback");
+        let paths = SelfRolloutPaths::new(&root);
+        let module_id =
+            sinomo_module::ModuleId::from_legacy_named("module.network.iroh").expect("module id");
+        let previous = sinomo_module::NativeDylibModuleLoaderState {
+            module_id: module_id.clone(),
+            artifact_id: None,
+            content_hash: "blake3:previous".to_string(),
+            cache_key: "network/iroh".to_string(),
+            library_name: "libsinomo_network_iroh_module.so".to_string(),
+            platform_triple: "x86_64-unknown-linux-gnu".to_string(),
+            native_abi_version: 1,
+            interface_version: "sinomo-network-module-v1".to_string(),
+            activated_at: "2026-07-12T00:00:00Z".to_string(),
+            source: "test:previous".to_string(),
+        };
+        let previous_cache = sinomo_module::native_module_cache_path(
+            &root,
+            &previous.cache_key,
+            &previous.content_hash,
+            &previous.library_name,
+        );
+        fs::create_dir_all(previous_cache.parent().expect("cache parent")).expect("cache dir");
+        fs::write(&previous_cache, b"previous native module").expect("previous cache");
+        sinomo_module::write_native_dylib_module_loader_state(&root, &previous)
+            .expect("previous loader state");
+
+        let mut activation = RolloutMainActivation {
+            source: "test-source".to_string(),
+            main_binary: root.join("bin/sinomo-main"),
+            shadow_binary: root.join("bin/sinomo-shadow"),
+            staged_main_binary: None,
+            staged_shadow_binary: None,
+            previous_main_binary: None,
+            native_dylib_loader_rollback_generation: None,
+            main_host: "127.0.0.1".to_string(),
+            main_port: 21353,
+            shadow_port: 21354,
+            requested_at: "2026-07-12T00:00:00Z".to_string(),
+            mode: "test".to_string(),
+        };
+        let generation = stage_native_dylib_loader_state_rollback(&root, &paths, &mut activation)
+            .expect("stage rollback");
+
+        let mut candidate = previous.clone();
+        candidate.content_hash = "blake3:candidate".to_string();
+        candidate.native_abi_version = 2;
+        candidate.interface_version = "sinomo-network-module-v2".to_string();
+        candidate.source = "test:candidate".to_string();
+        let candidate_cache = sinomo_module::native_module_cache_path(
+            &root,
+            &candidate.cache_key,
+            &candidate.content_hash,
+            &candidate.library_name,
+        );
+        fs::create_dir_all(candidate_cache.parent().expect("candidate parent"))
+            .expect("candidate dir");
+        fs::write(&candidate_cache, b"candidate native module").expect("candidate cache");
+        sinomo_module::write_native_dylib_module_loader_state(&root, &candidate)
+            .expect("candidate loader state");
+
+        sinomo_module::prune_inactive_native_dylib_module_cache(&root, 1)
+            .expect("prune inactive cache");
+        assert!(
+            previous_cache.is_file(),
+            "the rollback generation must remain the newest retained inactive cache variant"
+        );
+
+        assert!(
+            restore_native_dylib_loader_state_for_activation(&root, &paths, &activation)
+                .expect("restore loader state")
+        );
+        let restored = sinomo_module::read_native_dylib_module_loader_state(&root, &module_id)
+            .expect("read restored state")
+            .expect("restored state");
+        assert_eq!(restored, previous);
+        let restored_cache = sinomo_module::native_module_cache_path(
+            &root,
+            &restored.cache_key,
+            &restored.content_hash,
+            &restored.library_name,
+        );
+        assert_eq!(restored_cache, previous_cache);
+        assert!(
+            restored_cache.is_file(),
+            "restored state must be load-addressable"
+        );
+        assert!(
+            rollout_native_dylib_loader_rollback_path(&paths, &generation)
+                .expect("rollback path")
+                .is_file(),
+            "failed generations remain available for diagnostics and retry"
+        );
+        assert!(
+            remove_native_dylib_loader_state_rollback(&paths, &generation)
+                .expect("remove accepted rollback")
+        );
+    }
+
+    #[test]
+    fn ambiguous_unresolved_loader_rollbacks_pin_every_generation_and_fail_recovery_closed() {
+        let root = unique_temp("sinomo-rollout-native-loader-multi-generation");
+        let paths = SelfRolloutPaths::new(&root);
+        let module_id =
+            sinomo_module::ModuleId::from_legacy_named("module.network.iroh").expect("module id");
+        let state = |hash: &str, source: &str| sinomo_module::NativeDylibModuleLoaderState {
+            module_id: module_id.clone(),
+            artifact_id: None,
+            content_hash: format!("blake3:{hash}"),
+            cache_key: "network/iroh".to_string(),
+            library_name: "libsinomo_network_iroh_module.so".to_string(),
+            platform_triple: "x86_64-unknown-linux-gnu".to_string(),
+            native_abi_version: 2,
+            interface_version: "sinomo-network-module-v2".to_string(),
+            activated_at: "2026-07-12T00:00:00Z".to_string(),
+            source: source.to_string(),
+        };
+        let write_artifact = |state: &sinomo_module::NativeDylibModuleLoaderState| {
+            let path = sinomo_module::native_module_cache_path(
+                &root,
+                &state.cache_key,
+                &state.content_hash,
+                &state.library_name,
+            );
+            fs::create_dir_all(path.parent().expect("cache parent")).expect("cache dir");
+            fs::write(&path, state.content_hash.as_bytes()).expect("cache artifact");
+            path
+        };
+
+        let first = state("first", "test:first");
+        let first_path = write_artifact(&first);
+        sinomo_module::write_native_dylib_module_loader_state(&root, &first)
+            .expect("first loader state");
+        let mut first_activation = RolloutMainActivation {
+            source: "first-rollout".to_string(),
+            main_binary: root.join("bin/sinomo-main"),
+            shadow_binary: root.join("bin/sinomo-shadow"),
+            staged_main_binary: None,
+            staged_shadow_binary: None,
+            previous_main_binary: None,
+            native_dylib_loader_rollback_generation: None,
+            main_host: "127.0.0.1".to_string(),
+            main_port: 21353,
+            shadow_port: 21354,
+            requested_at: "2026-07-12T00:00:00Z".to_string(),
+            mode: "test".to_string(),
+        };
+        let first_generation =
+            stage_native_dylib_loader_state_rollback(&root, &paths, &mut first_activation)
+                .expect("first rollback generation");
+
+        let second = state("second", "test:second");
+        let second_path = write_artifact(&second);
+        sinomo_module::write_native_dylib_module_loader_state(&root, &second)
+            .expect("second loader state");
+        let mut second_activation = first_activation.clone();
+        second_activation.source = "second-rollout".to_string();
+        second_activation.native_dylib_loader_rollback_generation = None;
+        let second_generation =
+            stage_native_dylib_loader_state_rollback(&root, &paths, &mut second_activation)
+                .expect("second rollback generation");
+        assert_ne!(first_generation, second_generation);
+
+        let candidate = state("candidate", "test:candidate");
+        let candidate_path = write_artifact(&candidate);
+        sinomo_module::write_native_dylib_module_loader_state(&root, &candidate)
+            .expect("candidate loader state");
+        let unpinned = state("unpinned", "test:unpinned");
+        let unpinned_path = write_artifact(&unpinned);
+
+        let pins = unresolved_native_dylib_loader_rollback_artifacts(&root, &paths)
+            .expect("collect unresolved rollback pins");
+        assert_eq!(
+            pins,
+            BTreeSet::from([first_path.clone(), second_path.clone()])
+        );
+        sinomo_module::prune_inactive_native_dylib_module_cache_with_pinned_artifacts(
+            &root, 0, &pins,
+        )
+        .expect("pin-aware prune");
+        assert!(
+            first_path.is_file(),
+            "first failed generation remains restorable"
+        );
+        assert!(
+            second_path.is_file(),
+            "second failed generation remains restorable"
+        );
+        assert!(
+            candidate_path.is_file(),
+            "active candidate remains retained"
+        );
+        assert!(
+            !unpinned_path.exists(),
+            "unreferenced inactive variant is pruned"
+        );
+
+        let error = recover_unresolved_native_dylib_loader_rollback_intents(&root, &paths)
+            .expect_err("ambiguous rollback history must not be replayed")
+            .to_string();
+        assert!(error.contains(&first_generation));
+        assert!(error.contains(&second_generation));
+    }
+
+    fn test_native_loader_state(
+        hash: &str,
+        source: &str,
+    ) -> sinomo_module::NativeDylibModuleLoaderState {
+        sinomo_module::NativeDylibModuleLoaderState {
+            module_id: sinomo_module::ModuleId::from_legacy_named("module.network.test")
+                .expect("module id"),
+            artifact_id: None,
+            content_hash: format!("blake3:{hash}"),
+            cache_key: "network/test".to_string(),
+            library_name: "libsinomo_network_test_module.so".to_string(),
+            platform_triple: "x86_64-unknown-linux-gnu".to_string(),
+            native_abi_version: 2,
+            interface_version: "sinomo-network-module-v2".to_string(),
+            activated_at: "2026-07-12T00:00:00Z".to_string(),
+            source: source.to_string(),
+        }
+    }
+
+    fn write_test_native_loader_state(
+        root: &Path,
+        state: &sinomo_module::NativeDylibModuleLoaderState,
+    ) {
+        let artifact = sinomo_module::native_module_cache_path(
+            root,
+            &state.cache_key,
+            &state.content_hash,
+            &state.library_name,
+        );
+        fs::create_dir_all(artifact.parent().expect("cache parent")).expect("cache directory");
+        fs::write(&artifact, state.content_hash.as_bytes()).expect("cache artifact");
+        sinomo_module::write_native_dylib_module_loader_state(root, state).expect("loader state");
+    }
+
+    fn test_native_loader_activation(root: &Path) -> RolloutMainActivation {
+        RolloutMainActivation {
+            source: "test-source".to_string(),
+            main_binary: root.join("bin/sinomo-main"),
+            shadow_binary: root.join("bin/sinomo-shadow"),
+            staged_main_binary: None,
+            staged_shadow_binary: None,
+            previous_main_binary: None,
+            native_dylib_loader_rollback_generation: None,
+            main_host: "127.0.0.1".to_string(),
+            main_port: 21353,
+            shadow_port: 21354,
+            requested_at: "2026-07-12T00:00:00Z".to_string(),
+            mode: "test".to_string(),
+        }
     }
 
     fn unique_temp(prefix: &str) -> sinomo_testdir::TestDir {

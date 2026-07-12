@@ -230,15 +230,18 @@ use sinomo_runtime::rollout::{
     LocalRolloutNativeDylibModuleArtifact, ManagedSourceDeployOptions, ManagedSourceStatus,
     RolloutActivationStrategy, RolloutController, RolloutError, RolloutMainActivation,
     RolloutObservation, RolloutRuntimeState, RolloutTelemetryGateConfig, SelfRolloutPaths,
-    clear_rollout_status, ensure_rollout_layout, ensure_rollout_source_repo_with_options,
+    acquire_rollout_activation_guard, clear_rollout_status, ensure_rollout_layout,
+    ensure_rollout_source_repo_with_options,
     install_local_rollout_native_dylib_modules as rollout_install_local_rollout_native_dylib_modules,
     managed_source_status, prepare_cluster_rollout_binary_manifest,
     prepare_cluster_rollout_build_request, prepare_cluster_rollout_native_dylib_module_request,
     prepare_local_rollout_artifacts_with_options, prepare_rollout_dev_artifacts,
     prepare_rollout_source_bundle, read_rollout_runtime_state, read_rollout_telemetry_gate_config,
+    reconcile_rollout_native_dylib_platforms, restore_native_dylib_loader_state_for_activation,
     rollout_build_dev_native_dylib_module, rollout_source_head, rollout_status_view,
     shadow_telemetry_scorecard_from_event_store, source_heads_match,
-    sync_external_repo_from_managed, unique_rollout_targets, write_rollout_telemetry_gate_config,
+    stage_native_dylib_loader_state_rollback, sync_external_repo_from_managed,
+    unique_rollout_targets, write_rollout_telemetry_gate_config,
 };
 use sinomo_runtime::rollout::{
     SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV, SHADOW_MAIN_PORT_ENV,
@@ -1150,7 +1153,9 @@ pub(crate) fn cli_command_requires_cluster_state(command: &CliCommand) -> bool {
     match command {
         CliCommand::Dfs(command) => dfs_command_requires_cluster_state(command),
         CliCommand::Test(command) => test_command_requires_cluster_state(command),
-        CliCommand::Registered(command) => command.policy().requires_cluster_state,
+        CliCommand::Registered(command) | CliCommand::RegisteredRolloutMutation(command) => {
+            command.policy().requires_cluster_state
+        }
         _ => false,
     }
 }
@@ -1164,7 +1169,9 @@ pub(crate) fn cli_command_supports_degraded_local_mode(command: &CliCommand) -> 
         | CliCommand::Skill(_) => true,
         CliCommand::Test(command) => !test_command_requires_cluster_state(command),
         CliCommand::Dfs(command) => !dfs_command_requires_cluster_state(command),
-        CliCommand::Registered(command) => command.policy().supports_degraded_local_mode,
+        CliCommand::Registered(command) | CliCommand::RegisteredRolloutMutation(command) => {
+            command.policy().supports_degraded_local_mode
+        }
         _ => false,
     }
 }
@@ -1184,7 +1191,9 @@ pub(crate) fn cli_command_is_help(command: &CliCommand) -> bool {
         | CliCommand::Agent(AgentCliCommand::Help)
         | CliCommand::Skill(SkillCliCommand::Help)
         | CliCommand::Agent(AgentCliCommand::Session(AgentSessionCliCommand::Help)) => true,
-        CliCommand::Registered(command) => command.is_help(),
+        CliCommand::Registered(command) | CliCommand::RegisteredRolloutMutation(command) => {
+            command.is_help()
+        }
         _ => false,
     }
 }
@@ -1296,6 +1305,7 @@ pub(crate) enum CliCommand {
     Agent(AgentCliCommand),
     Skill(SkillCliCommand),
     Registered(RegisteredCliCommand),
+    RegisteredRolloutMutation(RegisteredCliCommand),
     Usage(UsageOptions),
 }
 
@@ -1484,10 +1494,23 @@ pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError>
             Ok(CliCommand::Usage(parse_usage_options(rest)?))
         }
         _ => match cli_command_registry().parse(args)? {
+            Some(command) if registered_command_requires_rollout_admission(args) => {
+                Ok(CliCommand::RegisteredRolloutMutation(command))
+            }
             Some(command) => Ok(CliCommand::Registered(command)),
             None => Err(CliError::Usage),
         },
     }
+}
+
+fn registered_command_requires_rollout_admission(args: &[String]) -> bool {
+    matches!(
+        args,
+        [module, native_dylib, mutation, ..]
+            if module == "module"
+                && native_dylib == "native-dylib"
+                && matches!(mutation.as_str(), "activate" | "unload")
+    )
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -4599,6 +4622,31 @@ fn run_cli_command(args: &[String]) -> Result<(), CliError> {
     run_parsed_cli_invocation(parse_cli_invocation(args)?)
 }
 
+pub(crate) fn with_rollout_activation_admission<T>(
+    rollout_paths: &SelfRolloutPaths,
+    operation: impl FnOnce() -> Result<T, CliError>,
+) -> Result<T, CliError> {
+    let _admission = acquire_rollout_activation_guard(rollout_paths)?;
+    operation()
+}
+
+fn run_registered_cli_command(
+    command: RegisteredCliCommand,
+    force_local: bool,
+) -> Result<(), CliError> {
+    let command_name = command.name().to_string();
+    let mut stdout = CliStdoutWriter;
+    let mut stderr = CliStderrWriter;
+    let mut context =
+        CliCommandContext::new(&mut stdout, &mut stderr).with_force_local(force_local);
+    command
+        .run(&mut context)
+        .map_err(|error| CliError::ExternalCommand {
+            command: command_name,
+            detail: error.to_string(),
+        })
+}
+
 fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> {
     ensure_cluster_directory_installed();
     let command = invocation.command;
@@ -4652,18 +4700,13 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
         CliCommand::Test(command) => run_test_command(command),
         CliCommand::Agent(command) => run_agent_command(command),
         CliCommand::Skill(command) => run_skill_command(command),
-        CliCommand::Registered(command) => {
-            let command_name = command.name().to_string();
-            let mut stdout = CliStdoutWriter;
-            let mut stderr = CliStderrWriter;
-            let mut context =
-                CliCommandContext::new(&mut stdout, &mut stderr).with_force_local(force_local);
-            command
-                .run(&mut context)
-                .map_err(|error| CliError::ExternalCommand {
-                    command: command_name,
-                    detail: error.to_string(),
-                })
+        CliCommand::Registered(command) => run_registered_cli_command(command, force_local),
+        CliCommand::RegisteredRolloutMutation(command) => {
+            let data_dir = SinomoDataDir::from_env_or_home()?;
+            let rollout_paths = SelfRolloutPaths::new(&data_dir.root());
+            with_rollout_activation_admission(&rollout_paths, || {
+                run_registered_cli_command(command, force_local)
+            })
         }
         CliCommand::Usage(options) => usage(options),
     }

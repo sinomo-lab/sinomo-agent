@@ -486,6 +486,13 @@ pub fn load_daemon_network_module_registry(
         }
     };
     for state in states {
+        if !sinomo_rollout::native_dylib_loader_state_is_host_compatible(&state) {
+            tracing::warn!(
+                "sinomo daemon native module {} skipped because its build platform or native ABI does not match this host",
+                state.module_id
+            );
+            continue;
+        }
         match load_daemon_network_module_from_loader_state(data_dir_root, &state, context.as_ref())
         {
             Ok(Some((network_module_id, module, enabled, started))) => {
@@ -561,26 +568,22 @@ fn load_daemon_network_module_from_loader_state(
         )
     }
     .map_err(|error| network_error(error.to_string()))?;
-    // SAFETY: symbol type matches the pinned v1 entry signature.
+    // SAFETY: symbol type matches the pinned v2 entry signature.
     let entry = unsafe {
-        library.symbol::<sinomo_core::network::network_module_abi::SinomoNetworkModuleCreateV1Fn>(
+        library.symbol::<sinomo_core::network::network_module_abi::SinomoNetworkModuleCreateV2Fn>(
             sinomo_core::network::network_module_abi::SINOMO_NETWORK_MODULE_ENTRY_SYMBOL,
         )
     }
     .map_err(|error| network_error(error.to_string()))?;
     let mut instance: *mut std::ffi::c_void = std::ptr::null_mut();
-    let mut vtable = std::mem::MaybeUninit::<
-        sinomo_core::network::network_module_abi::SinomoNetworkModuleVtableV1,
-    >::uninit();
+    let mut vtable = sinomo_core::network::network_module_abi::SinomoNetworkModuleVtableV2::empty();
     // SAFETY: calling the module's exported entry with valid out pointers.
-    let status = unsafe { entry(&mut instance, vtable.as_mut_ptr()) };
+    let status = unsafe { entry(&mut instance, &mut vtable) };
     if status != sinomo_core::network::network_module_abi::SINOMO_NETWORK_MODULE_STATUS_OK {
         return Err(network_error(format!(
             "network module entry returned status {status}"
         )));
     }
-    // SAFETY: entry returned OK, so the vtable was fully initialized.
-    let vtable = unsafe { vtable.assume_init() };
     // SAFETY: instance/vtable come from the entry call above; the
     // NativeLibrary keep-alive token keeps the dylib mapped for the adapter's
     // lifetime (the registry never drops registered modules).

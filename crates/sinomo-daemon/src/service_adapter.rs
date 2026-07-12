@@ -3529,6 +3529,13 @@ fn daemon_internal_module_registry(
             }
         };
     for state in native_dylib_states {
+        if !sinomo_rollout::native_dylib_loader_state_is_host_compatible(&state) {
+            tracing::warn!(
+                "daemon native-dylib module {} skipped because its build platform or native ABI does not match this host",
+                state.module_id
+            );
+            continue;
+        }
         let registration = match sinomo_module::native_dylib_module_registration_from_loader_state(
             data_dir_root,
             &state,

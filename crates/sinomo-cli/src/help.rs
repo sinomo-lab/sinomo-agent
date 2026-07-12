@@ -295,13 +295,16 @@ pub(super) fn print_rollout_help() {
         "      Build the data-directory source repo, stage main and shadow binaries, then verify main health."
     );
     println!(
-        "  sinomo rollout cluster [--repo <path> | --binary <path>] [--target <host:port>] [--remote-build] [--force-source] [--remote-repo <path>] [--skip-local]"
+        "  sinomo rollout cluster [--repo <path> | --binary <path>] [--target <host:port>] [--remote-build] [--force-source] [--remote-repo <path>] [--skip-local] [--skip-native-modules]"
     );
     println!(
         "      Build or use a dev binary for compatible nodes, or ask targets to build from their own source repo, then activate through shadow supervision or the main-only shadow bootstrap path."
     );
     println!(
         "      --force-source stashes local changes in the managed source repo before overwriting it with the rollout source."
+    );
+    println!(
+        "      --skip-native-modules pushes only the locally built binary for supervisor ABI bootstrapping; it cannot be combined with --remote-build or --remote-repo."
     );
     println!(
         "  sinomo rollout module native-dylib <module-id|package|source|cache-key> [--repo <path>] [--target <host:port>] [--skip-local]"

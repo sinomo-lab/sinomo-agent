@@ -29,6 +29,7 @@ pub(crate) struct RolloutOptions {
     pub(crate) shadow_port: u16,
     pub(crate) skip_local: bool,
     pub(crate) remote_build: bool,
+    pub(crate) skip_native_modules: bool,
     pub(crate) force_source_overwrite: bool,
 }
 
@@ -44,6 +45,7 @@ impl Default for RolloutOptions {
             shadow_port: SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
             skip_local: false,
             remote_build: false,
+            skip_native_modules: false,
             force_source_overwrite: false,
         }
     }
@@ -126,34 +128,34 @@ pub(crate) fn parse_rollout_command(args: &[String]) -> Result<RolloutCliCommand
         Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
             Ok(RolloutCliCommand::Help)
         }
-        Some((command, rest)) if command == "init-source" => {
-            Ok(RolloutCliCommand::InitSource(parse_rollout_options(rest)?))
-        }
+        Some((command, rest)) if command == "init-source" => Ok(RolloutCliCommand::InitSource(
+            parse_rollout_options_without_native_module_skip(rest, "rollout init-source")?,
+        )),
         Some((command, rest))
             if matches!(command.as_str(), "import-source" | "sync-from-external") =>
         {
-            Ok(RolloutCliCommand::ImportSource(parse_rollout_options(
-                rest,
-            )?))
+            Ok(RolloutCliCommand::ImportSource(
+                parse_rollout_options_without_native_module_skip(rest, "rollout import-source")?,
+            ))
         }
         Some((command, rest))
             if matches!(command.as_str(), "export-source" | "sync-to-external") =>
         {
-            Ok(RolloutCliCommand::ExportSource(parse_rollout_options(
-                rest,
-            )?))
+            Ok(RolloutCliCommand::ExportSource(
+                parse_rollout_options_without_native_module_skip(rest, "rollout export-source")?,
+            ))
         }
         Some((command, rest)) if matches!(command.as_str(), "apply-external" | "from-external") => {
-            Ok(RolloutCliCommand::ApplyExternal(parse_rollout_options(
-                rest,
-            )?))
+            Ok(RolloutCliCommand::ApplyExternal(
+                parse_rollout_options_without_native_module_skip(rest, "rollout apply-external")?,
+            ))
         }
-        Some((command, rest)) if command == "apply" => {
-            Ok(RolloutCliCommand::Apply(parse_rollout_options(rest)?))
-        }
-        Some((command, rest)) if matches!(command.as_str(), "cluster" | "apply-cluster") => {
-            Ok(RolloutCliCommand::Cluster(parse_rollout_options(rest)?))
-        }
+        Some((command, rest)) if command == "apply" => Ok(RolloutCliCommand::Apply(
+            parse_rollout_options_without_native_module_skip(rest, "rollout apply")?,
+        )),
+        Some((command, rest)) if matches!(command.as_str(), "cluster" | "apply-cluster") => Ok(
+            RolloutCliCommand::Cluster(parse_rollout_cluster_options(rest)?),
+        ),
         Some((command, rest)) if command == "module" => parse_rollout_module_command(rest),
         Some((command, rest)) if command == "advance" => Ok(RolloutCliCommand::Advance(
             parse_rollout_advance_options(rest)?,
@@ -164,10 +166,14 @@ pub(crate) fn parse_rollout_command(args: &[String]) -> Result<RolloutCliCommand
             parse_rollout_telemetry_gates_command(rest)
         }
         Some((command, rest)) if matches!(command.as_str(), "diagnostics" | "diag") => {
-            Ok(RolloutCliCommand::Diagnostics(parse_rollout_options(rest)?))
+            Ok(RolloutCliCommand::Diagnostics(
+                parse_rollout_options_without_native_module_skip(rest, "rollout diagnostics")?,
+            ))
         }
         Some((command, rest)) if matches!(command.as_str(), "clear-status" | "clear-state") => {
-            Ok(RolloutCliCommand::ClearStatus(parse_rollout_options(rest)?))
+            Ok(RolloutCliCommand::ClearStatus(
+                parse_rollout_options_without_native_module_skip(rest, "rollout clear-status")?,
+            ))
         }
         Some((command, [])) if command == "status" => Ok(RolloutCliCommand::Status),
         _ => Err(CliError::Usage),
@@ -243,12 +249,58 @@ pub(crate) fn parse_rollout_options(args: &[String]) -> Result<RolloutOptions, C
             }
             "--skip-local" => options.skip_local = true,
             "--remote-build" => options.remote_build = true,
+            "--skip-native-modules" => options.skip_native_modules = true,
             "--force-source" | "--force-overwrite" => options.force_source_overwrite = true,
             _ => return Err(CliError::Usage),
         }
         index += 1;
     }
     Ok(options)
+}
+
+fn parse_rollout_options_without_native_module_skip(
+    args: &[String],
+    command: &str,
+) -> Result<RolloutOptions, CliError> {
+    let options = parse_rollout_options(args)?;
+    reject_native_module_skip(&options, command)?;
+    Ok(options)
+}
+
+fn reject_native_module_skip(options: &RolloutOptions, command: &str) -> Result<(), CliError> {
+    if options.skip_native_modules {
+        return Err(CliError::Parse {
+            detail: format!(
+                "--skip-native-modules is only supported by `rollout cluster` binary-push rollouts; `{command}` must keep the binary and native module set together"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn parse_rollout_cluster_options(args: &[String]) -> Result<RolloutOptions, CliError> {
+    let options = parse_rollout_options(args)?;
+    validate_cluster_native_module_skip(&options)?;
+    Ok(options)
+}
+
+fn validate_cluster_native_module_skip(options: &RolloutOptions) -> Result<(), CliError> {
+    if !options.skip_native_modules {
+        return Ok(());
+    }
+    if options.remote_build {
+        return Err(CliError::Parse {
+            detail: "--skip-native-modules cannot be combined with --remote-build; it is a binary-push bootstrap option"
+                .to_string(),
+        });
+    }
+    if options.remote_repo.is_some() {
+        return Err(CliError::Parse {
+            detail: "--skip-native-modules cannot be combined with --remote-repo; it is a binary-push bootstrap option"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn parse_rollout_module_native_dylib_options(
@@ -308,11 +360,12 @@ fn parse_rollout_module_native_dylib_options(
     if rollout.binary.is_some()
         || rollout.remote_build
         || rollout.remote_repo.is_some()
+        || rollout.skip_native_modules
         || rollout.force_source_overwrite
     {
         return Err(CliError::Parse {
             detail:
-                "module native-dylib rollout supports --repo, --target, --host, --port, --shadow-port, and --skip-local"
+                "module native-dylib rollout supports --repo, --target, --host, --port, --shadow-port, and --skip-local; --skip-native-modules is only for cluster binary-push rollouts"
                     .to_string(),
         });
     }
@@ -707,6 +760,7 @@ pub(crate) fn rollout_export_source(options: RolloutOptions) -> Result<(), CliEr
 }
 
 pub(crate) fn rollout_apply_external(options: RolloutOptions) -> Result<(), CliError> {
+    reject_native_module_skip(&options, "rollout apply-external")?;
     rollout_import_source(options.clone())?;
     let mut apply_options = options;
     apply_options.repo = None;
@@ -1152,7 +1206,12 @@ pub(crate) fn print_managed_source_status_view(status: ManagedSourceStatus) {
 }
 
 pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
+    reject_native_module_skip(&options, "rollout apply")?;
     let paths = rollout_paths_from_defaults()?;
+    // Local preparation also writes the shared staged binary paths. Acquire
+    // before preparation so a second apply rejects before it can overwrite the
+    // first candidate. The local build is conservatively kept inside the guard.
+    let activation_guard = acquire_rollout_activation_guard(&paths)?;
     let rollout_plan = paths.plan();
     let artifacts = prepare_local_rollout_artifacts_with_options(
         &paths,
@@ -1161,14 +1220,10 @@ pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
     )?;
 
     let data_dir = SinomoDataDir::from_env_or_home()?;
-    let installed_modules = rollout_install_local_rollout_native_dylib_modules(
-        &data_dir.root(),
-        &artifacts.native_dylib_modules,
-    )?;
     let requested_at = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string());
-    let plan = daemon_prepare_local_rollout_main_activation(
+    let mut plan = daemon_prepare_local_rollout_main_activation(
         &data_dir.root(),
         &paths,
         &artifacts,
@@ -1178,6 +1233,43 @@ pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
         requested_at,
         DAEMON_PROBE_TIMEOUT,
     );
+    stage_native_dylib_loader_state_rollback(&data_dir.root(), &paths, &mut plan.activation)?;
+    let installed_modules = match rollout_install_local_rollout_native_dylib_modules(
+        &data_dir.root(),
+        &artifacts.native_dylib_modules,
+    ) {
+        Ok(installed) => installed,
+        Err(error) => {
+            if let Err(rollback_error) = restore_native_dylib_loader_state_for_activation(
+                &data_dir.root(),
+                &paths,
+                &plan.activation,
+            ) {
+                return Err(CliError::Parse {
+                    detail: format!(
+                        "native module install failed ({error}); restoring previous native loader state failed: {rollback_error}"
+                    ),
+                });
+            }
+            return Err(error.into());
+        }
+    };
+    if let Err(error) =
+        reconcile_rollout_native_dylib_platforms(&data_dir.root(), &rollout_plan.build_dir)
+    {
+        if let Err(rollback_error) = restore_native_dylib_loader_state_for_activation(
+            &data_dir.root(),
+            &paths,
+            &plan.activation,
+        ) {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "native module platform reconciliation failed ({error}); restoring previous native loader state failed: {rollback_error}"
+                ),
+            });
+        }
+        return Err(error.into());
+    }
     // Do NOT stop the shadow supervisor here. Stopping it leaves the node
     // unsupervised whenever the shadow is the root of the process tree — PID 1
     // in a container, or a dev box with no external init to respawn it — which
@@ -1187,8 +1279,28 @@ pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
     // (see handle_daemon_finalize_shadow_rollout). The node is supervised the
     // entire time. When no shadow is running, stage_rollout_main_activation
     // takes the main-only bootstrap path and brings a fresh supervisor up.
-    let activation_strategy =
-        stage_rollout_main_activation(&data_dir.root(), &paths, plan.activation)?;
+    let activation_strategy = match stage_rollout_main_activation(
+        &data_dir.root(),
+        &paths,
+        plan.activation.clone(),
+    ) {
+        Ok(strategy) => strategy,
+        Err(error) => {
+            if let Err(rollback_error) = restore_native_dylib_loader_state_for_activation(
+                &data_dir.root(),
+                &paths,
+                &plan.activation,
+            ) {
+                return Err(CliError::Parse {
+                    detail: format!(
+                        "rollout activation staging failed ({error}); restoring previous native loader state failed: {rollback_error}"
+                    ),
+                });
+            }
+            return Err(error);
+        }
+    };
+    drop(activation_guard);
     if let Some(status) = plan.previous_main_status.as_ref() {
         let _ = send_daemon_shutdown_request(&status.address, DAEMON_PROBE_TIMEOUT);
     }
@@ -1222,6 +1334,7 @@ pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
 }
 
 pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
+    validate_cluster_native_module_skip(&options)?;
     let targets = rollout_cluster_targets(&options)?;
     if targets.is_empty() {
         return Err(CliError::Parse {
@@ -1287,12 +1400,13 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
             }
         };
         let platform_match = rollout_target_platform_matches_local(&target_status);
-        let use_remote_build = daemon_cluster_rollout_should_use_remote_build(
-            target.label(),
-            options.remote_build,
-            options.binary.is_some(),
-            platform_match,
-        );
+        let use_remote_build = !options.skip_native_modules
+            && daemon_cluster_rollout_should_use_remote_build(
+                target.label(),
+                options.remote_build,
+                options.binary.is_some(),
+                platform_match,
+            );
         if use_remote_build {
             let mut request = build_request.clone();
             if request.remote_repo.is_none() {
@@ -1367,6 +1481,7 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
                 source.clone(),
                 &artifacts.built_binary,
                 &artifacts.native_dylib_modules,
+                options.skip_native_modules,
                 options.host.clone(),
                 options.port,
                 options.shadow_port,
@@ -1506,6 +1621,51 @@ mod cluster_rollout_outcome_tests {
     }
 }
 
+#[cfg(test)]
+mod cluster_binary_rollout_tests {
+    use super::*;
+
+    #[test]
+    fn binary_only_rollout_omits_native_module_manifest_and_upload_sources() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cli-binary-only-rollout");
+        let binary = root.join("sinomo");
+        std::fs::write(&binary, b"binary-only").expect("write binary");
+        let missing_module = root.join("module-must-not-be-read.so");
+        let modules = vec![LocalRolloutNativeDylibModuleArtifact {
+            module_id: "module.test".to_string(),
+            interface_version: "test.v1".to_string(),
+            cache_key: "module/test".to_string(),
+            library_name: "libmodule_test.so".to_string(),
+            built_library: missing_module.clone(),
+            source: "test".to_string(),
+        }];
+
+        let prepared = prepare_cluster_binary_rollout(
+            "test-source".to_string(),
+            &binary,
+            &modules,
+            true,
+            "127.0.0.1".to_string(),
+            21_353,
+            21_354,
+            "now".to_string(),
+        )
+        .expect("prepare binary-only rollout without reading module artifact");
+
+        assert!(prepared.manifest.native_dylib_modules.is_empty());
+        assert_eq!(prepared.manifest.total_bytes(), Some(11));
+        assert_eq!(prepared.artifacts.len(), 1);
+        assert_eq!(prepared.artifacts[0].artifact_id, "binary");
+        assert_eq!(prepared.artifacts[0].path, binary);
+        assert!(
+            !prepared
+                .artifacts
+                .iter()
+                .any(|source| source.path == missing_module)
+        );
+    }
+}
+
 fn publish_cluster_rollout_desired(
     options: &RolloutOptions,
     source: &str,
@@ -1577,6 +1737,17 @@ pub(crate) fn rollout_prepare_dev_artifacts(
 ) -> Result<sinomo_runtime::rollout::RolloutBuiltArtifacts, CliError> {
     let repo = rollout_source_repo_from_options(options)?;
     let paths = rollout_paths_from_defaults()?;
+    if options.skip_native_modules {
+        let built_binary = sinomo_runtime::rollout::prepare_rollout_dev_binary(
+            &paths,
+            &repo,
+            options.binary.as_deref(),
+        )?;
+        return Ok(sinomo_runtime::rollout::RolloutBuiltArtifacts {
+            built_binary,
+            native_dylib_modules: Vec::new(),
+        });
+    }
     prepare_rollout_dev_artifacts(&paths, &repo, options.binary.as_deref()).map_err(Into::into)
 }
 
@@ -2228,11 +2399,17 @@ pub(crate) fn prepare_cluster_binary_rollout(
     source: String,
     binary: &Path,
     native_dylib_modules: &[LocalRolloutNativeDylibModuleArtifact],
+    skip_native_modules: bool,
     host: String,
     port: u16,
     shadow_port: u16,
     requested_at: String,
 ) -> Result<PreparedClusterBinaryRollout, CliError> {
+    let native_dylib_modules = if skip_native_modules {
+        &[]
+    } else {
+        native_dylib_modules
+    };
     let manifest = prepare_cluster_rollout_binary_manifest(
         source,
         binary,

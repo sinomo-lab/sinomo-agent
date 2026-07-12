@@ -1,5 +1,6 @@
 use crate::{
     ClusterRolloutNativeDylibModuleArtifact, LocalRolloutNativeDylibModuleArtifact, RolloutError,
+    SelfRolloutPaths, unresolved_native_dylib_loader_rollback_artifacts,
 };
 use std::path::Path;
 
@@ -27,9 +28,12 @@ pub fn install_local_rollout_native_dylib_modules(
         })
         .collect::<Result<Vec<_>, RolloutError>>()?;
     if !installed.is_empty() {
-        sinomo_module::prune_inactive_native_dylib_module_cache(
+        let rollout_paths = SelfRolloutPaths::new(data_dir);
+        let pinned = unresolved_native_dylib_loader_rollback_artifacts(data_dir, &rollout_paths)?;
+        sinomo_module::prune_inactive_native_dylib_module_cache_with_pinned_artifacts(
             data_dir,
             ROLLOUT_NATIVE_DYLIB_INACTIVE_CACHE_RETENTION_PER_KEY,
+            &pinned,
         )?;
     }
     Ok(installed)
@@ -57,9 +61,12 @@ pub fn install_cluster_rollout_native_dylib_modules(
         })
         .collect::<Result<Vec<_>, RolloutError>>()?;
     if !installed.is_empty() {
-        sinomo_module::prune_inactive_native_dylib_module_cache(
+        let rollout_paths = SelfRolloutPaths::new(data_dir);
+        let pinned = unresolved_native_dylib_loader_rollback_artifacts(data_dir, &rollout_paths)?;
+        sinomo_module::prune_inactive_native_dylib_module_cache_with_pinned_artifacts(
             data_dir,
             ROLLOUT_NATIVE_DYLIB_INACTIVE_CACHE_RETENTION_PER_KEY,
+            &pinned,
         )?;
     }
     Ok(installed)

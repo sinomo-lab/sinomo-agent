@@ -284,6 +284,9 @@ pub fn run_daemon_control_loop_with_services(
     } else {
         None
     };
+    // This must precede every loader-state read. Both the process-wide network
+    // registry below and the service module registry load native dylibs.
+    crate::rollout::recover_native_loader_intents_before_registry_load(&paths)?;
     if let Err(error) =
         sinomo_observe::init_observe_runtime(sinomo_observe::ObserveRuntimeConfig::daemon(
             label,

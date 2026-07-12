@@ -13,7 +13,7 @@ ring = "r1"
 
 [package.metadata.sinomo.native-dylib]
 module-id = "module.network-iroh"
-interface-version = "sinomo.network-iroh.v1"
+interface-version = "sinomo.network-iroh.v2"
 cache-key = "module/network/iroh"
 source = "rollout:modules/network/iroh"
 platforms = ["unix"]

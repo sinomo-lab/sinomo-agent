@@ -21,23 +21,27 @@ use sinomo_rollout::{
     PendingShadowRolloutContext, ROLLOUT_DIAGNOSTIC_TAIL_BYTES, RolloutActivationStrategy,
     RolloutFailureDiagnostics, RolloutMainActivation, SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV,
     SHADOW_MAIN_PORT_ENV, SHADOW_START_DELAY_MS_ENV, SelfRolloutPaths,
-    activate_staged_rollout_binary, classify_main_exit, clear_rollout_status,
-    cluster_rollout_progress_status, deploy_managed_source_bundle_with_options,
-    ensure_rollout_layout, managed_source_status, prune_rollout_binary_recovery_backups,
-    read_object, read_pending_shadow_rollout, read_rollout_main_activation, read_tail_lossy,
-    record_activation_failure, record_main_activation_staged,
-    record_main_rollout_failure_with_diagnostics, record_rollout_main_exit,
-    record_shadow_rollout_finalized, remove_main_activation, remove_shadow_finalize,
+    acquire_rollout_activation_guard, activate_staged_rollout_binary, classify_main_exit,
+    clear_rollout_status, cluster_rollout_progress_status,
+    deploy_managed_source_bundle_with_options, ensure_rollout_layout, managed_source_status,
+    prune_rollout_binary_recovery_backups, read_object, read_pending_shadow_rollout,
+    read_rollout_main_activation, read_tail_lossy, record_activation_failure,
+    record_main_activation_staged, record_main_rollout_failure_with_diagnostics,
+    record_rollout_main_exit, record_shadow_rollout_finalized,
+    recover_unresolved_native_dylib_loader_rollback_intents, remove_main_activation,
+    remove_native_dylib_loader_state_rollback, remove_shadow_finalize,
+    restore_native_dylib_loader_state_for_activation, restore_native_dylib_loader_state_rollback,
     restore_rollout_binary_from_backup, rollout_artifact_suffix, rollout_build_dev_artifacts,
     rollout_main_activation_path, rollout_previous_binary_path, rollout_remote_repo_path,
     rollout_shadow_finalize_path, rollout_staged_main_binary, rollout_staged_shadow_binary,
-    rollout_timestamp_now, source_heads_match, stage_pending_shadow_rollout, stage_rollout_file,
-    stage_rollout_file_pair, write_json, write_main_activation, write_object, write_rollout_status,
+    rollout_timestamp_now, source_heads_match, stage_native_dylib_loader_state_rollback,
+    stage_pending_shadow_rollout, stage_rollout_file, stage_rollout_file_pair, write_json,
+    write_main_activation, write_object, write_rollout_status,
 };
 use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{self, Read};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -501,6 +505,7 @@ pub fn prepare_local_rollout_main_activation(
             staged_main_binary: Some(artifacts.staged_main_binary.clone()),
             staged_shadow_binary: Some(artifacts.staged_shadow_binary.clone()),
             previous_main_binary: Some(previous_main_binary),
+            native_dylib_loader_rollback_generation: None,
             main_host,
             main_port,
             shadow_port,
@@ -517,6 +522,72 @@ fn install_local_rollout_native_dylib_modules(
 ) -> Result<Vec<sinomo_module::NativeDylibModuleInstallResult>, DaemonError> {
     sinomo_rollout::install_local_rollout_native_dylib_modules(data_dir, artifacts)
         .map_err(Into::into)
+}
+
+/// Owns an unresolved native-loader intent until its rollout activation marker
+/// is durable. Any early return in the pre-activation phase restores the loader
+/// state and resolves the intent before rollout admission is released.
+struct NativeLoaderPreActivationRollbackGuard {
+    data_dir: PathBuf,
+    rollout_paths: SelfRolloutPaths,
+    activation: RolloutMainActivation,
+    armed: bool,
+}
+
+impl NativeLoaderPreActivationRollbackGuard {
+    fn new(
+        data_dir: &Path,
+        rollout_paths: &SelfRolloutPaths,
+        activation: &RolloutMainActivation,
+    ) -> Self {
+        Self {
+            data_dir: data_dir.to_path_buf(),
+            rollout_paths: rollout_paths.clone(),
+            activation: activation.clone(),
+            armed: true,
+        }
+    }
+
+    fn rollback(&mut self) -> Result<bool, sinomo_rollout::RolloutError> {
+        if !self.armed {
+            return Ok(false);
+        }
+        let restored = restore_native_dylib_loader_state_for_activation(
+            &self.data_dir,
+            &self.rollout_paths,
+            &self.activation,
+        )?;
+        self.armed = false;
+        Ok(restored)
+    }
+
+    fn rollback_with_detail(&mut self, detail: String) -> String {
+        match self.rollback() {
+            Ok(_) => detail,
+            Err(error) => {
+                format!("{detail}; restoring previous native loader state failed: {error}")
+            }
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for NativeLoaderPreActivationRollbackGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = self.rollback() {
+            tracing::error!(
+                error = %error,
+                generation = ?self.activation.native_dylib_loader_rollback_generation,
+                "failed to restore native loader state after pre-activation rollout failure"
+            );
+        }
+    }
 }
 
 fn shadow_reexec_request_path(rollout_paths: &SelfRolloutPaths) -> PathBuf {
@@ -591,6 +662,9 @@ fn complete_pending_shadow_rollout_after_start(
         "shadow rollout finalized",
     )?;
     prune_finalized_rollout_recovery_backups(&finalize.main_binary, &finalize.shadow_binary);
+    if let Some(generation) = finalize.native_dylib_loader_rollback_generation.as_deref() {
+        remove_native_dylib_loader_state_rollback(rollout_paths, generation)?;
+    }
     remove_main_activation(rollout_paths);
     remove_shadow_finalize(rollout_paths);
     crate::append_operational_event_best_effort(
@@ -633,6 +707,9 @@ fn rehydrate_main_activation_if_staged_main_is_pending(
         staged_main_binary: Some(staged_main.clone()),
         staged_shadow_binary: finalize.staged_shadow_binary.clone(),
         previous_main_binary: finalize.previous_main_binary.clone(),
+        native_dylib_loader_rollback_generation: finalize
+            .native_dylib_loader_rollback_generation
+            .clone(),
         main_host: finalize.main_host.clone(),
         main_port: finalize.main_port,
         shadow_port: finalize.shadow_port,
@@ -740,6 +817,24 @@ fn shutdown_shadow_runtime_after_task_shutdown(runtime: tokio::runtime::Runtime)
     runtime.shutdown_timeout(SHADOW_RUNTIME_SHUTDOWN_TIMEOUT);
 }
 
+/// Repairs an orphaned native-loader mutation before startup can read loader
+/// state into either the network-module registry or the service module registry.
+pub(crate) fn recover_native_loader_intents_before_registry_load(
+    paths: &DaemonPaths,
+) -> Result<Vec<String>, DaemonError> {
+    let data_dir = crate::control::daemon_data_dir_path(paths)?;
+    let rollout_paths = SelfRolloutPaths::new(&data_dir);
+    let recovered =
+        recover_unresolved_native_dylib_loader_rollback_intents(&data_dir, &rollout_paths)?;
+    if !recovered.is_empty() {
+        tracing::warn!(
+            generations = %recovered.join(","),
+            "recovered orphaned native loader pre-mutation intent before registry load"
+        );
+    }
+    Ok(recovered)
+}
+
 pub fn run_shadow_daemon_supervision_loop(
     options: crate::DaemonRunOptions,
     shadow_paths: DaemonPaths,
@@ -752,6 +847,7 @@ pub fn run_shadow_daemon_supervision_loop(
     probe_timeout: Duration,
 ) -> Result<(), DaemonError> {
     let _lock = DaemonLock::acquire(&shadow_paths, &options, cluster.clone())?;
+    recover_native_loader_intents_before_registry_load(&shadow_paths)?;
     let bind_address = format!("{}:{}", options.host, options.port);
     let daemon_runtime = crate::build_daemon_async_runtime("shadow-daemon")?;
     let daemon_runtime_handle = daemon_runtime.handle().clone();
@@ -1729,6 +1825,7 @@ pub fn handle_daemon_rollout_native_dylib_module_request(
     let shadow_binary = rollout_paths.shadow_binary.clone();
     let staged_main_binary = rollout_staged_main_binary(&rollout_paths);
     let staged_shadow_binary = rollout_staged_shadow_binary(&rollout_paths);
+    let activation_guard = acquire_rollout_activation_guard(&rollout_paths)?;
     let staging_result = stage_rollout_file(&main_binary, &staged_main_binary).and_then(|()| {
         stage_rollout_file(
             if shadow_binary.exists() {
@@ -1753,10 +1850,29 @@ pub fn handle_daemon_rollout_native_dylib_module_request(
         );
     }
 
+    let mut plan = prepare_cluster_rollout_main_activation(
+        paths,
+        data_dir,
+        source.clone(),
+        main_binary.clone(),
+        shadow_binary.clone(),
+        Some(staged_main_binary),
+        Some(staged_shadow_binary),
+        request.host.clone(),
+        request.port,
+        request.shadow_port,
+        requested_at.clone(),
+        "cluster-module-native-dylib",
+    )?;
+    stage_native_dylib_loader_state_rollback(data_dir, &rollout_paths, &mut plan.activation)?;
+    let mut native_loader_rollback =
+        NativeLoaderPreActivationRollbackGuard::new(data_dir, &rollout_paths, &plan.activation);
+
     let install_result = match install_cluster_rollout_native_dylib_module(data_dir, &request) {
         Ok(result) => result,
         Err(error) => {
-            let detail = format!("install native module artifact failed: {error}");
+            let detail = native_loader_rollback
+                .rollback_with_detail(format!("install native module artifact failed: {error}"));
             let _ = write_cluster_rollout_progress(
                 paths,
                 &rollout_paths,
@@ -1791,22 +1907,10 @@ pub fn handle_daemon_rollout_native_dylib_module_request(
         4,
         "preparing daemon refresh",
     )?;
-    let plan = prepare_cluster_rollout_main_activation(
-        paths,
-        data_dir,
-        source,
-        main_binary.clone(),
-        shadow_binary.clone(),
-        Some(staged_main_binary),
-        Some(staged_shadow_binary),
-        request.host,
-        request.port,
-        request.shadow_port,
-        requested_at,
-        "cluster-module-native-dylib",
-    )?;
     let activation_strategy =
         stage_rollout_main_activation(paths, data_dir, &rollout_paths, plan.activation)?;
+    native_loader_rollback.disarm();
+    drop(activation_guard);
     publish_rollout_progress_to_cluster(paths);
     Ok(ClusterRolloutBinaryResponse {
         status: "accepted".to_string(),
@@ -1927,6 +2031,7 @@ fn activate_daemon_rollout_binary_request(
     let shadow_binary = rollout_paths.shadow_binary.clone();
     let staged_main_binary = rollout_staged_main_binary(&rollout_paths);
     let staged_shadow_binary = rollout_staged_shadow_binary(&rollout_paths);
+    let activation_guard = acquire_rollout_activation_guard(&rollout_paths)?;
     write_cluster_rollout_progress(
         paths,
         &rollout_paths,
@@ -1954,7 +2059,28 @@ fn activate_daemon_rollout_binary_request(
             detail,
         );
     }
+    let mut plan = prepare_cluster_rollout_main_activation(
+        paths,
+        data_dir,
+        source.clone(),
+        main_binary.clone(),
+        shadow_binary.clone(),
+        Some(staged_main_binary),
+        Some(staged_shadow_binary),
+        manifest.host.clone(),
+        manifest.port,
+        manifest.shadow_port,
+        requested_at.clone(),
+        "cluster-binary-push",
+    )?;
+    let mut native_loader_rollback = None;
     if !uploaded_modules.is_empty() {
+        stage_native_dylib_loader_state_rollback(data_dir, &rollout_paths, &mut plan.activation)?;
+        native_loader_rollback = Some(NativeLoaderPreActivationRollbackGuard::new(
+            data_dir,
+            &rollout_paths,
+            &plan.activation,
+        ));
         write_cluster_rollout_progress(
             paths,
             &rollout_paths,
@@ -1972,7 +2098,10 @@ fn activate_daemon_rollout_binary_request(
         )?;
         if let Err(error) = install_local_rollout_native_dylib_modules(data_dir, &uploaded_modules)
         {
-            let detail = format!("install native module artifacts failed: {error}");
+            let detail = native_loader_rollback
+                .as_mut()
+                .expect("native loader rollback guard staged with module artifacts")
+                .rollback_with_detail(format!("install native module artifacts failed: {error}"));
             let _ = write_cluster_rollout_progress(
                 paths,
                 &rollout_paths,
@@ -2007,22 +2136,12 @@ fn activate_daemon_rollout_binary_request(
         4,
         "preparing activation",
     )?;
-    let plan = prepare_cluster_rollout_main_activation(
-        paths,
-        data_dir,
-        source,
-        main_binary.clone(),
-        shadow_binary.clone(),
-        Some(staged_main_binary),
-        Some(staged_shadow_binary),
-        manifest.host,
-        manifest.port,
-        manifest.shadow_port,
-        requested_at,
-        "cluster-binary-push",
-    )?;
     let activation_strategy =
         stage_rollout_main_activation(paths, data_dir, &rollout_paths, plan.activation)?;
+    if let Some(rollback) = native_loader_rollback.as_mut() {
+        rollback.disarm();
+    }
+    drop(activation_guard);
     publish_rollout_progress_to_cluster(paths);
     Ok(ClusterRolloutBinaryResponse {
         status: "accepted".to_string(),
@@ -2386,6 +2505,15 @@ pub fn stage_rollout_main_activation(
     rollout_paths: &SelfRolloutPaths,
     activation: RolloutMainActivation,
 ) -> Result<RolloutActivationStrategy, DaemonError> {
+    if rollout_main_activation_path(rollout_paths).exists()
+        || rollout_shadow_finalize_path(rollout_paths).exists()
+    {
+        restore_native_dylib_loader_state_for_activation(data_dir, rollout_paths, &activation)?;
+        return Err(sinomo_rollout::RolloutError::InvalidTransition {
+            detail: "another rollout activation is already pending on this node".to_string(),
+        }
+        .into());
+    }
     let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
     let current_daemon_is_shadow = paths_equivalent(&current_daemon_paths.root, &shadow_paths.root);
     let shadow_running = current_daemon_is_shadow
@@ -2394,11 +2522,30 @@ pub fn stage_rollout_main_activation(
             CLUSTER_HEALTH_PROBE_TIMEOUT,
         ));
     if !shadow_running {
-        stage_main_only_rollout_without_existing_shadow(data_dir, rollout_paths, activation)?;
+        if let Err(error) = stage_main_only_rollout_without_existing_shadow(
+            data_dir,
+            rollout_paths,
+            activation.clone(),
+        ) {
+            restore_native_dylib_loader_state_for_activation(data_dir, rollout_paths, &activation)?;
+            return Err(error);
+        }
         return Ok(RolloutActivationStrategy::MainOnlyShadowBootstrap);
     }
-    write_main_activation(rollout_paths, &activation)?;
-    record_main_activation_staged(rollout_paths, &activation)?;
+    if let Err(error) = write_main_activation(rollout_paths, &activation) {
+        remove_main_activation(rollout_paths);
+        restore_native_dylib_loader_state_for_activation(data_dir, rollout_paths, &activation)?;
+        return Err(error.into());
+    }
+    if let Err(error) = record_main_activation_staged(rollout_paths, &activation) {
+        // The activation record is the shadow supervisor's execution trigger.
+        // Never leave it behind when the accompanying durable status could not
+        // be recorded, or a restart may activate a rollout already reported as
+        // rejected while its loader state has been restored.
+        remove_main_activation(rollout_paths);
+        restore_native_dylib_loader_state_for_activation(data_dir, rollout_paths, &activation)?;
+        return Err(error.into());
+    }
     match staged_main_activation_shutdown_action(current_daemon_is_shadow) {
         StagedMainActivationShutdown::Immediate => {
             request_main_shutdown_for_shadow_rollout(data_dir, &activation)?;
@@ -2456,8 +2603,22 @@ fn stage_main_only_rollout_without_existing_shadow(
         STABLE_BINARY_COPY_TIMEOUT,
         STABLE_BINARY_COPY_RETRY_INTERVAL,
     )?;
-    write_main_activation(rollout_paths, &activation)?;
-    record_main_activation_staged(rollout_paths, &activation)?;
+    if let Err(error) = write_main_activation(rollout_paths, &activation) {
+        remove_main_activation(rollout_paths);
+        rollback_main_only_shadow_binary(
+            previous_shadow_binary.as_deref(),
+            &activation.shadow_binary,
+        )?;
+        return Err(error.into());
+    }
+    if let Err(error) = record_main_activation_staged(rollout_paths, &activation) {
+        remove_main_activation(rollout_paths);
+        rollback_main_only_shadow_binary(
+            previous_shadow_binary.as_deref(),
+            &activation.shadow_binary,
+        )?;
+        return Err(error.into());
+    }
     // Bring up the bootstrap shadow with bounded, health-verified retries so a
     // transient bind/lock race during handoff does not leave the node without a
     // supervisor. In tests the spawn/probe is skipped.
@@ -2488,16 +2649,52 @@ fn stage_main_only_rollout_without_existing_shadow(
             previous_main,
             &format!("main-only rollout could not start stable shadow supervisor: {error}"),
         );
-        if let Some(previous_shadow_binary) = previous_shadow_binary.as_ref() {
-            let _ = restore_rollout_binary_from_backup_with_retry(
-                previous_shadow_binary,
-                &activation.shadow_binary,
-                STABLE_BINARY_COPY_TIMEOUT,
-                STABLE_BINARY_COPY_RETRY_INTERVAL,
-            );
-        }
+        restore_native_dylib_loader_state_for_activation(data_dir, rollout_paths, &activation)?;
+        let _ = rollback_main_only_shadow_binary(
+            previous_shadow_binary.as_deref(),
+            &activation.shadow_binary,
+        );
         let _ = remove_main_activation(rollout_paths);
         return Err(error);
+    }
+    Ok(())
+}
+
+fn rollback_main_only_shadow_binary(
+    previous_shadow_binary: Option<&Path>,
+    shadow_binary: &Path,
+) -> Result<(), DaemonError> {
+    if let Some(previous_shadow_binary) = previous_shadow_binary {
+        restore_rollout_binary_from_backup_with_retry(
+            previous_shadow_binary,
+            shadow_binary,
+            STABLE_BINARY_COPY_TIMEOUT,
+            STABLE_BINARY_COPY_RETRY_INTERVAL,
+        )?;
+        return Ok(());
+    }
+
+    // The activation created this destination from scratch. Removing it is the
+    // inverse of the swap; leaving it behind would let a later bootstrap launch
+    // a candidate whose activation metadata was never durably accepted.
+    match fs::remove_file(shadow_binary) {
+        Ok(()) => {}
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(DaemonError::Io {
+                path: shadow_binary.display().to_string(),
+                detail: source.to_string(),
+            });
+        }
+    }
+    #[cfg(unix)]
+    if let Some(parent) = shadow_binary.parent() {
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| DaemonError::Io {
+                path: parent.display().to_string(),
+                detail: source.to_string(),
+            })?;
     }
     Ok(())
 }
@@ -2616,6 +2813,7 @@ fn prepare_cluster_rollout_main_activation(
             staged_main_binary,
             staged_shadow_binary,
             previous_main_binary: Some(previous_main_binary),
+            native_dylib_loader_rollback_generation: None,
             main_host,
             main_port,
             shadow_port,
@@ -2968,6 +3166,9 @@ fn finalize_pending_shadow_rollout(
                 Duration::from_secs(15),
                 DAEMON_PROBE_TIMEOUT,
             )?;
+            if let Some(generation) = finalize.native_dylib_loader_rollback_generation.as_deref() {
+                restore_native_dylib_loader_state_rollback(data_dir, &rollout_paths, generation)?;
+            }
             if let Some(previous_main_binary) = finalize.previous_main_binary.as_ref() {
                 restore_rollout_binary_from_backup_with_retry(
                     previous_main_binary,
@@ -3014,6 +3215,9 @@ fn finalize_pending_shadow_rollout(
     record_shadow_rollout_finalized(&rollout_paths, &finalize, status, &detail)?;
     if status == "accepted" {
         prune_finalized_rollout_recovery_backups(&finalize.main_binary, &finalize.shadow_binary);
+        if let Some(generation) = finalize.native_dylib_loader_rollback_generation.as_deref() {
+            remove_native_dylib_loader_state_rollback(&rollout_paths, generation)?;
+        }
     }
     remove_shadow_finalize(&rollout_paths);
     Ok(format!("{status}: {detail}\n"))
@@ -3281,6 +3485,11 @@ pub fn recover_failed_shadow_main_rollout(
         detail,
         Some(&diagnostics),
     )?;
+    let data_dir = rollout_paths.root.parent().ok_or_else(|| DaemonError::Io {
+        path: rollout_paths.root.display().to_string(),
+        detail: "rollout path has no data directory parent".to_string(),
+    })?;
+    restore_native_dylib_loader_state_for_activation(data_dir, rollout_paths, &pending.activation)?;
     restore_rollout_binary_from_backup_with_retry(
         &pending.previous_main_binary,
         &pending.activation.main_binary,
@@ -3349,6 +3558,15 @@ pub fn start_shadow_main_if_needed(
                     &activation,
                     &previous_main_binary,
                     &format!("candidate main could not execute: {error}"),
+                )?;
+                let data_dir = rollout_paths.root.parent().ok_or_else(|| DaemonError::Io {
+                    path: rollout_paths.root.display().to_string(),
+                    detail: "rollout path has no data directory parent".to_string(),
+                })?;
+                restore_native_dylib_loader_state_for_activation(
+                    data_dir,
+                    rollout_paths,
+                    &activation,
                 )?;
                 restore_rollout_binary_from_backup_with_retry(
                     &previous_main_binary,
@@ -3680,6 +3898,7 @@ pub fn handle_daemon_rollout_build_request(
     let shadow_binary = rollout_paths.shadow_binary.clone();
     let staged_main_binary = rollout_staged_main_binary(&rollout_paths);
     let staged_shadow_binary = rollout_staged_shadow_binary(&rollout_paths);
+    let activation_guard = acquire_rollout_activation_guard(&rollout_paths)?;
     write_cluster_rollout_progress(
         paths,
         &rollout_paths,
@@ -3709,6 +3928,23 @@ pub fn handle_daemon_rollout_build_request(
             detail,
         );
     }
+    let mut plan = prepare_cluster_rollout_main_activation(
+        paths,
+        data_dir,
+        source.clone(),
+        main_binary.clone(),
+        shadow_binary.clone(),
+        Some(staged_main_binary),
+        Some(staged_shadow_binary),
+        request.host.clone(),
+        request.port,
+        request.shadow_port,
+        requested_at.clone(),
+        "cluster-remote-build",
+    )?;
+    stage_native_dylib_loader_state_rollback(data_dir, &rollout_paths, &mut plan.activation)?;
+    let mut native_loader_rollback =
+        NativeLoaderPreActivationRollbackGuard::new(data_dir, &rollout_paths, &plan.activation);
     if !built_artifacts.native_dylib_modules.is_empty() {
         write_cluster_rollout_progress(
             paths,
@@ -3729,7 +3965,8 @@ pub fn handle_daemon_rollout_build_request(
             data_dir,
             &built_artifacts.native_dylib_modules,
         ) {
-            let detail = format!("install native module artifacts failed: {error}");
+            let detail = native_loader_rollback
+                .rollback_with_detail(format!("install native module artifacts failed: {error}"));
             let _ = write_cluster_rollout_progress(
                 paths,
                 &rollout_paths,
@@ -3751,6 +3988,29 @@ pub fn handle_daemon_rollout_build_request(
             });
         }
     }
+    if let Err(error) = sinomo_rollout::reconcile_rollout_native_dylib_platforms(data_dir, &repo) {
+        let detail = native_loader_rollback
+            .rollback_with_detail(format!("reconcile native module platforms failed: {error}"));
+        let _ = write_cluster_rollout_progress(
+            paths,
+            &rollout_paths,
+            "rejected",
+            "cluster-remote-build",
+            Some(detail.clone()),
+            &source,
+            &requested_at,
+            "module-install-failed",
+            CLUSTER_ROLLOUT_PROGRESS_TOTAL,
+            "module platform reconciliation failed",
+        );
+        return Ok(ClusterRolloutBinaryResponse {
+            status: "rejected".to_string(),
+            detail,
+            main_binary: PathBuf::new(),
+            shadow_binary: PathBuf::new(),
+            source_head: None,
+        });
+    }
 
     write_cluster_rollout_progress(
         paths,
@@ -3764,22 +4024,10 @@ pub fn handle_daemon_rollout_build_request(
         4,
         "preparing activation",
     )?;
-    let plan = prepare_cluster_rollout_main_activation(
-        paths,
-        data_dir,
-        source.clone(),
-        main_binary.clone(),
-        shadow_binary.clone(),
-        Some(staged_main_binary),
-        Some(staged_shadow_binary),
-        request.host.clone(),
-        request.port,
-        request.shadow_port,
-        requested_at.clone(),
-        "cluster-remote-build",
-    )?;
     let activation_strategy =
         stage_rollout_main_activation(paths, data_dir, &rollout_paths, plan.activation)?;
+    native_loader_rollback.disarm();
+    drop(activation_guard);
     let _ = (repo, built_artifacts);
     publish_rollout_progress_to_cluster(paths);
     Ok(ClusterRolloutBinaryResponse {
@@ -4226,6 +4474,11 @@ mod tests {
         ensure_rollout_layout(&rollout_paths).expect("rollout layout");
         let shadow_paths = DaemonPaths::with_root(root.join("shadow-daemon"));
         let activation = test_main_activation(&rollout_paths);
+        // Top-level rollout paths hold the activation guard while this staging
+        // primitive writes the durable pending record; it must not try to
+        // reacquire the caller-owned lock.
+        let _activation_guard =
+            acquire_rollout_activation_guard(&rollout_paths).expect("activation guard");
 
         let strategy =
             stage_rollout_main_activation(&shadow_paths, &root, &rollout_paths, activation.clone())
@@ -4236,6 +4489,31 @@ mod tests {
             .expect("read activation")
             .expect("activation staged");
         assert_eq!(staged, activation);
+    }
+
+    #[test]
+    fn activation_status_failure_removes_shadow_execution_trigger() {
+        let root = temp_rollout_test_root("activation-status-failure-cleans-trigger");
+        std::fs::create_dir_all(root.join("shadow-daemon")).expect("shadow root");
+        let mut rollout_paths = SelfRolloutPaths::new(&root);
+        ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let shadow_paths = DaemonPaths::with_root(root.join("shadow-daemon"));
+        rollout_paths.state = rollout_paths.root.join("unwritable-status-directory");
+        std::fs::create_dir_all(&rollout_paths.state).expect("status directory");
+
+        let error = stage_rollout_main_activation(
+            &shadow_paths,
+            &root,
+            &rollout_paths,
+            test_main_activation(&rollout_paths),
+        )
+        .expect_err("status metadata write must fail");
+
+        assert!(error.to_string().contains("filesystem error"));
+        assert!(
+            !rollout_main_activation_path(&rollout_paths).exists(),
+            "failed status write must not leave an executable pending activation"
+        );
     }
 
     #[test]
@@ -4331,6 +4609,76 @@ mod tests {
             staged_names,
             vec![format!("sinomo{}", std::env::consts::EXE_SUFFIX)]
         );
+    }
+
+    #[test]
+    fn main_only_activation_status_failure_restores_swapped_shadow_before_returning() {
+        let root = temp_rollout_test_root("main-shadow-bootstrap-status-rollback");
+        std::fs::create_dir_all(root.join("daemon")).expect("main root");
+        let mut rollout_paths = SelfRolloutPaths::new(&root);
+        ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let main_paths = DaemonPaths::with_root(root.join("daemon"));
+        let staged_main = rollout_staged_main_binary(&rollout_paths);
+        let staged_shadow = rollout_staged_shadow_binary(&rollout_paths);
+        std::fs::create_dir_all(staged_main.parent().expect("staged parent"))
+            .expect("staged parent dir");
+        write_test_executable(&staged_main);
+        std::fs::write(&staged_shadow, b"candidate-shadow").expect("candidate shadow");
+        std::fs::create_dir_all(
+            rollout_paths
+                .shadow_binary
+                .parent()
+                .expect("installed shadow parent"),
+        )
+        .expect("installed shadow parent");
+        std::fs::write(&rollout_paths.shadow_binary, b"stable-shadow").expect("stable shadow");
+        let mut activation = test_main_activation(&rollout_paths);
+        activation.staged_main_binary = Some(staged_main);
+        activation.staged_shadow_binary = Some(staged_shadow);
+        rollout_paths.state = rollout_paths.root.join("unwritable-status-directory");
+        std::fs::create_dir_all(&rollout_paths.state).expect("status directory");
+
+        stage_rollout_main_activation(&main_paths, &root, &rollout_paths, activation)
+            .expect_err("status metadata write must fail");
+
+        assert_eq!(
+            std::fs::read(&rollout_paths.shadow_binary).expect("restored shadow"),
+            b"stable-shadow"
+        );
+        assert!(
+            !rollout_main_activation_path(&rollout_paths).exists(),
+            "failed main-only activation must remove its pending record"
+        );
+    }
+
+    #[test]
+    fn main_only_activation_status_failure_removes_new_shadow_without_predecessor() {
+        let root = temp_rollout_test_root("main-shadow-bootstrap-status-remove-new");
+        std::fs::create_dir_all(root.join("daemon")).expect("main root");
+        let mut rollout_paths = SelfRolloutPaths::new(&root);
+        ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let main_paths = DaemonPaths::with_root(root.join("daemon"));
+        let staged_main = rollout_staged_main_binary(&rollout_paths);
+        let staged_shadow = rollout_staged_shadow_binary(&rollout_paths);
+        std::fs::create_dir_all(staged_main.parent().expect("staged parent"))
+            .expect("staged parent dir");
+        write_test_executable(&staged_main);
+        std::fs::write(&staged_shadow, b"candidate-shadow").expect("candidate shadow");
+        assert!(!rollout_paths.shadow_binary.exists());
+        let mut activation = test_main_activation(&rollout_paths);
+        activation.staged_main_binary = Some(staged_main);
+        activation.staged_shadow_binary = Some(staged_shadow);
+        rollout_paths.state = rollout_paths.root.join("unwritable-status-directory");
+        std::fs::create_dir_all(&rollout_paths.state).expect("status directory");
+
+        stage_rollout_main_activation(&main_paths, &root, &rollout_paths, activation)
+            .expect_err("status metadata write must fail");
+
+        assert!(
+            !rollout_paths.shadow_binary.exists(),
+            "candidate destination created without a predecessor must be removed"
+        );
+        assert!(!rollout_main_activation_path(&rollout_paths).exists());
     }
 
     #[test]
@@ -4612,6 +4960,252 @@ mod tests {
     }
 
     #[test]
+    fn forced_candidate_failure_restores_previous_native_loader_state() {
+        let root = temp_rollout_test_root("candidate-loader-rollback");
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let module_id =
+            sinomo_module::ModuleId::from_legacy_named("module.network.iroh").expect("module id");
+        let previous_state = sinomo_module::NativeDylibModuleLoaderState {
+            module_id: module_id.clone(),
+            artifact_id: None,
+            content_hash: "blake3:previous".to_string(),
+            cache_key: "network/iroh".to_string(),
+            library_name: "libsinomo_network_iroh_module.so".to_string(),
+            platform_triple: "x86_64-unknown-linux-gnu".to_string(),
+            native_abi_version: 1,
+            interface_version: "sinomo-network-module-v1".to_string(),
+            activated_at: "2026-07-12T00:00:00Z".to_string(),
+            source: "test:previous".to_string(),
+        };
+        let previous_cache = sinomo_module::native_module_cache_path(
+            &root,
+            &previous_state.cache_key,
+            &previous_state.content_hash,
+            &previous_state.library_name,
+        );
+        fs::create_dir_all(previous_cache.parent().expect("cache parent")).expect("cache dir");
+        fs::write(&previous_cache, b"previous module").expect("previous cache");
+        sinomo_module::write_native_dylib_module_loader_state(&root, &previous_state)
+            .expect("previous loader state");
+
+        let mut activation = test_main_activation(&rollout_paths);
+        let generation =
+            stage_native_dylib_loader_state_rollback(&root, &rollout_paths, &mut activation)
+                .expect("stage native loader rollback");
+        let mut candidate_state = previous_state.clone();
+        candidate_state.content_hash = "blake3:candidate".to_string();
+        candidate_state.native_abi_version = 2;
+        candidate_state.interface_version = "sinomo-network-module-v2".to_string();
+        let candidate_cache = sinomo_module::native_module_cache_path(
+            &root,
+            &candidate_state.cache_key,
+            &candidate_state.content_hash,
+            &candidate_state.library_name,
+        );
+        fs::create_dir_all(candidate_cache.parent().expect("candidate parent"))
+            .expect("candidate cache dir");
+        fs::write(&candidate_cache, b"candidate module").expect("candidate cache");
+        sinomo_module::write_native_dylib_module_loader_state(&root, &candidate_state)
+            .expect("candidate loader state");
+
+        write_test_executable(&activation.main_binary);
+        let previous_main_binary = root.join("bin/sinomo.previous");
+        fs::write(&previous_main_binary, b"previous binary").expect("previous binary");
+        let diagnostics = CandidateMainDiagnostics {
+            stdout_log: root.join("rollout/logs/candidate.stdout.log"),
+            stderr_log: root.join("rollout/logs/candidate.stderr.log"),
+            diagnostics_path: root.join("rollout/logs/candidate.json"),
+        };
+        fs::create_dir_all(diagnostics.stdout_log.parent().expect("diagnostics parent"))
+            .expect("diagnostics dir");
+        fs::write(&diagnostics.stdout_log, b"").expect("stdout log");
+        fs::write(&diagnostics.stderr_log, b"forced candidate failure").expect("stderr log");
+        let monitor = ShadowMainRolloutMonitor {
+            activation,
+            main_options: crate::DaemonRunOptions {
+                host: "127.0.0.1".to_string(),
+                port: 21353,
+            },
+            previous_main_binary,
+            previous_shadow_binary: root.join("bin/shadow.previous"),
+            diagnostics,
+            deadline: Instant::now(),
+        };
+
+        recover_failed_shadow_main_rollout(
+            &rollout_paths,
+            &monitor,
+            "forced candidate failure",
+            None,
+        )
+        .expect("recover failed candidate");
+
+        let restored = sinomo_module::read_native_dylib_module_loader_state(&root, &module_id)
+            .expect("read restored loader state")
+            .expect("restored loader state");
+        assert_eq!(restored, previous_state);
+        assert_eq!(
+            fs::read(&monitor.activation.main_binary).expect("restored binary"),
+            b"previous binary"
+        );
+        assert!(
+            sinomo_rollout::rollout_native_dylib_loader_rollback_path(&rollout_paths, &generation,)
+                .expect("rollback path")
+                .exists(),
+            "failed generation backup must remain available"
+        );
+    }
+
+    #[test]
+    fn pre_install_progress_failure_resolves_native_loader_intent() {
+        let root = temp_rollout_test_root("pre-install-progress-loader-rollback");
+        let mut rollout_paths = SelfRolloutPaths::new(&root);
+        ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let module_id =
+            sinomo_module::ModuleId::from_legacy_named("module.network.progress-before-install")
+                .expect("module id");
+        let previous = test_native_loader_state(&module_id, "previous", "test:previous");
+        install_test_native_loader_state(&root, &previous);
+        let mut activation = test_main_activation(&rollout_paths);
+        stage_native_dylib_loader_state_rollback(&root, &rollout_paths, &mut activation)
+            .expect("pre-mutation intent");
+
+        rollout_paths.state = rollout_paths.root.join("unwritable-progress-status");
+        fs::create_dir_all(&rollout_paths.state).expect("status directory");
+        let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
+        fs::create_dir_all(&daemon_paths.root).expect("daemon root");
+        let error = {
+            let _rollback =
+                NativeLoaderPreActivationRollbackGuard::new(&root, &rollout_paths, &activation);
+            write_cluster_rollout_progress(
+                &daemon_paths,
+                &rollout_paths,
+                "in-progress",
+                "test",
+                None,
+                "test-source",
+                "now",
+                "staging-modules",
+                3,
+                "installing native module artifacts",
+            )
+        }
+        .expect_err("progress write must fail before install");
+
+        assert!(error.to_string().contains("filesystem error"));
+        assert_eq!(
+            sinomo_module::read_native_dylib_module_loader_state(&root, &module_id)
+                .expect("read loader state"),
+            Some(previous)
+        );
+        drop(
+            acquire_rollout_activation_guard(&rollout_paths)
+                .expect("resolved pre-install intent must not strand admission"),
+        );
+    }
+
+    #[test]
+    fn post_install_progress_failure_restores_native_loader_state() {
+        let root = temp_rollout_test_root("post-install-progress-loader-rollback");
+        let mut rollout_paths = SelfRolloutPaths::new(&root);
+        ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let module_id =
+            sinomo_module::ModuleId::from_legacy_named("module.network.progress-after-install")
+                .expect("module id");
+        let previous = test_native_loader_state(&module_id, "previous", "test:previous");
+        install_test_native_loader_state(&root, &previous);
+        let mut activation = test_main_activation(&rollout_paths);
+        stage_native_dylib_loader_state_rollback(&root, &rollout_paths, &mut activation)
+            .expect("pre-mutation intent");
+
+        rollout_paths.state = rollout_paths.root.join("unwritable-progress-status");
+        fs::create_dir_all(&rollout_paths.state).expect("status directory");
+        let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
+        fs::create_dir_all(&daemon_paths.root).expect("daemon root");
+        let candidate = test_native_loader_state(&module_id, "candidate", "test:candidate");
+        let error = {
+            let _rollback =
+                NativeLoaderPreActivationRollbackGuard::new(&root, &rollout_paths, &activation);
+            install_test_native_loader_state(&root, &candidate);
+            write_cluster_rollout_progress(
+                &daemon_paths,
+                &rollout_paths,
+                "in-progress",
+                "test",
+                None,
+                "test-source",
+                "now",
+                "preparing-activation",
+                4,
+                "preparing activation",
+            )
+        }
+        .expect_err("progress write must fail after install");
+
+        assert!(error.to_string().contains("filesystem error"));
+        assert_eq!(
+            sinomo_module::read_native_dylib_module_loader_state(&root, &module_id)
+                .expect("read restored loader state"),
+            Some(previous)
+        );
+        drop(
+            acquire_rollout_activation_guard(&rollout_paths)
+                .expect("restored post-install intent must not strand admission"),
+        );
+    }
+
+    #[test]
+    fn daemon_startup_recovers_orphaned_loader_intent_before_registry_observes_state() {
+        let root = temp_rollout_test_root("startup-loader-intent-ordering");
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let module_id = sinomo_module::ModuleId::from_legacy_named("module.network.startup-test")
+            .expect("module id");
+        let state = |hash: &str, source: &str| sinomo_module::NativeDylibModuleLoaderState {
+            module_id: module_id.clone(),
+            artifact_id: None,
+            content_hash: format!("blake3:{hash}"),
+            cache_key: "network/startup-test".to_string(),
+            library_name: "libsinomo_network_startup_test.so".to_string(),
+            platform_triple: "x86_64-unknown-linux-gnu".to_string(),
+            native_abi_version: 2,
+            interface_version: "sinomo-network-module-v2".to_string(),
+            activated_at: "2026-07-12T00:00:00Z".to_string(),
+            source: source.to_string(),
+        };
+        let install_state = |state: &sinomo_module::NativeDylibModuleLoaderState| {
+            let artifact = sinomo_module::native_module_cache_path(
+                &root,
+                &state.cache_key,
+                &state.content_hash,
+                &state.library_name,
+            );
+            fs::create_dir_all(artifact.parent().expect("cache parent")).expect("cache dir");
+            fs::write(&artifact, state.content_hash.as_bytes()).expect("cache artifact");
+            sinomo_module::write_native_dylib_module_loader_state(&root, state)
+                .expect("loader state");
+        };
+
+        let previous = state("previous", "test:previous");
+        install_state(&previous);
+        let mut activation = test_main_activation(&rollout_paths);
+        let generation =
+            stage_native_dylib_loader_state_rollback(&root, &rollout_paths, &mut activation)
+                .expect("pre-mutation intent");
+        install_state(&state("candidate", "test:candidate"));
+
+        let recovered = recover_native_loader_intents_before_registry_load(
+            &DaemonPaths::with_root(root.join("daemon")),
+        )
+        .expect("startup recovery before registry load");
+        assert_eq!(recovered, vec![generation]);
+        let registry_visible_states = sinomo_module::read_native_dylib_module_loader_states(&root)
+            .expect("registry loader-state read");
+        assert_eq!(registry_visible_states, vec![previous]);
+    }
+
+    #[test]
     fn daemon_control_port_released_requires_bindable_port() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test port");
         let port = listener.local_addr().expect("local addr").port();
@@ -4665,6 +5259,40 @@ mod tests {
         fs::write(path, b"sinomo rollout test executable").expect("test executable");
     }
 
+    fn test_native_loader_state(
+        module_id: &sinomo_module::ModuleId,
+        hash: &str,
+        source: &str,
+    ) -> sinomo_module::NativeDylibModuleLoaderState {
+        sinomo_module::NativeDylibModuleLoaderState {
+            module_id: module_id.clone(),
+            artifact_id: None,
+            content_hash: format!("blake3:{hash}"),
+            cache_key: "network/progress-test".to_string(),
+            library_name: "libsinomo_network_progress_test.so".to_string(),
+            platform_triple: "x86_64-unknown-linux-gnu".to_string(),
+            native_abi_version: 2,
+            interface_version: "sinomo-network-module-v2".to_string(),
+            activated_at: "2026-07-12T00:00:00Z".to_string(),
+            source: source.to_string(),
+        }
+    }
+
+    fn install_test_native_loader_state(
+        root: &Path,
+        state: &sinomo_module::NativeDylibModuleLoaderState,
+    ) {
+        let artifact = sinomo_module::native_module_cache_path(
+            root,
+            &state.cache_key,
+            &state.content_hash,
+            &state.library_name,
+        );
+        fs::create_dir_all(artifact.parent().expect("cache parent")).expect("cache directory");
+        fs::write(&artifact, state.content_hash.as_bytes()).expect("cache artifact");
+        sinomo_module::write_native_dylib_module_loader_state(root, state).expect("loader state");
+    }
+
     fn test_daemon_status(pid: u32) -> DaemonStatus {
         DaemonStatus {
             pid,
@@ -4694,6 +5322,7 @@ mod tests {
             staged_main_binary: Some(rollout_staged_main_binary(rollout_paths)),
             staged_shadow_binary: Some(rollout_staged_shadow_binary(rollout_paths)),
             previous_main_binary: Some(rollout_paths.main_binary.clone()),
+            native_dylib_loader_rollback_generation: None,
             main_host: "127.0.0.1".to_string(),
             main_port: 21353,
             shadow_port: 21354,

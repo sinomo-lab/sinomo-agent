@@ -190,7 +190,23 @@ pub fn rollout_build_dev_artifacts(
 }
 
 pub fn rollout_build_dev_binary(repo: &Path, build_log: &Path) -> Result<PathBuf, RolloutError> {
-    rollout_build_dev_artifacts(repo, build_log).map(|artifacts| artifacts.built_binary)
+    let _source_guards = prepare_rollout_build_source(repo)?;
+    let build_args = rollout_binary_build_args();
+    let (command, build) = run_rollout_cargo_build(repo, &build_args, None)?;
+    let log = rollout_build_log_section(repo, &command, &build);
+    fs::write(build_log, log).map_err(|source| RolloutError::Io {
+        path: build_log.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    if !build.status.success() {
+        return Err(rollout_build_process_error(command, &build));
+    }
+    let built_binary = repo
+        .join("target")
+        .join("debug")
+        .join(format!("sinomo{}", env::consts::EXE_SUFFIX));
+    ensure_artifact_exists(&built_binary)?;
+    Ok(built_binary)
 }
 
 fn rollout_build_dev_native_dylib_modules(
@@ -1400,6 +1416,7 @@ mod tests {
             source: "test".to_string(),
         };
 
+        assert_eq!(rollout_binary_build_args(), vec!["build", "-p", "sinomo"]);
         assert_eq!(
             rollout_build_args(std::slice::from_ref(&module)),
             vec![

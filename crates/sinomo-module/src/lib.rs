@@ -11,6 +11,7 @@ pub use native_host::*;
 
 use arc_swap::ArcSwap;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use fs2::FileExt;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_core::events::{EventId, EventStore, EventStoreError, StoredEvent};
@@ -25,7 +26,7 @@ use sinomo_module_api::{
     NativeModuleDeclarativeResource, NativeModuleDescriptor, NativeModuleObjectRpcRoute,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -43,6 +44,7 @@ pub type ModuleActivationId = sinomo_core::Id;
 pub const ARTIFACT_SIGNATURE_PROTOCOL: &str = "sinomo.artifact-manifest-signature.v1";
 pub const LOCAL_ED25519_ARTIFACT_SIGNATURE_SCHEME: &str = "local-ed25519";
 pub const MODULE_OBJECT_VERSION: u16 = 1;
+pub const NATIVE_DYLIB_HOST_ABI_VERSION: u32 = sinomo_module_api::SINOMO_NATIVE_MODULE_ABI_VERSION;
 pub const DEFAULT_LOCAL_COMMAND_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_LOCAL_COMMAND_OUTPUT_LIMIT_BYTES: usize = 128 * 1024;
 pub const SINOMO_MODULE_V1_INTERFACE_VERSION: &str = "sinomo-module-v1";
@@ -2153,6 +2155,66 @@ pub fn native_dylib_module_loader_state_dir(data_dir_root: &Path) -> PathBuf {
     module_loader_state_dir(data_dir_root).join("native-dylib")
 }
 
+fn native_dylib_module_loader_state_lock_path(data_dir_root: &Path) -> PathBuf {
+    module_loader_state_dir(data_dir_root).join("native-dylib.lock")
+}
+
+fn native_dylib_module_loader_state_transaction_path(data_dir_root: &Path) -> PathBuf {
+    module_loader_state_dir(data_dir_root).join("native-dylib.restore.sobj")
+}
+
+fn native_dylib_module_loader_state_staging_dir(data_dir_root: &Path) -> PathBuf {
+    module_loader_state_dir(data_dir_root).join(".native-dylib.restore-staged")
+}
+
+fn native_dylib_module_loader_state_previous_dir(data_dir_root: &Path) -> PathBuf {
+    module_loader_state_dir(data_dir_root).join(".native-dylib.restore-previous")
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct NativeDylibModuleLoaderStateTransaction {
+    prepared_at: String,
+}
+
+#[derive(Debug)]
+struct NativeDylibModuleStateLock {
+    file: fs::File,
+}
+
+impl Drop for NativeDylibModuleStateLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+fn acquire_native_dylib_module_state_lock(
+    data_dir_root: &Path,
+) -> Result<NativeDylibModuleStateLock, ModuleLoaderStoreError> {
+    let path = native_dylib_module_loader_state_lock_path(data_dir_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| ModuleLoaderStoreError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|source| ModuleLoaderStoreError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    file.lock_exclusive()
+        .map_err(|source| ModuleLoaderStoreError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    Ok(NativeDylibModuleStateLock { file })
+}
+
 pub fn native_dylib_module_loader_state_path(
     data_dir_root: &Path,
     module_id: &ModuleId,
@@ -2267,6 +2329,8 @@ pub fn read_native_dylib_module_loader_state(
     data_dir_root: &Path,
     module_id: &ModuleId,
 ) -> Result<Option<NativeDylibModuleLoaderState>, ModuleLoaderStoreError> {
+    let _lock = acquire_native_dylib_module_state_lock(data_dir_root)?;
+    recover_native_dylib_module_loader_state_transaction_unlocked(data_dir_root)?;
     let path = native_dylib_module_loader_state_path(data_dir_root, module_id);
     if !path.exists() {
         return Ok(None);
@@ -2277,7 +2341,190 @@ pub fn read_native_dylib_module_loader_state(
 pub fn read_native_dylib_module_loader_states(
     data_dir_root: &Path,
 ) -> Result<Vec<NativeDylibModuleLoaderState>, ModuleLoaderStoreError> {
+    let _lock = acquire_native_dylib_module_state_lock(data_dir_root)?;
+    recover_native_dylib_module_loader_state_transaction_unlocked(data_dir_root)?;
+    read_native_dylib_module_loader_states_unlocked(data_dir_root)
+}
+
+fn read_native_dylib_module_loader_states_unlocked(
+    data_dir_root: &Path,
+) -> Result<Vec<NativeDylibModuleLoaderState>, ModuleLoaderStoreError> {
     read_objects_from_dir(&native_dylib_module_loader_state_dir(data_dir_root))
+}
+
+/// Completes or rolls back an interrupted loader-directory swap. Readers and
+/// writers call this while holding the native loader lock, so they never expose
+/// a partially restored set of module records after process restart.
+pub fn recover_native_dylib_module_loader_state_transaction(
+    data_dir_root: &Path,
+) -> Result<bool, ModuleLoaderStoreError> {
+    let _lock = acquire_native_dylib_module_state_lock(data_dir_root)?;
+    recover_native_dylib_module_loader_state_transaction_unlocked(data_dir_root)
+}
+
+/// Replaces the complete native-dylib loader-state directory with `states` via a
+/// durable staged-directory swap. The transaction marker and topology recovery
+/// make every crash point restart-safe without copying module cache artifacts.
+pub fn replace_native_dylib_module_loader_states_transactionally(
+    data_dir_root: &Path,
+    states: &[NativeDylibModuleLoaderState],
+) -> Result<(), ModuleLoaderStoreError> {
+    let _lock = acquire_native_dylib_module_state_lock(data_dir_root)?;
+    recover_native_dylib_module_loader_state_transaction_unlocked(data_dir_root)?;
+
+    let mut module_ids = BTreeSet::new();
+    for state in states {
+        if !module_ids.insert(state.module_id.clone()) {
+            return Err(ModuleLoaderStoreError::Object {
+                path: native_dylib_module_loader_state_dir(data_dir_root)
+                    .display()
+                    .to_string(),
+                detail: format!(
+                    "duplicate native dylib loader state for {}",
+                    state.module_id
+                ),
+            });
+        }
+    }
+
+    let live = native_dylib_module_loader_state_dir(data_dir_root);
+    let staging = native_dylib_module_loader_state_staging_dir(data_dir_root);
+    let previous = native_dylib_module_loader_state_previous_dir(data_dir_root);
+    let marker = native_dylib_module_loader_state_transaction_path(data_dir_root);
+    let parent = module_loader_state_dir(data_dir_root);
+    remove_dir_if_exists(&staging)?;
+    remove_dir_if_exists(&previous)?;
+    fs::create_dir_all(&staging).map_err(|source| ModuleLoaderStoreError::Io {
+        path: staging.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    for state in states {
+        let path = staging.join(format!("{}.sobj", state.module_id));
+        write_object(&path, state)?;
+        sync_module_loader_file(&path)?;
+    }
+    sync_module_loader_dir(&staging)?;
+    write_object(
+        &marker,
+        &NativeDylibModuleLoaderStateTransaction {
+            prepared_at: module_loader_applied_at_now(),
+        },
+    )?;
+    sync_module_loader_file(&marker)?;
+    sync_module_loader_dir(&parent)?;
+
+    if live.exists() {
+        fs::rename(&live, &previous).map_err(|source| ModuleLoaderStoreError::Io {
+            path: live.display().to_string(),
+            detail: format!("move current loader directory to rollback slot: {source}"),
+        })?;
+        sync_module_loader_dir(&parent)?;
+    }
+    fs::rename(&staging, &live).map_err(|source| ModuleLoaderStoreError::Io {
+        path: staging.display().to_string(),
+        detail: format!("activate staged loader directory: {source}"),
+    })?;
+    sync_module_loader_dir(&parent)?;
+    remove_dir_if_exists(&previous)?;
+    remove_file_if_exists(&marker)?;
+    sync_module_loader_dir(&parent)?;
+    Ok(())
+}
+
+fn recover_native_dylib_module_loader_state_transaction_unlocked(
+    data_dir_root: &Path,
+) -> Result<bool, ModuleLoaderStoreError> {
+    let marker = native_dylib_module_loader_state_transaction_path(data_dir_root);
+    if !marker.exists() {
+        return Ok(false);
+    }
+    // Validate the marker before using the recovery topology. A corrupt marker
+    // fails closed; silently guessing could discard the only complete state set.
+    let _: NativeDylibModuleLoaderStateTransaction = read_object(&marker)?;
+    let live = native_dylib_module_loader_state_dir(data_dir_root);
+    let staging = native_dylib_module_loader_state_staging_dir(data_dir_root);
+    let previous = native_dylib_module_loader_state_previous_dir(data_dir_root);
+    let parent = module_loader_state_dir(data_dir_root);
+
+    if live.exists() {
+        // Either the swap never began (staging remains, no previous) or the new
+        // directory is already live. In both cases `live` is the authoritative
+        // complete set and the other directories are cleanup-only.
+        remove_dir_if_exists(&staging)?;
+        remove_dir_if_exists(&previous)?;
+    } else if staging.exists() {
+        // The old directory was moved aside and the process stopped before the
+        // second rename. Complete the intended restore.
+        fs::rename(&staging, &live).map_err(|source| ModuleLoaderStoreError::Io {
+            path: staging.display().to_string(),
+            detail: format!("complete interrupted loader restore: {source}"),
+        })?;
+        sync_module_loader_dir(&parent)?;
+        remove_dir_if_exists(&previous)?;
+    } else if previous.exists() {
+        // The staged set disappeared before it could become live. Roll back to
+        // the last complete directory instead of exposing an empty loader set.
+        fs::rename(&previous, &live).map_err(|source| ModuleLoaderStoreError::Io {
+            path: previous.display().to_string(),
+            detail: format!("roll back interrupted loader restore: {source}"),
+        })?;
+        sync_module_loader_dir(&parent)?;
+    } else {
+        return Err(ModuleLoaderStoreError::Io {
+            path: marker.display().to_string(),
+            detail: "loader restore marker exists but no complete state directory is recoverable"
+                .to_string(),
+        });
+    }
+    remove_file_if_exists(&marker)?;
+    sync_module_loader_dir(&parent)?;
+    Ok(true)
+}
+
+fn remove_dir_if_exists(path: &Path) -> Result<(), ModuleLoaderStoreError> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(ModuleLoaderStoreError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }),
+    }
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), ModuleLoaderStoreError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(ModuleLoaderStoreError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }),
+    }
+}
+
+fn sync_module_loader_file(path: &Path) -> Result<(), ModuleLoaderStoreError> {
+    fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| ModuleLoaderStoreError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })
+}
+
+#[cfg(unix)]
+fn sync_module_loader_dir(path: &Path) -> Result<(), ModuleLoaderStoreError> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| ModuleLoaderStoreError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_module_loader_dir(_path: &Path) -> Result<(), ModuleLoaderStoreError> {
+    Ok(())
 }
 
 pub fn read_native_dylib_module_cache_entries(
@@ -2326,6 +2573,25 @@ pub fn prune_inactive_native_dylib_module_cache(
     data_dir_root: &Path,
     retain_inactive_variants_per_cache_key: usize,
 ) -> Result<NativeDylibModuleCachePruneReport, ModuleLoaderStoreError> {
+    prune_inactive_native_dylib_module_cache_with_pinned_artifacts(
+        data_dir_root,
+        retain_inactive_variants_per_cache_key,
+        &BTreeSet::new(),
+    )
+}
+
+/// Prunes inactive content-addressed native module variants while retaining every
+/// variant referenced by `pinned_artifacts`. Pins do not consume the normal
+/// inactive-retention allowance: a rollback artifact remains available until its
+/// owning subsystem removes the pin, and the newest unpinned variants are still
+/// retained for ordinary operator recovery.
+pub fn prune_inactive_native_dylib_module_cache_with_pinned_artifacts(
+    data_dir_root: &Path,
+    retain_inactive_variants_per_cache_key: usize,
+    pinned_artifacts: &BTreeSet<PathBuf>,
+) -> Result<NativeDylibModuleCachePruneReport, ModuleLoaderStoreError> {
+    let _lock = acquire_native_dylib_module_state_lock(data_dir_root)?;
+    recover_native_dylib_module_loader_state_transaction_unlocked(data_dir_root)?;
     let cache_root = native_dylib_module_cache_dir(data_dir_root);
     if !cache_root.exists() {
         return Ok(NativeDylibModuleCachePruneReport {
@@ -2334,7 +2600,35 @@ pub fn prune_inactive_native_dylib_module_cache(
             removed_inactive_variants: Vec::new(),
         });
     }
-    let active_variant_dirs = read_native_dylib_module_loader_states(data_dir_root)?
+    let pinned_variant_dirs = pinned_artifacts
+        .iter()
+        .map(|path| {
+            let relative =
+                path.strip_prefix(&cache_root)
+                    .map_err(|source| ModuleLoaderStoreError::Io {
+                        path: path.display().to_string(),
+                        detail: format!(
+                            "pinned native module artifact is not under {}: {source}",
+                            cache_root.display()
+                        ),
+                    })?;
+            if relative.components().count() < 3 {
+                return Err(ModuleLoaderStoreError::Io {
+                    path: path.display().to_string(),
+                    detail:
+                        "pinned native module artifact has no content-addressed variant directory"
+                            .to_string(),
+                });
+            }
+            path.parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| ModuleLoaderStoreError::Io {
+                    path: path.display().to_string(),
+                    detail: "pinned native module artifact has no parent directory".to_string(),
+                })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let active_variant_dirs = read_native_dylib_module_loader_states_unlocked(data_dir_root)?
         .into_iter()
         .filter_map(|state| {
             native_module_cache_path(
@@ -2370,11 +2664,17 @@ pub fn prune_inactive_native_dylib_module_cache(
                 .cmp(&left.modified)
                 .then(left.path.cmp(&right.path))
         });
-        retained_inactive_variants += variants.len().min(retain_inactive_variants_per_cache_key);
-        for variant in variants
-            .into_iter()
-            .skip(retain_inactive_variants_per_cache_key)
-        {
+        let mut retained_unpinned = 0usize;
+        for variant in variants {
+            if pinned_variant_dirs.contains(&variant.path) {
+                retained_inactive_variants += 1;
+                continue;
+            }
+            if retained_unpinned < retain_inactive_variants_per_cache_key {
+                retained_unpinned += 1;
+                retained_inactive_variants += 1;
+                continue;
+            }
             fs::remove_dir_all(&variant.path).map_err(|source| ModuleLoaderStoreError::Io {
                 path: variant.path.display().to_string(),
                 detail: source.to_string(),
@@ -2620,8 +2920,21 @@ pub fn write_native_dylib_module_loader_state(
     data_dir_root: &Path,
     state: &NativeDylibModuleLoaderState,
 ) -> Result<PathBuf, ModuleLoaderStoreError> {
+    let _lock = acquire_native_dylib_module_state_lock(data_dir_root)?;
+    recover_native_dylib_module_loader_state_transaction_unlocked(data_dir_root)?;
+    write_native_dylib_module_loader_state_unlocked(data_dir_root, state)
+}
+
+fn write_native_dylib_module_loader_state_unlocked(
+    data_dir_root: &Path,
+    state: &NativeDylibModuleLoaderState,
+) -> Result<PathBuf, ModuleLoaderStoreError> {
     let path = native_dylib_module_loader_state_path(data_dir_root, &state.module_id);
     write_object(&path, state)?;
+    sync_module_loader_file(&path)?;
+    if let Some(parent) = path.parent() {
+        sync_module_loader_dir(parent)?;
+    }
     Ok(path)
 }
 
@@ -2859,6 +3172,8 @@ pub fn remove_native_dylib_module_loader_state(
     data_dir_root: &Path,
     module_id: &ModuleId,
 ) -> Result<Option<NativeDylibModuleLoaderState>, ModuleLoaderStoreError> {
+    let _lock = acquire_native_dylib_module_state_lock(data_dir_root)?;
+    recover_native_dylib_module_loader_state_transaction_unlocked(data_dir_root)?;
     let path = native_dylib_module_loader_state_path(data_dir_root, module_id);
     if !path.exists() {
         return Ok(None);
@@ -2873,6 +3188,9 @@ pub fn remove_native_dylib_module_loader_state(
                 detail: source.to_string(),
             });
         }
+    }
+    if let Some(parent) = path.parent() {
+        sync_module_loader_dir(parent)?;
     }
     Ok(Some(state))
 }
@@ -3452,6 +3770,8 @@ pub fn install_native_dylib_module_from_file(
         path: source_path.display().to_string(),
         detail: source.to_string(),
     })?;
+    let _lock = acquire_native_dylib_module_state_lock(data_dir_root)?;
+    recover_native_dylib_module_loader_state_transaction_unlocked(data_dir_root)?;
     install_native_dylib_module_from_path_and_bytes(data_dir_root, source_path, &bytes, request)
 }
 
@@ -3466,6 +3786,8 @@ pub fn install_native_dylib_module_from_bytes(
         });
     };
     let library_name = validate_native_dylib_module_library_name(library_name)?;
+    let _lock = acquire_native_dylib_module_state_lock(data_dir_root)?;
+    recover_native_dylib_module_loader_state_transaction_unlocked(data_dir_root)?;
     let staging_path = native_dylib_module_staging_path(data_dir_root, &library_name);
     write_native_dylib_module_file(&staging_path, bytes, None)?;
     let result = install_native_dylib_module_from_path_and_bytes(
@@ -3541,7 +3863,7 @@ fn install_native_dylib_module_from_path_and_bytes(
         activated_at: module_loader_applied_at_now(),
         source: request.source,
     };
-    let state_path = write_native_dylib_module_loader_state(data_dir_root, &state)?;
+    let state_path = write_native_dylib_module_loader_state_unlocked(data_dir_root, &state)?;
     Ok(NativeDylibModuleInstallResult {
         descriptor_module_id,
         state,
@@ -5350,6 +5672,120 @@ mod tests {
     }
 
     #[test]
+    fn native_dylib_loader_restore_recovers_every_durable_swap_topology() {
+        #[derive(Clone, Copy)]
+        enum Expected {
+            Live,
+            Staging,
+            Previous,
+        }
+
+        for (name, has_live, has_staging, has_previous, expected) in [
+            ("prepared", true, true, false, Expected::Live),
+            ("old-moved", false, true, true, Expected::Staging),
+            ("staging-lost", false, false, true, Expected::Previous),
+            ("new-live", true, false, true, Expected::Live),
+        ] {
+            let root = unique_temp(&format!("native-dylib-loader-recovery-{name}"));
+            let live = native_dylib_module_loader_state_dir(&root);
+            let staging = native_dylib_module_loader_state_staging_dir(&root);
+            let previous = native_dylib_module_loader_state_previous_dir(&root);
+            let marker = native_dylib_module_loader_state_transaction_path(&root);
+            let live_state = test_native_dylib_loader_state("live");
+            let staging_state = test_native_dylib_loader_state("staging");
+            let previous_state = test_native_dylib_loader_state("previous");
+            if has_live {
+                write_test_native_dylib_state_dir(&live, &live_state);
+            }
+            if has_staging {
+                write_test_native_dylib_state_dir(&staging, &staging_state);
+            }
+            if has_previous {
+                write_test_native_dylib_state_dir(&previous, &previous_state);
+            }
+            write_object(
+                &marker,
+                &NativeDylibModuleLoaderStateTransaction {
+                    prepared_at: "2026-07-12T00:00:00Z".to_string(),
+                },
+            )
+            .expect("transaction marker");
+
+            assert!(
+                recover_native_dylib_module_loader_state_transaction(&root)
+                    .expect("recover transaction"),
+                "{name} topology should recover"
+            );
+            let expected_state = match expected {
+                Expected::Live => live_state,
+                Expected::Staging => staging_state,
+                Expected::Previous => previous_state,
+            };
+            assert_eq!(
+                read_native_dylib_module_loader_states(&root).expect("read recovered states"),
+                vec![expected_state],
+                "unexpected authoritative state for {name} topology"
+            );
+            assert!(live.is_dir());
+            assert!(!staging.exists());
+            assert!(!previous.exists());
+            assert!(!marker.exists());
+        }
+    }
+
+    #[test]
+    fn native_dylib_loader_restore_fails_closed_on_corrupt_and_partial_markers() {
+        for marker_kind in ["corrupt", "partial"] {
+            let root = unique_temp(&format!("native-dylib-loader-marker-{marker_kind}"));
+            let live = native_dylib_module_loader_state_dir(&root);
+            let staging = native_dylib_module_loader_state_staging_dir(&root);
+            let previous = native_dylib_module_loader_state_previous_dir(&root);
+            let marker = native_dylib_module_loader_state_transaction_path(&root);
+            let live_state = test_native_dylib_loader_state("live");
+            let staging_state = test_native_dylib_loader_state("staging");
+            let previous_state = test_native_dylib_loader_state("previous");
+            write_test_native_dylib_state_dir(&live, &live_state);
+            write_test_native_dylib_state_dir(&staging, &staging_state);
+            write_test_native_dylib_state_dir(&previous, &previous_state);
+            if marker_kind == "corrupt" {
+                std::fs::create_dir_all(marker.parent().expect("marker parent"))
+                    .expect("marker parent");
+                std::fs::write(&marker, b"not-a-sinomo-object").expect("corrupt marker");
+            } else {
+                write_object(
+                    &marker,
+                    &NativeDylibModuleLoaderStateTransaction {
+                        prepared_at: "2026-07-12T00:00:00Z".to_string(),
+                    },
+                )
+                .expect("complete marker");
+                let mut bytes = std::fs::read(&marker).expect("read marker");
+                bytes.truncate(bytes.len().saturating_sub(1).max(1));
+                std::fs::write(&marker, bytes).expect("partial marker");
+            }
+
+            recover_native_dylib_module_loader_state_transaction(&root)
+                .expect_err("invalid marker must fail closed");
+            assert!(marker.is_file());
+            assert_eq!(
+                read_objects_from_dir::<NativeDylibModuleLoaderState>(&live)
+                    .expect("raw live states"),
+                vec![live_state]
+            );
+            assert_eq!(
+                read_objects_from_dir::<NativeDylibModuleLoaderState>(&staging)
+                    .expect("raw staging states"),
+                vec![staging_state]
+            );
+            assert_eq!(
+                read_objects_from_dir::<NativeDylibModuleLoaderState>(&previous)
+                    .expect("raw previous states"),
+                vec![previous_state]
+            );
+        }
+    }
+
+    #[test]
     fn native_dylib_loader_state_removal_records_unload() {
         let root = unique_temp("native-dylib-unload-state");
         let module_id = ModuleId::from_legacy_named("module.sandbox.wasix").expect("module");
@@ -6370,6 +6806,27 @@ mod tests {
 
     fn unique_temp(prefix: &str) -> sinomo_testdir::TestDir {
         sinomo_testdir::TestDir::new(prefix)
+    }
+
+    fn test_native_dylib_loader_state(label: &str) -> NativeDylibModuleLoaderState {
+        NativeDylibModuleLoaderState {
+            module_id: ModuleId::from_legacy_named(format!("module.test.{label}"))
+                .expect("module id"),
+            artifact_id: None,
+            content_hash: format!("blake3:{label}"),
+            cache_key: format!("module/test/{label}"),
+            library_name: format!("libsinomo_test_{label}.so"),
+            platform_triple: "x86_64-unknown-linux-gnu".to_string(),
+            native_abi_version: 1,
+            interface_version: "sinomo.test.v1".to_string(),
+            activated_at: "2026-07-12T00:00:00Z".to_string(),
+            source: format!("test:{label}"),
+        }
+    }
+
+    fn write_test_native_dylib_state_dir(dir: &Path, state: &NativeDylibModuleLoaderState) {
+        let path = dir.join(format!("{}.sobj", state.module_id));
+        write_object(&path, state).expect("write native dylib state");
     }
 
     fn runtime_state(

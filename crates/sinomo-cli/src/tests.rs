@@ -33,11 +33,11 @@ use super::{
     data_dir_storage_contract_findings, default_dfs_file_system_id, ensure_rollout_layout,
     expire_cluster_network_records_in_kv, format_rollout_progress_line,
     handle_daemon_cluster_join_request, handle_daemon_cluster_kv_txn_request,
-    handle_daemon_rollout_build_request, install_should_update_binary, install_with_layout,
-    load_tui_model_runtime_config, main_agent_config_tool_registry,
-    main_agent_handler_for_tui_with_data_dir, main_agent_tool_registry_for_workspace,
-    managed_source_status, model_config_uses_cluster, models_default_with_data_dir,
-    normalize_model_provider, observe_cli_rpc_via_daemon,
+    handle_daemon_rollout_build_request, install_prepared_native_dylib_modules,
+    install_should_update_binary, install_with_layout, load_tui_model_runtime_config,
+    main_agent_config_tool_registry, main_agent_handler_for_tui_with_data_dir,
+    main_agent_tool_registry_for_workspace, managed_source_status, model_config_uses_cluster,
+    models_default_with_data_dir, normalize_model_provider, observe_cli_rpc_via_daemon,
     open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
     parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
     parse_dfs_command, parse_install_options, parse_model_default_options,
@@ -52,8 +52,8 @@ use super::{
     send_rollout_request_with_progress_for_test, shadow_daemon_node_id,
     sign_daemon_rpc_request_from_data_dir, stage_rollout_main_activation, sync_cluster_state_to_kv,
     test_command_requires_cluster_state, tui_default_daemon_status, uninstall_with_layout,
-    with_cli_force_local_mode, write_daemon_status, write_imported_cluster_kv_snapshot,
-    write_model_runtime_config_for_node, write_rollout_status,
+    with_cli_force_local_mode, with_rollout_activation_admission, write_daemon_status,
+    write_imported_cluster_kv_snapshot, write_model_runtime_config_for_node, write_rollout_status,
 };
 use super::{
     daemon_handle_daemon_sandbox_http_fetch_to_file, daemon_handle_daemon_sandbox_import_busybox,
@@ -814,6 +814,26 @@ fn top_level_cli_parser_routes_subcommands() {
         ])
         .expect("module native-rust disable"),
         CliCommand::Registered(command) if command.name() == "module"
+    ));
+    assert!(matches!(
+        parse_cli_command(&[
+            "module".to_string(),
+            "native-dylib".to_string(),
+            "activate".to_string(),
+            "/tmp/libsinomo_test_module.so".to_string(),
+        ])
+        .expect("module native-dylib activate"),
+        CliCommand::RegisteredRolloutMutation(command) if command.name() == "module"
+    ));
+    assert!(matches!(
+        parse_cli_command(&[
+            "module".to_string(),
+            "native-dylib".to_string(),
+            "unload".to_string(),
+            "module.test-native-dylib".to_string(),
+        ])
+        .expect("module native-dylib unload"),
+        CliCommand::RegisteredRolloutMutation(command) if command.name() == "module"
     ));
     assert!(matches!(
         parse_cli_command(&["dfs".to_string(), "status".to_string()]).expect("dfs"),
@@ -7091,6 +7111,126 @@ fn install_writes_boot_entries_and_uninstall_retains_data_dir() {
 }
 
 #[test]
+fn cli_rollout_admission_rejects_pending_activation_before_mutation_runs() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-module-admission-pending");
+    let rollout_paths = SelfRolloutPaths::new(&root);
+    std::fs::create_dir_all(&rollout_paths.root).expect("rollout root");
+
+    for (label, pending_path) in [
+        (
+            "main",
+            sinomo_runtime::rollout::rollout_main_activation_path(&rollout_paths),
+        ),
+        (
+            "shadow",
+            sinomo_runtime::rollout::rollout_shadow_finalize_path(&rollout_paths),
+        ),
+    ] {
+        std::fs::write(&pending_path, b"pending activation").expect("pending marker");
+        let mut mutation_ran = false;
+        let error = with_rollout_activation_admission(&rollout_paths, || {
+            mutation_ran = true;
+            Ok(())
+        })
+        .expect_err("pending activation must reject mutation admission");
+        assert!(!mutation_ran, "{label} admission ran the mutation");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("pending {label} rollout")),
+            "unexpected {label} admission error: {error}"
+        );
+        std::fs::remove_file(pending_path).expect("remove pending marker");
+    }
+
+    let mut mutation_ran = false;
+    with_rollout_activation_admission(&rollout_paths, || {
+        mutation_ran = true;
+        Ok(())
+    })
+    .expect("mutation is admitted after pending activation clears");
+    assert!(mutation_ran);
+}
+
+#[test]
+fn install_module_mutation_reconciles_exact_managed_source_under_rollout_admission() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-install-module-admission");
+    let rollout_paths = SelfRolloutPaths::new(&root);
+    let source_repo = root.join("installed-managed-source");
+    let module_dir = source_repo.join("modules/test/install-policy");
+    std::fs::create_dir_all(&module_dir).expect("module source");
+    let excluded_platform = if cfg!(windows) { "unix" } else { "windows" };
+    std::fs::write(
+        module_dir.join("Cargo.toml"),
+        format!(
+            r#"
+[package]
+name = "sinomo-install-policy-test"
+version = "0.1.0"
+
+[package.metadata.sinomo.native-dylib]
+module-id = "module.install.policy-test"
+interface-version = "sinomo-install-policy-test-v1"
+source = "rollout:modules/test/install-policy"
+platforms = ["{excluded_platform}"]
+"#
+        ),
+    )
+    .expect("platform policy");
+
+    let module_id =
+        sinomo_runtime::module::ModuleId::from_legacy_named("module.install.policy-test")
+            .expect("module id");
+    let state = sinomo_runtime::module::NativeDylibModuleLoaderState {
+        module_id: module_id.clone(),
+        artifact_id: None,
+        content_hash: "blake3:install-policy-test".to_string(),
+        cache_key: "install/policy-test".to_string(),
+        library_name: if cfg!(windows) {
+            "sinomo_install_policy_test.dll".to_string()
+        } else {
+            "libsinomo_install_policy_test.so".to_string()
+        },
+        platform_triple: format!(
+            "{}-{}-{}",
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            std::env::consts::FAMILY
+        ),
+        native_abi_version: sinomo_runtime::module::NATIVE_DYLIB_HOST_ABI_VERSION,
+        interface_version: "sinomo-install-policy-test-v1".to_string(),
+        activated_at: "2026-07-12T00:00:00Z".to_string(),
+        source: "rollout:modules/test/install-policy".to_string(),
+    };
+    sinomo_runtime::module::write_native_dylib_module_loader_state(&root, &state)
+        .expect("loader state");
+
+    std::fs::create_dir_all(&rollout_paths.root).expect("rollout root");
+    let pending = sinomo_runtime::rollout::rollout_main_activation_path(&rollout_paths);
+    std::fs::write(&pending, b"pending main").expect("pending main marker");
+    let error = install_prepared_native_dylib_modules(&root, &source_repo, &[])
+        .expect_err("pending activation must block install module mutation");
+    assert!(error.to_string().contains("pending main rollout"));
+    assert!(
+        sinomo_runtime::module::read_native_dylib_module_loader_state(&root, &module_id)
+            .expect("read state while blocked")
+            .is_some(),
+        "blocked install must not reconcile loader state"
+    );
+
+    std::fs::remove_file(pending).expect("remove pending main");
+    let installed = install_prepared_native_dylib_modules(&root, &source_repo, &[])
+        .expect("install reconciliation");
+    assert!(installed.is_empty());
+    assert!(
+        sinomo_runtime::module::read_native_dylib_module_loader_state(&root, &module_id)
+            .expect("read reconciled state")
+            .is_none(),
+        "the exact installed managed-source policy must remove excluded rollout state"
+    );
+}
+
+#[test]
 fn install_reports_unregistered_storage_without_blocking_startup() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-install-storage-warning");
     std::fs::write(root.join("unexpected-local-file"), b"debug").expect("unexpected file");
@@ -11732,6 +11872,64 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
 }
 
 #[test]
+fn rollout_parser_scopes_native_module_skip_to_cluster_binary_push() {
+    let parsed = parse_rollout_command(&[
+        "cluster".to_string(),
+        "--binary".to_string(),
+        "/tmp/sinomo".to_string(),
+        "--target".to_string(),
+        "192.0.2.11:21353".to_string(),
+        "--skip-native-modules".to_string(),
+    ])
+    .expect("binary-only cluster rollout");
+    assert_eq!(
+        parsed,
+        RolloutCliCommand::Cluster(RolloutOptions {
+            binary: Some(PathBuf::from("/tmp/sinomo")),
+            targets: vec!["192.0.2.11:21353".to_string()],
+            skip_native_modules: true,
+            ..RolloutOptions::default()
+        })
+    );
+
+    let parse_error = |args: &[&str]| {
+        let args = args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>();
+        match parse_rollout_command(&args).expect_err("incompatible rollout options") {
+            CliError::Parse { detail } => detail,
+            other => panic!("expected parse error, got {other}"),
+        }
+    };
+
+    let detail = parse_error(&["cluster", "--skip-native-modules", "--remote-build"]);
+    assert!(detail.contains("cannot be combined with --remote-build"));
+
+    let detail = parse_error(&[
+        "cluster",
+        "--skip-native-modules",
+        "--remote-repo",
+        "/srv/sinomo",
+    ]);
+    assert!(detail.contains("cannot be combined with --remote-repo"));
+
+    let detail = parse_error(&["apply", "--skip-native-modules"]);
+    assert!(detail.contains("only supported by `rollout cluster` binary-push rollouts"));
+
+    let detail = parse_error(&["apply-external", "--skip-native-modules"]);
+    assert!(detail.contains("only supported by `rollout cluster` binary-push rollouts"));
+
+    let detail = parse_error(&[
+        "module",
+        "native-dylib",
+        "module.test",
+        "--skip-native-modules",
+    ]);
+    assert!(detail.contains("only for cluster binary-push rollouts"));
+}
+
+#[test]
 fn local_rollout_wait_timeout_covers_shadow_candidate_handoff() {
     assert!(super::local_rollout_wait_timeout() >= Duration::from_secs(30));
 }
@@ -13122,6 +13320,7 @@ fn rollout_main_activation_without_shadow_requires_staged_binary() {
             staged_main_binary: None,
             staged_shadow_binary: None,
             previous_main_binary: Some(root.join("bin").join("previous-main")),
+            native_dylib_loader_rollback_generation: None,
             main_host: "0.0.0.0".to_string(),
             main_port: 21_353,
             shadow_port: 21_354,
