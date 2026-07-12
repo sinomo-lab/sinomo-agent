@@ -13,7 +13,7 @@ ring = "r1"
 
 [features]
 default = []
-native-devices = ["dep:cpal", "dep:v4l"]
+native-devices = ["dep:cpal", "dep:image", "dep:nokhwa", "dep:v4l"]
 
 [dependencies]
 cpal = { workspace = true, optional = true }
@@ -23,6 +23,15 @@ thiserror.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 v4l = { workspace = true, optional = true }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+image = { workspace = true, features = ["jpeg"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+nokhwa = { workspace = true, features = ["decoding", "input-msmf"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nokhwa = { workspace = true, features = ["decoding", "input-avfoundation"], optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true

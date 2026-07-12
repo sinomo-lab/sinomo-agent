@@ -1,4 +1,5 @@
-//! Embeds build metadata only into the final `sinomo-app` binary.
+//! Embeds build metadata and target-specific application metadata into the
+//! final `sinomo-app` binary.
 
 use std::fs;
 use std::path::PathBuf;
@@ -7,6 +8,7 @@ use std::process::Command;
 const ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV: &str = "SINOMO_ROLLOUT_BUILD_COMMIT_OVERRIDE";
 
 fn main() {
+    embed_macos_privacy_plist();
     println!("cargo:rerun-if-env-changed={ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV}");
     let commit = std::env::var(ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV)
         .ok()
@@ -16,6 +18,21 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=SINOMO_GIT_COMMIT={commit}");
     watch_git_head();
+}
+
+fn embed_macos_privacy_plist() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return;
+    }
+    let manifest_dir = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR"),
+    );
+    let plist = manifest_dir.join("assets").join("macos").join("Info.plist");
+    println!("cargo:rerun-if-changed={}", plist.display());
+    println!(
+        "cargo:rustc-link-arg-bin=sinomo-app=-Wl,-sectcreate,__TEXT,__info_plist,{}",
+        plist.display()
+    );
 }
 
 fn git_commit() -> Option<String> {

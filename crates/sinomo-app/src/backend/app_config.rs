@@ -18,6 +18,10 @@ pub struct AppUiConfig {
     pub theme: AppThemeMode,
     #[serde(default = "default_render_mode")]
     pub render_mode: AppRenderMode,
+    /// Device selectors are local to the app host because that node owns the
+    /// physical microphone, speaker, and camera.
+    #[serde(default)]
+    pub media: AppMediaPreferences,
 }
 
 impl Default for AppUiConfig {
@@ -25,6 +29,32 @@ impl Default for AppUiConfig {
         Self {
             theme: AppThemeMode::System,
             render_mode: default_render_mode(),
+            media: AppMediaPreferences::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppMediaPreferences {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub microphone: Option<RememberedNativeDevice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<RememberedNativeDevice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<RememberedNativeDevice>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RememberedNativeDevice {
+    pub native_id: String,
+    pub display_name: String,
+}
+
+impl RememberedNativeDevice {
+    pub fn new(native_id: impl Into<String>, display_name: impl Into<String>) -> Self {
+        Self {
+            native_id: native_id.into(),
+            display_name: display_name.into(),
         }
     }
 }
@@ -58,6 +88,10 @@ pub fn load_render_mode(data_dir: &SinomoDataDir) -> AppRenderMode {
     load_ui_config(data_dir).render_mode
 }
 
+pub fn load_media_preferences(data_dir: &SinomoDataDir) -> AppMediaPreferences {
+    load_ui_config(data_dir).media
+}
+
 pub fn save_theme(data_dir: &SinomoDataDir, theme: AppThemeMode) -> Result<(), String> {
     let mut config = load_ui_config(data_dir);
     config.theme = theme;
@@ -70,6 +104,15 @@ pub fn save_render_mode(
 ) -> Result<(), String> {
     let mut config = load_ui_config(data_dir);
     config.render_mode = render_mode;
+    save_ui_config(data_dir, &config)
+}
+
+pub fn save_media_preferences(
+    data_dir: &SinomoDataDir,
+    media: &AppMediaPreferences,
+) -> Result<(), String> {
+    let mut config = load_ui_config(data_dir);
+    config.media = media.clone();
     save_ui_config(data_dir, &config)
 }
 
@@ -158,5 +201,69 @@ mod tests {
         assert_eq!(load_render_mode(&data_dir), AppRenderMode::ForceSdr);
         let saved = fs::read_to_string(ui_config_file(&data_dir)).expect("read saved config");
         assert!(saved.contains("\"render_mode\": \"force_sdr\""));
+    }
+
+    #[test]
+    fn legacy_ui_config_defaults_media_devices_to_system_defaults() {
+        let data_dir = temp_data_dir("legacy-media");
+        let path = ui_config_file(&data_dir);
+        fs::create_dir_all(path.parent().expect("config parent")).expect("create config parent");
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "theme": "dark",
+                "render_mode": default_render_mode(),
+            }))
+            .expect("serialize legacy config"),
+        )
+        .expect("write legacy config");
+
+        let loaded = load_ui_config(&data_dir);
+
+        assert_eq!(loaded.theme, AppThemeMode::Dark);
+        assert_eq!(loaded.media, AppMediaPreferences::default());
+    }
+
+    #[test]
+    fn save_media_preferences_round_trips_without_losing_ui_preferences() {
+        let data_dir = temp_data_dir("media-round-trip");
+        save_theme(&data_dir, AppThemeMode::Light).expect("save theme");
+        save_render_mode(&data_dir, AppRenderMode::PreferWideGamut).expect("save render mode");
+        let media = AppMediaPreferences {
+            microphone: Some(RememberedNativeDevice::new(
+                "cpal:input:1:desk-mic",
+                "Desk microphone",
+            )),
+            speaker: Some(RememberedNativeDevice::new(
+                "cpal:output:2:headphones",
+                "Headphones",
+            )),
+            camera: Some(RememberedNativeDevice::new("camera:front", "Front camera")),
+        };
+
+        save_media_preferences(&data_dir, &media).expect("save media preferences");
+
+        assert_eq!(load_media_preferences(&data_dir), media);
+        assert_eq!(load_theme(&data_dir), AppThemeMode::Light);
+        assert_eq!(load_render_mode(&data_dir), AppRenderMode::PreferWideGamut);
+    }
+
+    #[test]
+    fn clearing_one_media_preference_preserves_the_other_devices() {
+        let data_dir = temp_data_dir("media-clear-one");
+        let mut media = AppMediaPreferences {
+            microphone: Some(RememberedNativeDevice::new("mic", "Microphone")),
+            speaker: Some(RememberedNativeDevice::new("speaker", "Speaker")),
+            camera: Some(RememberedNativeDevice::new("camera", "Camera")),
+        };
+        save_media_preferences(&data_dir, &media).expect("save media preferences");
+
+        media.microphone = None;
+        save_media_preferences(&data_dir, &media).expect("clear microphone preference");
+
+        let loaded = load_media_preferences(&data_dir);
+        assert_eq!(loaded.microphone, None);
+        assert_eq!(loaded.speaker, media.speaker);
+        assert_eq!(loaded.camera, media.camera);
     }
 }

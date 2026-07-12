@@ -120,6 +120,15 @@ pub struct NativeVideoFrame {
     pub bytes: Vec<u8>,
 }
 
+/// UI-ready camera snapshot decoded off the render thread.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct NativeVideoPreviewFrame {
+    pub sequence: u64,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
 pub struct NativeVideoCapture {
     raw: device::NativeCameraCapture,
 }
@@ -140,6 +149,8 @@ impl NativeVideoCapture {
 pub enum NativeVideoError {
     #[error("native video device error: {0}")]
     Device(#[from] device::NativeDeviceError),
+    #[error("native video frame decode failed: {detail}")]
+    Decode { detail: String },
 }
 
 pub fn start_native_camera_capture(
@@ -152,6 +163,26 @@ pub fn start_native_camera_capture(
         frame_interval_ms: config.frame_interval_ms,
     })?;
     Ok(NativeVideoCapture { raw })
+}
+
+/// Decode the native JPEG contract into RGBA pixels suitable for a SUI image.
+/// Keep this work on the media worker; camera frames must never be decoded in
+/// a widget's paint callback.
+pub fn decode_native_video_preview(
+    frame: &NativeVideoFrame,
+) -> Result<NativeVideoPreviewFrame, NativeVideoError> {
+    let image = image::load_from_memory_with_format(&frame.bytes, image::ImageFormat::Jpeg)
+        .map_err(|error| NativeVideoError::Decode {
+            detail: error.to_string(),
+        })?
+        .to_rgba8();
+    let (width, height) = image.dimensions();
+    Ok(NativeVideoPreviewFrame {
+        sequence: frame.sequence,
+        width,
+        height,
+        rgba: image.into_raw(),
+    })
 }
 
 fn native_video_frame_from_device(frame: device::NativeVideoFrame) -> NativeVideoFrame {
@@ -219,5 +250,46 @@ mod tests {
         assert_eq!(wrapped.width, raw.width);
         assert_eq!(wrapped.height, raw.height);
         assert_eq!(wrapped.frame_interval_ms, raw.frame_interval_ms);
+    }
+
+    #[test]
+    fn native_video_preview_decodes_jpeg_to_rgba() {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90)
+            .encode(&[255, 0, 0], 1, 1, image::ExtendedColorType::Rgb8)
+            .expect("encode jpeg");
+        let frame = NativeVideoFrame {
+            sequence: 7,
+            format: NativeVideoFrameFormat::Jpeg,
+            width: 1,
+            height: 1,
+            captured_at_unix_ms: 42,
+            bytes: jpeg,
+        };
+
+        let preview = decode_native_video_preview(&frame).expect("decode preview");
+
+        assert_eq!(preview.sequence, 7);
+        assert_eq!((preview.width, preview.height), (1, 1));
+        assert_eq!(preview.rgba.len(), 4);
+        assert!(preview.rgba[0] > 200);
+        assert_eq!(preview.rgba[3], 255);
+    }
+
+    #[test]
+    fn native_video_preview_rejects_invalid_jpeg() {
+        let frame = NativeVideoFrame {
+            sequence: 0,
+            format: NativeVideoFrameFormat::Jpeg,
+            width: 1,
+            height: 1,
+            captured_at_unix_ms: 0,
+            bytes: vec![1, 2, 3],
+        };
+
+        assert!(matches!(
+            decode_native_video_preview(&frame),
+            Err(NativeVideoError::Decode { .. })
+        ));
     }
 }

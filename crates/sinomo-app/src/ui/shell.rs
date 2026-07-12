@@ -224,6 +224,11 @@ impl Shell {
             return;
         }
         self.last_tab.set(current);
+        if self.shared.is_ready() {
+            self.shared
+                .chat_mut()
+                .sync_media_setup_visibility(current == Tab::Sinomo);
+        }
         self.start_cluster_refresh_if_active();
         ctx.request_measure();
         ctx.request_arrange();
@@ -564,6 +569,7 @@ impl Widget for Shell {
                 };
                 let connection_changed = self.shared.pump_connection_probe();
                 let cluster_changed = self.pump_cluster_refresh();
+                let chat_visible = self.shared.active_tab() == Tab::Sinomo;
                 let chat_changed = if self.shared.is_ready() {
                     let mut chat = self.shared.chat_mut();
                     let worker_changed = chat.pump_worker_events();
@@ -571,11 +577,19 @@ impl Widget for Shell {
                     let agents_changed = chat.pump_agent_list();
                     let list_changed = chat.pump_session_list();
                     let delete_changed = chat.pump_delete();
+                    let media_changed = chat.pump_media_call_runtime();
+                    let media_visibility_changed = if chat_visible {
+                        false
+                    } else {
+                        chat.sync_media_setup_visibility(false)
+                    };
                     worker_changed
                         || providers_changed
                         || agents_changed
                         || list_changed
                         || delete_changed
+                        || media_changed
+                        || media_visibility_changed
                 } else {
                     false
                 };
@@ -620,12 +634,23 @@ impl Widget for Shell {
             self.schedule_health_probe_timer(ctx);
             let connection_changed = self.shared.pump_connection_probe();
             let cluster_changed = self.pump_cluster_refresh();
+            let chat_visible = self.shared.active_tab() == Tab::Sinomo;
             let chat_changed = if self.shared.is_ready() {
                 let mut chat = self.shared.chat_mut();
                 let providers_changed = chat.pump_provider_list();
                 let agents_changed = chat.pump_agent_list();
                 let list_changed = chat.pump_session_list();
-                providers_changed || agents_changed || list_changed
+                let media_changed = chat.pump_media_call_runtime();
+                let media_visibility_changed = if chat_visible {
+                    false
+                } else {
+                    chat.sync_media_setup_visibility(false)
+                };
+                providers_changed
+                    || agents_changed
+                    || list_changed
+                    || media_changed
+                    || media_visibility_changed
             } else {
                 false
             };
