@@ -3,7 +3,6 @@
 /// This module models the retry/suppression boundary around:
 /// - `repair_rejection_indicates_lost_authority`
 /// - `repair_rejection_indicates_stale_replica_base`
-/// - `repair_rejection_indicates_stale_chunk_resume`
 /// - `suppress_repair_retries_for_lost_authority`
 /// - `restore_repair_attempt_records`
 ///
@@ -16,7 +15,6 @@ module dfs_repair_lost_authority {
   type RepairReason =
     LostAuthority
     | StaleReplicaBase
-    | StaleChunkResume
     | TransientRouteFailure
     | OtherRejection
 
@@ -31,11 +29,9 @@ module dfs_repair_lost_authority {
   type Decision =
     NoDecision
     | RepairRequestRecorded
-    | PartialWindowRecorded
     | LostAuthoritySuppressed
     | PendingDroppedForLostAuthority
     | StaleBaseRetryScheduled
-    | StaleChunkResumeReset
     | TransientRouteRetryScheduled
     | GenericRetryScheduled
     | RetryAllowed
@@ -44,7 +40,6 @@ module dfs_repair_lost_authority {
   pure val RepairReasons: Set[RepairReason] = Set(
     LostAuthority,
     StaleReplicaBase,
-    StaleChunkResume,
     TransientRouteFailure,
     OtherRejection
   )
@@ -74,13 +69,10 @@ module dfs_repair_lost_authority {
   var knownRetryReplicas: Set[Node]
   var suppressedReplicas: Set[Node]
   var repairRequestIds: Set[Node]
-  var repairResumeReplicas: Set[Node]
   var retryDueReplicas: Set[Node]
   var fetchInflightSources: Set[Node]
   var fetchRequestIds: Set[Node]
-  var fetchResumeSources: Set[Node]
   var fetchFailedSources: Set[Node]
-  var incomingFetchTransfers: Set[Node]
   var persistedLostAuthorityRecords: Set[Node]
   var lastDecision: Decision
   var lastReplica: Option[Node]
@@ -91,9 +83,6 @@ module dfs_repair_lost_authority {
 
   pure def reasonIndicatesStaleBase(reason: RepairReason): bool =
     reason == StaleReplicaBase
-
-  pure def reasonIndicatesStaleChunkResume(reason: RepairReason): bool =
-    reason == StaleChunkResume
 
   pure def reasonIndicatesTransientRouteFailure(reason: RepairReason): bool =
     reason == TransientRouteFailure
@@ -115,13 +104,10 @@ module dfs_repair_lost_authority {
     knownRetryReplicas' = Set(),
     suppressedReplicas' = Set(),
     repairRequestIds' = Set(),
-    repairResumeReplicas' = Set(),
     retryDueReplicas' = Set(),
     fetchInflightSources' = Set(),
     fetchRequestIds' = Set(),
-    fetchResumeSources' = Set(),
     fetchFailedSources' = Set(),
-    incomingFetchTransfers' = Set(),
     persistedLostAuthorityRecords' = Set(),
     lastDecision' = NoDecision,
     lastReplica' = None,
@@ -137,13 +123,10 @@ module dfs_repair_lost_authority {
     knownRetryReplicas' = jobs,
     suppressedReplicas' = Set(),
     repairRequestIds' = Set(),
-    repairResumeReplicas' = Set(),
     retryDueReplicas' = jobs,
     fetchInflightSources' = Set(),
     fetchRequestIds' = Set(),
-    fetchResumeSources' = Set(),
     fetchFailedSources' = Set(),
-    incomingFetchTransfers' = Set(),
     persistedLostAuthorityRecords' = Set(),
     lastDecision' = NoDecision,
     lastReplica' = None,
@@ -168,15 +151,11 @@ module dfs_repair_lost_authority {
         if (removePending) { Set() } else { suppressedReplicas.union(affectedReplicas) },
       repairRequestIds' =
         if (removePending) { Set() } else { repairRequestIds.filter(node => not(affectedReplicas.contains(node))) },
-      repairResumeReplicas' =
-        if (removePending) { Set() } else { repairResumeReplicas.filter(node => not(affectedReplicas.contains(node))) },
       retryDueReplicas' =
         if (removePending) { Set() } else { retryDueReplicas.filter(node => not(affectedReplicas.contains(node))) },
       fetchInflightSources' = Set(),
       fetchRequestIds' = Set(),
-      fetchResumeSources' = Set(),
       fetchFailedSources' = Set(),
-      incomingFetchTransfers' = Set(),
       persistedLostAuthorityRecords' =
         if (removePending) { Set() } else { persistedLostAuthorityRecords.union(affectedReplicas) },
       lastDecision' =
@@ -196,38 +175,12 @@ module dfs_repair_lost_authority {
     knownRetryReplicas' = knownRetryReplicas.union(Set(replica)),
     suppressedReplicas' = suppressedReplicas,
     repairRequestIds' = repairRequestIds.union(Set(replica)),
-    repairResumeReplicas' = repairResumeReplicas,
     retryDueReplicas' = removeNode(retryDueReplicas, replica),
     fetchInflightSources' = fetchInflightSources,
     fetchRequestIds' = fetchRequestIds,
-    fetchResumeSources' = fetchResumeSources,
     fetchFailedSources' = fetchFailedSources,
-    incomingFetchTransfers' = incomingFetchTransfers,
     persistedLostAuthorityRecords' = persistedLostAuthorityRecords,
     lastDecision' = RepairRequestRecorded,
-    lastReplica' = Some(replica),
-    lastDroppedCommittedPending' = false,
-  }
-
-  action recordPartialRepairWindow(replica: Node): bool = all {
-    pendingExists,
-    repairJobs.contains(replica),
-    not(suppressedReplicas.contains(replica)),
-    pendingExists' = pendingExists,
-    intentCommitted' = intentCommitted,
-    repairJobs' = repairJobs,
-    knownRetryReplicas' = knownRetryReplicas.union(Set(replica)),
-    suppressedReplicas' = suppressedReplicas,
-    repairRequestIds' = repairRequestIds.union(Set(replica)),
-    repairResumeReplicas' = repairResumeReplicas.union(Set(replica)),
-    retryDueReplicas' = retryDueReplicas.union(Set(replica)),
-    fetchInflightSources' = fetchInflightSources,
-    fetchRequestIds' = fetchRequestIds,
-    fetchResumeSources' = fetchResumeSources,
-    fetchFailedSources' = fetchFailedSources,
-    incomingFetchTransfers' = incomingFetchTransfers,
-    persistedLostAuthorityRecords' = persistedLostAuthorityRecords,
-    lastDecision' = PartialWindowRecorded,
     lastReplica' = Some(replica),
     lastDroppedCommittedPending' = false,
   }
@@ -241,13 +194,10 @@ module dfs_repair_lost_authority {
     knownRetryReplicas' = knownRetryReplicas,
     suppressedReplicas' = suppressedReplicas,
     repairRequestIds' = repairRequestIds,
-    repairResumeReplicas' = repairResumeReplicas,
     retryDueReplicas' = retryDueReplicas,
     fetchInflightSources' = fetchInflightSources.union(Set(source)),
     fetchRequestIds' = fetchRequestIds.union(Set(source)),
-    fetchResumeSources' = fetchResumeSources.union(Set(source)),
     fetchFailedSources' = fetchFailedSources,
-    incomingFetchTransfers' = incomingFetchTransfers.union(Set(source)),
     persistedLostAuthorityRecords' = persistedLostAuthorityRecords,
     lastDecision' = NoDecision,
     lastReplica' = Some(source),
@@ -267,37 +217,12 @@ module dfs_repair_lost_authority {
         knownRetryReplicas' = knownRetryReplicas.union(Set(replica)),
         suppressedReplicas' = suppressedReplicas,
         repairRequestIds' = removeNode(repairRequestIds, replica),
-        repairResumeReplicas' = removeNode(repairResumeReplicas, replica),
         retryDueReplicas' = removeNode(retryDueReplicas, replica),
         fetchInflightSources' = fetchInflightSources,
         fetchRequestIds' = fetchRequestIds,
-        fetchResumeSources' = fetchResumeSources,
         fetchFailedSources' = fetchFailedSources,
-        incomingFetchTransfers' = incomingFetchTransfers,
         persistedLostAuthorityRecords' = persistedLostAuthorityRecords,
         lastDecision' = StaleBaseRetryScheduled,
-        lastReplica' = Some(replica),
-        lastDroppedCommittedPending' = false,
-      }
-    } else if (reasonIndicatesStaleChunkResume(reason)) {
-      all {
-        pendingExists,
-        not(suppressedReplicas.contains(replica)),
-        pendingExists' = pendingExists,
-        intentCommitted' = intentCommitted,
-        repairJobs' = repairJobs,
-        knownRetryReplicas' = knownRetryReplicas.union(Set(replica)),
-        suppressedReplicas' = suppressedReplicas,
-        repairRequestIds' = removeNode(repairRequestIds, replica),
-        repairResumeReplicas' = removeNode(repairResumeReplicas, replica),
-        retryDueReplicas' = retryDueReplicas.union(Set(replica)),
-        fetchInflightSources' = fetchInflightSources,
-        fetchRequestIds' = fetchRequestIds,
-        fetchResumeSources' = fetchResumeSources,
-        fetchFailedSources' = fetchFailedSources,
-        incomingFetchTransfers' = incomingFetchTransfers,
-        persistedLostAuthorityRecords' = persistedLostAuthorityRecords,
-        lastDecision' = StaleChunkResumeReset,
         lastReplica' = Some(replica),
         lastDroppedCommittedPending' = false,
       }
@@ -311,13 +236,10 @@ module dfs_repair_lost_authority {
         knownRetryReplicas' = knownRetryReplicas.union(Set(replica)),
         suppressedReplicas' = suppressedReplicas,
         repairRequestIds' = removeNode(repairRequestIds, replica),
-        repairResumeReplicas' = removeNode(repairResumeReplicas, replica),
         retryDueReplicas' = removeNode(retryDueReplicas, replica),
         fetchInflightSources' = fetchInflightSources,
         fetchRequestIds' = fetchRequestIds,
-        fetchResumeSources' = fetchResumeSources,
         fetchFailedSources' = fetchFailedSources,
-        incomingFetchTransfers' = incomingFetchTransfers,
         persistedLostAuthorityRecords' = persistedLostAuthorityRecords,
         lastDecision' = GenericRetryScheduled,
         lastReplica' = Some(replica),
@@ -334,13 +256,10 @@ module dfs_repair_lost_authority {
     knownRetryReplicas' = knownRetryReplicas.union(Set(replica)),
     suppressedReplicas' = suppressedReplicas,
     repairRequestIds' = removeNode(repairRequestIds, replica),
-    repairResumeReplicas' = removeNode(repairResumeReplicas, replica),
     retryDueReplicas' = removeNode(retryDueReplicas, replica),
     fetchInflightSources' = fetchInflightSources,
     fetchRequestIds' = fetchRequestIds,
-    fetchResumeSources' = fetchResumeSources,
     fetchFailedSources' = fetchFailedSources,
-    incomingFetchTransfers' = incomingFetchTransfers,
     persistedLostAuthorityRecords' = persistedLostAuthorityRecords,
     lastDecision' =
       if (reasonIndicatesTransientRouteFailure(reason)) {
@@ -361,7 +280,6 @@ module dfs_repair_lost_authority {
     knownRetryReplicas' = knownRetryReplicas,
     suppressedReplicas' = suppressedReplicas,
     repairRequestIds' = repairRequestIds,
-    repairResumeReplicas' = repairResumeReplicas,
     retryDueReplicas' =
       if (suppressedReplicas.contains(replica)) {
         retryDueReplicas
@@ -370,9 +288,7 @@ module dfs_repair_lost_authority {
       },
     fetchInflightSources' = fetchInflightSources,
     fetchRequestIds' = fetchRequestIds,
-    fetchResumeSources' = fetchResumeSources,
     fetchFailedSources' = fetchFailedSources,
-    incomingFetchTransfers' = incomingFetchTransfers,
     persistedLostAuthorityRecords' = persistedLostAuthorityRecords,
     lastDecision' = NoDecision,
     lastReplica' = Some(replica),
@@ -391,13 +307,10 @@ module dfs_repair_lost_authority {
         knownRetryReplicas' = knownRetryReplicas,
         suppressedReplicas' = suppressedReplicas,
         repairRequestIds' = removeNode(repairRequestIds, replica),
-        repairResumeReplicas' = removeNode(repairResumeReplicas, replica),
         retryDueReplicas' = removeNode(retryDueReplicas, replica),
         fetchInflightSources' = fetchInflightSources,
         fetchRequestIds' = fetchRequestIds,
-        fetchResumeSources' = fetchResumeSources,
         fetchFailedSources' = fetchFailedSources,
-        incomingFetchTransfers' = incomingFetchTransfers,
         persistedLostAuthorityRecords' = persistedLostAuthorityRecords,
         lastDecision' = RestoreIgnored,
         lastReplica' = Some(replica),
@@ -412,7 +325,6 @@ module dfs_repair_lost_authority {
         knownRetryReplicas' = knownRetryReplicas.union(Set(replica)),
         suppressedReplicas' = suppressedReplicas,
         repairRequestIds' = removeNode(repairRequestIds, replica),
-        repairResumeReplicas' = removeNode(repairResumeReplicas, replica),
         retryDueReplicas' =
           if (suppressedReplicas.contains(replica)) {
             retryDueReplicas
@@ -421,9 +333,7 @@ module dfs_repair_lost_authority {
           },
         fetchInflightSources' = fetchInflightSources,
         fetchRequestIds' = fetchRequestIds,
-        fetchResumeSources' = fetchResumeSources,
         fetchFailedSources' = fetchFailedSources,
-        incomingFetchTransfers' = incomingFetchTransfers,
         persistedLostAuthorityRecords' = persistedLostAuthorityRecords,
         lastDecision' =
           if (reasonIndicatesTransientRouteFailure(reason)) {
@@ -451,13 +361,10 @@ module dfs_repair_lost_authority {
         knownRetryReplicas' = knownRetryReplicas,
         suppressedReplicas' = suppressedReplicas,
         repairRequestIds' = repairRequestIds,
-        repairResumeReplicas' = repairResumeReplicas,
         retryDueReplicas' = retryDueReplicas.filter(node => not(suppressedReplicas.contains(node))),
         fetchInflightSources' = fetchInflightSources,
         fetchRequestIds' = fetchRequestIds,
-        fetchResumeSources' = fetchResumeSources,
         fetchFailedSources' = fetchFailedSources,
-        incomingFetchTransfers' = incomingFetchTransfers,
         persistedLostAuthorityRecords' = persistedLostAuthorityRecords,
         lastDecision' = RetryAllowed,
         lastReplica' = None,
@@ -475,7 +382,6 @@ module dfs_repair_lost_authority {
       nondet replica = oneOf(Nodes)
       any {
         recordRepairRequest(replica),
-        recordPartialRepairWindow(replica),
         startFetchFromAlternate(replica),
         wakeRepairRetry(replica),
       }

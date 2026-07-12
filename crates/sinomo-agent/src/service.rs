@@ -841,6 +841,7 @@ mod tests {
     };
     use sinomo_lm::{LanguageModelError, LanguageModelRequest, LanguageModelResponse};
     use sinomo_runtime::local::SinomoDataDir;
+    use sinomo_runtime::network::{ObjectRpcIncomingBody, ObjectRpcSessionResponse};
     use sinomo_runtime::service::{ResponseSink, ServiceRegistry, ServiceSigner};
     use std::future::Future;
     use std::pin::Pin;
@@ -859,8 +860,16 @@ mod tests {
     }
 
     impl ResponseSink for TestSink {
-        fn emit(&mut self, response: ObjectRpcResponse) -> Result<(), ServiceError> {
-            self.frames.lock().expect("frames lock").push(response);
+        fn send(self: Box<Self>, response: ObjectRpcSessionResponse) -> Result<(), ServiceError> {
+            if !response.body.is_empty() {
+                return Err(ServiceError::Service(
+                    "agent test sink received an unexpected response body".to_string(),
+                ));
+            }
+            self.frames
+                .lock()
+                .expect("frames lock")
+                .push(response.response);
             Ok(())
         }
     }
@@ -1018,12 +1027,13 @@ mod tests {
         let registry = register_services(ServiceRegistry::builder()).build();
         assert!(registry.owns(AGENT_SESSION_INSPECT_ROUTE));
         let sink = TestSink::default();
-        let ctx = ServiceContext {
-            data_dir: Arc::new(data_dir),
-            cluster: None,
-            signer: ServiceSigner::Local,
-            sink: Box::new(sink.clone()),
-        };
+        let ctx = ServiceContext::new(
+            Arc::new(data_dir),
+            None,
+            ServiceSigner::Local,
+            ObjectRpcIncomingBody::empty(),
+            Box::new(sink.clone()),
+        );
         let request = ObjectRpcRequest::encode_body(
             AGENT_SESSION_INSPECT_ROUTE,
             AGENT_RPC_CATEGORY,
@@ -1087,12 +1097,13 @@ mod tests {
 
         let session_id = SessionId::from_legacy_named("sess_agent_control").expect("session id");
         let sink = TestSink::default();
-        let ctx = ServiceContext {
-            data_dir: Arc::new(data_dir),
-            cluster: None,
-            signer: ServiceSigner::Local,
-            sink: Box::new(sink.clone()),
-        };
+        let ctx = ServiceContext::new(
+            Arc::new(data_dir),
+            None,
+            ServiceSigner::Local,
+            ObjectRpcIncomingBody::empty(),
+            Box::new(sink.clone()),
+        );
         let request = ObjectRpcRequest::encode_body(
             AGENT_SESSION_STEER_ROUTE,
             AGENT_RPC_CATEGORY,
@@ -1124,12 +1135,13 @@ mod tests {
             register_runtime_control_services(ServiceRegistry::builder(), host.clone()).build();
         let session_id = SessionId::from_legacy_named("sess_agent_resume").expect("session id");
         let sink = TestSink::default();
-        let ctx = ServiceContext {
-            data_dir: Arc::new(data_dir),
-            cluster: None,
-            signer: ServiceSigner::Local,
-            sink: Box::new(sink.clone()),
-        };
+        let ctx = ServiceContext::new(
+            Arc::new(data_dir),
+            None,
+            ServiceSigner::Local,
+            ObjectRpcIncomingBody::empty(),
+            Box::new(sink.clone()),
+        );
         let request = ObjectRpcRequest::encode_body(
             AGENT_SESSION_RESUME_ROUTE,
             AGENT_RPC_CATEGORY,
@@ -1195,12 +1207,13 @@ mod tests {
         let host = Arc::new(AgentRuntimeControlRegistry::new());
         let registry = register_runtime_control_services(ServiceRegistry::builder(), host).build();
         let sink = TestSink::default();
-        let ctx = ServiceContext {
-            data_dir: Arc::new(data_dir),
-            cluster: None,
-            signer: ServiceSigner::Local,
-            sink: Box::new(sink.clone()),
-        };
+        let ctx = ServiceContext::new(
+            Arc::new(data_dir),
+            None,
+            ServiceSigner::Local,
+            ObjectRpcIncomingBody::empty(),
+            Box::new(sink.clone()),
+        );
         let request = ObjectRpcRequest::encode_body(
             AGENT_SESSION_RESUME_ROUTE,
             AGENT_RPC_CATEGORY,
@@ -1270,12 +1283,13 @@ mod tests {
         )
         .build();
         let sink = TestSink::default();
-        let ctx = ServiceContext {
-            data_dir: Arc::new(data_dir),
-            cluster: None,
-            signer: ServiceSigner::Local,
-            sink: Box::new(sink.clone()),
-        };
+        let ctx = ServiceContext::new(
+            Arc::new(data_dir),
+            None,
+            ServiceSigner::Local,
+            ObjectRpcIncomingBody::empty(),
+            Box::new(sink.clone()),
+        );
         let request = ObjectRpcRequest::encode_body(
             AGENT_SESSION_STEER_ROUTE,
             AGENT_RPC_CATEGORY,
@@ -1346,12 +1360,13 @@ mod tests {
         )
         .build();
         let sink = TestSink::default();
-        let ctx = ServiceContext {
-            data_dir: Arc::new(data_dir),
-            cluster: None,
-            signer: ServiceSigner::Local,
-            sink: Box::new(sink.clone()),
-        };
+        let ctx = ServiceContext::new(
+            Arc::new(data_dir),
+            None,
+            ServiceSigner::Local,
+            ObjectRpcIncomingBody::empty(),
+            Box::new(sink.clone()),
+        );
         let request = ObjectRpcRequest::encode_body(
             AGENT_SESSION_REMOVE_QUEUED_INPUT_ROUTE,
             AGENT_RPC_CATEGORY,

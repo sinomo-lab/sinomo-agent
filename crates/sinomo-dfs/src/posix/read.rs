@@ -48,156 +48,6 @@ enum PosixBulkReadPlan {
     Fallback,
 }
 
-#[derive(Debug)]
-struct PosixRemoteRangeReadAssembly {
-    object_id: DfsObjectId,
-    source_node_id: NodeId,
-    version: DfsVersion,
-    content_hash: Option<String>,
-    range_offset: u64,
-    range_size_bytes: u64,
-    object_total_size_bytes: u64,
-    next_chunk_index: u32,
-    total_chunks: u32,
-    bytes: Vec<u8>,
-}
-
-impl PosixRemoteRangeReadAssembly {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        object_id: DfsObjectId,
-        source_node_id: NodeId,
-        version: DfsVersion,
-        content_hash: Option<String>,
-        range_offset: u64,
-        range_size_bytes: u64,
-        object_total_size_bytes: u64,
-        total_chunks: u32,
-        max_bytes: usize,
-    ) -> Result<Self> {
-        let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
-        let expected_range_size = object_total_size_bytes
-            .saturating_sub(range_offset)
-            .min(max_bytes_u64);
-        if range_size_bytes != expected_range_size {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "chunked prefix range size mismatch: expected {expected_range_size}, actual {range_size_bytes}"
-                ),
-            }
-            .into());
-        }
-        if total_chunks == 0 {
-            return Err(DfsError::Distributed {
-                message: "chunked prefix range response has no chunks".to_string(),
-            }
-            .into());
-        }
-        let capacity = usize::try_from(range_size_bytes).map_err(|_| DfsError::Distributed {
-            message: format!(
-                "chunked prefix range size does not fit this platform: {range_size_bytes}"
-            ),
-        })?;
-        Ok(Self {
-            object_id,
-            source_node_id,
-            version,
-            content_hash,
-            range_offset,
-            range_size_bytes,
-            object_total_size_bytes,
-            next_chunk_index: 0,
-            total_chunks,
-            bytes: Vec::with_capacity(capacity),
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn metadata_matches(
-        &self,
-        object_id: &DfsObjectId,
-        source_node_id: &NodeId,
-        version: &DfsVersion,
-        content_hash: &Option<String>,
-        range_offset: u64,
-        range_size_bytes: u64,
-        object_total_size_bytes: u64,
-        total_chunks: u32,
-    ) -> bool {
-        self.object_id == *object_id
-            && self.source_node_id == *source_node_id
-            && self.version == *version
-            && self.content_hash == *content_hash
-            && self.range_offset == range_offset
-            && self.range_size_bytes == range_size_bytes
-            && self.object_total_size_bytes == object_total_size_bytes
-            && self.total_chunks == total_chunks
-    }
-
-    fn push_chunk(&mut self, chunk_index: u32, bytes: Vec<u8>, complete: bool) -> Result<bool> {
-        if chunk_index != self.next_chunk_index {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "chunked prefix range response is out of order: expected {}, actual {chunk_index}",
-                    self.next_chunk_index
-                ),
-            }
-            .into());
-        }
-        let next_len =
-            self.bytes
-                .len()
-                .checked_add(bytes.len())
-                .ok_or_else(|| DfsError::Distributed {
-                    message: "chunked prefix range response length overflow".to_string(),
-                })?;
-        if u64::try_from(next_len).unwrap_or(u64::MAX) > self.range_size_bytes {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "chunked prefix range response exceeds requested range: expected {}, actual {next_len}",
-                    self.range_size_bytes
-                ),
-            }
-            .into());
-        }
-        self.bytes.extend(bytes);
-        self.next_chunk_index = self.next_chunk_index.saturating_add(1);
-        let expected_complete = self.next_chunk_index == self.total_chunks;
-        if complete != expected_complete {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "chunked prefix range completion mismatch: chunk={}, total={}, complete={complete}",
-                    self.next_chunk_index, self.total_chunks
-                ),
-            }
-            .into());
-        }
-        if complete && u64::try_from(self.bytes.len()).unwrap_or(u64::MAX) != self.range_size_bytes
-        {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "completed chunked prefix range size mismatch: expected {}, actual {}",
-                    self.range_size_bytes,
-                    self.bytes.len()
-                ),
-            }
-            .into());
-        }
-        Ok(complete)
-    }
-
-    fn into_data(self) -> DfsReadRangeData {
-        DfsReadRangeData {
-            object_id: self.object_id,
-            version: self.version,
-            content_hash: self.content_hash,
-            offset: self.range_offset,
-            total_size_bytes: self.object_total_size_bytes,
-            bytes: self.bytes,
-        }
-    }
-}
-
 fn validate_complete_posix_range_content_hash(
     object: &DfsObjectMetadata,
     data: &DfsReadRangeData,
@@ -348,9 +198,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_bytes: usize,
     ) -> Result<DfsPosixFileRangeReadStream> {
         let (path, object) = self.local_posix_file_content_object(path, true)?;
-        match self
-            .open_local_object_metadata_range_stream_with_state(&object, offset, max_bytes, 0)?
-        {
+        match self.open_local_object_metadata_range_stream_with_state(&object, offset, max_bytes)? {
             NetworkedDfsRangeReadStreamOutcome::Found(stream) => Ok(DfsPosixFileRangeReadStream {
                 object_id: stream.data.object_id,
                 version: stream.data.version,
@@ -1052,7 +900,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if request_ids.is_empty() {
             return Ok(initial);
         }
-        let mut range_assemblies = BTreeMap::<String, PosixRemoteRangeReadAssembly>::new();
         let mut idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
         loop {
             self.check_cancelled("remote metadata range read wait")?;
@@ -1087,89 +934,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         });
                     }
                     NetworkedDfsServiceEvent::RemoteReadCompleted { request_id, .. }
-                        if request_ids.contains(&request_id) =>
-                    {
-                        range_assemblies.remove(&request_id);
-                    }
-                    NetworkedDfsServiceEvent::RemoteRangeReadChunkReceived {
-                        request_id,
-                        object_id: event_object_id,
-                        source_node_id,
-                        version,
-                        content_hash,
-                        range_offset,
-                        range_size_bytes,
-                        object_total_size_bytes,
-                        chunk_index,
-                        total_chunks,
-                        bytes,
-                        complete,
-                    } if request_ids.contains(&request_id)
-                        && event_object_id == object.object_id =>
-                    {
-                        if !range_assemblies.contains_key(&request_id) {
-                            range_assemblies.insert(
-                                request_id.clone(),
-                                PosixRemoteRangeReadAssembly::new(
-                                    event_object_id.clone(),
-                                    source_node_id.clone(),
-                                    version.clone(),
-                                    content_hash.clone(),
-                                    range_offset,
-                                    range_size_bytes,
-                                    object_total_size_bytes,
-                                    total_chunks,
-                                    max_bytes,
-                                )?,
-                            );
-                        }
-                        let assembly = range_assemblies
-                            .get_mut(&request_id)
-                            .expect("range assembly inserted above");
-                        if !assembly.metadata_matches(
-                            &event_object_id,
-                            &source_node_id,
-                            &version,
-                            &content_hash,
-                            range_offset,
-                            range_size_bytes,
-                            object_total_size_bytes,
-                            total_chunks,
-                        ) {
-                            return Err(DfsError::Distributed {
-                                message: format!(
-                                    "conflicting chunked prefix range metadata for {request_id}"
-                                ),
-                            }
-                            .into());
-                        }
-                        if assembly.push_chunk(chunk_index, bytes, complete)? {
-                            let assembly = range_assemblies
-                                .remove(&request_id)
-                                .expect("completed range assembly");
-                            let completed_source = assembly.source_node_id.clone();
-                            let data = assembly.into_data();
-                            if let Err(error) =
-                                validate_complete_posix_range_content_hash(&object, &data)
-                            {
-                                self.mark_remote_read_location_missing(
-                                    &object.object_id,
-                                    &object.version,
-                                    &object.content_hash,
-                                    &completed_source,
-                                )?;
-                                return Err(error.into());
-                            }
-                            return Ok(NetworkedDfsRangeReadOutcome::Found {
-                                data,
-                                freshness: NetworkedDfsReadFreshness::Current,
-                            });
-                        }
-                    }
+                        if request_ids.contains(&request_id) => {}
                     _ => {}
                 }
             }
-            range_assemblies.retain(|request_id, _| self.pending_reads.contains_key(request_id));
             object = self.current_read_object_metadata_or_path_object(&object)?;
             let current = self
                 .read_object_metadata_local_range_with_state(&object, offset, max_bytes, false)?;

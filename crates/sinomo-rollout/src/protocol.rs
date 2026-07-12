@@ -5,23 +5,6 @@ use sinomo_core::{ClusterBootstrapState, ClusterEndpointPrivacy};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ClusterRolloutBinaryRequest {
-    pub source: String,
-    #[serde(with = "serde_bytes")]
-    pub binary: Vec<u8>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub native_dylib_modules: Vec<ClusterRolloutNativeDylibModuleArtifact>,
-    #[serde(default)]
-    pub target_os: String,
-    #[serde(default)]
-    pub target_arch: String,
-    pub host: String,
-    pub port: u16,
-    pub shadow_port: u16,
-    pub requested_at: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterRolloutNativeDylibModuleArtifact {
     pub module_id: String,
     pub interface_version: String,
@@ -74,8 +57,13 @@ pub struct ClusterRolloutNativeDylibModuleUploadSpec {
     pub artifact: ClusterRolloutUploadArtifactSpec,
 }
 
+/// Small object-RPC head for a streamed cluster-binary rollout.
+///
+/// Artifact bytes are never embedded in this object. Each artifact is sent as
+/// one body attachment on [`crate::ROLLOUT_BINARY_ROUTE`], so
+/// `sinomo-network` owns transport chunking, progress, and retries.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ClusterRolloutBinaryUploadManifest {
+pub struct ClusterRolloutBinaryManifest {
     pub upload_id: String,
     pub source: String,
     #[serde(default)]
@@ -91,26 +79,42 @@ pub struct ClusterRolloutBinaryUploadManifest {
     pub native_dylib_modules: Vec<ClusterRolloutNativeDylibModuleUploadSpec>,
 }
 
+impl ClusterRolloutBinaryManifest {
+    pub fn artifact(&self, artifact_id: &str) -> Option<&ClusterRolloutUploadArtifactSpec> {
+        if self.binary.artifact_id == artifact_id {
+            return Some(&self.binary);
+        }
+        self.native_dylib_modules
+            .iter()
+            .map(|module| &module.artifact)
+            .find(|artifact| artifact.artifact_id == artifact_id)
+    }
+
+    pub fn artifacts(&self) -> impl Iterator<Item = &ClusterRolloutUploadArtifactSpec> {
+        std::iter::once(&self.binary).chain(
+            self.native_dylib_modules
+                .iter()
+                .map(|module| &module.artifact),
+        )
+    }
+
+    pub fn total_bytes(&self) -> Option<u64> {
+        self.artifacts().try_fold(0_u64, |total, artifact| {
+            total.checked_add(artifact.total_bytes)
+        })
+    }
+}
+
+/// One whole-artifact transfer on [`crate::ROLLOUT_BINARY_ROUTE`].
+///
+/// `activate` is set only on the last semantic artifact. It replaces the old
+/// protocol-level chunk/finalize routes without making callers shard files.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ClusterRolloutBinaryUploadChunkRequest {
-    pub upload_id: String,
+pub struct ClusterRolloutBinaryRequest {
+    pub manifest: ClusterRolloutBinaryManifest,
     pub artifact_id: String,
-    pub offset: u64,
-    pub total_bytes: u64,
-    #[serde(with = "serde_bytes")]
-    pub bytes: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ClusterRolloutBinaryUploadChunkResponse {
-    pub accepted: bool,
-    pub detail: String,
-    pub received_bytes: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ClusterRolloutBinaryUploadFinalizeRequest {
-    pub manifest: ClusterRolloutBinaryUploadManifest,
+    #[serde(default)]
+    pub activate: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -140,7 +144,7 @@ pub struct ClusterRolloutBinaryResponse {
     pub source_head: Option<String>,
 }
 
-pub fn prepare_cluster_rollout_binary_request(
+pub fn prepare_cluster_rollout_binary_manifest(
     source: impl Into<String>,
     binary: &Path,
     native_dylib_modules: &[LocalRolloutNativeDylibModuleArtifact],
@@ -148,25 +152,74 @@ pub fn prepare_cluster_rollout_binary_request(
     port: u16,
     shadow_port: u16,
     requested_at: impl Into<String>,
-) -> Result<ClusterRolloutBinaryRequest, RolloutError> {
-    let binary_bytes = std::fs::read(binary).map_err(|source| RolloutError::Io {
-        path: binary.display().to_string(),
-        detail: source.to_string(),
-    })?;
+) -> Result<ClusterRolloutBinaryManifest, RolloutError> {
+    let binary = rollout_upload_artifact_spec("binary", binary)?;
     let native_dylib_modules = native_dylib_modules
         .iter()
-        .map(cluster_native_dylib_module_artifact_from_local)
+        .enumerate()
+        .map(|(index, artifact)| {
+            Ok::<_, RolloutError>(ClusterRolloutNativeDylibModuleUploadSpec {
+                module_id: artifact.module_id.clone(),
+                interface_version: artifact.interface_version.clone(),
+                cache_key: artifact.cache_key.clone(),
+                library_name: artifact.library_name.clone(),
+                source: artifact.source.clone(),
+                artifact: rollout_upload_artifact_spec(
+                    &format!("module-{index}"),
+                    &artifact.built_library,
+                )?,
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(ClusterRolloutBinaryRequest {
+    Ok(ClusterRolloutBinaryManifest {
+        upload_id: format!(
+            "rollout-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ),
         source: source.into(),
-        binary: binary_bytes,
-        native_dylib_modules,
         target_os: std::env::consts::OS.to_string(),
         target_arch: std::env::consts::ARCH.to_string(),
         host: host.into(),
         port,
         shadow_port,
         requested_at: requested_at.into(),
+        binary,
+        native_dylib_modules,
+    })
+}
+
+fn rollout_upload_artifact_spec(
+    artifact_id: &str,
+    path: &Path,
+) -> Result<ClusterRolloutUploadArtifactSpec, RolloutError> {
+    let total_bytes = std::fs::metadata(path)
+        .map_err(|source| RolloutError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?
+        .len();
+    let mut file = std::fs::File::open(path).map_err(|source| RolloutError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read =
+            std::io::Read::read(&mut file, &mut buffer).map_err(|source| RolloutError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(ClusterRolloutUploadArtifactSpec {
+        artifact_id: artifact_id.to_string(),
+        total_bytes,
+        blake3: hasher.finalize().as_bytes().to_vec(),
     })
 }
 
@@ -293,12 +346,12 @@ mod tests {
     type ClusterId = Id;
 
     #[test]
-    fn prepare_cluster_rollout_binary_request_reads_and_encodes_binary() {
+    fn prepare_cluster_rollout_binary_manifest_describes_binary_without_embedding_it() {
         let root = temp_root("cluster-binary-request");
         let binary = root.join("sinomo");
         std::fs::write(&binary, b"binary-bytes").expect("binary");
 
-        let request = prepare_cluster_rollout_binary_request(
+        let manifest = prepare_cluster_rollout_binary_manifest(
             "source",
             &binary,
             &[],
@@ -309,24 +362,27 @@ mod tests {
         )
         .expect("request");
 
-        assert_eq!(request.source, "source");
-        assert_eq!(request.binary, b"binary-bytes".to_vec());
-        assert_eq!(request.host, "127.0.0.1");
-        assert_eq!(request.port, 21353);
-        assert_eq!(request.shadow_port, 21354);
-        assert!(!request.target_os.is_empty());
-        assert!(!request.target_arch.is_empty());
+        assert_eq!(manifest.source, "source");
+        assert_eq!(manifest.binary.artifact_id, "binary");
+        assert_eq!(manifest.binary.total_bytes, 12);
+        assert_eq!(manifest.binary.blake3.len(), 32);
+        assert_eq!(manifest.host, "127.0.0.1");
+        assert_eq!(manifest.port, 21353);
+        assert_eq!(manifest.shadow_port, 21354);
+        assert!(!manifest.target_os.is_empty());
+        assert!(!manifest.target_arch.is_empty());
+        assert_eq!(manifest.total_bytes(), Some(12));
     }
 
     #[test]
-    fn prepare_cluster_rollout_binary_request_includes_native_module_artifacts() {
+    fn prepare_cluster_rollout_binary_manifest_describes_native_module_artifacts() {
         let root = temp_root("cluster-binary-module-request");
         let binary = root.join("sinomo");
         let module = root.join("libmodule.so");
         std::fs::write(&binary, b"binary-bytes").expect("binary");
         std::fs::write(&module, b"module-bytes").expect("module");
 
-        let request = prepare_cluster_rollout_binary_request(
+        let manifest = prepare_cluster_rollout_binary_manifest(
             "source",
             &binary,
             &[LocalRolloutNativeDylibModuleArtifact {
@@ -344,14 +400,17 @@ mod tests {
         )
         .expect("request");
 
-        assert_eq!(request.native_dylib_modules.len(), 1);
-        let artifact = &request.native_dylib_modules[0];
-        assert_eq!(artifact.module_id, "module.test");
-        assert_eq!(artifact.interface_version, "test.v1");
-        assert_eq!(artifact.cache_key, "module/test");
-        assert_eq!(artifact.library_name, "libmodule.so");
-        assert_eq!(artifact.source, "test");
-        assert_eq!(artifact.library, b"module-bytes".to_vec());
+        assert_eq!(manifest.native_dylib_modules.len(), 1);
+        let module = &manifest.native_dylib_modules[0];
+        assert_eq!(module.module_id, "module.test");
+        assert_eq!(module.interface_version, "test.v1");
+        assert_eq!(module.cache_key, "module/test");
+        assert_eq!(module.library_name, "libmodule.so");
+        assert_eq!(module.source, "test");
+        assert_eq!(module.artifact.artifact_id, "module-0");
+        assert_eq!(module.artifact.total_bytes, 12);
+        assert_eq!(module.artifact.blake3.len(), 32);
+        assert_eq!(manifest.total_bytes(), Some(24));
     }
 
     #[test]

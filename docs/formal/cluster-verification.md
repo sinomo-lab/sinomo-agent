@@ -65,8 +65,8 @@ The model inventory is split by subsystem:
   namespace transaction publication, sharded namespace routing,
   namespace-command replay and cancellation, metadata journal source
   validation, repair authorization, replication policy, no-conflict
-  serialization, pending request lifecycle, repair content validation, chunked
-  transfer, lost-authority repair suppression, and local content anti-entropy.
+  serialization, pending request lifecycle, repair content validation,
+  lost-authority repair suppression, and local content anti-entropy.
   Matching invariant entrypoints live under `checks/dfs/`; deterministic
   advisory-lock fencing, file-sync recovery, directory-generation barriers,
   complete-holder/quorum-repair partitions, local-first reconciliation,
@@ -895,8 +895,8 @@ stage/repair inflight cleanup helpers in `service_repair.rs`. The model
 deliberately captures the implementation nuance that completed routed writes
 may remain in `pending_routed_writes` as terminal cached results for
 `write_outcome`; they are not active pending requests. It does not prove
-eventual progress, wall-clock timeout fairness, chunk assembly correctness, or
-full transfer-window accounting.
+eventual progress, wall-clock timeout fairness, or end-to-end byte-body
+integrity across the DFS and network-session layers.
 
 The `dfs_namespace_command_replay_safety.safety` invariant refines the
 primary-side namespace replay cache and requester cancellation boundary:
@@ -944,65 +944,27 @@ This maps to `NetworkedDfsService::put_metadata_receipt`,
 `NetworkedDfsService::ensure_stage_response_matches_pending`,
 `NetworkedDfsService::handle_repair_replica_response`,
 `NetworkedDfsService::ensure_repair_response_matches_pending`, and
-`NetworkedDfsService::handle_fetch_blob_response_chunk`. The model includes the
+`NetworkedDfsService::handle_fetch_blob_response`. The model includes the
 implementation nuance that a restored repair response may be accepted without a
 tracked in-flight request when a matching repair job still exists. It also
 models stale wrong-hash metadata receipts as backend state that must not become
-durable repair evidence. It does not prove chunk assembly, transfer-window
-accounting, retry fairness, or that every missing replica is eventually
-repaired.
-
-The `dfs_chunked_transfer_safety.safety` invariant combines these properties:
-
-- received chunks stay within the declared transfer shape;
-- every received chunk has a recorded payload, and recorded payloads correspond
-  to received chunks;
-- a durable response requires the transfer to be committed;
-- durable responses carry the expected full-content hash;
-- committed transfers require every chunk to have arrived;
-- committed transfers require the assembled full-object hash to match the
-  expected content hash;
-- malformed chunk shape, bad per-chunk hash, conflicting duplicate chunk, and
-  final assembled-hash mismatch never send a durable response;
-- receiver resume indexes are bounded and refer to a contiguous received prefix;
-- sender windows contain only valid chunk indexes;
-- sender `next_chunk_index` stays in range;
-- sender `complete` implies `next_chunk_index == total_chunks`;
-- an unroutable stopped sender window is not complete and resumes at the first
-  unsent chunk;
-- every sent chunk in the last modeled sender window is before
-  `next_chunk_index`.
-
-This maps to `validate_chunked_transfer_shape`, `validate_chunk_bytes`,
-`validate_chunk_hash`, `ChunkedBlobAssembler::insert_chunk`,
-`LocalContentStore::commit_chunked_object_version`,
-`NetworkedDfsService::send_stage_blob_window_if_routable`,
-`NetworkedDfsService::send_repair_replica_window_if_routable`,
-`NetworkedDfsService::handle_stage_blob_chunk`,
-`NetworkedDfsService::handle_repair_replica_chunk`, and
-`NetworkedDfsService::handle_fetch_blob_response_chunk`. The model deliberately
-separates sender window completion from receiver commit: a sender can report a
-complete window, but the receiver can only commit after its assembler has all
-chunks and the final content hash matches. It does not prove chunked patch
-offset/base semantics, read-memory assembly details, network delivery fairness,
-or eventual retry progress.
+durable repair evidence. Body framing, end-to-end finish attestation, flow
+control, and replay-safe retry are now `sinomo-network` obligations and are not
+proved by this DFS slice. It also does not prove retry fairness or that every
+missing replica is eventually repaired.
 
 The `dfs_repair_lost_authority_safety.safety` invariant combines these properties:
 
 - removing committed pending repair state clears all pending repair/fetch state;
-- suppressed repair replicas cannot remain active, keep repair resume indexes,
-  or become retry-due;
+- suppressed repair replicas cannot remain active or become retry-due;
 - persisted lost-authority attempt records stay represented as suppressed
   retry state;
-- lost-authority suppression clears fetch inflight, request, resume, failed, and
-  incoming fetch-transfer state;
+- lost-authority suppression clears fetch inflight, request, and failed state;
 - lost-authority repair responses suppress the observed replica;
 - lost-authority maintenance suppresses the repair backlog when the local node
   is no longer authoritative or the pending repair no longer targets current
   content;
 - stale repair-base rejections stay retryable and do not suppress the replica;
-- stale chunk-resume rejections clear request/resume state and make the repair
-  immediately retryable from chunk zero;
 - transient route failures stay retryable and do not suppress the replica;
 - retry-due and repair-request replicas are known repair replicas and are not
   suppressed;
@@ -1010,16 +972,14 @@ The `dfs_repair_lost_authority_safety.safety` invariant combines these propertie
 
 This maps to `repair_rejection_indicates_lost_authority`,
 `repair_rejection_indicates_stale_replica_base`,
-`repair_rejection_indicates_stale_chunk_resume`,
 `repair_error_indicates_transient_route_failure`,
 `NetworkedDfsService::handle_repair_replica_response`,
 `NetworkedDfsService::retry_pending_repairs_bounded_with_attempts`,
 `NetworkedDfsService::restore_repair_attempt_records`,
 `NetworkedDfsService::record_repair_retry_scheduled_with_error`,
-`NetworkedDfsService::record_repair_resume_reset`, and
 `NetworkedDfsService::suppress_repair_retries_for_lost_authority`. The model
-explicitly separates permanent lost-authority suppression from stale
-base/chunk sequencing failures and transient routing errors. It does not prove
+explicitly separates permanent lost-authority suppression from stale-base
+failures and transient routing errors. It does not prove
 that a newly authoritative primary will eventually take over repair, nor does
 it prove network fairness or cross-primary repair handoff progress.
 
@@ -1234,9 +1194,7 @@ in about 129 seconds, and interrupted Apalache 4/5-step attempts reported Z3
 defaulting to 4; a 5-step membership check passed on this checkout but took
 about 50 seconds by itself. The repair content-validation spec can be overridden
 with `QUINT_DFS_REPAIR_CONTENT_VERIFY_MAX_STEPS`; its 5-step symbolic check
-passed in about 30 seconds. The chunked-transfer spec can be overridden with
-`QUINT_DFS_CHUNKED_VERIFY_MAX_STEPS`; its 5-step symbolic check passed in about
-8 seconds. The repair lost-authority spec can be overridden with
+passed in about 30 seconds. The repair lost-authority spec can be overridden with
 `QUINT_DFS_REPAIR_LOST_AUTHORITY_VERIFY_MAX_STEPS`; its default is 4 because
 the 5-step symbolic check passed but took about 135 seconds. The anti-entropy
 spec can be overridden with `QUINT_DFS_ANTI_ENTROPY_VERIFY_MAX_STEPS`; its
@@ -1255,7 +1213,7 @@ resident-replay and cache-loss/cancellation witnesses.
 Use larger bounds for local audit runs, not as a routine CI gate:
 
 ```bash
-QUINT_VERIFY_MAX_STEPS=8 QUINT_RAFT_PROTOCOL_VERIFY_MAX_STEPS=2 QUINT_NETWORK_ENDPOINT_VERIFY_MAX_STEPS=5 QUINT_NETWORK_ROUTE_VERIFY_MAX_STEPS=5 QUINT_NETWORK_ROUTE_CACHE_VERIFY_MAX_STEPS=5 QUINT_NETWORK_DELIVERY_VERIFY_MAX_STEPS=6 QUINT_NETWORK_ATTEMPT_BUDGET_VERIFY_MAX_STEPS=4 QUINT_NETWORK_TIMED_TRANSPORT_VERIFY_MAX_STEPS=6 QUINT_NETWORK_TIMED_DELIVERY_VERIFY_MAX_STEPS=8 QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_STEPS=160 QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_SAMPLES=5000 QUINT_SYSTEM_SMOKE_RUN_MAX_STEPS=240 QUINT_SYSTEM_SMOKE_RUN_MAX_SAMPLES=10000 QUINT_DFS_ROUTING_VERIFY_MAX_STEPS=6 QUINT_DFS_READ_FRESHNESS_VERIFY_MAX_STEPS=4 QUINT_DFS_ROUTED_NAMESPACE_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_NAMESPACE_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_LINKS_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_CROSS_SHARD_VERIFY_MAX_STEPS=3 QUINT_DFS_POSIX_READ_WRITE_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_ADVISORY_LOCKS_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_FSYNC_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_PARTITIONED_OPERATION_VERIFY_MAX_STEPS=10 QUINT_DFS_LOCAL_FIRST_FILE_VERIFY_MAX_STEPS=6 QUINT_DFS_LOCAL_FIRST_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_LOCAL_FIRST_NAMESPACE_DURABILITY_VERIFY_MAX_STEPS=8 QUINT_DFS_LOCAL_FIRST_RECONCILE_GATEWAY_VERIFY_MAX_STEPS=6 QUINT_DFS_PRIMARY_FAILOVER_VERIFY_MAX_STEPS=4 QUINT_DFS_NAMESPACE_REPLAY_VERIFY_MAX_STEPS=6 QUINT_DFS_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_SHARDED_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_JOURNAL_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_VERIFY_MAX_STEPS=6 QUINT_DFS_REPLICATION_VERIFY_MAX_STEPS=6 QUINT_DFS_NO_CONFLICT_VERIFY_MAX_STEPS=6 QUINT_DFS_PENDING_VERIFY_MAX_STEPS=4 QUINT_DFS_REPAIR_CONTENT_VERIFY_MAX_STEPS=6 QUINT_DFS_CHUNKED_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_LOST_AUTHORITY_VERIFY_MAX_STEPS=5 QUINT_DFS_ANTI_ENTROPY_VERIFY_MAX_STEPS=6 QUINT_MEMBERSHIP_VERIFY_MAX_STEPS=5 QUINT_MEMBERSHIP_KV_VERIFY_MAX_STEPS=5 QUINT_MEMBERSHIP_RAFT_CONFIG_VERIFY_MAX_STEPS=5 bash scripts/formal/check-quint.sh all
+QUINT_VERIFY_MAX_STEPS=8 QUINT_RAFT_PROTOCOL_VERIFY_MAX_STEPS=2 QUINT_NETWORK_ENDPOINT_VERIFY_MAX_STEPS=5 QUINT_NETWORK_ROUTE_VERIFY_MAX_STEPS=5 QUINT_NETWORK_ROUTE_CACHE_VERIFY_MAX_STEPS=5 QUINT_NETWORK_DELIVERY_VERIFY_MAX_STEPS=6 QUINT_NETWORK_ATTEMPT_BUDGET_VERIFY_MAX_STEPS=4 QUINT_NETWORK_TIMED_TRANSPORT_VERIFY_MAX_STEPS=6 QUINT_NETWORK_TIMED_DELIVERY_VERIFY_MAX_STEPS=8 QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_STEPS=160 QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_SAMPLES=5000 QUINT_SYSTEM_SMOKE_RUN_MAX_STEPS=240 QUINT_SYSTEM_SMOKE_RUN_MAX_SAMPLES=10000 QUINT_DFS_ROUTING_VERIFY_MAX_STEPS=6 QUINT_DFS_READ_FRESHNESS_VERIFY_MAX_STEPS=4 QUINT_DFS_ROUTED_NAMESPACE_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_NAMESPACE_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_LINKS_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_CROSS_SHARD_VERIFY_MAX_STEPS=3 QUINT_DFS_POSIX_READ_WRITE_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_ADVISORY_LOCKS_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_FSYNC_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_PARTITIONED_OPERATION_VERIFY_MAX_STEPS=10 QUINT_DFS_LOCAL_FIRST_FILE_VERIFY_MAX_STEPS=6 QUINT_DFS_LOCAL_FIRST_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_LOCAL_FIRST_NAMESPACE_DURABILITY_VERIFY_MAX_STEPS=8 QUINT_DFS_LOCAL_FIRST_RECONCILE_GATEWAY_VERIFY_MAX_STEPS=6 QUINT_DFS_PRIMARY_FAILOVER_VERIFY_MAX_STEPS=4 QUINT_DFS_NAMESPACE_REPLAY_VERIFY_MAX_STEPS=6 QUINT_DFS_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_SHARDED_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_JOURNAL_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_VERIFY_MAX_STEPS=6 QUINT_DFS_REPLICATION_VERIFY_MAX_STEPS=6 QUINT_DFS_NO_CONFLICT_VERIFY_MAX_STEPS=6 QUINT_DFS_PENDING_VERIFY_MAX_STEPS=4 QUINT_DFS_REPAIR_CONTENT_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_LOST_AUTHORITY_VERIFY_MAX_STEPS=5 QUINT_DFS_ANTI_ENTROPY_VERIFY_MAX_STEPS=6 QUINT_MEMBERSHIP_VERIFY_MAX_STEPS=5 QUINT_MEMBERSHIP_KV_VERIFY_MAX_STEPS=5 QUINT_MEMBERSHIP_RAFT_CONFIG_VERIFY_MAX_STEPS=5 bash scripts/formal/check-quint.sh all
 ```
 
 ## Current Abstractions
@@ -1274,13 +1232,13 @@ This slice does not yet model:
   real directory snapshots, composition with the focused route-cache model, raw
   transport frames, stream payloads, full KV log replay, and concrete DFS
   object-store contents;
-- live `ClusterDirectory` read failures during an in-flight delivery, raw
-  streamed response retry budgets, concrete transport nonce entropy, unbounded
+- live `ClusterDirectory` read failures during an in-flight delivery,
+  full-duplex session retry budgets, concrete transport nonce entropy, unbounded
   wall-clock fairness, and dynamic module enable/disable races;
 - directory fragments, local-owned owner routing, owner-inclusion replica-set
   normalization, durable namespace-command idempotency across cache eviction or
   restart, cross-primary repair handoff progress, router-local recovery after
-  sharded namespace index write failures, chunked patch offset/base semantics,
+  sharded namespace index write failures, patch offset/base semantics,
   read-memory assembly details, distributed anti-entropy repair scheduling
   progress, wall-clock timeout fairness, concrete lock-lease clock bounds,
   byte-range and multi-object application lock cycles, open-handle behavior

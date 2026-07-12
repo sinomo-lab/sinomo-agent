@@ -20,31 +20,30 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::direct_read::{
-    handle_dfs_direct_read_rpc_request_with_initialized_content_store,
-    handle_dfs_direct_read_stream_rpc_request_with_initialized_content_store,
-};
+use crate::direct_read::handle_dfs_direct_read_body_rpc_request_with_initialized_content_store;
 use crate::local_state::open_cluster_aware_dfs_metadata_backend_for_inspection;
 use crate::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_PLANE_SERVICE_ROUTES, DFS_DIRECT_READ_ROUTE,
-    DFS_DIRECT_READ_STREAM_CHUNK_BYTES, DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE,
-    DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_SMOKE_ROUTE,
-    DFS_STATUS_ROUTE, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMessageCommand,
-    DfsMessageResponse, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
-    DfsMetadataJournalBatchResponse, DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand,
-    DfsMetadataSnapshotInstallResponse, DfsOperatorInspector, DfsOperatorStatus, DfsSmokeReport,
-    LocalContentStore, decode_dfs_message_rpc_request, default_dfs_metadata_root,
-    default_dfs_metadata_shards_root, dfs_module_surfaces, dfs_route_is_message_data_plane,
+    DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE, DFS_METADATA_JOURNAL_BATCH_ROUTE,
+    DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE,
+    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMessageCommand, DfsMessageResponse,
+    DfsMetadataBackend, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
+    DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
+    DfsOperatorInspector, DfsOperatorStatus, DfsOutboundBody, DfsSmokeReport, LocalContentStore,
+    decode_dfs_message_rpc_request, default_dfs_metadata_root, default_dfs_metadata_shards_root,
+    dfs_module_surfaces, dfs_route_is_message_data_plane,
     ensure_default_cluster_aware_dfs_expose_config, inspect_cluster_aware_dfs_status,
     metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
     resolve_dfs_conflicts, sifs_file_system_id, use_dfs_conflict_version,
 };
 use sinomo_core::local::SinomoDataDir;
-use sinomo_core::network::{ClusterPaths, ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_core::network::{
+    ClusterPaths, ObjectRpcBodySource, ObjectRpcRequest, ObjectRpcResponse,
+};
 
 use sinomo_core::service::{
-    Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
-    ServiceRegistryBuilder, ServiceRoute, ServiceStreamFuture, ServiceStreamResponse,
+    Service, ServiceBodyMode, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
+    ServiceRegistryBuilder, ServiceRoute,
 };
 
 const DFS_DEFAULT_ROUTE_CONCURRENCY_LIMIT: usize = 8;
@@ -94,7 +93,31 @@ fn dfs_service_route(route: &'static str) -> ServiceRoute {
     if let Some(timeout) = dfs_service_route_timeout(route.route.as_str()) {
         route = route.with_timeout(timeout);
     }
+    if dfs_route_accepts_request_body(route.route.as_str()) {
+        route = route.with_request_body_mode(ServiceBodyMode::Optional);
+    }
+    if dfs_route_returns_response_body(route.route.as_str()) {
+        route = route.with_response_body_mode(ServiceBodyMode::Optional);
+    }
     route
+}
+
+fn dfs_route_accepts_request_body(route: &str) -> bool {
+    matches!(
+        route,
+        crate::DFS_DATA_WRITE_ROUTE
+            | crate::DFS_DATA_DISTRIBUTED_WRITE_ROUTE
+            | crate::DFS_DATA_STAGE_BLOB_ROUTE
+            | crate::DFS_DATA_STAGE_PATCH_ROUTE
+            | crate::DFS_DATA_REPAIR_REPLICA_ROUTE
+    )
+}
+
+fn dfs_route_returns_response_body(route: &str) -> bool {
+    matches!(
+        route,
+        DFS_DIRECT_READ_ROUTE | crate::DFS_DATA_READ_ROUTE | crate::DFS_DATA_FETCH_BLOB_ROUTE
+    )
 }
 
 fn dfs_service_route_concurrency_limit(route: &str) -> usize {
@@ -145,7 +168,22 @@ pub trait DfsDataPlaneHost: Send + Sync {
         &'a self,
         command: DfsMessageCommand,
         traceparent: Option<String>,
-    ) -> DfsDataPlaneHostFuture<'a, DfsMessageResponse>;
+    ) -> DfsDataPlaneHostFuture<'a, DfsDataPlaneResponse>;
+}
+
+#[derive(Debug)]
+pub struct DfsDataPlaneResponse {
+    pub response: DfsMessageResponse,
+    pub body: Option<DfsOutboundBody>,
+}
+
+impl DfsDataPlaneResponse {
+    pub fn buffered(response: DfsMessageResponse) -> Self {
+        Self {
+            response,
+            body: None,
+        }
+    }
 }
 
 pub type DfsDataPlaneHostFuture<'a, T> =
@@ -307,55 +345,60 @@ impl Service for DfsDataPlaneService {
                 }
                 route if dfs_route_is_message_data_plane(route) => {
                     let traceparent = request.traceparent().map(ToString::to_string);
-                    let command = decode_dfs_message_rpc_request(&request)?;
+                    let request_body = ctx.take_request_body();
+                    let command = if request_body.is_empty() {
+                        decode_dfs_message_rpc_request(&request)?
+                    } else {
+                        let head = crate::body_rpc::decode_dfs_body_message_rpc_request(&request)?;
+                        let max_bytes =
+                            usize::try_from(head.body.total_size_bytes).map_err(|_| {
+                                ServiceError::Service(format!(
+                                    "DFS request body for {route} is too large for this platform"
+                                ))
+                            })?;
+                        let bytes = request_body.collect_to_vec(max_bytes).await?;
+                        crate::body_rpc::attach_dfs_message_request_body(head, bytes)?
+                    };
                     let message_response = service
                         .host
                         .handle_message(command, traceparent)
                         .await
                         .map_err(service_error)?;
-                    ObjectRpcResponse::encode_body(route, &message_response)?
+                    if let Some(body) = message_response.body {
+                        let response = crate::body_rpc::encode_dfs_body_message_rpc_response(
+                            route,
+                            message_response.response,
+                            body.descriptor,
+                        )?;
+                        ctx.respond_with_body(response, body.source)?;
+                        return Ok(ServiceDisposition::Continue);
+                    }
+                    if let Some((head, descriptor, bytes)) =
+                        crate::body_rpc::split_dfs_message_response_body(&message_response.response)
+                    {
+                        let response = crate::body_rpc::encode_dfs_body_message_rpc_response(
+                            route, head, descriptor,
+                        )?;
+                        ctx.respond_with_body(response, ObjectRpcBodySource::bytes(bytes))?;
+                        return Ok(ServiceDisposition::Continue);
+                    }
+                    ObjectRpcResponse::encode_body(route, &message_response.response)?
                 }
                 DFS_DIRECT_READ_ROUTE => {
                     let content = service.content_store_for(&ctx.data_dir)?;
-                    handle_dfs_direct_read_rpc_request_with_initialized_content_store(
-                        &content, request,
-                    )
-                    .map_err(service_error)?
+                    let response =
+                        handle_dfs_direct_read_body_rpc_request_with_initialized_content_store(
+                            &content, request,
+                        )
+                        .map_err(service_error)?;
+                    ctx.respond_with_body(response.response, response.body)?;
+                    return Ok(ServiceDisposition::Continue);
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
             };
             ctx.respond(response)?;
             Ok(ServiceDisposition::Continue)
         })
-    }
-
-    fn handle_stream(
-        &self,
-        ctx: ServiceContext,
-        request: ObjectRpcRequest,
-    ) -> Option<ServiceStreamFuture<'_>> {
-        if request.route != DFS_DIRECT_READ_ROUTE
-            || !sinomo_core::network::object_rpc_request_stream_mode(&request)
-                .expects_raw_streamed_response()
-        {
-            return None;
-        }
-        let service = self.clone();
-        Some(Box::pin(async move {
-            let content = service.content_store_for(&ctx.data_dir)?;
-            let stream_response =
-                handle_dfs_direct_read_stream_rpc_request_with_initialized_content_store(
-                    &content, request,
-                )
-                .map_err(service_error)?;
-            Ok(ServiceStreamResponse {
-                response: stream_response.response,
-                reader: stream_response
-                    .reader
-                    .map(|reader| Box::new(reader) as Box<dyn std::io::Read + Send>),
-                chunk_bytes: DFS_DIRECT_READ_STREAM_CHUNK_BYTES,
-            })
-        }))
     }
 }
 
@@ -582,11 +625,14 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct VecSink {
-        frames: Arc<Mutex<Vec<ObjectRpcResponse>>>,
+        frames: Arc<Mutex<Vec<sinomo_core::network::ObjectRpcSessionResponse>>>,
     }
 
     impl ResponseSink for VecSink {
-        fn emit(&mut self, response: ObjectRpcResponse) -> Result<(), ServiceError> {
+        fn send(
+            self: Box<Self>,
+            response: sinomo_core::network::ObjectRpcSessionResponse,
+        ) -> Result<(), ServiceError> {
             self.frames.lock().expect("sink lock").push(response);
             Ok(())
         }
@@ -636,7 +682,7 @@ mod tests {
             &'a self,
             command: DfsMessageCommand,
             traceparent: Option<String>,
-        ) -> DfsDataPlaneHostFuture<'a, DfsMessageResponse> {
+        ) -> DfsDataPlaneHostFuture<'a, DfsDataPlaneResponse> {
             Box::pin(async move {
                 self.message_request_ids
                     .lock()
@@ -646,10 +692,10 @@ mod tests {
                     .lock()
                     .expect("message traceparents")
                     .push(traceparent);
-                Ok(DfsMessageResponse {
+                Ok(DfsDataPlaneResponse::buffered(DfsMessageResponse {
                     request_id: command.request_id,
                     outbound_messages: Vec::new(),
-                })
+                }))
             })
         }
     }
@@ -668,12 +714,13 @@ mod tests {
     ) -> (ServiceDisposition, ObjectRpcResponse) {
         let sink = VecSink::default();
         let frames = Arc::clone(&sink.frames);
-        let ctx = ServiceContext {
+        let ctx = ServiceContext::new(
             data_dir,
-            cluster: None,
-            signer: ServiceSigner::Local,
-            sink: Box::new(sink),
-        };
+            None,
+            ServiceSigner::Local,
+            sinomo_core::network::ObjectRpcIncomingBody::empty(),
+            Box::new(sink),
+        );
         let request = ObjectRpcRequest::encode_body(route, DFS_RPC_CATEGORY, body)
             .expect("encode")
             .with_traceparent("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01");
@@ -681,28 +728,31 @@ mod tests {
         let response = frames
             .lock()
             .expect("frames")
-            .first()
-            .cloned()
-            .expect("a response frame");
+            .pop()
+            .expect("a response frame")
+            .response;
         (disposition, response)
     }
 
-    async fn dispatch_stream_local(
+    async fn dispatch_body_local(
         registry: &ServiceRegistry,
         data_dir: Arc<SinomoDataDir>,
         request: ObjectRpcRequest,
-    ) -> ServiceStreamResponse {
-        let ctx = ServiceContext {
+    ) -> sinomo_core::network::ObjectRpcSessionResponse {
+        let sink = VecSink::default();
+        let frames = Arc::clone(&sink.frames);
+        let ctx = ServiceContext::new(
             data_dir,
-            cluster: None,
-            signer: ServiceSigner::Local,
-            sink: Box::new(VecSink::default()),
-        };
+            None,
+            ServiceSigner::Local,
+            sinomo_core::network::ObjectRpcIncomingBody::empty(),
+            Box::new(sink),
+        );
         registry
-            .dispatch_stream_direct(ctx, request)
-            .expect("stream dispatch future")
+            .dispatch_direct(ctx, request)
             .await
-            .expect("stream dispatch")
+            .expect("body dispatch");
+        frames.lock().expect("frames").pop().expect("response")
     }
 
     #[test]
@@ -783,13 +833,12 @@ mod tests {
 
         let first_request =
             crate::dfs_direct_read_rpc_request(&direct_read).expect("first request");
-        let mut first = dispatch_stream_local(&registry, data_dir.clone(), first_request).await;
-        let mut first_bytes = Vec::new();
-        std::io::Read::read_to_end(
-            first.reader.as_mut().expect("first stream reader"),
-            &mut first_bytes,
-        )
-        .expect("read first stream");
+        let first = dispatch_body_local(&registry, data_dir.clone(), first_request).await;
+        let first_bytes = first
+            .body
+            .collect_to_vec(bytes.len())
+            .await
+            .expect("read first body");
         assert_eq!(first_bytes, bytes);
         assert_eq!(cache_probe.cached_content_store_count(), 1);
         let first_cached = cache_probe
@@ -798,13 +847,12 @@ mod tests {
 
         let second_request =
             crate::dfs_direct_read_rpc_request(&direct_read).expect("second request");
-        let mut second = dispatch_stream_local(&registry, data_dir.clone(), second_request).await;
-        let mut second_bytes = Vec::new();
-        std::io::Read::read_to_end(
-            second.reader.as_mut().expect("second stream reader"),
-            &mut second_bytes,
-        )
-        .expect("read second stream");
+        let second = dispatch_body_local(&registry, data_dir.clone(), second_request).await;
+        let second_bytes = second
+            .body
+            .collect_to_vec(bytes.len())
+            .await
+            .expect("read second body");
         assert_eq!(second_bytes, bytes);
         assert_eq!(cache_probe.cached_content_store_count(), 1);
         let second_cached = cache_probe
@@ -1120,8 +1168,6 @@ mod tests {
                     content_size_bytes: None,
                     range_offset: None,
                     range_max_bytes: None,
-                    start_chunk_index: 0,
-                    max_chunks: 0,
                 }),
             },
         };

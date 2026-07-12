@@ -594,9 +594,10 @@ must not require unbounded scans in the foreground write path.
 
 Benchmarks and integration tests are the source of truth for supported scale and
 performance. Formal models cover authority, routing freshness, namespace
-publication, receipt policy, repair authorization, chunk transfer, and the rule
-that normal operation does not create conflict histories. See the
-[formal verification guide](formal/cluster-verification.md).
+publication, receipt policy, repair authorization, content validation, and the
+rule that normal operation does not create conflict histories. Network-session
+framing and body attestation are implementation-tested rather than modeled by
+the DFS specs. See the [formal verification guide](formal/cluster-verification.md).
 
 This architecture records required behavior. Exact Rust types, storage table
 names, protocol message variants, benchmark presets, and migration readers

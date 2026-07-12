@@ -79,7 +79,6 @@ register_case dfs-replication specs/quint/checks/dfs/replication_policy_safety.q
 register_case dfs-no-conflict specs/quint/checks/dfs/no_conflict_safety.qnt dfs_no_conflict_safety "${QUINT_DFS_NO_CONFLICT_VERIFY_MAX_STEPS:-$verify_steps}"
 register_case dfs-pending-requests specs/quint/checks/dfs/pending_request_lifecycle_safety.qnt dfs_pending_request_lifecycle_safety "${QUINT_DFS_PENDING_VERIFY_MAX_STEPS:-3}" apalache step step deep "successfulReadSettlementWitness wrongSourceDiscardWithPendingWitness wrongObjectTerminalRejectionWitness"
 register_case dfs-repair-content specs/quint/checks/dfs/repair_content_validation_safety.qnt dfs_repair_content_validation_safety "${QUINT_DFS_REPAIR_CONTENT_VERIFY_MAX_STEPS:-$verify_steps}" apalache step step deep
-register_case dfs-chunked-transfer specs/quint/checks/dfs/chunked_transfer_safety.qnt dfs_chunked_transfer_safety "${QUINT_DFS_CHUNKED_VERIFY_MAX_STEPS:-$verify_steps}"
 register_case dfs-repair-lost-authority specs/quint/checks/dfs/repair_lost_authority_safety.qnt dfs_repair_lost_authority_safety "${QUINT_DFS_REPAIR_LOST_AUTHORITY_VERIFY_MAX_STEPS:-4}" apalache step step deep
 register_case dfs-anti-entropy specs/quint/checks/dfs/anti_entropy_safety.qnt dfs_anti_entropy_safety "${QUINT_DFS_ANTI_ENTROPY_VERIFY_MAX_STEPS:-$verify_steps}"
 

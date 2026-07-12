@@ -132,10 +132,10 @@ use sinomo_runtime::daemon::{
     send_daemon_cluster_maintenance_refresh_to_endpoint as daemon_send_daemon_cluster_maintenance_refresh_to_endpoint,
     send_daemon_rollout_binary as daemon_send_daemon_rollout_binary,
     send_daemon_rollout_binary_to_endpoint as daemon_send_daemon_rollout_binary_to_endpoint,
-    send_daemon_rollout_binary_upload_finalize as daemon_send_daemon_rollout_binary_upload_finalize,
-    send_daemon_rollout_binary_upload_finalize_to_endpoint as daemon_send_daemon_rollout_binary_upload_finalize_to_endpoint,
-    send_daemon_rollout_build_to_endpoint_with_timeouts as daemon_send_daemon_rollout_build_to_endpoint_with_timeouts,
-    send_daemon_rollout_build_with_timeouts as daemon_send_daemon_rollout_build_with_timeouts,
+    send_daemon_rollout_binary_to_target as daemon_send_daemon_rollout_binary_to_target,
+    send_daemon_rollout_build as daemon_send_daemon_rollout_build,
+    send_daemon_rollout_build_to_endpoint as daemon_send_daemon_rollout_build_to_endpoint,
+    send_daemon_rollout_build_to_target as daemon_send_daemon_rollout_build_to_target,
     send_daemon_rollout_clear_status as daemon_send_daemon_rollout_clear_status,
     send_daemon_rollout_clear_status_to_endpoint as daemon_send_daemon_rollout_clear_status_to_endpoint,
     send_daemon_rollout_diagnostics as daemon_send_daemon_rollout_diagnostics,
@@ -221,17 +221,15 @@ use sinomo_runtime::rollout::rollout_main_activation_path;
 #[cfg(test)]
 use sinomo_runtime::rollout::write_rollout_status;
 use sinomo_runtime::rollout::{
-    AppliedRolloutTransition, ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse,
-    ClusterRolloutBinaryUploadChunkRequest, ClusterRolloutBinaryUploadFinalizeRequest,
-    ClusterRolloutBinaryUploadManifest, ClusterRolloutBuildRequest,
-    ClusterRolloutNativeDylibModuleRequest, ClusterRolloutNativeDylibModuleUploadSpec,
-    ClusterRolloutUploadArtifactSpec, DEFAULT_SHADOW_TELEMETRY_LIMIT,
+    AppliedRolloutTransition, ClusterRolloutBinaryManifest, ClusterRolloutBinaryRequest,
+    ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
+    ClusterRolloutNativeDylibModuleRequest, DEFAULT_SHADOW_TELEMETRY_LIMIT,
     LocalRolloutNativeDylibModuleArtifact, ManagedSourceDeployOptions, ManagedSourceStatus,
     RolloutActivationStrategy, RolloutController, RolloutError, RolloutMainActivation,
     RolloutObservation, RolloutRuntimeState, RolloutTelemetryGateConfig, SelfRolloutPaths,
     clear_rollout_status, ensure_rollout_layout, ensure_rollout_source_repo_with_options,
     install_local_rollout_native_dylib_modules as rollout_install_local_rollout_native_dylib_modules,
-    managed_source_status, prepare_cluster_rollout_binary_request,
+    managed_source_status, prepare_cluster_rollout_binary_manifest,
     prepare_cluster_rollout_build_request, prepare_cluster_rollout_native_dylib_module_request,
     prepare_local_rollout_artifacts_with_options, prepare_rollout_dev_artifacts,
     prepare_rollout_source_bundle, read_rollout_runtime_state, read_rollout_telemetry_gate_config,
@@ -248,7 +246,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, Write};
 #[cfg(unix)]
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};

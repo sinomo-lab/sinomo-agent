@@ -44,18 +44,6 @@ pub enum ClusterTcpTunnelFrame {
         id: u64,
         response: ObjectRpcResponse,
     },
-    StreamChunk {
-        id: u64,
-        #[serde(with = "serde_bytes")]
-        bytes: Vec<u8>,
-    },
-    StreamEnd {
-        id: u64,
-    },
-    StreamError {
-        id: u64,
-        detail: String,
-    },
     Close {
         detail: String,
     },

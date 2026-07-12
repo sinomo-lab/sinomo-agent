@@ -9,10 +9,13 @@
 use crate::endpoint_selector::cluster_endpoint_can_carry_main_daemon_rpc;
 use crate::file_mark::{ClusterFileMark, cluster_file_mark};
 use crate::prelude::*;
+use crate::session::start_object_rpc_client_session;
 use crate::{
     ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityState, ClusterPaths,
     DEFAULT_NETWORK_TIMEOUT, DaemonControlRequest, DaemonRpcTimeouts, NetworkCallPolicy,
-    NetworkDeliveryState, NetworkError, NetworkTimeoutPhase, ObjectRpcRequest, ObjectRpcResponse,
+    NetworkDeliveryState, NetworkDuplexStream, NetworkError, NetworkHealthPolicy,
+    NetworkTimeoutPhase, ObjectRpcBodySource, ObjectRpcRequest, ObjectRpcResponse,
+    ObjectRpcSessionCall, ObjectRpcSessionResult,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
@@ -432,11 +435,6 @@ pub struct RelayEnvelope {
     /// originating caller. Intermediate relays must not expand this budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) max_hop_timeout_ms: Option<u64>,
-    /// Exceptional response no-progress timeout requested by the originating
-    /// caller. This applies only while waiting for a buffered response; streamed
-    /// body progress retains the shared network timeout.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) extended_idle_timeout_ms: Option<u64>,
     /// The original signed request to deliver at the target, re-injected through its
     /// normal auth + dispatch path (its own signature/invite-proof is carried within).
     pub(crate) inner: DaemonControlRequest,
@@ -453,7 +451,6 @@ impl RelayEnvelope {
             planned_path: Vec::new(),
             target_endpoints: Vec::new(),
             max_hop_timeout_ms: None,
-            extended_idle_timeout_ms: None,
             inner,
         }
     }
@@ -1923,216 +1920,37 @@ pub trait ClusterRelayAsyncHost {
 }
 
 #[derive(Debug)]
-pub enum ClusterRelayStreamSendOutcome {
-    Forwarded,
-    RoutingError(ObjectRpcResponse),
-    StreamStartedThenFailed(NetworkError),
-}
-
-#[derive(Debug)]
-pub enum ClusterRelayStreamForwardOutcome {
-    Forwarded,
-    ErrorResponse(ObjectRpcResponse),
-    StreamStartedThenFailed(NetworkError),
-}
-
-#[derive(Debug)]
-pub enum ClusterRelayStreamRequestAction {
-    NotStreamed,
+pub enum ClusterRelaySessionRequestAction {
     DeliverLocal(ObjectRpcRequest),
     Forward,
 }
 
-pub fn cluster_relay_stream_request_action(
-    local_node_id: &NodeId,
+/// Selects local delivery or the next forwarding hop for a canonical session
+/// relay without exposing the relay envelope's signed inner fields.
+pub fn cluster_relay_session_request_action(
+    state: &ClusterBootstrapState,
     request: &ObjectRpcRequest,
-) -> Result<ClusterRelayStreamRequestAction, NetworkError> {
+) -> Result<ClusterRelaySessionRequestAction, NetworkError> {
     let envelope = RelayEnvelope::from_request(request)?;
-    if !relay_envelope_inner_expects_streamed_response(&envelope) {
-        return Ok(ClusterRelayStreamRequestAction::NotStreamed);
+    if envelope.cluster_id != state.cluster_id {
+        return Err(NetworkError::ClusterMismatch {
+            expected: state.cluster_id.clone(),
+            actual: envelope.cluster_id,
+        });
     }
-    if envelope.target_node_id == *local_node_id {
-        Ok(ClusterRelayStreamRequestAction::DeliverLocal(
+    if envelope.target_node_id == state.local_node_id {
+        Ok(ClusterRelaySessionRequestAction::DeliverLocal(
             envelope.into_inner(),
         ))
     } else {
-        Ok(ClusterRelayStreamRequestAction::Forward)
+        Ok(ClusterRelaySessionRequestAction::Forward)
     }
-}
-
-pub trait ClusterRelayStreamForwardAsyncHost {
-    fn send_relay_stream_forward_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        request: &'a ObjectRpcRequest,
-        timeouts: DaemonRpcTimeouts,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<ClusterRelayStreamSendOutcome, NetworkError>> + Send + 'a>,
-    >;
-}
-
-/// Forwards an already-authenticated streamed object-RPC request to one
-/// concrete cluster endpoint and writes the streamed response to `upstream`.
-///
-/// This is the protocol-generic data-plane primitive used by relay code:
-/// built-in TCP/loopback endpoints preserve the raw byte stream without
-/// buffering the body, while network modules are dispatched through their
-/// raw-response hook.
-pub async fn forward_streamed_daemon_rpc_to_cluster_endpoint_async(
-    endpoint: &ClusterEndpointRecord,
-    request: &DaemonControlRequest,
-    timeouts: DaemonRpcTimeouts,
-    upstream: &mut crate::object::AsyncDaemonControlStream,
-    upstream_address: &str,
-    max_response_bytes: usize,
-) -> Result<ClusterRelayStreamSendOutcome, NetworkError> {
-    match endpoint.transport {
-        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
-            forward_streamed_daemon_rpc_to_tcp_endpoint_async(
-                endpoint,
-                request,
-                timeouts,
-                upstream,
-                upstream_address,
-                max_response_bytes,
-            )
-            .await
-        }
-        _ => {
-            let response =
-                crate::roaming::send_daemon_control_rpc_request_raw_response_to_cluster_endpoint_async(
-                    endpoint, request, timeouts,
-                )
-                .await?;
-            if relay_response_is_routing_error(&response) {
-                return Ok(ClusterRelayStreamSendOutcome::RoutingError(response));
-            }
-            write_streamed_daemon_rpc_response_to_upstream(
-                response,
-                upstream,
-                upstream_address,
-                timeouts,
-            )
-            .await?;
-            Ok(ClusterRelayStreamSendOutcome::Forwarded)
-        }
-    }
-}
-
-/// Signs and forwards a streamed object-RPC request to one concrete endpoint
-/// through the caller's endpoint host.
-///
-/// This keeps stream transport selection on the same endpoint-delivery seam as
-/// ordinary routed object RPC. Host implementations may reuse persistent
-/// connections or module transports, but callers do not need transport-specific
-/// branches.
-pub async fn forward_signed_streamed_daemon_rpc_to_cluster_endpoint_with_host_async(
-    host: &mut impl ClusterSignedObjectRpcAsyncHost,
-    endpoint: &ClusterEndpointRecord,
-    request: &ObjectRpcRequest,
-    timeouts: DaemonRpcTimeouts,
-    upstream: &mut crate::object::AsyncDaemonControlStream,
-    upstream_address: &str,
-    max_response_bytes: usize,
-) -> Result<ClusterRelayStreamSendOutcome, NetworkError> {
-    let request_auth = host.sign_object_rpc_request_async(request).await?;
-    host.forward_signed_endpoint_stream_rpc_async(
-        endpoint,
-        &request_auth,
-        request,
-        timeouts,
-        upstream,
-        upstream_address,
-        max_response_bytes,
-    )
-    .await
-}
-
-async fn forward_streamed_daemon_rpc_to_tcp_endpoint_async(
-    endpoint: &ClusterEndpointRecord,
-    request: &DaemonControlRequest,
-    timeouts: DaemonRpcTimeouts,
-    upstream: &mut crate::object::AsyncDaemonControlStream,
-    upstream_address: &str,
-    max_response_bytes: usize,
-) -> Result<ClusterRelayStreamSendOutcome, NetworkError> {
-    let frame_options =
-        crate::object::ObjectFrameIoOptions::none().with_idle_timeout(timeouts.idle_timeout);
-    let mut downstream =
-        crate::object::AsyncDaemonControlStream::connect_with_options(&endpoint.address, timeouts)
-            .await?;
-    downstream
-        .write_request(&endpoint.address, request, frame_options)
-        .await?;
-    let response = downstream
-        .read_rpc_response(&endpoint.address, max_response_bytes, frame_options)
-        .await?;
-    if relay_response_is_routing_error(&response) {
-        return Ok(ClusterRelayStreamSendOutcome::RoutingError(response));
-    }
-
-    upstream
-        .write_rpc_response(upstream_address, &response, frame_options)
-        .await?;
-    if crate::object_rpc_response_stream_mode(&response)
-        == crate::ObjectRpcResponseStreamMode::RawStreamedDaemonBody
-        && let Err(error) = downstream
-            .forward_raw_byte_stream_chunks_to(
-                &endpoint.address,
-                upstream,
-                upstream_address,
-                crate::object::RawByteStreamChunkOptions {
-                    chunk_bytes: crate::OBJECT_STREAM_MAX_CHUNK_BYTES,
-                    max_total_bytes: u64::try_from(max_response_bytes).ok(),
-                    idle_timeout: timeouts.idle_timeout,
-                },
-            )
-            .await
-    {
-        return Ok(ClusterRelayStreamSendOutcome::StreamStartedThenFailed(
-            error,
-        ));
-    }
-    Ok(ClusterRelayStreamSendOutcome::Forwarded)
-}
-
-async fn write_streamed_daemon_rpc_response_to_upstream(
-    mut response: ObjectRpcResponse,
-    upstream: &mut crate::object::AsyncDaemonControlStream,
-    upstream_address: &str,
-    timeouts: DaemonRpcTimeouts,
-) -> Result<(), NetworkError> {
-    let frame_options =
-        crate::object::ObjectFrameIoOptions::none().with_idle_timeout(timeouts.idle_timeout);
-    let raw_body = if crate::object_rpc_response_stream_mode(&response)
-        == crate::ObjectRpcResponseStreamMode::RawStreamedDaemonBody
-    {
-        Some(std::mem::take(&mut response.body))
-    } else {
-        None
-    };
-    upstream
-        .write_rpc_response(upstream_address, &response, frame_options)
-        .await?;
-    if let Some(body) = raw_body {
-        for chunk in body.chunks(crate::OBJECT_STREAM_MAX_CHUNK_BYTES) {
-            upstream
-                .write_raw_byte_stream_chunk(upstream_address, chunk, frame_options)
-                .await?;
-        }
-        upstream
-            .write_raw_byte_stream_chunk(upstream_address, &[], frame_options)
-            .await?;
-    }
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClusterObjectRpcOptions {
     timeouts: DaemonRpcTimeouts,
     overall_timeout: Option<Duration>,
-    extended_idle_timeout: Option<Duration>,
-    enforce_stream_deadline: bool,
 }
 
 impl ClusterObjectRpcOptions {
@@ -2143,10 +1961,6 @@ impl ClusterObjectRpcOptions {
         Self {
             timeouts,
             overall_timeout: None,
-            extended_idle_timeout: None,
-            // `new` preserves the phase-only contract of legacy callers. A
-            // connect-only override must not silently become a body deadline.
-            enforce_stream_deadline: false,
         }
     }
 
@@ -2162,23 +1976,9 @@ impl ClusterObjectRpcOptions {
     /// Override the whole-call delivery deadline.
     ///
     /// The deadline covers route planning, signing, connecting, writing, and
-    /// receiving the response header. Stream bodies retain the same absolute
-    /// deadline after the response header is received.
+    /// receiving the response.
     pub fn with_overall_timeout(mut self, timeout: Duration) -> Self {
         self.overall_timeout = Some(timeout);
-        self.enforce_stream_deadline = true;
-        self
-    }
-
-    /// Explicitly allow a buffered response to remain silent longer than the
-    /// shared network no-progress timeout.
-    ///
-    /// This is intended for bounded operations that cannot emit progress before
-    /// returning their response. Route, endpoint-attempt, and whole-call budgets
-    /// still cap the selected timeout. Streamed response bodies continue to use
-    /// [`DEFAULT_NETWORK_TIMEOUT`] between chunks.
-    pub fn with_extended_idle_timeout(mut self, timeout: Duration) -> Self {
-        self.extended_idle_timeout = Some(timeout);
         self
     }
 
@@ -2186,10 +1986,19 @@ impl ClusterObjectRpcOptions {
         self.overall_timeout
     }
 
-    fn stream_deadline(self, deadline: ClusterEndpointRpcDeadline) -> Option<tokio::time::Instant> {
-        self.enforce_stream_deadline
-            .then_some(deadline.deadline_at)
-            .flatten()
+    fn session_call_policy(self) -> NetworkCallPolicy {
+        let defaults = NetworkHealthPolicy::default();
+        NetworkCallPolicy {
+            health: NetworkHealthPolicy::new(
+                self.timeouts
+                    .connect_timeout
+                    .unwrap_or(defaults.connect_timeout),
+                self.timeouts
+                    .idle_timeout
+                    .unwrap_or(defaults.no_progress_timeout),
+            ),
+            overall_timeout: self.overall_timeout,
+        }
     }
 }
 
@@ -2204,8 +2013,6 @@ impl Default for ClusterObjectRpcOptions {
         Self {
             timeouts: DaemonRpcTimeouts::default(),
             overall_timeout: None,
-            extended_idle_timeout: None,
-            enforce_stream_deadline: true,
         }
     }
 }
@@ -2301,6 +2108,19 @@ pub trait ClusterSignedObjectRpcAsyncHost: Send {
         Box::pin(async { Ok(()) })
     }
 
+    /// Opens the transport stream for the canonical body-aware session. Hosts
+    /// may override synthetic/local transports; ordinary LAN and runtime
+    /// modules use the transport-neutral registry path.
+    fn open_object_rpc_session_stream_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        health: NetworkHealthPolicy,
+    ) -> ClusterSignedObjectRpcFuture<'a, Box<dyn NetworkDuplexStream>> {
+        Box::pin(async move {
+            crate::roaming::open_daemon_rpc_stream_to_cluster_endpoint_async(endpoint, health).await
+        })
+    }
+
     fn send_signed_object_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
@@ -2327,70 +2147,6 @@ pub trait ClusterSignedObjectRpcAsyncHost: Send {
             result
         })
     }
-
-    fn send_signed_endpoint_stream_response_rpc_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        auth: &'a [u8],
-        request: &'a ObjectRpcRequest,
-        timeouts: DaemonRpcTimeouts,
-    ) -> ClusterSignedObjectRpcFuture<'a, crate::ObjectRpcStreamResponse> {
-        Box::pin(async move {
-            let started = Instant::now();
-            let result =
-                crate::roaming::send_daemon_rpc_stream_response_frame_to_cluster_endpoint_async(
-                    endpoint,
-                    Some(auth),
-                    request,
-                    timeouts,
-                )
-                .await;
-            if let Some(observation) =
-                cluster_signed_endpoint_stream_response_rpc_observation(result.as_ref(), started)
-            {
-                let _ = self
-                    .observe_signed_endpoint_rpc_async(endpoint, observation)
-                    .await;
-            }
-            result
-        })
-    }
-
-    fn forward_signed_endpoint_stream_rpc_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        auth: &'a [u8],
-        request: &'a ObjectRpcRequest,
-        timeouts: DaemonRpcTimeouts,
-        upstream: &'a mut crate::object::AsyncDaemonControlStream,
-        upstream_address: &'a str,
-        max_response_bytes: usize,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<ClusterRelayStreamSendOutcome, NetworkError>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            let started = Instant::now();
-            let mut signed = request.clone();
-            signed.auth = Some(auth.to_vec());
-            let result = forward_streamed_daemon_rpc_to_cluster_endpoint_async(
-                endpoint,
-                &signed,
-                timeouts,
-                upstream,
-                upstream_address,
-                max_response_bytes,
-            )
-            .await;
-            if let Some(observation) =
-                cluster_signed_endpoint_stream_rpc_observation(result.as_ref(), started)
-            {
-                let _ = self
-                    .observe_signed_endpoint_rpc_async(endpoint, observation)
-                    .await;
-            }
-            result
-        })
-    }
 }
 
 fn cluster_signed_endpoint_rpc_observation(
@@ -2405,17 +2161,50 @@ fn cluster_signed_endpoint_rpc_observation(
     }
 }
 
-fn cluster_signed_endpoint_stream_response_rpc_observation(
-    result: Result<&crate::ObjectRpcStreamResponse, &NetworkError>,
+fn cluster_signed_endpoint_session_observation(
+    result: Result<&ObjectRpcSessionResult, &NetworkError>,
     started: Instant,
 ) -> Option<ClusterSignedObjectRpcObservation> {
     match result {
-        Ok(response) => Some(cluster_signed_endpoint_response_observation(
-            &response.response,
+        Ok(result) => Some(cluster_signed_endpoint_response_observation(
+            &result.response,
             started,
         )),
         Err(error) => cluster_signed_endpoint_rpc_error_observation(error),
     }
+}
+
+fn cluster_authorized_member_public_key(
+    state: &ClusterBootstrapState,
+    node_id: &NodeId,
+) -> Result<Vec<u8>, NetworkError> {
+    let member = state
+        .members
+        .iter()
+        .find(|member| &member.node_id == node_id && member.state.is_authorized())
+        .ok_or_else(|| NetworkError::UnauthorizedNode {
+            node_id: node_id.clone(),
+        })?;
+    crate::daemon_auth_decode_public_key(&member.node_public_key)
+}
+
+fn cluster_paths_data_dir(
+    paths: Option<&ClusterPaths>,
+) -> Result<sinomo_local::SinomoDataDir, NetworkError> {
+    if let Some(paths) = paths {
+        let root = paths.root.parent().ok_or_else(|| NetworkError::Io {
+            operation: "resolve cluster data directory".to_string(),
+            detail: format!(
+                "cluster path {} has no parent data directory",
+                paths.root.display()
+            ),
+        })?;
+        return Ok(sinomo_local::SinomoDataDir::new(root));
+    }
+    sinomo_local::SinomoDataDir::from_env_or_home().map_err(|error| NetworkError::Io {
+        operation: "resolve object RPC session data directory".to_string(),
+        detail: error.to_string(),
+    })
 }
 
 fn cluster_signed_endpoint_response_observation(
@@ -2427,24 +2216,6 @@ fn cluster_signed_endpoint_response_observation(
         _ => ClusterSignedObjectRpcObservation::success(Some(
             cluster_signed_endpoint_rpc_elapsed_latency_ms(started),
         )),
-    }
-}
-
-fn cluster_signed_endpoint_stream_rpc_observation(
-    result: Result<&ClusterRelayStreamSendOutcome, &NetworkError>,
-    started: Instant,
-) -> Option<ClusterSignedObjectRpcObservation> {
-    match result {
-        Ok(ClusterRelayStreamSendOutcome::Forwarded)
-        | Ok(ClusterRelayStreamSendOutcome::RoutingError(_)) => {
-            Some(ClusterSignedObjectRpcObservation::success(Some(
-                cluster_signed_endpoint_rpc_elapsed_latency_ms(started),
-            )))
-        }
-        Ok(ClusterRelayStreamSendOutcome::StreamStartedThenFailed(_)) => {
-            Some(ClusterSignedObjectRpcObservation::io_failure())
-        }
-        Err(error) => cluster_signed_endpoint_rpc_error_observation(error),
     }
 }
 
@@ -2488,7 +2259,6 @@ struct ClusterObjectRpcAttemptStartTrace<'a> {
     remaining_budget_ms: u64,
     connect_budget_ms: u64,
     attempt_budget_ms: u64,
-    stream: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2585,7 +2355,6 @@ impl ClusterObjectRpcAttemptStartTrace<'_> {
             delivery_state = "definitely_not_sent",
             retry_decision = "pending",
             outcome = "attempt_started",
-            stream = self.stream,
             "cluster object rpc attempt started"
         );
     }
@@ -2640,7 +2409,6 @@ impl ClusterObjectRpcAttemptTrace<'_> {
             send_us = self.send_us,
             attempt_us = self.attempt_us,
             total_us = self.total_us,
-            stream = start.stream,
             "cluster object rpc attempt completed"
         );
     }
@@ -2648,10 +2416,11 @@ impl ClusterObjectRpcAttemptTrace<'_> {
 
 /// Cluster object-RPC client facade.
 ///
-/// `call_target` is the canonical routed API: callers name a target node and
-/// the network layer chooses the next hop. `call_endpoint` is intentionally a
-/// raw explicit-endpoint send for bootstrap, probes, and other code that already
-/// owns a concrete endpoint.
+/// `call_target_session` is the canonical routed API: callers name a target
+/// node and provide a body source while the network layer chooses the next hop
+/// and manages the full-duplex transfer. `call_target` and `call_endpoint`
+/// remain bounded unary compatibility paths for bootstrap and small control
+/// requests.
 pub struct ClusterObjectRpcClient<'a, H> {
     host: &'a mut H,
     route_context: Option<ClusterObjectRpcRouteContext<'a>>,
@@ -2683,6 +2452,154 @@ impl<'a, H> ClusterObjectRpcClient<'a, H>
 where
     H: ClusterSignedObjectRpcAsyncHost + Send,
 {
+    /// Runs one body-aware RPC session against a concrete endpoint.
+    ///
+    /// The request head is signed only after the session descriptor has been
+    /// attached. The transport owns chunking, flow control, health checks, and
+    /// response-body delivery after this method opens the duplex stream.
+    pub async fn call_endpoint_session(
+        &mut self,
+        state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+        call: ObjectRpcSessionCall,
+        options: ClusterObjectRpcOptions,
+    ) -> Result<ObjectRpcSessionResult, NetworkError> {
+        let expected_public_key = cluster_authorized_member_public_key(state, &endpoint.node_id)?;
+        let data_dir = cluster_paths_data_dir(self.route_context.map(|context| context.paths))?;
+        self.call_authenticated_endpoint_session(
+            endpoint,
+            call,
+            options,
+            data_dir,
+            expected_public_key,
+        )
+        .await
+    }
+
+    /// Runs a canonical session against this process's loopback daemon before
+    /// cluster bootstrap state exists.
+    ///
+    /// This path is deliberately limited to loopback addresses. It pins the
+    /// responder to the local main-daemon identity on disk; non-loopback calls
+    /// must use [`Self::call_endpoint_session`] and an authorized cluster member.
+    pub async fn call_loopback_session(
+        &mut self,
+        data_dir: &sinomo_local::SinomoDataDir,
+        address: &str,
+        call: ObjectRpcSessionCall,
+        options: ClusterObjectRpcOptions,
+    ) -> Result<ObjectRpcSessionResult, NetworkError> {
+        if !crate::is_loopback_connect_address(address) {
+            return Err(NetworkError::Io {
+                operation: "open local object RPC session".to_string(),
+                detail: format!("non-loopback address `{address}` requires cluster authorization"),
+            });
+        }
+        let identity =
+            sinomo_node::load_or_create_main_node_identity(&data_dir.root()).map_err(|source| {
+                NetworkError::Io {
+                    operation: "load local object RPC session identity".to_string(),
+                    detail: source.to_string(),
+                }
+            })?;
+        let expected_public_key = crate::daemon_auth_decode_public_key(&identity.public_key)?;
+        let endpoint_node_id = NodeId::derived(
+            "sinomo.network.local-object-rpc-session",
+            &expected_public_key,
+        );
+        let endpoint = crate::endpoint_advertisement::daemon_loopback_endpoint(
+            &endpoint_node_id,
+            address.to_string(),
+            0,
+        );
+        self.call_authenticated_endpoint_session(
+            &endpoint,
+            call,
+            options,
+            data_dir.clone(),
+            expected_public_key,
+        )
+        .await
+    }
+
+    async fn call_authenticated_endpoint_session(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        call: ObjectRpcSessionCall,
+        options: ClusterObjectRpcOptions,
+        data_dir: sinomo_local::SinomoDataDir,
+        expected_public_key: Vec<u8>,
+    ) -> Result<ObjectRpcSessionResult, NetworkError> {
+        let policy = options.session_call_policy();
+        let deadline = ClusterEndpointRpcDeadline::new(policy.overall_timeout);
+        let open_timeout = deadline.timeout_error(
+            "cluster endpoint object RPC session",
+            NetworkTimeoutPhase::Overall,
+            NetworkDeliveryState::DefinitelyNotSent,
+        );
+        let stream = match cluster_object_rpc_call_with_deadline(
+            self.host
+                .open_object_rpc_session_stream_async(endpoint, policy.health),
+            deadline,
+            open_timeout,
+        )
+        .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                if let Some(observation) = cluster_signed_endpoint_rpc_error_observation(&error) {
+                    let _ = self
+                        .host
+                        .observe_signed_endpoint_rpc_async(endpoint, observation)
+                        .await;
+                }
+                return Err(error);
+            }
+        };
+        let prepared = call.prepare_for_signing()?;
+        let request_auth = cluster_object_rpc_sign_with_deadline(
+            self.host.sign_object_rpc_request_async(&prepared.request),
+            deadline,
+        )
+        .await?;
+        let Some(remaining) = deadline.checked_remaining() else {
+            return Err(deadline.timeout_error(
+                "cluster endpoint object RPC session",
+                NetworkTimeoutPhase::Overall,
+                NetworkDeliveryState::DefinitelyNotSent,
+            ));
+        };
+        let session_policy = NetworkCallPolicy {
+            health: policy.health,
+            overall_timeout: remaining,
+        };
+        let started = Instant::now();
+        let result = start_object_rpc_client_session(
+            stream,
+            prepared,
+            request_auth,
+            data_dir,
+            expected_public_key.clone(),
+            expected_public_key,
+            session_policy,
+        )
+        .await;
+        if let Some(observation) =
+            cluster_signed_endpoint_session_observation(result.as_ref(), started)
+        {
+            let _ = self
+                .host
+                .observe_signed_endpoint_rpc_async(endpoint, observation)
+                .await;
+        }
+        let result = result?;
+        if !result.response_origin_verified() {
+            return Err(NetworkError::AuthDenied);
+        }
+        result.response.error_detail()?;
+        Ok(result)
+    }
+
     pub async fn call_endpoint(
         &mut self,
         endpoint: &ClusterEndpointRecord,
@@ -2723,31 +2640,6 @@ where
             timeout_error,
         )
         .await
-    }
-
-    pub async fn call_endpoint_stream(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        request: &ObjectRpcRequest,
-        options: ClusterObjectRpcOptions,
-    ) -> Result<crate::ObjectRpcStreamResponse, NetworkError> {
-        let overall_timeout = cluster_endpoint_rpc_timeout(
-            options.requested_overall_timeout(),
-            cluster_target_final_hop_request_uses_full_response_budget(request),
-        );
-        let deadline = ClusterEndpointRpcDeadline::new(overall_timeout);
-        let timeout_error = deadline.timeout_error(
-            "cluster endpoint stream rpc",
-            NetworkTimeoutPhase::Overall,
-            NetworkDeliveryState::PossiblyApplied,
-        );
-        let response = cluster_object_rpc_call_with_deadline(
-            self.call_endpoint_stream_direct(endpoint, request, options, deadline),
-            deadline,
-            timeout_error,
-        )
-        .await?;
-        Ok(response.with_deadline(options.stream_deadline(deadline)))
     }
 
     pub async fn call_target(
@@ -2810,21 +2702,26 @@ where
         result
     }
 
-    pub async fn call_target_stream(
+    /// Canonical routed, full-duplex object RPC.
+    ///
+    /// Application crates provide a request head and a whole body source. This
+    /// layer chooses direct or relay hops and owns transport retries. A one-pass
+    /// body is never silently replayed after a session attempt starts.
+    pub async fn call_target_session(
         &mut self,
         state: &ClusterBootstrapState,
         target_node_id: &NodeId,
-        request: &ObjectRpcRequest,
+        call: ObjectRpcSessionCall,
         options: ClusterObjectRpcOptions,
-    ) -> Result<crate::ObjectRpcStreamResponse, NetworkError> {
+    ) -> Result<ObjectRpcSessionResult, NetworkError> {
         let Some(context) = self.route_context else {
             return Err(NetworkError::Io {
-                operation: "cluster target stream rpc".to_string(),
-                detail: "cluster target stream RPC requires a route context".to_string(),
+                operation: "cluster target object RPC session".to_string(),
+                detail: "cluster target RPC session requires a route context".to_string(),
             });
         };
         let route_timeout = cluster_object_rpc_effective_route_timeout(
-            request,
+            &call.request,
             options.requested_overall_timeout(),
         );
         let deadline = ClusterEndpointRpcDeadline::new(route_timeout);
@@ -2834,42 +2731,219 @@ where
             NetworkDeliveryState::PossiblyApplied,
             &[],
         );
-        let result = cluster_object_rpc_call_with_deadline(
-            self.call_target_stream_from_paths(
+        cluster_object_rpc_call_with_deadline(
+            self.call_target_session_from_paths(
                 context.runtime,
                 context.paths,
                 state,
                 target_node_id,
-                request,
+                call,
                 options,
-                route_timeout,
                 deadline,
             ),
             deadline,
             timeout_error,
         )
-        .await;
-        if let Err(error @ NetworkError::Timeout { .. }) = &result {
-            let (outcome, retry_decision) = cluster_object_rpc_timeout_trace_classification(
-                deadline.checked_remaining().is_none(),
-            );
-            tracing::debug!(
-                target: "sinomo.network.object_rpc",
-                traceparent = %request.traceparent().unwrap_or_default(),
-                route = %request.route,
-                category = %request.category,
-                %target_node_id,
-                route_timeout_ms = route_timeout.map(duration_millis_u64).unwrap_or_default(),
-                delivery_state = cluster_object_rpc_error_delivery_state_name(error),
-                retry_decision,
-                outcome,
-                detail = ClusterObjectRpcAttemptTraceDetail::for_transport_error(error).as_str(),
-                stream = true,
-                "cluster object rpc stream target call timed out"
-            );
+        .await
+    }
+
+    /// Forwards an already authenticated relay session by one hop.
+    ///
+    /// The origin-signed inner request and its session descriptor are preserved
+    /// on the final hop. Intermediate hops create a fresh outer relay session,
+    /// while the incoming body is piped through without application-level
+    /// sharding or whole-body buffering.
+    pub async fn forward_relay_session(
+        &mut self,
+        state: &ClusterBootstrapState,
+        request: crate::ObjectRpcSessionRequest,
+        options: ClusterObjectRpcOptions,
+    ) -> Result<ObjectRpcSessionResult, NetworkError> {
+        let Some(context) = self.route_context else {
+            return Err(NetworkError::Io {
+                operation: "forward cluster relay session".to_string(),
+                detail: "relay forwarding requires a route context".to_string(),
+            });
+        };
+        let envelope = RelayEnvelope::from_request(&request.request)?;
+        if envelope.cluster_id != state.cluster_id {
+            return Err(NetworkError::ClusterMismatch {
+                expected: state.cluster_id.clone(),
+                actual: envelope.cluster_id.clone(),
+            });
         }
-        let response = result?;
-        Ok(response.with_deadline(options.stream_deadline(deadline)))
+        if envelope
+            .visited
+            .iter()
+            .any(|node| node == &state.local_node_id)
+        {
+            return ObjectRpcResponse::encode_error(
+                CLUSTER_RELAY_ROUTE,
+                format!(
+                    "relay dropped: relay loop: {} already on the path",
+                    state.local_node_id
+                ),
+            )
+            .map(ObjectRpcSessionResult::buffered);
+        }
+        if envelope.ttl == 0 {
+            return ObjectRpcResponse::encode_error(
+                CLUSTER_RELAY_ROUTE,
+                "relay dropped: relay ttl exhausted",
+            )
+            .map(ObjectRpcSessionResult::buffered);
+        }
+
+        let deadline = ClusterEndpointRpcDeadline::new(relay_envelope_hop_timeout(&envelope));
+        let mut failed_edges = ClusterDeliveryFailedEdges::default();
+        let mut failures = Vec::new();
+        let max_route_attempts = state.members.len().saturating_mul(2).max(1) + 2;
+        let mut incoming_body = Some(request.body);
+        let data_dir = cluster_paths_data_dir(Some(context.paths))?;
+        let response_origin_public_key =
+            cluster_authorized_member_public_key(state, &envelope.target_node_id)?;
+
+        for _ in 0..max_route_attempts {
+            let plan_timeout = deadline.timeout_error(
+                "plan cluster relay object RPC session",
+                NetworkTimeoutPhase::Overall,
+                NetworkDeliveryState::DefinitelyNotSent,
+            );
+            let route_plan = cluster_object_rpc_call_with_deadline(
+                cluster_relay_forward_plan(
+                    context.runtime,
+                    context.paths,
+                    state,
+                    &state.local_node_id,
+                    &envelope,
+                    failed_edges.try_clone()?,
+                ),
+                deadline,
+                plan_timeout,
+            )
+            .await?;
+            let Some(route_plan) = route_plan else {
+                break;
+            };
+            let next_hop_public_key =
+                cluster_authorized_member_public_key(state, &route_plan.next_hop)?;
+            for endpoint in route_plan.endpoints {
+                let Some(_) = deadline.checked_remaining() else {
+                    break;
+                };
+                let health = options.session_call_policy().health;
+                let open_timeout = deadline.timeout_error(
+                    "open cluster relay object RPC session",
+                    NetworkTimeoutPhase::Overall,
+                    NetworkDeliveryState::DefinitelyNotSent,
+                );
+                let stream = match cluster_object_rpc_call_with_deadline(
+                    self.host
+                        .open_object_rpc_session_stream_async(&endpoint, health),
+                    deadline,
+                    open_timeout,
+                )
+                .await
+                {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        if let Some(observation) =
+                            cluster_signed_endpoint_rpc_error_observation(&error)
+                        {
+                            let _ = self
+                                .host
+                                .observe_signed_endpoint_rpc_async(&endpoint, observation)
+                                .await;
+                        }
+                        if deadline.checked_remaining().is_none() {
+                            return Err(error);
+                        }
+                        failures.push(format!(
+                            "{} ({:?}) open failed: {error}",
+                            endpoint.address, endpoint.transport
+                        ));
+                        continue;
+                    }
+                };
+                let body = incoming_body.take().ok_or_else(|| {
+                    NetworkError::outcome_unknown(
+                        "retry cluster relay session",
+                        envelope.inner.operation_id(),
+                        "incoming relay body is a one-pass stream and was already dispatched",
+                    )
+                })?;
+                let body = ObjectRpcBodySource::from_incoming_body(body);
+                let final_hop = route_plan.next_hop == envelope.target_node_id;
+                let (prepared, request_auth) = if final_hop {
+                    ObjectRpcSessionCall::new(envelope.inner.clone(), body)
+                        .prepare_from_signed_request()?
+                } else {
+                    let mut forwarded = envelope.clone();
+                    forwarded.ttl = forwarded.ttl.saturating_sub(1);
+                    forwarded.visited.push(state.local_node_id.clone());
+                    forwarded.max_hop_timeout_ms =
+                        cluster_relay_forward_remaining_timeout_ms(deadline).flatten();
+                    let prepared = ObjectRpcSessionCall::new(forwarded.into_request()?, body)
+                        .prepare_for_signing()?;
+                    let request_auth = cluster_object_rpc_sign_with_deadline(
+                        self.host.sign_object_rpc_request_async(&prepared.request),
+                        deadline,
+                    )
+                    .await?;
+                    (prepared, request_auth)
+                };
+                let Some(remaining) = deadline.checked_remaining() else {
+                    return Err(deadline.timeout_error(
+                        "forward cluster relay object RPC session",
+                        NetworkTimeoutPhase::Overall,
+                        NetworkDeliveryState::DefinitelyNotSent,
+                    ));
+                };
+                let policy = NetworkCallPolicy {
+                    health,
+                    overall_timeout: remaining,
+                };
+                let started = Instant::now();
+                let result = start_object_rpc_client_session(
+                    stream,
+                    prepared,
+                    request_auth,
+                    data_dir.clone(),
+                    next_hop_public_key,
+                    response_origin_public_key.clone(),
+                    policy,
+                )
+                .await;
+                if let Some(observation) =
+                    cluster_signed_endpoint_session_observation(result.as_ref(), started)
+                {
+                    let _ = self
+                        .host
+                        .observe_signed_endpoint_rpc_async(&endpoint, observation)
+                        .await;
+                }
+                return match result {
+                    Ok(result) => Ok(result),
+                    Err(error) => cluster_relay_session_forward_failure_result(&envelope, &error),
+                };
+            }
+            failed_edges.try_insert(&state.local_node_id, &route_plan.next_hop)?;
+        }
+
+        ObjectRpcResponse::encode_error(
+            CLUSTER_RELAY_ROUTE,
+            format!(
+                "relay dropped: no reachable route from {} to {}{}",
+                state.local_node_id,
+                envelope.target_node_id,
+                if failures.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", failures.join("; "))
+                }
+            ),
+        )
+        .map(ObjectRpcSessionResult::buffered)
     }
 
     async fn call_endpoint_direct(
@@ -2898,11 +2972,7 @@ where
                     endpoint,
                     &request_auth,
                     request,
-                    cluster_endpoint_transport_timeouts(
-                        options.timeouts,
-                        options.extended_idle_timeout,
-                        remaining,
-                    ),
+                    cluster_endpoint_transport_timeouts(options.timeouts, remaining),
                 ),
                 remaining,
                 endpoint,
@@ -2931,60 +3001,290 @@ where
         }
     }
 
-    async fn call_endpoint_stream_direct(
+    async fn call_target_session_from_paths(
         &mut self,
-        endpoint: &ClusterEndpointRecord,
-        request: &ObjectRpcRequest,
+        runtime: &tokio::runtime::Handle,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        call: ObjectRpcSessionCall,
         options: ClusterObjectRpcOptions,
         deadline: ClusterEndpointRpcDeadline,
-    ) -> Result<crate::ObjectRpcStreamResponse, NetworkError> {
-        let mut fresh_connection_retry_used = false;
-        loop {
-            let request_auth = cluster_object_rpc_sign_with_deadline(
-                self.host.sign_object_rpc_request_async(request),
-                deadline,
+    ) -> Result<ObjectRpcSessionResult, NetworkError> {
+        let mut failed_edges = ClusterDeliveryFailedEdges::default();
+        let mut failures = Vec::new();
+        let mut send_attempts = 0_usize;
+        let mut possibly_applied = false;
+        let max_route_attempts = state.members.len().saturating_mul(2).max(1) + 2;
+        let request_retry_safe = call.request.is_response_retry_safe();
+        let operation_id = call.request.operation_id().map(str::to_string);
+        let replayable_call = call.try_clone_replayable();
+        let mut one_pass_call = Some(call);
+        let data_dir = cluster_paths_data_dir(Some(paths))?;
+        let response_origin_public_key =
+            cluster_authorized_member_public_key(state, target_node_id)?;
+
+        'route_attempts: for _ in 0..max_route_attempts {
+            let Some(route_plan) = cluster_delivery_route_plan_async(
+                runtime,
+                paths,
+                state,
+                &state.local_node_id,
+                target_node_id,
+                failed_edges.try_clone()?,
+                Vec::new(),
             )
-            .await?;
-            let Some(remaining) = deadline.checked_remaining() else {
-                return Err(deadline.timeout_error(
-                    "cluster endpoint stream rpc",
-                    NetworkTimeoutPhase::Overall,
-                    NetworkDeliveryState::DefinitelyNotSent,
-                ));
+            .await?
+            else {
+                break;
             };
-            let response = match cluster_object_rpc_attempt_with_timeout(
-                self.host.send_signed_endpoint_stream_response_rpc_async(
-                    endpoint,
-                    &request_auth,
-                    request,
-                    cluster_endpoint_transport_timeouts(options.timeouts, None, remaining),
-                ),
-                remaining,
-                endpoint,
-            )
-            .await
-            {
-                Ok(response) => response,
-                Err(error)
-                    if cluster_object_rpc_error_allows_fresh_connection_retry(request, &error)
-                        && !fresh_connection_retry_used =>
-                {
-                    fresh_connection_retry_used = true;
-                    continue;
-                }
-                Err(error @ NetworkError::AuthDenied) => return Err(error),
-                Err(error) if error.delivery_state().is_some() => return Err(error),
-                Err(error) => {
-                    return Err(NetworkError::outcome_unknown(
-                        format!("cluster endpoint stream rpc to {}", endpoint.node_id),
-                        request.operation_id(),
-                        error.to_string(),
+            if route_plan.endpoints.is_empty() {
+                failures.push(format!("{}: no usable route", route_plan.next_hop));
+                failed_edges.try_insert(&state.local_node_id, &route_plan.next_hop)?;
+                continue;
+            }
+
+            let next_hop_public_key =
+                cluster_authorized_member_public_key(state, &route_plan.next_hop)?;
+            let relay_target_endpoints = if &route_plan.next_hop == target_node_id {
+                Vec::new()
+            } else {
+                cluster_delivery_target_endpoint_hints(paths, state, target_node_id)?
+            };
+            let mut route_endpoints = route_plan.endpoints;
+            let local_connectivity = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
+            cluster_delivery_sort_route_endpoints_for_attempt(
+                &local_connectivity,
+                &mut route_endpoints,
+                true,
+            );
+
+            for endpoint in route_endpoints {
+                let Some(remaining) = deadline.checked_remaining() else {
+                    return Err(deadline.timeout_error(
+                        "cluster target object RPC session",
+                        NetworkTimeoutPhase::Overall,
+                        NetworkDeliveryState::PossiblyApplied,
                     ));
+                };
+                let policy = NetworkCallPolicy {
+                    health: options.session_call_policy().health,
+                    overall_timeout: remaining,
+                };
+                // Dial before consuming a one-pass body. Endpoint discovery or
+                // connect failures remain safely retryable without touching it.
+                let stream = match self
+                    .host
+                    .open_object_rpc_session_stream_async(&endpoint, policy.health)
+                    .await
+                {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        if let Some(observation) =
+                            cluster_signed_endpoint_rpc_error_observation(&error)
+                        {
+                            let _ = self
+                                .host
+                                .observe_signed_endpoint_rpc_async(&endpoint, observation)
+                                .await;
+                        }
+                        failures.push(format!(
+                            "{} ({:?}) open failed: {error}",
+                            endpoint.address, endpoint.transport
+                        ));
+                        continue;
+                    }
+                };
+                let attempt_call = if let Some(template) = replayable_call.as_ref() {
+                    template
+                        .try_clone_replayable()
+                        .expect("replayable template clones")
+                } else if let Some(call) = one_pass_call.take() {
+                    call
+                } else {
+                    return Err(NetworkError::delivery_failed(
+                        "retry cluster object RPC session",
+                        NetworkDeliveryState::PossiblyApplied,
+                        "the one-pass request body was already consumed by a prior session attempt",
+                    ));
+                };
+
+                let final_hop = &route_plan.next_hop == target_node_id;
+                let prepared = if final_hop {
+                    attempt_call.prepare_for_signing()?
+                } else {
+                    let prepared_inner = attempt_call.prepare_for_signing()?;
+                    let inner_auth = self
+                        .host
+                        .sign_object_rpc_request_async(&prepared_inner.request)
+                        .await?;
+                    let outer = relay_request_for_signed_rpc_with_max_hop_timeout(
+                        &state.cluster_id,
+                        target_node_id,
+                        &prepared_inner.request,
+                        inner_auth,
+                        std::iter::once(state.local_node_id.clone()),
+                        &route_plan.path,
+                        &relay_target_endpoints,
+                        remaining,
+                    )?;
+                    ObjectRpcSessionCall::new(outer, prepared_inner.body).prepare_for_signing()?
+                };
+                let request_auth = self
+                    .host
+                    .sign_object_rpc_request_async(&prepared.request)
+                    .await?;
+                send_attempts = send_attempts.saturating_add(1);
+                let started = Instant::now();
+                let result = start_object_rpc_client_session(
+                    stream,
+                    prepared,
+                    request_auth,
+                    data_dir.clone(),
+                    next_hop_public_key.clone(),
+                    response_origin_public_key.clone(),
+                    policy,
+                )
+                .await;
+                if let Some(observation) =
+                    cluster_signed_endpoint_session_observation(result.as_ref(), started)
+                {
+                    let _ = self
+                        .host
+                        .observe_signed_endpoint_rpc_async(&endpoint, observation)
+                        .await;
                 }
-            };
-            response.response.error_detail()?;
-            return Ok(response);
+                match result {
+                    Ok(result) => {
+                        if !cluster_relay_session_response_origin_is_acceptable(
+                            &result.response,
+                            result.response_origin_verified(),
+                        ) {
+                            return Err(NetworkError::outcome_unknown(
+                                format!("cluster target object RPC session to {target_node_id}"),
+                                operation_id.as_deref(),
+                                "relay returned a delivered response head without a valid target attestation",
+                            ));
+                        }
+                        match cluster_relay_session_response_disposition(&result.response) {
+                            ClusterRelaySessionResponseDisposition::OutcomeUnknown => {
+                                return Err(NetworkError::outcome_unknown(
+                                    format!(
+                                        "cluster target object RPC session to {target_node_id}"
+                                    ),
+                                    operation_id.as_deref(),
+                                    relay_response_outcome_unknown_detail(&result.response),
+                                ));
+                            }
+                            ClusterRelaySessionResponseDisposition::FreshOriginSignature => {
+                                possibly_applied = true;
+                                let detail = relay_response_routing_error_detail(&result.response);
+                                if !request_retry_safe || replayable_call.is_none() {
+                                    return Err(NetworkError::outcome_unknown(
+                                        format!(
+                                            "cluster target object RPC session to {target_node_id}"
+                                        ),
+                                        operation_id.as_deref(),
+                                        detail,
+                                    ));
+                                }
+                                failures.push(format!(
+                                    "{} ({:?}) requested a fresh origin signature: {detail}",
+                                    endpoint.address, endpoint.transport
+                                ));
+                                continue 'route_attempts;
+                            }
+                            ClusterRelaySessionResponseDisposition::RoutingError => {
+                                failures.push(format!(
+                                    "{} ({:?}) returned routing error: {}",
+                                    endpoint.address,
+                                    endpoint.transport,
+                                    relay_response_routing_error_detail(&result.response)
+                                ));
+                                break;
+                            }
+                            ClusterRelaySessionResponseDisposition::Delivered => {}
+                        }
+                        if let Some(responder_node_id) = cluster_object_rpc_wrong_responder_node_id(
+                            &result.response,
+                            target_node_id,
+                        ) {
+                            possibly_applied = true;
+                            let detail = format!(
+                                "{} ({:?}) responder mismatch: expected {}, got {}",
+                                endpoint.address,
+                                endpoint.transport,
+                                target_node_id,
+                                responder_node_id
+                            );
+                            if !request_retry_safe {
+                                return Err(NetworkError::outcome_unknown(
+                                    "cluster object RPC session responder mismatch",
+                                    operation_id.as_deref(),
+                                    detail,
+                                ));
+                            }
+                            failures.push(detail);
+                            continue 'route_attempts;
+                        }
+                        result.response.error_detail()?;
+                        return Ok(result);
+                    }
+                    Err(error @ NetworkError::AuthDenied) => return Err(error),
+                    Err(error) => {
+                        let delivery_state = error
+                            .delivery_state()
+                            .unwrap_or(NetworkDeliveryState::PossiblyApplied);
+                        if delivery_state == NetworkDeliveryState::PossiblyApplied {
+                            possibly_applied = true;
+                        }
+                        failures.push(format!(
+                            "{} ({:?}): {error}",
+                            endpoint.address, endpoint.transport
+                        ));
+                        if delivery_state == NetworkDeliveryState::PossiblyApplied
+                            && !request_retry_safe
+                        {
+                            return Err(NetworkError::outcome_unknown(
+                                format!("cluster target object RPC session to {target_node_id}"),
+                                operation_id.as_deref(),
+                                error.to_string(),
+                            ));
+                        }
+                        if replayable_call.is_none() {
+                            return Err(
+                                if delivery_state == NetworkDeliveryState::PossiblyApplied {
+                                    NetworkError::outcome_unknown(
+                                        format!(
+                                            "cluster target object RPC session to {target_node_id}"
+                                        ),
+                                        operation_id.as_deref(),
+                                        error.to_string(),
+                                    )
+                                } else {
+                                    error
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            failed_edges.try_insert(&state.local_node_id, &route_plan.next_hop)?;
         }
+
+        Err(NetworkError::RetryExhausted {
+            operation: format!("cluster target object RPC session to {target_node_id}"),
+            attempts: send_attempts,
+            delivery_state: cluster_object_rpc_delivery_state(possibly_applied),
+            detail: format!(
+                "route to target node {target_node_id} failed{}",
+                if failures.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", failures.join("; "))
+                }
+            ),
+        })
     }
 
     async fn call_target_from_paths(
@@ -3147,7 +3447,6 @@ where
                 let hop_timeouts = if final_hop || hop_full_response_budget {
                     cluster_target_final_hop_transport_timeouts(
                         options.timeouts,
-                        options.extended_idle_timeout,
                         endpoint_attempt_budget,
                         hop_attempt_budget,
                         remaining,
@@ -3155,7 +3454,6 @@ where
                 } else {
                     cluster_relay_hop_transport_timeouts(
                         options.timeouts,
-                        options.extended_idle_timeout,
                         endpoint_attempt_budget,
                         remaining,
                     )
@@ -3184,7 +3482,6 @@ where
                     remaining_budget_ms,
                     connect_budget_ms,
                     attempt_budget_ms,
-                    stream: false,
                 };
                 if cluster_object_rpc_attempt_may_reach_route_deadline(
                     remaining,
@@ -3250,7 +3547,6 @@ where
                         &route_plan.path,
                         &relay_target_endpoints,
                         remaining_route_timeout,
-                        cluster_relay_request_extended_idle_timeout(options, false),
                     )?;
                     let outer_build_us = cluster_object_rpc_elapsed_us(outer_build_started_at);
                     let outer_sign_started_at = Instant::now();
@@ -3603,630 +3899,6 @@ where
             ),
         })
     }
-
-    async fn call_target_stream_from_paths(
-        &mut self,
-        runtime: &tokio::runtime::Handle,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-        target_node_id: &NodeId,
-        request: &ObjectRpcRequest,
-        options: ClusterObjectRpcOptions,
-        route_timeout: Option<Duration>,
-        deadline: ClusterEndpointRpcDeadline,
-    ) -> Result<crate::ObjectRpcStreamResponse, NetworkError> {
-        let traceparent = request.traceparent().unwrap_or_default().to_string();
-        let call_started_at = Instant::now();
-        let use_full_response_budget =
-            cluster_target_final_hop_request_uses_full_response_budget(request);
-        let mut failed_edges = ClusterDeliveryFailedEdges::default();
-        let mut failures = Vec::new();
-        let mut send_attempts = 0_usize;
-        let mut possibly_applied = false;
-        let mut fresh_connection_retry_used = false;
-        let max_route_attempts = state.members.len().saturating_mul(2).max(1) + 2;
-        metrics::counter!(
-            "sinomo.object_rpc.target.calls",
-            "route" => request.route.clone(),
-            "category" => request.category.clone()
-        )
-        .increment(1);
-        tracing::debug!(
-            target: "sinomo.network.object_rpc",
-            %traceparent,
-            route = %request.route,
-            category = %request.category,
-            %target_node_id,
-            stream = true,
-            "cluster object rpc stream route start"
-        );
-
-        'route_attempts: for route_attempt_index in 0..max_route_attempts {
-            let route_attempt = route_attempt_index.saturating_add(1);
-            let plan_started_at = Instant::now();
-            let Some(route_plan) = cluster_delivery_route_plan_async(
-                runtime,
-                paths,
-                state,
-                &state.local_node_id,
-                target_node_id,
-                failed_edges.try_clone()?,
-                Vec::new(),
-            )
-            .await?
-            else {
-                break;
-            };
-            let plan_us = cluster_object_rpc_elapsed_us(plan_started_at);
-            metrics::histogram!(
-                "sinomo.object_rpc.route_plan.us",
-                "route" => request.route.clone(),
-                "category" => request.category.clone()
-            )
-            .record(plan_us as f64);
-            if route_plan.endpoints.is_empty() {
-                let detail = format!("{}: no usable route", route_plan.next_hop);
-                tracing::debug!(
-                    target: "sinomo.network.object_rpc",
-                    %traceparent,
-                    route = %request.route,
-                    category = %request.category,
-                    %target_node_id,
-                    next_hop = %route_plan.next_hop,
-                    route_attempt,
-                    route_attempt_limit = max_route_attempts,
-                    send_attempts,
-                    endpoint_count = 0,
-                    remaining_budget_ms = deadline
-                        .checked_remaining()
-                        .flatten()
-                        .map(duration_millis_u64)
-                        .unwrap_or_default(),
-                    delivery_state = cluster_object_rpc_delivery_state_name(
-                        cluster_object_rpc_delivery_state(possibly_applied),
-                    ),
-                    retry_decision = cluster_object_rpc_replan_retry_decision(
-                        route_attempt_index,
-                        max_route_attempts,
-                    ),
-                    outcome = "empty_endpoint_plan",
-                    detail,
-                    plan_us,
-                    stream = true,
-                    "cluster object rpc stream route attempt completed"
-                );
-                failed_edges.try_insert(&state.local_node_id, &route_plan.next_hop)?;
-                failures.push(detail);
-                continue;
-            }
-            tracing::trace!(
-                target: "sinomo.network.object_rpc",
-                %traceparent,
-                route = %request.route,
-                category = %request.category,
-                %target_node_id,
-                next_hop = %route_plan.next_hop,
-                route_attempt,
-                route_attempt_limit = max_route_attempts,
-                plan_us,
-                endpoints = %cluster_object_rpc_endpoint_trace_list(&route_plan.endpoints),
-                stream = true,
-                "cluster object rpc stream route plan selected"
-            );
-            let local_connectivity = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
-            let mut route_endpoints = route_plan.endpoints;
-            cluster_delivery_sort_route_endpoints_for_attempt(
-                &local_connectivity,
-                &mut route_endpoints,
-                use_full_response_budget,
-            );
-            let relay_target_endpoints = if &route_plan.next_hop == target_node_id {
-                Vec::new()
-            } else {
-                cluster_delivery_target_endpoint_hints(paths, state, target_node_id)?
-            };
-            let relay_has_direct_target_fallback = relay_target_endpoints.iter().any(|endpoint| {
-                cluster_delivery_local_endpoint_is_usable(&state.local_node_id, endpoint)
-            });
-            let route_endpoint_count = route_endpoints.len();
-            for (endpoint_index, endpoint) in route_endpoints.into_iter().enumerate() {
-                let attempt_started_at = Instant::now();
-                let Some(remaining) = deadline.checked_remaining() else {
-                    return Err(cluster_target_rpc_timeout_error(
-                        target_node_id,
-                        route_timeout,
-                        if possibly_applied {
-                            NetworkDeliveryState::PossiblyApplied
-                        } else {
-                            NetworkDeliveryState::DefinitelyNotSent
-                        },
-                        &failures,
-                    ));
-                };
-                let final_hop = &route_plan.next_hop == target_node_id;
-                let endpoints_left = route_endpoint_count.saturating_sub(endpoint_index).max(1);
-                let endpoint_attempt_budget = cluster_target_endpoint_attempt_budget_for_endpoint(
-                    &local_connectivity,
-                    &endpoint,
-                    remaining,
-                    endpoints_left,
-                    route_endpoint_count,
-                );
-                let endpoint_attempt_budget = if final_hop {
-                    endpoint_attempt_budget
-                } else {
-                    cluster_target_relay_endpoint_attempt_budget(
-                        endpoint_attempt_budget,
-                        remaining,
-                        endpoints_left,
-                        relay_has_direct_target_fallback,
-                    )
-                };
-                let hop_full_response_budget = use_full_response_budget;
-                let hop_attempt_budget = cluster_response_attempt_budget(remaining);
-                let hop_timeouts = if final_hop || hop_full_response_budget {
-                    cluster_target_final_hop_transport_timeouts(
-                        options.timeouts,
-                        None,
-                        endpoint_attempt_budget,
-                        hop_attempt_budget,
-                        remaining,
-                    )
-                } else {
-                    cluster_relay_hop_transport_timeouts(
-                        options.timeouts,
-                        None,
-                        endpoint_attempt_budget,
-                        remaining,
-                    )
-                };
-                let attempt_deadline = deadline.capped_by(hop_attempt_budget);
-                let endpoint_attempt = endpoint_index.saturating_add(1);
-                let remaining_budget_ms = remaining.map(duration_millis_u64).unwrap_or_default();
-                let connect_budget_ms = endpoint_attempt_budget
-                    .map(duration_millis_u64)
-                    .unwrap_or_default();
-                let attempt_budget_ms = hop_attempt_budget
-                    .map(duration_millis_u64)
-                    .unwrap_or_default();
-                let attempt_trace_start = ClusterObjectRpcAttemptStartTrace {
-                    traceparent: &traceparent,
-                    request,
-                    target_node_id,
-                    next_hop: &route_plan.next_hop,
-                    endpoint: &endpoint,
-                    final_hop,
-                    route_attempt,
-                    route_attempt_limit: max_route_attempts,
-                    send_attempt: send_attempts.saturating_add(1),
-                    endpoint_attempt,
-                    endpoint_attempt_limit: route_endpoint_count,
-                    remaining_budget_ms,
-                    connect_budget_ms,
-                    attempt_budget_ms,
-                    stream: true,
-                };
-                if cluster_object_rpc_attempt_may_reach_route_deadline(
-                    remaining,
-                    hop_attempt_budget,
-                ) {
-                    attempt_trace_start.record();
-                }
-                let sign_started_at = Instant::now();
-                let request_auth = cluster_object_rpc_sign_with_deadline(
-                    self.host.sign_object_rpc_request_async(request),
-                    attempt_deadline,
-                )
-                .await?;
-                let request_sign_us = cluster_object_rpc_elapsed_us(sign_started_at);
-                metrics::histogram!(
-                    "sinomo.object_rpc.sign.us",
-                    "route" => request.route.clone(),
-                    "category" => request.category.clone()
-                )
-                .record(request_sign_us as f64);
-                let (outer_build_us, outer_sign_us, send_us, response) = if final_hop {
-                    let Some(attempt_timeout) = attempt_deadline.checked_remaining() else {
-                        return Err(attempt_deadline.timeout_error(
-                            "cluster endpoint stream rpc attempt",
-                            NetworkTimeoutPhase::Overall,
-                            NetworkDeliveryState::DefinitelyNotSent,
-                        ));
-                    };
-                    send_attempts = send_attempts.saturating_add(1);
-                    let send_started_at = Instant::now();
-                    let response = cluster_object_rpc_attempt_with_timeout(
-                        self.host.send_signed_endpoint_stream_response_rpc_async(
-                            &endpoint,
-                            &request_auth,
-                            request,
-                            hop_timeouts,
-                        ),
-                        attempt_timeout,
-                        &endpoint,
-                    )
-                    .await;
-                    (
-                        0,
-                        0,
-                        cluster_object_rpc_elapsed_us(send_started_at),
-                        response,
-                    )
-                } else {
-                    let outer_build_started_at = Instant::now();
-                    let Some(remaining_route_timeout) = deadline.checked_remaining() else {
-                        return Err(deadline.timeout_error(
-                            "cluster relay stream rpc envelope",
-                            NetworkTimeoutPhase::Overall,
-                            NetworkDeliveryState::DefinitelyNotSent,
-                        ));
-                    };
-                    let outer = relay_request_for_signed_rpc_with_max_hop_timeout(
-                        &state.cluster_id,
-                        target_node_id,
-                        request,
-                        request_auth.clone(),
-                        std::iter::once(state.local_node_id.clone()),
-                        &route_plan.path,
-                        &relay_target_endpoints,
-                        remaining_route_timeout,
-                        cluster_relay_request_extended_idle_timeout(options, true),
-                    )?;
-                    let outer_build_us = cluster_object_rpc_elapsed_us(outer_build_started_at);
-                    let outer_sign_started_at = Instant::now();
-                    let outer_auth = cluster_object_rpc_sign_with_deadline(
-                        self.host.sign_object_rpc_request_async(&outer),
-                        attempt_deadline,
-                    )
-                    .await?;
-                    let outer_sign_us = cluster_object_rpc_elapsed_us(outer_sign_started_at);
-                    let Some(attempt_timeout) = attempt_deadline.checked_remaining() else {
-                        return Err(attempt_deadline.timeout_error(
-                            "cluster relay endpoint stream rpc attempt",
-                            NetworkTimeoutPhase::Overall,
-                            NetworkDeliveryState::DefinitelyNotSent,
-                        ));
-                    };
-                    send_attempts = send_attempts.saturating_add(1);
-                    let send_started_at = Instant::now();
-                    let response = cluster_object_rpc_attempt_with_timeout(
-                        self.host.send_signed_endpoint_stream_response_rpc_async(
-                            &endpoint,
-                            &outer_auth,
-                            &outer,
-                            hop_timeouts,
-                        ),
-                        attempt_timeout,
-                        &endpoint,
-                    )
-                    .await;
-                    (
-                        outer_build_us,
-                        outer_sign_us,
-                        cluster_object_rpc_elapsed_us(send_started_at),
-                        response,
-                    )
-                };
-                let attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at);
-                let total_us = cluster_object_rpc_elapsed_us(call_started_at);
-                let attempt_trace = ClusterObjectRpcAttemptTrace {
-                    start: ClusterObjectRpcAttemptStartTrace {
-                        send_attempt: send_attempts,
-                        ..attempt_trace_start
-                    },
-                    sign_us: request_sign_us,
-                    plan_us,
-                    outer_build_us,
-                    outer_sign_us,
-                    send_us,
-                    attempt_us,
-                    total_us,
-                };
-                match response {
-                    Ok(response) if relay_response_reports_outcome_unknown(&response.response) => {
-                        let detail = relay_response_outcome_unknown_detail(&response.response);
-                        attempt_trace.record(
-                            "relay_outcome_unknown",
-                            "possibly_applied",
-                            "outcome_unknown",
-                            ClusterObjectRpcAttemptTraceDetail::RelayOutcomeUnknown,
-                        );
-                        return Err(cluster_object_rpc_outcome_unknown(
-                            target_node_id,
-                            request,
-                            detail,
-                        ));
-                    }
-                    Ok(response)
-                        if relay_response_requires_fresh_origin_signature(&response.response) =>
-                    {
-                        let detail = relay_response_routing_error_detail(&response.response);
-                        possibly_applied = true;
-                        let retry_decision = if !request.is_response_retry_safe() {
-                            "outcome_unknown"
-                        } else if route_attempt < max_route_attempts {
-                            "fresh_origin_signature"
-                        } else {
-                            "retry_exhausted"
-                        };
-                        attempt_trace.record(
-                            "fresh_origin_signature_required",
-                            "possibly_applied",
-                            retry_decision,
-                            ClusterObjectRpcAttemptTraceDetail::FreshOriginSignatureRequired,
-                        );
-                        if !request.is_response_retry_safe() {
-                            return Err(cluster_object_rpc_outcome_unknown(
-                                target_node_id,
-                                request,
-                                &detail,
-                            ));
-                        }
-                        failures.push(format!(
-                            "{} ({:?}) requested a fresh origin signature: {detail}",
-                            endpoint.address, endpoint.transport
-                        ));
-                        continue 'route_attempts;
-                    }
-                    Ok(response) if relay_response_is_routing_error(&response.response) => {
-                        metrics::counter!(
-                            "sinomo.object_rpc.target.routing_errors",
-                            "route" => request.route.clone(),
-                            "category" => request.category.clone()
-                        )
-                        .increment(1);
-                        let detail = relay_response_routing_error_detail(&response.response);
-                        attempt_trace.record(
-                            "relay_routing_error",
-                            cluster_object_rpc_delivery_state_name(
-                                cluster_object_rpc_delivery_state(possibly_applied),
-                            ),
-                            cluster_object_rpc_replan_retry_decision(
-                                route_attempt_index,
-                                max_route_attempts,
-                            ),
-                            ClusterObjectRpcAttemptTraceDetail::RelayRoutingError,
-                        );
-                        failures.push(format!(
-                            "{} ({:?}) returned routing error: {detail}",
-                            endpoint.address, endpoint.transport
-                        ));
-                        break;
-                    }
-                    Ok(response) => {
-                        if let Some(detail) =
-                            cluster_object_rpc_retryable_endpoint_error_detail(&response.response)
-                        {
-                            metrics::histogram!(
-                                "sinomo.object_rpc.target.attempt.us",
-                                "route" => request.route.clone(),
-                                "category" => request.category.clone(),
-                                "outcome" => "endpoint_error"
-                            )
-                            .record(cluster_object_rpc_elapsed_us(attempt_started_at) as f64);
-                            attempt_trace.record(
-                                "endpoint_error_response",
-                                cluster_object_rpc_delivery_state_name(
-                                    cluster_object_rpc_delivery_state(possibly_applied),
-                                ),
-                                cluster_object_rpc_endpoint_retry_decision(
-                                    endpoint_index,
-                                    route_endpoint_count,
-                                    route_attempt_index,
-                                    max_route_attempts,
-                                ),
-                                ClusterObjectRpcAttemptTraceDetail::EndpointAuthenticationDenied,
-                            );
-                            failures.push(format!(
-                                "{} ({:?}) returned endpoint error: {detail}",
-                                endpoint.address, endpoint.transport
-                            ));
-                            continue;
-                        }
-                        if let Some(responder_node_id) = cluster_object_rpc_wrong_responder_node_id(
-                            &response.response,
-                            target_node_id,
-                        ) {
-                            metrics::counter!(
-                                "sinomo.object_rpc.target.responder_mismatch",
-                                "route" => request.route.clone(),
-                                "category" => request.category.clone()
-                            )
-                            .increment(1);
-                            let failure = if final_hop {
-                                record_cluster_delivery_endpoint_identity_mismatch(
-                                    paths, state, &endpoint,
-                                );
-                                format!(
-                                    "{} ({:?}) responder mismatch: expected {}, got {}",
-                                    endpoint.address,
-                                    endpoint.transport,
-                                    target_node_id,
-                                    responder_node_id
-                                )
-                            } else {
-                                format!(
-                                    "{} ({:?}) relay responder mismatch: expected final {}, got {}",
-                                    endpoint.address,
-                                    endpoint.transport,
-                                    target_node_id,
-                                    responder_node_id
-                                )
-                            };
-                            possibly_applied = true;
-                            attempt_trace.record(
-                                "responder_mismatch",
-                                "possibly_applied",
-                                if request.is_response_retry_safe() {
-                                    cluster_object_rpc_endpoint_retry_decision(
-                                        endpoint_index,
-                                        route_endpoint_count,
-                                        route_attempt_index,
-                                        max_route_attempts,
-                                    )
-                                } else {
-                                    "outcome_unknown"
-                                },
-                                ClusterObjectRpcAttemptTraceDetail::ResponderMismatch,
-                            );
-                            if !request.is_response_retry_safe() {
-                                return Err(cluster_object_rpc_outcome_unknown(
-                                    target_node_id,
-                                    request,
-                                    &failure,
-                                ));
-                            }
-                            failures.push(failure);
-                            continue;
-                        }
-                        if let Err(error) = response.response.error_detail() {
-                            attempt_trace.record(
-                                "application_error_response",
-                                "confirmed_response",
-                                "do_not_retry",
-                                ClusterObjectRpcAttemptTraceDetail::ApplicationError,
-                            );
-                            return Err(error);
-                        }
-                        metrics::histogram!(
-                            "sinomo.object_rpc.target.attempt.us",
-                            "route" => request.route.clone(),
-                            "category" => request.category.clone(),
-                            "outcome" => "ok"
-                        )
-                        .record(attempt_us as f64);
-                        metrics::histogram!(
-                            "sinomo.object_rpc.target.total.us",
-                            "route" => request.route.clone(),
-                            "category" => request.category.clone(),
-                            "outcome" => "ok"
-                        )
-                        .record(total_us as f64);
-                        attempt_trace.record(
-                            "delivered",
-                            "confirmed_response",
-                            "complete",
-                            ClusterObjectRpcAttemptTraceDetail::None,
-                        );
-                        return Ok(response);
-                    }
-                    Err(error) => {
-                        if cluster_object_rpc_error_requires_hard_failure_observation(&error) {
-                            let _ = self
-                                .host
-                                .observe_signed_endpoint_rpc_async(
-                                    &endpoint,
-                                    ClusterSignedObjectRpcObservation::hard_io_failure(),
-                                )
-                                .await;
-                        }
-                        metrics::histogram!(
-                            "sinomo.object_rpc.target.attempt.us",
-                            "route" => request.route.clone(),
-                            "category" => request.category.clone(),
-                            "outcome" => "error"
-                        )
-                        .record(attempt_us as f64);
-                        metrics::histogram!(
-                            "sinomo.object_rpc.target.total.us",
-                            "route" => request.route.clone(),
-                            "category" => request.category.clone(),
-                            "outcome" => "error"
-                        )
-                        .record(total_us as f64);
-                        let delivery_state = error
-                            .delivery_state()
-                            .unwrap_or(NetworkDeliveryState::PossiblyApplied);
-                        let allows_fresh_connection_retry =
-                            cluster_object_rpc_error_allows_fresh_connection_retry(request, &error);
-                        let outcome_unknown = delivery_state
-                            == NetworkDeliveryState::PossiblyApplied
-                            && !request.is_response_retry_safe();
-                        let fresh_connection_retry =
-                            allows_fresh_connection_retry && !fresh_connection_retry_used;
-                        let retry_decision = if outcome_unknown {
-                            "outcome_unknown"
-                        } else if fresh_connection_retry {
-                            if route_attempt < max_route_attempts {
-                                "fresh_connection"
-                            } else {
-                                "retry_exhausted"
-                            }
-                        } else {
-                            cluster_object_rpc_endpoint_retry_decision(
-                                endpoint_index,
-                                route_endpoint_count,
-                                route_attempt_index,
-                                max_route_attempts,
-                            )
-                        };
-                        attempt_trace.record(
-                            "transport_error",
-                            cluster_object_rpc_delivery_state_name(delivery_state),
-                            retry_decision,
-                            ClusterObjectRpcAttemptTraceDetail::for_transport_error(&error),
-                        );
-                        if delivery_state == NetworkDeliveryState::PossiblyApplied {
-                            possibly_applied = true;
-                            if !request.is_response_retry_safe() {
-                                return Err(cluster_object_rpc_outcome_unknown(
-                                    target_node_id,
-                                    request,
-                                    &error,
-                                ));
-                            }
-                        }
-                        failures.push(format!(
-                            "{} ({:?}): {error}",
-                            endpoint.address, endpoint.transport
-                        ));
-                        if fresh_connection_retry {
-                            fresh_connection_retry_used = true;
-                            continue 'route_attempts;
-                        }
-                    }
-                }
-            }
-            failed_edges.try_insert(&state.local_node_id, &route_plan.next_hop)?;
-        }
-
-        let delivery_state = cluster_object_rpc_delivery_state(possibly_applied);
-        let last_failure = cluster_object_rpc_trace_last_failure(&failures);
-        tracing::debug!(
-            target: "sinomo.network.object_rpc",
-            %traceparent,
-            route = %request.route,
-            category = %request.category,
-            %target_node_id,
-            route_attempt_limit = max_route_attempts,
-            send_attempts,
-            remaining_budget_ms = deadline
-                .checked_remaining()
-                .flatten()
-                .map(duration_millis_u64)
-                .unwrap_or_default(),
-            delivery_state = cluster_object_rpc_delivery_state_name(delivery_state),
-            retry_decision = "retry_exhausted",
-            failure_count = failures.len(),
-            last_failure,
-            total_us = cluster_object_rpc_elapsed_us(call_started_at),
-            stream = true,
-            "cluster object rpc stream retries exhausted"
-        );
-        Err(NetworkError::RetryExhausted {
-            operation: format!("cluster target stream rpc to {target_node_id}"),
-            attempts: send_attempts,
-            delivery_state,
-            detail: format!(
-                "route to target node {target_node_id} failed{}",
-                if failures.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {}", failures.join("; "))
-                }
-            ),
-        })
-    }
 }
 
 fn cluster_object_rpc_delivery_state(possibly_applied: bool) -> NetworkDeliveryState {
@@ -4405,35 +4077,16 @@ fn propagate_relay_response_metadata(inner: &ObjectRpcRequest, outer: &mut Objec
             inner.observe_sampled().to_string(),
         );
     }
-    if let Some(timeout) = inner.forwarded_response_idle_timeout() {
-        outer.metadata.insert(
-            crate::rpc::OBJECT_RPC_FORWARDED_RESPONSE_IDLE_TIMEOUT_MS_METADATA_KEY.to_string(),
-            duration_millis_u64(timeout).to_string(),
-        );
-    }
     if inner.uses_full_response_budget() {
         outer.metadata.insert(
             crate::rpc::OBJECT_RPC_FULL_RESPONSE_BUDGET_METADATA_KEY.to_string(),
             "true".to_string(),
         );
     }
-    if crate::object_rpc_request_expects_raw_daemon_response(inner) {
-        outer.metadata.insert(
-            crate::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY.to_string(),
-            crate::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE.to_string(),
-        );
-    }
-    if crate::object_rpc_request_accepts_streamed_daemon_response(inner) {
-        outer.metadata.insert(
-            crate::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY.to_string(),
-            crate::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE.to_string(),
-        );
-    }
 }
 
 fn cluster_endpoint_transport_timeouts(
     timeouts: DaemonRpcTimeouts,
-    extended_idle_timeout: Option<Duration>,
     remaining_route_budget: Option<Duration>,
 ) -> DaemonRpcTimeouts {
     let connect_timeout = match (timeouts.connect_timeout, remaining_route_budget) {
@@ -4442,8 +4095,7 @@ fn cluster_endpoint_transport_timeouts(
         (None, Some(remaining)) => Some(remaining),
         (None, None) => None,
     };
-    let requested_idle_timeout = extended_idle_timeout.or(timeouts.idle_timeout);
-    let idle_timeout = match (requested_idle_timeout, remaining_route_budget) {
+    let idle_timeout = match (timeouts.idle_timeout, remaining_route_budget) {
         (Some(idle_timeout), Some(remaining)) => Some(idle_timeout.min(remaining)),
         (Some(idle_timeout), None) => Some(idle_timeout),
         (None, _) => None,
@@ -4455,7 +4107,6 @@ fn cluster_endpoint_transport_timeouts(
 
 fn cluster_relay_hop_transport_timeouts(
     timeouts: DaemonRpcTimeouts,
-    extended_idle_timeout: Option<Duration>,
     endpoint_connect_budget: Option<Duration>,
     remaining_route_budget: Option<Duration>,
 ) -> DaemonRpcTimeouts {
@@ -4465,13 +4116,11 @@ fn cluster_relay_hop_transport_timeouts(
         (None, Some(budget)) => Some(budget),
         (None, None) => None,
     };
-    let idle_timeout = extended_idle_timeout
-        .or(timeouts.idle_timeout)
-        .map(|idle_timeout| {
-            remaining_route_budget
-                .map(|remaining| idle_timeout.min(remaining))
-                .unwrap_or(idle_timeout)
-        });
+    let idle_timeout = timeouts.idle_timeout.map(|idle_timeout| {
+        remaining_route_budget
+            .map(|remaining| idle_timeout.min(remaining))
+            .unwrap_or(idle_timeout)
+    });
     timeouts
         .with_connect_timeout(connect_timeout)
         .with_idle_timeout(idle_timeout)
@@ -4479,7 +4128,6 @@ fn cluster_relay_hop_transport_timeouts(
 
 fn cluster_target_final_hop_transport_timeouts(
     timeouts: DaemonRpcTimeouts,
-    extended_idle_timeout: Option<Duration>,
     endpoint_connect_budget: Option<Duration>,
     endpoint_response_budget: Option<Duration>,
     remaining_route_budget: Option<Duration>,
@@ -4490,26 +4138,23 @@ fn cluster_target_final_hop_transport_timeouts(
         (None, Some(remaining)) => Some(remaining),
         (None, None) => None,
     };
-    let idle_timeout = extended_idle_timeout
-        .or(timeouts.idle_timeout)
-        .map(|idle_timeout| {
-            let mut capped = idle_timeout;
-            if let Some(remaining) = remaining_route_budget {
-                capped = capped.min(remaining);
-            }
-            if let Some(remaining) = endpoint_response_budget {
-                capped = capped.min(remaining);
-            }
-            capped
-        });
+    let idle_timeout = timeouts.idle_timeout.map(|idle_timeout| {
+        let mut capped = idle_timeout;
+        if let Some(remaining) = remaining_route_budget {
+            capped = capped.min(remaining);
+        }
+        if let Some(remaining) = endpoint_response_budget {
+            capped = capped.min(remaining);
+        }
+        capped
+    });
     timeouts
         .with_connect_timeout(connect_timeout)
         .with_idle_timeout(idle_timeout)
 }
 
 fn cluster_target_final_hop_request_uses_full_response_budget(request: &ObjectRpcRequest) -> bool {
-    crate::object_rpc_request_stream_mode(request).expects_raw_streamed_response()
-        || request.uses_full_response_budget()
+    request.uses_full_response_budget()
 }
 
 fn cluster_target_endpoint_attempt_budget(
@@ -4657,15 +4302,6 @@ fn cluster_object_rpc_error_requires_hard_failure_observation(error: &NetworkErr
 fn relay_envelope_hop_timeout(envelope: &RelayEnvelope) -> Option<Duration> {
     envelope
         .max_hop_timeout_ms
-        .map(|timeout_ms| Duration::from_millis(timeout_ms.max(1)))
-}
-
-fn relay_envelope_extended_idle_timeout(envelope: &RelayEnvelope) -> Option<Duration> {
-    if !cluster_target_final_hop_request_uses_full_response_budget(envelope.inner()) {
-        return None;
-    }
-    envelope
-        .extended_idle_timeout_ms
         .map(|timeout_ms| Duration::from_millis(timeout_ms.max(1)))
 }
 
@@ -4823,7 +4459,6 @@ fn relay_request_for_signed_rpc_with_max_hop_timeout(
     planned_path: &[NodeId],
     target_endpoints: &[ClusterEndpointRecord],
     max_hop_timeout: Option<Duration>,
-    extended_idle_timeout: Option<Duration>,
 ) -> Result<ObjectRpcRequest, NetworkError> {
     let inner = request.clone().with_auth(request_auth.into());
     let mut envelope = RelayEnvelope::new(cluster_id.clone(), target_node_id.clone(), inner);
@@ -4842,17 +4477,7 @@ fn relay_request_for_signed_rpc_with_max_hop_timeout(
         )?);
     }
     envelope.max_hop_timeout_ms = max_hop_timeout.map(duration_millis_u64);
-    envelope.extended_idle_timeout_ms = extended_idle_timeout.map(duration_millis_u64);
     envelope.into_request()
-}
-
-fn cluster_relay_request_extended_idle_timeout(
-    options: ClusterObjectRpcOptions,
-    streamed_response: bool,
-) -> Option<Duration> {
-    (!streamed_response)
-        .then_some(options.extended_idle_timeout)
-        .flatten()
 }
 
 fn duration_millis_u64(duration: Duration) -> u64 {
@@ -4889,12 +4514,6 @@ pub async fn handle_cluster_relay_async_with_host(
     host: &mut impl ClusterRelayAsyncHost,
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let envelope = RelayEnvelope::from_request(request)?;
-    if relay_envelope_inner_expects_streamed_response(&envelope) {
-        return Err(NetworkError::Io {
-            operation: "cluster relay rpc".to_string(),
-            detail: "streamed raw relay responses require socket streaming dispatch".to_string(),
-        });
-    }
     handle_cluster_relay_envelope_async_with_host(
         runtime,
         paths,
@@ -4921,13 +4540,11 @@ async fn handle_cluster_relay_envelope_async_with_host(
     let inner_category = envelope.inner.category.clone();
     let use_full_response_budget =
         cluster_target_final_hop_request_uses_full_response_budget(envelope.inner());
-    let extended_idle_timeout = relay_envelope_extended_idle_timeout(&envelope);
     let traceparent = envelope.inner.traceparent().unwrap_or_default().to_string();
     metrics::counter!(
         "sinomo.object_rpc.relay.calls",
         "route" => inner_route.clone(),
-        "category" => inner_category.clone(),
-        "stream" => "false"
+        "category" => inner_category.clone()
     )
     .increment(1);
     tracing::debug!(
@@ -4939,7 +4556,6 @@ async fn handle_cluster_relay_envelope_async_with_host(
         target_node_id = %envelope.target_node_id,
         ttl = envelope.ttl,
         visited = envelope.visited.len(),
-        stream = false,
         "cluster relay start"
     );
     if sinomo_node::cluster_node_is_local_process(state, &envelope.target_node_id) {
@@ -4950,7 +4566,6 @@ async fn handle_cluster_relay_envelope_async_with_host(
                 envelope.inner(),
                 cluster_endpoint_transport_timeouts(
                     options.timeouts,
-                    extended_idle_timeout,
                     relay_envelope_hop_timeout(&envelope),
                 ),
             )
@@ -4960,7 +4575,6 @@ async fn handle_cluster_relay_envelope_async_with_host(
                 cluster_relay_record_total_us(
                     &inner_route,
                     &inner_category,
-                    false,
                     "local",
                     relay_started_at,
                 );
@@ -4994,7 +4608,6 @@ async fn handle_cluster_relay_envelope_async_with_host(
                     cluster_relay_record_total_us(
                         &inner_route,
                         &inner_category,
-                        false,
                         "local_retry_from_origin",
                         relay_started_at,
                     );
@@ -5004,7 +4617,6 @@ async fn handle_cluster_relay_envelope_async_with_host(
                     cluster_relay_record_total_us(
                         &inner_route,
                         &inner_category,
-                        false,
                         "local_outcome_unknown",
                         relay_started_at,
                     );
@@ -5015,13 +4627,7 @@ async fn handle_cluster_relay_envelope_async_with_host(
     }
 
     if envelope.visited.iter().any(|node| node == local_node_id) {
-        cluster_relay_record_total_us(
-            &inner_route,
-            &inner_category,
-            false,
-            "loop",
-            relay_started_at,
-        );
+        cluster_relay_record_total_us(&inner_route, &inner_category, "loop", relay_started_at);
         return ObjectRpcResponse::encode_error(
             CLUSTER_RELAY_ROUTE,
             format!("relay dropped: relay loop: {local_node_id} already on the path"),
@@ -5031,7 +4637,6 @@ async fn handle_cluster_relay_envelope_async_with_host(
         cluster_relay_record_total_us(
             &inner_route,
             &inner_category,
-            false,
             "ttl_exhausted",
             relay_started_at,
         );
@@ -5063,8 +4668,7 @@ async fn handle_cluster_relay_envelope_async_with_host(
         metrics::histogram!(
             "sinomo.object_rpc.relay.route_plan.us",
             "route" => inner_route.clone(),
-            "category" => inner_category.clone(),
-            "stream" => "false"
+            "category" => inner_category.clone()
         )
         .record(plan_us as f64);
         if route_plan.endpoints.is_empty() {
@@ -5088,7 +4692,6 @@ async fn handle_cluster_relay_envelope_async_with_host(
             next_hop = %route_plan.next_hop,
             plan_us,
             endpoints = %cluster_object_rpc_endpoint_trace_list(&route_plan.endpoints),
-            stream = false,
             "cluster relay route plan selected"
         );
         let route_endpoint_count = route_plan.endpoints.len();
@@ -5119,7 +4722,6 @@ async fn handle_cluster_relay_envelope_async_with_host(
             let hop_timeouts = if final_hop || hop_full_response_budget {
                 cluster_target_final_hop_transport_timeouts(
                     options.timeouts,
-                    extended_idle_timeout,
                     endpoint_attempt_budget,
                     hop_attempt_budget,
                     remaining,
@@ -5127,7 +4729,6 @@ async fn handle_cluster_relay_envelope_async_with_host(
             } else {
                 cluster_relay_hop_transport_timeouts(
                     options.timeouts,
-                    extended_idle_timeout,
                     endpoint_attempt_budget,
                     remaining,
                 )
@@ -5169,14 +4770,12 @@ async fn handle_cluster_relay_envelope_async_with_host(
                     cluster_relay_record_attempt_us(
                         &inner_route,
                         &inner_category,
-                        false,
                         "retry_from_origin",
                         attempt_started_at,
                     );
                     cluster_relay_record_total_us(
                         &inner_route,
                         &inner_category,
-                        false,
                         "retry_from_origin",
                         relay_started_at,
                     );
@@ -5186,7 +4785,6 @@ async fn handle_cluster_relay_envelope_async_with_host(
                     cluster_relay_record_attempt_us(
                         &inner_route,
                         &inner_category,
-                        false,
                         "routing_error",
                         attempt_started_at,
                     );
@@ -5217,14 +4815,12 @@ async fn handle_cluster_relay_envelope_async_with_host(
                     cluster_relay_record_attempt_us(
                         &inner_route,
                         &inner_category,
-                        false,
                         "ok",
                         attempt_started_at,
                     );
                     cluster_relay_record_total_us(
                         &inner_route,
                         &inner_category,
-                        false,
                         "ok",
                         relay_started_at,
                     );
@@ -5249,7 +4845,6 @@ async fn handle_cluster_relay_envelope_async_with_host(
                     cluster_relay_record_attempt_us(
                         &inner_route,
                         &inner_category,
-                        false,
                         "error",
                         attempt_started_at,
                     );
@@ -5281,7 +4876,6 @@ async fn handle_cluster_relay_envelope_async_with_host(
                             cluster_relay_record_total_us(
                                 &inner_route,
                                 &inner_category,
-                                false,
                                 "retry_from_origin",
                                 relay_started_at,
                             );
@@ -5294,7 +4888,6 @@ async fn handle_cluster_relay_envelope_async_with_host(
                             cluster_relay_record_total_us(
                                 &inner_route,
                                 &inner_category,
-                                false,
                                 "outcome_unknown",
                                 relay_started_at,
                             );
@@ -5310,13 +4903,7 @@ async fn handle_cluster_relay_envelope_async_with_host(
         failed_edges.try_insert(local_node_id, &route_plan.next_hop)?;
     }
 
-    cluster_relay_record_total_us(
-        &inner_route,
-        &inner_category,
-        false,
-        "no_route",
-        relay_started_at,
-    );
+    cluster_relay_record_total_us(&inner_route, &inner_category, "no_route", relay_started_at);
     ObjectRpcResponse::encode_error(
         CLUSTER_RELAY_ROUTE,
         format!(
@@ -5329,435 +4916,6 @@ async fn handle_cluster_relay_envelope_async_with_host(
             }
         ),
     )
-}
-
-fn relay_envelope_inner_expects_streamed_response(envelope: &RelayEnvelope) -> bool {
-    crate::object_rpc_request_stream_mode(envelope.inner()).expects_raw_streamed_response()
-}
-
-pub async fn handle_cluster_relay_stream_forward_async_with_host(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    local_node_id: &NodeId,
-    request: &ObjectRpcRequest,
-    options: ClusterRelayOptions,
-    host: &mut impl ClusterRelayStreamForwardAsyncHost,
-) -> Result<ClusterRelayStreamForwardOutcome, NetworkError> {
-    let envelope = RelayEnvelope::from_request(request)?;
-    if !relay_envelope_inner_expects_streamed_response(&envelope) {
-        return ObjectRpcResponse::encode_error(
-            CLUSTER_RELAY_ROUTE,
-            "stream relay forwarding requires an inner request that expects a streamed raw response",
-        )
-        .map(ClusterRelayStreamForwardOutcome::ErrorResponse);
-    }
-    handle_cluster_relay_stream_forward_envelope_async_with_host(
-        runtime,
-        paths,
-        state,
-        local_node_id,
-        envelope,
-        options,
-        host,
-    )
-    .await
-}
-
-async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    local_node_id: &NodeId,
-    envelope: RelayEnvelope,
-    options: ClusterRelayOptions,
-    host: &mut impl ClusterRelayStreamForwardAsyncHost,
-) -> Result<ClusterRelayStreamForwardOutcome, NetworkError> {
-    let relay_started_at = Instant::now();
-    let inner_route = envelope.inner.route.clone();
-    let inner_category = envelope.inner.category.clone();
-    let use_full_response_budget =
-        cluster_target_final_hop_request_uses_full_response_budget(envelope.inner());
-    let traceparent = envelope.inner.traceparent().unwrap_or_default().to_string();
-    metrics::counter!(
-        "sinomo.object_rpc.relay.calls",
-        "route" => inner_route.clone(),
-        "category" => inner_category.clone(),
-        "stream" => "true"
-    )
-    .increment(1);
-    tracing::debug!(
-        target: "sinomo.network.object_rpc.relay",
-        %traceparent,
-        route = %inner_route,
-        category = %inner_category,
-        %local_node_id,
-        target_node_id = %envelope.target_node_id,
-        ttl = envelope.ttl,
-        visited = envelope.visited.len(),
-        stream = true,
-        "cluster stream relay start"
-    );
-    if sinomo_node::cluster_node_is_local_process(state, &envelope.target_node_id) {
-        cluster_relay_record_total_us(
-            &inner_route,
-            &inner_category,
-            true,
-            "local_stream",
-            relay_started_at,
-        );
-        return ObjectRpcResponse::encode_error(
-            CLUSTER_RELAY_ROUTE,
-            "stream relay local delivery must be handled by the daemon control loop",
-        )
-        .map(ClusterRelayStreamForwardOutcome::ErrorResponse);
-    }
-
-    if envelope.visited.iter().any(|node| node == local_node_id) {
-        cluster_relay_record_total_us(
-            &inner_route,
-            &inner_category,
-            true,
-            "loop",
-            relay_started_at,
-        );
-        return ObjectRpcResponse::encode_error(
-            CLUSTER_RELAY_ROUTE,
-            format!("relay dropped: relay loop: {local_node_id} already on the path"),
-        )
-        .map(ClusterRelayStreamForwardOutcome::ErrorResponse);
-    }
-    if envelope.ttl == 0 {
-        cluster_relay_record_total_us(
-            &inner_route,
-            &inner_category,
-            true,
-            "ttl_exhausted",
-            relay_started_at,
-        );
-        return ObjectRpcResponse::encode_error(
-            CLUSTER_RELAY_ROUTE,
-            "relay dropped: relay ttl exhausted",
-        )
-        .map(ClusterRelayStreamForwardOutcome::ErrorResponse);
-    }
-
-    let mut failures = Vec::new();
-    let mut failed_edges = ClusterDeliveryFailedEdges::default();
-    let max_route_attempts = state.members.len().saturating_mul(2).max(1) + 2;
-    let relay_deadline = ClusterEndpointRpcDeadline::new(relay_envelope_hop_timeout(&envelope));
-    'route_attempts: for _ in 0..max_route_attempts {
-        let plan_started_at = Instant::now();
-        let Some(route_plan) = cluster_relay_forward_plan(
-            runtime,
-            paths,
-            state,
-            local_node_id,
-            &envelope,
-            failed_edges.try_clone()?,
-        )
-        .await?
-        else {
-            break;
-        };
-        let plan_us = cluster_object_rpc_elapsed_us(plan_started_at);
-        metrics::histogram!(
-            "sinomo.object_rpc.relay.route_plan.us",
-            "route" => inner_route.clone(),
-            "category" => inner_category.clone(),
-            "stream" => "true"
-        )
-        .record(plan_us as f64);
-        if route_plan.endpoints.is_empty() {
-            push_cluster_relay_failure(
-                &mut failures,
-                format!(
-                    "{}: relay next hop has no reachable endpoint",
-                    route_plan.next_hop
-                ),
-            );
-            failed_edges.try_insert(local_node_id, &route_plan.next_hop)?;
-            continue;
-        }
-        tracing::trace!(
-            target: "sinomo.network.object_rpc.relay",
-            %traceparent,
-            route = %inner_route,
-            category = %inner_category,
-            %local_node_id,
-            target_node_id = %envelope.target_node_id,
-            next_hop = %route_plan.next_hop,
-            plan_us,
-            endpoints = %cluster_object_rpc_endpoint_trace_list(&route_plan.endpoints),
-            stream = true,
-            "cluster stream relay route plan selected"
-        );
-        let route_endpoint_count = route_plan.endpoints.len();
-        let local_connectivity = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
-        let mut route_endpoints = route_plan.endpoints;
-        cluster_delivery_sort_route_endpoints_for_attempt(
-            &local_connectivity,
-            &mut route_endpoints,
-            use_full_response_budget,
-        );
-        for (endpoint_index, endpoint) in route_endpoints.into_iter().enumerate() {
-            let attempt_started_at = Instant::now();
-            let Some(remaining) = relay_deadline.checked_remaining() else {
-                push_cluster_relay_failure(
-                    &mut failures,
-                    format!(
-                        "relay hop budget exhausted after {}ms",
-                        relay_deadline.timeout.unwrap_or_default().as_millis()
-                    ),
-                );
-                break 'route_attempts;
-            };
-            let endpoints_left = route_endpoint_count.saturating_sub(endpoint_index).max(1);
-            let endpoint_attempt_budget = cluster_target_endpoint_attempt_budget_for_endpoint(
-                &local_connectivity,
-                &endpoint,
-                remaining,
-                endpoints_left,
-                route_endpoint_count,
-            );
-            let final_hop = &route_plan.next_hop == &envelope.target_node_id;
-            let hop_full_response_budget = use_full_response_budget;
-            let hop_attempt_budget = cluster_response_attempt_budget(remaining);
-            let hop_timeouts = if final_hop || hop_full_response_budget {
-                cluster_target_final_hop_transport_timeouts(
-                    options.timeouts,
-                    None,
-                    endpoint_attempt_budget,
-                    hop_attempt_budget,
-                    remaining,
-                )
-            } else {
-                cluster_relay_hop_transport_timeouts(
-                    options.timeouts,
-                    None,
-                    endpoint_attempt_budget,
-                    remaining,
-                )
-            };
-            let mut forwarded = envelope.clone();
-            forwarded.ttl = envelope.ttl.saturating_sub(1);
-            forwarded.visited.push(local_node_id.clone());
-            let Some(forward_remaining_ms) =
-                cluster_relay_forward_remaining_timeout_ms(relay_deadline)
-            else {
-                push_cluster_relay_failure(
-                    &mut failures,
-                    "stream relay hop budget expired before forwarding to the next hop",
-                );
-                break 'route_attempts;
-            };
-            forwarded.max_hop_timeout_ms = forward_remaining_ms;
-            let outer = forwarded.into_request()?;
-            // A default stream has no wall-clock limit and relies on transport
-            // progress. An explicit semantic deadline remains terminal even
-            // while the stream is active.
-            let timeout_error = relay_deadline.timeout_error(
-                "cluster relay stream forward",
-                NetworkTimeoutPhase::Overall,
-                NetworkDeliveryState::PossiblyApplied,
-            );
-            match cluster_object_rpc_call_with_deadline(
-                host.send_relay_stream_forward_async(&endpoint, &outer, hop_timeouts),
-                relay_deadline,
-                timeout_error,
-            )
-            .await
-            {
-                Ok(ClusterRelayStreamSendOutcome::Forwarded) => {
-                    cluster_relay_record_attempt_us(
-                        &inner_route,
-                        &inner_category,
-                        true,
-                        "ok",
-                        attempt_started_at,
-                    );
-                    cluster_relay_record_total_us(
-                        &inner_route,
-                        &inner_category,
-                        true,
-                        "ok",
-                        relay_started_at,
-                    );
-                    tracing::debug!(
-                        target: "sinomo.network.object_rpc.relay",
-                        %traceparent,
-                        route = %inner_route,
-                        category = %inner_category,
-                        %local_node_id,
-                        target_node_id = %envelope.target_node_id,
-                        next_hop = %route_plan.next_hop,
-                        endpoint = %endpoint.address,
-                        transport = ?endpoint.transport,
-                        attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at),
-                        total_us = cluster_object_rpc_elapsed_us(relay_started_at),
-                        stream = true,
-                        "cluster stream relay forwarded"
-                    );
-                    return Ok(ClusterRelayStreamForwardOutcome::Forwarded);
-                }
-                Ok(ClusterRelayStreamSendOutcome::RoutingError(response))
-                    if relay_response_requires_fresh_origin_signature(&response) =>
-                {
-                    cluster_relay_record_attempt_us(
-                        &inner_route,
-                        &inner_category,
-                        true,
-                        "retry_from_origin",
-                        attempt_started_at,
-                    );
-                    cluster_relay_record_total_us(
-                        &inner_route,
-                        &inner_category,
-                        true,
-                        "retry_from_origin",
-                        relay_started_at,
-                    );
-                    return Ok(ClusterRelayStreamForwardOutcome::ErrorResponse(response));
-                }
-                Ok(ClusterRelayStreamSendOutcome::RoutingError(response)) => {
-                    cluster_relay_record_attempt_us(
-                        &inner_route,
-                        &inner_category,
-                        true,
-                        "routing_error",
-                        attempt_started_at,
-                    );
-                    tracing::debug!(
-                        target: "sinomo.network.object_rpc.relay",
-                        %traceparent,
-                        route = %inner_route,
-                        category = %inner_category,
-                        %local_node_id,
-                        target_node_id = %envelope.target_node_id,
-                        next_hop = %route_plan.next_hop,
-                        endpoint = %endpoint.address,
-                        transport = ?endpoint.transport,
-                        attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at),
-                        stream = true,
-                        "cluster stream relay hop returned routing error"
-                    );
-                    push_cluster_relay_failure(
-                        &mut failures,
-                        format!(
-                            "{} ({:?}) returned routing error: {}",
-                            endpoint.address,
-                            endpoint.transport,
-                            relay_response_routing_error_detail(&response)
-                        ),
-                    );
-                    break;
-                }
-                Ok(ClusterRelayStreamSendOutcome::StreamStartedThenFailed(error)) => {
-                    cluster_relay_record_attempt_us(
-                        &inner_route,
-                        &inner_category,
-                        true,
-                        "stream_started_failed",
-                        attempt_started_at,
-                    );
-                    cluster_relay_record_total_us(
-                        &inner_route,
-                        &inner_category,
-                        true,
-                        "stream_started_failed",
-                        relay_started_at,
-                    );
-                    return Ok(ClusterRelayStreamForwardOutcome::StreamStartedThenFailed(
-                        error,
-                    ));
-                }
-                Err(error) => {
-                    cluster_relay_record_attempt_us(
-                        &inner_route,
-                        &inner_category,
-                        true,
-                        "error",
-                        attempt_started_at,
-                    );
-                    tracing::debug!(
-                        target: "sinomo.network.object_rpc.relay",
-                        %traceparent,
-                        route = %inner_route,
-                        category = %inner_category,
-                        %local_node_id,
-                        target_node_id = %envelope.target_node_id,
-                        next_hop = %route_plan.next_hop,
-                        endpoint = %endpoint.address,
-                        transport = ?endpoint.transport,
-                        attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at),
-                        error = %error,
-                        stream = true,
-                        "cluster stream relay hop failed"
-                    );
-                    push_cluster_relay_failure(
-                        &mut failures,
-                        format!(
-                            "{} ({:?}) failed: {}",
-                            endpoint.address, endpoint.transport, error
-                        ),
-                    );
-                    match cluster_relay_failure_action(envelope.inner(), &error) {
-                        ClusterRelayFailureAction::RetryAlternateEndpoint => {}
-                        ClusterRelayFailureAction::RetryFromOrigin => {
-                            cluster_relay_record_total_us(
-                                &inner_route,
-                                &inner_category,
-                                true,
-                                "retry_from_origin",
-                                relay_started_at,
-                            );
-                            return cluster_relay_fresh_signature_retry_response(
-                                envelope.inner(),
-                                &error,
-                            )
-                            .map(ClusterRelayStreamForwardOutcome::ErrorResponse);
-                        }
-                        ClusterRelayFailureAction::Terminal => {
-                            cluster_relay_record_total_us(
-                                &inner_route,
-                                &inner_category,
-                                true,
-                                "outcome_unknown",
-                                relay_started_at,
-                            );
-                            return cluster_relay_outcome_unknown_response(
-                                envelope.inner(),
-                                &error,
-                            )
-                            .map(ClusterRelayStreamForwardOutcome::ErrorResponse);
-                        }
-                    }
-                }
-            }
-        }
-        failed_edges.try_insert(local_node_id, &route_plan.next_hop)?;
-    }
-
-    cluster_relay_record_total_us(
-        &inner_route,
-        &inner_category,
-        true,
-        "no_route",
-        relay_started_at,
-    );
-    ObjectRpcResponse::encode_error(
-        CLUSTER_RELAY_ROUTE,
-        format!(
-            "relay dropped: no reachable route from {local_node_id} to {}{}",
-            envelope.target_node_id,
-            if failures.is_empty() {
-                String::new()
-            } else {
-                format!(": {}", failures.join("; "))
-            }
-        ),
-    )
-    .map(ClusterRelayStreamForwardOutcome::ErrorResponse)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5782,6 +4940,25 @@ fn cluster_relay_failure_action(
         };
     }
     ClusterRelayFailureAction::Terminal
+}
+
+fn cluster_relay_session_forward_failure_result(
+    envelope: &RelayEnvelope,
+    error: &NetworkError,
+) -> Result<ObjectRpcSessionResult, NetworkError> {
+    let response = match cluster_relay_failure_action(envelope.inner(), error) {
+        ClusterRelayFailureAction::RetryAlternateEndpoint => ObjectRpcResponse::encode_error(
+            CLUSTER_RELAY_ROUTE,
+            format!("relay could not forward the object RPC session: {error}"),
+        )?,
+        ClusterRelayFailureAction::RetryFromOrigin => {
+            cluster_relay_fresh_signature_retry_response(envelope.inner(), error)?
+        }
+        ClusterRelayFailureAction::Terminal => {
+            cluster_relay_outcome_unknown_response(envelope.inner(), error)?
+        }
+    };
+    Ok(ObjectRpcSessionResult::buffered(response))
 }
 
 fn cluster_relay_forward_remaining_timeout_ms(
@@ -5836,42 +5013,24 @@ fn cluster_relay_fresh_signature_retry_response(
     Ok(response)
 }
 
-fn cluster_relay_record_attempt_us(
-    route: &str,
-    category: &str,
-    stream: bool,
-    outcome: &str,
-    started: Instant,
-) {
+fn cluster_relay_record_attempt_us(route: &str, category: &str, outcome: &str, started: Instant) {
     metrics::histogram!(
         "sinomo.object_rpc.relay.attempt.us",
         "route" => route.to_string(),
         "category" => category.to_string(),
-        "stream" => cluster_relay_stream_label(stream),
         "outcome" => outcome.to_string()
     )
     .record(cluster_object_rpc_elapsed_us(started) as f64);
 }
 
-fn cluster_relay_record_total_us(
-    route: &str,
-    category: &str,
-    stream: bool,
-    outcome: &str,
-    started: Instant,
-) {
+fn cluster_relay_record_total_us(route: &str, category: &str, outcome: &str, started: Instant) {
     metrics::histogram!(
         "sinomo.object_rpc.relay.total.us",
         "route" => route.to_string(),
         "category" => category.to_string(),
-        "stream" => cluster_relay_stream_label(stream),
         "outcome" => outcome.to_string()
     )
     .record(cluster_object_rpc_elapsed_us(started) as f64);
-}
-
-fn cluster_relay_stream_label(stream: bool) -> &'static str {
-    if stream { "true" } else { "false" }
 }
 
 async fn cluster_relay_forward_plan(
@@ -6159,6 +5318,37 @@ pub fn relay_response_is_routing_error(response: &ObjectRpcResponse) -> bool {
     response.route == CLUSTER_RELAY_ROUTE && response.error_detail().is_err()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClusterRelaySessionResponseDisposition {
+    Delivered,
+    RoutingError,
+    FreshOriginSignature,
+    OutcomeUnknown,
+}
+
+fn cluster_relay_session_response_disposition(
+    response: &ObjectRpcResponse,
+) -> ClusterRelaySessionResponseDisposition {
+    if relay_response_reports_outcome_unknown(response) {
+        ClusterRelaySessionResponseDisposition::OutcomeUnknown
+    } else if relay_response_requires_fresh_origin_signature(response) {
+        ClusterRelaySessionResponseDisposition::FreshOriginSignature
+    } else if relay_response_is_routing_error(response) {
+        ClusterRelaySessionResponseDisposition::RoutingError
+    } else {
+        ClusterRelaySessionResponseDisposition::Delivered
+    }
+}
+
+fn cluster_relay_session_response_origin_is_acceptable(
+    response: &ObjectRpcResponse,
+    response_origin_verified: bool,
+) -> bool {
+    response_origin_verified
+        || cluster_relay_session_response_disposition(response)
+            != ClusterRelaySessionResponseDisposition::Delivered
+}
+
 fn relay_response_requires_fresh_origin_signature(response: &ObjectRpcResponse) -> bool {
     relay_response_is_routing_error(response)
         && response
@@ -6405,49 +5595,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct RecordingRelayStreamHost {
-        sends: Vec<(ClusterEndpointRecord, ObjectRpcRequest, DaemonRpcTimeouts)>,
-        first_error: Option<NetworkError>,
-        routing_response: Option<ObjectRpcResponse>,
-        stall_first_send: Option<Duration>,
-    }
-
-    impl ClusterRelayStreamForwardAsyncHost for RecordingRelayStreamHost {
-        fn send_relay_stream_forward_async<'a>(
-            &'a mut self,
-            endpoint: &'a ClusterEndpointRecord,
-            request: &'a ObjectRpcRequest,
-            timeouts: DaemonRpcTimeouts,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<ClusterRelayStreamSendOutcome, NetworkError>>
-                    + Send
-                    + 'a,
-            >,
-        > {
-            let endpoint = endpoint.clone();
-            let request = request.clone();
-            let first_error = self.first_error.clone().filter(|_| self.sends.is_empty());
-            let routing_response = self.routing_response.clone();
-            let stall = self.stall_first_send.filter(|_| self.sends.is_empty());
-            let sends = &mut self.sends;
-            Box::pin(async move {
-                sends.push((endpoint, request, timeouts));
-                if let Some(stall) = stall {
-                    tokio::time::sleep(stall).await;
-                }
-                if let Some(error) = first_error {
-                    return Err(error);
-                }
-                if let Some(response) = routing_response {
-                    return Ok(ClusterRelayStreamSendOutcome::RoutingError(response));
-                }
-                Ok(ClusterRelayStreamSendOutcome::Forwarded)
-            })
-        }
-    }
-
     fn relay_retry_test_fixture(
         name: &str,
     ) -> (
@@ -6516,15 +5663,8 @@ mod tests {
         local_node: &NodeId,
         target_node: &NodeId,
         endpoints: &[ClusterEndpointRecord; 2],
-        mut inner: ObjectRpcRequest,
-        streamed: bool,
+        inner: ObjectRpcRequest,
     ) -> ObjectRpcRequest {
-        if streamed {
-            crate::set_object_rpc_request_stream_mode(
-                &mut inner,
-                crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
-            );
-        }
         let mut envelope = RelayEnvelope::new(state.cluster_id.clone(), target_node.clone(), inner);
         envelope.planned_path = vec![local_node.clone(), target_node.clone()];
         envelope.target_endpoints = endpoints.to_vec();
@@ -6622,19 +5762,12 @@ mod tests {
         bridge_node: &NodeId,
         target_node: &NodeId,
         target_endpoint: &ClusterEndpointRecord,
-        streamed: bool,
     ) -> (ObjectRpcRequest, ObjectRpcRequest) {
-        let mut inner =
+        let inner =
             ObjectRpcRequest::encode_body("/test/multihop-fresh-signature", "test", &"read")
                 .expect("inner request")
                 .with_response_retry_safe()
                 .with_auth(b"consumed-origin-auth".to_vec());
-        if streamed {
-            crate::set_object_rpc_request_stream_mode(
-                &mut inner,
-                crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
-            );
-        }
         let mut envelope =
             RelayEnvelope::new(state.cluster_id.clone(), target_node.clone(), inner.clone());
         envelope.planned_path = vec![local_node.clone(), bridge_node.clone(), target_node.clone()];
@@ -6658,11 +5791,11 @@ mod tests {
     struct RecordingSignedHost {
         target_sends: Vec<(ClusterEndpointRecord, ObjectRpcRequest, DaemonRpcTimeouts)>,
         target_auths: Vec<Vec<u8>>,
-        stream_target_sends: Vec<(ClusterEndpointRecord, ObjectRpcRequest, DaemonRpcTimeouts)>,
-        stream_target_auths: Vec<Vec<u8>>,
         observations: Vec<(ClusterEndpointRecord, ClusterSignedObjectRpcObservation)>,
         signed_routes: Vec<String>,
         signed_requests: Vec<ObjectRpcRequest>,
+        session_peers: Vec<tokio::io::DuplexStream>,
+        session_server_data_dir: Option<sinomo_local::SinomoDataDir>,
         fail_first_send: bool,
         timeout_first_send: bool,
         timeout_second_send: bool,
@@ -6671,16 +5804,11 @@ mod tests {
         fresh_signature_retry_first_send: bool,
         error_first_send: bool,
         domain_error_first_send: bool,
-        fresh_signature_retry_first_stream_send: bool,
-        stale_pooled_connection_first_stream_send: Option<NetworkDeliveryState>,
-        relay_outcome_unknown_first_stream_send: bool,
-        stream_error_first_send: bool,
         stall_first_send: Option<Duration>,
         stall_second_send: Option<Duration>,
         idle_timeout_first_send: bool,
-        stall_first_stream_send: Option<Duration>,
-        timeout_first_stream_send: bool,
         stall_first_sign: Option<Duration>,
+        stall_session_open: Option<Duration>,
     }
 
     impl ClusterSignedObjectRpcAsyncHost for RecordingSignedHost {
@@ -6713,6 +5841,44 @@ mod tests {
             Box::pin(async move {
                 observations.push((endpoint, observation));
                 Ok(())
+            })
+        }
+
+        fn open_object_rpc_session_stream_async<'a>(
+            &'a mut self,
+            _endpoint: &'a ClusterEndpointRecord,
+            _health: NetworkHealthPolicy,
+        ) -> ClusterSignedObjectRpcFuture<'a, Box<dyn NetworkDuplexStream>> {
+            let (client, peer) = tokio::io::duplex(1024);
+            if let Some(data_dir) = self.session_server_data_dir.clone() {
+                tokio::spawn(async move {
+                    let (request, responder) = crate::accept_object_rpc_server_session(
+                        Box::new(peer),
+                        data_dir,
+                        NetworkCallPolicy::default(),
+                        |_request, _claimed_node_id, _claimed_public_key| Ok(()),
+                    )
+                    .await
+                    .expect("accept test loopback session");
+                    let response = ObjectRpcResponse::encode_body(
+                        request.request.route.clone(),
+                        &"loopback-ok",
+                    )
+                    .expect("encode test loopback response");
+                    responder
+                        .respond(crate::ObjectRpcSessionResponse::buffered(response))
+                        .await
+                        .expect("respond to test loopback session");
+                });
+            } else {
+                self.session_peers.push(peer);
+            }
+            let stall = self.stall_session_open;
+            Box::pin(async move {
+                if let Some(stall) = stall {
+                    tokio::time::sleep(stall).await;
+                }
+                Ok(Box::new(client) as Box<dyn NetworkDuplexStream>)
             })
         }
 
@@ -6806,115 +5972,6 @@ mod tests {
                 } else {
                     ObjectRpcResponse::encode_body("/test/target", &"ok")
                 }
-            })
-        }
-
-        fn send_signed_endpoint_stream_response_rpc_async<'a>(
-            &'a mut self,
-            endpoint: &'a ClusterEndpointRecord,
-            _auth: &'a [u8],
-            request: &'a ObjectRpcRequest,
-            timeouts: DaemonRpcTimeouts,
-        ) -> ClusterSignedObjectRpcFuture<'a, crate::ObjectRpcStreamResponse> {
-            let endpoint = endpoint.clone();
-            let request = request.clone();
-            let should_retry_from_origin =
-                self.fresh_signature_retry_first_stream_send && self.stream_target_sends.is_empty();
-            let stale_pool_delivery_state = self
-                .stale_pooled_connection_first_stream_send
-                .filter(|_| self.stream_target_sends.is_empty());
-            let should_report_outcome_unknown =
-                self.relay_outcome_unknown_first_stream_send && self.stream_target_sends.is_empty();
-            let should_error = self.stream_error_first_send && self.stream_target_sends.is_empty();
-            let should_timeout =
-                self.timeout_first_stream_send && self.stream_target_sends.is_empty();
-            let stall = self
-                .stall_first_stream_send
-                .filter(|_| self.stream_target_sends.is_empty());
-            let sends = &mut self.stream_target_sends;
-            let auths = &mut self.stream_target_auths;
-            let auth = _auth.to_vec();
-            Box::pin(async move {
-                let retry_marker_request = request.clone();
-                sends.push((endpoint, request, timeouts));
-                auths.push(auth);
-                if let Some(stall) = stall {
-                    tokio::time::sleep(stall).await;
-                }
-                if should_timeout {
-                    return Err(NetworkError::timeout(
-                        "connect test target stream endpoint",
-                        NetworkTimeoutPhase::Connect,
-                        timeouts.connect_timeout.unwrap_or(DEFAULT_NETWORK_TIMEOUT),
-                        NetworkDeliveryState::DefinitelyNotSent,
-                    ));
-                }
-                if let Some(delivery_state) = stale_pool_delivery_state {
-                    return Err(NetworkError::StalePooledConnection {
-                        operation: "reuse test daemon control stream".to_string(),
-                        delivery_state,
-                        detail: "peer closed the pooled connection".to_string(),
-                    });
-                }
-                if should_report_outcome_unknown {
-                    let mut response = cluster_relay_outcome_unknown_response(
-                        &retry_marker_request,
-                        &relay_test_delivery_error(NetworkDeliveryState::PossiblyApplied),
-                    )?;
-                    response.mark_responder_node_id("node_test_bridge");
-                    return Ok(crate::ObjectRpcStreamResponse::from_buffered_response(
-                        response,
-                        crate::RawByteStreamChunkOptions {
-                            chunk_bytes: 4,
-                            max_total_bytes: Some(1024),
-                            idle_timeout: Some(Duration::from_secs(1)),
-                        },
-                    ));
-                }
-                if should_retry_from_origin {
-                    let response = cluster_relay_fresh_signature_retry_response(
-                        &retry_marker_request,
-                        &relay_test_delivery_error(NetworkDeliveryState::PossiblyApplied),
-                    )?;
-                    return Ok(crate::ObjectRpcStreamResponse::from_buffered_response(
-                        response,
-                        crate::RawByteStreamChunkOptions {
-                            chunk_bytes: 4,
-                            max_total_bytes: Some(1024),
-                            idle_timeout: Some(Duration::from_secs(1)),
-                        },
-                    ));
-                }
-                if should_error {
-                    let response = ObjectRpcResponse::encode_error(
-                        "/test/stream-target",
-                        "device authorization was denied",
-                    )?;
-                    return Ok(crate::ObjectRpcStreamResponse::from_buffered_response(
-                        response,
-                        crate::RawByteStreamChunkOptions {
-                            chunk_bytes: 4,
-                            max_total_bytes: Some(1024),
-                            idle_timeout: Some(Duration::from_secs(1)),
-                        },
-                    ));
-                }
-                let mut response = ObjectRpcResponse::from_encoded_body(
-                    "/test/stream-target",
-                    b"stream-body".to_vec(),
-                );
-                crate::set_object_rpc_response_stream_mode(
-                    &mut response,
-                    crate::ObjectRpcResponseStreamMode::RawStreamedDaemonBody,
-                );
-                Ok(crate::ObjectRpcStreamResponse::from_buffered_response(
-                    response,
-                    crate::RawByteStreamChunkOptions {
-                        chunk_bytes: 4,
-                        max_total_bytes: Some(1024),
-                        idle_timeout: Some(Duration::from_secs(1)),
-                    },
-                ))
             })
         }
     }
@@ -7025,6 +6082,114 @@ mod tests {
             tokio::time::Instant::now().duration_since(started_at),
             Duration::from_millis(100)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn endpoint_session_whole_call_deadline_covers_signing() {
+        let (_root, _paths, mut state, _local_node, target_node, endpoints) =
+            relay_retry_test_fixture("endpoint_session_sign_deadline");
+        state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == target_node)
+            .expect("target member")
+            .node_public_key = crate::daemon_auth_encode_public_key(&[9_u8; 32]);
+        let request = ObjectRpcRequest::encode_body("/test/session-sign-deadline", "test", &"head")
+            .expect("request");
+        let mut host = RecordingSignedHost {
+            stall_first_sign: Some(Duration::from_secs(60)),
+            ..RecordingSignedHost::default()
+        };
+        let mut client = ClusterObjectRpcClient::endpoint_only(&mut host);
+        let started_at = tokio::time::Instant::now();
+
+        let error = client
+            .call_endpoint_session(
+                &state,
+                &endpoints[0],
+                ObjectRpcSessionCall::buffered(request),
+                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::none())
+                    .with_overall_timeout(Duration::from_millis(100)),
+            )
+            .await
+            .expect_err("session signing must be bounded by the whole-call deadline");
+
+        assert!(
+            matches!(
+                &error,
+                NetworkError::Timeout {
+                    phase: NetworkTimeoutPhase::Signing,
+                    delivery_state: NetworkDeliveryState::DefinitelyNotSent,
+                    ..
+                }
+            ),
+            "unexpected session signing deadline error: {error:?}"
+        );
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started_at),
+            Duration::from_millis(100)
+        );
+        assert_eq!(host.session_peers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn loopback_session_uses_local_identity_without_cluster_state() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-pre-cluster-loopback-session");
+        let data_dir = sinomo_local::SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir layout");
+        assert!(
+            !ClusterPaths::new(&data_dir).state.exists(),
+            "fixture must remain a pre-cluster orphan"
+        );
+        let request =
+            ObjectRpcRequest::encode_body("/test/pre-cluster-loopback-session", "test", &"request")
+                .expect("request");
+        let mut host = RecordingSignedHost {
+            session_server_data_dir: Some(data_dir.clone()),
+            ..RecordingSignedHost::default()
+        };
+        let mut client = ClusterObjectRpcClient::endpoint_only(&mut host);
+
+        let result = client
+            .call_loopback_session(
+                &data_dir,
+                "127.0.0.1:21353",
+                ObjectRpcSessionCall::buffered(request),
+                ClusterObjectRpcOptions::default(),
+            )
+            .await
+            .expect("pre-cluster loopback session");
+
+        assert_eq!(result.response.route, "/test/pre-cluster-loopback-session");
+        let body: String = result.response.decode_body().expect("response body");
+        assert_eq!(body, "loopback-ok");
+        drop(client);
+        assert_eq!(host.signed_requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn loopback_session_rejects_non_loopback_before_opening_transport() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-non-loopback-local-session");
+        let data_dir = sinomo_local::SinomoDataDir::new(&root);
+        let request =
+            ObjectRpcRequest::encode_body("/test/not-loopback", "test", &()).expect("request");
+        let mut host = RecordingSignedHost::default();
+        let mut client = ClusterObjectRpcClient::endpoint_only(&mut host);
+
+        let error = client
+            .call_loopback_session(
+                &data_dir,
+                "10.0.0.8:21353",
+                ObjectRpcSessionCall::buffered(request),
+                ClusterObjectRpcOptions::default(),
+            )
+            .await
+            .expect_err("non-loopback must require cluster authorization");
+
+        assert!(matches!(error, NetworkError::Io { .. }));
+        drop(client);
+        assert!(host.session_peers.is_empty());
+        assert!(host.signed_requests.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -7169,77 +6334,6 @@ mod tests {
         assert_eq!(host.target_sends[0].2, DaemonRpcTimeouts::default());
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn endpoint_stream_body_retains_whole_call_deadline() {
-        let node_id = NodeId::from_legacy_named("node_stream_deadline_target").expect("node id");
-        let endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
-            &node_id,
-            "127.0.0.1:21353".to_string(),
-            0,
-        );
-        let mut request =
-            ObjectRpcRequest::encode_body("/test/stream-target", "test", &"body").expect("request");
-        crate::set_object_rpc_request_stream_mode(
-            &mut request,
-            crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
-        );
-        let mut host = RecordingSignedHost::default();
-        let mut client = ClusterObjectRpcClient::endpoint_only(&mut host);
-        let mut response = client
-            .call_endpoint_stream(
-                &endpoint,
-                &request,
-                ClusterObjectRpcOptions::default().with_overall_timeout(Duration::from_millis(100)),
-            )
-            .await
-            .expect("stream response header");
-
-        tokio::time::advance(Duration::from_millis(100)).await;
-        let error = response
-            .body
-            .read_next_chunk()
-            .await
-            .expect_err("body reads after the whole-call deadline must fail");
-
-        assert!(matches!(
-            error,
-            NetworkError::Timeout {
-                phase: NetworkTimeoutPhase::Overall,
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn endpoint_stream_body_default_has_no_whole_call_deadline() {
-        let node_id = NodeId::from_legacy_named("node_unbounded_stream_target").expect("node id");
-        let endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
-            &node_id,
-            "127.0.0.1:21353".to_string(),
-            0,
-        );
-        let mut request =
-            ObjectRpcRequest::encode_body("/test/unbounded-stream-target", "test", &"body")
-                .expect("request");
-        crate::set_object_rpc_request_stream_mode(
-            &mut request,
-            crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
-        );
-        let mut host = RecordingSignedHost::default();
-        let mut client = ClusterObjectRpcClient::endpoint_only(&mut host);
-        let mut response = client
-            .call_endpoint_stream(&endpoint, &request, ClusterObjectRpcOptions::default())
-            .await
-            .expect("stream response header");
-
-        tokio::time::advance(Duration::from_secs(120)).await;
-        assert_eq!(
-            response.body.read_next_chunk().await.expect("body chunk"),
-            Some(b"stre".to_vec()),
-            "active streams must not inherit the former 60-second wall-clock deadline"
-        );
-    }
-
     #[test]
     fn cluster_object_rpc_defaults_use_shared_network_progress_timeout() {
         let options = ClusterObjectRpcOptions::default();
@@ -7250,7 +6344,6 @@ mod tests {
             Some(DEFAULT_NETWORK_TIMEOUT)
         );
         assert_eq!(options.timeouts.idle_timeout, Some(DEFAULT_NETWORK_TIMEOUT));
-        assert_eq!(options.extended_idle_timeout, None);
     }
 
     #[test]
@@ -7275,150 +6368,9 @@ mod tests {
             ),
             overall_timeout: None,
         });
-        let transport = cluster_endpoint_transport_timeouts(custom.timeouts, None, None);
+        let transport = cluster_endpoint_transport_timeouts(custom.timeouts, None);
         assert_eq!(transport.connect_timeout, Some(Duration::from_secs(7)));
         assert_eq!(transport.idle_timeout, Some(Duration::from_secs(30)));
-    }
-
-    #[test]
-    fn only_explicit_overall_timeout_becomes_a_stream_body_deadline() {
-        let phase_only =
-            ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_only(Duration::from_secs(5)));
-        let unbounded = ClusterEndpointRpcDeadline::new(None);
-        let explicit = ClusterEndpointRpcDeadline::new(Some(Duration::from_secs(5)));
-
-        assert_eq!(phase_only.requested_overall_timeout(), None);
-        assert_eq!(phase_only.stream_deadline(explicit), None);
-        assert_eq!(
-            ClusterObjectRpcOptions::default().stream_deadline(unbounded),
-            None,
-            "network-owned defaults must not synthesize a stream body deadline"
-        );
-        assert!(
-            phase_only
-                .with_overall_timeout(Duration::from_secs(5))
-                .stream_deadline(explicit)
-                .is_some(),
-            "an explicit semantic whole-call timeout must include the body"
-        );
-    }
-
-    #[tokio::test]
-    async fn streamed_endpoint_forward_preserves_raw_body_chunks() {
-        let downstream_listener = crate::object::AsyncDaemonControlListener::bind("127.0.0.1:0")
-            .await
-            .expect("downstream listener");
-        let downstream_address = downstream_listener
-            .local_addr_string()
-            .expect("downstream address");
-        let downstream_server = tokio::spawn(async move {
-            let mut stream = downstream_listener
-                .accept()
-                .await
-                .expect("accept downstream");
-            let request = stream
-                .read_request(
-                    "downstream",
-                    1024,
-                    crate::object::ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
-                )
-                .await
-                .expect("downstream request");
-            assert_eq!(request.route, "/test/stream-forward");
-            assert_eq!(
-                crate::object_rpc_request_stream_mode(&request),
-                crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse
-            );
-            let mut response =
-                ObjectRpcResponse::from_encoded_body("/test/stream-forward", Vec::new());
-            crate::set_object_rpc_response_stream_mode(
-                &mut response,
-                crate::ObjectRpcResponseStreamMode::RawStreamedDaemonBody,
-            );
-            let frame_options =
-                crate::object::ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1));
-            stream
-                .write_rpc_response("downstream", &response, frame_options)
-                .await
-                .expect("downstream response");
-            for chunk in [b"alpha".as_slice(), b"beta".as_slice()] {
-                stream
-                    .write_raw_byte_stream_chunk("downstream", chunk, frame_options)
-                    .await
-                    .expect("downstream chunk");
-            }
-            stream
-                .write_raw_byte_stream_chunk("downstream", &[], frame_options)
-                .await
-                .expect("downstream final chunk");
-        });
-
-        let upstream_listener = crate::object::AsyncDaemonControlListener::bind("127.0.0.1:0")
-            .await
-            .expect("upstream listener");
-        let upstream_address = upstream_listener
-            .local_addr_string()
-            .expect("upstream address");
-        let upstream_client = tokio::spawn(async move {
-            let mut stream = crate::object::AsyncDaemonControlStream::connect(&upstream_address)
-                .await
-                .expect("connect upstream");
-            let frame_options =
-                crate::object::ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1));
-            let response = stream
-                .read_rpc_response("upstream", 1024, frame_options)
-                .await
-                .expect("upstream response");
-            assert_eq!(
-                crate::object_rpc_response_stream_mode(&response),
-                crate::ObjectRpcResponseStreamMode::RawStreamedDaemonBody
-            );
-            assert!(response.body.is_empty());
-            let mut body = Vec::new();
-            let mut raw = stream.into_inner();
-            crate::object::read_raw_byte_stream_chunks_to_vec_async(
-                &mut raw,
-                &mut body,
-                crate::object::RawByteStreamChunkOptions {
-                    chunk_bytes: crate::OBJECT_STREAM_MAX_CHUNK_BYTES,
-                    max_total_bytes: Some(1024),
-                    idle_timeout: Some(Duration::from_secs(1)),
-                },
-            )
-            .await
-            .expect("upstream chunks");
-            body
-        });
-        let mut upstream = upstream_listener.accept().await.expect("accept upstream");
-
-        let target_node =
-            NodeId::from_legacy_named("node_stream_forward_target").expect("target node id");
-        let endpoint =
-            crate::endpoint_advertisement::daemon_lan_endpoint(&target_node, downstream_address, 0);
-        let mut request =
-            ObjectRpcRequest::from_encoded_body("/test/stream-forward", "test", Vec::new());
-        crate::set_object_rpc_request_stream_mode(
-            &mut request,
-            crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
-        );
-
-        let outcome = forward_streamed_daemon_rpc_to_cluster_endpoint_async(
-            &endpoint,
-            &request,
-            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
-            &mut upstream,
-            "upstream",
-            1024,
-        )
-        .await
-        .expect("stream forward");
-
-        assert!(matches!(outcome, ClusterRelayStreamSendOutcome::Forwarded));
-        assert_eq!(
-            upstream_client.await.expect("upstream client"),
-            b"alphabeta"
-        );
-        downstream_server.await.expect("downstream server");
     }
 
     #[test]
@@ -7426,7 +6378,6 @@ mod tests {
         let base = DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(15));
         let shaped = cluster_target_final_hop_transport_timeouts(
             base,
-            None,
             Some(Duration::from_secs(2)),
             Some(Duration::from_secs(2)),
             Some(Duration::from_secs(12)),
@@ -7441,7 +6392,6 @@ mod tests {
         let base = DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(15));
         let shaped = cluster_target_final_hop_transport_timeouts(
             base,
-            None,
             Some(Duration::from_secs(2)),
             Some(Duration::from_secs(12)),
             Some(Duration::from_secs(12)),
@@ -7456,11 +6406,10 @@ mod tests {
         let base = DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(30));
         let remaining = Some(Duration::from_secs(20));
 
-        let direct = cluster_endpoint_transport_timeouts(base, None, remaining);
-        let final_hop = cluster_target_final_hop_transport_timeouts(
-            base, None, remaining, remaining, remaining,
-        );
-        let relay = cluster_relay_hop_transport_timeouts(base, None, remaining, remaining);
+        let direct = cluster_endpoint_transport_timeouts(base, remaining);
+        let final_hop =
+            cluster_target_final_hop_transport_timeouts(base, remaining, remaining, remaining);
+        let relay = cluster_relay_hop_transport_timeouts(base, remaining, remaining);
 
         assert_eq!(direct.idle_timeout, remaining);
         assert_eq!(final_hop.idle_timeout, remaining);
@@ -7468,65 +6417,16 @@ mod tests {
     }
 
     #[test]
-    fn explicit_extended_idle_timeout_is_still_capped_by_each_route_budget() {
-        let options =
-            ClusterObjectRpcOptions::default().with_extended_idle_timeout(Duration::from_secs(15));
-        let base = options.timeouts;
-        let extended = options.extended_idle_timeout;
-
-        let direct =
-            cluster_endpoint_transport_timeouts(base, extended, Some(Duration::from_secs(12)));
-        let final_hop = cluster_target_final_hop_transport_timeouts(
-            base,
-            extended,
-            Some(Duration::from_secs(4)),
-            Some(Duration::from_secs(9)),
-            Some(Duration::from_secs(11)),
-        );
-        let relay = cluster_relay_hop_transport_timeouts(
-            base,
-            extended,
-            Some(Duration::from_secs(7)),
-            Some(Duration::from_secs(7)),
-        );
-
-        assert_eq!(direct.idle_timeout, Some(Duration::from_secs(12)));
-        assert_eq!(final_hop.connect_timeout, Some(Duration::from_secs(4)));
-        assert_eq!(final_hop.idle_timeout, Some(Duration::from_secs(9)));
-        assert_eq!(relay.idle_timeout, Some(Duration::from_secs(7)));
-        assert!(direct.idle_timeout.expect("direct idle") > DEFAULT_NETWORK_TIMEOUT);
-        assert!(relay.idle_timeout.expect("relay idle") > DEFAULT_NETWORK_TIMEOUT);
-        assert_eq!(
-            cluster_endpoint_transport_timeouts(base, None, Some(Duration::from_secs(20)),)
-                .idle_timeout,
-            Some(DEFAULT_NETWORK_TIMEOUT),
-            "streamed body progress must not inherit the buffered-response exception"
-        );
-    }
-
-    #[test]
-    fn relay_envelope_round_trips_extended_idle_timeout() {
+    fn relay_envelope_round_trips_hop_timeout() {
         let cluster_id =
-            ClusterId::from_legacy_named("cluster_relay_extended_idle").expect("cluster id");
+            ClusterId::from_legacy_named("cluster_relay_hop_timeout").expect("cluster id");
         let source_node =
-            NodeId::from_legacy_named("node_relay_extended_idle_source").expect("source node");
+            NodeId::from_legacy_named("node_relay_hop_timeout_source").expect("source node");
         let target_node =
-            NodeId::from_legacy_named("node_relay_extended_idle_target").expect("target node");
+            NodeId::from_legacy_named("node_relay_hop_timeout_target").expect("target node");
         let request = ObjectRpcRequest::encode_body("/test/data", "test", &"payload")
             .expect("request")
-            .with_full_response_budget()
-            .with_forwarded_response_idle_timeout(Duration::from_secs(15));
-        let options =
-            ClusterObjectRpcOptions::default().with_extended_idle_timeout(Duration::from_secs(15));
-        assert_eq!(
-            cluster_relay_request_extended_idle_timeout(options, false),
-            Some(Duration::from_secs(15))
-        );
-        assert_eq!(
-            cluster_relay_request_extended_idle_timeout(options, true),
-            None,
-            "streaming relays must retain the shared per-chunk progress timeout"
-        );
+            .with_full_response_budget();
         let outer = relay_request_for_signed_rpc_with_max_hop_timeout(
             &cluster_id,
             &target_node,
@@ -7536,46 +6436,19 @@ mod tests {
             &[source_node, target_node.clone()],
             &[],
             Some(Duration::from_secs(20)),
-            Some(Duration::from_secs(15)),
         )
         .expect("relay request");
         let envelope = RelayEnvelope::from_request(&outer).expect("relay envelope");
 
         assert_eq!(envelope.max_hop_timeout_ms, Some(20_000));
-        assert_eq!(envelope.extended_idle_timeout_ms, Some(15_000));
-        assert_eq!(
-            outer.forwarded_response_idle_timeout(),
-            Some(Duration::from_secs(15)),
-            "the proxy-facing relay request must preserve the signed idle allowance"
-        );
         assert!(outer.uses_full_response_budget());
-        assert_eq!(
-            relay_envelope_extended_idle_timeout(&envelope),
-            Some(Duration::from_secs(15))
-        );
 
         let mut oversized = envelope.clone();
         oversized.max_hop_timeout_ms = Some(u64::MAX);
-        oversized.extended_idle_timeout_ms = Some(u64::MAX);
         assert_eq!(
             relay_envelope_hop_timeout(&oversized),
             Some(Duration::from_millis(u64::MAX)),
             "an authenticated explicit deadline must survive the relay envelope exactly"
-        );
-        assert_eq!(
-            relay_envelope_extended_idle_timeout(&oversized),
-            Some(Duration::from_millis(u64::MAX)),
-            "a custom no-progress policy remains authoritative until an overall deadline caps it"
-        );
-
-        oversized
-            .inner
-            .metadata
-            .remove(crate::rpc::OBJECT_RPC_FULL_RESPONSE_BUDGET_METADATA_KEY);
-        assert_eq!(
-            relay_envelope_extended_idle_timeout(&oversized),
-            None,
-            "ordinary relay requests must stay on the shared network progress timeout"
         );
     }
 
@@ -7856,191 +6729,6 @@ mod tests {
     }
 
     #[test]
-    fn cluster_target_stream_retries_relay_marker_with_a_fresh_origin_signature() {
-        let (_root, paths, state, _local_node, target_node, endpoints) =
-            relay_retry_test_fixture("origin_stream_fresh_signature_retry");
-        let mut request =
-            ObjectRpcRequest::encode_body("/test/origin-stream-fresh-signature", "test", &"read")
-                .expect("request")
-                .with_response_retry_safe();
-        crate::set_object_rpc_request_stream_mode(
-            &mut request,
-            crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
-        );
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let mut host = RecordingSignedHost {
-            fresh_signature_retry_first_stream_send: true,
-            ..RecordingSignedHost::default()
-        };
-        let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
-
-        let response = runtime
-            .block_on(client.call_target_stream(
-                &state,
-                &target_node,
-                &request,
-                ClusterObjectRpcOptions::default().with_overall_timeout(Duration::from_secs(2)),
-            ))
-            .expect("stream origin should retry with a fresh signature");
-
-        assert_eq!(response.response.route, "/test/stream-target");
-        assert_eq!(host.stream_target_sends.len(), 2);
-        assert_eq!(
-            host.stream_target_sends[0].0.endpoint_id,
-            endpoints[0].endpoint_id
-        );
-        assert_eq!(
-            host.stream_target_sends[1].0.endpoint_id,
-            endpoints[0].endpoint_id
-        );
-        assert_ne!(host.stream_target_auths[0], host.stream_target_auths[1]);
-        assert_eq!(host.signed_requests.len(), 2);
-    }
-
-    #[test]
-    fn cluster_target_stream_reconnects_stale_pool_with_fresh_signature() {
-        let (_root, paths, state, _local_node, target_node, endpoints) =
-            relay_retry_test_fixture("origin_stream_stale_pool_reconnect");
-        let mut unsafe_request =
-            ObjectRpcRequest::encode_body("/test/origin-stream-stale-pool", "test", &"read")
-                .expect("request");
-        crate::set_object_rpc_request_stream_mode(
-            &mut unsafe_request,
-            crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
-        );
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let mut definitely_unsent_host = RecordingSignedHost {
-            stale_pooled_connection_first_stream_send: Some(
-                NetworkDeliveryState::DefinitelyNotSent,
-            ),
-            ..RecordingSignedHost::default()
-        };
-        let mut definitely_unsent_client =
-            ClusterObjectRpcClient::routed(&mut definitely_unsent_host, runtime.handle(), &paths);
-        runtime
-            .block_on(definitely_unsent_client.call_target_stream(
-                &state,
-                &target_node,
-                &unsafe_request,
-                ClusterObjectRpcOptions::default().with_overall_timeout(Duration::from_secs(2)),
-            ))
-            .expect("definitely-unsent stream should reconnect without retry opt-in");
-        assert_eq!(definitely_unsent_host.stream_target_sends.len(), 2);
-        assert_ne!(
-            definitely_unsent_host.stream_target_auths[0],
-            definitely_unsent_host.stream_target_auths[1]
-        );
-        assert_eq!(definitely_unsent_host.signed_requests.len(), 2);
-
-        let request = unsafe_request.with_response_retry_safe();
-        let mut host = RecordingSignedHost {
-            stale_pooled_connection_first_stream_send: Some(NetworkDeliveryState::PossiblyApplied),
-            ..RecordingSignedHost::default()
-        };
-        let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
-
-        runtime
-            .block_on(client.call_target_stream(
-                &state,
-                &target_node,
-                &request,
-                ClusterObjectRpcOptions::default().with_overall_timeout(Duration::from_secs(2)),
-            ))
-            .expect("retry-safe stream request should reconnect");
-
-        assert_eq!(host.stream_target_sends.len(), 2);
-        assert_eq!(
-            host.stream_target_sends[0].0.endpoint_id,
-            endpoints[0].endpoint_id
-        );
-        assert_eq!(
-            host.stream_target_sends[1].0.endpoint_id,
-            endpoints[0].endpoint_id
-        );
-        assert_ne!(host.stream_target_auths[0], host.stream_target_auths[1]);
-        assert_eq!(host.signed_requests.len(), 2);
-    }
-
-    #[test]
-    fn endpoint_only_stream_reconnects_stale_pool_with_fresh_signature() {
-        let (_root, _paths, _state, _local_node, _target_node, endpoints) =
-            relay_retry_test_fixture("endpoint_stream_stale_pool_reconnect");
-        let mut unsafe_request =
-            ObjectRpcRequest::encode_body("/test/endpoint-stream-stale-pool", "test", &"read")
-                .expect("request");
-        crate::set_object_rpc_request_stream_mode(
-            &mut unsafe_request,
-            crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
-        );
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let mut unsafe_host = RecordingSignedHost {
-            stale_pooled_connection_first_stream_send: Some(NetworkDeliveryState::PossiblyApplied),
-            ..RecordingSignedHost::default()
-        };
-        let mut unsafe_client = ClusterObjectRpcClient::endpoint_only(&mut unsafe_host);
-        let error = runtime
-            .block_on(unsafe_client.call_endpoint_stream(
-                &endpoints[0],
-                &unsafe_request,
-                ClusterObjectRpcOptions::default().with_overall_timeout(Duration::from_secs(2)),
-            ))
-            .expect_err("ambiguous endpoint stream must not reconnect");
-        assert!(matches!(error, NetworkError::StalePooledConnection { .. }));
-        assert_eq!(unsafe_host.stream_target_sends.len(), 1);
-        assert_eq!(unsafe_host.signed_requests.len(), 1);
-
-        let mut definitely_unsent_host = RecordingSignedHost {
-            stale_pooled_connection_first_stream_send: Some(
-                NetworkDeliveryState::DefinitelyNotSent,
-            ),
-            ..RecordingSignedHost::default()
-        };
-        let mut definitely_unsent_client =
-            ClusterObjectRpcClient::endpoint_only(&mut definitely_unsent_host);
-        runtime
-            .block_on(definitely_unsent_client.call_endpoint_stream(
-                &endpoints[0],
-                &unsafe_request,
-                ClusterObjectRpcOptions::default().with_overall_timeout(Duration::from_secs(2)),
-            ))
-            .expect("definitely-unsent endpoint stream should reconnect without retry opt-in");
-        assert_eq!(definitely_unsent_host.stream_target_sends.len(), 2);
-        assert_ne!(
-            definitely_unsent_host.stream_target_auths[0],
-            definitely_unsent_host.stream_target_auths[1]
-        );
-        assert_eq!(definitely_unsent_host.signed_requests.len(), 2);
-
-        let request = unsafe_request.with_response_retry_safe();
-        let mut host = RecordingSignedHost {
-            stale_pooled_connection_first_stream_send: Some(NetworkDeliveryState::PossiblyApplied),
-            ..RecordingSignedHost::default()
-        };
-        let mut client = ClusterObjectRpcClient::endpoint_only(&mut host);
-
-        runtime
-            .block_on(client.call_endpoint_stream(
-                &endpoints[0],
-                &request,
-                ClusterObjectRpcOptions::default().with_overall_timeout(Duration::from_secs(2)),
-            ))
-            .expect("retry-safe endpoint stream should reconnect");
-
-        assert_eq!(host.stream_target_sends.len(), 2);
-        assert_ne!(host.stream_target_auths[0], host.stream_target_auths[1]);
-        assert_eq!(host.signed_requests.len(), 2);
-    }
-
-    #[test]
     fn relay_outcome_unknown_precedes_responder_mismatch() {
         let (_root, paths, state, _local_node, target_node, _endpoints) =
             relay_retry_test_fixture("origin_relay_outcome_unknown");
@@ -8078,47 +6766,115 @@ mod tests {
     }
 
     #[test]
-    fn stream_relay_outcome_unknown_precedes_responder_mismatch() {
-        let (_root, paths, state, _local_node, target_node, _endpoints) =
-            relay_retry_test_fixture("origin_stream_relay_outcome_unknown");
-        let mut request = ObjectRpcRequest::encode_body(
-            "/test/origin-stream-relay-outcome-unknown",
-            "test",
-            &"mutate",
-        )
-        .expect("request")
-        .with_operation_id("operation-stream-relay-outcome-unknown");
-        crate::set_object_rpc_request_stream_mode(
-            &mut request,
-            crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
+    fn session_relay_response_markers_precede_generic_routing_and_delivery() {
+        let request =
+            ObjectRpcRequest::encode_body("/test/session-relay-disposition", "test", &"mutate")
+                .expect("request")
+                .with_operation_id("operation-session-relay-disposition")
+                .with_auth(b"origin-auth".to_vec());
+        let error = relay_test_delivery_error(NetworkDeliveryState::PossiblyApplied);
+
+        let mut outcome_unknown =
+            cluster_relay_outcome_unknown_response(&request, &error).expect("outcome response");
+        outcome_unknown.mark_responder_node_id("node_wrong_responder");
+        assert_eq!(
+            cluster_relay_session_response_disposition(&outcome_unknown),
+            ClusterRelaySessionResponseDisposition::OutcomeUnknown,
+            "the terminal marker must win even though its response uses the inner route"
         );
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let mut host = RecordingSignedHost {
-            relay_outcome_unknown_first_stream_send: true,
-            ..RecordingSignedHost::default()
-        };
-        let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
 
-        let error = runtime
-            .block_on(client.call_target_stream(
-                &state,
-                &target_node,
-                &request,
-                ClusterObjectRpcOptions::default().with_overall_timeout(Duration::from_secs(2)),
-            ))
-            .expect_err("bridge stream outcome must remain terminal");
+        let fresh = cluster_relay_fresh_signature_retry_response(
+            &request.clone().with_response_retry_safe(),
+            &error,
+        )
+        .expect("fresh-signature response");
+        assert_eq!(
+            cluster_relay_session_response_disposition(&fresh),
+            ClusterRelaySessionResponseDisposition::FreshOriginSignature,
+            "the retry marker must win over the generic relay error route"
+        );
 
-        assert!(matches!(
-            error,
-            NetworkError::OutcomeUnknown {
-                operation_id: Some(ref operation_id),
-                ..
-            } if operation_id == "operation-stream-relay-outcome-unknown"
+        let routing = ObjectRpcResponse::encode_error(CLUSTER_RELAY_ROUTE, "no route")
+            .expect("routing response");
+        assert_eq!(
+            cluster_relay_session_response_disposition(&routing),
+            ClusterRelaySessionResponseDisposition::RoutingError
+        );
+    }
+
+    #[test]
+    fn session_relay_requires_target_attestation_only_for_delivered_responses() {
+        let delivered =
+            ObjectRpcResponse::encode_body("/test/session-relay-target-proof", &"delivered")
+                .expect("delivered response");
+        assert!(cluster_relay_session_response_origin_is_acceptable(
+            &delivered, true,
         ));
-        assert_eq!(host.stream_target_sends.len(), 1);
+        assert!(!cluster_relay_session_response_origin_is_acceptable(
+            &delivered, false,
+        ));
+
+        let routing = ObjectRpcResponse::encode_error(CLUSTER_RELAY_ROUTE, "no route")
+            .expect("routing response");
+        assert!(cluster_relay_session_response_origin_is_acceptable(
+            &routing, false,
+        ));
+    }
+
+    #[test]
+    fn session_relay_forward_failure_preserves_domain_retry_safety() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_session_relay_failure").expect("cluster id");
+        let target_node =
+            NodeId::from_legacy_named("node_session_relay_failure_target").expect("target node");
+        let unsafe_inner =
+            ObjectRpcRequest::encode_body("/test/session-relay-failure", "test", &"mutate")
+                .expect("inner request")
+                .with_operation_id("operation-session-relay-failure")
+                .with_auth(b"origin-auth".to_vec());
+        let unsafe_envelope = RelayEnvelope::new(
+            cluster_id.clone(),
+            target_node.clone(),
+            unsafe_inner.clone(),
+        );
+        let ambiguous = relay_test_delivery_error(NetworkDeliveryState::PossiblyApplied);
+
+        let terminal = cluster_relay_session_forward_failure_result(&unsafe_envelope, &ambiguous)
+            .expect("terminal relay result");
+        assert_eq!(
+            cluster_relay_session_response_disposition(&terminal.response),
+            ClusterRelaySessionResponseDisposition::OutcomeUnknown,
+            "an unsafe possibly-applied request must never be exposed as a retryable route miss"
+        );
+        assert_eq!(
+            terminal
+                .response
+                .metadata
+                .get(crate::rpc::OBJECT_RPC_OPERATION_ID_METADATA_KEY)
+                .map(String::as_str),
+            Some("operation-session-relay-failure"),
+        );
+
+        let safe_envelope = RelayEnvelope::new(
+            cluster_id,
+            target_node,
+            unsafe_inner.with_response_retry_safe(),
+        );
+        let fresh = cluster_relay_session_forward_failure_result(&safe_envelope, &ambiguous)
+            .expect("retry-safe relay result");
+        assert_eq!(
+            cluster_relay_session_response_disposition(&fresh.response),
+            ClusterRelaySessionResponseDisposition::FreshOriginSignature
+        );
+
+        let definitely_unsent = relay_test_delivery_error(NetworkDeliveryState::DefinitelyNotSent);
+        let routing =
+            cluster_relay_session_forward_failure_result(&unsafe_envelope, &definitely_unsent)
+                .expect("definitely-unsent relay result");
+        assert_eq!(
+            cluster_relay_session_response_disposition(&routing.response),
+            ClusterRelaySessionResponseDisposition::RoutingError
+        );
     }
 
     #[test]
@@ -8338,7 +7094,6 @@ mod tests {
 
         let shaped = cluster_target_final_hop_transport_timeouts(
             DaemonRpcTimeouts::default(),
-            None,
             unverified_connect_slot,
             remaining,
             remaining,
@@ -9113,29 +7868,6 @@ mod tests {
         let idle_timeout = host.target_sends[0].2.idle_timeout.expect("idle timeout");
         assert_eq!(connect_timeout, DEFAULT_NETWORK_TIMEOUT);
         assert_eq!(idle_timeout, DEFAULT_NETWORK_TIMEOUT);
-
-        let mut extended_host = RecordingSignedHost::default();
-        let mut extended_client =
-            ClusterObjectRpcClient::routed(&mut extended_host, runtime.handle(), &paths);
-        runtime
-            .block_on(
-                extended_client.call_target(
-                    &state,
-                    &target_node,
-                    &request,
-                    ClusterObjectRpcOptions::default()
-                        .with_overall_timeout(Duration::from_secs(12))
-                        .with_extended_idle_timeout(Duration::from_secs(15)),
-                ),
-            )
-            .expect("target rpc with extended idle timeout");
-
-        let extended_idle_timeout = extended_host.target_sends[0]
-            .2
-            .idle_timeout
-            .expect("extended idle timeout");
-        assert!(extended_idle_timeout > DEFAULT_NETWORK_TIMEOUT);
-        assert!(extended_idle_timeout <= Duration::from_secs(12));
     }
 
     #[test]
@@ -9234,127 +7966,6 @@ mod tests {
         assert_eq!(
             host.target_sends[1].0.endpoint_id,
             fallback_endpoint.endpoint_id
-        );
-    }
-
-    #[test]
-    fn cluster_target_rpc_preserves_stream_health_timeout_after_connecting() {
-        let root = sinomo_testdir::TestDir::new("sinomo-network-target-verified-response-budget");
-        let data_dir = SinomoDataDir::new(&root);
-        let paths = ClusterPaths::new(&data_dir);
-        paths.ensure().expect("cluster paths");
-
-        let now = OffsetDateTime::now_utc();
-        let cluster_id = ClusterId::from_legacy_named("cluster_target_verified_response_budget")
-            .expect("cluster id");
-        let local_node =
-            NodeId::from_legacy_named("node_target_verified_response_local").expect("local node");
-        let target_node =
-            NodeId::from_legacy_named("node_target_verified_response_target").expect("target node");
-        let mut state = ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "target verified response budget",
-            local_node.clone(),
-            "local",
-            "pk-local",
-            now,
-        );
-        let public_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
-            &target_node,
-            "198.51.100.76:21353".to_string(),
-            0,
-        );
-        let mut target_member =
-            ClusterMemberRecord::local_voter(cluster_id, target_node.clone(), "target", "pk", now);
-        target_member.capabilities = main_daemon_capabilities(&target_member.role);
-        target_member.allowed_capabilities = target_member.capabilities.clone();
-        target_member.endpoints = vec![
-            public_endpoint.clone(),
-            crate::endpoint_advertisement::daemon_lan_endpoint(
-                &target_node,
-                "fallback-a.test:21353".to_string(),
-                10,
-            ),
-            crate::endpoint_advertisement::daemon_lan_endpoint(
-                &target_node,
-                "fallback-b.test:21353".to_string(),
-                20,
-            ),
-            crate::endpoint_advertisement::daemon_lan_endpoint(
-                &target_node,
-                "fallback-c.test:21353".to_string(),
-                30,
-            ),
-        ];
-        state.members.push(target_member);
-        crate::connectivity_store::write_local_cluster_connectivity_records(
-            &paths,
-            &state.local_node_id,
-            &[crate::connectivity::cluster_connectivity_record(
-                &state,
-                &public_endpoint,
-                ClusterConnectivityState::Healthy,
-                Some(30),
-                0,
-                Some("ok".to_string()),
-                None,
-                now,
-                60,
-            )],
-        )
-        .expect("write local connectivity");
-
-        let mut request =
-            ObjectRpcRequest::encode_body("/test/target", "test", &"ping").expect("request");
-        crate::set_object_rpc_request_stream_mode(
-            &mut request,
-            crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
-        );
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let mut host = RecordingSignedHost {
-            stall_first_stream_send: Some(Duration::from_millis(1500)),
-            ..RecordingSignedHost::default()
-        };
-        let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
-
-        runtime
-            .block_on(
-                client.call_target_stream(
-                    &state,
-                    &target_node,
-                    &request,
-                    ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
-                        Duration::from_secs(4),
-                    ))
-                    .with_overall_timeout(Duration::from_secs(4)),
-                ),
-            )
-            .expect("verified direct endpoint should keep a bounded response budget");
-
-        assert_eq!(host.stream_target_sends.len(), 1);
-        assert_eq!(
-            host.stream_target_sends[0].0.endpoint_id,
-            public_endpoint.endpoint_id
-        );
-        let connect_timeout = host.stream_target_sends[0]
-            .2
-            .connect_timeout
-            .expect("connect timeout");
-        assert!(
-            connect_timeout > Duration::from_millis(900)
-                && connect_timeout <= Duration::from_secs(1),
-            "connect timeout should be roughly one quarter of the 4s route budget, got {connect_timeout:?}"
-        );
-        let idle_timeout = host.stream_target_sends[0]
-            .2
-            .idle_timeout
-            .expect("idle timeout");
-        assert!(
-            idle_timeout >= Duration::from_millis(3900) && idle_timeout <= Duration::from_secs(4),
-            "response no-progress timeout should remain independent of the connect slot, got {idle_timeout:?}"
         );
     }
 
@@ -9648,257 +8259,6 @@ mod tests {
     }
 
     #[test]
-    fn cluster_target_stream_routes_to_stream_endpoint_method() {
-        let root = sinomo_testdir::TestDir::new("sinomo-network-target-stream-route");
-        let data_dir = SinomoDataDir::new(&root);
-        let paths = ClusterPaths::new(&data_dir);
-        paths.ensure().expect("cluster paths");
-
-        let now = OffsetDateTime::now_utc();
-        let cluster_id =
-            ClusterId::from_legacy_named("cluster_target_stream_route").expect("cluster id");
-        let local_node = NodeId::from_legacy_named("node_target_stream_local").expect("local node");
-        let target_node =
-            NodeId::from_legacy_named("node_target_stream_target").expect("target node");
-        let mut state = ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "target stream route",
-            local_node.clone(),
-            "local",
-            "pk-local",
-            now,
-        );
-        let mut target_member =
-            ClusterMemberRecord::local_voter(cluster_id, target_node.clone(), "target", "pk", now);
-        target_member.capabilities = main_daemon_capabilities(&target_member.role);
-        target_member.allowed_capabilities = target_member.capabilities.clone();
-        target_member.endpoints = vec![crate::endpoint_advertisement::daemon_lan_endpoint(
-            &target_node,
-            "stream-target.test:21353".to_string(),
-            0,
-        )];
-        state.members.push(target_member);
-
-        let mut request = ObjectRpcRequest::encode_body("/test/stream-target", "test", &"ping")
-            .expect("request")
-            .with_response_retry_safe();
-        crate::set_object_rpc_request_stream_mode(
-            &mut request,
-            crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
-        );
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let mut host = RecordingSignedHost::default();
-        let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
-
-        let mut response = runtime
-            .block_on(client.call_target_stream(
-                &state,
-                &target_node,
-                &request,
-                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
-                    Duration::from_secs(15),
-                )),
-            ))
-            .expect("stream target route");
-        let body = runtime
-            .block_on(response.body.collect_to_vec())
-            .expect("stream body");
-
-        assert_eq!(response.response.route, "/test/stream-target");
-        assert_eq!(body, b"stream-body");
-        assert_eq!(host.target_sends.len(), 0);
-        assert_eq!(host.stream_target_sends.len(), 1);
-        assert_eq!(
-            host.stream_target_sends[0].0.address,
-            "stream-target.test:21353"
-        );
-    }
-
-    #[test]
-    fn cluster_target_stream_retries_after_endpoint_error_response() {
-        let root = sinomo_testdir::TestDir::new("sinomo-network-target-stream-error-retry");
-        let data_dir = SinomoDataDir::new(&root);
-        let paths = ClusterPaths::new(&data_dir);
-        paths.ensure().expect("cluster paths");
-
-        let now = OffsetDateTime::now_utc();
-        let cluster_id =
-            ClusterId::from_legacy_named("cluster_target_stream_error_retry").expect("cluster id");
-        let local_node =
-            NodeId::from_legacy_named("node_target_stream_error_local").expect("local node");
-        let target_node =
-            NodeId::from_legacy_named("node_target_stream_error_target").expect("target node");
-        let mut state = ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "target stream endpoint error retry",
-            local_node.clone(),
-            "local",
-            "pk-local",
-            now,
-        );
-        let mut target_member =
-            ClusterMemberRecord::local_voter(cluster_id, target_node.clone(), "target", "pk", now);
-        target_member.capabilities = main_daemon_capabilities(&target_member.role);
-        target_member.allowed_capabilities = target_member.capabilities.clone();
-        target_member.endpoints = vec![
-            crate::endpoint_advertisement::daemon_lan_endpoint(
-                &target_node,
-                "stream-auth-error-target.test:21353".to_string(),
-                0,
-            ),
-            crate::endpoint_advertisement::daemon_lan_endpoint(
-                &target_node,
-                "stream-retry-target.test:21353".to_string(),
-                10,
-            ),
-        ];
-        state.members.push(target_member);
-
-        let mut request = ObjectRpcRequest::encode_body("/test/stream-target", "test", &"ping")
-            .expect("request")
-            .with_response_retry_safe();
-        crate::set_object_rpc_request_stream_mode(
-            &mut request,
-            crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
-        );
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let mut host = RecordingSignedHost {
-            stream_error_first_send: true,
-            ..RecordingSignedHost::default()
-        };
-        let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
-
-        let mut response = runtime
-            .block_on(client.call_target_stream(
-                &state,
-                &target_node,
-                &request,
-                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
-                    Duration::from_secs(15),
-                )),
-            ))
-            .expect("second stream endpoint should be attempted");
-        let body = runtime
-            .block_on(response.body.collect_to_vec())
-            .expect("stream body");
-
-        assert_eq!(response.response.route, "/test/stream-target");
-        assert_eq!(body, b"stream-body");
-        assert_eq!(host.stream_target_sends.len(), 2);
-        assert_eq!(
-            host.stream_target_sends[0].0.address,
-            "stream-auth-error-target.test:21353"
-        );
-        assert_eq!(
-            host.stream_target_sends[1].0.address,
-            "stream-retry-target.test:21353"
-        );
-        assert_eq!(host.stream_target_auths.len(), 2);
-        assert_ne!(
-            host.stream_target_auths[0], host.stream_target_auths[1],
-            "each streamed endpoint retry must carry a fresh daemon auth nonce"
-        );
-    }
-
-    #[test]
-    fn cluster_target_stream_records_route_timeout_observation_before_retry() {
-        let root = sinomo_testdir::TestDir::new("sinomo-network-target-stream-timeout-observe");
-        let data_dir = SinomoDataDir::new(&root);
-        let paths = ClusterPaths::new(&data_dir);
-        paths.ensure().expect("cluster paths");
-
-        let now = OffsetDateTime::now_utc();
-        let cluster_id = ClusterId::from_legacy_named("cluster_target_stream_timeout_observe")
-            .expect("cluster id");
-        let local_node = NodeId::from_legacy_named("node_target_stream_timeout_observe_local")
-            .expect("local node");
-        let target_node = NodeId::from_legacy_named("node_target_stream_timeout_observe_target")
-            .expect("target node");
-        let mut state = ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "target stream timeout observation",
-            local_node.clone(),
-            "local",
-            "pk-local",
-            now,
-        );
-        let stalling_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
-            &target_node,
-            "stream-stall-target.test:21353".to_string(),
-            0,
-        );
-        let fallback_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
-            &target_node,
-            "stream-fallback-target.test:21353".to_string(),
-            10,
-        );
-        let mut target_member =
-            ClusterMemberRecord::local_voter(cluster_id, target_node.clone(), "target", "pk", now);
-        target_member.capabilities = main_daemon_capabilities(&target_member.role);
-        target_member.allowed_capabilities = target_member.capabilities.clone();
-        target_member.endpoints = vec![stalling_endpoint.clone(), fallback_endpoint.clone()];
-        state.members.push(target_member);
-
-        let mut request = ObjectRpcRequest::encode_body("/test/stream-target", "test", &"ping")
-            .expect("request")
-            .with_response_retry_safe();
-        crate::set_object_rpc_request_stream_mode(
-            &mut request,
-            crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
-        );
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let mut host = RecordingSignedHost {
-            timeout_first_stream_send: true,
-            ..RecordingSignedHost::default()
-        };
-        let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
-
-        let mut response = runtime
-            .block_on(
-                client.call_target_stream(
-                    &state,
-                    &target_node,
-                    &request,
-                    ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
-                        Duration::from_secs(4),
-                    ))
-                    .with_overall_timeout(Duration::from_secs(4)),
-                ),
-            )
-            .expect("fallback stream endpoint should be attempted");
-        let body = runtime
-            .block_on(response.body.collect_to_vec())
-            .expect("stream body");
-
-        assert_eq!(body, b"stream-body");
-        assert_eq!(host.stream_target_sends.len(), 2);
-        assert_eq!(
-            host.stream_target_sends[0].0.endpoint_id,
-            stalling_endpoint.endpoint_id
-        );
-        assert_eq!(
-            host.stream_target_sends[1].0.endpoint_id,
-            fallback_endpoint.endpoint_id
-        );
-        assert_eq!(host.observations.len(), 1);
-        assert_eq!(
-            host.observations[0].0.endpoint_id,
-            stalling_endpoint.endpoint_id
-        );
-        assert!(host.observations[0].1.is_io_failure());
-        assert!(host.observations[0].1.is_hard_io_failure());
-    }
-
-    #[test]
     fn signed_endpoint_response_observation_classifies_auth_error_frame() {
         let response =
             ObjectRpcResponse::encode_error("/test/target", "network authorization was denied")
@@ -9910,32 +8270,10 @@ mod tests {
     }
 
     #[test]
-    fn signed_endpoint_stream_response_observation_classifies_auth_error_frame() {
-        let response = crate::ObjectRpcStreamResponse::from_buffered_response(
-            ObjectRpcResponse::encode_error(
-                "/test/stream-target",
-                "network authorization was denied",
-            )
-            .expect("auth error response"),
-            crate::RawByteStreamChunkOptions {
-                chunk_bytes: 4,
-                max_total_bytes: Some(1024),
-                idle_timeout: Some(Duration::from_secs(1)),
-            },
-        );
-        let observation =
-            cluster_signed_endpoint_stream_response_rpc_observation(Ok(&response), Instant::now())
-                .expect("observation");
-
-        assert!(observation.is_auth_denied());
-    }
-
-    #[test]
     fn cluster_relay_hop_transport_timeouts_preserve_custom_progress_limit() {
         let base = DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(15));
         let shaped = cluster_relay_hop_transport_timeouts(
             base,
-            None,
             Some(Duration::from_secs(12)),
             Some(Duration::from_secs(12)),
         );
@@ -10282,7 +8620,6 @@ mod tests {
             &target_node,
             &endpoints,
             unsafe_inner.clone(),
-            false,
         );
         let mut unsafe_host = RecordingRelayHost {
             first_target_error: Some(relay_test_delivery_error(
@@ -10314,7 +8651,6 @@ mod tests {
             &target_node,
             &endpoints,
             unsafe_inner.clone().with_response_retry_safe(),
-            false,
         );
         let mut safe_host = RecordingRelayHost {
             first_target_error: Some(relay_test_delivery_error(
@@ -10343,7 +8679,6 @@ mod tests {
             &target_node,
             &endpoints,
             unsafe_inner.clone().with_response_retry_safe(),
-            false,
         );
         let mut application_error_host = RecordingRelayHost {
             first_target_application_error: true,
@@ -10364,14 +8699,8 @@ mod tests {
         assert_eq!(response.route, unsafe_inner.route);
         assert!(response.error_detail().is_err());
 
-        let definitely_unsent_request = relay_retry_test_request(
-            &state,
-            &local_node,
-            &target_node,
-            &endpoints,
-            unsafe_inner,
-            false,
-        );
+        let definitely_unsent_request =
+            relay_retry_test_request(&state, &local_node, &target_node, &endpoints, unsafe_inner);
         let mut definitely_unsent_host = RecordingRelayHost {
             first_target_error: Some(relay_test_delivery_error(
                 NetworkDeliveryState::DefinitelyNotSent,
@@ -10468,6 +8797,58 @@ mod tests {
         assert_eq!(remaining, 1_250);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn relay_session_hop_deadline_covers_stream_open() {
+        let (_root, paths, mut state, local_node, target_node, endpoints) =
+            relay_retry_test_fixture("relay_session_open_deadline");
+        let target_public_key = crate::daemon_auth_encode_public_key(&[7_u8; 32]);
+        state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == target_node)
+            .expect("target member")
+            .node_public_key = target_public_key;
+        crate::write_object_file(&paths.state, &state).expect("write state");
+
+        let inner =
+            ObjectRpcRequest::encode_body("/test/relay-session-open-deadline", "test", &"mutate")
+                .expect("inner request")
+                .with_auth(b"origin-auth".to_vec());
+        let mut envelope = RelayEnvelope::new(state.cluster_id.clone(), target_node, inner);
+        envelope.planned_path = vec![local_node, envelope.target_node_id.clone()];
+        envelope.target_endpoints = endpoints.to_vec();
+        envelope.max_hop_timeout_ms = Some(100);
+        let request = crate::ObjectRpcSessionRequest::buffered(
+            envelope.into_request().expect("relay session request"),
+        );
+        let mut host = RecordingSignedHost {
+            stall_session_open: Some(Duration::from_secs(60)),
+            ..RecordingSignedHost::default()
+        };
+        let runtime = tokio::runtime::Handle::current();
+        let mut client = ClusterObjectRpcClient::routed(&mut host, &runtime, &paths);
+        let started_at = tokio::time::Instant::now();
+
+        let error = client
+            .forward_relay_session(&state, request, ClusterObjectRpcOptions::default())
+            .await
+            .expect_err("relay stream open must remain inside the inherited hop deadline");
+
+        assert!(matches!(
+            error,
+            NetworkError::Timeout {
+                phase: NetworkTimeoutPhase::Overall,
+                delivery_state: NetworkDeliveryState::DefinitelyNotSent,
+                ..
+            }
+        ));
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started_at),
+            Duration::from_millis(100)
+        );
+        assert_eq!(host.session_peers.len(), 1);
+    }
+
     #[test]
     fn relay_preserves_explicit_deadlines_longer_than_sixty_seconds() {
         let cluster_id =
@@ -10501,7 +8882,6 @@ mod tests {
             &bridge_node,
             &target_node,
             &target_endpoint,
-            false,
         );
         let marker = cluster_relay_fresh_signature_retry_response(
             &inner,
@@ -10538,225 +8918,6 @@ mod tests {
             bridge_endpoint.endpoint_id
         );
         assert!(host.target_sends.is_empty());
-    }
-
-    #[test]
-    fn stream_relay_propagates_fresh_signature_marker_across_an_intermediate_hop() {
-        let (
-            _root,
-            paths,
-            state,
-            local_node,
-            bridge_node,
-            target_node,
-            bridge_endpoint,
-            target_endpoint,
-        ) = relay_multihop_test_fixture("stream_relay_multihop_fresh_signature");
-        let (inner, request) = relay_multihop_test_request(
-            &state,
-            &local_node,
-            &bridge_node,
-            &target_node,
-            &target_endpoint,
-            true,
-        );
-        let marker = cluster_relay_fresh_signature_retry_response(
-            &inner,
-            &relay_test_delivery_error(NetworkDeliveryState::PossiblyApplied),
-        )
-        .expect("retry marker");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let mut host = RecordingRelayStreamHost {
-            routing_response: Some(marker),
-            ..RecordingRelayStreamHost::default()
-        };
-
-        let outcome = runtime
-            .block_on(handle_cluster_relay_stream_forward_async_with_host(
-                runtime.handle(),
-                &paths,
-                &state,
-                &local_node,
-                &request,
-                ClusterRelayOptions::new(DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(
-                    2,
-                ))),
-                &mut host,
-            ))
-            .expect("intermediate stream relay should propagate the marker");
-
-        let ClusterRelayStreamForwardOutcome::ErrorResponse(response) = outcome else {
-            panic!("stream marker should remain an error response");
-        };
-        assert!(relay_response_requires_fresh_origin_signature(&response));
-        assert_eq!(host.sends.len(), 1);
-        assert_eq!(host.sends[0].0.endpoint_id, bridge_endpoint.endpoint_id);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn stream_relay_honors_an_explicit_overall_deadline() {
-        let (_root, paths, state, local_node, target_node, endpoints) =
-            relay_retry_test_fixture("stream_relay_explicit_deadline");
-        let mut inner = ObjectRpcRequest::from_encoded_body(
-            "/test/stream-relay-explicit-deadline",
-            "test",
-            Vec::new(),
-        );
-        crate::set_object_rpc_request_stream_mode(
-            &mut inner,
-            crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
-        );
-        let mut envelope = RelayEnvelope::new(state.cluster_id.clone(), target_node.clone(), inner);
-        envelope.planned_path = vec![local_node.clone(), target_node];
-        envelope.target_endpoints = endpoints.to_vec();
-        envelope.max_hop_timeout_ms = Some(100);
-        let request = envelope.into_request().expect("relay request");
-        let mut host = RecordingRelayStreamHost {
-            stall_first_send: Some(Duration::from_secs(1)),
-            ..RecordingRelayStreamHost::default()
-        };
-        let started_at = tokio::time::Instant::now();
-
-        let outcome = handle_cluster_relay_stream_forward_async_with_host(
-            &tokio::runtime::Handle::current(),
-            &paths,
-            &state,
-            &local_node,
-            &request,
-            ClusterRelayOptions::new(DaemonRpcTimeouts::default()),
-            &mut host,
-        )
-        .await
-        .expect("relay converts terminal delivery state into an inner response");
-
-        let ClusterRelayStreamForwardOutcome::ErrorResponse(response) = outcome else {
-            panic!("explicit deadline must terminate the relay stream");
-        };
-        assert!(relay_response_reports_outcome_unknown(&response));
-        let detail = relay_response_outcome_unknown_detail(&response);
-        assert!(detail.contains("Overall"), "unexpected detail: {detail}");
-        assert!(detail.contains("100ms"), "unexpected detail: {detail}");
-        assert_eq!(
-            tokio::time::Instant::now().duration_since(started_at),
-            Duration::from_millis(100)
-        );
-        assert_eq!(host.sends.len(), 1);
-    }
-
-    #[test]
-    fn stream_relay_returns_signed_ambiguous_retry_to_origin_for_a_fresh_signature() {
-        let (_root, paths, state, local_node, target_node, endpoints) =
-            relay_retry_test_fixture("stream_relay_retry_safety");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let options =
-            ClusterRelayOptions::new(DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(2)));
-        let unsafe_inner =
-            ObjectRpcRequest::encode_body("/test/unsafe-stream-relay", "test", &"mutate")
-                .expect("unsafe inner request")
-                .with_auth(b"test-origin-auth".to_vec());
-        let unsafe_request = relay_retry_test_request(
-            &state,
-            &local_node,
-            &target_node,
-            &endpoints,
-            unsafe_inner.clone(),
-            true,
-        );
-        let mut unsafe_host = RecordingRelayStreamHost {
-            first_error: Some(relay_test_delivery_error(
-                NetworkDeliveryState::PossiblyApplied,
-            )),
-            ..RecordingRelayStreamHost::default()
-        };
-
-        let outcome = runtime
-            .block_on(handle_cluster_relay_stream_forward_async_with_host(
-                runtime.handle(),
-                &paths,
-                &state,
-                &local_node,
-                &unsafe_request,
-                options,
-                &mut unsafe_host,
-            ))
-            .expect("ambiguous delivery should return a terminal inner-route response");
-
-        assert_eq!(unsafe_host.sends.len(), 1);
-        let ClusterRelayStreamForwardOutcome::ErrorResponse(response) = outcome else {
-            panic!("unsafe ambiguous delivery should produce an error response");
-        };
-        assert_eq!(response.route, unsafe_inner.route);
-        assert!(response.error_detail().is_err());
-        assert!(!relay_response_is_routing_error(&response));
-
-        let safe_request = relay_retry_test_request(
-            &state,
-            &local_node,
-            &target_node,
-            &endpoints,
-            unsafe_inner.clone().with_response_retry_safe(),
-            true,
-        );
-        let mut safe_host = RecordingRelayStreamHost {
-            first_error: Some(relay_test_delivery_error(
-                NetworkDeliveryState::PossiblyApplied,
-            )),
-            ..RecordingRelayStreamHost::default()
-        };
-        let outcome = runtime
-            .block_on(handle_cluster_relay_stream_forward_async_with_host(
-                runtime.handle(),
-                &paths,
-                &state,
-                &local_node,
-                &safe_request,
-                options,
-                &mut safe_host,
-            ))
-            .expect("signed retry-safe ambiguity should return to the origin");
-
-        assert_eq!(safe_host.sends.len(), 1);
-        let ClusterRelayStreamForwardOutcome::ErrorResponse(response) = outcome else {
-            panic!("signed retry-safe ambiguity should produce a retry marker");
-        };
-        assert!(relay_response_requires_fresh_origin_signature(&response));
-
-        let definitely_unsent_request = relay_retry_test_request(
-            &state,
-            &local_node,
-            &target_node,
-            &endpoints,
-            unsafe_inner,
-            true,
-        );
-        let mut definitely_unsent_host = RecordingRelayStreamHost {
-            first_error: Some(relay_test_delivery_error(
-                NetworkDeliveryState::DefinitelyNotSent,
-            )),
-            ..RecordingRelayStreamHost::default()
-        };
-        let outcome = runtime
-            .block_on(handle_cluster_relay_stream_forward_async_with_host(
-                runtime.handle(),
-                &paths,
-                &state,
-                &local_node,
-                &definitely_unsent_request,
-                options,
-                &mut definitely_unsent_host,
-            ))
-            .expect("definitely-unsent request should use the alternate endpoint");
-        assert_eq!(definitely_unsent_host.sends.len(), 2);
-        assert!(matches!(
-            outcome,
-            ClusterRelayStreamForwardOutcome::Forwarded
-        ));
     }
 
     #[test]

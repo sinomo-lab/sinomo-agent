@@ -2,6 +2,7 @@ use crate::error::NetworkError;
 #[cfg(any(test, feature = "test-support"))]
 use crate::object::ObjectFrameIoOptions;
 use crate::object::SinomoObjectCodec;
+use crate::{ObjectRpcSessionRequest, ObjectRpcSessionResponse};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use sinomo_base::{CapabilityName, Id};
@@ -53,8 +54,11 @@ where
 
 pub type ObjectRpcFuture =
     Pin<Box<dyn Future<Output = Result<ObjectRpcResponse, NetworkError>> + Send + 'static>>;
+pub type ObjectRpcSessionFuture =
+    Pin<Box<dyn Future<Output = Result<ObjectRpcSessionResponse, NetworkError>> + Send + 'static>>;
 
-type ObjectRouteHandler = Arc<dyn Fn(ObjectRpcRequest) -> ObjectRpcFuture + Send + Sync + 'static>;
+type ObjectRouteHandler =
+    Arc<dyn Fn(ObjectRpcSessionRequest) -> ObjectRpcSessionFuture + Send + Sync + 'static>;
 pub type ObjectRpcAuthorizationFuture =
     Pin<Box<dyn Future<Output = Result<(), NetworkError>> + Send + 'static>>;
 type ObjectRpcAuthorizer = Arc<
@@ -71,14 +75,12 @@ pub const OBJECT_RPC_CANCELS_OPERATION_ID_METADATA_KEY: &str = "sinomo-cancels-o
 pub const OBJECT_RPC_RESPONSE_RETRY_SAFE_METADATA_KEY: &str = "sinomo-response-retry-safe";
 pub const OBJECT_RPC_RESPONDER_NODE_ID_METADATA_KEY: &str = "sinomo-responder-node-id";
 pub const OBJECT_RPC_FULL_RESPONSE_BUDGET_METADATA_KEY: &str = "sinomo-full-response-budget";
-pub const OBJECT_RPC_FORWARDED_RESPONSE_IDLE_TIMEOUT_MS_METADATA_KEY: &str =
-    "sinomo-forwarded-response-idle-timeout-ms";
-/// Upper bound for a signed request's exceptional silent-response allowance
-/// on an internal daemon-forwarding hop.
-pub const OBJECT_RPC_FORWARDED_RESPONSE_IDLE_TIMEOUT_MAX: Duration = Duration::from_secs(60);
 pub const OBJECT_RPC_TRACEPARENT_METADATA_KEY: &str = "traceparent";
 pub const OBJECT_RPC_TRACESTATE_METADATA_KEY: &str = "tracestate";
 pub const OBJECT_RPC_OBSERVE_SAMPLED_METADATA_KEY: &str = "sinomo-observe-sampled";
+/// Compatibility ceiling when a body-aware route is invoked through the unary API.
+/// New large-object callers use [`crate::ObjectRpcSessionCall`] and never collect here.
+pub const OBJECT_RPC_UNARY_ADAPTER_MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
 pub const CLUSTER_HEALTH_RPC_CATEGORY: &str = "cluster.health";
 pub const CLUSTER_HEALTH_ROUTE: &str = "/cluster/health";
@@ -204,19 +206,6 @@ impl ObjectRpcRequest {
         self.with_metadata(OBJECT_RPC_FULL_RESPONSE_BUDGET_METADATA_KEY, "true")
     }
 
-    /// Carries an exceptional buffered-response no-progress allowance across
-    /// transports that proxy the signed RPC through a local daemon socket.
-    /// Connection, request-write, and streamed-body progress retain their
-    /// ordinary transport timeouts.
-    pub fn with_forwarded_response_idle_timeout(self, timeout: Duration) -> Self {
-        let timeout = timeout.min(OBJECT_RPC_FORWARDED_RESPONSE_IDLE_TIMEOUT_MAX);
-        let timeout_ms = timeout.as_millis().clamp(1, u128::from(u64::MAX)) as u64;
-        self.with_metadata(
-            OBJECT_RPC_FORWARDED_RESPONSE_IDLE_TIMEOUT_MS_METADATA_KEY,
-            timeout_ms.to_string(),
-        )
-    }
-
     pub fn with_traceparent(self, traceparent: impl Into<String>) -> Self {
         self.with_metadata(OBJECT_RPC_TRACEPARENT_METADATA_KEY, traceparent)
     }
@@ -283,16 +272,6 @@ impl ObjectRpcRequest {
         self.metadata
             .get(OBJECT_RPC_FULL_RESPONSE_BUDGET_METADATA_KEY)
             .is_some_and(|value| value == "true")
-    }
-
-    pub fn forwarded_response_idle_timeout(&self) -> Option<Duration> {
-        let timeout_ms = self
-            .metadata
-            .get(OBJECT_RPC_FORWARDED_RESPONSE_IDLE_TIMEOUT_MS_METADATA_KEY)?
-            .parse::<u64>()
-            .ok()
-            .filter(|timeout_ms| *timeout_ms > 0)?;
-        Some(Duration::from_millis(timeout_ms).min(OBJECT_RPC_FORWARDED_RESPONSE_IDLE_TIMEOUT_MAX))
     }
 }
 
@@ -477,6 +456,19 @@ impl ServiceCategory {
     }
 }
 
+/// Whether an object-RPC route accepts an attached transfer body in one direction.
+///
+/// The typed SOBJ request and response remain the operation heads; large or generated
+/// bytes travel through the canonical network session rather than domain chunk routes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ObjectRpcBodyMode {
+    #[default]
+    None,
+    Optional,
+    Required,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ObjectRouteDescriptor {
     pub route: String,
@@ -498,6 +490,14 @@ pub struct ObjectRouteDescriptor {
     pub concurrency_limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "object_rpc_body_mode_is_none")]
+    pub request_body_mode: ObjectRpcBodyMode,
+    #[serde(default, skip_serializing_if = "object_rpc_body_mode_is_none")]
+    pub response_body_mode: ObjectRpcBodyMode,
+}
+
+fn object_rpc_body_mode_is_none(mode: &ObjectRpcBodyMode) -> bool {
+    *mode == ObjectRpcBodyMode::None
 }
 
 impl ObjectRouteDescriptor {
@@ -519,6 +519,8 @@ impl ObjectRouteDescriptor {
             required_capabilities: Vec::new(),
             concurrency_limit: None,
             timeout_ms: None,
+            request_body_mode: ObjectRpcBodyMode::None,
+            response_body_mode: ObjectRpcBodyMode::None,
         }
     }
 
@@ -544,6 +546,16 @@ impl ObjectRouteDescriptor {
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout_ms = Some(timeout.as_millis().min(u128::from(u64::MAX)) as u64);
+        self
+    }
+
+    pub fn with_request_body_mode(mut self, mode: ObjectRpcBodyMode) -> Self {
+        self.request_body_mode = mode;
+        self
+    }
+
+    pub fn with_response_body_mode(mut self, mode: ObjectRpcBodyMode) -> Self {
+        self.response_body_mode = mode;
         self
     }
 
@@ -701,6 +713,8 @@ impl ServiceCatalogSnapshot {
 #[derive(Clone)]
 struct ObjectRouteEntry {
     category: String,
+    request_body_mode: ObjectRpcBodyMode,
+    response_body_mode: ObjectRpcBodyMode,
     handler: ObjectRouteHandler,
 }
 
@@ -708,25 +722,59 @@ impl ObjectRouteEntry {
     fn new(descriptor: &ObjectRouteDescriptor, handler: ObjectRouteHandler) -> Self {
         Self {
             category: descriptor.category.clone(),
+            request_body_mode: descriptor.request_body_mode,
+            response_body_mode: descriptor.response_body_mode,
             handler,
         }
     }
 
-    fn call(&self, request: ObjectRpcRequest) -> ObjectRpcFuture {
-        let route = request.route.clone();
+    fn call(&self, request: ObjectRpcSessionRequest) -> ObjectRpcSessionFuture {
+        let route = request.request.route.clone();
         let expected_category = self.category.clone();
+        let request_body_mode = self.request_body_mode;
+        let response_body_mode = self.response_body_mode;
         let handler = Arc::clone(&self.handler);
         Box::pin(async move {
-            if request.category != expected_category {
+            if request.request.category != expected_category {
                 return Err(NetworkError::Serialization {
                     detail: format!(
                         "object rpc route {route} expected category {expected_category}, got {}",
-                        request.category
+                        request.request.category
                     ),
                 });
             }
-            handler(request).await
+            validate_object_rpc_body_mode(
+                &route,
+                "request",
+                request_body_mode,
+                request.body.is_empty(),
+            )?;
+            let response = handler(request).await?;
+            validate_object_rpc_body_mode(
+                &route,
+                "response",
+                response_body_mode,
+                response.body.is_empty(),
+            )?;
+            Ok(response)
         })
+    }
+}
+
+fn validate_object_rpc_body_mode(
+    route: &str,
+    direction: &str,
+    mode: ObjectRpcBodyMode,
+    is_empty: bool,
+) -> Result<(), NetworkError> {
+    match (mode, is_empty) {
+        (ObjectRpcBodyMode::None, false) => Err(NetworkError::Serialization {
+            detail: format!("object rpc route {route} does not accept a {direction} body"),
+        }),
+        (ObjectRpcBodyMode::Required, true) => Err(NetworkError::Serialization {
+            detail: format!("object rpc route {route} requires a {direction} body"),
+        }),
+        _ => Ok(()),
     }
 }
 
@@ -834,7 +882,7 @@ impl ObjectRpcRouteRegistryBuilder {
     }
 
     pub fn try_register_route<F, Fut>(
-        mut self,
+        self,
         descriptor: ObjectRouteDescriptor,
         handler: F,
     ) -> Result<Self, NetworkError>
@@ -842,7 +890,46 @@ impl ObjectRpcRouteRegistryBuilder {
         F: Fn(ObjectRpcRequest) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ObjectRpcResponse, NetworkError>> + Send + 'static,
     {
-        let handler = Arc::new(move |request| Box::pin(handler(request)) as ObjectRpcFuture);
+        let handler = Arc::new(move |request: ObjectRpcSessionRequest| {
+            let future = handler(request.request);
+            Box::pin(async move { future.await.map(ObjectRpcSessionResponse::buffered) })
+                as ObjectRpcSessionFuture
+        });
+        self.try_insert_route(descriptor, handler)
+    }
+
+    /// Registers a body-aware route on the same router and policy stack as unary RPC.
+    pub fn register_session_route<F, Fut>(
+        self,
+        descriptor: ObjectRouteDescriptor,
+        handler: F,
+    ) -> Self
+    where
+        F: Fn(ObjectRpcSessionRequest) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ObjectRpcSessionResponse, NetworkError>> + Send + 'static,
+    {
+        self.try_register_session_route(descriptor, handler)
+            .expect("valid object rpc session route registration")
+    }
+
+    pub fn try_register_session_route<F, Fut>(
+        self,
+        descriptor: ObjectRouteDescriptor,
+        handler: F,
+    ) -> Result<Self, NetworkError>
+    where
+        F: Fn(ObjectRpcSessionRequest) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ObjectRpcSessionResponse, NetworkError>> + Send + 'static,
+    {
+        let handler = Arc::new(move |request| Box::pin(handler(request)) as ObjectRpcSessionFuture);
+        self.try_insert_route(descriptor, handler)
+    }
+
+    fn try_insert_route(
+        mut self,
+        descriptor: ObjectRouteDescriptor,
+        handler: ObjectRouteHandler,
+    ) -> Result<Self, NetworkError> {
         let route = descriptor.route.clone();
         if self.registry.catalog.routes.contains_key(&route)
             || self.registry.routes.contains_key(&route)
@@ -886,7 +973,7 @@ impl ObjectRpcRouteRegistryBuilder {
     }
 
     pub fn try_replace_route<F, Fut>(
-        mut self,
+        self,
         descriptor: ObjectRouteDescriptor,
         handler: F,
     ) -> Result<Self, NetworkError>
@@ -894,7 +981,32 @@ impl ObjectRpcRouteRegistryBuilder {
         F: Fn(ObjectRpcRequest) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ObjectRpcResponse, NetworkError>> + Send + 'static,
     {
-        let handler = Arc::new(move |request| Box::pin(handler(request)) as ObjectRpcFuture);
+        let handler = Arc::new(move |request: ObjectRpcSessionRequest| {
+            let future = handler(request.request);
+            Box::pin(async move { future.await.map(ObjectRpcSessionResponse::buffered) })
+                as ObjectRpcSessionFuture
+        });
+        self.try_replace_session_route_handler(descriptor, handler)
+    }
+
+    pub fn try_replace_session_route<F, Fut>(
+        self,
+        descriptor: ObjectRouteDescriptor,
+        handler: F,
+    ) -> Result<Self, NetworkError>
+    where
+        F: Fn(ObjectRpcSessionRequest) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ObjectRpcSessionResponse, NetworkError>> + Send + 'static,
+    {
+        let handler = Arc::new(move |request| Box::pin(handler(request)) as ObjectRpcSessionFuture);
+        self.try_replace_session_route_handler(descriptor, handler)
+    }
+
+    fn try_replace_session_route_handler(
+        mut self,
+        descriptor: ObjectRouteDescriptor,
+        handler: ObjectRouteHandler,
+    ) -> Result<Self, NetworkError> {
         let route = descriptor.route.clone();
         if !self.registry.catalog.routes.contains_key(&route)
             || !self.registry.routes.contains_key(&route)
@@ -1047,13 +1159,27 @@ impl ObjectRpcRouter {
         })
     }
 
-    fn call_route(&self, request: ObjectRpcRequest) -> ObjectRpcFuture {
+    fn call_session_route(&self, request: ObjectRpcSessionRequest) -> ObjectRpcSessionFuture {
         let registry = self.route_registry_snapshot();
-        let Some(route) = registry.route(&request.route) else {
-            let route = request.route.clone();
+        let Some(route) = registry.route(&request.request.route) else {
+            let route = request.request.route.clone();
             return Box::pin(async move { Err(NetworkError::UnknownRoute { route }) });
         };
         Box::pin(async move { route.call(request).await })
+    }
+
+    fn call_route(&self, request: ObjectRpcRequest) -> ObjectRpcFuture {
+        let future = self.call_session_route(ObjectRpcSessionRequest::buffered(request));
+        Box::pin(async move {
+            let mut result = future.await?;
+            if !result.body.is_empty() {
+                result.response.body = result
+                    .body
+                    .collect_to_vec(OBJECT_RPC_UNARY_ADAPTER_MAX_BODY_BYTES)
+                    .await?;
+            }
+            Ok(result.response)
+        })
     }
 }
 
@@ -1137,6 +1263,7 @@ pub struct ObjectRpcRoutePolicyLayer {
 #[derive(Clone)]
 struct ObjectRpcRoutePolicyEntry {
     category: String,
+    request_body_mode: ObjectRpcBodyMode,
     concurrency_limit: Option<usize>,
     semaphore: Option<Arc<tokio::sync::Semaphore>>,
     timeout: Option<Duration>,
@@ -1146,6 +1273,7 @@ impl ObjectRpcRoutePolicyEntry {
     fn new(descriptor: &ObjectRouteDescriptor) -> Self {
         Self {
             category: descriptor.category.clone(),
+            request_body_mode: descriptor.request_body_mode,
             concurrency_limit: descriptor.concurrency_limit,
             semaphore: descriptor
                 .concurrency_limit
@@ -1302,6 +1430,20 @@ impl Service<ObjectRpcRequest> for ObjectRpcRouter {
     }
 }
 
+impl Service<ObjectRpcSessionRequest> for ObjectRpcRouter {
+    type Response = ObjectRpcSessionResponse;
+    type Error = NetworkError;
+    type Future = ObjectRpcSessionFuture;
+
+    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: ObjectRpcSessionRequest) -> Self::Future {
+        self.call_session_route(request)
+    }
+}
+
 impl<S> Service<ObjectRpcRequest> for ObjectRpcAuthorizationService<S>
 where
     S: Service<ObjectRpcRequest, Response = ObjectRpcResponse, Error = NetworkError>
@@ -1327,6 +1469,44 @@ where
             Some(descriptor) => authorizer(descriptor, context),
             None => {
                 let route = request.route.clone();
+                return Box::pin(async move { Err(NetworkError::UnknownRoute { route }) });
+            }
+        };
+        let mut inner = self.take_poll_ready_inner_for_call();
+        Box::pin(async move {
+            future.await?;
+            inner.call(request).await
+        })
+    }
+}
+
+impl<S> Service<ObjectRpcSessionRequest> for ObjectRpcAuthorizationService<S>
+where
+    S: Service<ObjectRpcSessionRequest, Response = ObjectRpcSessionResponse, Error = NetworkError>
+        + ObjectRpcRouteCatalog
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = ObjectRpcSessionResponse;
+    type Error = NetworkError;
+    type Future = ObjectRpcSessionFuture;
+
+    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(context)
+    }
+
+    fn call(&mut self, request: ObjectRpcSessionRequest) -> Self::Future {
+        let descriptor = self
+            .inner
+            .object_rpc_route_descriptor(&request.request.route);
+        let authorizer = Arc::clone(&self.authorizer);
+        let context = ObjectRpcAuthorizationContext::from_request(&request.request);
+        let future = match descriptor {
+            Some(descriptor) => authorizer(descriptor, context),
+            None => {
+                let route = request.request.route.clone();
                 return Box::pin(async move { Err(NetworkError::UnknownRoute { route }) });
             }
         };
@@ -1411,6 +1591,93 @@ where
     }
 }
 
+impl<S> Service<ObjectRpcSessionRequest> for ObjectRpcRoutePolicyService<S>
+where
+    S: Service<ObjectRpcSessionRequest, Response = ObjectRpcSessionResponse, Error = NetworkError>
+        + ObjectRpcRouteCatalog
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = ObjectRpcSessionResponse;
+    type Error = NetworkError;
+    type Future = ObjectRpcSessionFuture;
+
+    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(context)
+    }
+
+    fn call(&mut self, request: ObjectRpcSessionRequest) -> Self::Future {
+        let route = request.request.route.clone();
+        let Some(entry) = self.layer.routes.get(&route).cloned() else {
+            return Box::pin(async move { Err(NetworkError::UnknownRoute { route }) });
+        };
+        if request.request.category != entry.category {
+            let expected_category = entry.category;
+            return Box::pin(async move {
+                Err(NetworkError::Serialization {
+                    detail: format!(
+                        "object rpc route {route} expected category {expected_category}, got {}",
+                        request.request.category
+                    ),
+                })
+            });
+        }
+        if let Err(error) = validate_object_rpc_body_mode(
+            &route,
+            "request",
+            entry.request_body_mode,
+            request.body.is_empty(),
+        ) {
+            return Box::pin(async move { Err(error) });
+        }
+
+        let mut inner = self.take_poll_ready_inner_for_call();
+        Box::pin(async move {
+            let timeout_route = route.clone();
+            let run = async move {
+                let permit = if let Some(semaphore) = entry.semaphore {
+                    match semaphore.try_acquire_owned() {
+                        Ok(permit) => Some(permit),
+                        Err(tokio::sync::TryAcquireError::NoPermits) => {
+                            return Err(NetworkError::ObjectRpcRouteSaturated {
+                                route,
+                                concurrency_limit: entry.concurrency_limit.unwrap_or(0),
+                            });
+                        }
+                        Err(tokio::sync::TryAcquireError::Closed) => {
+                            return Err(NetworkError::Io {
+                                operation: format!("object rpc route {route}"),
+                                detail: "route limiter closed".to_string(),
+                            });
+                        }
+                    }
+                } else {
+                    None
+                };
+                let mut response = inner.call(request).await?;
+                if let Some(permit) = permit
+                    && !response.body.is_empty()
+                {
+                    response.body.hold_lifetime_guard(permit)?;
+                }
+                Ok(response)
+            };
+            if let Some(timeout) = entry.timeout {
+                tokio::time::timeout(timeout, run)
+                    .await
+                    .map_err(|_| NetworkError::Io {
+                        operation: format!("object rpc route {timeout_route}"),
+                        detail: format!("timed out after {}ms", timeout.as_millis()),
+                    })?
+            } else {
+                run.await
+            }
+        })
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub async fn call_object_rpc_frame_async<IO>(
     stream: &mut IO,
@@ -1431,6 +1698,19 @@ pub async fn call_object_rpc_service_async<S>(
 ) -> Result<ObjectRpcResponse, NetworkError>
 where
     S: Service<ObjectRpcRequest, Response = ObjectRpcResponse, Error = NetworkError>,
+{
+    std::future::poll_fn(|context| service.poll_ready(context)).await?;
+    service.call(request).await
+}
+
+/// Dispatches a body-aware request through the same readiness, authorization,
+/// concurrency, and timeout layers used by unary object RPC.
+pub async fn call_object_rpc_session_service_async<S>(
+    service: &mut S,
+    request: ObjectRpcSessionRequest,
+) -> Result<ObjectRpcSessionResponse, NetworkError>
+where
+    S: Service<ObjectRpcSessionRequest, Response = ObjectRpcSessionResponse, Error = NetworkError>,
 {
     std::future::poll_fn(|context| service.poll_ready(context)).await?;
     service.call(request).await
@@ -1636,31 +1916,105 @@ mod tests {
         assert!(slice_is_borrowed_from(decoded.bytes, &response.body));
     }
 
-    #[test]
-    fn forwarded_response_idle_timeout_is_explicit_and_bounded() {
-        let ordinary = ObjectRpcRequest::from_encoded_body("/test/ordinary", "test", Vec::new());
-        assert_eq!(ordinary.forwarded_response_idle_timeout(), None);
-
-        let extended = ordinary
-            .clone()
-            .with_forwarded_response_idle_timeout(Duration::from_secs(15));
-        assert_eq!(
-            extended.forwarded_response_idle_timeout(),
-            Some(Duration::from_secs(15))
-        );
-
-        let oversized = ordinary.with_forwarded_response_idle_timeout(Duration::MAX);
-        assert_eq!(
-            oversized.forwarded_response_idle_timeout(),
-            Some(OBJECT_RPC_FORWARDED_RESPONSE_IDLE_TIMEOUT_MAX)
-        );
-    }
-
     fn slice_is_borrowed_from(slice: &[u8], source: &[u8]) -> bool {
         let source_start = source.as_ptr() as usize;
         let source_end = source_start + source.len();
         let slice_start = slice.as_ptr() as usize;
         let slice_end = slice_start + slice.len();
         slice_start >= source_start && slice_end <= source_end
+    }
+
+    #[tokio::test]
+    async fn session_routes_enforce_body_modes_on_the_canonical_router() {
+        let descriptor =
+            ObjectRouteDescriptor::new("/test/body-route", "test", "body route", "Head", "Head")
+                .with_request_body_mode(ObjectRpcBodyMode::Required)
+                .with_response_body_mode(ObjectRpcBodyMode::Required);
+        let registry = ObjectRpcRouteRegistry::builder()
+            .register_session_route(descriptor, |request| async move {
+                let bytes = request.body.collect_to_vec(64).await?;
+                Ok(ObjectRpcSessionResponse::new(
+                    ObjectRpcResponse::encode_body(request.request.route, &bytes.len())?,
+                    crate::ObjectRpcBodySource::bytes(bytes),
+                ))
+            })
+            .build();
+        let mut router = ObjectRpcRouter::from_route_registry(registry).expect("router");
+
+        let empty = call_object_rpc_session_service_async(
+            &mut router,
+            ObjectRpcSessionRequest::buffered(ObjectRpcRequest::from_encoded_body(
+                "/test/body-route",
+                "test",
+                Vec::new(),
+            )),
+        )
+        .await
+        .expect_err("required request body");
+        assert!(empty.to_string().contains("requires a request body"));
+
+        let response = call_object_rpc_session_service_async(
+            &mut router,
+            ObjectRpcSessionRequest::new(
+                ObjectRpcRequest::from_encoded_body("/test/body-route", "test", Vec::new()),
+                crate::ObjectRpcIncomingBody::bytes(b"body".to_vec()),
+            ),
+        )
+        .await
+        .expect("body route");
+        assert_eq!(response.response.decode_body::<usize>().expect("head"), 4);
+        assert_eq!(
+            response
+                .body
+                .collect_to_vec(64)
+                .await
+                .expect("response body"),
+            b"body"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_concurrency_permit_is_held_until_response_body_drops() {
+        let descriptor =
+            ObjectRouteDescriptor::new("/test/body-permit", "test", "body permit", "Head", "Head")
+                .with_concurrency_limit(1)
+                .with_response_body_mode(ObjectRpcBodyMode::Required);
+        let registry = ObjectRpcRouteRegistry::builder()
+            .register_session_route(descriptor, |request| async move {
+                Ok(ObjectRpcSessionResponse::new(
+                    ObjectRpcResponse::encode_body(request.request.route, &())?,
+                    crate::ObjectRpcBodySource::bytes(b"held".to_vec()),
+                ))
+            })
+            .build();
+        let router = ObjectRpcRouter::from_route_registry(registry).expect("router");
+        let mut service = ObjectRpcRoutePolicyLayer::new(router.catalog())
+            .expect("policy")
+            .layer(router);
+        let request = || {
+            ObjectRpcSessionRequest::buffered(ObjectRpcRequest::from_encoded_body(
+                "/test/body-permit",
+                "test",
+                Vec::new(),
+            ))
+        };
+
+        let first = call_object_rpc_session_service_async(&mut service, request())
+            .await
+            .expect("first response");
+        let second = call_object_rpc_session_service_async(&mut service, request())
+            .await
+            .expect_err("permit remains attached to body");
+        assert!(matches!(
+            second,
+            NetworkError::ObjectRpcRouteSaturated {
+                concurrency_limit: 1,
+                ..
+            }
+        ));
+        drop(first);
+        call_object_rpc_session_service_async(&mut service, request())
+            .await
+            .expect("permit released with body");
     }
 }

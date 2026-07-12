@@ -172,10 +172,12 @@ pub trait NetworkModule: Send + Sync {
     fn descriptor(&self) -> NetworkModuleDescriptor;
     fn start(&self, ctx: &NetworkModuleContext) -> Result<(), NetworkError>;
     fn stop(&self) -> Result<(), NetworkError>;
+    fn open_rpc_stream(&self, endpoint: &ClusterEndpointRecord,
+                       health: NetworkHealthPolicy)
+        -> NetworkFuture<Box<dyn NetworkDuplexStream>>;
+    // Bounded unary compatibility is an adapter over open_rpc_stream.
     fn dial_rpc(&self, endpoint: &ClusterEndpointRecord, request: &[u8],
                 timeouts: DaemonRpcTimeouts) -> NetworkFuture<Vec<u8>>;
-    fn dial_rpc_raw_response(&self, endpoint: &ClusterEndpointRecord, request: &[u8],
-                timeouts: DaemonRpcTimeouts) -> NetworkFuture<ObjectRpcResponse>;
     fn local_endpoints(&self) -> Result<Vec<ClusterEndpointRecord>, NetworkError>;
 }
 
@@ -185,8 +187,8 @@ pub struct NetworkModuleRegistry { /* arc-swap; register/set_enabled/dispatch */
 - Dispatch: endpoint transport kind AND address scheme resolve to a module
   (today `iroh://` strings ride on LanTcp-tagged endpoints —
   roaming.rs:2289-2309). Loopback/LAN-TCP ship as built-in modules; their
-  pooled/streamed raw paths remain internal to the built-in implementation, so
-  no regression through the trait.
+  socket lifecycle remains internal to the built-in implementation, so no
+  transport-specific framing leaks through the trait.
 - `ClusterEndpointSelector` takes the registry's dialable-transport snapshot
   and filters/deprioritizes endpoints whose transport has no enabled dialer
   (review: otherwise iroh candidates burn per-endpoint timeout budgets when
@@ -236,17 +238,19 @@ pub struct SinomoNetworkModuleVtableV1 {
     pub descriptor: unsafe extern "C" fn(*mut SinomoNetworkByteBuffer) -> i32,
     pub start: unsafe extern "C" fn(*mut c_void, *const SinomoNetworkModuleConfigV1) -> i32,
     pub stop: unsafe extern "C" fn(*mut c_void) -> i32,
-    /// Blocking request/response dial: endpoint address (UTF-8), request
-    /// bytes, timeouts (connect_ms, idle_ms); response into module buffer.
-    /// The host wraps calls in spawn_blocking.
-    pub dial_rpc: unsafe extern "C" fn(
+    /// Open a raw bidirectional stream. Object-RPC framing stays host-owned.
+    pub open_rpc_stream: unsafe extern "C" fn(
         *mut c_void,
         SinomoNetworkByteSlice,      // endpoint address utf8
-        SinomoNetworkByteSlice,      // request frame bytes
         u64,                         // connect timeout ms
-        u64,                         // idle timeout ms
-        *mut SinomoNetworkByteBuffer // response frame bytes
+        u64,                         // no-progress timeout ms
+        *mut SinomoNetworkRpcStreamV1,
+        *mut SinomoNetworkByteBuffer // structured error
     ) -> i32,
+    pub read_rpc_stream: unsafe extern "C" fn(/* stream, host buffer, ... */) -> i32,
+    pub write_rpc_stream: unsafe extern "C" fn(/* stream, host bytes, ... */) -> i32,
+    pub shutdown_rpc_stream_write: unsafe extern "C" fn(/* stream, ... */) -> i32,
+    pub close_rpc_stream: unsafe extern "C" fn(SinomoNetworkRpcStreamV1),
     /// SOBJ Vec<ClusterEndpointRecord> the module currently advertises.
     pub local_endpoints: unsafe extern "C" fn(*mut c_void, *mut SinomoNetworkByteBuffer) -> i32,
     pub free_buffer: unsafe extern "C" fn(SinomoNetworkByteBuffer),
@@ -263,10 +267,10 @@ Status codes mirror sinomo-module-api (0 ok, 1 invalid arg, 2 unsupported ABI,
 vtable in the safe `NetworkModule` trait, holds the `libloading::Library`
 alive for the registry's lifetime (disable = `stop()`, never unload), and
 converts the descriptor/endpoint SOBJ payloads. Streamed object-RPC transfer is
-a generic `sinomo-network` capability: the built-in LanTcp path can forward raw
-chunks without buffering, while dynamic modules preserve or collect the same
-generic raw body stream through `dial_rpc_raw_response` instead of advertising a
-route- or DFS-specific capability flag.
+a generic `sinomo-network` capability: built-in and dynamic transports expose
+the same opaque full-duplex byte stream, while the host owns session framing,
+flow control, retries, and relays. Modules do not advertise route- or
+DFS-specific transfer capability flags.
 
 ### modules/network/iroh
 

@@ -18,7 +18,7 @@ use crate::{
     AsyncDfsMetadataNodeTransport, AsyncDfsPeerTransport, ContentStoreGcOptions,
     ContentStoreGcReport, ContentStoreScrubReport, ContentStoreStagingGcOptions,
     ContentStoreStagingGcReport, ContentStoreVersionGcOptions, ContentStoreVersionGcReport,
-    DFS_CHUNK_TRANSFER_STALE_AFTER, DfsControlPlaneKvClient, DfsError, DfsFileSystemId,
+    DFS_PENDING_TRANSFER_STALE_AFTER, DfsControlPlaneKvClient, DfsError, DfsFileSystemId,
     DfsMessageSender, DfsMessageTransport, DfsMetadataBackend, DfsMetadataJournalBatchSender,
     DfsMetadataJournalPublisherHost, DfsMetadataJournalReplicationOptions,
     DfsMetadataJournalReplicationReport, DfsMetadataJournalReplicationTransport,
@@ -315,11 +315,7 @@ pub struct DfsRepairAttemptRecord {
     pub in_flight: bool,
     pub last_attempt_unix_nanos: u64,
     pub next_retry_unix_nanos: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_chunk_index: Option<u32>,
-    /// Request identity for a resumable chunk transfer. A receiver keys its
-    /// partial assembler by this id, so maintenance services recreated between
-    /// windows must reuse it together with `next_chunk_index`.
+    /// Stable request identity for an in-flight logical transfer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -791,7 +787,7 @@ impl Default for DfsMaintenanceRunOptions {
             anti_entropy_max_issues: DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_ISSUES,
             repair_metadata: true,
             cleanup_stale_staging: true,
-            stale_staging_min_age: DFS_CHUNK_TRANSFER_STALE_AFTER,
+            stale_staging_min_age: DFS_PENDING_TRANSFER_STALE_AFTER,
         }
     }
 }

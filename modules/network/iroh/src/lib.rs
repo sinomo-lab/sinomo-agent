@@ -3,7 +3,7 @@
 //! This module owns every Iroh-specific behavior: endpoint builder +
 //! relay-mode config, secret-key load/create, endpoint record parse/format,
 //! stable endpoint ids, endpoint record file I/O, the daemon proxy
-//! supervisor/accept loop/frame budget, and the dial client. `sinomo-network`
+//! supervisor/accept loop, and the dial client. `sinomo-network`
 //! only sees generic network-module descriptors, endpoint records, and the
 //! optional endpoint-role classification hook.
 //!
@@ -19,7 +19,6 @@
 
 mod dial;
 mod endpoint;
-mod frames;
 mod proxy;
 
 use endpoint::{iroh_endpoint_public_key, stable_iroh_endpoint_id};
@@ -28,8 +27,8 @@ use sinomo_core::network::network_module_abi::{
     SINOMO_NETWORK_MODULE_ABI_VERSION, SINOMO_NETWORK_MODULE_STATUS_INVALID_ARGUMENT,
     SINOMO_NETWORK_MODULE_STATUS_OK, SINOMO_NETWORK_MODULE_STATUS_RUNTIME_ERROR,
     SinomoNetworkByteBuffer, SinomoNetworkByteSlice, SinomoNetworkModuleConfigV1,
-    SinomoNetworkModuleStatusCode, SinomoNetworkModuleVtableV1, encode_network_module_rpc_error,
-    encode_network_module_sobj,
+    SinomoNetworkModuleStatusCode, SinomoNetworkModuleVtableV1, SinomoNetworkRpcStreamV1,
+    encode_network_module_rpc_error, encode_network_module_sobj,
 };
 use sinomo_core::network::{
     ClusterPaths, DaemonRpcTimeouts, NetworkError, NetworkModuleDescriptor,
@@ -57,8 +56,6 @@ pub const SINOMO_NETWORK_IROH_MODULE_ID: &str = "module.network-iroh";
 pub const SINOMO_NETWORK_IROH_INTERFACE_VERSION: &str = "sinomo.network-iroh.v1";
 /// Network-module descriptor id (`NetworkModuleDescriptor::id`).
 pub const SINOMO_NETWORK_IROH_NETWORK_MODULE_ID: &str = "iroh";
-pub const IROH_DAEMON_COMMAND_MAX_BYTES: usize =
-    sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES;
 const SINOMO_DISABLE_IROH_ENV: &str = "SINOMO_DISABLE_IROH";
 
 fn iroh_disabled_by_env() -> bool {
@@ -236,6 +233,93 @@ struct IrohNetworkModuleInstance {
     dialer: dial::IrohDaemonDialer,
 }
 
+/// One native QUIC bidirectional stream retained behind the opaque network
+/// module ABI handle. Separate locks allow a blocking read and write to make
+/// progress concurrently on the module runtime.
+struct IrohNetworkRpcStream {
+    runtime: tokio::runtime::Handle,
+    recv: Mutex<Option<iroh::endpoint::RecvStream>>,
+    send: Mutex<Option<iroh::endpoint::SendStream>>,
+    no_progress_timeout: Option<Duration>,
+}
+
+impl IrohNetworkRpcStream {
+    fn read(&self, bytes: &mut [u8]) -> Result<usize, NetworkError> {
+        let mut recv = self
+            .recv
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(recv) = recv.as_mut() else {
+            return Ok(0);
+        };
+        let read = async { tokio::io::AsyncReadExt::read(recv, bytes).await };
+        let result = match self.no_progress_timeout {
+            Some(timeout) => self
+                .runtime
+                .block_on(tokio::time::timeout(timeout, read))
+                .map_err(|_| {
+                    NetworkError::timeout(
+                        "read iroh RPC stream",
+                        sinomo_core::network::NetworkTimeoutPhase::Idle,
+                        timeout,
+                        sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                    )
+                })?,
+            None => self.runtime.block_on(read),
+        };
+        result.map_err(|source| NetworkError::Io {
+            operation: "read iroh RPC stream".to_string(),
+            detail: source.to_string(),
+        })
+    }
+
+    fn write(&self, bytes: &[u8]) -> Result<usize, NetworkError> {
+        let mut send = self
+            .send
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(send) = send.as_mut() else {
+            return Err(NetworkError::Io {
+                operation: "write iroh RPC stream".to_string(),
+                detail: "write side is already shut down".to_string(),
+            });
+        };
+        let write = async { tokio::io::AsyncWriteExt::write(send, bytes).await };
+        let result = match self.no_progress_timeout {
+            Some(timeout) => self
+                .runtime
+                .block_on(tokio::time::timeout(timeout, write))
+                .map_err(|_| {
+                    NetworkError::timeout(
+                        "write iroh RPC stream",
+                        sinomo_core::network::NetworkTimeoutPhase::Write,
+                        timeout,
+                        sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                    )
+                })?,
+            None => self.runtime.block_on(write),
+        };
+        result.map_err(|source| NetworkError::Io {
+            operation: "write iroh RPC stream".to_string(),
+            detail: source.to_string(),
+        })
+    }
+
+    fn shutdown_write(&self) -> Result<(), NetworkError> {
+        let mut send = self
+            .send
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(mut send) = send.take() else {
+            return Ok(());
+        };
+        send.finish().map_err(|source| NetworkError::Io {
+            operation: "shutdown iroh RPC stream write".to_string(),
+            detail: source.to_string(),
+        })
+    }
+}
+
 impl IrohNetworkModuleInstance {
     fn new() -> Self {
         Self {
@@ -315,24 +399,26 @@ impl IrohNetworkModuleInstance {
         Ok(())
     }
 
-    fn dial(
+    fn open_stream(
         &self,
         address: &str,
-        request_frame: &[u8],
         timeouts: DaemonRpcTimeouts,
-    ) -> Result<Vec<u8>, NetworkError> {
+    ) -> Result<IrohNetworkRpcStream, NetworkError> {
         if iroh_disabled_by_env() {
             return Err(NetworkError::Io {
-                operation: "dial iroh network module".to_string(),
+                operation: "open iroh network module stream".to_string(),
                 detail: format!("{SINOMO_DISABLE_IROH_ENV}=1"),
             });
         }
         let runtime = self.runtime()?;
-        runtime.block_on(self.dialer.dial_daemon_control_frame_async(
-            address,
-            request_frame,
-            timeouts,
-        ))
+        let (send, recv) =
+            runtime.block_on(self.dialer.open_daemon_stream_async(address, timeouts))?;
+        Ok(IrohNetworkRpcStream {
+            runtime: runtime.handle().clone(),
+            recv: Mutex::new(Some(recv)),
+            send: Mutex::new(Some(send)),
+            no_progress_timeout: timeouts.idle_timeout,
+        })
     }
 
     fn local_endpoints(&self) -> Vec<sinomo_core::ClusterEndpointRecord> {
@@ -439,6 +525,17 @@ unsafe fn module_instance<'a>(instance: *mut c_void) -> Option<&'a IrohNetworkMo
     unsafe { (instance as *const IrohNetworkModuleInstance).as_ref() }
 }
 
+/// # Safety
+///
+/// `stream` must be an opaque handle produced by
+/// [`iroh_network_module_open_rpc_stream_ffi`] that has not been closed.
+unsafe fn rpc_stream_instance<'a>(
+    stream: SinomoNetworkRpcStreamV1,
+) -> Option<&'a IrohNetworkRpcStream> {
+    // SAFETY: caller contract above.
+    unsafe { (stream.ptr as *const IrohNetworkRpcStream).as_ref() }
+}
+
 fn write_network_buffer(out: *mut SinomoNetworkByteBuffer, bytes: Vec<u8>) {
     if out.is_null() {
         return;
@@ -539,29 +636,28 @@ unsafe extern "C" fn iroh_network_module_stop_ffi(
     result.unwrap_or(SINOMO_NETWORK_MODULE_STATUS_RUNTIME_ERROR)
 }
 
-unsafe extern "C" fn iroh_network_module_dial_rpc_ffi(
+unsafe extern "C" fn iroh_network_module_open_rpc_stream_ffi(
     instance: *mut c_void,
     address_utf8: SinomoNetworkByteSlice,
-    request_frame: SinomoNetworkByteSlice,
     connect_timeout_ms: u64,
     idle_timeout_ms: u64,
-    response_out: *mut SinomoNetworkByteBuffer,
+    stream_out: *mut SinomoNetworkRpcStreamV1,
+    error_out: *mut SinomoNetworkByteBuffer,
 ) -> SinomoNetworkModuleStatusCode {
     let result = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: host passes the instance created by the entry function.
         let Some(instance) = (unsafe { module_instance(instance) }) else {
             return SINOMO_NETWORK_MODULE_STATUS_INVALID_ARGUMENT;
         };
-        if response_out.is_null() {
+        if stream_out.is_null() || error_out.is_null() {
             return SINOMO_NETWORK_MODULE_STATUS_INVALID_ARGUMENT;
         }
-        // SAFETY: the host guarantees both views are valid for this call.
+        // SAFETY: the host guarantees the address view is valid for this call.
         let address_bytes = unsafe { address_utf8.as_slice() };
-        let request = unsafe { request_frame.as_slice() };
         let Ok(address) = std::str::from_utf8(address_bytes) else {
             write_network_buffer(
-                response_out,
-                b"network module dial address is not UTF-8".to_vec(),
+                error_out,
+                b"network module stream address is not UTF-8".to_vec(),
             );
             return SINOMO_NETWORK_MODULE_STATUS_INVALID_ARGUMENT;
         };
@@ -569,15 +665,113 @@ unsafe extern "C" fn iroh_network_module_dial_rpc_ffi(
             connect_timeout: ffi_timeout(connect_timeout_ms),
             idle_timeout: ffi_timeout(idle_timeout_ms),
         };
-        match instance.dial(address, request, timeouts) {
-            Ok(response) => {
-                write_network_buffer(response_out, response);
+        match instance.open_stream(address, timeouts) {
+            Ok(stream) => {
+                // SAFETY: output slot was validated above. Ownership transfers
+                // to the host until close_rpc_stream returns it below.
+                unsafe {
+                    *stream_out = SinomoNetworkRpcStreamV1 {
+                        ptr: Box::into_raw(Box::new(stream)) as *mut c_void,
+                    };
+                }
                 SINOMO_NETWORK_MODULE_STATUS_OK
             }
-            Err(error) => network_rpc_error_status(response_out, &error),
+            Err(error) => network_rpc_error_status(error_out, &error),
         }
     }));
     result.unwrap_or(SINOMO_NETWORK_MODULE_STATUS_RUNTIME_ERROR)
+}
+
+unsafe extern "C" fn iroh_network_module_read_rpc_stream_ffi(
+    stream: SinomoNetworkRpcStreamV1,
+    buffer: *mut u8,
+    capacity: usize,
+    read_out: *mut usize,
+    error_out: *mut SinomoNetworkByteBuffer,
+) -> SinomoNetworkModuleStatusCode {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: host passes an open stream handle.
+        let Some(stream) = (unsafe { rpc_stream_instance(stream) }) else {
+            return SINOMO_NETWORK_MODULE_STATUS_INVALID_ARGUMENT;
+        };
+        if read_out.is_null() || error_out.is_null() || (buffer.is_null() && capacity != 0) {
+            return SINOMO_NETWORK_MODULE_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the host owns a writable `capacity`-byte buffer for the call.
+        let bytes = if capacity == 0 {
+            &mut []
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(buffer, capacity) }
+        };
+        match stream.read(bytes) {
+            Ok(read) => {
+                // SAFETY: output slot was validated above.
+                unsafe { *read_out = read };
+                SINOMO_NETWORK_MODULE_STATUS_OK
+            }
+            Err(error) => network_rpc_error_status(error_out, &error),
+        }
+    }));
+    result.unwrap_or(SINOMO_NETWORK_MODULE_STATUS_RUNTIME_ERROR)
+}
+
+unsafe extern "C" fn iroh_network_module_write_rpc_stream_ffi(
+    stream: SinomoNetworkRpcStreamV1,
+    bytes: SinomoNetworkByteSlice,
+    written_out: *mut usize,
+    error_out: *mut SinomoNetworkByteBuffer,
+) -> SinomoNetworkModuleStatusCode {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: host passes an open stream handle.
+        let Some(stream) = (unsafe { rpc_stream_instance(stream) }) else {
+            return SINOMO_NETWORK_MODULE_STATUS_INVALID_ARGUMENT;
+        };
+        if written_out.is_null() || error_out.is_null() {
+            return SINOMO_NETWORK_MODULE_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: host guarantees this byte view is valid for the call.
+        let bytes = unsafe { bytes.as_slice() };
+        match stream.write(bytes) {
+            Ok(written) => {
+                // SAFETY: output slot was validated above.
+                unsafe { *written_out = written };
+                SINOMO_NETWORK_MODULE_STATUS_OK
+            }
+            Err(error) => network_rpc_error_status(error_out, &error),
+        }
+    }));
+    result.unwrap_or(SINOMO_NETWORK_MODULE_STATUS_RUNTIME_ERROR)
+}
+
+unsafe extern "C" fn iroh_network_module_shutdown_rpc_stream_write_ffi(
+    stream: SinomoNetworkRpcStreamV1,
+    error_out: *mut SinomoNetworkByteBuffer,
+) -> SinomoNetworkModuleStatusCode {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: host passes an open stream handle.
+        let Some(stream) = (unsafe { rpc_stream_instance(stream) }) else {
+            return SINOMO_NETWORK_MODULE_STATUS_INVALID_ARGUMENT;
+        };
+        if error_out.is_null() {
+            return SINOMO_NETWORK_MODULE_STATUS_INVALID_ARGUMENT;
+        }
+        match stream.shutdown_write() {
+            Ok(()) => SINOMO_NETWORK_MODULE_STATUS_OK,
+            Err(error) => network_rpc_error_status(error_out, &error),
+        }
+    }));
+    result.unwrap_or(SINOMO_NETWORK_MODULE_STATUS_RUNTIME_ERROR)
+}
+
+unsafe extern "C" fn iroh_network_module_close_rpc_stream_ffi(stream: SinomoNetworkRpcStreamV1) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if stream.ptr.is_null() {
+            return;
+        }
+        // SAFETY: the host closes each successful open exactly once and only
+        // after all read/write callbacks have returned.
+        unsafe { drop(Box::from_raw(stream.ptr as *mut IrohNetworkRpcStream)) };
+    }));
 }
 
 unsafe extern "C" fn iroh_network_module_local_endpoints_ffi(
@@ -682,7 +876,11 @@ pub unsafe extern "C" fn sinomo_network_module_create_v1(
                 descriptor: iroh_network_module_descriptor_ffi,
                 start: iroh_network_module_start_ffi,
                 stop: iroh_network_module_stop_ffi,
-                dial_rpc: iroh_network_module_dial_rpc_ffi,
+                open_rpc_stream: iroh_network_module_open_rpc_stream_ffi,
+                read_rpc_stream: iroh_network_module_read_rpc_stream_ffi,
+                write_rpc_stream: iroh_network_module_write_rpc_stream_ffi,
+                shutdown_rpc_stream_write: iroh_network_module_shutdown_rpc_stream_write_ffi,
+                close_rpc_stream: iroh_network_module_close_rpc_stream_ffi,
                 local_endpoints: iroh_network_module_local_endpoints_ffi,
                 endpoint_role: Some(iroh_network_module_endpoint_role_ffi),
                 free_buffer: iroh_network_module_free_buffer_ffi,
@@ -760,6 +958,27 @@ mod tests {
             sinomo_core::network::network_module_abi::decode_network_module_sobj(&bytes)
                 .expect("decode endpoints");
         assert!(decoded.is_empty(), "no listener yet, no endpoints");
+
+        // The v1 ABI exposes an opaque byte stream, not a whole-response
+        // buffer. A rejected open leaves the handle null and reports the
+        // structured transport error through the module-owned error buffer.
+        let mut stream = SinomoNetworkRpcStreamV1::null();
+        let mut error = SinomoNetworkByteBuffer::null();
+        let status = unsafe {
+            (vtable.open_rpc_stream)(
+                instance,
+                SinomoNetworkByteSlice::from_slice(b"not-an-iroh-address"),
+                5_000,
+                5_000,
+                &mut stream,
+                &mut error,
+            )
+        };
+        assert_ne!(status, SINOMO_NETWORK_MODULE_STATUS_OK);
+        assert!(stream.is_null());
+        assert!(!error.ptr.is_null(), "failed open should carry detail");
+        // SAFETY: release through the same module vtable that allocated it.
+        unsafe { (vtable.free_buffer)(error) };
 
         // SAFETY: destroy exactly once with the instance from the entry.
         unsafe { (vtable.destroy)(instance) };

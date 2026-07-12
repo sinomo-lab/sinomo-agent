@@ -117,8 +117,6 @@ impl<T: DfsMessageTransport> LocalOwnedDfsService<T> {
                         content_size_bytes: None,
                         range_offset: None,
                         range_max_bytes: None,
-                        start_chunk_index: 0,
-                        max_chunks: 0,
                     }),
                 )?;
                 Ok(DfsReadOutcome::Routed {
@@ -219,18 +217,14 @@ impl<T: DfsMessageTransport> LocalOwnedDfsService<T> {
                     });
                 }
                 DfsNetworkMessage::StageBlob(_)
-                | DfsNetworkMessage::StageBlobChunk(_)
                 | DfsNetworkMessage::StagePatch(_)
-                | DfsNetworkMessage::StagePatchChunk(_)
                 | DfsNetworkMessage::StageBlobResponse(_)
                 | DfsNetworkMessage::CommitVersion(_)
                 | DfsNetworkMessage::CommitVersionResponse(_)
                 | DfsNetworkMessage::RepairReplica(_)
-                | DfsNetworkMessage::RepairReplicaChunk(_)
                 | DfsNetworkMessage::RepairReplicaResponse(_)
                 | DfsNetworkMessage::FetchBlob(_)
                 | DfsNetworkMessage::FetchBlobResponse(_)
-                | DfsNetworkMessage::FetchBlobResponseChunk(_)
                 | DfsNetworkMessage::DistributedWriteRequest(_)
                 | DfsNetworkMessage::DistributedWriteResponse(_)
                 | DfsNetworkMessage::NamespaceRequest(_)
@@ -238,8 +232,7 @@ impl<T: DfsMessageTransport> LocalOwnedDfsService<T> {
                 | DfsNetworkMessage::MetadataJournalBatch(_)
                 | DfsNetworkMessage::MetadataJournalBatchResponse(_)
                 | DfsNetworkMessage::MetadataSnapshotInstall(_)
-                | DfsNetworkMessage::MetadataSnapshotInstallResponse(_)
-                | DfsNetworkMessage::ReadResponseChunk(_) => {}
+                | DfsNetworkMessage::MetadataSnapshotInstallResponse(_) => {}
             }
         }
 

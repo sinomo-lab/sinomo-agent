@@ -83,6 +83,7 @@ pub fn register_services(builder: ServiceRegistryBuilder) -> ServiceRegistryBuil
 mod tests {
     use super::*;
     use sinomo_core::local::SinomoDataDir;
+    use sinomo_core::network::{ObjectRpcIncomingBody, ObjectRpcSessionResponse};
     use sinomo_core::service::{ResponseSink, ServiceRegistry, ServiceSigner};
     use std::sync::{Arc, Mutex};
 
@@ -92,8 +93,16 @@ mod tests {
     }
 
     impl ResponseSink for VecSink {
-        fn emit(&mut self, response: ObjectRpcResponse) -> Result<(), ServiceError> {
-            self.frames.lock().expect("sink lock").push(response);
+        fn send(self: Box<Self>, response: ObjectRpcSessionResponse) -> Result<(), ServiceError> {
+            if !response.body.is_empty() {
+                return Err(ServiceError::Service(
+                    "rollout test sink received an unexpected response body".to_string(),
+                ));
+            }
+            self.frames
+                .lock()
+                .expect("sink lock")
+                .push(response.response);
             Ok(())
         }
     }
@@ -136,12 +145,13 @@ mod tests {
         let data_dir = Arc::new(SinomoDataDir::new(&dir));
         let sink = VecSink::default();
         let frames = Arc::clone(&sink.frames);
-        let ctx = ServiceContext {
+        let ctx = ServiceContext::new(
             data_dir,
-            cluster: None,
-            signer: ServiceSigner::Local,
-            sink: Box::new(sink),
-        };
+            None,
+            ServiceSigner::Local,
+            ObjectRpcIncomingBody::empty(),
+            Box::new(sink),
+        );
         let request = ObjectRpcRequest::encode_body(
             ROLLOUT_DIAGNOSTICS_ROUTE,
             crate::ROLLOUT_RPC_CATEGORY,

@@ -36,9 +36,10 @@ before/after build races.
 2. **Purpose-specific endpoint selection.** Refine selection for rollout, Raft,
    member status, and data traffic while preserving the common authorization
    and reachability rules.
-3. **Stream retry budgets.** Extend delivery models with streaming capability
-   and raw-response constraints. Prove that fallback cannot expand the caller's
-   deadline or select an incompatible transport.
+3. **Session retry budgets.** Extend delivery models with body replayability,
+   progress, and finish-attestation constraints. Prove that fallback cannot
+   expand the caller's deadline, replay a one-pass source, or select an
+   incompatible transport.
 
 ## Integrated System
 
@@ -78,9 +79,9 @@ stranding durable jobs with path reservations held.
    whether reopen repairs it automatically or explicit retry owns recovery.
 3. **Chunked patch semantics.** Prove that patch commit validates base version,
    base content, offset, and final content hash.
-4. **Range-read assembly.** Model source retry, stale-source rejection, and
-   chunk assembly. Prove that completed reads match current metadata and that
-   mismatched responses cannot populate local state.
+4. **Range-read body integrity.** Model source retry, stale-source rejection,
+   and streamed-body verification. Prove that completed reads match current
+   metadata and that mismatched responses cannot populate local state.
 5. **Replica placement.** Prove that duplicate candidates, owner normalization,
    and policy widening preserve the configured commit and desired replica
    counts.

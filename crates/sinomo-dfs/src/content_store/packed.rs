@@ -498,7 +498,7 @@ impl LocalContentStore {
             .len();
         let start = offset.min(location.size_bytes);
         let physical_start = location.offset.checked_add(start).ok_or_else(|| {
-            ContentStoreError::InvalidChunkedContent {
+            ContentStoreError::InvalidContentLayout {
                 message: format!(
                     "packed blob offset overflows: segment={}",
                     location.segment_id
@@ -508,14 +508,14 @@ impl LocalContentStore {
         let physical_end = location
             .offset
             .checked_add(location.size_bytes)
-            .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+            .ok_or_else(|| ContentStoreError::InvalidContentLayout {
                 message: format!(
                     "packed blob range overflows: segment={}",
                     location.segment_id
                 ),
             })?;
         if physical_end > segment_len {
-            return Err(ContentStoreError::InvalidChunkedContent {
+            return Err(ContentStoreError::InvalidContentLayout {
                 message: format!(
                     "packed blob range exceeds segment: segment={}, end={}, len={segment_len}",
                     location.segment_id, physical_end

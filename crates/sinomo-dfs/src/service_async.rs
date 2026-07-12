@@ -14,7 +14,7 @@ where
     pub async fn process_incoming_async(
         &mut self,
     ) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
-        self.prune_idle_chunk_transfers();
+        self.prune_idle_transfer_state();
         if self
             .transport
             .pending_incoming_count_async()

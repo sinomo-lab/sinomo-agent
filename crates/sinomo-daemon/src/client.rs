@@ -14,21 +14,21 @@ use sinomo_core::kv::{
     ClusterRaftAppendRequest, ClusterRaftAppendResponse, ClusterRaftVoteRequest,
     ClusterRaftVoteResponse, KvSnapshot,
 };
-use sinomo_core::network::{AsyncDaemonControlStream, NetworkError, ObjectRpcRequest};
+use sinomo_core::network::{
+    NetworkError, ObjectRpcRequest, ObjectRpcSessionCall, ObjectRpcSessionResult,
+};
 use sinomo_core::node::NodeId;
 use sinomo_dfs::{
     DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
     DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
 };
 use sinomo_rollout::{
-    ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse,
-    ClusterRolloutBinaryUploadChunkRequest, ClusterRolloutBinaryUploadChunkResponse,
-    ClusterRolloutBinaryUploadFinalizeRequest, ClusterRolloutBuildRequest,
-    ClusterRolloutNativeDylibModuleRequest, ROLLOUT_BINARY_ROUTE,
-    ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE, ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE, ROLLOUT_BUILD_ROUTE,
+    ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
+    ClusterRolloutNativeDylibModuleRequest, ROLLOUT_BINARY_ROUTE, ROLLOUT_BUILD_ROUTE,
     ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
     ROLLOUT_OBJECT_RPC_ROUTES, ROLLOUT_RPC_CATEGORY,
 };
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 fn object_rpc_request_from_kv_payload(
@@ -254,33 +254,40 @@ pub async fn send_daemon_rpc_stream_async(
     timeouts: sinomo_core::network::DaemonRpcTimeouts,
     mut on_response: impl FnMut(sinomo_core::network::ObjectRpcResponse) -> Result<bool, DaemonError>,
 ) -> Result<(), DaemonError> {
-    let route = request.route.clone();
-    let category = request.category.clone();
-    let body_sha256 = daemon_rpc_body_sha256(request);
-    let signed = tokio::task::spawn_blocking(move || {
-        sign_daemon_rpc_request_digest_for_local_node(&route, &category, body_sha256)
-    })
-    .await
-    .map_err(|source| DaemonError::Network {
-        address: address.to_string(),
-        detail: format!("daemon streaming RPC signing task failed: {source}"),
-    })??;
-    let control_request = request.clone().with_auth(signed);
-    let mut stream = AsyncDaemonControlStream::connect_with_options(address, timeouts).await?;
-    let frame_options =
-        sinomo_core::network::ObjectFrameIoOptions::none().with_idle_timeout(timeouts.idle_timeout);
-    stream
-        .write_request(address, &control_request, frame_options)
-        .await?;
-    stream.shutdown_write(address).await?;
+    let data_dir = local_session_data_dir()?;
+    let runtime = tokio::runtime::Handle::current();
+    let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+    let mut host =
+        DaemonSignedObjectRpcAsyncHost::new(&runtime, false).with_cluster_paths(&cluster_paths);
+    let mut request = request.clone();
+    request.auth = None;
+    let call = sinomo_core::network::ObjectRpcSessionCall::buffered(request);
+    let options = sinomo_core::network::ClusterObjectRpcOptions::new(timeouts);
+    let result = if sinomo_core::network::is_loopback_connect_address(address) {
+        let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
+        client
+            .call_loopback_session(&data_dir, address, call, options)
+            .await?
+    } else {
+        let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+        let endpoint = local_session_endpoint_for_address(&state, address)?;
+        let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(
+            &mut host,
+            &runtime,
+            &cluster_paths,
+        );
+        client
+            .call_endpoint_session(&state, &endpoint, call, options)
+            .await?
+    };
+    let mut body = result.body;
     loop {
-        let rpc = stream
-            .read_response(
-                address,
-                sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
-                frame_options,
-            )
-            .await?;
+        let rpc = sinomo_core::network::read_object_frame_async(
+            &mut body,
+            sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
+            sinomo_core::network::ObjectFrameIoOptions::none(),
+        )
+        .await?;
         if !on_response(rpc)? {
             return Ok(());
         }
@@ -340,8 +347,9 @@ pub fn send_daemon_rpc_to_endpoint_with_timeouts(
 /// retry for a directly addressed daemon during a sequential upgrade.
 ///
 /// Generic daemon RPC never downgrades. This compatibility path is deliberately
-/// limited to rollout routes and the rollout status poll; mixed-version routed
-/// and data-plane RPC remain incompatible during the upgrade window.
+/// limited to head-only rollout routes and the rollout status poll. Canonical
+/// session routes such as rollout build/binary, mixed-version routed RPC, and
+/// data-plane RPC remain incompatible during the upgrade window.
 pub fn send_daemon_rpc_with_rollout_legacy_compatibility(
     address: &str,
     request: &ObjectRpcRequest,
@@ -461,7 +469,7 @@ async fn send_daemon_rpc_to_endpoint_with_rollout_legacy_compatibility_async(
 fn rollout_legacy_auth_fallback_denied(request: &ObjectRpcRequest) -> DaemonError {
     DaemonError::Parse {
         detail: format!(
-            "legacy daemon auth compatibility is limited to rollout/status RPCs with a metadata-free fallback; route {} is not eligible",
+            "legacy daemon auth compatibility is limited to head-only rollout/status RPCs with a metadata-free fallback; route {} is not eligible",
             request.route
         ),
     }
@@ -587,6 +595,27 @@ pub(crate) async fn send_daemon_rpc_to_target_async_with_daemon_paths_and_networ
     client
         .call_target(&state, target_node_id, request, options)
         .await
+}
+
+pub(crate) async fn send_object_rpc_session_to_target_async_with_daemon_paths_and_options(
+    daemon_paths: &DaemonPaths,
+    target_node_id: &NodeId,
+    call: ObjectRpcSessionCall,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+    runtime: &tokio::runtime::Handle,
+    observe_connectivity: bool,
+) -> Result<ObjectRpcSessionResult, DaemonError> {
+    let data_dir = daemon_data_dir_from_paths(daemon_paths)?;
+    let paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+    let state = sinomo_core::cluster::read_cluster_state(&paths)?;
+    let mut host =
+        DaemonSignedObjectRpcAsyncHost::new(runtime, observe_connectivity).with_paths(daemon_paths);
+    let mut client =
+        sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, runtime, &paths);
+    client
+        .call_target_session(&state, target_node_id, call, options)
+        .await
+        .map_err(DaemonError::from)
 }
 
 fn block_on_daemon_client<F, T>(future: F) -> Result<T, DaemonError>
@@ -1085,123 +1114,6 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonSignedObjec
             result
         })
     }
-
-    fn send_signed_endpoint_stream_response_rpc_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        auth: &'a [u8],
-        request: &'a ObjectRpcRequest,
-        timeouts: sinomo_core::network::DaemonRpcTimeouts,
-    ) -> sinomo_core::network::ClusterSignedObjectRpcFuture<
-        'a,
-        sinomo_core::network::ObjectRpcStreamResponse,
-    > {
-        let runtime = self.runtime.clone();
-        let use_tcp_tunnel = self.tcp_tunnel_available() && daemon_endpoint_is_tcp_tunnel(endpoint);
-        Box::pin(async move {
-            let started = Instant::now();
-            let result = if use_tcp_tunnel
-                && let Some(result) = crate::tcp_tunnel::send_signed_endpoint_rpc_via_tcp_tunnel(
-                    endpoint,
-                    auth,
-                    request,
-                    timeouts,
-                    &runtime,
-                    self.paths.as_ref(),
-                )
-                .await
-            {
-                result.map(|response| {
-                    sinomo_core::network::ObjectRpcStreamResponse::from_buffered_response(
-                        response,
-                        sinomo_core::network::RawByteStreamChunkOptions {
-                            chunk_bytes: sinomo_core::network::OBJECT_STREAM_MAX_CHUNK_BYTES,
-                            max_total_bytes: u64::try_from(
-                                sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
-                            )
-                            .ok(),
-                            idle_timeout: timeouts.idle_timeout,
-                        },
-                    )
-                })
-            } else {
-                sinomo_core::network::send_daemon_rpc_stream_response_frame_to_cluster_endpoint_async(
-                    endpoint,
-                    Some(auth),
-                    request,
-                    timeouts,
-                )
-                .await
-            };
-            let observation =
-                daemon_signed_endpoint_stream_response_observation(result.as_ref(), started);
-            let _ = self
-                .observe_signed_endpoint_rpc_async(endpoint, observation)
-                .await;
-            result
-        })
-    }
-
-    fn forward_signed_endpoint_stream_rpc_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        auth: &'a [u8],
-        request: &'a ObjectRpcRequest,
-        timeouts: sinomo_core::network::DaemonRpcTimeouts,
-        upstream: &'a mut sinomo_core::network::AsyncDaemonControlStream,
-        upstream_address: &'a str,
-        max_response_bytes: usize,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        sinomo_core::network::ClusterRelayStreamSendOutcome,
-                        sinomo_core::network::NetworkError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        let runtime = self.runtime.clone();
-        let use_tcp_tunnel = self.tcp_tunnel_available() && daemon_endpoint_is_tcp_tunnel(endpoint);
-        Box::pin(async move {
-            let started = Instant::now();
-            let result = if use_tcp_tunnel
-                && let Some(result) = crate::tcp_tunnel::forward_signed_endpoint_rpc_via_tcp_tunnel(
-                    endpoint,
-                    auth,
-                    request,
-                    timeouts,
-                    upstream,
-                    upstream_address,
-                    max_response_bytes,
-                    &runtime,
-                    self.paths.as_ref(),
-                )
-                .await
-            {
-                result
-            } else {
-                let mut signed = request.clone();
-                signed.auth = Some(auth.to_vec());
-                sinomo_core::network::forward_streamed_daemon_rpc_to_cluster_endpoint_async(
-                    endpoint,
-                    &signed,
-                    timeouts,
-                    upstream,
-                    upstream_address,
-                    max_response_bytes,
-                )
-                .await
-            };
-            let observation =
-                daemon_signed_endpoint_stream_send_observation(result.as_ref(), started);
-            let _ = self
-                .observe_signed_endpoint_rpc_async(endpoint, observation)
-                .await;
-            result
-        })
-    }
 }
 
 fn daemon_paths_from_cluster_paths(
@@ -1222,20 +1134,13 @@ fn daemon_endpoint_is_tcp_tunnel(endpoint: &ClusterEndpointRecord) -> bool {
 
 fn rollout_legacy_auth_fallback_request(request: &ObjectRpcRequest) -> Option<ObjectRpcRequest> {
     let eligible_route = request.route == crate::DAEMON_STATUS_ROUTE
-        || ROLLOUT_OBJECT_RPC_ROUTES.contains(&request.route.as_str());
+        || (request.route != ROLLOUT_BUILD_ROUTE
+            && ROLLOUT_OBJECT_RPC_ROUTES.contains(&request.route.as_str()));
     if !eligible_route {
         return None;
     }
     if request.metadata.is_empty() {
         return Some(request.clone());
-    }
-    if request.route == ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE
-        && request.metadata.len() == 1
-        && request.is_response_retry_safe()
-    {
-        let mut fallback = request.clone();
-        fallback.metadata.clear();
-        return Some(fallback);
     }
     None
 }
@@ -1360,48 +1265,6 @@ fn daemon_signed_endpoint_object_rpc_observation(
         Ok(_) => sinomo_core::network::ClusterSignedObjectRpcObservation::success(Some(
             daemon_signed_endpoint_rpc_elapsed_latency_ms(started),
         )),
-        Err(sinomo_core::network::NetworkError::AuthDenied) => {
-            sinomo_core::network::ClusterSignedObjectRpcObservation::auth_denied()
-        }
-        Err(_) => sinomo_core::network::ClusterSignedObjectRpcObservation::io_failure(),
-    }
-}
-
-fn daemon_signed_endpoint_stream_response_observation(
-    result: Result<
-        &sinomo_core::network::ObjectRpcStreamResponse,
-        &sinomo_core::network::NetworkError,
-    >,
-    started: Instant,
-) -> sinomo_core::network::ClusterSignedObjectRpcObservation {
-    match result {
-        Ok(response) => {
-            daemon_signed_endpoint_object_rpc_observation(Ok(&response.response), started)
-        }
-        Err(error) => daemon_signed_endpoint_object_rpc_observation(Err(error), started),
-    }
-}
-
-fn daemon_signed_endpoint_stream_send_observation(
-    result: Result<
-        &sinomo_core::network::ClusterRelayStreamSendOutcome,
-        &sinomo_core::network::NetworkError,
-    >,
-    started: Instant,
-) -> sinomo_core::network::ClusterSignedObjectRpcObservation {
-    match result {
-        Ok(sinomo_core::network::ClusterRelayStreamSendOutcome::Forwarded)
-        | Ok(sinomo_core::network::ClusterRelayStreamSendOutcome::RoutingError(_)) => {
-            sinomo_core::network::ClusterSignedObjectRpcObservation::success(Some(
-                daemon_signed_endpoint_rpc_elapsed_latency_ms(started),
-            ))
-        }
-        Ok(sinomo_core::network::ClusterRelayStreamSendOutcome::StreamStartedThenFailed(
-            sinomo_core::network::NetworkError::AuthDenied,
-        )) => sinomo_core::network::ClusterSignedObjectRpcObservation::auth_denied(),
-        Ok(sinomo_core::network::ClusterRelayStreamSendOutcome::StreamStartedThenFailed(_)) => {
-            sinomo_core::network::ClusterSignedObjectRpcObservation::io_failure()
-        }
         Err(sinomo_core::network::NetworkError::AuthDenied) => {
             sinomo_core::network::ClusterSignedObjectRpcObservation::auth_denied()
         }
@@ -1644,6 +1507,30 @@ pub(crate) fn send_object_rpc_to_target_on_runtime_with_daemon_paths_and_options
             &daemon_paths,
             &target_node_id,
             &request,
+            options,
+            &runtime_for_future,
+            observe_connectivity,
+        )
+        .await
+    })
+}
+
+pub(crate) fn send_object_rpc_session_to_target_on_runtime_with_daemon_paths_and_options(
+    daemon_paths: &DaemonPaths,
+    target_node_id: &NodeId,
+    call: ObjectRpcSessionCall,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+    runtime: &tokio::runtime::Handle,
+    observe_connectivity: bool,
+) -> Result<ObjectRpcSessionResult, DaemonError> {
+    let daemon_paths = daemon_paths.clone();
+    let target_node_id = target_node_id.clone();
+    let runtime_for_future = runtime.clone();
+    block_on_daemon_client_on_owner_runtime(runtime, async move {
+        send_object_rpc_session_to_target_async_with_daemon_paths_and_options(
+            &daemon_paths,
+            &target_node_id,
+            call,
             options,
             &runtime_for_future,
             observe_connectivity,
@@ -1917,97 +1804,210 @@ pub(crate) async fn send_cluster_member_publish_async(
 pub fn send_daemon_rollout_binary(
     address: &str,
     request: &ClusterRolloutBinaryRequest,
-    timeout: Duration,
+    body_path: &Path,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    send_daemon_rollout_compatible_body(
-        address,
-        ROLLOUT_BINARY_ROUTE,
-        ROLLOUT_RPC_CATEGORY,
+    let (cluster_paths, state) = local_session_cluster_state()?;
+    let endpoint = state
+        .members
+        .iter()
+        .flat_map(|member| member.endpoints.iter())
+        .find(|endpoint| endpoint.address == address)
+        .cloned()
+        .ok_or_else(|| DaemonError::Network {
+            address: address.to_string(),
+            detail: "rollout session endpoint is not authorized in local cluster state".to_string(),
+        })?;
+    send_daemon_rollout_binary_to_endpoint_with_state(
+        &cluster_paths,
+        &state,
+        &endpoint,
         request,
-        timeout,
+        body_path,
     )
 }
 
 pub fn send_daemon_rollout_binary_to_endpoint(
     endpoint: &ClusterEndpointRecord,
     request: &ClusterRolloutBinaryRequest,
-    timeout: Duration,
+    body_path: &Path,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    send_daemon_rollout_compatible_body_to_endpoint(
+    let (cluster_paths, state) = local_session_cluster_state()?;
+    send_daemon_rollout_binary_to_endpoint_with_state(
+        &cluster_paths,
+        &state,
         endpoint,
-        ROLLOUT_BINARY_ROUTE,
-        ROLLOUT_RPC_CATEGORY,
         request,
-        timeout,
+        body_path,
     )
 }
 
-pub fn send_daemon_rollout_binary_upload_chunk(
+pub fn send_daemon_rollout_binary_to_target(
+    target_node_id: &NodeId,
+    request: &ClusterRolloutBinaryRequest,
+    body_path: &Path,
+) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    let (cluster_paths, state) = local_session_cluster_state()?;
+    block_on_rollout_session(send_daemon_rollout_binary_to_target_async(
+        cluster_paths,
+        state,
+        target_node_id.clone(),
+        request.clone(),
+        body_path.to_path_buf(),
+    ))
+}
+
+fn local_session_cluster_state() -> Result<
+    (
+        sinomo_core::network::ClusterPaths,
+        sinomo_core::ClusterBootstrapState,
+    ),
+    DaemonError,
+> {
+    let data_dir = local_session_data_dir()?;
+    let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+    Ok((cluster_paths, state))
+}
+
+fn local_session_data_dir() -> Result<sinomo_core::local::SinomoDataDir, DaemonError> {
+    sinomo_core::local::SinomoDataDir::from_env_or_home().map_err(|source| DaemonError::Io {
+        path: "Sinomo data directory".to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn local_session_endpoint_for_address(
+    state: &sinomo_core::ClusterBootstrapState,
     address: &str,
-    request: &ClusterRolloutBinaryUploadChunkRequest,
-    timeout: Duration,
-) -> Result<ClusterRolloutBinaryUploadChunkResponse, DaemonError> {
-    let request = ObjectRpcRequest::encode_body(
-        ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
-        ROLLOUT_RPC_CATEGORY,
-        request,
-    )?
-    .with_response_retry_safe();
-    send_daemon_rpc_with_rollout_legacy_compatibility(
-        address,
-        &request,
-        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
-    )?
-    .decode_body()
-    .map_err(Into::into)
+) -> Result<ClusterEndpointRecord, DaemonError> {
+    if let Some(endpoint) = state
+        .members
+        .iter()
+        .flat_map(|member| member.endpoints.iter())
+        .find(|endpoint| endpoint.address == address)
+    {
+        return Ok(endpoint.clone());
+    }
+    Err(DaemonError::Network {
+        address: address.to_string(),
+        detail: "daemon session endpoint is not authorized in local cluster state".to_string(),
+    })
 }
 
-pub fn send_daemon_rollout_binary_upload_chunk_to_endpoint(
+fn send_daemon_rollout_binary_to_endpoint_with_state(
+    cluster_paths: &sinomo_core::network::ClusterPaths,
+    state: &sinomo_core::ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
-    request: &ClusterRolloutBinaryUploadChunkRequest,
-    timeout: Duration,
-) -> Result<ClusterRolloutBinaryUploadChunkResponse, DaemonError> {
-    let request = ObjectRpcRequest::encode_body(
-        ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
-        ROLLOUT_RPC_CATEGORY,
-        request,
-    )?
-    .with_response_retry_safe();
-    send_daemon_rpc_to_endpoint_with_rollout_legacy_compatibility(
-        endpoint,
-        &request,
-        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
-    )?
-    .decode_body()
-    .map_err(Into::into)
+    request: &ClusterRolloutBinaryRequest,
+    body_path: &Path,
+) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    block_on_rollout_session(send_daemon_rollout_binary_to_endpoint_async(
+        cluster_paths.clone(),
+        state.clone(),
+        endpoint.clone(),
+        request.clone(),
+        body_path.to_path_buf(),
+    ))
 }
 
-pub fn send_daemon_rollout_binary_upload_finalize(
-    address: &str,
-    request: &ClusterRolloutBinaryUploadFinalizeRequest,
-    timeout: Duration,
-) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    send_daemon_rollout_compatible_body(
-        address,
-        ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
-        ROLLOUT_RPC_CATEGORY,
-        request,
-        timeout,
-    )
+fn block_on_rollout_session<F, T>(future: F) -> Result<T, DaemonError>
+where
+    F: std::future::Future<Output = Result<T, DaemonError>> + Send,
+    T: Send,
+{
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        return block_on_daemon_client_on_owner_runtime(&runtime, future);
+    }
+    block_on_daemon_client_on_ephemeral_sync_runtime(future)
 }
 
-pub fn send_daemon_rollout_binary_upload_finalize_to_endpoint(
-    endpoint: &ClusterEndpointRecord,
-    request: &ClusterRolloutBinaryUploadFinalizeRequest,
-    timeout: Duration,
+fn rollout_binary_session_call(
+    request: &ClusterRolloutBinaryRequest,
+    body_path: &Path,
+) -> Result<sinomo_core::network::ObjectRpcSessionCall, DaemonError> {
+    let artifact = request
+        .manifest
+        .artifact(&request.artifact_id)
+        .ok_or_else(|| DaemonError::Parse {
+            detail: format!(
+                "rollout manifest does not contain artifact {}",
+                request.artifact_id
+            ),
+        })?;
+    let body = sinomo_core::network::ObjectRpcBodySource::file(body_path.to_path_buf())?;
+    if body.total_bytes() != Some(artifact.total_bytes) {
+        return Err(DaemonError::Io {
+            path: body_path.display().to_string(),
+            detail: format!(
+                "rollout artifact size changed after preparation: expected {}, found {}",
+                artifact.total_bytes,
+                body.total_bytes().unwrap_or_default()
+            ),
+        });
+    }
+    let head = ObjectRpcRequest::encode_body(ROLLOUT_BINARY_ROUTE, ROLLOUT_RPC_CATEGORY, request)?
+        .with_operation_id(format!(
+            "{}:{}",
+            request.manifest.upload_id, request.artifact_id
+        ))
+        .with_response_retry_safe();
+    Ok(sinomo_core::network::ObjectRpcSessionCall::new(head, body))
+}
+
+async fn send_daemon_rollout_binary_to_endpoint_async(
+    cluster_paths: sinomo_core::network::ClusterPaths,
+    state: sinomo_core::ClusterBootstrapState,
+    endpoint: ClusterEndpointRecord,
+    request: ClusterRolloutBinaryRequest,
+    body_path: std::path::PathBuf,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    send_daemon_rollout_compatible_body_to_endpoint(
-        endpoint,
-        ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
-        ROLLOUT_RPC_CATEGORY,
-        request,
-        timeout,
-    )
+    let runtime = tokio::runtime::Handle::current();
+    let mut host =
+        DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+    let mut client =
+        sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &runtime, &cluster_paths);
+    let result = client
+        .call_endpoint_session(
+            &state,
+            &endpoint,
+            rollout_binary_session_call(&request, &body_path)?,
+            sinomo_core::network::ClusterObjectRpcOptions::default(),
+        )
+        .await?;
+    if !result.body.is_empty() {
+        return Err(DaemonError::Parse {
+            detail: "rollout binary response unexpectedly contained a body attachment".to_string(),
+        });
+    }
+    result.response.decode_body().map_err(Into::into)
+}
+
+async fn send_daemon_rollout_binary_to_target_async(
+    cluster_paths: sinomo_core::network::ClusterPaths,
+    state: sinomo_core::ClusterBootstrapState,
+    target_node_id: NodeId,
+    request: ClusterRolloutBinaryRequest,
+    body_path: std::path::PathBuf,
+) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    let runtime = tokio::runtime::Handle::current();
+    let mut host =
+        DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+    let mut client =
+        sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &runtime, &cluster_paths);
+    let result = client
+        .call_target_session(
+            &state,
+            &target_node_id,
+            rollout_binary_session_call(&request, &body_path)?,
+            sinomo_core::network::ClusterObjectRpcOptions::default(),
+        )
+        .await?;
+    if !result.body.is_empty() {
+        return Err(DaemonError::Parse {
+            detail: "rollout binary response unexpectedly contained a body attachment".to_string(),
+        });
+    }
+    result.response.decode_body().map_err(Into::into)
 }
 
 pub fn send_daemon_rollout_native_dylib_module(
@@ -2041,49 +2041,146 @@ pub fn send_daemon_rollout_native_dylib_module_to_endpoint(
 pub fn send_daemon_rollout_build(
     address: &str,
     request: &ClusterRolloutBuildRequest,
-    timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    send_daemon_rollout_build_with_timeouts(
-        address,
-        request,
-        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
-    )
-}
-
-pub fn send_daemon_rollout_build_with_timeouts(
-    address: &str,
-    request: &ClusterRolloutBuildRequest,
-    timeouts: sinomo_core::network::DaemonRpcTimeouts,
-) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    let request =
-        ObjectRpcRequest::encode_body(ROLLOUT_BUILD_ROUTE, ROLLOUT_RPC_CATEGORY, request)?;
-    send_daemon_rpc_with_rollout_legacy_compatibility(address, &request, timeouts)?
-        .decode_body()
-        .map_err(Into::into)
+    let data_dir = local_session_data_dir()?;
+    let address = address.to_string();
+    let request = request.clone();
+    block_on_rollout_session(async move {
+        let runtime = tokio::runtime::Handle::current();
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        let mut host =
+            DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+        let result = if sinomo_core::network::is_loopback_connect_address(&address) {
+            let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
+            client
+                .call_loopback_session(
+                    &data_dir,
+                    &address,
+                    rollout_build_session_call(request)?,
+                    sinomo_core::network::ClusterObjectRpcOptions::default(),
+                )
+                .await?
+        } else {
+            let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+            let endpoint = local_session_endpoint_for_address(&state, &address)?;
+            let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(
+                &mut host,
+                &runtime,
+                &cluster_paths,
+            );
+            client
+                .call_endpoint_session(
+                    &state,
+                    &endpoint,
+                    rollout_build_session_call(request)?,
+                    sinomo_core::network::ClusterObjectRpcOptions::default(),
+                )
+                .await?
+        };
+        decode_rollout_build_session_result(result)
+    })
 }
 
 pub fn send_daemon_rollout_build_to_endpoint(
     endpoint: &ClusterEndpointRecord,
     request: &ClusterRolloutBuildRequest,
-    timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    send_daemon_rollout_build_to_endpoint_with_timeouts(
-        endpoint,
-        request,
-        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
-    )
+    let data_dir = local_session_data_dir()?;
+    let endpoint = endpoint.clone();
+    let request = request.clone();
+    block_on_rollout_session(async move {
+        let runtime = tokio::runtime::Handle::current();
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        let mut host =
+            DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+        let result = if sinomo_core::network::is_loopback_connect_address(&endpoint.address) {
+            let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
+            client
+                .call_loopback_session(
+                    &data_dir,
+                    &endpoint.address,
+                    rollout_build_session_call(request)?,
+                    sinomo_core::network::ClusterObjectRpcOptions::default(),
+                )
+                .await?
+        } else {
+            let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+            let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(
+                &mut host,
+                &runtime,
+                &cluster_paths,
+            );
+            client
+                .call_endpoint_session(
+                    &state,
+                    &endpoint,
+                    rollout_build_session_call(request)?,
+                    sinomo_core::network::ClusterObjectRpcOptions::default(),
+                )
+                .await?
+        };
+        decode_rollout_build_session_result(result)
+    })
 }
 
-pub fn send_daemon_rollout_build_to_endpoint_with_timeouts(
-    endpoint: &ClusterEndpointRecord,
+pub fn send_daemon_rollout_build_to_target(
+    target_node_id: &NodeId,
     request: &ClusterRolloutBuildRequest,
-    timeouts: sinomo_core::network::DaemonRpcTimeouts,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    let request =
-        ObjectRpcRequest::encode_body(ROLLOUT_BUILD_ROUTE, ROLLOUT_RPC_CATEGORY, request)?;
-    send_daemon_rpc_to_endpoint_with_rollout_legacy_compatibility(endpoint, &request, timeouts)?
-        .decode_body()
-        .map_err(Into::into)
+    let (cluster_paths, state) = local_session_cluster_state()?;
+    let target_node_id = target_node_id.clone();
+    let request = request.clone();
+    block_on_rollout_session(async move {
+        let runtime = tokio::runtime::Handle::current();
+        let mut host =
+            DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+        let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(
+            &mut host,
+            &runtime,
+            &cluster_paths,
+        );
+        let result = client
+            .call_target_session(
+                &state,
+                &target_node_id,
+                rollout_build_session_call(request)?,
+                sinomo_core::network::ClusterObjectRpcOptions::default(),
+            )
+            .await?;
+        decode_rollout_build_session_result(result)
+    })
+}
+
+fn rollout_build_session_call(
+    mut head_payload: ClusterRolloutBuildRequest,
+) -> Result<ObjectRpcSessionCall, DaemonError> {
+    let operation_id = format!("rollout-build:{}", head_payload.requested_at);
+    let source_bundle = match head_payload.source_bundle.take() {
+        Some(source_bundle) if !source_bundle.is_empty() => source_bundle,
+        Some(source_bundle) => {
+            head_payload.source_bundle = Some(source_bundle);
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+    let head =
+        ObjectRpcRequest::encode_body(ROLLOUT_BUILD_ROUTE, ROLLOUT_RPC_CATEGORY, &head_payload)?
+            .with_operation_id(operation_id);
+    Ok(ObjectRpcSessionCall::new(
+        head,
+        sinomo_core::network::ObjectRpcBodySource::bytes(source_bundle),
+    ))
+}
+
+fn decode_rollout_build_session_result(
+    result: ObjectRpcSessionResult,
+) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    if !result.body.is_empty() {
+        return Err(DaemonError::Parse {
+            detail: "rollout build response unexpectedly contained a body attachment".to_string(),
+        });
+    }
+    result.response.decode_body().map_err(Into::into)
 }
 
 pub fn send_daemon_rollout_clear_status(
@@ -2152,6 +2249,37 @@ mod tests {
         assert_eq!(
             timeouts.idle_timeout,
             Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn rollout_build_session_moves_source_bundle_out_of_request_head() {
+        let source_bundle = vec![7_u8; 32 * 1024];
+        let request = sinomo_rollout::ClusterRolloutBuildRequest {
+            source: "test-source".to_string(),
+            remote_repo: None,
+            source_bundle: Some(source_bundle.clone()),
+            source_head: Some("abc123".to_string()),
+            force_source_overwrite: false,
+            host: "127.0.0.1".to_string(),
+            port: 21_353,
+            shadow_port: 21_354,
+            requested_at: "2026-07-12T00:00:00Z".to_string(),
+        };
+
+        let call = super::rollout_build_session_call(request).expect("session call");
+        let head: sinomo_rollout::ClusterRolloutBuildRequest =
+            call.request.decode_body().expect("request head");
+
+        assert_eq!(head.source_bundle, None);
+        assert_eq!(call.body.total_bytes(), Some(source_bundle.len() as u64));
+        assert_eq!(
+            call.request.operation_id(),
+            Some("rollout-build:2026-07-12T00:00:00Z")
+        );
+        assert!(
+            !call.request.is_response_retry_safe(),
+            "remote builds are not idempotent and must not retry after possible delivery"
         );
     }
 
@@ -2744,7 +2872,7 @@ mod tests {
                         )
                         .await
                         .expect("request");
-                    assert_eq!(request.route, sinomo_rollout::ROLLOUT_BUILD_ROUTE);
+                    assert_eq!(request.route, sinomo_rollout::ROLLOUT_CLEAR_STATUS_ROUTE);
                     assert!(request.metadata.is_empty());
                     let auth: sinomo_core::network::SignedDaemonCommand =
                         sinomo_core::network::SinomoObjectCodec::default()
@@ -2805,7 +2933,7 @@ mod tests {
                 last_observed_latency_ms: None,
             };
             let request = ObjectRpcRequest::encode_body(
-                sinomo_rollout::ROLLOUT_BUILD_ROUTE,
+                sinomo_rollout::ROLLOUT_CLEAR_STATUS_ROUTE,
                 sinomo_rollout::ROLLOUT_RPC_CATEGORY,
                 &(),
             )
@@ -2866,6 +2994,7 @@ mod tests {
                         )
                         .await
                         .expect("request");
+                    assert_eq!(request.route, sinomo_rollout::ROLLOUT_CLEAR_STATUS_ROUTE);
                     let auth: sinomo_core::network::SignedDaemonCommand =
                         sinomo_core::network::SinomoObjectCodec::default()
                             .decode(request.auth.as_deref().expect("signed request"))
@@ -2911,7 +3040,7 @@ mod tests {
             });
 
             let request = ObjectRpcRequest::encode_body(
-                sinomo_rollout::ROLLOUT_BUILD_ROUTE,
+                sinomo_rollout::ROLLOUT_CLEAR_STATUS_ROUTE,
                 sinomo_rollout::ROLLOUT_RPC_CATEGORY,
                 &(),
             )
@@ -2955,20 +3084,29 @@ mod tests {
     }
 
     #[test]
-    fn rollout_chunk_legacy_fallback_strips_retry_metadata() {
+    fn rollout_body_session_does_not_downgrade_metadata_bound_auth() {
         let request = ObjectRpcRequest::encode_body(
-            sinomo_rollout::ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
+            sinomo_rollout::ROLLOUT_BINARY_ROUTE,
             sinomo_rollout::ROLLOUT_RPC_CATEGORY,
             &(),
         )
-        .expect("chunk request")
+        .expect("rollout request")
+        .with_operation_id("rollout-test:binary")
         .with_response_retry_safe();
-        let fallback = super::rollout_legacy_auth_fallback_request(&request)
-            .expect("chunk is rollout-compatible");
 
         assert!(request.is_response_retry_safe());
-        assert!(fallback.metadata.is_empty());
-        assert_eq!(fallback.body, request.body);
+        assert!(super::rollout_legacy_auth_fallback_request(&request).is_none());
+
+        let build = ObjectRpcRequest::encode_body(
+            sinomo_rollout::ROLLOUT_BUILD_ROUTE,
+            sinomo_rollout::ROLLOUT_RPC_CATEGORY,
+            &(),
+        )
+        .expect("build request");
+        assert!(
+            super::rollout_legacy_auth_fallback_request(&build).is_none(),
+            "rollout builds require the canonical session wire even before metadata is attached"
+        );
 
         let ordinary = ObjectRpcRequest::encode_body("/dfs/status", "dfs", &())
             .expect("ordinary request")
@@ -3060,25 +3198,6 @@ mod tests {
             std::time::Instant::now(),
         );
         assert!(io.is_io_failure());
-    }
-
-    #[test]
-    fn daemon_signed_endpoint_stream_observation_preserves_late_auth_denied() {
-        let auth_denied = super::daemon_signed_endpoint_stream_send_observation(
-            Ok(
-                &sinomo_core::network::ClusterRelayStreamSendOutcome::StreamStartedThenFailed(
-                    sinomo_core::network::NetworkError::AuthDenied,
-                ),
-            ),
-            std::time::Instant::now(),
-        );
-        assert!(auth_denied.is_auth_denied());
-
-        let forwarded = super::daemon_signed_endpoint_stream_send_observation(
-            Ok(&sinomo_core::network::ClusterRelayStreamSendOutcome::Forwarded),
-            std::time::Instant::now(),
-        );
-        assert!(forwarded.is_success());
     }
 
     #[test]

@@ -1,6 +1,8 @@
+use crate::transfer::{TransferDigest, TransferId};
 use crate::{ClusterPaths, NetworkError, ObjectRpcRequest, SinomoObjectCodec};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::digest;
+use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use sinomo_local::SinomoDataDir;
 use sinomo_node::load_or_create_main_node_identity;
@@ -14,6 +16,9 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 pub const DAEMON_AUTH_PROTOCOL: &str = "sinomo.daemon-auth.v1";
+pub const SESSION_FRAME_PROOF_PROTOCOL: &str = "sinomo.rpc-session-frame.v1";
+pub(crate) const BODY_FINISH_PROOF_PROTOCOL: &str = "sinomo.rpc-body-finish.v1";
+pub(crate) const RESPONSE_HEAD_PROOF_PROTOCOL: &str = "sinomo.rpc-response-head.v1";
 
 const DAEMON_RPC_REQUEST_DIGEST_DOMAIN: &[u8] = b"sinomo.daemon-rpc-request\0";
 
@@ -26,6 +31,74 @@ struct CachedDaemonSigningIdentity {
     node_id: String,
     public_key: Vec<u8>,
     key_pair: Arc<ring::signature::Ed25519KeyPair>,
+}
+
+/// Session-local signer loaded once when a duplex stream is established.
+///
+/// Looking up the daemon identity for every data frame would also re-read the
+/// cluster state to refresh its node label, adding filesystem I/O to the hot
+/// transfer loop. A session has one stable identity for its whole transcript,
+/// so capture it once and reuse the key pair.
+#[derive(Clone)]
+pub(crate) struct SessionFrameSigner {
+    identity: CachedDaemonSigningIdentity,
+}
+
+impl SessionFrameSigner {
+    pub(crate) fn from_data_dir(data_dir: &SinomoDataDir) -> Result<Self, NetworkError> {
+        Ok(Self {
+            identity: cached_daemon_signing_identity(data_dir)?,
+        })
+    }
+
+    pub(crate) fn sign(&self, input: SessionFrameProofInput) -> SignedSessionFrameProof {
+        let transcript_digest = session_frame_transcript_digest(&input);
+        let identity = &self.identity;
+        let payload = session_frame_signing_payload(
+            &identity.node_id,
+            &identity.public_key,
+            transcript_digest,
+        );
+        let signature = identity.key_pair.sign(&payload);
+        SignedSessionFrameProof {
+            protocol: SESSION_FRAME_PROOF_PROTOCOL.to_string(),
+            signer_node_id: identity.node_id.clone(),
+            public_key: identity.public_key.clone(),
+            input,
+            transcript_digest,
+            signature: signature.as_ref().to_vec(),
+        }
+    }
+
+    pub(crate) fn sign_body_finish(&self, input: BodyFinishProofInput) -> SignedBodyFinishProof {
+        let identity = &self.identity;
+        let payload = body_finish_signing_payload(&identity.node_id, &identity.public_key, &input);
+        let signature = identity.key_pair.sign(&payload);
+        SignedBodyFinishProof {
+            protocol: BODY_FINISH_PROOF_PROTOCOL.to_string(),
+            signer_node_id: identity.node_id.clone(),
+            public_key: identity.public_key.clone(),
+            input,
+            signature: signature.as_ref().to_vec(),
+        }
+    }
+
+    pub(crate) fn sign_response_head(
+        &self,
+        input: ResponseHeadProofInput,
+    ) -> SignedResponseHeadProof {
+        let identity = &self.identity;
+        let payload =
+            response_head_signing_payload(&identity.node_id, &identity.public_key, &input);
+        let signature = identity.key_pair.sign(&payload);
+        SignedResponseHeadProof {
+            protocol: RESPONSE_HEAD_PROOF_PROTOCOL.to_string(),
+            signer_node_id: identity.node_id.clone(),
+            public_key: identity.public_key.clone(),
+            input,
+            signature: signature.as_ref().to_vec(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -51,6 +124,297 @@ pub struct SignedDaemonCommand {
         deserialize_with = "crate::fallible_serde::deserialize_bytes"
     )]
     pub signature: Vec<u8>,
+}
+
+/// Which authenticated peer-to-peer direction owns a session frame sequence.
+/// ACKs for a request body share the responder-to-initiator sequence with the
+/// response body, so one ordered proof chain covers every byte each peer emits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionFrameDirection {
+    InitiatorToResponder,
+    ResponderToInitiator,
+}
+
+impl SessionFrameDirection {
+    const fn domain_byte(self) -> u8 {
+        match self {
+            Self::InitiatorToResponder => 1,
+            Self::ResponderToInitiator => 2,
+        }
+    }
+}
+
+/// Canonical inputs authenticated for one session control or data frame.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SessionFrameProofInput {
+    pub session_id: TransferId,
+    pub direction: SessionFrameDirection,
+    pub sequence: u64,
+    pub previous_digest: TransferDigest,
+    pub frame_header_digest: TransferDigest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_digest: Option<TransferDigest>,
+}
+
+/// Ed25519 proof for one link in an RPC session transcript.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SignedSessionFrameProof {
+    pub protocol: String,
+    pub signer_node_id: String,
+    #[serde(
+        serialize_with = "crate::fallible_serde::serialize_bytes",
+        deserialize_with = "crate::fallible_serde::deserialize_bytes"
+    )]
+    pub public_key: Vec<u8>,
+    pub input: SessionFrameProofInput,
+    pub transcript_digest: TransferDigest,
+    #[serde(
+        serialize_with = "crate::fallible_serde::serialize_bytes",
+        deserialize_with = "crate::fallible_serde::deserialize_bytes"
+    )]
+    pub signature: Vec<u8>,
+}
+
+/// Stable head contract authenticated by the node that originated an attached
+/// request or response body. Relay sessions preserve this binding instead of
+/// replacing it with their hop-local session identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct BodyFinishProofBinding {
+    pub session_id: TransferId,
+    pub direction: SessionFrameDirection,
+    pub head_digest: TransferDigest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct BodyFinishProofInput {
+    pub binding: BodyFinishProofBinding,
+    pub total_bytes: u64,
+    pub digest: TransferDigest,
+}
+
+/// End-to-end Ed25519 attestation for a complete RPC attachment. Link-frame
+/// proofs protect each transport hop; this proof survives relay re-framing and
+/// binds the final bytes to the authenticated origin request/response head.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SignedBodyFinishProof {
+    pub protocol: String,
+    pub signer_node_id: String,
+    #[serde(
+        serialize_with = "crate::fallible_serde::serialize_bytes",
+        deserialize_with = "crate::fallible_serde::deserialize_bytes"
+    )]
+    pub public_key: Vec<u8>,
+    pub input: BodyFinishProofInput,
+    #[serde(
+        serialize_with = "crate::fallible_serde::serialize_bytes",
+        deserialize_with = "crate::fallible_serde::deserialize_bytes"
+    )]
+    pub signature: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ResponseHeadProofInput {
+    pub session_id: TransferId,
+    pub head_digest: TransferDigest,
+}
+
+/// Target-authenticated response head. Unlike a hop transcript proof, this
+/// attestation is carried unchanged through relays and covers empty responses.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SignedResponseHeadProof {
+    pub protocol: String,
+    pub signer_node_id: String,
+    #[serde(
+        serialize_with = "crate::fallible_serde::serialize_bytes",
+        deserialize_with = "crate::fallible_serde::deserialize_bytes"
+    )]
+    pub public_key: Vec<u8>,
+    pub input: ResponseHeadProofInput,
+    #[serde(
+        serialize_with = "crate::fallible_serde::serialize_bytes",
+        deserialize_with = "crate::fallible_serde::deserialize_bytes"
+    )]
+    pub signature: Vec<u8>,
+}
+
+pub fn session_frame_transcript_digest(input: &SessionFrameProofInput) -> TransferDigest {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(SESSION_FRAME_PROOF_PROTOCOL.as_bytes());
+    hasher.update(&[0]);
+    session_frame_hash_bytes(&mut hasher, input.session_id.as_str().as_bytes());
+    hasher.update(&[input.direction.domain_byte()]);
+    hasher.update(&input.sequence.to_be_bytes());
+    hasher.update(input.previous_digest.as_bytes());
+    hasher.update(input.frame_header_digest.as_bytes());
+    match input.payload_digest {
+        Some(payload_digest) => {
+            hasher.update(&[1]);
+            hasher.update(payload_digest.as_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    TransferDigest::new(*hasher.finalize().as_bytes())
+}
+
+fn session_frame_hash_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    hasher.update(&len.to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn session_frame_signing_payload(
+    signer_node_id: &str,
+    public_key: &[u8],
+    transcript_digest: TransferDigest,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(
+        SESSION_FRAME_PROOF_PROTOCOL.len()
+            + signer_node_id.len()
+            + public_key.len()
+            + transcript_digest.as_bytes().len()
+            + 32,
+    );
+    payload.extend_from_slice(SESSION_FRAME_PROOF_PROTOCOL.as_bytes());
+    payload.push(0);
+    session_frame_append_bytes(&mut payload, signer_node_id.as_bytes());
+    session_frame_append_bytes(&mut payload, public_key);
+    payload.extend_from_slice(transcript_digest.as_bytes());
+    payload
+}
+
+fn session_frame_append_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    output.extend_from_slice(&len.to_be_bytes());
+    output.extend_from_slice(bytes);
+}
+
+#[cfg(test)]
+pub fn sign_session_frame_proof_from_data_dir(
+    data_dir: &SinomoDataDir,
+    input: SessionFrameProofInput,
+) -> Result<SignedSessionFrameProof, NetworkError> {
+    Ok(SessionFrameSigner::from_data_dir(data_dir)?.sign(input))
+}
+
+/// Verifies one frame proof against both the expected peer key and the exact
+/// next transcript input. A caller cannot accidentally accept a valid proof
+/// from the wrong session, direction, sequence, or payload.
+pub fn verify_session_frame_proof(
+    proof: &SignedSessionFrameProof,
+    expected_public_key: &[u8],
+    expected_input: &SessionFrameProofInput,
+) -> Result<TransferDigest, NetworkError> {
+    if proof.protocol != SESSION_FRAME_PROOF_PROTOCOL
+        || proof.public_key != expected_public_key
+        || &proof.input != expected_input
+    {
+        return Err(NetworkError::AuthDenied);
+    }
+    let transcript_digest = session_frame_transcript_digest(expected_input);
+    if proof.transcript_digest != transcript_digest {
+        return Err(NetworkError::AuthDenied);
+    }
+    let payload = session_frame_signing_payload(
+        &proof.signer_node_id,
+        expected_public_key,
+        transcript_digest,
+    );
+    UnparsedPublicKey::new(&ED25519, expected_public_key)
+        .verify(&payload, &proof.signature)
+        .map_err(|_| NetworkError::AuthDenied)?;
+    Ok(transcript_digest)
+}
+
+fn body_finish_signing_payload(
+    signer_node_id: &str,
+    public_key: &[u8],
+    input: &BodyFinishProofInput,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(
+        BODY_FINISH_PROOF_PROTOCOL.len()
+            + signer_node_id.len()
+            + public_key.len()
+            + input.binding.session_id.as_str().len()
+            + 128,
+    );
+    payload.extend_from_slice(BODY_FINISH_PROOF_PROTOCOL.as_bytes());
+    payload.push(0);
+    session_frame_append_bytes(&mut payload, signer_node_id.as_bytes());
+    session_frame_append_bytes(&mut payload, public_key);
+    session_frame_append_bytes(&mut payload, input.binding.session_id.as_str().as_bytes());
+    payload.push(input.binding.direction.domain_byte());
+    payload.extend_from_slice(input.binding.head_digest.as_bytes());
+    payload.extend_from_slice(&input.total_bytes.to_be_bytes());
+    payload.extend_from_slice(input.digest.as_bytes());
+    payload
+}
+
+pub(crate) fn verify_body_finish_proof(
+    proof: &SignedBodyFinishProof,
+    expected_signer_node_id: Option<&str>,
+    expected_public_key: &[u8],
+    expected_binding: &BodyFinishProofBinding,
+    expected_total_bytes: u64,
+    expected_digest: TransferDigest,
+) -> Result<(), NetworkError> {
+    if proof.protocol != BODY_FINISH_PROOF_PROTOCOL
+        || expected_signer_node_id.is_some_and(|expected| proof.signer_node_id != expected)
+        || proof.public_key != expected_public_key
+        || &proof.input.binding != expected_binding
+        || proof.input.total_bytes != expected_total_bytes
+        || proof.input.digest != expected_digest
+    {
+        return Err(NetworkError::AuthDenied);
+    }
+    let payload =
+        body_finish_signing_payload(&proof.signer_node_id, expected_public_key, &proof.input);
+    UnparsedPublicKey::new(&ED25519, expected_public_key)
+        .verify(&payload, &proof.signature)
+        .map_err(|_| NetworkError::AuthDenied)
+}
+
+fn response_head_signing_payload(
+    signer_node_id: &str,
+    public_key: &[u8],
+    input: &ResponseHeadProofInput,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(
+        RESPONSE_HEAD_PROOF_PROTOCOL.len()
+            + signer_node_id.len()
+            + public_key.len()
+            + input.session_id.as_str().len()
+            + 64,
+    );
+    payload.extend_from_slice(RESPONSE_HEAD_PROOF_PROTOCOL.as_bytes());
+    payload.push(0);
+    session_frame_append_bytes(&mut payload, signer_node_id.as_bytes());
+    session_frame_append_bytes(&mut payload, public_key);
+    session_frame_append_bytes(&mut payload, input.session_id.as_str().as_bytes());
+    payload.extend_from_slice(input.head_digest.as_bytes());
+    payload
+}
+
+pub(crate) fn verify_response_head_proof(
+    proof: &SignedResponseHeadProof,
+    expected_public_key: &[u8],
+    expected_session_id: &TransferId,
+    expected_head_digest: TransferDigest,
+) -> Result<(), NetworkError> {
+    if proof.protocol != RESPONSE_HEAD_PROOF_PROTOCOL
+        || proof.public_key != expected_public_key
+        || &proof.input.session_id != expected_session_id
+        || proof.input.head_digest != expected_head_digest
+    {
+        return Err(NetworkError::AuthDenied);
+    }
+    let payload =
+        response_head_signing_payload(&proof.signer_node_id, expected_public_key, &proof.input);
+    UnparsedPublicKey::new(&ED25519, expected_public_key)
+        .verify(&payload, &proof.signature)
+        .map_err(|_| NetworkError::AuthDenied)
 }
 
 pub fn sign_daemon_rpc_request_for_local_node(
@@ -491,5 +855,130 @@ mod tests {
             .decode(&second_auth)
             .expect("decode second envelope");
         assert_eq!(second_envelope.node_id, second_node.to_string());
+    }
+
+    fn session_proof_input() -> SessionFrameProofInput {
+        SessionFrameProofInput {
+            session_id: TransferId::generate(),
+            direction: SessionFrameDirection::InitiatorToResponder,
+            sequence: 7,
+            previous_digest: TransferDigest::blake3(b"previous"),
+            frame_header_digest: TransferDigest::blake3(b"header"),
+            payload_digest: Some(TransferDigest::blake3(b"payload")),
+        }
+    }
+
+    #[test]
+    fn session_frame_proof_binds_the_complete_transcript_input() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-session-frame-proof");
+        let data_dir = SinomoDataDir::new(root.path());
+        let input = session_proof_input();
+        let proof = sign_session_frame_proof_from_data_dir(&data_dir, input.clone())
+            .expect("sign frame proof");
+        let next = verify_session_frame_proof(&proof, &proof.public_key, &input)
+            .expect("verify frame proof");
+        assert_eq!(next, session_frame_transcript_digest(&input));
+
+        let mut changed = input.clone();
+        changed.sequence += 1;
+        assert!(matches!(
+            verify_session_frame_proof(&proof, &proof.public_key, &changed),
+            Err(NetworkError::AuthDenied)
+        ));
+
+        changed = input;
+        changed.payload_digest = Some(TransferDigest::blake3(b"tampered"));
+        assert!(matches!(
+            verify_session_frame_proof(&proof, &proof.public_key, &changed),
+            Err(NetworkError::AuthDenied)
+        ));
+    }
+
+    #[test]
+    fn session_frame_proof_rejects_an_unexpected_peer_key() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-session-frame-wrong-peer");
+        let data_dir = SinomoDataDir::new(root.path());
+        let input = session_proof_input();
+        let proof = sign_session_frame_proof_from_data_dir(&data_dir, input.clone())
+            .expect("sign frame proof");
+        assert!(matches!(
+            verify_session_frame_proof(&proof, &[9_u8; 32], &input),
+            Err(NetworkError::AuthDenied)
+        ));
+    }
+
+    #[test]
+    fn body_finish_proof_binds_origin_head_direction_and_final_digest() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-body-finish-proof");
+        let data_dir = SinomoDataDir::new(root.path());
+        let binding = BodyFinishProofBinding {
+            session_id: TransferId::generate(),
+            direction: SessionFrameDirection::InitiatorToResponder,
+            head_digest: TransferDigest::blake3(b"origin request head"),
+        };
+        let digest = TransferDigest::blake3(b"body bytes");
+        let proof = SessionFrameSigner::from_data_dir(&data_dir)
+            .expect("body proof signer")
+            .sign_body_finish(BodyFinishProofInput {
+                binding: binding.clone(),
+                total_bytes: 10,
+                digest,
+            });
+        verify_body_finish_proof(
+            &proof,
+            Some(&proof.signer_node_id),
+            &proof.public_key,
+            &binding,
+            10,
+            digest,
+        )
+        .expect("valid body finish proof");
+
+        let mut wrong_binding = binding.clone();
+        wrong_binding.head_digest = TransferDigest::blake3(b"different request head");
+        assert!(matches!(
+            verify_body_finish_proof(
+                &proof,
+                Some(&proof.signer_node_id),
+                &proof.public_key,
+                &wrong_binding,
+                10,
+                digest,
+            ),
+            Err(NetworkError::AuthDenied)
+        ));
+        assert!(matches!(
+            verify_body_finish_proof(
+                &proof,
+                Some("wrong-origin"),
+                &proof.public_key,
+                &binding,
+                10,
+                digest,
+            ),
+            Err(NetworkError::AuthDenied)
+        ));
+        assert!(matches!(
+            verify_body_finish_proof(
+                &proof,
+                Some(&proof.signer_node_id),
+                &[0_u8; 32],
+                &binding,
+                10,
+                digest,
+            ),
+            Err(NetworkError::AuthDenied)
+        ));
+        assert!(matches!(
+            verify_body_finish_proof(
+                &proof,
+                Some(&proof.signer_node_id),
+                &proof.public_key,
+                &binding,
+                10,
+                TransferDigest::blake3(b"same length!!"),
+            ),
+            Err(NetworkError::AuthDenied)
+        ));
     }
 }

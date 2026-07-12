@@ -11460,17 +11460,6 @@ fn daemon_rollout_timeout_covers_windows_shadow_handoff() {
 }
 
 #[test]
-fn remote_build_rollout_timeout_does_not_idle_timeout_slow_builds() {
-    let timeouts = super::remote_build_rollout_timeouts();
-    assert_eq!(timeouts.idle_timeout, None);
-    assert_eq!(
-        timeouts.connect_timeout,
-        Some(sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT),
-        "remote builds should retain the network default connect timeout"
-    );
-}
-
-#[test]
 fn rollout_progress_bar_formats_known_and_unknown_progress() {
     assert_eq!(rollout_progress_bar(None), "[........................]   -");
     let status = sinomo_runtime::core::ClusterNodeRolloutStatus {

@@ -52,7 +52,7 @@ The default filesystem is SIFS. From this crate's perspective SIFS is ordinary D
 
 Object versions are protected by hash. Rewriting the same `(object_id, version)` with different bytes is rejected. Storage writes use unique temporary files, atomic rename, and fsync of the file and parent directory.
 
-Large objects are represented as manifests over extents. Full-object writes remain the compact fast path, while chunked assembly and write-at patches publish extent manifests so random writes and remote patch replication do not rewrite the full base object. Local APIs expose bounded range reads and range streams for serving large blobs without materializing the whole object in memory.
+Object versions can be represented as manifests over extents. Full-object writes remain the compact single-blob fast path, while write-at patches publish extent manifests so random writes and remote patch replication do not rewrite the full base object. Local APIs expose bounded range reads and range streams for serving large blobs without materializing the whole object in memory.
 
 ### Metadata Backend
 
@@ -119,7 +119,11 @@ Replica-side commands are authorized against object ownership, metadata-shard pr
 
 Repair is restart-aware. On service hydration, persisted intents and receipts rebuild coordinator state and missing-replica jobs. Repair retries have backoff-like scheduling, and a recovered coordinator that no longer has local blob bytes can fetch the blob from another durable replica before repairing a missing node.
 
-Large data-plane flows use chunk windows for stage, repair, fetch, and remote read responses. Chunks include object/version metadata, offsets or chunk indexes, declared total size, and optional checksums; retry paths resume from the next missing prefix instead of reloading or resending entire blobs.
+Large data-plane flows attach byte bodies to the canonical `sinomo-network`
+object-RPC session. DFS heads retain object/version identity, declared size, and
+content hashes, while the network layer owns framing, flow control, health
+timeouts, and replay-safe retries. DFS does not expose transport chunk indexes,
+windows, or resume routes.
 
 ### Lifecycle Maintenance
 

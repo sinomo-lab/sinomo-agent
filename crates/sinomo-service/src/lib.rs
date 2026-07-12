@@ -27,7 +27,6 @@ pub use discovery::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::io::Read;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,7 +34,10 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use sinomo_kv::{KvEntry, KvError, KvTxn, KvTxnResponse};
 use sinomo_local::SinomoDataDir;
-use sinomo_network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse, ObjectRpcRouteReadiness};
+use sinomo_network::{
+    NetworkError, ObjectRpcBodyMode, ObjectRpcBodySource, ObjectRpcIncomingBody, ObjectRpcRequest,
+    ObjectRpcResponse, ObjectRpcRouteReadiness, ObjectRpcSessionResponse,
+};
 
 /// Whether the host should keep serving after a request (`Stop` == daemon shutdown).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,11 +108,13 @@ pub trait ClusterAccess: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<KvTxnResponse, ServiceError>> + Send + 'a>>;
 }
 
-/// Where a service's response frame(s) go: one [`ResponseSink::emit`] for a unary reply,
-/// several for a streamed reply. Owned per request, so the host adapter decides the
-/// destination (network stream, stdout, an in-memory buffer, …).
+/// Where the response to one service request goes.
+///
+/// The sink is consumed by [`ResponseSink::send`], making response delivery exactly
+/// once. The host adapter decides the destination (a network session, stdout, an
+/// in-memory collector, …), while `sinomo-network` owns body framing and transfer.
 pub trait ResponseSink: Send {
-    fn emit(&mut self, response: ObjectRpcResponse) -> Result<(), ServiceError>;
+    fn send(self: Box<Self>, response: ObjectRpcSessionResponse) -> Result<(), ServiceError>;
 }
 
 /// Everything a service needs to serve one request — owned and `'static`, with no daemon
@@ -122,11 +126,27 @@ pub struct ServiceContext {
     pub cluster: Option<Arc<dyn ClusterAccess>>,
     /// Who originated the request.
     pub signer: ServiceSigner,
-    /// Where response frames are written.
-    pub sink: Box<dyn ResponseSink>,
+    request_body: ObjectRpcIncomingBody,
+    response_sink: Option<Box<dyn ResponseSink>>,
 }
 
 impl ServiceContext {
+    pub fn new(
+        data_dir: Arc<SinomoDataDir>,
+        cluster: Option<Arc<dyn ClusterAccess>>,
+        signer: ServiceSigner,
+        request_body: ObjectRpcIncomingBody,
+        response_sink: Box<dyn ResponseSink>,
+    ) -> Self {
+        Self {
+            data_dir,
+            cluster,
+            signer,
+            request_body,
+            response_sink: Some(response_sink),
+        }
+    }
+
     /// Cluster handle for a route that requires consensus, or
     /// [`ServiceError::NotClustered`] when running without a cluster.
     pub fn require_cluster(&self, route: &str) -> Result<Arc<dyn ClusterAccess>, ServiceError> {
@@ -135,26 +155,35 @@ impl ServiceContext {
             .ok_or_else(|| ServiceError::NotClustered(route.to_string()))
     }
 
-    /// Emit a single unary response frame.
+    /// Takes ownership of the optional request body attachment.
+    ///
+    /// A second call returns an empty body. Services choose a high-level sink or
+    /// reader; transport framing and chunk sizes stay inside `sinomo-network`.
+    pub fn take_request_body(&mut self) -> ObjectRpcIncomingBody {
+        std::mem::take(&mut self.request_body)
+    }
+
+    /// Send a response without a body attachment.
     pub fn respond(&mut self, response: ObjectRpcResponse) -> Result<(), ServiceError> {
-        self.sink.emit(response)
+        self.respond_with_body(response, ObjectRpcBodySource::default())
+    }
+
+    /// Send a response with an optional body source managed by `sinomo-network`.
+    pub fn respond_with_body(
+        &mut self,
+        response: ObjectRpcResponse,
+        body: ObjectRpcBodySource,
+    ) -> Result<(), ServiceError> {
+        let sink = self.response_sink.take().ok_or_else(|| {
+            ServiceError::Service("service response was already sent".to_string())
+        })?;
+        sink.send(ObjectRpcSessionResponse { response, body })
     }
 }
 
 /// The future returned by [`Service::handle`] and [`ServiceRegistry::dispatch`].
 pub type ServiceFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ServiceDisposition, ServiceError>> + Send + 'a>>;
-
-pub struct ServiceStreamResponse {
-    pub response: ObjectRpcResponse,
-    pub reader: Option<Box<dyn Read + Send>>,
-    pub chunk_bytes: usize,
-}
-
-/// The future returned by [`Service::handle_stream`] and
-/// [`ServiceRegistry::dispatch_stream_direct`].
-pub type ServiceStreamFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<ServiceStreamResponse, ServiceError>> + Send + 'a>>;
 
 /// A host-agnostic control-plane service: owns object-RPC routes and serves requests
 /// asynchronously. Implementors return `Box::pin(async move { … })`.
@@ -174,20 +203,12 @@ pub trait Service: Send + Sync {
             .map(|route| ServiceRoute::new(route, self.name()))
             .collect()
     }
-    /// Serve a request whose route this service owns, writing the reply via `ctx.sink`,
+    /// Serve a request whose route this service owns, writing the reply via `ctx.respond*`,
     /// and report whether the host should keep running.
     fn handle(&self, ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_>;
-
-    /// Serve a request whose response body should be transferred as a byte stream.
-    /// Services that do not own streamed responses leave this as `None`.
-    fn handle_stream(
-        &self,
-        _ctx: ServiceContext,
-        _request: ObjectRpcRequest,
-    ) -> Option<ServiceStreamFuture<'_>> {
-        None
-    }
 }
+
+pub type ServiceBodyMode = ObjectRpcBodyMode;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceRoute {
@@ -197,6 +218,8 @@ pub struct ServiceRoute {
     pub required_capabilities: Vec<String>,
     pub concurrency_limit: Option<usize>,
     pub timeout_ms: Option<u64>,
+    pub request_body_mode: ServiceBodyMode,
+    pub response_body_mode: ServiceBodyMode,
 }
 
 impl ServiceRoute {
@@ -208,6 +231,8 @@ impl ServiceRoute {
             required_capabilities: Vec::new(),
             concurrency_limit: None,
             timeout_ms: None,
+            request_body_mode: ServiceBodyMode::None,
+            response_body_mode: ServiceBodyMode::None,
         }
     }
 
@@ -255,6 +280,16 @@ impl ServiceRoute {
         self.timeout_ms = Some(timeout.as_millis().min(u128::from(u64::MAX)) as u64);
         self
     }
+
+    pub fn with_request_body_mode(mut self, mode: ServiceBodyMode) -> Self {
+        self.request_body_mode = mode;
+        self
+    }
+
+    pub fn with_response_body_mode(mut self, mode: ServiceBodyMode) -> Self {
+        self.response_body_mode = mode;
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -265,6 +300,8 @@ struct RouteOwner {
     required_capabilities: Vec<String>,
     concurrency_limit: Option<usize>,
     timeout_ms: Option<u64>,
+    request_body_mode: ServiceBodyMode,
+    response_body_mode: ServiceBodyMode,
 }
 
 /// Dispatches object-RPC requests to the service that owns the request's route and
@@ -324,47 +361,6 @@ impl ServiceRegistry {
         }
     }
 
-    pub fn dispatch_stream_direct(
-        &self,
-        ctx: ServiceContext,
-        request: ObjectRpcRequest,
-    ) -> Option<ServiceStreamFuture<'static>> {
-        match self.by_route.get(request.route.as_str()) {
-            Some(owner) if request.category == owner.category => {
-                let service = Arc::clone(&self.services[owner.service_index]);
-                let route = request.route.clone();
-                Some(Box::pin(async move {
-                    let Some(future) = service.handle_stream(ctx, request) else {
-                        return Err(ServiceError::Network(NetworkError::Serialization {
-                            detail: format!(
-                                "service route {route} does not support streamed object-RPC responses"
-                            ),
-                        }));
-                    };
-                    future.await
-                }))
-            }
-            Some(owner) => {
-                let route = request.route.clone();
-                let expected = owner.category.to_string();
-                let actual = request.category;
-                Some(Box::pin(async move {
-                    Err(ServiceError::Network(NetworkError::Serialization {
-                        detail: format!(
-                            "service route {route} expected category {expected}, got {actual}"
-                        ),
-                    }))
-                }))
-            }
-            None => {
-                let route = request.route.clone();
-                Some(Box::pin(
-                    async move { Err(ServiceError::UnknownRoute(route)) },
-                ))
-            }
-        }
-    }
-
     /// Names of the registered services, in registration order.
     pub fn service_names(&self) -> Vec<&'static str> {
         self.services.iter().map(|service| service.name()).collect()
@@ -386,6 +382,8 @@ impl ServiceRegistry {
                 required_capabilities: owner.required_capabilities.clone(),
                 concurrency_limit: owner.concurrency_limit,
                 timeout_ms: owner.timeout_ms,
+                request_body_mode: owner.request_body_mode,
+                response_body_mode: owner.response_body_mode,
             })
             .collect()
     }
@@ -537,6 +535,8 @@ impl ServiceRegistryBuilder {
                     required_capabilities: route.required_capabilities,
                     concurrency_limit,
                     timeout_ms: route.timeout_ms,
+                    request_body_mode: route.request_body_mode,
+                    response_body_mode: route.response_body_mode,
                 },
             ) {
                 panic!(
@@ -637,11 +637,11 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct CollectingSink {
-        frames: Arc<Mutex<Vec<ObjectRpcResponse>>>,
+        frames: Arc<Mutex<Vec<ObjectRpcSessionResponse>>>,
     }
 
     impl ResponseSink for CollectingSink {
-        fn emit(&mut self, response: ObjectRpcResponse) -> Result<(), ServiceError> {
+        fn send(self: Box<Self>, response: ObjectRpcSessionResponse) -> Result<(), ServiceError> {
             self.frames.lock().expect("sink lock").push(response);
             Ok(())
         }
@@ -653,12 +653,13 @@ mod tests {
     }
 
     fn local_context(sink: CollectingSink) -> ServiceContext {
-        ServiceContext {
-            data_dir: test_data_dir(),
-            cluster: None,
-            signer: ServiceSigner::Local,
-            sink: Box::new(sink),
-        }
+        ServiceContext::new(
+            test_data_dir(),
+            None,
+            ServiceSigner::Local,
+            ObjectRpcIncomingBody::default(),
+            Box::new(sink),
+        )
     }
 
     #[tokio::test]
@@ -716,16 +717,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_dispatches_streamed_response_without_sink_frames() {
-        struct StreamService;
+    async fn registry_dispatches_response_body_through_the_same_sink() {
+        struct BodyService;
 
-        impl Service for StreamService {
+        impl Service for BodyService {
             fn name(&self) -> &'static str {
-                "stream"
+                "body"
             }
 
             fn routes(&self) -> &'static [&'static str] {
-                &["/test/stream"]
+                &["/test/body"]
+            }
+
+            fn route_categories(&self) -> Vec<ServiceRoute> {
+                vec![
+                    ServiceRoute::new("/test/body", "body")
+                        .with_response_body_mode(ServiceBodyMode::Optional),
+                ]
+            }
+
+            fn handle(
+                &self,
+                mut ctx: ServiceContext,
+                _request: ObjectRpcRequest,
+            ) -> ServiceFuture<'_> {
+                Box::pin(async move {
+                    ctx.respond_with_body(
+                        ObjectRpcResponse::encode_body("/test/body", &"metadata".to_string())?,
+                        ObjectRpcBodySource::bytes(b"stream-body".to_vec()),
+                    )?;
+                    Ok(ServiceDisposition::Continue)
+                })
+            }
+        }
+
+        let registry = ServiceRegistry::builder().register(BodyService).build();
+        let sink = CollectingSink::default();
+        let frames = Arc::clone(&sink.frames);
+        let request = ObjectRpcRequest::encode_body("/test/body", "body", &()).expect("encode");
+        registry
+            .dispatch(local_context(sink), request)
+            .await
+            .expect("dispatch");
+        let session_response = frames.lock().expect("frames").pop().expect("response");
+
+        assert_eq!(
+            session_response
+                .response
+                .decode_body::<String>()
+                .expect("metadata"),
+            "metadata"
+        );
+        assert!(!session_response.body.is_empty());
+        assert_eq!(session_response.body.total_bytes(), Some(11));
+        assert_eq!(
+            registry.route_categories(),
+            vec![
+                ServiceRoute::new("/test/body", "body")
+                    .with_response_body_mode(ServiceBodyMode::Optional)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn service_context_sends_at_most_one_response() {
+        struct DoubleResponseService;
+
+        impl Service for DoubleResponseService {
+            fn name(&self) -> &'static str {
+                "double-response"
+            }
+
+            fn routes(&self) -> &'static [&'static str] {
+                &["/test/double-response"]
             }
 
             fn handle(
@@ -735,58 +799,56 @@ mod tests {
             ) -> ServiceFuture<'_> {
                 Box::pin(async move {
                     ctx.respond(ObjectRpcResponse::encode_body(
-                        "/test/stream",
-                        &"ordinary".to_string(),
+                        "/test/double-response",
+                        &"first",
                     )?)?;
+                    let error = ctx
+                        .respond(ObjectRpcResponse::encode_body(
+                            "/test/double-response",
+                            &"second",
+                        )?)
+                        .expect_err("second response should be rejected");
+                    assert!(error.to_string().contains("already sent"));
                     Ok(ServiceDisposition::Continue)
                 })
             }
-
-            fn handle_stream(
-                &self,
-                _ctx: ServiceContext,
-                _request: ObjectRpcRequest,
-            ) -> Option<ServiceStreamFuture<'_>> {
-                Some(Box::pin(async move {
-                    Ok(ServiceStreamResponse {
-                        response: ObjectRpcResponse::encode_body(
-                            "/test/stream",
-                            &"metadata".to_string(),
-                        )?,
-                        reader: Some(Box::new(std::io::Cursor::new(b"stream-body".to_vec()))),
-                        chunk_bytes: 3,
-                    })
-                }))
-            }
         }
 
-        let registry = ServiceRegistry::builder().register(StreamService).build();
+        let registry = ServiceRegistry::builder()
+            .register(DoubleResponseService)
+            .build();
         let sink = CollectingSink::default();
         let frames = Arc::clone(&sink.frames);
-        let request = ObjectRpcRequest::encode_body("/test/stream", "stream", &()).expect("encode");
-        let mut stream_response = registry
-            .dispatch_stream_direct(local_context(sink), request)
-            .expect("stream future")
-            .await
-            .expect("stream response");
+        let request =
+            ObjectRpcRequest::encode_body("/test/double-response", "double-response", &())
+                .expect("encode");
 
-        assert_eq!(
-            stream_response
-                .response
-                .decode_body::<String>()
-                .expect("metadata"),
-            "metadata"
+        registry
+            .dispatch(local_context(sink), request)
+            .await
+            .expect("dispatch");
+
+        assert_eq!(frames.lock().expect("frames").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn service_context_request_body_is_taken_once() {
+        let mut ctx = local_context(CollectingSink::default());
+
+        assert!(
+            ctx.take_request_body()
+                .collect_to_vec(1)
+                .await
+                .expect("first request body")
+                .is_empty()
         );
-        let mut body = Vec::new();
-        stream_response
-            .reader
-            .take()
-            .expect("reader")
-            .read_to_end(&mut body)
-            .expect("read body");
-        assert_eq!(body, b"stream-body");
-        assert_eq!(stream_response.chunk_bytes, 3);
-        assert!(frames.lock().expect("frames").is_empty());
+        assert!(
+            ctx.take_request_body()
+                .collect_to_vec(1)
+                .await
+                .expect("replacement request body")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -875,7 +937,9 @@ mod tests {
                         .with_auth_scope("admin")
                         .require_capability("policy.write")
                         .with_concurrency_limit(4)
-                        .with_timeout(Duration::from_millis(250)),
+                        .with_timeout(Duration::from_millis(250))
+                        .with_request_body_mode(ServiceBodyMode::Required)
+                        .with_response_body_mode(ServiceBodyMode::Optional),
                 ]
             }
 
@@ -903,6 +967,8 @@ mod tests {
                     .require_capability("policy.write")
                     .with_concurrency_limit(4)
                     .with_timeout(Duration::from_millis(250))
+                    .with_request_body_mode(ServiceBodyMode::Required)
+                    .with_response_body_mode(ServiceBodyMode::Optional)
             ]
         );
     }

@@ -19,7 +19,7 @@ or DFS semantics, or read cluster storage directly.
 | Layer | Owns |
 |---|---|
 | Domain service | Request and response types, route names, target selection, business authorization, and side effects. |
-| `sinomo-network` | Object RPC, framing, route registration, endpoint selection, route graphs, retries, relays, stream transport, and connectivity feedback. |
+| `sinomo-network` | Object RPC sessions, framing, route registration, endpoint selection, route graphs, retries, relays, transfer flow control, and connectivity feedback. |
 | `sinomo-cluster` | Authoritative member and endpoint projection, plus transport drivers for membership and Raft. |
 | Transport module | Dialing, listening, and advertising endpoints for one transport family. |
 
@@ -29,20 +29,28 @@ cannot grant membership, mutate cluster state, or apply domain policy.
 
 ## Wire and Service Model
 
-The canonical target for internal request/response traffic is one body-aware
-typed object-RPC model. The current migration keeps legacy buffered and
-response-only stream adapters internal until every transport implements the
-session; higher-level protocols must not add new chunk-RPC paths meanwhile.
+Internal request/response traffic uses one body-aware typed object-RPC model.
+The old response-only raw-stream transport has been removed. A bounded unary
+adapter remains for small compatibility calls, but large request and response
+bodies use the same full-duplex session on every transport.
 Each direction has a small SOBJ head and an optional body. Domain callers work
 with serde-compatible heads and high-level body sources or sinks; object
-encoding, inline-versus-streamed selection, chunking, flow control, retries,
-and transfer state remain inside the network boundary.
+encoding, body framing, chunking, flow control, retries, and transfer state
+remain inside the network boundary.
 
-Small known bodies may be carried inline as an optimization of the same RPC
-session. Large files, readers, and generated bodies use bounded streaming in
+Small typed payloads stay in the SOBJ request or response head. Optional byte
+bodies, including files, readers, and generated data, use bounded streaming in
 both directions and are not repeatedly re-encoded as object documents. Domain
 protocols may attach operation identities and expected content digests, but do
 not define transport chunk sizes or per-chunk RPC routes.
+
+Verified body frames first move through a bounded in-memory reader channel. If
+the application falls behind, the session lazily spills only the remaining
+suffix to a temporary file; a reader that deliberately drops a request body
+switches the session to verified discard so transport acknowledgements and an
+early response can still complete. Normal completion and cancellation remove
+spill files. Crash-orphan collection is not treated as transfer resume state
+and must use process-ownership proof rather than deleting files by age.
 
 Each route belongs to a discoverable service category and declares its input,
 output, and observation metadata. This gives the daemon one router and one
@@ -92,12 +100,27 @@ A routed packet carries:
 - the authenticated protocol payload;
 - a cap for one downstream hop attempt.
 
-Within one relay attempt, forwarding preserves the signed inner route and
-payload. The final target belongs to the hop-signed relay envelope rather than
-the inner signature, so each hop separately authorizes forwarding. A relay
-cannot alter the signed inner route or body without invalidating the original
-request signature. A new endpoint retry may use a new authentication envelope
-and nonce.
+Within one relay attempt, forwarding preserves the origin-signed inner head and
+session descriptor. Each hop separately authenticates its immediate peer's
+frame transcript, while the final target authenticates the original request.
+A relay cannot alter the signed inner route, metadata, or body descriptor
+without invalidating the original request signature. Intermediate hops create
+fresh outer relay sessions and body-transfer descriptors.
+
+Every response head carries an Ed25519 attestation binding its normalized head
+digest to the logical origin session. Direct responses must verify against the
+expected target key. Relays preserve that target attestation unchanged for a
+delivered response; relay-generated routing feedback remains hop-authenticated
+and is classified before it can be treated as target delivery. This covers
+empty responses as well as responses with an attachment.
+
+Every non-empty body ends with an origin-authenticated Ed25519 finish
+attestation binding the original session ID, request or response head digest,
+direction, final byte count, and content digest. Relays may re-frame bytes for
+each transport hop, but they forward this attestation unchanged. Request bodies
+are therefore bound to the authenticated caller, and relayed response bodies
+are bound to the expected target key; same-length substitution or a modified
+head fails before the receiver acknowledges completion.
 
 Retries may race, and transport behavior may duplicate delivery. Generic object
 RPC does not provide a universal response replay cache. Exact authentication
@@ -114,7 +137,7 @@ The graph contains only authorized members and usable endpoints. Its inputs are:
 - the authoritative connectivity graph published through the control plane;
 - the current transport-module availability snapshot;
 - local observations for the current delivery;
-- purpose-specific constraints such as raw-stream support.
+- purpose-specific constraints such as full-duplex stream support.
 
 Route cost prefers local and direct paths over more expensive or relayed ones,
 then incorporates observed health and latency. An unreachable or unauthorized
@@ -157,10 +180,10 @@ five-second health timeout. A progressing call may therefore run for an
 unbounded wall-clock duration. Callers that require strict end-to-end expiry
 provide an explicit operation deadline.
 
-During migration, the buffered local-daemon forwarding adapter cannot relay
-inner progress and retains a bounded compatibility idle allowance. It does not
-yet provide the unbounded-progress guarantee; body-aware forwarding removes
-that exception once progress frames are authenticated end to end.
+The bounded unary adapter cannot relay body progress and is intentionally for
+small compatibility calls. Body-aware calls use hop-authenticated progress
+frames plus an end-to-end origin finish attestation and the canonical health
+policy.
 
 Route discovery remains finite through its attempt count, hop limit, and
 per-attempt health limits. Relay envelopes carry a maximum per-hop timeout, not
@@ -168,12 +191,14 @@ an implicit absolute end-to-end expiry. Validated progress includes advancing
 body offsets, cumulative acknowledgements, or authenticated control progress;
 merely waiting longer does not extend an explicit operation deadline.
 
-The transfer migration is complete when replayable transfers reconnect with the
-same transfer identity and resume from the receiver's durable contiguous
-acknowledgement. Losing a completion reply must not commit a transfer twice.
-Generated one-pass bodies retain a bounded unacknowledged replay window or fail
-explicitly when safe resume is impossible; the network must not silently
-collect an unbounded producer into memory.
+Replayable byte and file sources can retry on a fresh connection; the current
+engine safely restarts those attempts at offset zero. It does not claim durable
+partial-transfer resume: implementing that requires persisted receiver state,
+handler reattachment, and garbage collection as one atomic design. Generated
+one-pass bodies fail explicitly once safe replay is impossible; the network
+does not silently collect an unbounded producer into memory. Side-effecting
+routes still use stable operation identities so a lost completion reply cannot
+commit the domain operation twice.
 
 Failures are classified so route learning remains useful:
 
@@ -181,7 +206,7 @@ Failures are classified so route learning remains useful:
 |---|---|
 | Authentication or identity mismatch | Suppress the endpoint and report an authorization failure. |
 | Unsupported transport or stream capability | Exclude the endpoint for this request shape. |
-| Connect or no-progress timeout | Record degraded connectivity and try a bounded alternative or resume. |
+| Connect or no-progress timeout | Record degraded connectivity and try a bounded alternative only when replay semantics allow it. |
 | Explicit unreachable feedback | Exclude the edge until directory or probe evidence changes. |
 | No authorized route | Fail without exploratory delivery to an untrusted node. |
 | Explicit operation deadline or hop limit exhausted | Stop the current routing attempt and return the terminal delivery result. |
@@ -192,9 +217,9 @@ cannot promote a peer, and a failed dial cannot remove one.
 ## Transport Modules
 
 Transports are modules behind one lifecycle: describe capability, start, stop,
-dial object RPC, expose local endpoints, and report whether raw or streamed
-responses are supported. Loopback and LAN transport are built in. Additional
-transports, including Iroh, are loaded through the module system.
+open a full-duplex RPC stream, and expose local endpoints. Loopback and LAN
+transport are built in. Additional transports, including Iroh, are loaded
+through the module system.
 
 Dispatch is address-scheme and capability aware. An endpoint is not attempted
 when no enabled module can dial it or when the request requires a feature the
@@ -227,15 +252,16 @@ loopback control uses the same authentication boundary for sensitive commands.
 
 ## Architectural Invariants
 
-1. Domain protocols converge on the single typed object-RPC session; new
-   protocols do not add separate chunk-RPC paths during migration. Inline and
-   streamed bodies are network-selected representations of that session.
+1. Domain protocols use the single typed object-RPC session and do not add
+   separate chunk-RPC paths. Typed heads and optional attached bodies are the
+   two application-visible parts of that session.
 2. Network and KV have no production dependency on one another;
    `sinomo-cluster` is their only R0 bridge.
 3. Directory membership and connectivity are inputs to routing, not outputs of
    successful delivery.
-4. A relay cannot modify the signed inner route or payload of the attempt it
-   forwards; target-node forwarding is authorized hop by hop.
+4. A relay cannot modify the signed inner route or substitute request/response
+   body bytes: the original head and final content digest are authenticated end
+   to end, while target-node forwarding is authorized hop by hop.
 5. Origin calls have no implicit whole-call deadline; explicit operation
    deadlines are distinct from per-connect and per-progress health limits.
 6. Side-effecting routes that permit retry must provide operation-level

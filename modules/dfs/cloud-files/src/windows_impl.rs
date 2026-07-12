@@ -22,8 +22,8 @@ use sinomo_runtime::core::ClusterEndpointRecord;
 use sinomo_runtime::daemon;
 use sinomo_runtime::dfs::{
     self, DfsControlPlaneKvClient, DfsMessageCommand, DfsMessageResponse, DfsMessageTransport,
-    DfsNetworkMessage, DfsObjectKind, DfsPosixError, DfsRoutedMessage, DfsTransportIdentity,
-    DfsWriteOptions, LocalContentStore, NetworkedDfsService,
+    DfsObjectKind, DfsPosixError, DfsRoutedMessage, DfsTransportIdentity, DfsWriteOptions,
+    LocalContentStore, NetworkedDfsService,
 };
 use sinomo_runtime::kv::{
     KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse, read_cluster_kv_entry,
@@ -1238,12 +1238,9 @@ impl DfsCloudFilesEndpointTransport {
         }
     }
 
-    fn send_timeouts(
-        &self,
-        message: &DfsRoutedMessage,
-    ) -> std::result::Result<network::DaemonRpcTimeouts, NetworkError> {
+    fn send_timeouts(&self) -> std::result::Result<network::DaemonRpcTimeouts, NetworkError> {
         let mut connect_timeout = network::DEFAULT_NETWORK_TIMEOUT;
-        let mut idle_timeout = cloud_files_response_no_progress_timeout(message);
+        let mut idle_timeout = network::DEFAULT_NETWORK_TIMEOUT;
         if let Some(deadline) = self.operation_deadline {
             let Some(remaining) = deadline
                 .checked_duration_since(Instant::now())
@@ -1316,7 +1313,7 @@ impl DfsCloudFilesEndpointTransport {
         };
         let mut failures = Vec::new();
         for endpoint in &endpoints {
-            let timeouts = self.send_timeouts(&request.routed_message)?;
+            let timeouts = self.send_timeouts()?;
             match send_dfs_message(endpoint, &request, timeouts) {
                 Ok(response) => {
                     for returned_message in response.outbound_messages {
@@ -1362,11 +1359,6 @@ impl DfsMessageTransport for DfsCloudFilesEndpointTransport {
     fn operation_deadline(&self) -> Option<Instant> {
         self.operation_deadline
     }
-}
-
-fn cloud_files_response_no_progress_timeout(message: &DfsRoutedMessage) -> Duration {
-    dfs::dfs_network_message_no_progress_timeout(&message.message)
-        .unwrap_or(network::DEFAULT_NETWORK_TIMEOUT)
 }
 
 fn send_dfs_message(
@@ -1457,73 +1449,22 @@ fn slice_bytes(bytes: &[u8], start: usize, len: usize) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    fn test_routed_message(message: DfsNetworkMessage) -> DfsRoutedMessage {
-        let source = NodeId::from_legacy_named("cloud_files_timeout_source").expect("source");
-        let target = NodeId::from_legacy_named("cloud_files_timeout_target").expect("target");
-        DfsRoutedMessage {
-            source_node_id: source,
-            target_node_id: target,
-            frame_id: 1,
-            message_id: 1,
-            message,
-        }
-    }
-
-    fn test_namespace_message() -> DfsRoutedMessage {
-        let source = NodeId::from_legacy_named("cloud_files_timeout_source").expect("source");
-        test_routed_message(DfsNetworkMessage::NamespaceRequest(
-            dfs::DfsNamespaceCommand {
-                request_id: "cloud_files_namespace_timeout".to_string(),
-                file_system_id: dfs::sifs_file_system_id(),
-                requesting_node_id: source,
-                include_metadata_journal_batches: false,
-                metadata_journal_after_sequences: Vec::new(),
-                operation: dfs::DfsNamespaceOperation::LookupPath {
-                    path: "/services/cloud-files-timeout".to_string(),
-                },
-            },
-        ))
-    }
-
-    fn test_ordinary_message() -> DfsRoutedMessage {
-        test_routed_message(DfsNetworkMessage::ReadResponse(dfs::DfsReadResponse {
-            request_id: "cloud_files_read_timeout".to_string(),
-            object_id: dfs::DfsObjectId::from_legacy_named("cloud_files_timeout_object")
-                .expect("object"),
-            result: dfs::DfsReadResult::NotFound,
-        }))
-    }
-
     #[test]
-    fn cloud_files_transport_uses_shared_default_and_namespace_exception() {
+    fn cloud_files_transport_uses_shared_default_health_timeout() {
         let local = NodeId::from_legacy_named("cloud_files_timeout_local").expect("local");
         let mut transport = DfsCloudFilesEndpointTransport::new(local, Vec::new());
 
-        let ordinary = transport
-            .send_timeouts(&test_ordinary_message())
-            .expect("ordinary timeouts");
+        let ordinary = transport.send_timeouts().expect("ordinary timeouts");
         assert_eq!(
             ordinary,
             network::DaemonRpcTimeouts::connect_and_idle(network::DEFAULT_NETWORK_TIMEOUT)
-        );
-
-        let namespace = transport
-            .send_timeouts(&test_namespace_message())
-            .expect("namespace timeouts");
-        assert_eq!(
-            namespace.connect_timeout,
-            Some(network::DEFAULT_NETWORK_TIMEOUT)
-        );
-        assert_eq!(
-            namespace.idle_timeout,
-            Some(dfs::DFS_ROUTED_NAMESPACE_OP_TIMEOUT)
         );
 
         let deadline = Instant::now() + Duration::from_secs(2);
         assert_eq!(transport.set_operation_deadline(Some(deadline)), None);
         assert_eq!(transport.operation_deadline(), Some(deadline));
         let bounded = transport
-            .send_timeouts(&test_namespace_message())
+            .send_timeouts()
             .expect("deadline-bounded timeouts");
         assert!(
             bounded

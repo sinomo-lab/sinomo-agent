@@ -8,19 +8,15 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
 
-use crate::transfer::{
-    InProgressBlobTransfer, InProgressFetchBlobTransfer, InProgressPatchTransfer,
-    InProgressReadMemoryTransfer, InProgressReadTransfer, PendingNetworkedRead,
-    PendingNetworkedWrite,
-};
+use crate::transfer::{PendingNetworkedRead, PendingNetworkedWrite};
 use crate::{
     DfsBulkReadItemResponse, DfsConflictRecord, DfsConflictStatus, DfsControlPlaneKvClient,
     DfsDistributedWriteCommand, DfsDistributedWriteResult, DfsError, DfsFileSystemId,
     DfsMessageResponse, DfsMetadataBackend, DfsMetadataShardConfig, DfsMetadataShardId,
     DfsMetadataStore, DfsNamespaceCommand, DfsNamespaceResponse, DfsNamespaceResult, DfsObjectId,
-    DfsObjectMetadata, DfsPosixCoordinationResult, DfsReadData, DfsReadRangeData, DfsReadResult,
-    DfsRepairAttemptRecord, DfsVersion, DistributedEventualCoordinator, DistributedRepairJob,
-    LocalContentStore, ObjectVersionReader,
+    DfsObjectMetadata, DfsOutboundBody, DfsPosixCoordinationResult, DfsReadData, DfsReadRangeData,
+    DfsReadResult, DfsRepairAttemptRecord, DfsVersion, DistributedEventualCoordinator,
+    DistributedRepairJob, LocalContentStore, ObjectVersionReader,
 };
 
 pub(crate) const DFS_BLOB_INLINE_LIMIT_BYTES: usize = 1024 * 1024;
@@ -37,15 +33,11 @@ pub(crate) const DFS_CONFLICT_SCAN_PAGE_SIZE: usize = 2;
 pub(crate) const DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT: usize = 8;
 // Namespace RPCs are on the app-visible critical path, but they may include a
 // durable WAN metadata mutation and bounded journal replay. They are not safe
-// to redispatch after a response timeout because their exact-response replay
-// cache is not durable across daemon restarts. Give the primary the bounded
-// full-response route ceiling instead of abandoning a possibly-applied
-// mutation at the normal network no-progress deadline.
+// to redispatch after an operation deadline because their exact-response replay
+// cache is not durable across daemon restarts. Give the primary a bounded
+// semantic deadline while the canonical session independently enforces its
+// normal network-health policy.
 pub const DFS_ROUTED_NAMESPACE_OP_TIMEOUT: Duration = Duration::from_secs(60);
-// Distributed writes have durable request identity and are response-retry
-// safe. Keep their shorter no-progress interval separate so sinomo-network can
-// retry a lost response without shortening namespace mutation semantics.
-pub const DFS_ROUTED_DISTRIBUTED_WRITE_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(15);
 /// Nested coordination depth (serving a namespace request while settling
 /// another) beyond which new coordination rejects as Busy instead of growing
 /// the stack.
@@ -118,11 +110,6 @@ pub struct NetworkedDfsService<T> {
     pub(crate) repair_attempt_records: BTreeMap<(String, NodeId), DfsRepairAttemptRecord>,
     pub(crate) transient_remote_read_pruned_locations:
         BTreeMap<(DfsObjectId, DfsVersion, Option<String>), BTreeSet<NodeId>>,
-    pub(crate) incoming_read_transfers: BTreeMap<String, InProgressReadTransfer>,
-    pub(crate) incoming_read_memory_transfers: BTreeMap<String, InProgressReadMemoryTransfer>,
-    pub(crate) incoming_fetch_transfers: BTreeMap<String, InProgressFetchBlobTransfer>,
-    pub(crate) incoming_blob_transfers: BTreeMap<String, InProgressBlobTransfer>,
-    pub(crate) incoming_patch_transfers: BTreeMap<String, InProgressPatchTransfer>,
     pub(crate) local_metadata_journal_cursors: BTreeMap<DfsMetadataShardId, u64>,
     pub(crate) metadata_replication_cursors: BTreeMap<(NodeId, DfsMetadataShardId), u64>,
     pub(crate) recent_namespace_freshness_syncs:
@@ -146,9 +133,10 @@ pub struct NetworkedDfsService<T> {
 }
 
 /// Result from serving one DFS message command through a networked service.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DfsMessageProcessResult {
     pub response: DfsMessageResponse,
+    pub body: Option<DfsOutboundBody>,
     pub events: Vec<NetworkedDfsServiceEvent>,
 }
 
@@ -274,8 +262,6 @@ pub(crate) enum NetworkedDfsRangeReadStreamOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StageBlobSendOutcome {
     pub(crate) sent: bool,
-    pub(crate) complete: bool,
-    pub(crate) next_chunk_index: u32,
     pub(crate) last_error: Option<String>,
 }
 
@@ -484,20 +470,6 @@ pub enum NetworkedDfsServiceEvent {
         requester_node_id: NodeId,
         result_count: usize,
     },
-    RemoteRangeReadChunkReceived {
-        request_id: String,
-        object_id: DfsObjectId,
-        source_node_id: NodeId,
-        version: DfsVersion,
-        content_hash: Option<String>,
-        range_offset: u64,
-        range_size_bytes: u64,
-        object_total_size_bytes: u64,
-        chunk_index: u32,
-        total_chunks: u32,
-        bytes: Vec<u8>,
-        complete: bool,
-    },
     RemoteReadCompleted {
         request_id: String,
         object_id: DfsObjectId,
@@ -629,33 +601,6 @@ fn retained_networked_dfs_service_event(
                 .iter()
                 .map(retained_dfs_bulk_read_item_response)
                 .collect(),
-        },
-        NetworkedDfsServiceEvent::RemoteRangeReadChunkReceived {
-            request_id,
-            object_id,
-            source_node_id,
-            version,
-            content_hash,
-            range_offset,
-            range_size_bytes,
-            object_total_size_bytes,
-            chunk_index,
-            total_chunks,
-            complete,
-            ..
-        } => NetworkedDfsServiceEvent::RemoteRangeReadChunkReceived {
-            request_id: request_id.clone(),
-            object_id: object_id.clone(),
-            source_node_id: source_node_id.clone(),
-            version: version.clone(),
-            content_hash: content_hash.clone(),
-            range_offset: *range_offset,
-            range_size_bytes: *range_size_bytes,
-            object_total_size_bytes: *object_total_size_bytes,
-            chunk_index: *chunk_index,
-            total_chunks: *total_chunks,
-            bytes: Vec::new(),
-            complete: *complete,
         },
         _ => event.clone(),
     }

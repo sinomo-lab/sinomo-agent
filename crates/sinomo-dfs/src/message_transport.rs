@@ -8,11 +8,57 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-use sinomo_core::network::NetworkError;
+use sinomo_core::network::{NetworkError, ObjectRpcBodySource};
 use sinomo_core::node::NodeId;
 
 use crate::protocol::DfsRoutedMessage;
 use crate::routes::{dfs_routed_message_from_object_rpc_request, dfs_routed_message_rpc_request};
+use crate::{DfsRpcBodyDescriptor, ObjectVersionReader};
+
+#[derive(Debug)]
+pub struct DfsOutboundBody {
+    pub descriptor: DfsRpcBodyDescriptor,
+    pub source: ObjectRpcBodySource,
+}
+
+impl DfsOutboundBody {
+    pub fn from_reader(
+        reader: ObjectVersionReader,
+        total_size_bytes: u64,
+        content_hash: impl Into<String>,
+    ) -> Self {
+        Self {
+            descriptor: DfsRpcBodyDescriptor {
+                total_size_bytes,
+                content_hash: Some(content_hash.into()),
+            },
+            source: ObjectRpcBodySource::from_reader(reader, Some(total_size_bytes)),
+        }
+    }
+
+    pub fn from_bytes(bytes: Vec<u8>, content_hash: impl Into<String>) -> Self {
+        Self {
+            descriptor: DfsRpcBodyDescriptor {
+                total_size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                content_hash: Some(content_hash.into()),
+            },
+            source: ObjectRpcBodySource::bytes(bytes),
+        }
+    }
+
+    pub fn from_reader_with_transport_integrity(
+        reader: ObjectVersionReader,
+        total_size_bytes: u64,
+    ) -> Self {
+        Self {
+            descriptor: DfsRpcBodyDescriptor {
+                total_size_bytes,
+                content_hash: None,
+            },
+            source: ObjectRpcBodySource::from_reader(reader, Some(total_size_bytes)),
+        }
+    }
+}
 
 pub trait DfsTransportIdentity {
     fn local_node_id(&self) -> &NodeId;
@@ -30,29 +76,30 @@ impl DfsTransportIdentity for sinomo_core::network::AsyncInProcessTransport {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DfsTransferProfile {
-    Conservative,
-    Lan,
-    Local,
-}
-
-impl From<sinomo_core::network::ClusterRouteTransferProfile> for DfsTransferProfile {
-    fn from(profile: sinomo_core::network::ClusterRouteTransferProfile) -> Self {
-        match profile {
-            sinomo_core::network::ClusterRouteTransferProfile::Conservative => Self::Conservative,
-            sinomo_core::network::ClusterRouteTransferProfile::Lan => Self::Lan,
-            sinomo_core::network::ClusterRouteTransferProfile::Local => Self::Local,
-        }
-    }
-}
-
 pub trait DfsMessageTransport: DfsTransportIdentity {
     fn send_routed_message(
         &mut self,
         target_node_id: &NodeId,
         message: DfsRoutedMessage,
     ) -> Result<(), NetworkError>;
+
+    fn send_routed_message_with_body(
+        &mut self,
+        target_node_id: &NodeId,
+        message: DfsRoutedMessage,
+        body: DfsOutboundBody,
+    ) -> Result<(), NetworkError> {
+        let max_bytes = usize::try_from(body.descriptor.total_size_bytes).map_err(|_| {
+            NetworkError::FrameTooLarge {
+                actual_bytes: usize::MAX,
+                max_bytes: usize::MAX,
+            }
+        })?;
+        let bytes = collect_dfs_outbound_body_sync(body.source, max_bytes)?;
+        let message =
+            crate::body_rpc::attach_dfs_routed_message_body(message, body.descriptor, bytes)?;
+        self.send_routed_message(target_node_id, message)
+    }
 
     fn send_detached_routed_message(
         &mut self,
@@ -74,10 +121,6 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
 
     fn can_return_committed_foreground_response_before_replica_repair(&self) -> bool {
         false
-    }
-
-    fn transfer_profile(&self, _target_node_id: &NodeId) -> DfsTransferProfile {
-        DfsTransferProfile::Conservative
     }
 
     fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
@@ -125,6 +168,27 @@ pub trait AsyncDfsMessageTransport: Send {
         message: DfsRoutedMessage,
     ) -> DfsMessageTransportFuture<'a, Result<(), NetworkError>>;
 
+    fn send_routed_message_with_body_async<'a>(
+        &'a mut self,
+        target_node_id: &'a NodeId,
+        message: DfsRoutedMessage,
+        body: DfsOutboundBody,
+    ) -> DfsMessageTransportFuture<'a, Result<(), NetworkError>> {
+        Box::pin(async move {
+            let max_bytes = usize::try_from(body.descriptor.total_size_bytes).map_err(|_| {
+                NetworkError::FrameTooLarge {
+                    actual_bytes: usize::MAX,
+                    max_bytes: usize::MAX,
+                }
+            })?;
+            let bytes = body.source.collect_to_vec(max_bytes).await?;
+            let message =
+                crate::body_rpc::attach_dfs_routed_message_body(message, body.descriptor, bytes)?;
+            self.send_routed_message_async(target_node_id, message)
+                .await
+        })
+    }
+
     fn drain_incoming_messages_async<'a>(
         &'a mut self,
     ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedMessage>, NetworkError>>;
@@ -158,6 +222,37 @@ pub trait AsyncDfsMessageTransport: Send {
     }
 }
 
+fn collect_dfs_outbound_body_sync(
+    source: ObjectRpcBodySource,
+    max_bytes: usize,
+) -> Result<Vec<u8>, NetworkError> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if matches!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            return tokio::task::block_in_place(|| {
+                handle.block_on(source.collect_to_vec(max_bytes))
+            });
+        }
+        return Err(NetworkError::Io {
+            operation: "collect DFS outbound body".to_string(),
+            detail: "sync DFS body fallback cannot run inside a current-thread Tokio runtime"
+                .to_string(),
+        });
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| NetworkError::Io {
+            operation: "create DFS body collection runtime".to_string(),
+            detail: source.to_string(),
+        })?;
+    let result = runtime.block_on(source.collect_to_vec(max_bytes));
+    runtime.shutdown_timeout(Duration::from_millis(250));
+    result
+}
+
 impl DfsMessageTransport for sinomo_core::network::InProcessTransport {
     fn send_routed_message(
         &mut self,
@@ -182,10 +277,6 @@ impl DfsMessageTransport for sinomo_core::network::InProcessTransport {
 
     fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {
         self.wait_for_incoming_object_rpc_request(timeout)
-    }
-
-    fn transfer_profile(&self, _target_node_id: &NodeId) -> DfsTransferProfile {
-        DfsTransferProfile::Local
     }
 }
 

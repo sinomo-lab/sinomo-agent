@@ -1533,6 +1533,7 @@ impl From<ConfigError> for ServiceError {
 mod tests {
     use super::*;
     use sinomo_core::kv::{KvEntry, KvRevision, KvVersion};
+    use sinomo_core::network::{ObjectRpcIncomingBody, ObjectRpcSessionResponse};
     use sinomo_core::service::ResponseSink;
     use std::sync::Mutex;
 
@@ -1770,8 +1771,16 @@ mod tests {
     }
 
     impl ResponseSink for VecSink {
-        fn emit(&mut self, response: ObjectRpcResponse) -> Result<(), ServiceError> {
-            self.frames.lock().expect("sink lock").push(response);
+        fn send(self: Box<Self>, response: ObjectRpcSessionResponse) -> Result<(), ServiceError> {
+            if !response.body.is_empty() {
+                return Err(ServiceError::Service(
+                    "config test sink received an unexpected response body".to_string(),
+                ));
+            }
+            self.frames
+                .lock()
+                .expect("sink lock")
+                .push(response.response);
             Ok(())
         }
     }
@@ -1781,12 +1790,13 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-config-service");
         let sink = VecSink::default();
         let frames = Arc::clone(&sink.frames);
-        let ctx = ServiceContext {
-            data_dir: Arc::new(SinomoDataDir::new(&root)),
-            cluster: None,
-            signer: sinomo_core::service::ServiceSigner::Local,
-            sink: Box::new(sink),
-        };
+        let ctx = ServiceContext::new(
+            Arc::new(SinomoDataDir::new(&root)),
+            None,
+            sinomo_core::service::ServiceSigner::Local,
+            ObjectRpcIncomingBody::empty(),
+            Box::new(sink),
+        );
         let registry =
             register_services(sinomo_core::service::ServiceRegistry::builder(), registry()).build();
         let request = ObjectRpcRequest::encode_body(

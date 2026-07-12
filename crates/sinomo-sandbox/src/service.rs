@@ -359,6 +359,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use sinomo_core::local::SinomoDataDir;
+    use sinomo_core::network::{ObjectRpcIncomingBody, ObjectRpcSessionResponse};
 
     use sinomo_core::service::{ResponseSink, ServiceRegistry, ServiceSigner};
 
@@ -368,19 +369,28 @@ mod tests {
     }
 
     impl ResponseSink for CollectingSink {
-        fn emit(&mut self, response: ObjectRpcResponse) -> Result<(), ServiceError> {
-            self.frames.lock().expect("sink lock").push(response);
+        fn send(self: Box<Self>, response: ObjectRpcSessionResponse) -> Result<(), ServiceError> {
+            if !response.body.is_empty() {
+                return Err(ServiceError::Service(
+                    "sandbox test sink received an unexpected response body".to_string(),
+                ));
+            }
+            self.frames
+                .lock()
+                .expect("sink lock")
+                .push(response.response);
             Ok(())
         }
     }
 
     fn local_context(dir: &std::path::Path, sink: CollectingSink) -> ServiceContext {
-        ServiceContext {
-            data_dir: Arc::new(SinomoDataDir::new(dir)),
-            cluster: None,
-            signer: ServiceSigner::Local,
-            sink: Box::new(sink),
-        }
+        ServiceContext::new(
+            Arc::new(SinomoDataDir::new(dir)),
+            None,
+            ServiceSigner::Local,
+            ObjectRpcIncomingBody::empty(),
+            Box::new(sink),
+        )
     }
 
     /// A factory that fails to open a backend (e.g. clustered route with no cluster).

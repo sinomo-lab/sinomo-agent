@@ -1,7 +1,6 @@
 //! Durable local content storage for DFS blobs.
 
 mod accounting;
-mod chunked;
 mod fs_ops;
 mod packed;
 mod readers;
@@ -13,7 +12,6 @@ use accounting::{ContentStoreQuotaDelta, ContentStoreStatsDelta, ContentStoreSta
 use blake3::hazmat::{
     ChainingValue, HasherExt, Mode, left_subtree_len, merge_subtrees_non_root, merge_subtrees_root,
 };
-pub use chunked::ChunkedBlobAssembler;
 #[cfg(test)]
 use fs_ops::write_file_atomic;
 use fs_ops::{
@@ -71,27 +69,8 @@ pub enum ContentStoreError {
     MissingLooseBlob { hash: String },
     #[error("content-addressed blob is packed, not loose: {hash}")]
     PackedBlob { hash: String },
-    #[error(
-        "chunked content hash mismatch: object={object_id}, version={version}, expected={expected_hash}, actual={actual_hash}"
-    )]
-    ChunkHashMismatch {
-        object_id: String,
-        version: String,
-        expected_hash: String,
-        actual_hash: String,
-    },
-    #[error("chunked content transfer incomplete: object={object_id}, version={version}")]
-    IncompleteChunkedContent { object_id: String, version: String },
-    #[error(
-        "conflicting duplicate content chunk: object={object_id}, version={version}, chunk={chunk_index}"
-    )]
-    ConflictingChunk {
-        object_id: String,
-        version: String,
-        chunk_index: u32,
-    },
-    #[error("invalid chunked content transfer: {message}")]
-    InvalidChunkedContent { message: String },
+    #[error("invalid content layout: {message}")]
+    InvalidContentLayout { message: String },
     #[error(
         "object version manifest already exists with different content: object={object_id}, version={version}, existing={existing_hash}, new={new_hash}"
     )]
@@ -684,7 +663,7 @@ impl LocalContentStore {
     ) -> Result<ContentManifest> {
         let reader = self.open_blob_stream(content_hash)?;
         if reader.size_bytes() != size_bytes {
-            return Err(ContentStoreError::InvalidChunkedContent {
+            return Err(ContentStoreError::InvalidContentLayout {
                 message: format!(
                     "blob-only manifest size does not match blob: object={object_id}, version={version}, manifest={size_bytes}, blob={}",
                     reader.size_bytes()
@@ -983,7 +962,7 @@ impl LocalContentStore {
     ) -> Result<(ContentManifest, Vec<u8>)> {
         let (manifest, mut reader) = self.open_object_version_stream(object_id, version)?;
         let capacity = usize::try_from(reader.size_bytes()).map_err(|_| {
-            ContentStoreError::InvalidChunkedContent {
+            ContentStoreError::InvalidContentLayout {
                 message: format!(
                     "object version is too large to buffer: object={object_id}, version={version}, size={}",
                     reader.size_bytes()
@@ -1010,7 +989,7 @@ impl LocalContentStore {
         if manifest.extents.is_empty() {
             let reader = self.open_blob_stream(&manifest.content_hash)?;
             if reader.size_bytes() != manifest.size_bytes {
-                return Err(ContentStoreError::InvalidChunkedContent {
+                return Err(ContentStoreError::InvalidContentLayout {
                     message: format!(
                         "object version manifest size does not match blob size: object={object_id}, version={version}, manifest={}, blob={}",
                         manifest.size_bytes,
@@ -1048,7 +1027,7 @@ impl LocalContentStore {
             let extent_end = extent
                 .logical_offset
                 .checked_add(extent.size_bytes)
-                .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+                .ok_or_else(|| ContentStoreError::InvalidContentLayout {
                     message: format!(
                         "extent range overflows object size: object={}, version={}",
                         manifest.object_id, manifest.version
@@ -1067,7 +1046,7 @@ impl LocalContentStore {
                 blob_offset: extent
                     .blob_offset
                     .checked_add(extent_delta)
-                    .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+                    .ok_or_else(|| ContentStoreError::InvalidContentLayout {
                         message: format!(
                             "extent blob offset overflows: object={}, version={}",
                             manifest.object_id, manifest.version
@@ -1092,7 +1071,7 @@ impl LocalContentStore {
         let manifest = self.read_manifest(object_id, version)?;
         let reader = self.open_blob_stream(&manifest.content_hash)?;
         if reader.size_bytes() != manifest.size_bytes {
-            return Err(ContentStoreError::InvalidChunkedContent {
+            return Err(ContentStoreError::InvalidContentLayout {
                 message: format!(
                     "object version manifest size does not match blob size: object={object_id}, version={version}, manifest={}, blob={}",
                     manifest.size_bytes,
@@ -1800,7 +1779,7 @@ impl LocalContentStore {
         hash_hex(&base_identity.content_hash)?;
         let reader = self.open_blob_stream(&base_identity.content_hash)?;
         if reader.size_bytes() != base_identity.size_bytes {
-            return Err(ContentStoreError::InvalidChunkedContent {
+            return Err(ContentStoreError::InvalidContentLayout {
                 message: format!(
                     "blob-only patch base has wrong size: object={object_id}, base={base_version}, hash={}, expected={}, actual={}",
                     base_identity.content_hash,
@@ -1830,7 +1809,7 @@ impl LocalContentStore {
         let base_extents = self.logical_extents_for_manifest(&base_manifest)?;
         self.ensure_extents_readable(&base_extents)?;
         if offset > base_manifest.size_bytes {
-            return Err(ContentStoreError::InvalidChunkedContent {
+            return Err(ContentStoreError::InvalidContentLayout {
                 message: format!(
                     "patch offset leaves sparse gap: object={object_id}, base={base_version}, offset={offset}, size={}",
                     base_manifest.size_bytes
@@ -1839,7 +1818,7 @@ impl LocalContentStore {
         }
         offset
             .checked_add(patch_size)
-            .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+            .ok_or_else(|| ContentStoreError::InvalidContentLayout {
                 message: format!(
                     "patch range overflows object size: object={object_id}, offset={offset}, bytes={patch_size}"
                 ),
@@ -1887,7 +1866,7 @@ impl LocalContentStore {
         let base_extents = self.logical_extents_for_manifest(&base_manifest)?;
         self.ensure_extents_readable(&base_extents)?;
         if offset > base_manifest.size_bytes {
-            return Err(ContentStoreError::InvalidChunkedContent {
+            return Err(ContentStoreError::InvalidContentLayout {
                 message: format!(
                     "patch offset leaves sparse gap: object={object_id}, base={base_version}, offset={offset}, size={}",
                     base_manifest.size_bytes
@@ -1898,7 +1877,7 @@ impl LocalContentStore {
         let patch_end =
             offset
                 .checked_add(patch_size)
-                .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+                .ok_or_else(|| ContentStoreError::InvalidContentLayout {
                     message: format!(
                         "patch range overflows object size: object={object_id}, offset={offset}, bytes={patch_size}"
                     ),
@@ -1908,7 +1887,7 @@ impl LocalContentStore {
 
         for extent in base_extents {
             let extent_end = extent.logical_offset.checked_add(extent.size_bytes).ok_or_else(
-                || ContentStoreError::InvalidChunkedContent {
+                || ContentStoreError::InvalidContentLayout {
                     message: format!(
                         "extent range overflows object size: object={object_id}, version={base_version}"
                     ),
@@ -2982,7 +2961,7 @@ impl LocalContentStore {
         let max_bytes = u64::try_from(max_bytes).unwrap_or(u64::MAX);
         let end = start.saturating_add(max_bytes).min(manifest.size_bytes);
         let capacity = usize::try_from(end.saturating_sub(start)).map_err(|_| {
-            ContentStoreError::InvalidChunkedContent {
+            ContentStoreError::InvalidContentLayout {
                 message: format!(
                     "object range is too large to buffer: object={}, version={}, range={}..{}",
                     manifest.object_id, manifest.version, start, end
@@ -2994,7 +2973,7 @@ impl LocalContentStore {
             let extent_end = extent
                 .logical_offset
                 .checked_add(extent.size_bytes)
-                .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+                .ok_or_else(|| ContentStoreError::InvalidContentLayout {
                     message: format!(
                         "extent range overflows object size: object={}, version={}",
                         manifest.object_id, manifest.version
@@ -3009,14 +2988,14 @@ impl LocalContentStore {
             let blob_offset = extent
                 .blob_offset
                 .checked_add(extent_delta)
-                .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+                .ok_or_else(|| ContentStoreError::InvalidContentLayout {
                     message: format!(
                         "extent blob offset overflows: object={}, version={}",
                         manifest.object_id, manifest.version
                     ),
                 })?;
             let read_len = usize::try_from(range_end - range_start).map_err(|_| {
-                ContentStoreError::InvalidChunkedContent {
+                ContentStoreError::InvalidContentLayout {
                     message: format!(
                         "extent range is too large to buffer: object={}, version={}",
                         manifest.object_id, manifest.version
@@ -3025,7 +3004,7 @@ impl LocalContentStore {
             })?;
             let part = self.read_blob_range(&extent.content_hash, blob_offset, read_len)?;
             if part.len() != read_len {
-                return Err(ContentStoreError::InvalidChunkedContent {
+                return Err(ContentStoreError::InvalidContentLayout {
                     message: format!(
                         "extent range shorter than manifest: object={}, version={}, expected={}, actual={}",
                         manifest.object_id,
@@ -3070,7 +3049,7 @@ impl LocalContentStore {
 
     fn ensure_extents_readable(&self, extents: &[ContentExtent]) -> Result<()> {
         if !self.extents_readable(extents)? {
-            return Err(ContentStoreError::InvalidChunkedContent {
+            return Err(ContentStoreError::InvalidContentLayout {
                 message: "manifest references missing or truncated content extents".to_string(),
             });
         }
@@ -3099,7 +3078,7 @@ impl LocalContentStore {
         let required_end = extent
             .blob_offset
             .checked_add(extent.size_bytes)
-            .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+            .ok_or_else(|| ContentStoreError::InvalidContentLayout {
                 message: format!(
                     "extent blob range overflows for content hash {}",
                     extent.content_hash
@@ -3175,7 +3154,7 @@ impl LocalContentStore {
             || tree.content_hash != content_hash
             || tree.leaf_bytes != CONTENT_HASH_TREE_LEAF_BYTES
         {
-            return Err(ContentStoreError::InvalidChunkedContent {
+            return Err(ContentStoreError::InvalidContentLayout {
                 message: format!(
                     "content hash tree does not match manifest: object={object_id}, version={version}"
                 ),
@@ -3183,7 +3162,7 @@ impl LocalContentStore {
         }
         let expected_leaves = content_hash_tree_leaf_count(size_bytes)?;
         if tree.leaves.len() != expected_leaves {
-            return Err(ContentStoreError::InvalidChunkedContent {
+            return Err(ContentStoreError::InvalidContentLayout {
                 message: format!(
                     "content hash tree leaf count mismatch: object={object_id}, version={version}, expected={expected_leaves}, actual={}",
                     tree.leaves.len()
@@ -3193,7 +3172,7 @@ impl LocalContentStore {
         for (index, leaf) in tree.leaves.iter().enumerate() {
             let (expected_offset, expected_size) = content_hash_tree_leaf_range(size_bytes, index)?;
             if leaf.logical_offset != expected_offset || leaf.size_bytes != expected_size {
-                return Err(ContentStoreError::InvalidChunkedContent {
+                return Err(ContentStoreError::InvalidContentLayout {
                     message: format!(
                         "content hash tree leaf shape mismatch: object={object_id}, version={version}, leaf={index}"
                     ),
@@ -3233,7 +3212,7 @@ impl LocalContentStore {
                 manifest,
                 logical_offset,
                 usize::try_from(size_bytes).map_err(|_| {
-                    ContentStoreError::InvalidChunkedContent {
+                    ContentStoreError::InvalidContentLayout {
                         message: format!(
                             "content hash tree leaf is too large to buffer: object={}, version={}, bytes={size_bytes}",
                             manifest.object_id, manifest.version
@@ -3242,7 +3221,7 @@ impl LocalContentStore {
                 })?,
             )?;
             if bytes.len() as u64 != size_bytes {
-                return Err(ContentStoreError::InvalidChunkedContent {
+                return Err(ContentStoreError::InvalidContentLayout {
                     message: format!(
                         "content hash tree leaf read was short: object={}, version={}, expected={size_bytes}, actual={}",
                         manifest.object_id,
@@ -3296,7 +3275,7 @@ impl LocalContentStore {
         let patch_end =
             offset
                 .checked_add(patch_size)
-                .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+                .ok_or_else(|| ContentStoreError::InvalidContentLayout {
                     message: format!(
                         "patch range overflows object size: object={}, offset={offset}, bytes={patch_size}",
                         target_manifest.object_id
@@ -3306,7 +3285,7 @@ impl LocalContentStore {
             let (logical_offset, size_bytes) =
                 content_hash_tree_leaf_range(target_manifest.size_bytes, index)?;
             let leaf_end = logical_offset.checked_add(size_bytes).ok_or_else(|| {
-                ContentStoreError::InvalidChunkedContent {
+                ContentStoreError::InvalidContentLayout {
                     message: format!(
                         "content hash tree leaf range overflows: object={}, version={}",
                         target_manifest.object_id, target_manifest.version
@@ -3329,7 +3308,7 @@ impl LocalContentStore {
                 target_manifest,
                 logical_offset,
                 usize::try_from(size_bytes).map_err(|_| {
-                    ContentStoreError::InvalidChunkedContent {
+                    ContentStoreError::InvalidContentLayout {
                         message: format!(
                             "content hash tree patch leaf is too large to buffer: object={}, version={}, bytes={size_bytes}",
                             target_manifest.object_id, target_manifest.version
@@ -3338,7 +3317,7 @@ impl LocalContentStore {
                 })?,
             )?;
             if bytes.len() as u64 != size_bytes {
-                return Err(ContentStoreError::InvalidChunkedContent {
+                return Err(ContentStoreError::InvalidContentLayout {
                     message: format!(
                         "content hash tree patch leaf read was short: object={}, version={}, expected={size_bytes}, actual={}",
                         target_manifest.object_id,
@@ -3392,7 +3371,7 @@ impl LocalContentStore {
         let mut buffer = [0_u8; 64 * 1024];
         for extent in extents {
             let max_bytes = usize::try_from(extent.size_bytes).map_err(|_| {
-                ContentStoreError::InvalidChunkedContent {
+                ContentStoreError::InvalidContentLayout {
                     message: format!(
                         "extent is too large to hash in this process: {} bytes",
                         extent.size_bytes
@@ -3402,7 +3381,7 @@ impl LocalContentStore {
             let mut reader =
                 self.open_blob_range_stream(&extent.content_hash, extent.blob_offset, max_bytes)?;
             if reader.remaining_bytes() != extent.size_bytes {
-                return Err(ContentStoreError::InvalidChunkedContent {
+                return Err(ContentStoreError::InvalidContentLayout {
                     message: format!(
                         "extent source is shorter than manifest: hash={}, expected={}, actual={}",
                         extent.content_hash,
@@ -3541,18 +3520,18 @@ fn clip_extent(
     logical_end: u64,
 ) -> Result<ContentExtent> {
     if logical_start < extent.logical_offset || logical_end < logical_start {
-        return Err(ContentStoreError::InvalidChunkedContent {
+        return Err(ContentStoreError::InvalidContentLayout {
             message: "invalid extent clip range".to_string(),
         });
     }
     let extent_end = extent
         .logical_offset
         .checked_add(extent.size_bytes)
-        .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+        .ok_or_else(|| ContentStoreError::InvalidContentLayout {
             message: "extent logical range overflow".to_string(),
         })?;
     if logical_end > extent_end {
-        return Err(ContentStoreError::InvalidChunkedContent {
+        return Err(ContentStoreError::InvalidContentLayout {
             message: "extent clip exceeds source extent".to_string(),
         });
     }
@@ -3562,7 +3541,7 @@ fn clip_extent(
         size_bytes: logical_end - logical_start,
         content_hash: extent.content_hash.clone(),
         blob_offset: extent.blob_offset.checked_add(delta).ok_or_else(|| {
-            ContentStoreError::InvalidChunkedContent {
+            ContentStoreError::InvalidContentLayout {
                 message: "extent blob offset overflow".to_string(),
             }
         })?,
@@ -3578,13 +3557,13 @@ fn push_extent_coalescing(extents: &mut Vec<ContentExtent>, extent: ContentExten
         let last_logical_end = last
             .logical_offset
             .checked_add(last.size_bytes)
-            .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+            .ok_or_else(|| ContentStoreError::InvalidContentLayout {
                 message: "extent logical range overflow".to_string(),
             })?;
         let last_blob_end = last
             .blob_offset
             .checked_add(last.size_bytes)
-            .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+            .ok_or_else(|| ContentStoreError::InvalidContentLayout {
                 message: "extent blob range overflow".to_string(),
             })?;
         if last.content_hash == extent.content_hash
@@ -3594,7 +3573,7 @@ fn push_extent_coalescing(extents: &mut Vec<ContentExtent>, extent: ContentExten
             last.size_bytes = last
                 .size_bytes
                 .checked_add(extent.size_bytes)
-                .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+                .ok_or_else(|| ContentStoreError::InvalidContentLayout {
                     message: "coalesced extent size overflow".to_string(),
                 })?;
             return Ok(());
@@ -3622,7 +3601,7 @@ fn validate_extents_cover_size(
         if extents.is_empty() {
             return Ok(());
         }
-        return Err(ContentStoreError::InvalidChunkedContent {
+        return Err(ContentStoreError::InvalidContentLayout {
             message: format!("zero-sized object {object_id} {version} has non-empty extents"),
         });
     }
@@ -3630,12 +3609,12 @@ fn validate_extents_cover_size(
     for extent in extents {
         hash_hex(&extent.content_hash)?;
         if extent.size_bytes == 0 {
-            return Err(ContentStoreError::InvalidChunkedContent {
+            return Err(ContentStoreError::InvalidContentLayout {
                 message: format!("zero-sized extent in object {object_id} {version}"),
             });
         }
         if extent.logical_offset != cursor {
-            return Err(ContentStoreError::InvalidChunkedContent {
+            return Err(ContentStoreError::InvalidContentLayout {
                 message: format!(
                     "manifest extents are not contiguous for object {object_id} {version}: expected offset {cursor}, actual {}",
                     extent.logical_offset
@@ -3645,19 +3624,19 @@ fn validate_extents_cover_size(
         let logical_end = extent
             .logical_offset
             .checked_add(extent.size_bytes)
-            .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+            .ok_or_else(|| ContentStoreError::InvalidContentLayout {
                 message: format!("extent logical range overflow in object {object_id} {version}"),
             })?;
         extent
             .blob_offset
             .checked_add(extent.size_bytes)
-            .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+            .ok_or_else(|| ContentStoreError::InvalidContentLayout {
                 message: format!("extent blob range overflow in object {object_id} {version}"),
             })?;
         cursor = logical_end;
     }
     if cursor != size_bytes {
-        return Err(ContentStoreError::InvalidChunkedContent {
+        return Err(ContentStoreError::InvalidContentLayout {
             message: format!(
                 "manifest extents do not cover object {object_id} {version}: covered {cursor}, expected {size_bytes}"
             ),
@@ -3675,23 +3654,23 @@ fn content_hash_tree_leaf_count(size_bytes: u64) -> Result<usize> {
         return Ok(0);
     }
     usize::try_from(size_bytes.div_ceil(CONTENT_HASH_TREE_LEAF_BYTES)).map_err(|_| {
-        ContentStoreError::InvalidChunkedContent {
+        ContentStoreError::InvalidContentLayout {
             message: format!("content hash tree has too many leaves: bytes={size_bytes}"),
         }
     })
 }
 
 fn content_hash_tree_leaf_range(size_bytes: u64, index: usize) -> Result<(u64, u64)> {
-    let index = u64::try_from(index).map_err(|_| ContentStoreError::InvalidChunkedContent {
+    let index = u64::try_from(index).map_err(|_| ContentStoreError::InvalidContentLayout {
         message: "content hash tree leaf index is too large".to_string(),
     })?;
     let logical_offset = index
         .checked_mul(CONTENT_HASH_TREE_LEAF_BYTES)
-        .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+        .ok_or_else(|| ContentStoreError::InvalidContentLayout {
             message: format!("content hash tree leaf offset overflows: leaf={index}"),
         })?;
     if logical_offset >= size_bytes {
-        return Err(ContentStoreError::InvalidChunkedContent {
+        return Err(ContentStoreError::InvalidContentLayout {
             message: format!(
                 "content hash tree leaf starts beyond object: leaf={index}, offset={logical_offset}, size={size_bytes}"
             ),
@@ -3720,19 +3699,19 @@ fn content_hash_from_hash_tree_leaves(
         return Ok(content_hash(&[]));
     }
     if size_bytes <= CONTENT_HASH_TREE_LEAF_BYTES || leaves.len() <= 1 {
-        return Err(ContentStoreError::InvalidChunkedContent {
+        return Err(ContentStoreError::InvalidContentLayout {
             message: "content hash tree root requires at least two leaves".to_string(),
         });
     }
     let left_len = left_subtree_len(size_bytes);
     let left_leaf_count =
         usize::try_from(left_len / CONTENT_HASH_TREE_LEAF_BYTES).map_err(|_| {
-            ContentStoreError::InvalidChunkedContent {
+            ContentStoreError::InvalidContentLayout {
                 message: format!("content hash tree left subtree is too large: bytes={left_len}"),
             }
         })?;
     if left_leaf_count == 0 || left_leaf_count >= leaves.len() {
-        return Err(ContentStoreError::InvalidChunkedContent {
+        return Err(ContentStoreError::InvalidContentLayout {
             message: format!(
                 "content hash tree invalid root split: bytes={size_bytes}, left_leaves={left_leaf_count}, leaves={}",
                 leaves.len()
@@ -3752,13 +3731,13 @@ fn content_hash_tree_subtree_cv(
     size_bytes: u64,
 ) -> Result<ChainingValue> {
     if leaves.is_empty() {
-        return Err(ContentStoreError::InvalidChunkedContent {
+        return Err(ContentStoreError::InvalidContentLayout {
             message: "content hash tree subtree has no leaves".to_string(),
         });
     }
     if leaves.len() == 1 {
         if leaves[0].size_bytes != size_bytes {
-            return Err(ContentStoreError::InvalidChunkedContent {
+            return Err(ContentStoreError::InvalidContentLayout {
                 message: format!(
                     "content hash tree leaf size mismatch: expected={size_bytes}, actual={}",
                     leaves[0].size_bytes
@@ -3770,12 +3749,12 @@ fn content_hash_tree_subtree_cv(
     let left_len = left_subtree_len(size_bytes);
     let left_leaf_count =
         usize::try_from(left_len / CONTENT_HASH_TREE_LEAF_BYTES).map_err(|_| {
-            ContentStoreError::InvalidChunkedContent {
+            ContentStoreError::InvalidContentLayout {
                 message: format!("content hash tree subtree split is too large: bytes={left_len}"),
             }
         })?;
     if left_leaf_count == 0 || left_leaf_count >= leaves.len() {
-        return Err(ContentStoreError::InvalidChunkedContent {
+        return Err(ContentStoreError::InvalidContentLayout {
             message: format!(
                 "content hash tree invalid subtree split: bytes={size_bytes}, left_leaves={left_leaf_count}, leaves={}",
                 leaves.len()
@@ -5392,25 +5371,6 @@ mod tests {
             }
         ));
         assert_eq!(store.stats().expect("stats").staging_bytes, 0);
-        let error = store
-            .begin_chunked_object_version(
-                "object-chunk-quota",
-                "v1",
-                &content_hash(b"12345"),
-                5,
-                1,
-                5,
-            )
-            .expect_err("staging quota should reject chunked temp allocation");
-        assert!(matches!(
-            error,
-            ContentStoreError::QuotaExceeded {
-                resource: ContentStoreQuotaResource::StagingBytes,
-                ..
-            }
-        ));
-        assert_eq!(store.stats().expect("stats").staging_bytes, 0);
-
         let store = store.with_quota(ContentStoreQuota {
             max_blob_bytes: Some(12),
             max_logical_object_bytes: Some(128),
@@ -5444,149 +5404,6 @@ mod tests {
                 .has_blob(&content_hash(b"patch"))
                 .expect("rejected patch blob should not be written")
         );
-
-        cleanup(&root);
-    }
-
-    #[test]
-    fn chunked_object_assembler_writes_out_of_order_chunks_to_blob() {
-        let root = temp_root("chunked_object_assembler_writes_out_of_order_chunks_to_blob");
-        let store = LocalContentStore::new(&root).expect("create store");
-        let bytes = b"chunked object bytes stored through a file-backed assembler";
-        let hash = content_hash(bytes);
-        let chunk_size = 11;
-        let total_chunks = bytes.len().div_ceil(chunk_size) as u32;
-        let mut assembler = store
-            .begin_chunked_object_version(
-                "object-chunked",
-                "v1",
-                &hash,
-                bytes.len() as u64,
-                total_chunks,
-                chunk_size,
-            )
-            .expect("begin chunked object");
-
-        assert!(
-            !assembler
-                .insert_chunk(1, &bytes[chunk_size..chunk_size * 2])
-                .expect("second chunk")
-        );
-        assert!(
-            !assembler
-                .insert_chunk(0, &bytes[..chunk_size])
-                .expect("first chunk")
-        );
-        assert!(
-            !assembler
-                .insert_chunk(1, &bytes[chunk_size..chunk_size * 2])
-                .expect("duplicate second chunk")
-        );
-        for (chunk_index, chunk) in bytes.chunks(chunk_size).enumerate().skip(2) {
-            assembler
-                .insert_chunk(chunk_index as u32, chunk)
-                .expect("remaining chunk");
-        }
-        assert!(assembler.is_complete());
-
-        let manifest = store
-            .commit_chunked_object_version(assembler)
-            .expect("commit chunked object");
-        assert_eq!(manifest.content_hash, hash);
-        assert_eq!(manifest.size_bytes, bytes.len() as u64);
-        assert_eq!(
-            store.read_blob(&manifest.content_hash).expect("read blob"),
-            bytes
-        );
-        assert!(
-            std::fs::read_dir(root.join("staging"))
-                .expect("staging dir")
-                .next()
-                .is_none(),
-            "chunked assembly must clean temporary staging files"
-        );
-
-        cleanup(&root);
-    }
-
-    #[test]
-    fn stale_staging_gc_removes_abandoned_chunked_file() {
-        let root = temp_root("stale_staging_gc_removes_abandoned_chunked_file");
-        let store = LocalContentStore::new(&root).expect("create store");
-        let bytes = b"abandoned chunked staging bytes";
-        let assembler = store
-            .begin_chunked_object_version(
-                "object-abandoned-staging",
-                "v1",
-                &content_hash(bytes),
-                bytes.len() as u64,
-                1,
-                bytes.len(),
-            )
-            .expect("begin chunked object");
-        std::mem::forget(assembler);
-
-        let staged_stats = store.stats().expect("stats after abandoned staging");
-        assert_eq!(staged_stats.staging_file_count, 1);
-        assert_eq!(staged_stats.staging_bytes, bytes.len() as u64);
-
-        let dry_run = store
-            .collect_stale_staging(ContentStoreStagingGcOptions::dry_run(Duration::from_nanos(
-                0,
-            )))
-            .expect("dry-run staging gc");
-        assert_eq!(dry_run.scanned_staging_count, 1);
-        assert_eq!(dry_run.eligible_staging_count, 1);
-        assert_eq!(dry_run.deleted_staging_count, 0);
-        assert_eq!(
-            store
-                .stats()
-                .expect("stats after dry run")
-                .staging_file_count,
-            1
-        );
-
-        let report = store
-            .collect_stale_staging(ContentStoreStagingGcOptions::delete_eligible(
-                Duration::from_nanos(0),
-            ))
-            .expect("staging gc");
-        assert_eq!(report.scanned_staging_count, 1);
-        assert_eq!(report.eligible_staging_count, 1);
-        assert_eq!(report.deleted_staging_count, 1);
-        assert_eq!(report.deleted_staging_bytes, bytes.len() as u64);
-        let final_stats = store.stats().expect("stats after staging gc");
-        assert_eq!(final_stats.staging_file_count, 0);
-        assert_eq!(final_stats.staging_bytes, 0);
-
-        cleanup(&root);
-    }
-
-    #[test]
-    fn chunked_object_assembler_rejects_conflicting_duplicate_chunk() {
-        let root = temp_root("chunked_object_assembler_rejects_conflicting_duplicate_chunk");
-        let store = LocalContentStore::new(&root).expect("create store");
-        let bytes = b"conflicting duplicate chunk";
-        let hash = content_hash(bytes);
-        let mut assembler = store
-            .begin_chunked_object_version(
-                "object-duplicate",
-                "v1",
-                &hash,
-                bytes.len() as u64,
-                2,
-                16,
-            )
-            .expect("begin chunked object");
-        assembler
-            .insert_chunk(0, &bytes[..16])
-            .expect("first chunk");
-        let mut duplicate = bytes[..16].to_vec();
-        duplicate[0] ^= 0xff;
-        assert!(matches!(
-            assembler.insert_chunk(0, &duplicate),
-            Err(ContentStoreError::ConflictingChunk { chunk_index: 0, .. })
-        ));
 
         cleanup(&root);
     }

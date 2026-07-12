@@ -9,6 +9,7 @@ use crate::object::DaemonRpcTimeouts;
 #[cfg(any(test, feature = "test-support"))]
 use crate::peer::{EndpointCandidateStatus, PeerEndpointCandidate};
 use crate::prelude::*;
+use crate::{NetworkDuplexStream, NetworkHealthPolicy};
 #[cfg(any(test, feature = "test-support"))]
 use sinomo_kv::KvEntry;
 #[cfg(any(test, feature = "test-support"))]
@@ -216,6 +217,46 @@ pub async fn send_daemon_rpc_to_cluster_endpoint_async(
     Ok(response)
 }
 
+/// Opens the transport-neutral byte stream used by the canonical object-RPC
+/// session engine. Endpoint selection and retry stay in `route`; transports do
+/// not see object heads or transfer frames.
+pub(crate) async fn open_daemon_rpc_stream_to_cluster_endpoint_async(
+    endpoint: &ClusterEndpointRecord,
+    health: NetworkHealthPolicy,
+) -> Result<Box<dyn NetworkDuplexStream>, NetworkError> {
+    match endpoint.transport {
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
+            if endpoint
+                .address
+                .starts_with(crate::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX)
+            {
+                return Err(NetworkError::Io {
+                    operation: "open object RPC session stream".to_string(),
+                    detail: "legacy multiplexed TCP-tunnel endpoints do not expose a canonical byte stream"
+                        .to_string(),
+                });
+            }
+            let stream = crate::AsyncDaemonControlStream::connect_with_options(
+                &endpoint.address,
+                health.into(),
+            )
+            .await?;
+            Ok(Box::new(stream.into_inner()))
+        }
+        ref transport => {
+            let module = crate::network_module::registered_network_module_for_transport(transport)
+                .ok_or_else(|| NetworkError::Io {
+                    operation: format!("open object RPC session to {}", endpoint.address),
+                    detail: format!(
+                        "unsupported object RPC session transport {:?}",
+                        endpoint.transport
+                    ),
+                })?;
+            module.open_rpc_stream(endpoint, health).await
+        }
+    }
+}
+
 /// Send a daemon RPC while preserving a received application error frame.
 ///
 /// Routed delivery uses this form so a valid peer response terminates transport
@@ -228,52 +269,8 @@ pub async fn send_daemon_rpc_response_to_cluster_endpoint_async(
     timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::ObjectRpcResponse, NetworkError> {
     let control_request = daemon_rpc_control_request(auth, request);
-    Ok(
-        if crate::object_rpc_request_expects_raw_daemon_response(request) {
-            send_daemon_control_rpc_request_raw_response_to_cluster_endpoint_async(
-                endpoint,
-                &control_request,
-                timeouts,
-            )
-            .await?
-        } else {
-            send_daemon_control_request_to_cluster_endpoint_async(
-                endpoint,
-                &control_request,
-                timeouts,
-            )
-            .await?
-        },
-    )
-}
-
-pub async fn send_daemon_rpc_stream_response_to_cluster_endpoint_async(
-    endpoint: &ClusterEndpointRecord,
-    auth: Option<&[u8]>,
-    request: &crate::ObjectRpcRequest,
-    timeouts: DaemonRpcTimeouts,
-) -> Result<crate::ObjectRpcStreamResponse, NetworkError> {
-    let response = send_daemon_rpc_stream_response_frame_to_cluster_endpoint_async(
-        endpoint, auth, request, timeouts,
-    )
-    .await?;
-    response.response.error_detail()?;
-    Ok(response)
-}
-
-pub async fn send_daemon_rpc_stream_response_frame_to_cluster_endpoint_async(
-    endpoint: &ClusterEndpointRecord,
-    auth: Option<&[u8]>,
-    request: &crate::ObjectRpcRequest,
-    timeouts: DaemonRpcTimeouts,
-) -> Result<crate::ObjectRpcStreamResponse, NetworkError> {
-    let control_request = daemon_rpc_control_request(auth, request);
-    send_daemon_control_rpc_request_stream_response_to_cluster_endpoint_async(
-        endpoint,
-        &control_request,
-        timeouts,
-    )
-    .await
+    send_daemon_control_request_to_cluster_endpoint_async(endpoint, &control_request, timeouts)
+        .await
 }
 
 fn daemon_rpc_control_request(
@@ -316,7 +313,7 @@ async fn send_daemon_control_request_to_cluster_endpoint_async(
 }
 
 /// Dials one daemon control request through a runtime network module: the
-/// typed request is framed, the module returns the raw response frame, and
+/// typed request is framed, the module returns the encoded response frame, and
 /// the frame is decoded back into the typed response.
 async fn dial_daemon_control_request_via_network_module(
     module: &dyn crate::network_module::NetworkModule,
@@ -349,85 +346,6 @@ fn cluster_endpoint_record_for_module_address_dial(
         privacy: ClusterEndpointPrivacy::InternetDirect,
         priority: 0,
         last_observed_latency_ms: None,
-    }
-}
-
-pub(crate) async fn send_daemon_control_rpc_request_raw_response_to_cluster_endpoint_async(
-    endpoint: &ClusterEndpointRecord,
-    request: &crate::DaemonControlRequest,
-    timeouts: DaemonRpcTimeouts,
-) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    match endpoint.transport {
-        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
-            crate::send_daemon_control_rpc_request_raw_response_async(
-                &endpoint.address,
-                request,
-                timeouts,
-                crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
-            )
-            .await
-        }
-        ref transport => {
-            if let Some(module) =
-                crate::network_module::registered_network_module_for_transport(transport)
-            {
-                let frame = crate::object::encode_object_frame_to_vec(request)?;
-                return module
-                    .dial_rpc_raw_response(endpoint, &frame, timeouts)
-                    .await;
-            }
-            Err(NetworkError::Io {
-                operation: format!("send streamed daemon rpc to {}", endpoint.address),
-                detail: format!(
-                    "streamed raw RPC responses are not supported over module transport {:?}",
-                    endpoint.transport
-                ),
-            })
-        }
-    }
-}
-
-pub(crate) async fn send_daemon_control_rpc_request_stream_response_to_cluster_endpoint_async(
-    endpoint: &ClusterEndpointRecord,
-    request: &crate::DaemonControlRequest,
-    timeouts: DaemonRpcTimeouts,
-) -> Result<crate::ObjectRpcStreamResponse, NetworkError> {
-    let body_options = crate::RawByteStreamChunkOptions {
-        chunk_bytes: crate::OBJECT_STREAM_MAX_CHUNK_BYTES,
-        max_total_bytes: u64::try_from(crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES).ok(),
-        idle_timeout: timeouts.idle_timeout,
-    };
-    match endpoint.transport {
-        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
-            crate::send_daemon_control_rpc_request_stream_response_async(
-                &endpoint.address,
-                request,
-                timeouts,
-                crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
-            )
-            .await
-        }
-        ref transport => {
-            if let Some(module) =
-                crate::network_module::registered_network_module_for_transport(transport)
-            {
-                let frame = crate::object::encode_object_frame_to_vec(request)?;
-                let response = module
-                    .dial_rpc_raw_response(endpoint, &frame, timeouts)
-                    .await?;
-                return Ok(crate::ObjectRpcStreamResponse::from_buffered_response(
-                    response,
-                    body_options,
-                ));
-            }
-            Err(NetworkError::Io {
-                operation: format!("send streamed daemon rpc to {}", endpoint.address),
-                detail: format!(
-                    "streamed raw RPC responses are not supported over module transport {:?}",
-                    endpoint.transport
-                ),
-            })
-        }
     }
 }
 

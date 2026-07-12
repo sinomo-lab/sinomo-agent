@@ -1,9 +1,7 @@
 use crate::cluster::{
     ClusterNetworkMaintenance, DAEMON_CLUSTER_PUBLISH_INTERVAL, DAEMON_CLUSTER_TICK_INTERVAL,
     cluster_paths_from_daemon_paths, handle_daemon_cluster_kv_snapshot,
-    handle_daemon_cluster_relay_request_on_runtime,
-    handle_daemon_cluster_relay_stream_forward_on_runtime,
-    prune_local_cluster_raft_uncommitted_tail,
+    handle_daemon_cluster_relay_request_on_runtime, prune_local_cluster_raft_uncommitted_tail,
 };
 use crate::dfs::{
     daemon_dfs_maintenance_notify, daemon_dfs_node_transport, daemon_dfs_node_transport_on_runtime,
@@ -38,6 +36,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
+use tokio::io::AsyncWriteExt as _;
 
 pub const DAEMON_COMMAND_MAX_BYTES: usize =
     sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES;
@@ -56,10 +55,11 @@ const DAEMON_BACKGROUND_MAINTENANCE_TASK_JOIN_TIMEOUT: Duration = DAEMON_RUNTIME
 const DAEMON_RUNTIME_TASK_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const DAEMON_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const DAEMON_SANDBOX_STREAM_CHANNEL_CAPACITY: usize = 64;
+const DAEMON_SANDBOX_SESSION_BODY_BUFFER_BYTES: usize = 256 * 1024;
 const DAEMON_DFS_MESSAGE_REPLAY_RETENTION: Duration = Duration::from_secs(120);
 const DAEMON_DFS_MESSAGE_REPLAY_WAIT: Duration = Duration::from_secs(30);
 const DAEMON_DFS_MESSAGE_REPLAY_MAX_CACHED_BODY_BYTES: usize =
-    sinomo_dfs::DFS_DIRECT_READ_STREAM_CHUNK_BYTES;
+    sinomo_core::network::OBJECT_RPC_UNARY_ADAPTER_MAX_BODY_BYTES;
 
 static DAEMON_DFS_MESSAGE_REPLAY_CACHE: OnceLock<
     Mutex<BTreeMap<PathBuf, BTreeMap<Vec<u8>, DaemonDfsMessageReplayEntry>>>,
@@ -921,6 +921,16 @@ pub(crate) async fn handle_daemon_connection_async(
     stream_address: String,
 ) -> Result<bool, DaemonError> {
     loop {
+        if daemon_control_stream_uses_object_rpc_session(&stream).await? {
+            return handle_daemon_object_rpc_session_async(
+                stream,
+                paths,
+                service_host,
+                service_runtime,
+                stream_address,
+            )
+            .await;
+        }
         let mut request = match read_daemon_control_frame_async(&mut stream, &stream_address).await
         {
             Ok(request) => request,
@@ -1105,18 +1115,6 @@ pub(crate) async fn handle_daemon_connection_async(
         if let Some(request) = rpc_request.as_ref()
             && request.route == sinomo_core::network::CLUSTER_RELAY_ROUTE
         {
-            if try_handle_streamed_cluster_relay_request_async(
-                request,
-                &mut stream,
-                &paths,
-                &service_host,
-                &service_runtime,
-                &stream_address,
-            )
-            .await?
-            {
-                continue;
-            }
             let response = match handle_daemon_cluster_relay_request_on_runtime(
                 &paths,
                 request,
@@ -1141,39 +1139,6 @@ pub(crate) async fn handle_daemon_connection_async(
             .await?;
             continue;
         }
-        if let Some(request) = rpc_request.as_ref()
-            && daemon_rpc_request_allows_reusable_stream(request)
-            && let Some(result) = crate::service_adapter::try_dispatch_via_registry_async(
-                &authenticated,
-                &rpc_request,
-                &mut stream,
-                &stream_address,
-                &service_host,
-                &paths,
-                replay_key.clone(),
-            )
-            .await
-        {
-            match result {
-                Ok(stop) if stop => return Ok(true),
-                Ok(_) => continue,
-                Err(error) => {
-                    if let Some(response) = rpc_error_response_for_request(&rpc_request, &error) {
-                        let _ = write_daemon_rpc_response_frame_async(
-                            &mut stream,
-                            &stream_address,
-                            response,
-                        )
-                        .await;
-                    }
-                    if let Some(key) = replay_key.as_ref() {
-                        abandon_daemon_dfs_message_replay(&paths, key);
-                    }
-                    let _ = stream.shutdown_write(&stream_address).await;
-                    return Ok(false);
-                }
-            }
-        }
         return handle_authenticated_daemon_command_async(
             authenticated,
             rpc_request,
@@ -1185,6 +1150,315 @@ pub(crate) async fn handle_daemon_connection_async(
             stream_address.clone(),
         )
         .await;
+    }
+}
+
+async fn daemon_control_stream_uses_object_rpc_session(
+    stream: &sinomo_core::network::AsyncDaemonControlStream,
+) -> Result<bool, DaemonError> {
+    let mut prefix = [0_u8; 4];
+    let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let available = tokio::time::timeout_at(deadline, stream.peek_prefix(&mut prefix))
+            .await
+            .map_err(|_| {
+                DaemonError::from(sinomo_core::network::NetworkError::timeout(
+                    "peek daemon object RPC protocol",
+                    sinomo_core::network::NetworkTimeoutPhase::Idle,
+                    sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                    sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                ))
+            })??;
+        if available == 0 {
+            return Ok(false);
+        }
+        if available >= prefix.len() {
+            return Ok(sinomo_core::network::object_rpc_session_wire_prefix_matches(&prefix));
+        }
+        // A normal length-prefixed object frame starts with a zero high byte
+        // under the compatibility frame limit. Only a partial session magic
+        // needs another packet before protocol selection is safe.
+        if prefix[..available] != b"SXFR"[..available] {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+async fn handle_daemon_object_rpc_session_async(
+    stream: sinomo_core::network::AsyncDaemonControlStream,
+    paths: DaemonPaths,
+    service_host: crate::service_adapter::DaemonServiceRegistryHost,
+    service_runtime: tokio::runtime::Handle,
+    _stream_address: String,
+) -> Result<bool, DaemonError> {
+    let data_dir = sinomo_core::local::SinomoDataDir::new(daemon_data_dir_path(&paths)?);
+    let authenticated = Arc::new(Mutex::new(None::<AuthenticatedDaemonCommand>));
+    let authenticated_slot = Arc::clone(&authenticated);
+    let auth_paths = paths.clone();
+    let (request, responder) = sinomo_core::network::accept_object_rpc_server_session(
+        Box::new(stream.into_inner()),
+        data_dir,
+        sinomo_core::network::NetworkCallPolicy::default(),
+        move |request, claimed_link_node_id, claimed_link_public_key| {
+            let command = authenticate_daemon_control_request(&auth_paths, request)
+                .map_err(|_| sinomo_core::network::NetworkError::AuthDenied)?;
+            authorize_daemon_session_link_peer(
+                &auth_paths,
+                request,
+                &command,
+                claimed_link_node_id,
+                claimed_link_public_key,
+            )?;
+            *authenticated_slot
+                .lock()
+                .map_err(|_| sinomo_core::network::NetworkError::Io {
+                    operation: "record authenticated object RPC session".to_string(),
+                    detail: "authenticated session slot lock poisoned".to_string(),
+                })? = Some(command);
+            Ok(())
+        },
+    )
+    .await
+    .map_err(DaemonError::from)?;
+    let authenticated = authenticated
+        .lock()
+        .map_err(|_| DaemonError::Parse {
+            detail: "authenticated object RPC session slot lock poisoned".to_string(),
+        })?
+        .take()
+        .ok_or(DaemonError::AuthDenied)?;
+
+    let route = request.request.route.clone();
+    let dispatch = async {
+        if route == sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE {
+            if !request.body.is_empty() {
+                return Err(DaemonError::Parse {
+                    detail: "cluster network ping does not accept an attached body".to_string(),
+                });
+            }
+            Ok((
+                sinomo_core::network::ObjectRpcSessionResponse::buffered(
+                    daemon_cluster_network_ping_response(&paths, request.request)?,
+                ),
+                false,
+            ))
+        } else if route == sinomo_core::network::CLUSTER_RELAY_ROUTE {
+            handle_daemon_cluster_relay_session_async(
+                &paths,
+                &service_host,
+                &service_runtime,
+                request,
+            )
+            .await
+        } else if crate::service_adapter::is_sandbox_stream_route(&request.request) {
+            if !request.body.is_empty() {
+                return Err(DaemonError::Parse {
+                    detail: "sandbox stream session does not accept an attached request body"
+                        .to_string(),
+                });
+            }
+            Ok((
+                daemon_sandbox_stream_session_response(&paths, request.request, &service_runtime)?,
+                false,
+            ))
+        } else {
+            crate::service_adapter::dispatch_rpc_via_registry_to_session_response_async(
+                &service_host,
+                &authenticated,
+                request,
+                Some(&paths),
+                None,
+            )
+            .await
+        }
+    }
+    .await;
+    let (response, stop) = match dispatch {
+        Ok(response) => response,
+        Err(error) => (
+            sinomo_core::network::ObjectRpcSessionResponse::buffered(
+                sinomo_core::network::ObjectRpcResponse::encode_error(&route, error.to_string())?,
+            ),
+            false,
+        ),
+    };
+    responder
+        .respond(response)
+        .await
+        .map_err(DaemonError::from)?;
+    Ok(stop)
+}
+
+fn daemon_sandbox_stream_session_response(
+    paths: &DaemonPaths,
+    request: sinomo_core::network::ObjectRpcRequest,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_core::network::ObjectRpcSessionResponse, DaemonError> {
+    let route = request.route.clone();
+    let response = sinomo_core::network::ObjectRpcResponse::encode_body(&route, &())
+        .map_err(DaemonError::from)?;
+    let (reader, mut writer) = tokio::io::duplex(DAEMON_SANDBOX_SESSION_BODY_BUFFER_BYTES);
+    let paths = paths.clone();
+    let runtime = runtime.clone();
+    let producer = match route.as_str() {
+        sinomo_sandbox::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE => {
+            let payload = request.decode_body().map_err(DaemonError::from)?;
+            tokio::spawn(async move {
+                if let Err(error) = handle_daemon_sandbox_run_toolchain_stream_async_on_runtime(
+                    &paths,
+                    payload,
+                    &mut writer,
+                    &runtime,
+                )
+                .await
+                {
+                    let frame = sinomo_sandbox::SandboxRunToolchainStreamFrame::Error {
+                        detail: error.to_string(),
+                    };
+                    let _ = write_daemon_sandbox_stream_frame_async(&mut writer, &frame).await;
+                }
+                let _ = writer.shutdown().await;
+            })
+        }
+        sinomo_sandbox::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE => {
+            let payload = request.decode_body().map_err(DaemonError::from)?;
+            tokio::spawn(async move {
+                if let Err(error) = handle_daemon_sandbox_run_process_plan_stream_async_on_runtime(
+                    &paths,
+                    payload,
+                    &mut writer,
+                    &runtime,
+                )
+                .await
+                {
+                    let frame = sinomo_sandbox::SandboxRunProcessPlanStreamFrame::Error {
+                        detail: error.to_string(),
+                    };
+                    let _ =
+                        write_daemon_sandbox_process_plan_stream_frame_async(&mut writer, &frame)
+                            .await;
+                }
+                let _ = writer.shutdown().await;
+            })
+        }
+        _ => {
+            return Err(DaemonError::Network {
+                address: route,
+                detail: "unsupported sandbox session stream route".to_string(),
+            });
+        }
+    };
+    let body = sinomo_core::network::ObjectRpcBodySource::async_reader(reader, None)
+        .with_lifetime_guard(producer)
+        .map_err(DaemonError::from)?;
+    Ok(sinomo_core::network::ObjectRpcSessionResponse::new(
+        response, body,
+    ))
+}
+
+fn authorize_daemon_session_link_peer(
+    paths: &DaemonPaths,
+    request: &sinomo_core::network::ObjectRpcRequest,
+    authenticated: &AuthenticatedDaemonCommand,
+    claimed_link_node_id: &str,
+    claimed_link_public_key: &[u8],
+) -> Result<(), sinomo_core::network::NetworkError> {
+    let origin_public_key =
+        sinomo_core::network::daemon_auth_decode_public_key(&authenticated.signer_public_key)?;
+    if authenticated.signer_node_id == claimed_link_node_id
+        && origin_public_key == claimed_link_public_key
+    {
+        return Ok(());
+    }
+    if request.route == sinomo_core::network::CLUSTER_RELAY_ROUTE {
+        // The outer relay head is freshly signed by the immediate hop. Only a
+        // final-hop inner request may retain an origin signature while using a
+        // different, separately authorized link signer.
+        return Err(sinomo_core::network::NetworkError::AuthDenied);
+    }
+    let cluster_paths = cluster_paths_from_daemon_paths(paths).map_err(|error| {
+        sinomo_core::network::NetworkError::Io {
+            operation: "authorize daemon session link peer".to_string(),
+            detail: error.to_string(),
+        }
+    })?;
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+    let authorized = state.members.iter().any(|member| {
+        member.state.is_authorized()
+            && member.node_id.as_str() == claimed_link_node_id
+            && sinomo_core::network::daemon_auth_decode_public_key(&member.node_public_key)
+                .is_ok_and(|key| key == claimed_link_public_key)
+    });
+    if authorized {
+        Ok(())
+    } else {
+        Err(sinomo_core::network::NetworkError::AuthDenied)
+    }
+}
+
+async fn handle_daemon_cluster_relay_session_async(
+    paths: &DaemonPaths,
+    service_host: &crate::service_adapter::DaemonServiceRegistryHost,
+    service_runtime: &tokio::runtime::Handle,
+    request: sinomo_core::network::ObjectRpcSessionRequest,
+) -> Result<(sinomo_core::network::ObjectRpcSessionResponse, bool), DaemonError> {
+    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+        .map_err(DaemonError::from)?;
+    match sinomo_core::network::cluster_relay_session_request_action(&state, &request.request)
+        .map_err(DaemonError::from)?
+    {
+        sinomo_core::network::ClusterRelaySessionRequestAction::DeliverLocal(inner_request) => {
+            let request = request
+                .bind_signed_inner_request(inner_request)
+                .map_err(DaemonError::from)?;
+            let authenticated = authenticate_daemon_control_request(paths, &request.request)?;
+            crate::service_adapter::dispatch_rpc_via_registry_to_session_response_async(
+                service_host,
+                &authenticated,
+                request,
+                Some(paths),
+                None,
+            )
+            .await
+        }
+        sinomo_core::network::ClusterRelaySessionRequestAction::Forward => {
+            let mut host =
+                crate::client::DaemonSignedObjectRpcAsyncHost::new(service_runtime, true)
+                    .with_paths(paths);
+            let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(
+                &mut host,
+                service_runtime,
+                &cluster_paths,
+            );
+            match client
+                .forward_relay_session(
+                    &state,
+                    request,
+                    sinomo_core::network::ClusterObjectRpcOptions::default(),
+                )
+                .await
+            {
+                Ok(result) => Ok((
+                    sinomo_core::network::ObjectRpcSessionResponse::new(
+                        result.response,
+                        sinomo_core::network::ObjectRpcBodySource::from_incoming_body(result.body),
+                    ),
+                    false,
+                )),
+                Err(error) => Ok((
+                    sinomo_core::network::ObjectRpcSessionResponse::buffered(
+                        sinomo_core::network::ObjectRpcResponse::encode_error(
+                            sinomo_core::network::CLUSTER_RELAY_ROUTE,
+                            format!("relay dropped while forwarding session: {error}"),
+                        )
+                        .map_err(DaemonError::from)?,
+                    ),
+                    false,
+                )),
+            }
+        }
     }
 }
 
@@ -1335,132 +1609,6 @@ fn daemon_cluster_network_ping_response(
         time::OffsetDateTime::now_utc(),
     )
     .map_err(DaemonError::from)
-}
-
-async fn try_handle_streamed_cluster_relay_request_async(
-    request: &sinomo_core::network::ObjectRpcRequest,
-    stream: &mut sinomo_core::network::AsyncDaemonControlStream,
-    paths: &DaemonPaths,
-    service_host: &crate::service_adapter::DaemonServiceRegistryHost,
-    service_runtime: &tokio::runtime::Handle,
-    stream_address: &str,
-) -> Result<bool, DaemonError> {
-    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
-        .map_err(DaemonError::from)?;
-    match sinomo_core::network::cluster_relay_stream_request_action(&state.local_node_id, request)
-        .map_err(DaemonError::from)?
-    {
-        sinomo_core::network::ClusterRelayStreamRequestAction::NotStreamed => return Ok(false),
-        sinomo_core::network::ClusterRelayStreamRequestAction::DeliverLocal(inner_request) => {
-            dispatch_streamed_cluster_relay_local_request_async(
-                inner_request,
-                stream,
-                paths,
-                service_host,
-                stream_address,
-            )
-            .await?;
-        }
-        sinomo_core::network::ClusterRelayStreamRequestAction::Forward => {
-            handle_daemon_cluster_relay_stream_forward_on_runtime(
-                paths,
-                request,
-                service_runtime,
-                stream,
-                stream_address,
-            )
-            .await?;
-        }
-    }
-    Ok(true)
-}
-
-async fn dispatch_streamed_cluster_relay_local_request_async(
-    request: sinomo_core::network::ObjectRpcRequest,
-    stream: &mut sinomo_core::network::AsyncDaemonControlStream,
-    paths: &DaemonPaths,
-    service_host: &crate::service_adapter::DaemonServiceRegistryHost,
-    stream_address: &str,
-) -> Result<(), DaemonError> {
-    let replay_key = daemon_dfs_message_replay_key(&request);
-    if let Some(key) = replay_key.as_ref()
-        && let Some(response) = wait_for_daemon_dfs_message_replay(paths, key).await
-    {
-        write_daemon_rpc_response_frame_async_for_rpc_request(
-            stream,
-            stream_address,
-            paths,
-            &request,
-            response,
-        )
-        .await?;
-        return Ok(());
-    }
-
-    let authenticated = match authenticate_daemon_control_request(paths, &request) {
-        Ok(authenticated) => authenticated,
-        Err(error) => {
-            write_daemon_rpc_response_frame_async_for_rpc_request(
-                stream,
-                stream_address,
-                paths,
-                &request,
-                sinomo_core::network::ObjectRpcResponse::encode_error(
-                    request.route.clone(),
-                    error.to_string(),
-                )
-                .map_err(DaemonError::from)?,
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-    if let Some(key) = replay_key.as_ref() {
-        begin_daemon_dfs_message_replay(paths, key);
-    }
-    let route = request.route.clone();
-    let rpc_request = Some(request);
-    match crate::service_adapter::try_dispatch_via_registry_async(
-        &authenticated,
-        &rpc_request,
-        stream,
-        stream_address,
-        service_host,
-        paths,
-        replay_key.clone(),
-    )
-    .await
-    {
-        Some(Ok(_)) => Ok(()),
-        Some(Err(error)) => {
-            if let Some(response) = rpc_error_response_for_request(&rpc_request, &error) {
-                let _ =
-                    write_daemon_rpc_response_frame_async(stream, stream_address, response).await;
-            }
-            if let Some(key) = replay_key.as_ref() {
-                abandon_daemon_dfs_message_replay(paths, key);
-            }
-            Ok(())
-        }
-        None => {
-            if let Some(key) = replay_key.as_ref() {
-                abandon_daemon_dfs_message_replay(paths, key);
-            }
-            let response = sinomo_core::network::ObjectRpcResponse::encode_error(
-                route,
-                "streamed relay local delivery has no registered object RPC route",
-            )
-            .map_err(DaemonError::from)?;
-            write_daemon_rpc_response_frame_async(stream, stream_address, response).await
-        }
-    }
-}
-
-fn daemon_rpc_request_allows_reusable_stream(
-    request: &sinomo_core::network::ObjectRpcRequest,
-) -> bool {
-    sinomo_core::network::object_rpc_request_stream_mode(request).reuses_daemon_stream()
 }
 
 pub(crate) fn daemon_dfs_message_replay_key(
@@ -1618,18 +1766,6 @@ async fn handle_authenticated_daemon_command_async(
     stream_address: String,
 ) -> Result<bool, DaemonError> {
     if let Some(request) = rpc_request.as_ref()
-        && crate::service_adapter::is_sandbox_stream_route(request)
-    {
-        return dispatch_sandbox_stream_route_async(
-            stream,
-            stream_address,
-            paths,
-            request.clone(),
-            service_runtime.clone(),
-        )
-        .await;
-    }
-    if let Some(request) = rpc_request.as_ref()
         && request.route == sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE
     {
         let response = daemon_cluster_network_ping_response(&paths, request.clone())?;
@@ -1646,18 +1782,6 @@ async fn handle_authenticated_daemon_command_async(
     if let Some(request) = rpc_request.as_ref()
         && request.route == sinomo_core::network::CLUSTER_RELAY_ROUTE
     {
-        if try_handle_streamed_cluster_relay_request_async(
-            request,
-            &mut stream,
-            &paths,
-            &service_host,
-            &service_runtime,
-            &stream_address,
-        )
-        .await?
-        {
-            return Ok(false);
-        }
         let response = match handle_daemon_cluster_relay_request_on_runtime(
             &paths,
             request,
@@ -1774,24 +1898,6 @@ async fn handle_authenticated_daemon_command_async(
         abandon_daemon_dfs_message_replay(&paths, key);
     }
     result
-}
-
-async fn dispatch_sandbox_stream_route_async(
-    mut stream: sinomo_core::network::AsyncDaemonControlStream,
-    stream_address: String,
-    paths: DaemonPaths,
-    request: sinomo_core::network::ObjectRpcRequest,
-    service_runtime: tokio::runtime::Handle,
-) -> Result<bool, DaemonError> {
-    crate::service_adapter::dispatch_sandbox_stream_route_async_on_runtime(
-        &request,
-        &mut stream,
-        &stream_address,
-        &paths,
-        &service_runtime,
-    )
-    .await
-    .unwrap_or(Ok(false))
 }
 
 async fn read_daemon_control_frame_async(
@@ -3519,8 +3625,7 @@ fn append_daemon_sandbox_command_events<T: sinomo_dfs::DfsMessageTransport>(
 pub(crate) async fn handle_daemon_sandbox_run_toolchain_stream_async_on_runtime(
     paths: &DaemonPaths,
     request: sinomo_sandbox::SandboxRunToolchainRequest,
-    stream: &mut sinomo_core::network::AsyncDaemonControlStream,
-    stream_address: &str,
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
     runtime: &tokio::runtime::Handle,
 ) -> Result<(), DaemonError> {
     enum StreamMessage {
@@ -3582,16 +3687,11 @@ pub(crate) async fn handle_daemon_sandbox_run_toolchain_stream_async_on_runtime(
                         let frame = sinomo_sandbox::SandboxRunToolchainStreamFrame::Output {
                             chunk: chunk.clone(),
                         };
-                        write_daemon_sandbox_stream_frame_async(stream, stream_address, &frame)
-                            .await?;
+                        write_daemon_sandbox_stream_frame_async(writer, &frame).await?;
                     }
                 }
                 let frame = sinomo_sandbox::SandboxRunToolchainStreamFrame::Complete { outcome };
-                write_daemon_sandbox_stream_frame_async(stream, stream_address, &frame).await?;
-                stream
-                    .shutdown_write(stream_address)
-                    .await
-                    .map_err(DaemonError::from)?;
+                write_daemon_sandbox_stream_frame_async(writer, &frame).await?;
                 worker.await.map_err(|source| DaemonError::Network {
                     address: "daemon sandbox stream".to_string(),
                     detail: format!("sandbox stream task failed: {source}"),
@@ -3603,11 +3703,7 @@ pub(crate) async fn handle_daemon_sandbox_run_toolchain_stream_async_on_runtime(
                 ..
             } => {
                 let frame = sinomo_sandbox::SandboxRunToolchainStreamFrame::Error { detail };
-                write_daemon_sandbox_stream_frame_async(stream, stream_address, &frame).await?;
-                stream
-                    .shutdown_write(stream_address)
-                    .await
-                    .map_err(DaemonError::from)?;
+                write_daemon_sandbox_stream_frame_async(writer, &frame).await?;
                 worker.await.map_err(|source| DaemonError::Network {
                     address: "daemon sandbox stream".to_string(),
                     detail: format!("sandbox stream task failed: {source}"),
@@ -3615,7 +3711,7 @@ pub(crate) async fn handle_daemon_sandbox_run_toolchain_stream_async_on_runtime(
                 return Ok(());
             }
         };
-        write_daemon_sandbox_stream_frame_async(stream, stream_address, &frame).await?;
+        write_daemon_sandbox_stream_frame_async(writer, &frame).await?;
     }
 
     worker.await.map_err(|source| DaemonError::Network {
@@ -3628,8 +3724,7 @@ pub(crate) async fn handle_daemon_sandbox_run_toolchain_stream_async_on_runtime(
 pub(crate) async fn handle_daemon_sandbox_run_process_plan_stream_async_on_runtime(
     paths: &DaemonPaths,
     request: sinomo_sandbox::SandboxRunProcessPlanRequest,
-    stream: &mut sinomo_core::network::AsyncDaemonControlStream,
-    stream_address: &str,
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
     runtime: &tokio::runtime::Handle,
 ) -> Result<(), DaemonError> {
     enum StreamMessage {
@@ -3662,12 +3757,7 @@ pub(crate) async fn handle_daemon_sandbox_run_process_plan_stream_async_on_runti
             StreamMessage::Output(chunk) => {
                 sent_output_chunks.insert(sandbox_output_chunk_stream_key(&chunk));
                 let frame = sinomo_sandbox::SandboxRunProcessPlanStreamFrame::Output { chunk };
-                write_daemon_sandbox_process_plan_stream_frame_async(
-                    stream,
-                    stream_address,
-                    &frame,
-                )
-                .await?;
+                write_daemon_sandbox_process_plan_stream_frame_async(writer, &frame).await?;
             }
             StreamMessage::Complete(Ok(outcome)) => {
                 for step in &outcome.step_outcomes {
@@ -3676,26 +3766,13 @@ pub(crate) async fn handle_daemon_sandbox_run_process_plan_stream_async_on_runti
                             let frame = sinomo_sandbox::SandboxRunProcessPlanStreamFrame::Output {
                                 chunk: chunk.clone(),
                             };
-                            write_daemon_sandbox_process_plan_stream_frame_async(
-                                stream,
-                                stream_address,
-                                &frame,
-                            )
-                            .await?;
+                            write_daemon_sandbox_process_plan_stream_frame_async(writer, &frame)
+                                .await?;
                         }
                     }
                 }
                 let frame = sinomo_sandbox::SandboxRunProcessPlanStreamFrame::Complete { outcome };
-                write_daemon_sandbox_process_plan_stream_frame_async(
-                    stream,
-                    stream_address,
-                    &frame,
-                )
-                .await?;
-                stream
-                    .shutdown_write(stream_address)
-                    .await
-                    .map_err(DaemonError::from)?;
+                write_daemon_sandbox_process_plan_stream_frame_async(writer, &frame).await?;
                 worker.await.map_err(|source| DaemonError::Network {
                     address: "daemon sandbox stream".to_string(),
                     detail: format!("sandbox stream task failed: {source}"),
@@ -3704,16 +3781,7 @@ pub(crate) async fn handle_daemon_sandbox_run_process_plan_stream_async_on_runti
             }
             StreamMessage::Complete(Err(detail)) => {
                 let frame = sinomo_sandbox::SandboxRunProcessPlanStreamFrame::Error { detail };
-                write_daemon_sandbox_process_plan_stream_frame_async(
-                    stream,
-                    stream_address,
-                    &frame,
-                )
-                .await?;
-                stream
-                    .shutdown_write(stream_address)
-                    .await
-                    .map_err(DaemonError::from)?;
+                write_daemon_sandbox_process_plan_stream_frame_async(writer, &frame).await?;
                 worker.await.map_err(|source| DaemonError::Network {
                     address: "daemon sandbox stream".to_string(),
                     detail: format!("sandbox stream task failed: {source}"),
@@ -3760,8 +3828,7 @@ fn sandbox_output_chunk_stream_key(
 }
 
 async fn write_daemon_sandbox_stream_frame_async(
-    stream: &mut sinomo_core::network::AsyncDaemonControlStream,
-    stream_address: &str,
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
     frame: &sinomo_sandbox::SandboxRunToolchainStreamFrame,
 ) -> Result<(), DaemonError> {
     let response = sinomo_core::network::ObjectRpcResponse::encode_body(
@@ -3769,12 +3836,17 @@ async fn write_daemon_sandbox_stream_frame_async(
         frame,
     )
     .map_err(DaemonError::from)?;
-    write_daemon_rpc_response_frame_async(stream, stream_address, response).await
+    sinomo_core::network::write_object_frame_async(
+        writer,
+        &response,
+        sinomo_core::network::ObjectFrameIoOptions::none(),
+    )
+    .await
+    .map_err(DaemonError::from)
 }
 
 async fn write_daemon_sandbox_process_plan_stream_frame_async(
-    stream: &mut sinomo_core::network::AsyncDaemonControlStream,
-    stream_address: &str,
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
     frame: &sinomo_sandbox::SandboxRunProcessPlanStreamFrame,
 ) -> Result<(), DaemonError> {
     let response = sinomo_core::network::ObjectRpcResponse::encode_body(
@@ -3782,7 +3854,13 @@ async fn write_daemon_sandbox_process_plan_stream_frame_async(
         frame,
     )
     .map_err(DaemonError::from)?;
-    write_daemon_rpc_response_frame_async(stream, stream_address, response).await
+    sinomo_core::network::write_object_frame_async(
+        writer,
+        &response,
+        sinomo_core::network::ObjectFrameIoOptions::none(),
+    )
+    .await
+    .map_err(DaemonError::from)
 }
 
 fn load_daemon_sandbox_policy_config(
@@ -4493,6 +4571,77 @@ mod tests {
     use std::fs;
     use std::net::{TcpListener, TcpStream};
     use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn sandbox_session_body_uses_standard_object_frames() {
+        let expected_detail = "sandbox stream test".to_string();
+        let frame = sinomo_sandbox::SandboxRunToolchainStreamFrame::Error {
+            detail: expected_detail.clone(),
+        };
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+
+        write_daemon_sandbox_stream_frame_async(&mut writer, &frame)
+            .await
+            .expect("write sandbox response frame");
+        drop(writer);
+
+        let response: sinomo_core::network::ObjectRpcResponse =
+            sinomo_core::network::read_object_frame_async(
+                &mut reader,
+                sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
+                sinomo_core::network::ObjectFrameIoOptions::none(),
+            )
+            .await
+            .expect("read standard object frame");
+        assert_eq!(
+            response.route,
+            sinomo_sandbox::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE
+        );
+        let decoded: sinomo_sandbox::SandboxRunToolchainStreamFrame = response
+            .decode_body()
+            .expect("decode sandbox response body");
+        match decoded {
+            sinomo_sandbox::SandboxRunToolchainStreamFrame::Error { detail } => {
+                assert_eq!(detail, expected_detail);
+            }
+            other => panic!("unexpected sandbox response frame: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outer_relay_session_requires_request_signer_to_match_link_signer() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-relay-session-link-signer");
+        let paths = DaemonPaths::with_root(root.join("daemon"));
+        let origin_public_key = vec![1_u8; 32];
+        let claimed_link_public_key = vec![2_u8; 32];
+        let authenticated = AuthenticatedDaemonCommand {
+            route: sinomo_core::network::CLUSTER_RELAY_ROUTE.to_string(),
+            signer: crate::DaemonSignerAuthority::Member,
+            signer_node_id: "origin-node".to_string(),
+            signer_public_key: sinomo_core::network::daemon_auth_encode_public_key(
+                &origin_public_key,
+            ),
+        };
+        let request = sinomo_core::network::ObjectRpcRequest::from_encoded_body(
+            sinomo_core::network::CLUSTER_RELAY_ROUTE,
+            "cluster-relay",
+            Vec::new(),
+        );
+
+        let error = authorize_daemon_session_link_peer(
+            &paths,
+            &request,
+            &authenticated,
+            "different-link-node",
+            &claimed_link_public_key,
+        )
+        .expect_err("an outer relay must be signed by its immediate link peer");
+
+        assert!(matches!(
+            error,
+            sinomo_core::network::NetworkError::AuthDenied
+        ));
+    }
 
     #[test]
     fn daemon_network_module_context_runtime_task_gets_graceful_join_budget() {

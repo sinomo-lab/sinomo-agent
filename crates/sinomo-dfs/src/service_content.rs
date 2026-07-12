@@ -197,6 +197,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(bytes)
     }
 
+    pub(crate) fn open_patch_blob_stream(
+        &self,
+        patch_hash: &str,
+        size_bytes: u64,
+    ) -> Result<ObjectVersionReader, DfsError> {
+        let max_bytes = usize::try_from(size_bytes).map_err(|_| DfsError::Distributed {
+            message: format!("DFS patch is too large to transfer: {size_bytes} bytes"),
+        })?;
+        let reader = self
+            .content
+            .open_blob_range_stream(patch_hash, 0, max_bytes)
+            .map_err(|source| DfsError::ContentStore {
+                message: format!("failed to open DFS patch blob {patch_hash}: {source}"),
+            })?;
+        if reader.remaining_bytes() != size_bytes {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "DFS patch size mismatch for {patch_hash}: expected {size_bytes}, actual {}",
+                    reader.remaining_bytes()
+                ),
+            });
+        }
+        Ok(ObjectVersionReader::from_blob_range(reader))
+    }
+
     pub(crate) fn object_content_size_hint(
         &self,
         object: &DfsObjectMetadata,
@@ -251,32 +276,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         Ok(None)
-    }
-
-    pub(crate) fn local_object_version_manifest_matches(
-        &self,
-        object_id: &DfsObjectId,
-        version: &DfsVersion,
-        expected_hash: &str,
-        expected_size_bytes: u64,
-    ) -> bool {
-        if self
-            .content
-            .read_manifest(object_id.as_str(), version.as_str())
-            .is_ok_and(|manifest| {
-                manifest.content_hash == expected_hash
-                    && manifest.size_bytes == expected_size_bytes
-                    && self
-                        .content
-                        .manifest_content_available(&manifest)
-                        .unwrap_or(false)
-            })
-        {
-            return true;
-        }
-        self.content
-            .open_blob_stream(expected_hash)
-            .is_ok_and(|reader| reader.size_bytes() == expected_size_bytes)
     }
 
     pub(crate) fn local_object_version_manifest_size_if_matches(

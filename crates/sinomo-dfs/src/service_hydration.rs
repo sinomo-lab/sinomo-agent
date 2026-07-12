@@ -92,11 +92,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.coordinator = DistributedEventualCoordinator::new();
         self.pending_writes.clear();
         self.pending_reads.clear();
-        self.incoming_read_transfers.clear();
-        self.incoming_read_memory_transfers.clear();
-        self.incoming_fetch_transfers.clear();
-        self.incoming_blob_transfers.clear();
-        self.incoming_patch_transfers.clear();
         self.rebuild_cross_shard_namespace_locks()?;
 
         for file_system in &file_systems {

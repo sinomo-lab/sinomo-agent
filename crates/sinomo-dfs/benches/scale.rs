@@ -1496,7 +1496,6 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
     let mut owner_range_events = 0usize;
     let mut reader_range_events = 0usize;
     let mut range_process_loops = 0usize;
-    let mut range_chunks = 0usize;
     let mut received_range_bytes = 0u64;
     loop {
         let owner_events = owner_dfs.process_incoming()?;
@@ -1507,46 +1506,6 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
         let mut completed = false;
         for event in &reader_events {
             match event {
-                NetworkedDfsServiceEvent::RemoteRangeReadChunkReceived {
-                    object_id: chunk_object_id,
-                    content_hash,
-                    range_offset: chunk_range_offset,
-                    range_size_bytes,
-                    object_total_size_bytes,
-                    bytes,
-                    complete,
-                    ..
-                } if chunk_object_id == &object_id => {
-                    if content_hash != &expected_content_hash {
-                        return Err(format!(
-                            "remote range read chunk used unexpected content hash {:?}, expected {:?}",
-                            content_hash, expected_content_hash
-                        )
-                        .into());
-                    }
-                    if *chunk_range_offset != range_offset {
-                        return Err(format!(
-                            "remote range read chunk offset mismatch: expected {range_offset}, actual {chunk_range_offset}"
-                        )
-                        .into());
-                    }
-                    if *range_size_bytes != range_bytes as u64 {
-                        return Err(format!(
-                            "remote range read chunk size mismatch: expected {range_bytes}, actual {range_size_bytes}"
-                        )
-                        .into());
-                    }
-                    if *object_total_size_bytes != args.network_blob_bytes {
-                        return Err(format!(
-                            "remote range read object size mismatch: expected {}, actual {object_total_size_bytes}",
-                            args.network_blob_bytes
-                        )
-                        .into());
-                    }
-                    received_range_bytes = received_range_bytes.saturating_add(bytes.len() as u64);
-                    range_chunks = range_chunks.saturating_add(1);
-                    completed |= *complete;
-                }
                 NetworkedDfsServiceEvent::RemoteReadCompleted {
                     object_id: completed_object_id,
                     result: DfsReadResult::RangeFound(data),
@@ -1605,7 +1564,7 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
             "range_offset": range_offset,
             "requested_bytes": range_bytes,
             "received_bytes": received_range_bytes,
-            "chunks": range_chunks,
+            "response_bodies": 1,
             "mib_per_second": mib_per_second(received_range_bytes, range_elapsed),
             "initial_sources": requested_range_sources,
             "owner_events": owner_range_events,

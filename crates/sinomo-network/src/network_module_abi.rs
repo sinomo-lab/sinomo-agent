@@ -13,11 +13,11 @@
 //!   creating a module instance and filling the vtable.
 //! - All vtable functions must be callable from any thread; the instance is
 //!   shared across threads by the host.
-//! - Buffers written by the module (`descriptor`, `dial_rpc` response,
+//! - Buffers written by the module (`descriptor`, stream errors,
 //!   `local_endpoints`) are allocated by the module and must be released
 //!   through the module's own `free_buffer` — allocators may differ across the
 //!   dylib boundary.
-//! - On a non-OK `dial_rpc` status the module SHOULD fill the output buffer
+//! - On a non-OK stream status the module SHOULD fill the error buffer
 //!   with a name-keyed SOBJ [`NetworkModuleRpcErrorV1`]. The host retains a
 //!   legacy UTF-8 fallback for older modules. Other functions MAY fill the
 //!   output buffer with UTF-8 error detail.
@@ -25,15 +25,16 @@
 //!   [`encode_network_module_sobj`] (`SINOMO_NETWORK_MODULE_OBJECT_VERSION`).
 //! - Timeouts are milliseconds; `0` means "no timeout".
 //!
-//! Report deviations rather than changing this ABI: it is pinned for stage C
-//! of docs/plans/r0-r1-crate-boundary-refactor.md.
+//! Sinomo is still pre-release, so v1 evolves in place with the canonical
+//! transport contract rather than carrying a second response-only ABI.
 
 use crate::error::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase};
 use crate::network_module::{
     NetworkFuture, NetworkModule, NetworkModuleContext, NetworkModuleDescriptor,
     NetworkModuleEndpointRole,
 };
-use crate::object::DaemonRpcTimeouts;
+use crate::session::NetworkDuplexStream;
+use crate::transfer::NetworkHealthPolicy;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sinomo_base::ClusterEndpointRecord;
@@ -44,6 +45,7 @@ use std::ptr;
 use std::slice;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// ABI version filled into [`SinomoNetworkModuleVtableV1::abi_version`].
 pub const SINOMO_NETWORK_MODULE_ABI_VERSION: u32 = 1;
@@ -152,6 +154,31 @@ pub struct SinomoNetworkModuleConfigV1 {
     pub daemon_forward_address_utf8: SinomoNetworkByteSlice,
 }
 
+/// Opaque module-owned full-duplex stream. The host never dereferences this
+/// pointer; it is valid until the matching `close_rpc_stream` call.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug)]
+pub struct SinomoNetworkRpcStreamV1 {
+    pub ptr: *mut c_void,
+}
+
+impl SinomoNetworkRpcStreamV1 {
+    pub const fn null() -> Self {
+        Self {
+            ptr: ptr::null_mut(),
+        }
+    }
+
+    pub const fn is_null(self) -> bool {
+        self.ptr.is_null()
+    }
+}
+
+// SAFETY: the ABI requires stream callbacks to be callable from any thread.
+unsafe impl Send for SinomoNetworkRpcStreamV1 {}
+// SAFETY: read and write callbacks may run concurrently for full duplex.
+unsafe impl Sync for SinomoNetworkRpcStreamV1 {}
+
 /// The pinned v1 vtable a network module fills in its entry function.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -165,17 +192,40 @@ pub struct SinomoNetworkModuleVtableV1 {
         *const SinomoNetworkModuleConfigV1,
     ) -> SinomoNetworkModuleStatusCode,
     pub stop: unsafe extern "C" fn(*mut c_void) -> SinomoNetworkModuleStatusCode,
-    /// Blocking request/response dial: endpoint address (UTF-8), request
-    /// bytes, timeouts (connect_ms, idle_ms); response into module buffer.
-    /// The host wraps calls in spawn_blocking.
-    pub dial_rpc: unsafe extern "C" fn(
+    /// Opens a raw bidirectional byte stream. Object-RPC and transfer framing
+    /// stays entirely on the host side. The blocking operation is bridged off
+    /// the async executor by [`FfiNetworkModule`].
+    pub open_rpc_stream: unsafe extern "C" fn(
         *mut c_void,
-        SinomoNetworkByteSlice,       // endpoint address utf8
-        SinomoNetworkByteSlice,       // request frame bytes
-        u64,                          // connect timeout ms
-        u64,                          // idle timeout ms
-        *mut SinomoNetworkByteBuffer, // response frame bytes
+        SinomoNetworkByteSlice,        // endpoint address utf8
+        u64,                           // connect timeout ms
+        u64,                           // no-progress timeout ms
+        *mut SinomoNetworkRpcStreamV1, // module-owned stream handle
+        *mut SinomoNetworkByteBuffer,  // structured error on failure
     ) -> SinomoNetworkModuleStatusCode,
+    /// Blocking read into host-owned storage. `read_out == 0` means EOF.
+    pub read_rpc_stream: unsafe extern "C" fn(
+        SinomoNetworkRpcStreamV1,
+        *mut u8,
+        usize,
+        *mut usize,
+        *mut SinomoNetworkByteBuffer,
+    ) -> SinomoNetworkModuleStatusCode,
+    /// Blocking write from host-owned storage. Partial writes are allowed.
+    pub write_rpc_stream: unsafe extern "C" fn(
+        SinomoNetworkRpcStreamV1,
+        SinomoNetworkByteSlice,
+        *mut usize,
+        *mut SinomoNetworkByteBuffer,
+    ) -> SinomoNetworkModuleStatusCode,
+    /// Flushes and half-closes the write side while preserving the read side.
+    pub shutdown_rpc_stream_write: unsafe extern "C" fn(
+        SinomoNetworkRpcStreamV1,
+        *mut SinomoNetworkByteBuffer,
+    ) -> SinomoNetworkModuleStatusCode,
+    /// Releases the opaque stream. Called exactly once after all callbacks
+    /// using the handle have returned.
+    pub close_rpc_stream: unsafe extern "C" fn(SinomoNetworkRpcStreamV1),
     /// SOBJ Vec<ClusterEndpointRecord> the module currently advertises.
     pub local_endpoints: unsafe extern "C" fn(
         *mut c_void,
@@ -325,6 +375,26 @@ struct FfiNetworkModuleShared {
     _keep_alive: Box<dyn Any + Send + Sync>,
 }
 
+/// Shared ownership of one opaque module stream. Each bridge pump owns a
+/// clone, so `close_rpc_stream` cannot race a blocking read or write. The
+/// parent module/library is retained until after the stream is closed.
+struct FfiNetworkModuleStreamShared {
+    stream: SinomoNetworkRpcStreamV1,
+    module: Arc<FfiNetworkModuleShared>,
+}
+
+impl Drop for FfiNetworkModuleStreamShared {
+    fn drop(&mut self) {
+        // SAFETY: this is the last Arc owner, so every callback using the
+        // opaque handle has returned. The handle came from open_rpc_stream and
+        // is closed exactly once here.
+        unsafe { (self.module.vtable.close_rpc_stream)(self.stream) };
+    }
+}
+
+const FFI_NETWORK_STREAM_PIPE_BYTES: usize = 256 * 1024;
+const FFI_NETWORK_STREAM_IO_BYTES: usize = 64 * 1024;
+
 impl Drop for FfiNetworkModuleShared {
     fn drop(&mut self) {
         // SAFETY: this shared state owns the instance; destroy is called
@@ -452,55 +522,146 @@ impl NetworkModule for FfiNetworkModule {
         Ok(())
     }
 
-    fn dial_rpc(
+    fn open_rpc_stream(
         &self,
         endpoint: &ClusterEndpointRecord,
-        request: &[u8],
-        timeouts: DaemonRpcTimeouts,
-    ) -> NetworkFuture<Vec<u8>> {
-        let shared = self.shared.clone();
+        health: NetworkHealthPolicy,
+    ) -> NetworkFuture<Box<dyn NetworkDuplexStream>> {
+        let module = self.shared.clone();
         let address = endpoint.address.clone();
-        let request = request.to_vec();
-        let connect_ms = network_module_timeout_ms(timeouts.connect_timeout);
-        let idle_ms = network_module_timeout_ms(timeouts.idle_timeout);
+        let connect_ms = network_module_timeout_ms(Some(health.connect_timeout));
+        let idle_ms = network_module_timeout_ms(Some(health.no_progress_timeout));
         Box::pin(async move {
-            // The module dial is blocking by contract; bridge it off the
-            // async worker threads. The closure owns a clone of the shared
-            // state, so the instance and its library stay alive across the
-            // call even if the module is dropped or replaced mid-dial.
-            tokio::task::spawn_blocking(move || {
-                let mut response = SinomoNetworkByteBuffer::null();
-                // SAFETY: the owned `shared` keeps instance/vtable/library
-                // valid for the duration of this call; the byte views borrow
-                // `address` and `request`, which live across the call.
+            let opened_module = module.clone();
+            let opened = tokio::task::spawn_blocking(move || {
+                let mut stream = SinomoNetworkRpcStreamV1::null();
+                let mut error = SinomoNetworkByteBuffer::null();
+                // SAFETY: the module/library is retained by `opened_module`;
+                // address bytes live through the call and both output slots
+                // are valid.
                 let status = unsafe {
-                    (shared.vtable.dial_rpc)(
-                        shared.instance.0,
+                    (opened_module.vtable.open_rpc_stream)(
+                        opened_module.instance.0,
                         SinomoNetworkByteSlice::from_slice(address.as_bytes()),
-                        SinomoNetworkByteSlice::from_slice(&request),
                         connect_ms,
                         idle_ms,
-                        &mut response,
+                        &mut stream,
+                        &mut error,
                     )
                 };
-                // SAFETY: `response` was filled (or left null) by the module
-                // and is released through the module's own free_buffer.
-                let bytes =
-                    unsafe { copy_and_free_network_buffer(response, shared.vtable.free_buffer) };
+                // SAFETY: any error buffer was allocated by this module.
+                let detail = unsafe {
+                    copy_and_free_network_buffer(error, opened_module.vtable.free_buffer)
+                };
                 if status != SINOMO_NETWORK_MODULE_STATUS_OK {
                     return Err(network_module_rpc_status_error(
-                        "dial network module rpc",
+                        "open network module RPC stream",
                         status,
-                        &bytes,
+                        &detail,
                     ));
                 }
-                Ok(bytes)
+                if stream.is_null() {
+                    return Err(NetworkError::Io {
+                        operation: "open network module RPC stream".to_string(),
+                        detail: "network module returned a null stream handle".to_string(),
+                    });
+                }
+                Ok(Arc::new(FfiNetworkModuleStreamShared {
+                    stream,
+                    module: opened_module,
+                }))
             })
             .await
             .map_err(|source| NetworkError::Io {
-                operation: "dial network module rpc".to_string(),
+                operation: "open network module RPC stream".to_string(),
                 detail: source.to_string(),
-            })?
+            })??;
+
+            // The ABI operations are deliberately blocking. A bounded duplex
+            // pipe gives callers a normal AsyncRead+AsyncWrite stream while
+            // two independent pumps retain true full-duplex behavior and
+            // apply backpressure instead of collecting either direction.
+            let (caller, bridge) = tokio::io::duplex(FFI_NETWORK_STREAM_PIPE_BYTES);
+            let (mut bridge_reader, mut bridge_writer) = tokio::io::split(bridge);
+
+            let read_stream = opened.clone();
+            tokio::spawn(async move {
+                loop {
+                    let operation_stream = read_stream.clone();
+                    let read = tokio::task::spawn_blocking(move || {
+                        ffi_network_stream_read(operation_stream)
+                    })
+                    .await;
+                    let bytes = match read {
+                        Ok(Ok(bytes)) => bytes,
+                        Ok(Err(error)) => {
+                            tracing::debug!(%error, "network module stream read stopped");
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::debug!(%error, "network module stream read task stopped");
+                            break;
+                        }
+                    };
+                    if bytes.is_empty() {
+                        break;
+                    }
+                    if bridge_writer.write_all(&bytes).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = bridge_writer.shutdown().await;
+            });
+
+            let write_stream = opened.clone();
+            tokio::spawn(async move {
+                let mut buffer = vec![0_u8; FFI_NETWORK_STREAM_IO_BYTES];
+                loop {
+                    let read = match bridge_reader.read(&mut buffer).await {
+                        Ok(read) => read,
+                        Err(error) => {
+                            tracing::debug!(%error, "network module stream bridge read stopped");
+                            return;
+                        }
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    let bytes = buffer[..read].to_vec();
+                    let operation_stream = write_stream.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        ffi_network_stream_write_all(operation_stream, bytes)
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            tracing::debug!(%error, "network module stream write stopped");
+                            return;
+                        }
+                        Err(error) => {
+                            tracing::debug!(%error, "network module stream write task stopped");
+                            return;
+                        }
+                    }
+                }
+                let operation_stream = write_stream.clone();
+                match tokio::task::spawn_blocking(move || {
+                    ffi_network_stream_shutdown_write(operation_stream)
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::debug!(%error, "network module stream shutdown stopped");
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "network module stream shutdown task stopped");
+                    }
+                }
+            });
+
+            Ok(Box::new(caller) as Box<dyn NetworkDuplexStream>)
         })
     }
 
@@ -550,6 +711,107 @@ impl NetworkModule for FfiNetworkModule {
         }
         decode_network_module_sobj(&bytes).unwrap_or(NetworkModuleEndpointRole::Unknown)
     }
+}
+
+fn ffi_network_stream_read(
+    shared: Arc<FfiNetworkModuleStreamShared>,
+) -> Result<Vec<u8>, NetworkError> {
+    let mut bytes = vec![0_u8; FFI_NETWORK_STREAM_IO_BYTES];
+    let mut read = 0_usize;
+    let mut error = SinomoNetworkByteBuffer::null();
+    // SAFETY: `shared` retains the module and opaque stream for this call;
+    // `bytes` and both output slots remain valid until it returns.
+    let status = unsafe {
+        (shared.module.vtable.read_rpc_stream)(
+            shared.stream,
+            bytes.as_mut_ptr(),
+            bytes.len(),
+            &mut read,
+            &mut error,
+        )
+    };
+    // SAFETY: any error buffer was allocated by this module.
+    let detail = unsafe { copy_and_free_network_buffer(error, shared.module.vtable.free_buffer) };
+    if status != SINOMO_NETWORK_MODULE_STATUS_OK {
+        return Err(network_module_rpc_status_error(
+            "read network module RPC stream",
+            status,
+            &detail,
+        ));
+    }
+    if read > bytes.len() {
+        return Err(NetworkError::Io {
+            operation: "read network module RPC stream".to_string(),
+            detail: format!(
+                "network module reported {read} bytes for a {}-byte buffer",
+                bytes.len()
+            ),
+        });
+    }
+    bytes.truncate(read);
+    Ok(bytes)
+}
+
+fn ffi_network_stream_write_all(
+    shared: Arc<FfiNetworkModuleStreamShared>,
+    bytes: Vec<u8>,
+) -> Result<(), NetworkError> {
+    let mut offset = 0_usize;
+    while offset < bytes.len() {
+        let mut written = 0_usize;
+        let mut error = SinomoNetworkByteBuffer::null();
+        // SAFETY: `shared` retains the module and opaque stream; the byte view
+        // and output slots remain valid through the blocking callback.
+        let status = unsafe {
+            (shared.module.vtable.write_rpc_stream)(
+                shared.stream,
+                SinomoNetworkByteSlice::from_slice(&bytes[offset..]),
+                &mut written,
+                &mut error,
+            )
+        };
+        // SAFETY: any error buffer was allocated by this module.
+        let detail =
+            unsafe { copy_and_free_network_buffer(error, shared.module.vtable.free_buffer) };
+        if status != SINOMO_NETWORK_MODULE_STATUS_OK {
+            return Err(network_module_rpc_status_error(
+                "write network module RPC stream",
+                status,
+                &detail,
+            ));
+        }
+        if written == 0 || written > bytes.len() - offset {
+            return Err(NetworkError::Io {
+                operation: "write network module RPC stream".to_string(),
+                detail: format!(
+                    "network module reported invalid progress {written} for {} remaining bytes",
+                    bytes.len() - offset
+                ),
+            });
+        }
+        offset += written;
+    }
+    Ok(())
+}
+
+fn ffi_network_stream_shutdown_write(
+    shared: Arc<FfiNetworkModuleStreamShared>,
+) -> Result<(), NetworkError> {
+    let mut error = SinomoNetworkByteBuffer::null();
+    // SAFETY: `shared` retains the module and opaque stream and the output
+    // slot remains valid through the callback.
+    let status =
+        unsafe { (shared.module.vtable.shutdown_rpc_stream_write)(shared.stream, &mut error) };
+    // SAFETY: any error buffer was allocated by this module.
+    let detail = unsafe { copy_and_free_network_buffer(error, shared.module.vtable.free_buffer) };
+    if status != SINOMO_NETWORK_MODULE_STATUS_OK {
+        return Err(network_module_rpc_status_error(
+            "shutdown network module RPC stream",
+            status,
+            &detail,
+        ));
+    }
+    Ok(())
 }
 
 /// Copies a module-owned buffer into host memory and releases the module

@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
-use sinomo_core::network::{
-    ClusterEndpointId, ClusterPaths, NetworkError, read_object_file, write_object_file,
-};
+use sinomo_core::network::{ClusterEndpointId, ClusterPaths, NetworkError, write_object_file};
 use sinomo_core::node::{ClusterId, NodeId};
 use sinomo_core::{
     ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterTransportKind,
@@ -28,10 +26,7 @@ pub struct IrohEndpointRecord {
 }
 
 impl IrohEndpointRecord {
-    pub fn read(paths: &ClusterPaths, node_id: &NodeId) -> Result<Self, NetworkError> {
-        read_iroh_endpoint_record(paths, node_id)
-    }
-
+    #[cfg(test)]
     pub fn from_relay_url(
         cluster_id: ClusterId,
         node_id: NodeId,
@@ -104,13 +99,6 @@ pub(crate) fn iroh_endpoint_dir(paths: &ClusterPaths) -> PathBuf {
 
 fn iroh_endpoint_record_path(paths: &ClusterPaths, node_id: &NodeId) -> PathBuf {
     iroh_endpoint_dir(paths).join(format!("{}.endpoint.sobj", node_id.as_str()))
-}
-
-pub(crate) fn read_iroh_endpoint_record(
-    paths: &ClusterPaths,
-    node_id: &NodeId,
-) -> Result<IrohEndpointRecord, NetworkError> {
-    read_object_file(&iroh_endpoint_record_path(paths, node_id))
 }
 
 pub(crate) fn write_iroh_endpoint_record(

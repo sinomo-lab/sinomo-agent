@@ -84,13 +84,9 @@ pub struct DaemonObjectRpcForwardRequest {
     pub request: sinomo_core::network::ObjectRpcRequest,
     pub connect_timeout_millis: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub no_progress_timeout_millis: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overall_timeout_millis: Option<u64>,
     #[serde(default)]
     pub observe_connectivity: bool,
-    #[serde(default)]
-    pub raw_response: bool,
 }
 
 /// Retry-safety evidence carried only across the trusted local daemon-control

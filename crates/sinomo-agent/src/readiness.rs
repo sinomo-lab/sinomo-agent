@@ -40,7 +40,10 @@ use sinomo_lm::{
 };
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::network::{ObjectRpcCancelRequest, ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_runtime::network::{
+    ObjectRpcCancelRequest, ObjectRpcIncomingBody, ObjectRpcRequest, ObjectRpcResponse,
+    ObjectRpcSessionResponse,
+};
 use sinomo_runtime::node::NodeId;
 use sinomo_runtime::service::{
     ResponseSink, ServiceContext, ServiceError, ServiceRegistry, ServiceSigner,
@@ -5085,11 +5088,16 @@ impl ReadinessResponseSink {
 }
 
 impl ResponseSink for ReadinessResponseSink {
-    fn emit(&mut self, response: ObjectRpcResponse) -> Result<(), ServiceError> {
+    fn send(self: Box<Self>, response: ObjectRpcSessionResponse) -> Result<(), ServiceError> {
+        if !response.body.is_empty() {
+            return Err(ServiceError::Service(
+                "agent readiness sink received an unexpected response body".to_string(),
+            ));
+        }
         self.frames
             .lock()
             .expect("readiness response frames")
-            .push(response);
+            .push(response.response);
         Ok(())
     }
 }
@@ -5105,12 +5113,13 @@ where
     B: Serialize + ?Sized,
 {
     let sink = ReadinessResponseSink::default();
-    let ctx = ServiceContext {
+    let ctx = ServiceContext::new(
         data_dir,
-        cluster: None,
-        signer: ServiceSigner::Local,
-        sink: Box::new(sink.clone()),
-    };
+        None,
+        ServiceSigner::Local,
+        ObjectRpcIncomingBody::empty(),
+        Box::new(sink.clone()),
+    );
     let request = ObjectRpcRequest::encode_body(route, AGENT_RPC_CATEGORY, body)
         .map_err(|error| error.to_string())?;
     block_on_readiness_future(registry.dispatch_direct(ctx, request))

@@ -1,7 +1,7 @@
 /// DFS repair command authorization after metadata-primary movement.
 ///
 /// This module models `ensure_replica_command_authorized_with_metadata`, the
-/// authorization gate shared by repair and chunked repair commands. It focuses
+/// authorization gate shared by repair requests regardless of body size. It focuses
 /// on the branch ordering that matters after metadata primary handoff: durable
 /// intent authority and locally known current-replica evidence must be checked
 /// before rejecting a requester merely because it is not the current metadata

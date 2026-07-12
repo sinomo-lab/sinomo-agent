@@ -21,9 +21,8 @@ use sinomo_core::node::{
 use sinomo_core::storage::durable_file::file_ino;
 use sinomo_core::{ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState};
 use sinomo_rollout::{
-    ROLLOUT_BINARY_ROUTE, ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE, ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
-    ROLLOUT_BUILD_ROUTE, ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_DIAGNOSTICS_ROUTE,
-    ROLLOUT_FINALIZE_SHADOW_ROUTE, ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
+    ROLLOUT_BINARY_ROUTE, ROLLOUT_BUILD_ROUTE, ROLLOUT_CLEAR_STATUS_ROUTE,
+    ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_FINALIZE_SHADOW_ROUTE, ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -417,8 +416,6 @@ pub fn authorize_authenticated_daemon_command(
         }
         route
             if route == ROLLOUT_BINARY_ROUTE
-                || route == ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE
-                || route == ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE
                 || route == ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE
                 || route == ROLLOUT_BUILD_ROUTE =>
         {
@@ -1791,12 +1788,8 @@ mod tests {
     }
 
     #[test]
-    fn rollout_upload_routes_authorize_admin_signers() {
-        for route in [
-            ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
-            ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
-            ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
-        ] {
+    fn rollout_binary_routes_authorize_admin_signers() {
+        for route in [ROLLOUT_BINARY_ROUTE, ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE] {
             for signer in [DaemonSignerAuthority::Local, DaemonSignerAuthority::Voter] {
                 let authenticated = authenticated_command(route.to_string(), signer);
                 authorize_authenticated_daemon_command(&authenticated)

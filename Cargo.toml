@@ -104,7 +104,7 @@ tar = "0.4"
 thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "parsing", "serde", "serde-well-known"] }
 toml = "1.1.2"
-tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.52.3", features = ["fs", "io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry", "std"] }
 metrics = "0.24"

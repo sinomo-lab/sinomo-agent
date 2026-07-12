@@ -482,7 +482,6 @@ pub fn dfs_events_should_publish_metadata(events: &[NetworkedDfsServiceEvent]) -
         | NetworkedDfsServiceEvent::BlobFetchRejected { .. }
         | NetworkedDfsServiceEvent::RemoteReadServed { .. }
         | NetworkedDfsServiceEvent::RemoteBulkReadServed { .. }
-        | NetworkedDfsServiceEvent::RemoteRangeReadChunkReceived { .. }
         | NetworkedDfsServiceEvent::RemoteReadCompleted { .. }
         | NetworkedDfsServiceEvent::RemoteBulkReadCompleted { .. }
         | NetworkedDfsServiceEvent::RepairRejected { .. }

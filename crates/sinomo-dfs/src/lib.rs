@@ -7,6 +7,7 @@
 //! couple to the internal module layout.
 
 mod advisory_lock;
+mod body_rpc;
 mod cluster_service;
 mod content_store;
 mod control_plane;
@@ -103,6 +104,7 @@ pub use advisory_lock::{
     DfsAdvisoryLockTransitionContext, DfsAdvisoryLockTransitionError, DfsAdvisoryLockWaiter,
     transition_advisory_lock_state,
 };
+pub use body_rpc::{DfsBodyMessageCommand, DfsBodyMessageResponse, DfsRpcBodyDescriptor};
 pub use cluster_service::cluster_dfs_peer_node_ids;
 pub(crate) use cluster_service::{
     object_rpc_request_from_kv_payload, open_cluster_dfs_service_with_message_sender,
@@ -111,12 +113,11 @@ pub(crate) use cluster_service::{
 };
 pub(crate) use content_store::content_hash;
 pub use content_store::{
-    BlobRangeReader, BlobReader, ChunkedBlobAssembler, ContentManifest, ContentStoreError,
-    ContentStoreGcOptions, ContentStoreGcReport, ContentStoreQuota, ContentStoreQuotaResource,
-    ContentStoreQuotaUsage, ContentStoreScrubIssue, ContentStoreScrubReport,
-    ContentStoreStagingGcOptions, ContentStoreStagingGcReport, ContentStoreStats,
-    ContentStoreVersionGcOptions, ContentStoreVersionGcReport, ContentVersionIdentity,
-    LocalContentStore, ObjectVersionReader,
+    BlobRangeReader, BlobReader, ContentManifest, ContentStoreError, ContentStoreGcOptions,
+    ContentStoreGcReport, ContentStoreQuota, ContentStoreQuotaResource, ContentStoreQuotaUsage,
+    ContentStoreScrubIssue, ContentStoreScrubReport, ContentStoreStagingGcOptions,
+    ContentStoreStagingGcReport, ContentStoreStats, ContentStoreVersionGcOptions,
+    ContentStoreVersionGcReport, ContentVersionIdentity, LocalContentStore, ObjectVersionReader,
 };
 pub use control_plane::{
     AsyncDfsControlPlaneKvClient, DfsControlPlaneAsyncStore, DfsControlPlaneKvClient,
@@ -144,20 +145,17 @@ pub use default_cluster::{
 };
 #[cfg(test)]
 pub(crate) use direct_read::{
-    DFS_DIRECT_READ_STATUS_FOUND, DFS_DIRECT_READ_STATUS_METADATA_KEY,
-    dfs_direct_read_rpc_request_from_message_command, dfs_direct_read_rpc_response,
-    dfs_message_response_from_direct_read_rpc_response,
-};
-pub use direct_read::{
-    DFS_DIRECT_READ_STREAM_CHUNK_BYTES, DfsDirectReadClientStreamData,
-    DfsDirectReadClientStreamResponse, DfsDirectReadClientStreamResult,
-    DfsDirectReadStreamResponse, dfs_direct_read_response_from_rpc_response,
-    dfs_direct_read_response_from_rpc_stream_response, dfs_direct_read_rpc_request,
-    handle_dfs_direct_read_rpc_request, handle_dfs_direct_read_stream_rpc_request,
+    DFS_DIRECT_READ_STATUS_FOUND, DFS_DIRECT_READ_STATUS_METADATA_KEY, dfs_direct_read_rpc_response,
 };
 pub(crate) use direct_read::{
     DFS_DIRECT_REMOTE_READ_MAX_BYTES, dfs_direct_read_request_from_read_request,
     direct_full_read_response_allowed,
+};
+pub use direct_read::{
+    DfsDirectReadBodyResponse, DfsDirectReadClientBodyData, DfsDirectReadClientBodyResponse,
+    DfsDirectReadClientBodyResult, dfs_direct_read_response_from_rpc_response,
+    dfs_direct_read_response_from_rpc_session_result, dfs_direct_read_rpc_request,
+    handle_dfs_direct_read_body_rpc_request,
 };
 pub use discovery::{
     DfsClusterView, DfsNodeAdvertisement, content_service_key, content_services_prefix,
@@ -236,7 +234,7 @@ pub(crate) use maintenance::{
     run_cluster_dfs_maintenance_tick, write_legacy_dfs_metadata_replication_cursor,
 };
 pub use message_transport::{
-    AsyncDfsMessageTransport, DfsMessageTransport, DfsMessageTransportFuture, DfsTransferProfile,
+    AsyncDfsMessageTransport, DfsMessageTransport, DfsMessageTransportFuture, DfsOutboundBody,
     DfsTransportIdentity,
 };
 pub use metadata_api::DfsMetadataBackend;
@@ -348,7 +346,7 @@ pub(crate) use namespace::{
 };
 #[cfg(test)]
 pub(crate) use node_transport::{
-    AsyncDfsDirectReadSender, AsyncDfsDirectReadStreamSender, AsyncDfsMessageSender,
+    AsyncDfsDirectReadBodySender, AsyncDfsDirectReadSender, AsyncDfsMessageSender,
     DfsDirectReadSender, async_dfs_direct_read_sender_from_peer_transport,
     dfs_direct_read_sender_from_peer_transport,
 };
@@ -382,58 +380,53 @@ pub use protocol::{
     DfsBlobTransferResult, DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest,
     DfsBulkReadResponse, DfsCommitVersionCommand, DfsCommitVersionResponse, DfsDirectReadRequest,
     DfsDistributedWriteCommand, DfsDistributedWriteResponse, DfsDistributedWriteResult,
-    DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResponseChunk, DfsFetchBlobResult,
-    DfsMessageCommand, DfsMessageResponse, DfsMetadataJournalBatchCommand,
-    DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataPrefixProbe,
-    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
-    DfsMetadataSnapshotInstallResult, DfsNamespaceCommand, DfsNamespaceOperation,
-    DfsNamespacePosixError, DfsNamespaceResponse, DfsNamespaceResult, DfsNamespaceShardCursor,
-    DfsNetworkMessage, DfsPosixCoordinationResult, DfsReadData, DfsReadRangeData, DfsReadRequest,
-    DfsReadResponse, DfsReadResponseChunk, DfsReadResult, DfsRepairReplicaChunkCommand,
-    DfsRepairReplicaCommand, DfsRepairReplicaResponse, DfsRoutedMessage, DfsStageBlobChunkCommand,
-    DfsStageBlobCommand, DfsStageBlobResponse, DfsStagePatchChunkCommand, DfsStagePatchCommand,
-    DfsWriteCommand, DfsWriteResponse, DfsWriteResult,
+    DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResult, DfsMessageCommand,
+    DfsMessageResponse, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
+    DfsMetadataJournalBatchResult, DfsMetadataPrefixProbe, DfsMetadataSnapshotInstallCommand,
+    DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult, DfsNamespaceCommand,
+    DfsNamespaceOperation, DfsNamespacePosixError, DfsNamespaceResponse, DfsNamespaceResult,
+    DfsNamespaceShardCursor, DfsNetworkMessage, DfsPosixCoordinationResult, DfsReadData,
+    DfsReadRangeData, DfsReadRequest, DfsReadResponse, DfsReadResult, DfsRepairReplicaCommand,
+    DfsRepairReplicaResponse, DfsRoutedMessage, DfsStageBlobCommand, DfsStageBlobResponse,
+    DfsStagePatchCommand, DfsWriteCommand, DfsWriteResponse, DfsWriteResult,
 };
 pub(crate) use repair::{
     repair_attempt_record_indicates_lost_authority,
     repair_attempt_record_indicates_transient_route_failure,
     repair_error_indicates_transient_route_failure, repair_rejection_indicates_lost_authority,
-    repair_rejection_indicates_stale_chunk_resume, repair_rejection_indicates_stale_replica_base,
+    repair_rejection_indicates_stale_replica_base,
 };
 pub use routes::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_BULK_READ_RESPONSE_ROUTE, DFS_DATA_BULK_READ_ROUTE,
     DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE, DFS_DATA_COMMIT_VERSION_ROUTE,
     DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE, DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
-    DFS_DATA_FETCH_BLOB_RESPONSE_CHUNK_ROUTE, DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE,
-    DFS_DATA_FETCH_BLOB_ROUTE, DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE,
-    DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE, DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE,
-    DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_DATA_NAMESPACE_RESPONSE_ROUTE,
-    DFS_DATA_NAMESPACE_ROUTE, DFS_DATA_PLANE_ROUTES, DFS_DATA_PLANE_SERVICE_ROUTES,
-    DFS_DATA_READ_RESPONSE_CHUNK_ROUTE, DFS_DATA_READ_RESPONSE_ROUTE, DFS_DATA_READ_ROUTE,
-    DFS_DATA_REPAIR_REPLICA_CHUNK_ROUTE, DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE,
-    DFS_DATA_REPAIR_REPLICA_ROUTE, DFS_DATA_STAGE_BLOB_CHUNK_ROUTE,
-    DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE, DFS_DATA_STAGE_BLOB_ROUTE,
-    DFS_DATA_STAGE_PATCH_CHUNK_ROUTE, DFS_DATA_STAGE_PATCH_ROUTE, DFS_DATA_WRITE_RESPONSE_ROUTE,
-    DFS_DATA_WRITE_ROUTE, DFS_DIRECT_READ_ROUTE, DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE,
-    DFS_MESSAGE_DATA_PLANE_ROUTES, DFS_METADATA_JOURNAL_BATCH_ROUTE,
-    DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_OBJECT_RPC_ROUTES, DFS_RPC_CATEGORY, DFS_SMOKE_ROUTE,
-    DFS_STATUS_ROUTE, decode_dfs_inspection_rpc_response, decode_dfs_message_rpc_request,
-    decode_dfs_message_rpc_response, decode_dfs_metadata_journal_batch_rpc_response,
+    DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE, DFS_DATA_FETCH_BLOB_ROUTE,
+    DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE, DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+    DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE, DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE,
+    DFS_DATA_NAMESPACE_RESPONSE_ROUTE, DFS_DATA_NAMESPACE_ROUTE, DFS_DATA_PLANE_ROUTES,
+    DFS_DATA_PLANE_SERVICE_ROUTES, DFS_DATA_READ_RESPONSE_ROUTE, DFS_DATA_READ_ROUTE,
+    DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE, DFS_DATA_REPAIR_REPLICA_ROUTE,
+    DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE, DFS_DATA_STAGE_BLOB_ROUTE, DFS_DATA_STAGE_PATCH_ROUTE,
+    DFS_DATA_WRITE_RESPONSE_ROUTE, DFS_DATA_WRITE_ROUTE, DFS_DIRECT_READ_ROUTE,
+    DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE, DFS_MESSAGE_DATA_PLANE_ROUTES,
+    DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_OBJECT_RPC_ROUTES,
+    DFS_RPC_CATEGORY, DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE, decode_dfs_inspection_rpc_response,
+    decode_dfs_message_rpc_request, decode_dfs_message_rpc_response,
+    decode_dfs_metadata_journal_batch_rpc_response,
     decode_dfs_metadata_snapshot_install_rpc_response, decode_dfs_smoke_rpc_response,
     decode_dfs_status_rpc_response, dfs_inspection_rpc_request,
     dfs_message_allows_write_repair_progress, dfs_message_is_read_only_request,
     dfs_message_requires_fresh_metadata, dfs_message_requires_full_metadata_hydrate,
     dfs_message_rpc_request, dfs_metadata_journal_batch_rpc_request,
-    dfs_metadata_snapshot_install_rpc_request, dfs_network_message_no_progress_timeout,
-    dfs_route_is_message_data_plane, dfs_routed_message_rpc_request, dfs_smoke_rpc_request,
-    dfs_status_rpc_request,
+    dfs_metadata_snapshot_install_rpc_request, dfs_route_is_message_data_plane,
+    dfs_routed_message_rpc_request, dfs_smoke_rpc_request, dfs_status_rpc_request,
 };
 pub(crate) use routes::{
     build_dfs_routed_message, dfs_network_message_allows_write_repair_progress,
 };
 pub(crate) use service_content::object_content_identity;
 pub(crate) use service_outbound::read_small_blob_from_reader;
-pub(crate) use service_repair::DFS_CHUNK_TRANSFER_STALE_AFTER;
+pub(crate) use service_repair::DFS_PENDING_TRANSFER_STALE_AFTER;
 pub use service_sync::{
     DEFAULT_DFS_POSIX_SYNC_TIMEOUT, DfsMetadataQuorumSyncCertificate,
     DfsMetadataQuorumSyncProgress, DfsMetadataQuorumSyncTarget, dfs_metadata_replica_quorum_size,
@@ -449,8 +442,8 @@ pub type DfsObjectId = sinomo_core::Id;
 pub type DfsVersion = sinomo_core::Id;
 
 pub use service::{
-    DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture, DfsDataPlaneService,
-    DfsService, register_data_plane_services, register_services,
+    DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture, DfsDataPlaneResponse,
+    DfsDataPlaneService, DfsService, register_data_plane_services, register_services,
 };
 pub(crate) use service_state::{
     ActiveReplicaStage, CachedSifsMetadataShards, DFS_BLOB_INLINE_LIMIT_BYTES,
@@ -467,12 +460,12 @@ pub(crate) use service_state::{
     StageBlobSendOutcome, retained_networked_dfs_service_events,
 };
 pub use service_state::{
-    DFS_ROUTED_DISTRIBUTED_WRITE_NO_PROGRESS_TIMEOUT, DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
-    DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT, DfsCancellationFlag, DfsConfirmedTimeoutAction,
-    DfsConfirmedTimeoutOutcome, DfsConflictReadView, DfsMessageProcessResult,
-    DfsMetadataReplicationOutcome, DfsOwnerHandoffOutcome, DfsReconnectReconciliation,
-    NetworkedDfsRangeReadOutcome, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
-    NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
+    DFS_ROUTED_NAMESPACE_OP_TIMEOUT, DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT, DfsCancellationFlag,
+    DfsConfirmedTimeoutAction, DfsConfirmedTimeoutOutcome, DfsConflictReadView,
+    DfsMessageProcessResult, DfsMetadataReplicationOutcome, DfsOwnerHandoffOutcome,
+    DfsReconnectReconciliation, NetworkedDfsRangeReadOutcome, NetworkedDfsReadFreshness,
+    NetworkedDfsReadOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
+    NetworkedDfsWriteOutcome,
 };
 pub use service_trace::with_dfs_traceparent;
 pub(crate) use service_trace::{
@@ -492,12 +485,6 @@ pub(crate) use smoke::{
     run_cluster_dfs_smoke,
 };
 #[cfg(test)]
-use transfer::{
-    DFS_ADAPTIVE_TRANSFER_WINDOW_MAX_BYTES, DFS_BLOB_CHUNK_BYTES, DFS_LAN_CHUNK_WINDOW_SIZE,
-    DFS_LOCAL_CHUNK_WINDOW_SIZE, DFS_REPAIR_RETRY_SUPPRESSED_TICK, RepairRetryState,
-    blob_chunk_count, blob_chunk_count_for_size, chunk_hash, fetch_inflight_timeout_ticks,
-    repair_replica_chunk_start_and_window, repair_retry_delay_ticks,
-    repair_transfer_inflight_timeout_ticks,
-};
+use transfer::{DFS_REPAIR_RETRY_SUPPRESSED_TICK, RepairRetryState, fetch_inflight_timeout_ticks};
 #[cfg(test)]
 mod tests;

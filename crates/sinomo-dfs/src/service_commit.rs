@@ -241,18 +241,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 continue;
             }
-            let start_chunk_index = pending
-                .repair_next_chunk_indexes
-                .get(&replica_node_id)
-                .copied()
-                .unwrap_or(0);
             let request_id = pending
                 .repair_inflight_request_ids
                 .get(&replica_node_id)
                 .cloned()
                 .unwrap_or_else(|| self.next_request_id());
-            let max_chunks = self.adaptive_stage_chunk_window(&replica_node_id, pending.size_bytes);
-            let outcome = self.send_repair_replica_remaining_if_routable(
+            let outcome = self.send_repair_replica_body_if_routable(
                 &replica_node_id,
                 request_id.clone(),
                 intent_id,
@@ -262,17 +256,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &pending.version,
                 &pending.content_hash,
                 pending.size_bytes,
-                start_chunk_index,
-                max_chunks,
                 committed_metadata.clone(),
             )?;
             if outcome.sent {
-                self.record_repair_window_progress(
-                    intent_id,
-                    &replica_node_id,
-                    request_id,
-                    outcome,
-                );
+                self.record_repair_inflight(intent_id, &replica_node_id, request_id);
             } else {
                 self.record_repair_retry_scheduled_with_error(
                     intent_id,

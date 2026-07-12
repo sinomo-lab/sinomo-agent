@@ -92,7 +92,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         drain_deferred_parent_touches: bool,
     ) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
-        self.prune_idle_chunk_transfers();
+        self.prune_idle_transfer_state();
         if self
             .transport
             .pending_incoming_count()
@@ -174,18 +174,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNetworkMessage::StageBlob(command) => {
                 events.push(self.handle_stage_blob(source_node_id, command)?);
             }
-            DfsNetworkMessage::StageBlobChunk(command) => {
-                if let Some(event) = self.handle_stage_blob_chunk(source_node_id, command)? {
-                    events.push(event);
-                }
-            }
             DfsNetworkMessage::StagePatch(command) => {
                 events.push(self.handle_stage_patch(source_node_id, command)?);
-            }
-            DfsNetworkMessage::StagePatchChunk(command) => {
-                if let Some(event) = self.handle_stage_patch_chunk(source_node_id, command)? {
-                    events.push(event);
-                }
             }
             DfsNetworkMessage::StageBlobResponse(response) => {
                 if let Some(event) = self.handle_stage_blob_response(source_node_id, response)? {
@@ -198,11 +188,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNetworkMessage::RepairReplica(command) => {
                 events.push(self.handle_repair_replica(source_node_id, command)?);
             }
-            DfsNetworkMessage::RepairReplicaChunk(command) => {
-                if let Some(event) = self.handle_repair_replica_chunk(source_node_id, command)? {
-                    events.push(event);
-                }
-            }
             DfsNetworkMessage::RepairReplicaResponse(response) => {
                 events.push(self.handle_repair_replica_response(source_node_id, response)?);
             }
@@ -211,13 +196,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             DfsNetworkMessage::FetchBlobResponse(response) => {
                 events.push(self.handle_fetch_blob_response(source_node_id.clone(), response)?);
-            }
-            DfsNetworkMessage::FetchBlobResponseChunk(chunk) => {
-                if let Some(event) =
-                    self.handle_fetch_blob_response_chunk(source_node_id.clone(), chunk)?
-                {
-                    events.push(event);
-                }
             }
             DfsNetworkMessage::ReadRequest(request) => {
                 events.push(self.handle_networked_read_request(source_node_id, request)?);
@@ -230,13 +208,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             DfsNetworkMessage::BulkReadResponse(response) => {
                 events.push(self.handle_networked_bulk_read_response(source_node_id, response)?);
-            }
-            DfsNetworkMessage::ReadResponseChunk(chunk) => {
-                if let Some(event) =
-                    self.handle_networked_read_response_chunk(source_node_id, chunk)?
-                {
-                    events.push(event);
-                }
             }
             DfsNetworkMessage::DistributedWriteRequest(command) => {
                 events.push(self.handle_distributed_write_request(source_node_id, command)?);
@@ -303,15 +274,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .filter_map(|(request_id, pending)| {
                 let prune_after = pending
                     .next_retry_at
-                    .checked_add(DFS_CHUNK_TRANSFER_STALE_AFTER)
+                    .checked_add(DFS_PENDING_TRANSFER_STALE_AFTER)
                     .unwrap_or(pending.next_retry_at);
                 (prune_after <= now).then_some(request_id.clone())
             })
             .collect::<Vec<_>>();
         for request_id in expired_request_ids {
             self.pending_reads.remove(&request_id);
-            self.incoming_read_transfers.remove(&request_id);
-            self.incoming_read_memory_transfers.remove(&request_id);
         }
     }
 }

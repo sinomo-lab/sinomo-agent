@@ -5,11 +5,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use sinomo_core::network::NetworkError;
 use sinomo_core::node::NodeId;
 
-use crate::transfer::{
-    DFS_FETCH_CHUNK_WINDOW_SIZE, DFS_READ_CHUNK_WINDOW_SIZE, DFS_STAGE_CHUNK_WINDOW_SIZE,
-    chunk_prefix_bytes, dfs_adaptive_chunk_window_size, pending_stage_transfer_size_bytes,
-    range_transfer_size_bytes,
-};
 use crate::{
     AsyncDfsMessageTransport, DfsCancellationFlag, DfsConflictStatus, DfsControlPlaneKvClient,
     DfsError, DfsFileSystem, DfsMessageTransport, DfsMetadataBackend, DfsMetadataStore,
@@ -64,11 +59,6 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             pending_reads: BTreeMap::new(),
             repair_attempt_records: BTreeMap::new(),
             transient_remote_read_pruned_locations: BTreeMap::new(),
-            incoming_read_transfers: BTreeMap::new(),
-            incoming_read_memory_transfers: BTreeMap::new(),
-            incoming_fetch_transfers: BTreeMap::new(),
-            incoming_blob_transfers: BTreeMap::new(),
-            incoming_patch_transfers: BTreeMap::new(),
             local_metadata_journal_cursors: BTreeMap::new(),
             metadata_replication_cursors: BTreeMap::new(),
             recent_namespace_freshness_syncs: BTreeMap::new(),
@@ -159,42 +149,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if outer || should_clear {
             self.clear_metadata_lookup_cache();
         }
-    }
-
-    pub(crate) fn adaptive_stage_chunk_window(
-        &self,
-        target_node_id: &NodeId,
-        total_size_bytes: u64,
-    ) -> u32 {
-        dfs_adaptive_chunk_window_size(
-            self.transport.transfer_profile(target_node_id),
-            total_size_bytes,
-            DFS_STAGE_CHUNK_WINDOW_SIZE,
-        )
-    }
-
-    pub(crate) fn adaptive_read_chunk_window(
-        &self,
-        target_node_id: &NodeId,
-        total_size_bytes: u64,
-    ) -> u32 {
-        dfs_adaptive_chunk_window_size(
-            self.transport.transfer_profile(target_node_id),
-            total_size_bytes,
-            DFS_READ_CHUNK_WINDOW_SIZE,
-        )
-    }
-
-    pub(crate) fn adaptive_fetch_chunk_window(
-        &self,
-        target_node_id: &NodeId,
-        total_size_bytes: u64,
-    ) -> u32 {
-        dfs_adaptive_chunk_window_size(
-            self.transport.transfer_profile(target_node_id),
-            total_size_bytes,
-            DFS_FETCH_CHUNK_WINDOW_SIZE,
-        )
     }
 
     /// Install a cooperative cancellation flag. Distributed wait/retry loops
@@ -348,147 +302,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .values()
             .map(|pending| pending.fetch_failed_from.len())
             .sum();
-        let stage_window_resume_count = self
-            .pending_writes
-            .values()
-            .map(|pending| pending.stage_next_chunk_indexes.len())
-            .sum();
-        let stage_window_resume_bytes = self
-            .pending_writes
-            .values()
-            .flat_map(|pending| {
-                pending
-                    .stage_next_chunk_indexes
-                    .iter()
-                    .map(|(node_id, next_chunk_index)| {
-                        let size_bytes = pending_stage_transfer_size_bytes(pending, node_id);
-                        chunk_prefix_bytes(size_bytes, *next_chunk_index)
-                    })
-            })
-            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
-        let repair_window_resume_count = self
-            .pending_writes
-            .values()
-            .map(|pending| pending.repair_next_chunk_indexes.len())
-            .sum();
-        let repair_window_resume_bytes = self
-            .pending_writes
-            .values()
-            .flat_map(|pending| {
-                pending
-                    .repair_next_chunk_indexes
-                    .values()
-                    .map(|next_chunk_index| {
-                        chunk_prefix_bytes(pending.size_bytes, *next_chunk_index)
-                    })
-            })
-            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
-        let fetch_window_resume_count = self
-            .pending_writes
-            .values()
-            .map(|pending| {
-                pending
-                    .fetch_next_chunk_indexes
-                    .values()
-                    .filter(|next_chunk_index| **next_chunk_index > 0)
-                    .count()
-            })
-            .sum();
-        let fetch_window_resume_bytes = self
-            .pending_writes
-            .values()
-            .flat_map(|pending| {
-                pending
-                    .fetch_next_chunk_indexes
-                    .values()
-                    .filter(|next_chunk_index| **next_chunk_index > 0)
-                    .map(|next_chunk_index| {
-                        chunk_prefix_bytes(pending.size_bytes, *next_chunk_index)
-                    })
-            })
-            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
-        let pending_read_window_resume_count = self
-            .pending_reads
-            .values()
-            .filter(|pending| pending.next_chunk_index > 0)
-            .count();
-        let pending_read_window_resume_bytes = self
-            .pending_reads
-            .values()
-            .filter_map(|pending| {
-                pending.content_size_bytes.map(|size_bytes| {
-                    let transfer_size_bytes = match (pending.range_offset, pending.range_max_bytes)
-                    {
-                        (Some(offset), Some(max_bytes)) => {
-                            range_transfer_size_bytes(size_bytes, offset, max_bytes)
-                        }
-                        _ => size_bytes,
-                    };
-                    chunk_prefix_bytes(transfer_size_bytes, pending.next_chunk_index)
-                })
-            })
-            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
-        let incoming_transfer_bytes = self
-            .incoming_blob_transfers
-            .values()
-            .map(|transfer| transfer.total_size_bytes())
-            .chain(
-                self.incoming_patch_transfers
-                    .values()
-                    .map(|transfer| transfer.total_size_bytes()),
-            )
-            .chain(
-                self.incoming_fetch_transfers
-                    .values()
-                    .map(|transfer| transfer.total_size_bytes()),
-            )
-            .chain(
-                self.incoming_read_transfers
-                    .values()
-                    .map(|transfer| transfer.total_size_bytes()),
-            )
-            .fold(0_u64, |total, size| total.saturating_add(size));
-        let incoming_blob_transfer_received_bytes = self
-            .incoming_blob_transfers
-            .values()
-            .map(|transfer| {
-                chunk_prefix_bytes(
-                    transfer.total_size_bytes(),
-                    transfer.contiguous_received_chunk_count(),
-                )
-            })
-            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
-        let incoming_patch_transfer_received_bytes = self
-            .incoming_patch_transfers
-            .values()
-            .map(|transfer| {
-                chunk_prefix_bytes(
-                    transfer.total_size_bytes(),
-                    transfer.contiguous_received_chunk_count(),
-                )
-            })
-            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
-        let incoming_fetch_transfer_received_bytes = self
-            .incoming_fetch_transfers
-            .values()
-            .map(|transfer| {
-                chunk_prefix_bytes(
-                    transfer.total_size_bytes(),
-                    transfer.contiguous_received_chunk_count(),
-                )
-            })
-            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
-        let incoming_read_transfer_received_bytes = self
-            .incoming_read_transfers
-            .values()
-            .map(|transfer| {
-                chunk_prefix_bytes(
-                    transfer.total_size_bytes(),
-                    transfer.contiguous_received_chunk_count(),
-                )
-            })
-            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
-
         Ok(DfsOperationalMetrics {
             node_id: self.node_id.clone(),
             file_system_count: self.metadata.filesystems.len(),
@@ -507,23 +320,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             repair_inflight_count,
             fetch_inflight_count,
             fetch_failed_source_count,
-            stage_window_resume_count,
-            stage_window_resume_bytes,
-            repair_window_resume_count,
-            repair_window_resume_bytes,
-            fetch_window_resume_count,
-            fetch_window_resume_bytes,
-            pending_read_window_resume_count,
-            pending_read_window_resume_bytes,
-            incoming_blob_transfer_count: self.incoming_blob_transfers.len(),
-            incoming_patch_transfer_count: self.incoming_patch_transfers.len(),
-            incoming_fetch_transfer_count: self.incoming_fetch_transfers.len(),
-            incoming_read_transfer_count: self.incoming_read_transfers.len(),
-            incoming_transfer_bytes,
-            incoming_blob_transfer_received_bytes,
-            incoming_patch_transfer_received_bytes,
-            incoming_fetch_transfer_received_bytes,
-            incoming_read_transfer_received_bytes,
             active_replica_stage_count: self.active_replica_stages.len(),
             metadata_replication_cursor_count: self.metadata_replication_cursors.len(),
             pending_metadata_replication_count: self.pending_metadata_replications.len(),

@@ -10,13 +10,10 @@ module dfs_repair_lost_authority_safety {
       knownRetryReplicas == Set(),
       suppressedReplicas == Set(),
       repairRequestIds == Set(),
-      repairResumeReplicas == Set(),
       retryDueReplicas == Set(),
       fetchInflightSources == Set(),
       fetchRequestIds == Set(),
-      fetchResumeSources == Set(),
       fetchFailedSources == Set(),
-      incomingFetchTransfers == Set(),
       persistedLostAuthorityRecords == Set(),
     }
 
@@ -24,7 +21,6 @@ module dfs_repair_lost_authority_safety {
   def suppressedRepairsAreNotActiveOrDue: bool =
     all {
       suppressedReplicas.intersect(repairRequestIds) == Set(),
-      suppressedReplicas.intersect(repairResumeReplicas) == Set(),
       suppressedReplicas.intersect(retryDueReplicas) == Set(),
     }
 
@@ -40,9 +36,7 @@ module dfs_repair_lost_authority_safety {
     } implies all {
       fetchInflightSources == Set(),
       fetchRequestIds == Set(),
-      fetchResumeSources == Set(),
       fetchFailedSources == Set(),
-      incomingFetchTransfers == Set(),
     }
 
 
@@ -75,21 +69,6 @@ module dfs_repair_lost_authority_safety {
             pendingExists,
             not(suppressedReplicas.contains(replica)),
             not(repairRequestIds.contains(replica)),
-            not(repairResumeReplicas.contains(replica)),
-          }
-      | None => true
-    }
-
-
-  def staleChunkResumeResetsWithoutSuppressing: bool =
-    match lastReplica {
-      | Some(replica) =>
-          lastDecision == StaleChunkResumeReset implies all {
-            pendingExists,
-            not(suppressedReplicas.contains(replica)),
-            not(repairRequestIds.contains(replica)),
-            not(repairResumeReplicas.contains(replica)),
-            retryDueReplicas.contains(replica),
           }
       | None => true
     }
@@ -121,11 +100,7 @@ module dfs_repair_lost_authority_safety {
 
 
   def fetchRequestStateIsConsistent: bool =
-    all {
-      fetchRequestIds.subseteq(fetchInflightSources),
-      fetchResumeSources.subseteq(fetchInflightSources),
-      incomingFetchTransfers.subseteq(fetchRequestIds.union(fetchInflightSources)),
-    }
+    fetchRequestIds.subseteq(fetchInflightSources)
 
 
   def safety: bool = all {
@@ -137,7 +112,6 @@ module dfs_repair_lost_authority_safety {
     lostAuthorityMaintenanceSuppressesRepairBacklog,
     droppedPendingIsRecordedAsCommittedDrop,
     staleBaseRejectionRemainsRetryable,
-    staleChunkResumeResetsWithoutSuppressing,
     transientRouteFailureRemainsRetryable,
     retryDueReplicasAreKnownAndNotSuppressed,
     repairRequestReplicasAreKnownAndNotSuppressed,

@@ -12,24 +12,14 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const SINOMO_NETWORK_OBJECT_VERSION: u16 = 1;
-pub const OBJECT_STREAM_DEFAULT_CHUNK_BYTES: usize = 1024 * 1024;
-pub const OBJECT_STREAM_MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 pub const OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL: u32 = u32::MAX;
-pub const DAEMON_CONTROL_RPC_MAX_FRAME_BYTES: usize = usize::MAX;
+/// Maximum SOBJ head or unary-compatibility frame. Large payloads use the
+/// canonical object-RPC session body instead of expanding this allocation.
+pub const DAEMON_CONTROL_RPC_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// Default limit for establishing a network path and for each period without
 /// stream I/O progress. This is a per-phase/per-progress limit, not a total
 /// operation deadline.
 pub const DEFAULT_NETWORK_TIMEOUT: Duration = Duration::from_secs(5);
-pub(crate) const DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY: &str =
-    "sinomo.daemon-control.reuse-stream";
-pub(crate) const DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE: &str = "1";
-pub(crate) const DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY: &str =
-    "sinomo.daemon-control.raw-rpc-response";
-pub(crate) const DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE: &str = "1";
-pub(crate) const DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY: &str =
-    "sinomo.daemon-control.streamed-rpc-response";
-pub(crate) const DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE: &str = "raw-byte-chunks-v1";
-const DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES: usize = 8;
 
 /// Timeout policy for daemon object-RPC transport.
 ///
@@ -133,7 +123,7 @@ pub(crate) struct ObjectFrameByteBudget {
 #[derive(Clone, Copy, Debug)]
 enum ObjectFrameByteBudgetLimit {
     AvailableMemory,
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     Fixed(usize),
 }
 
@@ -156,7 +146,7 @@ impl ObjectFrameByteBudget {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn fixed(max_bytes: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(ObjectFrameByteBudgetState::default())),
@@ -174,7 +164,7 @@ impl ObjectFrameByteBudget {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let available_memory_bytes = match self.limit {
             ObjectFrameByteBudgetLimit::AvailableMemory => current_available_memory_bytes(),
-            #[cfg(any(test, feature = "test-support"))]
+            #[cfg(test)]
             ObjectFrameByteBudgetLimit::Fixed(max_bytes) => {
                 Some(max_bytes.saturating_sub(state.in_flight_bytes))
             }
@@ -206,7 +196,7 @@ impl ObjectFrameByteBudget {
         })
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn in_flight_bytes(&self) -> usize {
         self.inner
             .lock()
@@ -390,215 +380,6 @@ pub struct AsyncDaemonControlStream {
     stream: tokio::net::TcpStream,
 }
 
-#[derive(Debug)]
-pub struct ObjectRpcStreamResponse {
-    pub response: crate::ObjectRpcResponse,
-    pub body: ObjectRpcStreamBody,
-}
-
-impl ObjectRpcStreamResponse {
-    pub fn from_buffered_response(
-        mut response: crate::ObjectRpcResponse,
-        options: RawByteStreamChunkOptions,
-    ) -> Self {
-        let body = if object_rpc_response_has_streamed_daemon_body(&response)
-            && !response.body.is_empty()
-        {
-            ObjectRpcStreamBody::Buffered {
-                bytes: std::mem::take(&mut response.body),
-                offset: 0,
-                options,
-            }
-        } else {
-            ObjectRpcStreamBody::Empty
-        };
-        Self { response, body }
-    }
-
-    fn from_daemon_stream_response(
-        response: crate::ObjectRpcResponse,
-        address: impl Into<String>,
-        stream: AsyncDaemonControlStream,
-        options: RawByteStreamChunkOptions,
-    ) -> Self {
-        let body = if object_rpc_response_has_streamed_daemon_body(&response) {
-            ObjectRpcStreamBody::DaemonControlRaw {
-                address: address.into(),
-                stream: Some(stream),
-                options,
-                total_read: 0,
-            }
-        } else {
-            ObjectRpcStreamBody::Empty
-        };
-        Self { response, body }
-    }
-
-    /// Attaches the absolute deadline for the whole RPC call to the response
-    /// body. A body keeps the earliest deadline when multiple layers attach one.
-    pub fn with_deadline(self, deadline: Option<tokio::time::Instant>) -> Self {
-        Self {
-            response: self.response,
-            body: self.body.with_deadline(deadline),
-        }
-    }
-
-    pub async fn collect_body_to_vec(mut self) -> Result<crate::ObjectRpcResponse, NetworkError> {
-        let body = self.body.collect_to_vec().await?;
-        self.response.body = body;
-        Ok(self.response)
-    }
-}
-
-#[derive(Debug)]
-pub enum ObjectRpcStreamBody {
-    Empty,
-    Buffered {
-        bytes: Vec<u8>,
-        offset: usize,
-        options: RawByteStreamChunkOptions,
-    },
-    DaemonControlRaw {
-        address: String,
-        stream: Option<AsyncDaemonControlStream>,
-        options: RawByteStreamChunkOptions,
-        total_read: u64,
-    },
-    Deadline {
-        body: Box<ObjectRpcStreamBody>,
-        deadline: tokio::time::Instant,
-    },
-}
-
-impl ObjectRpcStreamBody {
-    /// Attaches an absolute whole-call deadline without changing the existing
-    /// per-chunk idle timeout. The earlier timeout wins while reading.
-    pub fn with_deadline(self, deadline: Option<tokio::time::Instant>) -> Self {
-        let Some(deadline) = deadline else {
-            return self;
-        };
-        match self {
-            ObjectRpcStreamBody::Deadline {
-                body,
-                deadline: existing,
-            } => ObjectRpcStreamBody::Deadline {
-                body,
-                deadline: existing.min(deadline),
-            },
-            body => ObjectRpcStreamBody::Deadline {
-                body: Box::new(body),
-                deadline,
-            },
-        }
-    }
-
-    pub async fn read_next_chunk(&mut self) -> Result<Option<Vec<u8>>, NetworkError> {
-        let (body, deadline) = self.unwrapped_body_and_deadline();
-        let Some(deadline) = deadline else {
-            return body.read_next_chunk_without_deadline().await;
-        };
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(object_rpc_stream_overall_timeout(remaining));
-        }
-        match tokio::time::timeout_at(deadline, body.read_next_chunk_without_deadline()).await {
-            Ok(result) => result,
-            Err(_) => Err(object_rpc_stream_overall_timeout(remaining)),
-        }
-    }
-
-    fn unwrapped_body_and_deadline(
-        &mut self,
-    ) -> (&mut ObjectRpcStreamBody, Option<tokio::time::Instant>) {
-        let mut body = self;
-        let mut earliest: Option<tokio::time::Instant> = None;
-        loop {
-            match body {
-                ObjectRpcStreamBody::Deadline {
-                    body: inner,
-                    deadline,
-                } => {
-                    earliest = Some(earliest.map_or(*deadline, |current| current.min(*deadline)));
-                    body = inner.as_mut();
-                }
-                _ => return (body, earliest),
-            }
-        }
-    }
-
-    async fn read_next_chunk_without_deadline(&mut self) -> Result<Option<Vec<u8>>, NetworkError> {
-        match self {
-            ObjectRpcStreamBody::Empty => Ok(None),
-            ObjectRpcStreamBody::Buffered {
-                bytes,
-                offset,
-                options,
-            } => {
-                let chunk_bytes = validate_raw_byte_stream_chunk_options(*options)?;
-                if *offset >= bytes.len() {
-                    Ok(None)
-                } else {
-                    let end = offset.saturating_add(chunk_bytes).min(bytes.len());
-                    checked_object_stream_total(0, end, options.max_total_bytes)?;
-                    let len = end.saturating_sub(*offset);
-                    let mut chunk = Vec::new();
-                    try_reserve_vec(&mut chunk, len, "read buffered raw byte stream chunk")?;
-                    chunk.extend_from_slice(&bytes[*offset..end]);
-                    *offset = end;
-                    Ok(Some(chunk))
-                }
-            }
-            ObjectRpcStreamBody::DaemonControlRaw {
-                address,
-                stream,
-                options,
-                total_read,
-            } => {
-                let Some(stream_ref) = stream.as_mut() else {
-                    return Ok(None);
-                };
-                let result =
-                    read_raw_byte_stream_chunk_from_async_stream(&mut stream_ref.stream, options)
-                        .await
-                        .map_err(|error| {
-                            map_daemon_control_frame_error(
-                                error,
-                                format!("read async daemon control stream {address}"),
-                            )
-                        })?;
-                let Some(bytes) = result else {
-                    *stream = None;
-                    return Ok(None);
-                };
-                *total_read =
-                    checked_object_stream_total(*total_read, bytes.len(), options.max_total_bytes)?;
-                Ok(Some(bytes))
-            }
-            ObjectRpcStreamBody::Deadline { .. } => {
-                unreachable!("stream deadline wrappers are removed before reading")
-            }
-        }
-    }
-
-    pub async fn collect_to_vec(&mut self) -> Result<Vec<u8>, NetworkError> {
-        let mut output = Vec::new();
-        while let Some(chunk) = self.read_next_chunk().await? {
-            try_reserve_vec(&mut output, chunk.len(), "collect raw byte stream body")?;
-            output.extend_from_slice(&chunk);
-        }
-        Ok(output)
-    }
-}
-
-fn object_rpc_stream_overall_timeout(timeout: Duration) -> NetworkError {
-    NetworkError::timeout(
-        "read object rpc stream body",
-        NetworkTimeoutPhase::Overall,
-        timeout,
-        NetworkDeliveryState::PossiblyApplied,
-    )
-}
-
 const ASYNC_DAEMON_CONTROL_STREAM_POOL_MAX_IDLE_PER_ADDRESS: usize = 64;
 // The daemon closes a connection after DEFAULT_NETWORK_TIMEOUT without frame
 // progress. Retire client-side idle entries first so normal reuse never races
@@ -717,6 +498,18 @@ impl AsyncDaemonControlStream {
         self.stream
     }
 
+    /// Peeks without consuming bytes so the daemon can select the canonical
+    /// session protocol or the temporary unary compatibility decoder.
+    pub async fn peek_prefix(&self, output: &mut [u8]) -> Result<usize, NetworkError> {
+        self.stream
+            .peek(output)
+            .await
+            .map_err(|source| NetworkError::Io {
+                operation: "peek async daemon control stream".to_string(),
+                detail: source.to_string(),
+            })
+    }
+
     pub fn peer_addr(&self) -> Result<SocketAddr, NetworkError> {
         self.stream.peer_addr().map_err(|source| NetworkError::Io {
             operation: "read async daemon control peer address".to_string(),
@@ -806,50 +599,6 @@ impl AsyncDaemonControlStream {
         self.write_frame(address, response, options).await
     }
 
-    pub async fn write_rpc_response(
-        &mut self,
-        address: &str,
-        response: &crate::ObjectRpcResponse,
-        options: ObjectFrameIoOptions,
-    ) -> Result<(), NetworkError> {
-        self.write_response(address, response, options).await
-    }
-
-    pub async fn write_raw_byte_stream_chunk(
-        &mut self,
-        address: &str,
-        bytes: &[u8],
-        options: ObjectFrameIoOptions,
-    ) -> Result<(), NetworkError> {
-        let result = write_raw_byte_stream_chunk_async(&mut self.stream, bytes, options).await;
-        result.map_err(|error| {
-            map_daemon_control_frame_error(
-                error,
-                format!("write async daemon control stream {address}"),
-            )
-        })
-    }
-
-    pub async fn forward_raw_byte_stream_chunks_to(
-        &mut self,
-        source_address: &str,
-        sink: &mut AsyncDaemonControlStream,
-        sink_address: &str,
-        options: RawByteStreamChunkOptions,
-    ) -> Result<u64, NetworkError> {
-        forward_raw_byte_stream_chunks_async(&mut self.stream, &mut sink.stream, options)
-            .await
-            .map_err(|error| match error {
-                NetworkError::Io { detail, .. } => NetworkError::Io {
-                    operation: format!(
-                        "forward raw byte stream chunks {source_address} to {sink_address}"
-                    ),
-                    detail,
-                },
-                other => other,
-            })
-    }
-
     async fn write_frame<T>(
         &mut self,
         address: &str,
@@ -883,15 +632,6 @@ impl AsyncDaemonControlStream {
         max_bytes: usize,
         options: ObjectFrameIoOptions,
     ) -> Result<DaemonControlResponse, NetworkError> {
-        self.read_frame(address, max_bytes, options).await
-    }
-
-    pub async fn read_rpc_response(
-        &mut self,
-        address: &str,
-        max_bytes: usize,
-        options: ObjectFrameIoOptions,
-    ) -> Result<crate::ObjectRpcResponse, NetworkError> {
         self.read_frame(address, max_bytes, options).await
     }
 
@@ -957,76 +697,10 @@ pub async fn send_daemon_control_rpc_request_async(
     timeouts: DaemonRpcTimeouts,
     max_response_bytes: usize,
 ) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    let response = if object_rpc_request_expects_raw_daemon_response(request) {
-        send_daemon_control_rpc_request_raw_response_async(
-            address,
-            request,
-            timeouts,
-            max_response_bytes,
-        )
-        .await?
-    } else {
-        send_daemon_control_request_async(address, request, timeouts, max_response_bytes).await?
-    };
+    let response =
+        send_daemon_control_request_async(address, request, timeouts, max_response_bytes).await?;
     response.error_detail()?;
     Ok(response)
-}
-
-pub async fn send_daemon_control_rpc_request_stream_response_async(
-    address: &str,
-    request: &DaemonControlRequest,
-    timeouts: DaemonRpcTimeouts,
-    max_response_bytes: usize,
-) -> Result<ObjectRpcStreamResponse, NetworkError> {
-    let mut stream = AsyncDaemonControlStream::connect_with_options(address, timeouts).await?;
-    let frame_options = ObjectFrameIoOptions::none().with_idle_timeout(timeouts.idle_timeout);
-    stream
-        .write_request_tracking_dispatch(address, request, frame_options)
-        .await
-        .map_err(DaemonControlAttemptError::into_source)?;
-    let response = stream
-        .read_rpc_response(address, max_response_bytes, frame_options)
-        .await
-        .map_err(DaemonControlAttemptError::after_request_write)
-        .map_err(DaemonControlAttemptError::into_source)?;
-    let body_options = RawByteStreamChunkOptions {
-        chunk_bytes: OBJECT_STREAM_MAX_CHUNK_BYTES,
-        max_total_bytes: u64::try_from(max_response_bytes).ok(),
-        idle_timeout: timeouts.idle_timeout,
-    };
-    Ok(ObjectRpcStreamResponse::from_daemon_stream_response(
-        response,
-        address,
-        stream,
-        body_options,
-    ))
-}
-
-pub(crate) async fn send_daemon_control_rpc_request_raw_response_async(
-    address: &str,
-    request: &DaemonControlRequest,
-    timeouts: DaemonRpcTimeouts,
-    max_response_bytes: usize,
-) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    if daemon_control_request_allows_stream_reuse(request) {
-        return send_reusable_daemon_control_rpc_request_raw_response_async(
-            address,
-            request,
-            timeouts,
-            max_response_bytes,
-        )
-        .await;
-    }
-    let mut stream = AsyncDaemonControlStream::connect_with_options(address, timeouts).await?;
-    send_daemon_control_rpc_request_raw_response_on_stream_async(
-        address,
-        request,
-        timeouts,
-        max_response_bytes,
-        &mut stream,
-    )
-    .await
-    .map_err(DaemonControlAttemptError::into_source)
 }
 
 async fn send_reusable_daemon_control_request_async(
@@ -1090,64 +764,6 @@ async fn send_reusable_daemon_control_request_async(
     }
 }
 
-async fn send_reusable_daemon_control_rpc_request_raw_response_async(
-    address: &str,
-    request: &DaemonControlRequest,
-    timeouts: DaemonRpcTimeouts,
-    max_response_bytes: usize,
-) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    let (mut stream, reused) = match take_pooled_daemon_control_stream(address) {
-        Some(stream) => (stream, true),
-        None => (
-            AsyncDaemonControlStream::connect_with_options(address, timeouts).await?,
-            false,
-        ),
-    };
-    match send_daemon_control_rpc_request_raw_response_on_stream_async(
-        address,
-        request,
-        timeouts,
-        max_response_bytes,
-        &mut stream,
-    )
-    .await
-    {
-        Ok(response) => {
-            return_pooled_daemon_control_stream(address, stream);
-            Ok(response)
-        }
-        Err(error) => {
-            purge_pooled_daemon_control_streams(address);
-            if reused && reused_stream_failure_is_retry_safe(request, error.dispatch) {
-                let mut stream =
-                    AsyncDaemonControlStream::connect_with_options(address, timeouts).await?;
-                match send_daemon_control_rpc_request_raw_response_on_stream_async(
-                    address,
-                    request,
-                    timeouts,
-                    max_response_bytes,
-                    &mut stream,
-                )
-                .await
-                {
-                    Ok(response) => {
-                        return_pooled_daemon_control_stream(address, stream);
-                        Ok(response)
-                    }
-                    Err(error) => {
-                        purge_pooled_daemon_control_streams(address);
-                        Err(error.into_source())
-                    }
-                }
-            } else if reused {
-                Err(error.into_stale_pooled_connection())
-            } else {
-                Err(error.into_source())
-            }
-        }
-    }
-}
-
 async fn send_daemon_control_request_on_stream_async(
     address: &str,
     request: &DaemonControlRequest,
@@ -1165,46 +781,6 @@ async fn send_daemon_control_request_on_stream_async(
         .map_err(DaemonControlAttemptError::after_request_write)
 }
 
-async fn send_daemon_control_rpc_request_raw_response_on_stream_async(
-    address: &str,
-    request: &DaemonControlRequest,
-    timeouts: DaemonRpcTimeouts,
-    max_response_bytes: usize,
-    stream: &mut AsyncDaemonControlStream,
-) -> Result<crate::ObjectRpcResponse, DaemonControlAttemptError> {
-    let frame_options = ObjectFrameIoOptions::none().with_idle_timeout(timeouts.idle_timeout);
-    stream
-        .write_request_tracking_dispatch(address, request, frame_options)
-        .await?;
-    let mut response = stream
-        .read_rpc_response(address, max_response_bytes, frame_options)
-        .await
-        .map_err(DaemonControlAttemptError::after_request_write)?;
-    if object_rpc_response_has_streamed_daemon_body(&response) {
-        let max_total_bytes = u64::try_from(max_response_bytes).ok();
-        let mut body = Vec::new();
-        read_raw_byte_stream_chunks_to_vec_async(
-            &mut stream.stream,
-            &mut body,
-            RawByteStreamChunkOptions {
-                chunk_bytes: OBJECT_STREAM_MAX_CHUNK_BYTES,
-                max_total_bytes,
-                idle_timeout: timeouts.idle_timeout,
-            },
-        )
-        .await
-        .map_err(|error| {
-            map_daemon_control_frame_error(
-                error,
-                format!("read async daemon control stream {address}"),
-            )
-        })
-        .map_err(DaemonControlAttemptError::after_request_write)?;
-        response.body = body;
-    }
-    Ok(response)
-}
-
 fn reused_stream_failure_is_retry_safe(
     request: &DaemonControlRequest,
     dispatch: DaemonRequestDispatch,
@@ -1218,178 +794,9 @@ fn reused_stream_failure_is_retry_safe(
             || request.is_response_retry_safe())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ObjectRpcRequestStreamMode {
-    Buffered,
-    ReuseDaemonStream,
-    RawStreamedDaemonResponse,
-}
-
-impl ObjectRpcRequestStreamMode {
-    pub const fn reuses_daemon_stream(self) -> bool {
-        matches!(
-            self,
-            Self::ReuseDaemonStream | Self::RawStreamedDaemonResponse
-        )
-    }
-
-    pub const fn expects_raw_streamed_response(self) -> bool {
-        matches!(self, Self::RawStreamedDaemonResponse)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ObjectRpcResponseStreamMode {
-    Buffered,
-    RawStreamedDaemonBody,
-}
-
-pub fn set_object_rpc_request_stream_mode(
-    request: &mut crate::ObjectRpcRequest,
-    mode: ObjectRpcRequestStreamMode,
-) {
-    request
-        .metadata
-        .remove(DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY);
-    request
-        .metadata
-        .remove(DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY);
-    request
-        .metadata
-        .remove(DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY);
-
-    match mode {
-        ObjectRpcRequestStreamMode::Buffered => {}
-        ObjectRpcRequestStreamMode::ReuseDaemonStream => {
-            mark_object_rpc_request_reuses_daemon_stream(request);
-        }
-        ObjectRpcRequestStreamMode::RawStreamedDaemonResponse => {
-            mark_object_rpc_request_reuses_daemon_stream(request);
-            mark_object_rpc_request_accepts_raw_streamed_daemon_response(request);
-        }
-    }
-}
-
-pub fn object_rpc_request_stream_mode(
-    request: &crate::ObjectRpcRequest,
-) -> ObjectRpcRequestStreamMode {
-    if object_rpc_request_expects_raw_daemon_response(request)
-        && object_rpc_request_accepts_streamed_daemon_response(request)
-    {
-        return ObjectRpcRequestStreamMode::RawStreamedDaemonResponse;
-    }
-    if object_rpc_request_reuses_daemon_stream(request) {
-        return ObjectRpcRequestStreamMode::ReuseDaemonStream;
-    }
-    ObjectRpcRequestStreamMode::Buffered
-}
-
-pub fn set_object_rpc_response_stream_mode(
-    response: &mut crate::ObjectRpcResponse,
-    mode: ObjectRpcResponseStreamMode,
-) {
-    response
-        .metadata
-        .remove(DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY);
-    match mode {
-        ObjectRpcResponseStreamMode::Buffered => {}
-        ObjectRpcResponseStreamMode::RawStreamedDaemonBody => {
-            mark_object_rpc_response_has_streamed_daemon_body(response);
-        }
-    }
-}
-
-pub fn object_rpc_response_stream_mode(
-    response: &crate::ObjectRpcResponse,
-) -> ObjectRpcResponseStreamMode {
-    if object_rpc_response_has_streamed_daemon_body(response) {
-        ObjectRpcResponseStreamMode::RawStreamedDaemonBody
-    } else {
-        ObjectRpcResponseStreamMode::Buffered
-    }
-}
-
-pub(crate) fn object_rpc_request_expects_raw_daemon_response(
-    request: &crate::ObjectRpcRequest,
-) -> bool {
-    request
-        .metadata
-        .get(DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY)
-        .is_some_and(|value| {
-            value == DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE
-                || value.eq_ignore_ascii_case("true")
-        })
-}
-
-pub(crate) fn object_rpc_request_accepts_streamed_daemon_response(
-    request: &crate::ObjectRpcRequest,
-) -> bool {
-    request
-        .metadata
-        .get(DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY)
-        .is_some_and(|value| {
-            value == DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE
-                || value.eq_ignore_ascii_case("true")
-        })
-}
-
-pub(crate) fn mark_object_rpc_request_reuses_daemon_stream(request: &mut crate::ObjectRpcRequest) {
-    request.metadata.insert(
-        DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY.to_string(),
-        DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE.to_string(),
-    );
-}
-
-pub(crate) fn object_rpc_request_reuses_daemon_stream(request: &crate::ObjectRpcRequest) -> bool {
-    request
-        .metadata
-        .get(DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY)
-        .is_some_and(|value| {
-            value == DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE
-                || value.eq_ignore_ascii_case("true")
-        })
-}
-
-pub(crate) fn mark_object_rpc_request_accepts_raw_streamed_daemon_response(
-    request: &mut crate::ObjectRpcRequest,
-) {
-    request.metadata.insert(
-        DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY.to_string(),
-        DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE.to_string(),
-    );
-    request.metadata.insert(
-        DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY.to_string(),
-        DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE.to_string(),
-    );
-}
-
-pub(crate) fn mark_object_rpc_response_has_streamed_daemon_body(
-    response: &mut crate::ObjectRpcResponse,
-) {
-    response.metadata.insert(
-        DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY.to_string(),
-        DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE.to_string(),
-    );
-}
-
-pub(crate) fn object_rpc_response_has_streamed_daemon_body(
-    response: &crate::ObjectRpcResponse,
-) -> bool {
-    response
-        .metadata
-        .get(DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY)
-        .is_some_and(|value| value == DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE)
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub fn daemon_control_request_expects_raw_rpc_response(request: &DaemonControlRequest) -> bool {
-    object_rpc_request_expects_raw_daemon_response(request)
-}
-
 fn daemon_control_request_allows_stream_reuse(request: &DaemonControlRequest) -> bool {
     request.route == crate::CLUSTER_NETWORK_PING_ROUTE
         || request.route == crate::CLUSTER_RELAY_ROUTE
-        || object_rpc_request_reuses_daemon_stream(request)
 }
 
 fn pooled_daemon_control_stream_max_idle() -> Duration {
@@ -1627,7 +1034,7 @@ where
     Ok(frame)
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub fn encode_borrowed_object_frame_to_vec(
     document: &BorrowedDocumentBuilder<'_>,
 ) -> Result<Vec<u8>, NetworkError> {
@@ -2072,312 +1479,6 @@ async fn read_object_frame_len_async<R: AsyncRead + Unpin>(
     Ok((len, if extended { 12 } else { 4 }))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RawByteStreamChunkOptions {
-    pub chunk_bytes: usize,
-    pub max_total_bytes: Option<u64>,
-    pub idle_timeout: Option<Duration>,
-}
-
-impl Default for RawByteStreamChunkOptions {
-    fn default() -> Self {
-        Self {
-            chunk_bytes: OBJECT_STREAM_DEFAULT_CHUNK_BYTES,
-            max_total_bytes: None,
-            idle_timeout: Some(DEFAULT_NETWORK_TIMEOUT),
-        }
-    }
-}
-
-async fn write_raw_byte_stream_chunk_async<W>(
-    writer: &mut W,
-    bytes: &[u8],
-    options: ObjectFrameIoOptions,
-) -> Result<(), NetworkError>
-where
-    W: AsyncWrite + Unpin,
-{
-    let len = u64::try_from(bytes.len()).map_err(|_| NetworkError::FrameTooLarge {
-        actual_bytes: usize::MAX,
-        max_bytes: usize::MAX,
-    })?;
-    let len_bytes = len.to_be_bytes();
-    write_all_async_frame_unflushed(
-        writer,
-        &len_bytes,
-        options.idle_timeout,
-        "write raw byte stream chunk",
-        "length",
-    )
-    .await?;
-    if !bytes.is_empty() {
-        write_all_async_frame_unflushed(
-            writer,
-            bytes,
-            options.idle_timeout,
-            "write raw byte stream chunk",
-            "body",
-        )
-        .await?;
-    }
-    flush_async_frame(writer, options.idle_timeout, "write raw byte stream chunk").await?;
-    if let Some(observer) = io_observer() {
-        observer.on_net_sent(
-            DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64 + bytes.len() as u64,
-        );
-    }
-    Ok(())
-}
-
-pub async fn read_raw_byte_stream_chunks_to_vec_async<R>(
-    reader: &mut R,
-    output: &mut Vec<u8>,
-    options: RawByteStreamChunkOptions,
-) -> Result<u64, NetworkError>
-where
-    R: AsyncRead + Unpin,
-{
-    let chunk_bytes = validate_raw_byte_stream_chunk_options(options)?;
-    let mut total = 0_u64;
-    loop {
-        let mut len_bytes = [0_u8; DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES];
-        read_exact_async_frame(
-            reader,
-            &mut len_bytes,
-            options.idle_timeout,
-            "read raw byte stream chunk length",
-            "length",
-        )
-        .await?;
-        let len = u64::from_be_bytes(len_bytes);
-        if len == 0 {
-            if let Some(observer) = io_observer() {
-                observer.on_net_recv(DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64);
-            }
-            return Ok(total);
-        }
-        let len_usize = usize::try_from(len).map_err(|_| NetworkError::FrameTooLarge {
-            actual_bytes: usize::MAX,
-            max_bytes: chunk_bytes,
-        })?;
-        if len_usize > chunk_bytes {
-            return Err(NetworkError::FrameTooLarge {
-                actual_bytes: len_usize,
-                max_bytes: chunk_bytes,
-            });
-        }
-        total = checked_object_stream_total(total, len_usize, options.max_total_bytes)?;
-        let start = output.len();
-        let end = start
-            .checked_add(len_usize)
-            .ok_or(NetworkError::FrameTooLarge {
-                actual_bytes: usize::MAX,
-                max_bytes: usize::MAX,
-            })?;
-        try_reserve_vec(output, len_usize, "read raw byte stream chunks")?;
-        output.resize(end, 0);
-        read_exact_async_frame(
-            reader,
-            &mut output[start..end],
-            options.idle_timeout,
-            "read raw byte stream chunk body",
-            "body",
-        )
-        .await?;
-        if let Some(observer) = io_observer() {
-            observer.on_net_recv(
-                DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64 + len_usize as u64,
-            );
-        }
-    }
-}
-
-async fn read_raw_byte_stream_chunk_from_async_stream<R>(
-    reader: &mut R,
-    options: &RawByteStreamChunkOptions,
-) -> Result<Option<Vec<u8>>, NetworkError>
-where
-    R: AsyncRead + Unpin,
-{
-    let chunk_bytes = validate_raw_byte_stream_chunk_options(*options)?;
-    let mut len_bytes = [0_u8; DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES];
-    read_exact_async_frame(
-        reader,
-        &mut len_bytes,
-        options.idle_timeout,
-        "read raw byte stream chunk length",
-        "length",
-    )
-    .await?;
-    let len = u64::from_be_bytes(len_bytes);
-    if len == 0 {
-        if let Some(observer) = io_observer() {
-            observer.on_net_recv(DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64);
-        }
-        return Ok(None);
-    }
-    let len_usize = usize::try_from(len).map_err(|_| NetworkError::FrameTooLarge {
-        actual_bytes: usize::MAX,
-        max_bytes: chunk_bytes,
-    })?;
-    if len_usize > chunk_bytes {
-        return Err(NetworkError::FrameTooLarge {
-            actual_bytes: len_usize,
-            max_bytes: chunk_bytes,
-        });
-    }
-    let mut bytes = try_zeroed_vec(len_usize, "read raw byte stream chunk")?;
-    read_exact_async_frame(
-        reader,
-        &mut bytes,
-        options.idle_timeout,
-        "read raw byte stream chunk body",
-        "body",
-    )
-    .await?;
-    if let Some(observer) = io_observer() {
-        observer.on_net_recv(
-            DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64 + len_usize as u64,
-        );
-    }
-    Ok(Some(bytes))
-}
-
-pub async fn forward_raw_byte_stream_chunks_async<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    options: RawByteStreamChunkOptions,
-) -> Result<u64, NetworkError>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let chunk_bytes = validate_raw_byte_stream_chunk_options(options)?;
-    let copy_buffer_bytes = chunk_bytes.min(OBJECT_STREAM_DEFAULT_CHUNK_BYTES).max(1);
-    let mut buffer = try_zeroed_vec(copy_buffer_bytes, "forward raw byte stream buffer")?;
-    let mut total = 0_u64;
-    loop {
-        let mut len_bytes = [0_u8; DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES];
-        read_exact_async_frame(
-            reader,
-            &mut len_bytes,
-            options.idle_timeout,
-            "forward raw byte stream chunk length",
-            "length",
-        )
-        .await?;
-        let len = u64::from_be_bytes(len_bytes);
-        if len == 0 {
-            write_all_async_frame(
-                writer,
-                &len_bytes,
-                options.idle_timeout,
-                "forward raw byte stream chunk length",
-                "length",
-            )
-            .await?;
-            if let Some(observer) = io_observer() {
-                observer.on_net_recv(DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64);
-                observer.on_net_sent(DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64);
-            }
-            return Ok(total);
-        }
-        let len_usize = usize::try_from(len).map_err(|_| NetworkError::FrameTooLarge {
-            actual_bytes: usize::MAX,
-            max_bytes: chunk_bytes,
-        })?;
-        if len_usize > chunk_bytes {
-            return Err(NetworkError::FrameTooLarge {
-                actual_bytes: len_usize,
-                max_bytes: chunk_bytes,
-            });
-        }
-        total = checked_object_stream_total(total, len_usize, options.max_total_bytes)?;
-        write_all_async_frame_unflushed(
-            writer,
-            &len_bytes,
-            options.idle_timeout,
-            "forward raw byte stream chunk length",
-            "length",
-        )
-        .await?;
-        let mut remaining = len_usize;
-        while remaining > 0 {
-            let take = remaining.min(buffer.len());
-            read_exact_async_frame(
-                reader,
-                &mut buffer[..take],
-                options.idle_timeout,
-                "forward raw byte stream chunk body",
-                "body",
-            )
-            .await?;
-            write_all_async_frame_unflushed(
-                writer,
-                &buffer[..take],
-                options.idle_timeout,
-                "forward raw byte stream chunk body",
-                "body",
-            )
-            .await?;
-            remaining -= take;
-        }
-        flush_async_frame(
-            writer,
-            options.idle_timeout,
-            "forward raw byte stream chunk body",
-        )
-        .await?;
-        if let Some(observer) = io_observer() {
-            observer.on_net_recv(
-                DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64 + len_usize as u64,
-            );
-            observer.on_net_sent(
-                DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64 + len_usize as u64,
-            );
-        }
-    }
-}
-
-fn validate_raw_byte_stream_chunk_options(
-    options: RawByteStreamChunkOptions,
-) -> Result<usize, NetworkError> {
-    if options.chunk_bytes == 0 {
-        return Err(NetworkError::Serialization {
-            detail: "raw byte stream chunk size must be greater than zero".to_string(),
-        });
-    }
-    if options.chunk_bytes > OBJECT_STREAM_MAX_CHUNK_BYTES {
-        return Err(NetworkError::FrameTooLarge {
-            actual_bytes: options.chunk_bytes,
-            max_bytes: OBJECT_STREAM_MAX_CHUNK_BYTES,
-        });
-    }
-    Ok(options.chunk_bytes)
-}
-
-fn checked_object_stream_total(
-    current: u64,
-    next_chunk_bytes: usize,
-    max_total_bytes: Option<u64>,
-) -> Result<u64, NetworkError> {
-    let total = current
-        .checked_add(next_chunk_bytes as u64)
-        .ok_or_else(|| NetworkError::FrameTooLarge {
-            actual_bytes: usize::MAX,
-            max_bytes: usize::MAX,
-        })?;
-    if let Some(max_total_bytes) = max_total_bytes
-        && total > max_total_bytes
-    {
-        return Err(NetworkError::FrameTooLarge {
-            actual_bytes: usize::try_from(total).unwrap_or(usize::MAX),
-            max_bytes: usize::try_from(max_total_bytes).unwrap_or(usize::MAX),
-        });
-    }
-    Ok(total)
-}
-
 pub(crate) async fn write_all_async_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     buf: &[u8],
@@ -2524,18 +1625,11 @@ fn object_frame_eof_detail(part: &str, read: usize, expected: usize) -> String {
 mod serde_bytes_tests {
     use super::{
         AsyncDaemonControlListener, AsyncDaemonControlStream, DaemonRpcTimeouts,
-        ObjectFrameIoOptions, ObjectRpcRequestStreamMode, ObjectRpcResponseStreamMode,
-        ObjectRpcStreamBody, ObjectRpcStreamResponse, RawByteStreamChunkOptions,
-        SINOMO_NETWORK_OBJECT_VERSION, SinomoObjectCodec, decode_single_object_frame_from_slice,
-        encode_borrowed_object_frame_to_vec, encode_object_frame_to_vec,
-        forward_raw_byte_stream_chunks_async, object_rpc_request_accepts_streamed_daemon_response,
-        object_rpc_request_expects_raw_daemon_response, object_rpc_request_reuses_daemon_stream,
-        object_rpc_request_stream_mode, object_rpc_response_stream_mode, read_object_frame_async,
-        read_object_frame_blocking, read_raw_byte_stream_chunks_to_vec_async,
-        send_daemon_control_request_async, send_daemon_control_rpc_request_stream_response_async,
-        set_object_rpc_request_stream_mode, set_object_rpc_response_stream_mode,
-        write_all_async_frame, write_borrowed_object_frame_async, write_object_frame_blocking,
-        write_raw_byte_stream_chunk_async,
+        ObjectFrameIoOptions, SINOMO_NETWORK_OBJECT_VERSION, SinomoObjectCodec,
+        decode_single_object_frame_from_slice, encode_borrowed_object_frame_to_vec,
+        encode_object_frame_to_vec, read_object_frame_async, read_object_frame_blocking,
+        send_daemon_control_request_async, write_all_async_frame,
+        write_borrowed_object_frame_async, write_object_frame_blocking,
     };
     use crate::error::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase};
     use serde::{Deserialize, Serialize};
@@ -2898,8 +1992,8 @@ mod serde_bytes_tests {
     }
 
     #[test]
-    fn daemon_control_default_frame_limit_is_pointer_sized() {
-        assert_eq!(super::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES, usize::MAX);
+    fn daemon_control_default_frame_limit_is_bounded() {
+        assert_eq!(super::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES, 16 * 1024 * 1024);
     }
 
     #[test]
@@ -2910,10 +2004,6 @@ mod serde_bytes_tests {
         );
         assert_eq!(
             ObjectFrameIoOptions::default().idle_timeout,
-            Some(super::DEFAULT_NETWORK_TIMEOUT)
-        );
-        assert_eq!(
-            RawByteStreamChunkOptions::default().idle_timeout,
             Some(super::DEFAULT_NETWORK_TIMEOUT)
         );
         assert_eq!(DaemonRpcTimeouts::none().connect_timeout, None);
@@ -3251,7 +2341,6 @@ mod serde_bytes_tests {
     }
 
     async fn exercise_ambiguous_reused_stream_failure(
-        stream_mode: ObjectRpcRequestStreamMode,
         response_retry_safe: bool,
         signed: bool,
     ) -> (Result<crate::ObjectRpcResponse, NetworkError>, bool) {
@@ -3259,8 +2348,7 @@ mod serde_bytes_tests {
             .await
             .expect("listener");
         let address = listener.local_addr_string().expect("listener address");
-        let route =
-            format!("/test/reused-stream-retry/{stream_mode:?}/{response_retry_safe}/{signed}");
+        let route = crate::CLUSTER_NETWORK_PING_ROUTE.to_string();
         let server_route = route.clone();
         let server = tokio::spawn(async move {
             let frame_options = ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1));
@@ -3274,7 +2362,7 @@ mod serde_bytes_tests {
                 crate::ObjectRpcResponse::encode_body(&first_request.route, &"first".to_string())
                     .expect("first response");
             stream
-                .write_rpc_response("listener", &first_response, frame_options)
+                .write_response("listener", &first_response, frame_options)
                 .await
                 .expect("write first response");
 
@@ -3300,14 +2388,13 @@ mod serde_bytes_tests {
                 crate::ObjectRpcResponse::encode_body(&retry_request.route, &"retried".to_string())
                     .expect("retry response");
             retry_stream
-                .write_rpc_response("listener", &retry_response, frame_options)
+                .write_response("listener", &retry_response, frame_options)
                 .await
                 .expect("write retry response");
             true
         });
 
         let mut request = crate::ObjectRpcRequest::from_encoded_body(route, "test", Vec::new());
-        set_object_rpc_request_stream_mode(&mut request, stream_mode);
         if response_retry_safe {
             request = request.with_response_retry_safe();
         }
@@ -3431,54 +2518,36 @@ mod serde_bytes_tests {
 
     #[tokio::test]
     async fn reused_stream_does_not_redispatch_ambiguous_request_without_opt_in() {
-        for stream_mode in [
-            ObjectRpcRequestStreamMode::ReuseDaemonStream,
-            ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
-        ] {
-            let (response, retried) =
-                exercise_ambiguous_reused_stream_failure(stream_mode, false, false).await;
-            assert!(response.is_err(), "{stream_mode:?} should remain failed");
-            assert!(!retried, "{stream_mode:?} should not be redispatched");
-        }
+        let (response, retried) = exercise_ambiguous_reused_stream_failure(false, false).await;
+        assert!(response.is_err(), "ambiguous request should remain failed");
+        assert!(!retried, "ambiguous request should not be redispatched");
     }
 
     #[tokio::test]
     async fn reused_stream_redispatches_ambiguous_request_with_explicit_opt_in() {
-        for stream_mode in [
-            ObjectRpcRequestStreamMode::ReuseDaemonStream,
-            ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
-        ] {
-            let (response, retried) =
-                exercise_ambiguous_reused_stream_failure(stream_mode, true, false).await;
-            let response = response.expect("retry-safe response");
-            assert_eq!(
-                response.decode_body::<String>().expect("retry body"),
-                "retried"
-            );
-            assert!(retried, "{stream_mode:?} should be redispatched");
-        }
+        let (response, retried) = exercise_ambiguous_reused_stream_failure(true, false).await;
+        let response = response.expect("retry-safe response");
+        assert_eq!(
+            response.decode_body::<String>().expect("retry body"),
+            "retried"
+        );
+        assert!(retried, "retry-safe request should be redispatched");
     }
 
     #[tokio::test]
     async fn signed_reused_stream_failure_returns_to_route_for_fresh_auth() {
-        for stream_mode in [
-            ObjectRpcRequestStreamMode::ReuseDaemonStream,
-            ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
-        ] {
-            let (response, retried) =
-                exercise_ambiguous_reused_stream_failure(stream_mode, true, true).await;
-            assert!(matches!(
-                response,
-                Err(NetworkError::StalePooledConnection {
-                    delivery_state: NetworkDeliveryState::PossiblyApplied,
-                    ..
-                })
-            ));
-            assert!(
-                !retried,
-                "{stream_mode:?} must be re-signed before a fresh connection retry"
-            );
-        }
+        let (response, retried) = exercise_ambiguous_reused_stream_failure(true, true).await;
+        assert!(matches!(
+            response,
+            Err(NetworkError::StalePooledConnection {
+                delivery_state: NetworkDeliveryState::PossiblyApplied,
+                ..
+            })
+        ));
+        assert!(
+            !retried,
+            "signed request must be re-signed before a fresh connection retry"
+        );
     }
 
     #[tokio::test]
@@ -3542,603 +2611,6 @@ mod serde_bytes_tests {
         assert_eq!(first.decode_body::<String>().expect("first body"), "one");
         assert_eq!(second.decode_body::<String>().expect("second body"), "two");
         server.await.expect("server task");
-    }
-
-    #[tokio::test]
-    async fn reusable_daemon_control_request_reuses_metadata_opt_in_stream() {
-        let listener = AsyncDaemonControlListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener");
-        let address = listener.local_addr_string().expect("listener address");
-        let server = tokio::spawn(async move {
-            let mut stream = listener.accept().await.expect("accept");
-            for expected in ["one", "two"] {
-                let request = stream
-                    .read_request(
-                        "listener",
-                        1024,
-                        ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
-                    )
-                    .await
-                    .expect("request");
-                assert_eq!(request.route, "/test/reusable");
-                let response =
-                    crate::ObjectRpcResponse::encode_body("/test/reusable", &expected.to_string())
-                        .expect("response");
-                stream
-                    .write_response(
-                        "listener",
-                        &response,
-                        ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
-                    )
-                    .await
-                    .expect("response");
-            }
-        });
-        let mut metadata = std::collections::BTreeMap::new();
-        metadata.insert(
-            super::DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY.to_string(),
-            super::DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE.to_string(),
-        );
-        let request = crate::ObjectRpcRequest {
-            route: "/test/reusable".to_string(),
-            category: "test".to_string(),
-            metadata,
-            auth: None,
-            body: Vec::new(),
-        };
-
-        let first = send_daemon_control_request_async(
-            &address,
-            &request,
-            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
-            1024,
-        )
-        .await
-        .expect("first response");
-        let second = send_daemon_control_request_async(
-            &address,
-            &request,
-            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
-            1024,
-        )
-        .await
-        .expect("second response");
-
-        assert_eq!(first.decode_body::<String>().expect("first body"), "one");
-        assert_eq!(second.decode_body::<String>().expect("second body"), "two");
-        server.await.expect("server task");
-    }
-
-    #[tokio::test]
-    async fn reusable_daemon_control_request_can_read_object_rpc_response() {
-        let listener = AsyncDaemonControlListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener");
-        let address = listener.local_addr_string().expect("listener address");
-        let server = tokio::spawn(async move {
-            let mut stream = listener.accept().await.expect("accept");
-            for expected in ["one", "two"] {
-                let request = stream
-                    .read_request(
-                        "listener",
-                        1024,
-                        ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
-                    )
-                    .await
-                    .expect("request");
-                assert_eq!(request.route, "/test/reusable-rpc-response");
-                let response = crate::ObjectRpcResponse::encode_body(
-                    "/test/reusable-rpc-response",
-                    &expected.to_string(),
-                )
-                .expect("response");
-                stream
-                    .write_rpc_response(
-                        "listener",
-                        &response,
-                        ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
-                    )
-                    .await
-                    .expect("response");
-            }
-        });
-        let mut metadata = std::collections::BTreeMap::new();
-        metadata.insert(
-            super::DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY.to_string(),
-            super::DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE.to_string(),
-        );
-        let request = crate::ObjectRpcRequest {
-            route: "/test/reusable-rpc-response".to_string(),
-            category: "test".to_string(),
-            metadata,
-            auth: None,
-            body: Vec::new(),
-        };
-
-        let first = send_daemon_control_request_async(
-            &address,
-            &request,
-            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
-            1024,
-        )
-        .await
-        .expect("first response");
-        let second = send_daemon_control_request_async(
-            &address,
-            &request,
-            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
-            1024,
-        )
-        .await
-        .expect("second response");
-
-        assert_eq!(first.decode_body::<String>().expect("first body"), "one");
-        assert_eq!(second.decode_body::<String>().expect("second body"), "two");
-        server.await.expect("server task");
-    }
-
-    #[tokio::test]
-    async fn raw_rpc_response_can_stream_body_chunks() {
-        let listener = AsyncDaemonControlListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener");
-        let address = listener.local_addr_string().expect("listener address");
-        let server = tokio::spawn(async move {
-            let mut stream = listener.accept().await.expect("accept");
-            let request = stream
-                .read_request(
-                    "listener",
-                    1024,
-                    ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
-                )
-                .await
-                .expect("request");
-            assert_eq!(request.route, "/test/raw-stream");
-            assert!(super::daemon_control_request_expects_raw_rpc_response(
-                &request
-            ));
-            assert!(super::object_rpc_request_accepts_streamed_daemon_response(
-                &request
-            ));
-            let mut response =
-                crate::ObjectRpcResponse::from_encoded_body("/test/raw-stream", Vec::new());
-            response.metadata.insert(
-                super::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY.to_string(),
-                super::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE.to_string(),
-            );
-            stream
-                .write_rpc_response(
-                    "listener",
-                    &response,
-                    ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
-                )
-                .await
-                .expect("response");
-            for bytes in [b"one".as_slice(), b"two".as_slice()] {
-                stream
-                    .write_raw_byte_stream_chunk(
-                        "listener",
-                        bytes,
-                        ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
-                    )
-                    .await
-                    .expect("chunk");
-            }
-            stream
-                .write_raw_byte_stream_chunk(
-                    "listener",
-                    &[],
-                    ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
-                )
-                .await
-                .expect("final chunk");
-        });
-        let mut metadata = std::collections::BTreeMap::new();
-        metadata.insert(
-            super::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY.to_string(),
-            super::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE.to_string(),
-        );
-        metadata.insert(
-            super::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY.to_string(),
-            super::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE.to_string(),
-        );
-        let request = crate::DaemonControlRequest {
-            route: "/test/raw-stream".to_string(),
-            category: "test".to_string(),
-            metadata,
-            auth: None,
-            body: Vec::new(),
-        };
-
-        let response = super::send_daemon_control_rpc_request_raw_response_async(
-            &address,
-            &request,
-            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
-            1024,
-        )
-        .await
-        .expect("streamed response");
-
-        assert_eq!(response.body, b"onetwo");
-        server.await.expect("server task");
-    }
-
-    fn assert_possibly_applied_overall_stream_timeout(error: NetworkError) {
-        match error {
-            NetworkError::Timeout {
-                operation,
-                phase,
-                delivery_state,
-                ..
-            } => {
-                assert_eq!(operation, "read object rpc stream body");
-                assert_eq!(phase, NetworkTimeoutPhase::Overall);
-                assert_eq!(delivery_state, NetworkDeliveryState::PossiblyApplied);
-            }
-            other => panic!("expected typed overall stream timeout, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn expired_stream_deadline_rejects_buffered_and_empty_body_reads() {
-        let options = RawByteStreamChunkOptions {
-            chunk_bytes: 4,
-            max_total_bytes: Some(1024),
-            idle_timeout: Some(Duration::from_secs(1)),
-        };
-        let expired = tokio::time::Instant::now()
-            .checked_sub(Duration::from_millis(1))
-            .expect("expired deadline");
-        let mut response = crate::ObjectRpcResponse::from_encoded_body(
-            "/test/buffered-deadline",
-            b"body".to_vec(),
-        );
-        set_object_rpc_response_stream_mode(
-            &mut response,
-            ObjectRpcResponseStreamMode::RawStreamedDaemonBody,
-        );
-        let mut response = ObjectRpcStreamResponse::from_buffered_response(response, options)
-            .with_deadline(Some(expired));
-        let error = response
-            .body
-            .read_next_chunk()
-            .await
-            .expect_err("expired buffered body deadline");
-        assert_possibly_applied_overall_stream_timeout(error);
-
-        let mut empty = ObjectRpcStreamBody::Empty.with_deadline(Some(expired));
-        let error = empty
-            .read_next_chunk()
-            .await
-            .expect_err("expired empty body deadline");
-        assert_possibly_applied_overall_stream_timeout(error);
-    }
-
-    #[tokio::test]
-    async fn raw_stream_body_deadline_bounds_subsequent_chunk_read() {
-        let listener = AsyncDaemonControlListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener");
-        let address = listener.local_addr_string().expect("listener address");
-        let server = tokio::spawn(async move {
-            let frame_options = ObjectFrameIoOptions::idle_timeout(Duration::from_secs(2));
-            let mut stream = listener.accept().await.expect("accept");
-            stream
-                .read_request("listener", 1024, frame_options)
-                .await
-                .expect("request");
-            let mut response =
-                crate::ObjectRpcResponse::from_encoded_body("/test/body-deadline", Vec::new());
-            set_object_rpc_response_stream_mode(
-                &mut response,
-                ObjectRpcResponseStreamMode::RawStreamedDaemonBody,
-            );
-            stream
-                .write_rpc_response("listener", &response, frame_options)
-                .await
-                .expect("response");
-            stream
-                .write_raw_byte_stream_chunk("listener", b"first", frame_options)
-                .await
-                .expect("first chunk");
-            tokio::time::sleep(Duration::from_millis(400)).await;
-        });
-        let request =
-            crate::ObjectRpcRequest::from_encoded_body("/test/body-deadline", "test", Vec::new());
-        let mut response = send_daemon_control_rpc_request_stream_response_async(
-            &address,
-            &request,
-            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(2)),
-            1024,
-        )
-        .await
-        .expect("stream response")
-        .with_deadline(Some(
-            tokio::time::Instant::now() + Duration::from_millis(150),
-        ));
-
-        let first = response
-            .body
-            .read_next_chunk()
-            .await
-            .expect("first chunk read")
-            .expect("first chunk");
-        assert_eq!(first, b"first");
-        let error = response
-            .body
-            .read_next_chunk()
-            .await
-            .expect_err("whole-call deadline should beat idle timeout");
-        assert_possibly_applied_overall_stream_timeout(error);
-        server.await.expect("server task");
-    }
-
-    #[tokio::test]
-    async fn high_level_daemon_rpc_uses_raw_streamed_response_reader() {
-        let listener = AsyncDaemonControlListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener");
-        let address = listener.local_addr_string().expect("listener address");
-        let server = tokio::spawn(async move {
-            let mut stream = listener.accept().await.expect("accept");
-            let request = stream
-                .read_request(
-                    "listener",
-                    1024,
-                    ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
-                )
-                .await
-                .expect("request");
-            assert_eq!(request.route, "/test/high-level-raw-stream");
-            assert!(super::daemon_control_request_expects_raw_rpc_response(
-                &request
-            ));
-            let mut response = crate::ObjectRpcResponse::from_encoded_body(
-                "/test/high-level-raw-stream",
-                Vec::new(),
-            );
-            response.metadata.insert(
-                super::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY.to_string(),
-                super::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE.to_string(),
-            );
-            stream
-                .write_rpc_response(
-                    "listener",
-                    &response,
-                    ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
-                )
-                .await
-                .expect("response");
-            stream
-                .write_raw_byte_stream_chunk(
-                    "listener",
-                    b"streamed",
-                    ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
-                )
-                .await
-                .expect("chunk");
-            stream
-                .write_raw_byte_stream_chunk(
-                    "listener",
-                    &[],
-                    ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
-                )
-                .await
-                .expect("final chunk");
-        });
-        let mut metadata = std::collections::BTreeMap::new();
-        metadata.insert(
-            super::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY.to_string(),
-            super::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE.to_string(),
-        );
-        metadata.insert(
-            super::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY.to_string(),
-            super::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE.to_string(),
-        );
-        let request = crate::ObjectRpcRequest {
-            route: "/test/high-level-raw-stream".to_string(),
-            category: "test".to_string(),
-            metadata,
-            auth: None,
-            body: Vec::new(),
-        };
-
-        let response = super::send_daemon_control_rpc_request_async(
-            &address,
-            &request,
-            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
-            crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
-        )
-        .await
-        .expect("streamed response");
-
-        assert_eq!(response.body, b"streamed");
-        server.await.expect("server task");
-    }
-
-    #[tokio::test]
-    async fn raw_byte_stream_chunks_can_forward_without_collecting_body() {
-        let (mut source_writer, mut source_reader) = tokio::io::duplex(128);
-        let (mut sink_writer, mut sink_reader) = tokio::io::duplex(128);
-        let options = RawByteStreamChunkOptions {
-            chunk_bytes: 8,
-            max_total_bytes: Some(16),
-            idle_timeout: Some(Duration::from_secs(1)),
-        };
-
-        let producer = tokio::spawn(async move {
-            for bytes in [b"abcd".as_slice(), b"efgh".as_slice()] {
-                write_raw_byte_stream_chunk_async(
-                    &mut source_writer,
-                    bytes,
-                    ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
-                )
-                .await
-                .expect("write source chunk");
-            }
-            write_raw_byte_stream_chunk_async(
-                &mut source_writer,
-                &[],
-                ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
-            )
-            .await
-            .expect("write source terminator");
-        });
-        let forwarder = tokio::spawn(async move {
-            forward_raw_byte_stream_chunks_async(&mut source_reader, &mut sink_writer, options)
-                .await
-                .expect("forward chunks")
-        });
-
-        let mut forwarded = Vec::new();
-        let read = read_raw_byte_stream_chunks_to_vec_async(
-            &mut sink_reader,
-            &mut forwarded,
-            RawByteStreamChunkOptions {
-                chunk_bytes: 8,
-                max_total_bytes: Some(16),
-                idle_timeout: Some(Duration::from_secs(1)),
-            },
-        )
-        .await
-        .expect("read forwarded chunks");
-
-        producer.await.expect("producer");
-        let forwarded_total = forwarder.await.expect("forwarder");
-        assert_eq!(forwarded_total, 8);
-        assert_eq!(read, 8);
-        assert_eq!(forwarded, b"abcdefgh");
-    }
-
-    #[tokio::test]
-    async fn raw_byte_stream_reader_rejects_oversized_chunk_before_body_read() {
-        let mut frame = 9_u64.to_be_bytes().to_vec();
-        frame.extend_from_slice(b"ignored body");
-        let mut cursor = Cursor::new(frame);
-        let mut output = Vec::new();
-
-        let error = read_raw_byte_stream_chunks_to_vec_async(
-            &mut cursor,
-            &mut output,
-            RawByteStreamChunkOptions {
-                chunk_bytes: 8,
-                max_total_bytes: None,
-                idle_timeout: None,
-            },
-        )
-        .await
-        .expect_err("oversized raw stream chunk");
-
-        assert_eq!(
-            error,
-            NetworkError::FrameTooLarge {
-                actual_bytes: 9,
-                max_bytes: 8,
-            }
-        );
-        assert_eq!(
-            cursor.position(),
-            super::DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64,
-            "oversized chunk rejection should happen before reading the body"
-        );
-        assert!(output.is_empty());
-    }
-
-    #[tokio::test]
-    async fn raw_byte_stream_forwarder_rejects_oversized_chunk_before_body_read() {
-        let mut frame = 9_u64.to_be_bytes().to_vec();
-        frame.extend_from_slice(b"ignored body");
-        let mut source = Cursor::new(frame);
-        let mut sink = tokio::io::sink();
-
-        let error = forward_raw_byte_stream_chunks_async(
-            &mut source,
-            &mut sink,
-            RawByteStreamChunkOptions {
-                chunk_bytes: 8,
-                max_total_bytes: None,
-                idle_timeout: None,
-            },
-        )
-        .await
-        .expect_err("oversized raw stream chunk");
-
-        assert_eq!(
-            error,
-            NetworkError::FrameTooLarge {
-                actual_bytes: 9,
-                max_bytes: 8,
-            }
-        );
-        assert_eq!(
-            source.position(),
-            super::DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64,
-            "oversized forwarded chunk rejection should happen before reading the body"
-        );
-    }
-
-    #[test]
-    fn object_rpc_stream_modes_round_trip_metadata() {
-        let mut request =
-            crate::ObjectRpcRequest::from_encoded_body("/test/stream-mode", "test", Vec::new());
-        assert_eq!(
-            object_rpc_request_stream_mode(&request),
-            ObjectRpcRequestStreamMode::Buffered
-        );
-
-        set_object_rpc_request_stream_mode(
-            &mut request,
-            ObjectRpcRequestStreamMode::ReuseDaemonStream,
-        );
-        assert_eq!(
-            object_rpc_request_stream_mode(&request),
-            ObjectRpcRequestStreamMode::ReuseDaemonStream
-        );
-        assert!(object_rpc_request_reuses_daemon_stream(&request));
-        assert!(!object_rpc_request_expects_raw_daemon_response(&request));
-
-        set_object_rpc_request_stream_mode(
-            &mut request,
-            ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
-        );
-        assert_eq!(
-            object_rpc_request_stream_mode(&request),
-            ObjectRpcRequestStreamMode::RawStreamedDaemonResponse
-        );
-        assert!(object_rpc_request_reuses_daemon_stream(&request));
-        assert!(object_rpc_request_expects_raw_daemon_response(&request));
-        assert!(object_rpc_request_accepts_streamed_daemon_response(
-            &request
-        ));
-
-        set_object_rpc_request_stream_mode(&mut request, ObjectRpcRequestStreamMode::Buffered);
-        assert_eq!(
-            object_rpc_request_stream_mode(&request),
-            ObjectRpcRequestStreamMode::Buffered
-        );
-        assert!(request.metadata.is_empty());
-
-        let mut response =
-            crate::ObjectRpcResponse::from_encoded_body("/test/stream-mode", Vec::new());
-        assert_eq!(
-            object_rpc_response_stream_mode(&response),
-            ObjectRpcResponseStreamMode::Buffered
-        );
-        set_object_rpc_response_stream_mode(
-            &mut response,
-            ObjectRpcResponseStreamMode::RawStreamedDaemonBody,
-        );
-        assert_eq!(
-            object_rpc_response_stream_mode(&response),
-            ObjectRpcResponseStreamMode::RawStreamedDaemonBody
-        );
-        set_object_rpc_response_stream_mode(&mut response, ObjectRpcResponseStreamMode::Buffered);
-        assert_eq!(
-            object_rpc_response_stream_mode(&response),
-            ObjectRpcResponseStreamMode::Buffered
-        );
-        assert!(response.metadata.is_empty());
     }
 
     fn slice_is_borrowed_from(slice: &[u8], source: &[u8]) -> bool {

@@ -9,7 +9,8 @@ use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::kv::{KvCompare, KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
-    ClusterPaths, NetworkError, ObjectRpcRequest, ObjectRpcResponse, ObjectRpcStreamResponse,
+    ClusterPaths, NetworkError, ObjectRpcRequest, ObjectRpcResponse, ObjectRpcSessionCall,
+    ObjectRpcSessionResult,
 };
 use sinomo_core::node::NodeId;
 use std::path::PathBuf;
@@ -409,13 +410,13 @@ impl MountedSifsPeerTransport {
         Ok(response)
     }
 
-    async fn call_object_rpc_stream_async_inner(
+    async fn call_object_rpc_session_async_inner(
         &self,
         target_node_id: &NodeId,
-        request: &ObjectRpcRequest,
+        call: ObjectRpcSessionCall,
         options: DfsObjectRpcSendOptions,
         runtime: &tokio::runtime::Handle,
-    ) -> Result<ObjectRpcStreamResponse, NetworkError> {
+    ) -> Result<ObjectRpcSessionResult, NetworkError> {
         let state = sinomo_core::cluster::read_cluster_state(&self.cluster_paths)?;
         let mut host = MountedSifsObjectRpcHost {
             data_dir: self.data_dir.clone(),
@@ -426,14 +427,11 @@ impl MountedSifsPeerTransport {
             runtime,
             &self.cluster_paths,
         );
-        client
-            .call_target_stream(
-                &state,
-                target_node_id,
-                request,
-                options.cluster_rpc_options(),
-            )
-            .await
+        let result = client
+            .call_target_session(&state, target_node_id, call, options.cluster_rpc_options())
+            .await?;
+        result.response.error_detail()?;
+        Ok(result)
     }
 }
 
@@ -478,6 +476,47 @@ impl DfsPeerTransport for MountedSifsPeerTransport {
         runtime.shutdown_timeout(Duration::from_millis(250));
         result.map_err(|source| DfsPeerTransportError::new(source.to_string()))
     }
+
+    fn call_object_rpc_session(
+        &self,
+        target_node_id: &NodeId,
+        call: ObjectRpcSessionCall,
+        options: DfsObjectRpcSendOptions,
+    ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            return if matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) {
+                let result = tokio::task::block_in_place(|| {
+                    handle.block_on(self.call_object_rpc_session_async_inner(
+                        target_node_id,
+                        call,
+                        options,
+                        &handle,
+                    ))
+                });
+                result.map_err(|source| DfsPeerTransportError::new(source.to_string()))
+            } else {
+                Err(DfsPeerTransportError::new(
+                    "mounted SIFS sync peer transport cannot run inside a current-thread Tokio runtime; use the async transport",
+                ))
+            };
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+        let result = runtime.block_on(self.call_object_rpc_session_async_inner(
+            target_node_id,
+            call,
+            options,
+            runtime.handle(),
+        ));
+        runtime.shutdown_timeout(Duration::from_millis(250));
+        result.map_err(|source| DfsPeerTransportError::new(source.to_string()))
+    }
 }
 
 impl AsyncDfsPeerTransport for MountedSifsPeerTransport {
@@ -496,16 +535,16 @@ impl AsyncDfsPeerTransport for MountedSifsPeerTransport {
         })
     }
 
-    fn call_object_rpc_stream_async<'a>(
+    fn call_object_rpc_session_async<'a>(
         &'a self,
         target_node_id: &'a NodeId,
-        request: &'a ObjectRpcRequest,
+        call: ObjectRpcSessionCall,
         options: DfsObjectRpcSendOptions,
-    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcStreamResponse, DfsPeerTransportError>> {
+    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcSessionResult, DfsPeerTransportError>> {
         Box::pin(async move {
             let runtime = tokio::runtime::Handle::try_current()
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-            self.call_object_rpc_stream_async_inner(target_node_id, request, options, &runtime)
+            self.call_object_rpc_session_async_inner(target_node_id, call, options, &runtime)
                 .await
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))
         })

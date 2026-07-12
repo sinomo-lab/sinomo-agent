@@ -2,9 +2,9 @@
 //! (`sinomo-service`).
 //!
 //! Routes owned by the [`ServiceRegistry`] are served here; everything else falls
-//! through to the daemon's own dispatch. Unary daemon RPC connections stay on the
-//! async Tokio stream path; stream-coupled sandbox RPCs are adapted onto blocking
-//! streams at the edge because the sandbox command runners are still synchronous.
+//! through to the daemon's own dispatch. Sandbox live output is produced by the
+//! daemon and carried as standard object frames inside a canonical session body;
+//! the synchronous command runners remain isolated behind a bounded producer.
 //!
 //! The registry mixes host-agnostic services from `sinomo-service` and native modules
 //! such as `sinomo-rollout` with **daemon-foundational** services defined here
@@ -17,11 +17,11 @@
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt as _;
 
 use crate::registry::network_module_surfaces;
 use sinomo_config::{
@@ -45,20 +45,20 @@ use sinomo_core::network::{
     ClusterPaths, DaemonControlRequest, NETWORK_OBJECT_RPC_ROUTES, NetworkError,
     ObjectRouteDescriptor, ObjectRpcAuthorizationLayer, ObjectRpcCancelRequest,
     ObjectRpcCancelResponse, ObjectRpcRequest, ObjectRpcResponse, ObjectRpcRouteCatalog,
-    ObjectRpcRoutePolicyLayer, ObjectRpcRouteRegistry, ObjectRpcRouter, ServiceCatalog,
+    ObjectRpcRoutePolicyLayer, ObjectRpcRouteRegistry, ObjectRpcRouter, ObjectRpcSessionRequest,
+    ObjectRpcSessionResponse, ServiceCatalog,
 };
 use sinomo_core::service::{
-    ClusterAccess, ResponseSink, Service, ServiceContext, ServiceDisposition, ServiceError,
-    ServiceFuture, ServiceRegistry, ServiceRegistryBuilder, ServiceRegistrySnapshot,
-    ServiceRegistrySnapshotStore, ServiceRoute, ServiceSigner, ServiceStreamFuture,
-    ServiceStreamResponse,
+    ClusterAccess, ResponseSink, Service, ServiceBodyMode, ServiceContext, ServiceDisposition,
+    ServiceError, ServiceFuture, ServiceRegistry, ServiceRegistryBuilder, ServiceRegistrySnapshot,
+    ServiceRegistrySnapshotStore, ServiceRoute, ServiceSigner,
 };
 use sinomo_dfs::register_services as register_dfs_services;
 use sinomo_module::{MODULE_NATIVE_DYLIB_CANCEL_ROUTE, MODULE_RPC_CATEGORY};
 use sinomo_rollout::{
-    ClusterRolloutBinaryResponse, ROLLOUT_BINARY_ROUTE, ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
-    ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE, ROLLOUT_BUILD_ROUTE, ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
-    register_services as register_rollout_services, rollout_module_surfaces,
+    ClusterRolloutBinaryResponse, ROLLOUT_BINARY_ROUTE, ROLLOUT_BUILD_ROUTE,
+    ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE, register_services as register_rollout_services,
+    rollout_module_surfaces,
 };
 use sinomo_sandbox::{
     LocalSandboxBackend, SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE, SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
@@ -102,10 +102,8 @@ use crate::control::{
     handle_daemon_sandbox_import_busybox_on_runtime, handle_daemon_sandbox_list_on_runtime,
     handle_daemon_sandbox_read_on_runtime, handle_daemon_sandbox_reboot_on_runtime,
     handle_daemon_sandbox_resume_on_runtime, handle_daemon_sandbox_run_process_plan_on_runtime,
-    handle_daemon_sandbox_run_process_plan_stream_async_on_runtime,
     handle_daemon_sandbox_run_process_plan_with_cancellation_on_runtime,
     handle_daemon_sandbox_run_toolchain_on_runtime,
-    handle_daemon_sandbox_run_toolchain_stream_async_on_runtime,
     handle_daemon_sandbox_run_toolchain_with_cancellation_on_runtime,
     handle_daemon_sandbox_status_on_runtime,
     handle_daemon_sandbox_toolchain_add_artifact_on_runtime,
@@ -121,8 +119,7 @@ use crate::dfs::{
 use crate::error::DaemonError;
 use crate::paths::DaemonPaths;
 use crate::rollout::{
-    handle_daemon_rollout_binary_request, handle_daemon_rollout_binary_upload_chunk_request,
-    handle_daemon_rollout_binary_upload_finalize_request, handle_daemon_rollout_build_request,
+    handle_daemon_rollout_binary_request, handle_daemon_rollout_build_request,
     handle_daemon_rollout_native_dylib_module_request,
 };
 use crate::{
@@ -142,10 +139,6 @@ use crate::{
 static DAEMON_CLUSTER_NETWORK_PING_NODE_IDS: OnceLock<
     Mutex<HashMap<PathBuf, sinomo_core::node::NodeId>>,
 > = OnceLock::new();
-
-const OBJECT_RPC_STREAM_BUFFER_DEPTH: usize = 4;
-const OBJECT_RPC_LARGE_STREAM_BUFFER_DEPTH: usize = 2;
-const OBJECT_RPC_SMALL_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
 fn daemon_error(error: DaemonError) -> ServiceError {
     ServiceError::Service(error.to_string())
@@ -170,10 +163,6 @@ async fn forward_object_rpc_from_daemon_control(
     let transport_timeouts = sinomo_core::network::DaemonRpcTimeouts::default()
         .with_connect_timeout(Some(Duration::from_millis(payload.connect_timeout_millis)));
     let mut options = sinomo_core::network::ClusterObjectRpcOptions::new(transport_timeouts);
-    if let Some(no_progress_timeout_millis) = payload.no_progress_timeout_millis {
-        options =
-            options.with_extended_idle_timeout(Duration::from_millis(no_progress_timeout_millis));
-    }
     if let Some(overall_timeout_millis) = payload.overall_timeout_millis {
         options = options.with_overall_timeout(Duration::from_millis(overall_timeout_millis));
     }
@@ -199,24 +188,6 @@ async fn forward_object_rpc_from_daemon_control(
                 }
             }),
         }),
-    }
-}
-
-fn service_stream_response_from_collected_object_rpc_response(
-    mut response: ObjectRpcResponse,
-) -> ServiceStreamResponse {
-    let reader = if sinomo_core::network::object_rpc_response_stream_mode(&response)
-        == sinomo_core::network::ObjectRpcResponseStreamMode::RawStreamedDaemonBody
-    {
-        Some(Box::new(Cursor::new(std::mem::take(&mut response.body)))
-            as Box<dyn std::io::Read + Send>)
-    } else {
-        None
-    };
-    ServiceStreamResponse {
-        response,
-        reader,
-        chunk_bytes: sinomo_core::network::OBJECT_STREAM_MAX_CHUNK_BYTES,
     }
 }
 
@@ -624,12 +595,6 @@ impl Service for DaemonControlService {
                 }
                 DAEMON_OBJECT_RPC_FORWARD_ROUTE | DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE => {
                     let payload: crate::DaemonObjectRpcForwardRequest = request.decode_body()?;
-                    if payload.raw_response {
-                        return Err(ServiceError::Service(
-                            "raw daemon object-RPC forward requires a streamed daemon-control request"
-                                .to_string(),
-                        ));
-                    }
                     let runtime =
                         require_service_runtime(runtime.as_ref(), "daemon object RPC forward")?
                             .clone();
@@ -645,44 +610,6 @@ impl Service for DaemonControlService {
             ctx.respond(response)?;
             Ok(disposition)
         })
-    }
-
-    fn handle_stream(
-        &self,
-        _ctx: ServiceContext,
-        request: ObjectRpcRequest,
-    ) -> Option<ServiceStreamFuture<'_>> {
-        if (request.route != DAEMON_OBJECT_RPC_FORWARD_ROUTE
-            && request.route != DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE)
-            || !sinomo_core::network::object_rpc_request_stream_mode(&request)
-                .expects_raw_streamed_response()
-        {
-            return None;
-        }
-        let runtime = self.runtime.clone();
-        let paths = self.paths.clone();
-        Some(Box::pin(async move {
-            let payload: crate::DaemonObjectRpcForwardRequest = request.decode_body()?;
-            if !payload.raw_response {
-                return Err(ServiceError::Service(
-                    "streamed daemon object-RPC forward requires raw_response=true".to_string(),
-                ));
-            }
-            let runtime =
-                require_service_runtime(runtime.as_ref(), "daemon object RPC stream forward")?
-                    .clone();
-            let forwarded =
-                forward_object_rpc_from_daemon_control(&paths, payload, &runtime).await?;
-            let response = match forwarded {
-                crate::DaemonObjectRpcForwardResponse::Success { response } => response,
-                crate::DaemonObjectRpcForwardResponse::NetworkError { detail, .. } => {
-                    ObjectRpcResponse::encode_error(request.route, detail)?
-                }
-            };
-            Ok(service_stream_response_from_collected_object_rpc_response(
-                response,
-            ))
-        }))
     }
 }
 
@@ -1620,6 +1547,32 @@ impl RolloutBinaryService {
     }
 }
 
+async fn decode_rollout_build_session_request(
+    request: &ObjectRpcRequest,
+    body: &mut sinomo_core::network::ObjectRpcIncomingBody,
+) -> Result<sinomo_rollout::ClusterRolloutBuildRequest, ServiceError> {
+    let mut payload: sinomo_rollout::ClusterRolloutBuildRequest = request.decode_body()?;
+    if body.is_empty() {
+        return Ok(payload);
+    }
+    if payload.source_bundle.is_some() {
+        return Err(ServiceError::Service(
+            "rollout build source bundle must be carried either in the request head or the session body, not both"
+                .to_string(),
+        ));
+    }
+    let mut source_bundle = Vec::new();
+    body.read_to_end(&mut source_bundle)
+        .await
+        .map_err(|source| {
+            ServiceError::Service(format!(
+                "failed to receive rollout build source bundle body: {source}"
+            ))
+        })?;
+    payload.source_bundle = Some(source_bundle);
+    Ok(payload)
+}
+
 impl Service for RolloutBinaryService {
     fn name(&self) -> &'static str {
         "rollout-binary"
@@ -1628,8 +1581,6 @@ impl Service for RolloutBinaryService {
     fn routes(&self) -> &'static [&'static str] {
         &[
             ROLLOUT_BINARY_ROUTE,
-            ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
-            ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
             ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
             ROLLOUT_BUILD_ROUTE,
         ]
@@ -1639,7 +1590,18 @@ impl Service for RolloutBinaryService {
         self.routes()
             .iter()
             .copied()
-            .map(rollout_binary_service_route)
+            .map(|route| {
+                let service_route = rollout_binary_service_route(route);
+                match route {
+                    ROLLOUT_BINARY_ROUTE => {
+                        service_route.with_request_body_mode(ServiceBodyMode::Required)
+                    }
+                    ROLLOUT_BUILD_ROUTE => {
+                        service_route.with_request_body_mode(ServiceBodyMode::Optional)
+                    }
+                    _ => service_route,
+                }
+            })
             .collect()
     }
 
@@ -1650,53 +1612,10 @@ impl Service for RolloutBinaryService {
             let (response, disposition) = match route.as_str() {
                 ROLLOUT_BINARY_ROUTE => {
                     let payload = request.decode_body()?;
-                    let rollout_paths = paths.clone();
-                    run_blocking_service_task(route.clone(), "rollout binary", move || {
-                        Self::finish(
-                            &rollout_paths,
-                            ROLLOUT_BINARY_ROUTE,
-                            handle_daemon_rollout_binary_request(&rollout_paths, payload),
-                        )
-                    })
-                    .await?
-                }
-                ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE => {
-                    let payload = request.decode_body()?;
-                    let rollout_paths = paths.clone();
-                    let response = run_blocking_service_task(
-                        route.clone(),
-                        "rollout binary upload chunk",
-                        move || {
-                            handle_daemon_rollout_binary_upload_chunk_request(
-                                &rollout_paths,
-                                payload,
-                            )
-                            .map_err(daemon_error)
-                        },
-                    )
-                    .await?;
-                    (
-                        ObjectRpcResponse::encode_body(
-                            ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
-                            &response,
-                        )?,
-                        ServiceDisposition::Continue,
-                    )
-                }
-                ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE => {
-                    let payload = request.decode_body()?;
-                    let rollout_paths = paths.clone();
-                    run_blocking_service_task(route.clone(), "rollout binary finalize", move || {
-                        Self::finish(
-                            &rollout_paths,
-                            ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
-                            handle_daemon_rollout_binary_upload_finalize_request(
-                                &rollout_paths,
-                                payload,
-                            ),
-                        )
-                    })
-                    .await?
+                    let mut body = ctx.take_request_body();
+                    let result =
+                        handle_daemon_rollout_binary_request(&paths, payload, &mut body).await;
+                    Self::finish(&paths, ROLLOUT_BINARY_ROUTE, result)?
                 }
                 ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE => {
                     let payload = request.decode_body()?;
@@ -1718,7 +1637,8 @@ impl Service for RolloutBinaryService {
                     .await?
                 }
                 ROLLOUT_BUILD_ROUTE => {
-                    let payload = request.decode_body()?;
+                    let mut body = ctx.take_request_body();
+                    let payload = decode_rollout_build_session_request(&request, &mut body).await?;
                     let rollout_paths = paths.clone();
                     run_blocking_service_task(route.clone(), "rollout build", move || {
                         Self::finish(
@@ -3449,18 +3369,23 @@ fn register_daemon_config_definitions(
     sinomo_sandbox::register_config_definitions(builder).map_err(|error| error.to_string())
 }
 
-/// Collects a service's response frame(s) so the daemon can write them to the blocking
-/// control stream after the async dispatch completes.
+/// Captures the exactly-once service response for the network session adapter.
 struct BufferSink {
-    frames: Arc<Mutex<Vec<ObjectRpcResponse>>>,
+    response: Arc<Mutex<Option<ObjectRpcSessionResponse>>>,
 }
 
 impl ResponseSink for BufferSink {
-    fn emit(&mut self, response: ObjectRpcResponse) -> Result<(), ServiceError> {
-        self.frames
+    fn send(self: Box<Self>, response: ObjectRpcSessionResponse) -> Result<(), ServiceError> {
+        let mut slot = self
+            .response
             .lock()
-            .map_err(|_| ServiceError::Service("daemon response sink poisoned".to_string()))?
-            .push(response);
+            .map_err(|_| ServiceError::Service("daemon response sink poisoned".to_string()))?;
+        if slot.is_some() {
+            return Err(ServiceError::Service(
+                "daemon response sink received more than one response".to_string(),
+            ));
+        }
+        *slot = Some(response);
         Ok(())
     }
 }
@@ -3470,54 +3395,6 @@ pub(crate) fn is_sandbox_stream_route(request: &ObjectRpcRequest) -> bool {
         request.route.as_str(),
         SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE | SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE
     )
-}
-
-/// The streaming sandbox-execution routes write `SandboxRun*StreamFrame`s to the connection
-/// in real time during long-running, `sandbox`-feature-gated execution. That stream-coupled
-/// I/O model is owned by the daemon's own stream handlers (and cannot run daemonless), so we
-/// serve them here directly rather than through the unary, host-agnostic service registry.
-pub(crate) async fn dispatch_sandbox_stream_route_async_on_runtime(
-    request: &ObjectRpcRequest,
-    stream: &mut AsyncDaemonControlStream,
-    stream_address: &str,
-    paths: &DaemonPaths,
-    runtime: &tokio::runtime::Handle,
-) -> Option<Result<bool, DaemonError>> {
-    match request.route.as_str() {
-        SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE => {
-            let result = match request.decode_body() {
-                Ok(payload) => {
-                    handle_daemon_sandbox_run_toolchain_stream_async_on_runtime(
-                        paths,
-                        payload,
-                        stream,
-                        stream_address,
-                        runtime,
-                    )
-                    .await
-                }
-                Err(error) => Err(DaemonError::from(error)),
-            };
-            Some(result.map(|()| false))
-        }
-        SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE => {
-            let result = match request.decode_body() {
-                Ok(payload) => {
-                    handle_daemon_sandbox_run_process_plan_stream_async_on_runtime(
-                        paths,
-                        payload,
-                        stream,
-                        stream_address,
-                        runtime,
-                    )
-                    .await
-                }
-                Err(error) => Err(DaemonError::from(error)),
-            };
-            Some(result.map(|()| false))
-        }
-        _ => None,
-    }
 }
 
 fn service_error_to_network_error(error: ServiceError) -> NetworkError {
@@ -3794,6 +3671,8 @@ fn apply_service_route_execution_policy(
 ) -> ObjectRouteDescriptor {
     descriptor.concurrency_limit = route.concurrency_limit;
     descriptor.timeout_ms = route.timeout_ms;
+    descriptor.request_body_mode = route.request_body_mode;
+    descriptor.response_body_mode = route.response_body_mode;
     descriptor
 }
 
@@ -3843,89 +3722,39 @@ async fn dispatch_service_registry_request(
     data_dir: Arc<SinomoDataDir>,
     cluster: Option<Arc<dyn ClusterAccess>>,
     signer: ServiceSigner,
-    request: ObjectRpcRequest,
-) -> Result<ObjectRpcResponse, NetworkError> {
-    let route = request.route.clone();
-    let frames = Arc::new(Mutex::new(Vec::new()));
-    let ctx = ServiceContext {
+    request: ObjectRpcSessionRequest,
+) -> Result<ObjectRpcSessionResponse, NetworkError> {
+    let route = request.request.route.clone();
+    let response = Arc::new(Mutex::new(None));
+    let ctx = ServiceContext::new(
         data_dir,
         cluster,
         signer,
-        sink: Box::new(BufferSink {
-            frames: Arc::clone(&frames),
+        request.body,
+        Box::new(BufferSink {
+            response: Arc::clone(&response),
         }),
-    };
-    let request_for_dispatch = request.clone();
+    );
     let service_disposition = registry
-        .dispatch_direct(ctx, request_for_dispatch)
+        .dispatch_direct(ctx, request.request)
         .await
         .map_err(service_error_to_network_error)?;
 
-    let mut drained = std::mem::take(&mut *frames.lock().map_err(|_| NetworkError::Io {
-        operation: format!("drain service response frames for {route}"),
+    let mut response = response.lock().map_err(|_| NetworkError::Io {
+        operation: format!("take service response for {route}"),
         detail: "service response sink lock poisoned".to_string(),
-    })?);
-    match drained.len() {
-        1 => {
-            let mut response = drained.remove(0);
-            response.metadata.insert(
-                DAEMON_SERVICE_DISPOSITION_METADATA_KEY.to_string(),
-                match service_disposition {
-                    ServiceDisposition::Continue => "continue",
-                    ServiceDisposition::Stop => "stop",
-                }
-                .to_string(),
-            );
-            Ok(response)
+    })?;
+    let mut response = response.take().ok_or_else(|| NetworkError::Serialization {
+        detail: format!("service route {route} sent no response"),
+    })?;
+    response.response.metadata.insert(
+        DAEMON_SERVICE_DISPOSITION_METADATA_KEY.to_string(),
+        match service_disposition {
+            ServiceDisposition::Continue => "continue",
+            ServiceDisposition::Stop => "stop",
         }
-        0 => Err(NetworkError::Serialization {
-            detail: format!("service route {route} emitted no response frames"),
-        }),
-        count => Err(NetworkError::Serialization {
-            detail: format!(
-                "service route {route} emitted {count} response frames; object RPC router expects exactly one"
-            ),
-        }),
-    }
-}
-
-async fn dispatch_service_registry_stream_request(
-    registry: Arc<ServiceRegistry>,
-    data_dir: Arc<SinomoDataDir>,
-    cluster: Option<Arc<dyn ClusterAccess>>,
-    signer: ServiceSigner,
-    request: ObjectRpcRequest,
-) -> Result<ServiceStreamResponse, NetworkError> {
-    let route = request.route.clone();
-    let frames = Arc::new(Mutex::new(Vec::new()));
-    let ctx = ServiceContext {
-        data_dir,
-        cluster,
-        signer,
-        sink: Box::new(BufferSink {
-            frames: Arc::clone(&frames),
-        }),
-    };
-    let Some(future) = registry.dispatch_stream_direct(ctx, request) else {
-        return Err(NetworkError::Serialization {
-            detail: format!("service route {route} does not support streamed object-RPC responses"),
-        });
-    };
-    let response = future.await.map_err(service_error_to_network_error)?;
-    let emitted = frames
-        .lock()
-        .map_err(|_| NetworkError::Io {
-            operation: format!("drain streamed service response frames for {route}"),
-            detail: "service response sink lock poisoned".to_string(),
-        })?
-        .len();
-    if emitted != 0 {
-        return Err(NetworkError::Serialization {
-            detail: format!(
-                "streamed service route {route} emitted {emitted} ordinary response frames"
-            ),
-        });
-    }
+        .to_string(),
+    );
     Ok(response)
 }
 
@@ -4279,7 +4108,7 @@ fn daemon_service_object_rpc_route_registry_from_module_snapshot(
         let handler_paths = paths.clone();
         let handler_runtime = service_runtime.clone();
         let active_native_dylib_operations = Arc::clone(&active_native_dylib_operations);
-        builder = builder.try_register_route(descriptor, move |request| {
+        builder = builder.try_register_session_route(descriptor, move |request| {
             let registry = Arc::clone(&registry);
             let paths = handler_paths.clone();
             let runtime = handler_runtime.clone();
@@ -4287,25 +4116,43 @@ fn daemon_service_object_rpc_route_registry_from_module_snapshot(
             let active_native_dylib_operations = Arc::clone(&active_native_dylib_operations);
             async move {
                 if is_native_cancel_route {
+                    if !request.body.is_empty() {
+                        return Err(NetworkError::Serialization {
+                            detail: "native module cancellation does not accept a request body"
+                                .to_string(),
+                        });
+                    }
                     return dispatch_native_dylib_module_cancel_request(
                         &active_native_dylib_operations,
-                        request,
-                    );
+                        request.request,
+                    )
+                    .map(ObjectRpcSessionResponse::buffered);
                 }
                 if let Some(native_target) = native_target {
+                    if !request.body.is_empty() {
+                        return Err(NetworkError::Serialization {
+                            detail: "native module invocation does not accept a request body"
+                                .to_string(),
+                        });
+                    }
                     return dispatch_native_dylib_module_request(
                         paths,
                         native_target,
                         active_native_dylib_operations,
-                        request,
+                        request.request,
                     )
-                    .await;
+                    .await
+                    .map(ObjectRpcSessionResponse::buffered);
                 }
-                let route = request.route.clone();
-                let category = request.category.clone();
-                let traceparent = request.traceparent().unwrap_or_default().to_string();
+                let route = request.request.route.clone();
+                let category = request.request.category.clone();
+                let traceparent = request
+                    .request
+                    .traceparent()
+                    .unwrap_or_default()
+                    .to_string();
                 let started_at = Instant::now();
-                let signer = daemon_service_signer_from_request_metadata(&request)?;
+                let signer = daemon_service_signer_from_request_metadata(&request.request)?;
                 let (data_dir, cluster) = tokio::task::spawn_blocking(move || {
                     let data_dir = Arc::new(SinomoDataDir::new(
                         daemon_data_dir_path(&paths).map_err(daemon_error_to_network_error)?,
@@ -4324,7 +4171,10 @@ fn daemon_service_object_rpc_route_registry_from_module_snapshot(
                 })
                 .await
                 .map_err(|source| NetworkError::Io {
-                    operation: format!("build daemon service context for {}", request.route),
+                    operation: format!(
+                        "build daemon service context for {}",
+                        request.request.route
+                    ),
                     detail: format!("daemon service context task failed: {source}"),
                 })??;
                 let context_us = daemon_service_rpc_elapsed_us(started_at);
@@ -4577,21 +4427,6 @@ pub(crate) async fn try_dispatch_via_registry_async(
         dfs_data_plane = sinomo_dfs::dfs_route_is_message_data_plane(&request.route),
         "daemon service rpc dispatch accepted"
     );
-    if sinomo_core::network::object_rpc_request_stream_mode(request).expects_raw_streamed_response()
-    {
-        return Some(
-            dispatch_stream_via_registry_async(
-                service_host,
-                authenticated,
-                request.clone(),
-                stream,
-                stream_address,
-                paths,
-                replay_key,
-            )
-            .await,
-        );
-    }
     Some(
         dispatch_via_registry_async(
             service_host,
@@ -4604,155 +4439,6 @@ pub(crate) async fn try_dispatch_via_registry_async(
         )
         .await,
     )
-}
-
-async fn dispatch_stream_via_registry_async(
-    service_host: &DaemonServiceRegistryHost,
-    authenticated: &AuthenticatedDaemonCommand,
-    request: ObjectRpcRequest,
-    stream: &mut AsyncDaemonControlStream,
-    stream_address: &str,
-    paths: &DaemonPaths,
-    replay_key: Option<Vec<u8>>,
-) -> Result<bool, DaemonError> {
-    let stream_response = dispatch_rpc_via_registry_to_stream_response_async(
-        service_host,
-        authenticated,
-        request,
-        paths,
-        replay_key.clone(),
-    )
-    .await
-    .inspect_err(|_| {
-        if let Some(key) = replay_key.as_ref() {
-            crate::control::abandon_daemon_dfs_message_replay(paths, key);
-        }
-    })?;
-    stream
-        .write_rpc_response(
-            stream_address,
-            &stream_response.response,
-            sinomo_core::network::ObjectFrameIoOptions::default(),
-        )
-        .await
-        .map_err(DaemonError::from)?;
-    if let Some(reader) = stream_response.reader {
-        if let Err(error) = write_object_rpc_stream_chunks(
-            stream,
-            stream_address,
-            reader,
-            stream_response.chunk_bytes,
-        )
-        .await
-        {
-            if let Some(key) = replay_key.as_ref() {
-                crate::control::abandon_daemon_dfs_message_replay(paths, key);
-            }
-            let _ = stream.shutdown_write(stream_address).await;
-            return Err(error);
-        }
-    }
-    if let Some(key) = replay_key.as_ref() {
-        crate::control::complete_daemon_dfs_message_replay(paths, key, &stream_response.response);
-    }
-    Ok(false)
-}
-
-async fn write_object_rpc_stream_chunks(
-    stream: &mut AsyncDaemonControlStream,
-    stream_address: &str,
-    mut reader: Box<dyn std::io::Read + Send>,
-    requested_chunk_bytes: usize,
-) -> Result<u64, DaemonError> {
-    struct Chunk {
-        buffer: Vec<u8>,
-        read: usize,
-    }
-
-    let (chunk_bytes, buffer_depth) = object_rpc_stream_buffer_plan(requested_chunk_bytes);
-    let (filled_tx, mut filled_rx) =
-        tokio::sync::mpsc::channel::<Result<Chunk, String>>(buffer_depth);
-    let (empty_tx, mut empty_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(buffer_depth);
-    for _ in 0..buffer_depth {
-        empty_tx
-            .try_send(vec![0_u8; chunk_bytes])
-            .map_err(|source| DaemonError::Network {
-                address: stream_address.to_string(),
-                detail: format!("object-RPC stream buffer seed failed: {source}"),
-            })?;
-    }
-
-    let producer_stream_address = stream_address.to_string();
-    let producer = tokio::task::spawn_blocking(move || {
-        while let Some(mut buffer) = empty_rx.blocking_recv() {
-            let read = match reader.read(&mut buffer) {
-                Ok(read) => read,
-                Err(source) => {
-                    let _ = filled_tx.blocking_send(Err(source.to_string()));
-                    return;
-                }
-            };
-            if filled_tx.blocking_send(Ok(Chunk { buffer, read })).is_err() {
-                return;
-            }
-            if read == 0 {
-                return;
-            }
-        }
-    });
-
-    let mut total = 0_u64;
-    let write_result = async {
-        while let Some(chunk_result) = filled_rx.recv().await {
-            let chunk = chunk_result.map_err(|detail| DaemonError::Network {
-                address: stream_address.to_string(),
-                detail,
-            })?;
-            stream
-                .write_raw_byte_stream_chunk(
-                    stream_address,
-                    &chunk.buffer[..chunk.read],
-                    sinomo_core::network::ObjectFrameIoOptions::default(),
-                )
-                .await
-                .map_err(DaemonError::from)?;
-            if chunk.read == 0 {
-                return Ok(total);
-            }
-            total = total
-                .checked_add(chunk.read as u64)
-                .ok_or_else(|| DaemonError::Network {
-                    address: stream_address.to_string(),
-                    detail: "object-RPC stream byte count overflowed".to_string(),
-                })?;
-            let _ = empty_tx.send(chunk.buffer).await;
-        }
-        Err(DaemonError::Network {
-            address: stream_address.to_string(),
-            detail: "object-RPC stream ended before terminator chunk".to_string(),
-        })
-    }
-    .await;
-
-    drop(empty_tx);
-    drop(filled_rx);
-    producer.await.map_err(|source| DaemonError::Network {
-        address: producer_stream_address,
-        detail: format!("object-RPC stream producer task failed: {source}"),
-    })?;
-    write_result
-}
-
-fn object_rpc_stream_buffer_plan(requested_chunk_bytes: usize) -> (usize, usize) {
-    let max_chunk = sinomo_core::network::OBJECT_STREAM_MAX_CHUNK_BYTES;
-    let chunk_bytes = requested_chunk_bytes.clamp(1, max_chunk);
-    if chunk_bytes >= max_chunk {
-        return (max_chunk, OBJECT_RPC_LARGE_STREAM_BUFFER_DEPTH);
-    }
-    if chunk_bytes >= OBJECT_RPC_SMALL_STREAM_CHUNK_BYTES {
-        return (chunk_bytes, OBJECT_RPC_STREAM_BUFFER_DEPTH);
-    }
-    (chunk_bytes, OBJECT_RPC_STREAM_BUFFER_DEPTH)
 }
 
 async fn dispatch_via_registry_async(
@@ -4793,14 +4479,44 @@ async fn dispatch_via_registry_async(
 pub(crate) async fn dispatch_rpc_via_registry_to_response_async(
     service_host: &DaemonServiceRegistryHost,
     authenticated: &AuthenticatedDaemonCommand,
-    mut request: ObjectRpcRequest,
+    request: ObjectRpcRequest,
     paths: Option<&DaemonPaths>,
     replay_key: Option<Vec<u8>>,
 ) -> Result<(ObjectRpcResponse, bool), DaemonError> {
-    let traceparent = request.traceparent().unwrap_or_default().to_string();
-    let route = request.route.clone();
-    let category = request.category.clone();
-    let body_bytes = request.body.len();
+    let (mut response, stop) = dispatch_rpc_via_registry_to_session_response_async(
+        service_host,
+        authenticated,
+        ObjectRpcSessionRequest::buffered(request),
+        paths,
+        replay_key,
+    )
+    .await?;
+    if !response.body.is_empty() {
+        response.response.body = response
+            .body
+            .collect_to_vec(sinomo_core::network::OBJECT_RPC_UNARY_ADAPTER_MAX_BODY_BYTES)
+            .await
+            .map_err(DaemonError::from)?;
+    }
+    Ok((response.response, stop))
+}
+
+pub(crate) async fn dispatch_rpc_via_registry_to_session_response_async(
+    service_host: &DaemonServiceRegistryHost,
+    authenticated: &AuthenticatedDaemonCommand,
+    mut request: ObjectRpcSessionRequest,
+    paths: Option<&DaemonPaths>,
+    replay_key: Option<Vec<u8>>,
+) -> Result<(ObjectRpcSessionResponse, bool), DaemonError> {
+    let traceparent = request
+        .request
+        .traceparent()
+        .unwrap_or_default()
+        .to_string();
+    let route = request.request.route.clone();
+    let category = request.request.category.clone();
+    let head_body_bytes = request.request.body.len();
+    let has_body = !request.body.is_empty();
     let dispatch_started = Instant::now();
     tracing::trace!(
         target: "sinomo.daemon.service_rpc",
@@ -4808,18 +4524,21 @@ pub(crate) async fn dispatch_rpc_via_registry_to_response_async(
         route = %route,
         category = %category,
         signer_node_id = %authenticated.signer_node_id,
-        body_bytes,
+        head_body_bytes,
+        has_body,
         dfs_data_plane = sinomo_dfs::dfs_route_is_message_data_plane(&route),
         "daemon service rpc dispatch start"
     );
-    annotate_daemon_service_request(&mut request, authenticated);
+    annotate_daemon_service_request(&mut request.request, authenticated);
     let router = service_host
         .route_policy_layer()
         .layer(service_host.active_router());
     let mut router =
         daemon_service_object_rpc_authorization_layer(authenticated.signer.clone()).layer(router);
     let mut response =
-        match sinomo_core::network::call_object_rpc_service_async(&mut router, request).await {
+        match sinomo_core::network::call_object_rpc_session_service_async(&mut router, request)
+            .await
+        {
             Ok(response) => response,
             Err(error) => {
                 if let (Some(paths), Some(key)) = (paths, replay_key.as_ref()) {
@@ -4829,116 +4548,33 @@ pub(crate) async fn dispatch_rpc_via_registry_to_response_async(
             }
         };
     if let Some(paths) = paths {
-        mark_daemon_rpc_response_responder(paths, &mut response);
+        mark_daemon_rpc_response_responder(paths, &mut response.response);
     }
     let stop = response
+        .response
         .metadata
         .remove(DAEMON_SERVICE_DISPOSITION_METADATA_KEY)
         .is_some_and(|value| value == "stop");
     if let (Some(paths), Some(key)) = (paths, replay_key.as_ref()) {
-        crate::control::complete_daemon_dfs_message_replay(paths, key, &response);
+        if response.body.is_empty() {
+            crate::control::complete_daemon_dfs_message_replay(paths, key, &response.response);
+        } else {
+            // The legacy head-only cache cannot safely replay an attached body.
+            crate::control::abandon_daemon_dfs_message_replay(paths, key);
+        }
     }
     tracing::trace!(
         target: "sinomo.daemon.service_rpc",
         traceparent = %traceparent,
         route = %route,
         category = %category,
-        response_body_bytes = response.body.len(),
+        response_head_body_bytes = response.response.body.len(),
+        response_has_body = !response.body.is_empty(),
         elapsed_ms = dispatch_started.elapsed().as_millis(),
         stop,
         "daemon service rpc dispatch complete"
     );
     Ok((response, stop))
-}
-
-pub(crate) async fn dispatch_rpc_via_registry_to_stream_response_async(
-    service_host: &DaemonServiceRegistryHost,
-    authenticated: &AuthenticatedDaemonCommand,
-    mut request: ObjectRpcRequest,
-    paths: &DaemonPaths,
-    replay_key: Option<Vec<u8>>,
-) -> Result<ServiceStreamResponse, DaemonError> {
-    if let Some(descriptor) = service_host.object_rpc_route_descriptor(&request.route) {
-        if let Some(auth_scope) = descriptor.auth_scope.as_deref()
-            && !daemon_signer_authorizes_route_scope(&authenticated.signer, auth_scope)
-        {
-            warn_daemon_service_auth_denied(
-                &request.route,
-                auth_scope,
-                &authenticated.signer,
-                Some(&authenticated.signer_node_id),
-                Some(&authenticated.signer_public_key),
-            );
-            return Err(DaemonError::AuthDenied);
-        }
-    } else {
-        return Err(DaemonError::Network {
-            address: request.route,
-            detail: "streamed object-RPC route is not registered".to_string(),
-        });
-    }
-
-    annotate_daemon_service_request(&mut request, authenticated);
-    let registry = service_host
-        .service_registry_snapshot_store()
-        .active_snapshot()
-        .registry_arc();
-    let signer = daemon_service_signer_from_request_metadata(&request)?;
-    let route = request.route.clone();
-    let runtime = tokio::runtime::Handle::current();
-    let paths_for_context = paths.clone();
-    let (data_dir, cluster) = tokio::task::spawn_blocking(move || {
-        let data_dir = Arc::new(SinomoDataDir::new(
-            daemon_data_dir_path(&paths_for_context).map_err(daemon_error_to_network_error)?,
-        ));
-        let cluster: Option<Arc<dyn ClusterAccess>> =
-            if ClusterPaths::new(data_dir.as_ref()).state.exists() {
-                Some(Arc::new(DaemonClusterAccess::new(
-                    paths_for_context.clone(),
-                    data_dir.as_ref(),
-                    Some(&runtime),
-                )))
-            } else {
-                None
-            };
-        Ok::<_, NetworkError>((data_dir, cluster))
-    })
-    .await
-    .map_err(|source| DaemonError::Network {
-        address: route.clone(),
-        detail: format!("streamed service context task failed: {source}"),
-    })?
-    .map_err(DaemonError::from)?;
-
-    let mut stream_response =
-        dispatch_service_registry_stream_request(registry, data_dir, cluster, signer, request)
-            .await
-            .inspect_err(|_| {
-                if let Some(key) = replay_key.as_ref() {
-                    crate::control::abandon_daemon_dfs_message_replay(paths, key);
-                }
-            })
-            .map_err(DaemonError::from)?;
-    mark_daemon_rpc_response_responder(paths, &mut stream_response.response);
-    Ok(stream_response)
-}
-
-pub(crate) async fn dispatch_stream_rpc_in_process_async(
-    paths: DaemonPaths,
-    service_runtime: tokio::runtime::Handle,
-    request: ObjectRpcRequest,
-) -> Result<ServiceStreamResponse, DaemonError> {
-    let service_host =
-        DaemonServiceRegistryHost::new_on_runtime(paths.clone(), service_runtime).await?;
-    let authenticated = crate::auth::authenticate_daemon_control_request(&paths, &request)?;
-    dispatch_rpc_via_registry_to_stream_response_async(
-        &service_host,
-        &authenticated,
-        request,
-        &paths,
-        None,
-    )
-    .await
 }
 
 async fn write_async_daemon_rpc_response_frame(
@@ -4963,6 +4599,40 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn rollout_build_session_body_rehydrates_source_bundle() {
+        let payload = sinomo_rollout::ClusterRolloutBuildRequest {
+            source: "test-source".to_string(),
+            remote_repo: None,
+            source_bundle: None,
+            source_head: Some("abc123".to_string()),
+            force_source_overwrite: false,
+            host: "127.0.0.1".to_string(),
+            port: 21_353,
+            shadow_port: 21_354,
+            requested_at: "2026-07-12T00:00:00Z".to_string(),
+        };
+        let request = ObjectRpcRequest::encode_body(
+            ROLLOUT_BUILD_ROUTE,
+            sinomo_rollout::ROLLOUT_RPC_CATEGORY,
+            &payload,
+        )
+        .expect("request head");
+        let expected_bundle = vec![9_u8; 48 * 1024];
+        let mut body = sinomo_core::network::ObjectRpcIncomingBody::bytes(expected_bundle.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let decoded = runtime
+            .block_on(decode_rollout_build_session_request(&request, &mut body))
+            .expect("session request");
+
+        assert_eq!(decoded.source_bundle, Some(expected_bundle));
+        assert_eq!(decoded.source_head, payload.source_head);
+    }
+
+    #[test]
     fn dfs_browser_write_targets_only_discovered_content_servers() {
         let first = sinomo_core::node::NodeId::from_legacy_named(
             "node_dfs_browser_discovered_content_first",
@@ -4977,34 +4647,6 @@ mod tests {
 
         assert_eq!(options.replica_candidates, vec![first, second]);
         assert!(!options.foreground_replica_repair);
-    }
-
-    #[test]
-    fn collected_raw_object_rpc_response_is_reemitted_as_stream() {
-        let mut response =
-            ObjectRpcResponse::from_encoded_body("/test/raw-stream", b"stream-body".to_vec());
-        sinomo_core::network::set_object_rpc_response_stream_mode(
-            &mut response,
-            sinomo_core::network::ObjectRpcResponseStreamMode::RawStreamedDaemonBody,
-        );
-
-        let mut stream_response =
-            service_stream_response_from_collected_object_rpc_response(response);
-
-        assert_eq!(stream_response.response.route, "/test/raw-stream");
-        assert!(stream_response.response.body.is_empty());
-        assert_eq!(
-            sinomo_core::network::object_rpc_response_stream_mode(&stream_response.response),
-            sinomo_core::network::ObjectRpcResponseStreamMode::RawStreamedDaemonBody
-        );
-        let mut bytes = Vec::new();
-        stream_response
-            .reader
-            .as_mut()
-            .expect("raw streamed response should keep a reader")
-            .read_to_end(&mut bytes)
-            .expect("read stream");
-        assert_eq!(bytes, b"stream-body");
     }
 
     struct TestStopService;
@@ -6281,32 +5923,6 @@ mod tests {
     }
 
     #[test]
-    fn object_rpc_stream_buffer_plan_scales_with_requested_chunk_size() {
-        assert_eq!(
-            object_rpc_stream_buffer_plan(0),
-            (1, OBJECT_RPC_STREAM_BUFFER_DEPTH)
-        );
-        assert_eq!(
-            object_rpc_stream_buffer_plan(32),
-            (32, OBJECT_RPC_STREAM_BUFFER_DEPTH)
-        );
-        assert_eq!(
-            object_rpc_stream_buffer_plan(OBJECT_RPC_SMALL_STREAM_CHUNK_BYTES),
-            (
-                OBJECT_RPC_SMALL_STREAM_CHUNK_BYTES,
-                OBJECT_RPC_STREAM_BUFFER_DEPTH
-            )
-        );
-        assert_eq!(
-            object_rpc_stream_buffer_plan(sinomo_core::network::OBJECT_STREAM_MAX_CHUNK_BYTES),
-            (
-                sinomo_core::network::OBJECT_STREAM_MAX_CHUNK_BYTES,
-                OBJECT_RPC_LARGE_STREAM_BUFFER_DEPTH
-            )
-        );
-    }
-
-    #[test]
     fn cluster_registry_hosts_cluster_routes() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-cluster-kv-registry-routes");
         let data_dir = SinomoDataDir::new(&root);
@@ -6536,8 +6152,6 @@ mod tests {
             .collect::<std::collections::BTreeMap<_, _>>();
         for route in [
             ROLLOUT_BINARY_ROUTE,
-            ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
-            ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
             ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
             ROLLOUT_BUILD_ROUTE,
         ] {
@@ -6560,6 +6174,14 @@ mod tests {
                     .iter()
                     .map(|capability| capability.as_str().to_string())
                     .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                service_route.request_body_mode,
+                match route {
+                    ROLLOUT_BINARY_ROUTE => ServiceBodyMode::Required,
+                    ROLLOUT_BUILD_ROUTE => ServiceBodyMode::Optional,
+                    _ => ServiceBodyMode::None,
+                }
             );
         }
     }

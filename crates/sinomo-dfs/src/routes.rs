@@ -8,7 +8,6 @@ use crate::{
 };
 use sinomo_core::network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_core::node::NodeId;
-use std::time::Duration;
 
 pub const DFS_RPC_CATEGORY: &str = "dfs";
 pub const DFS_STATUS_ROUTE: &str = "/dfs/status";
@@ -20,7 +19,6 @@ pub const DFS_METADATA_SNAPSHOT_INSTALL_ROUTE: &str = "/dfs/metadata/snapshot-in
 pub const DFS_DIRECT_READ_ROUTE: &str = "/dfs/object/read";
 pub const DFS_DATA_READ_ROUTE: &str = "/dfs/data/read";
 pub const DFS_DATA_READ_RESPONSE_ROUTE: &str = "/dfs/data/read/response";
-pub const DFS_DATA_READ_RESPONSE_CHUNK_ROUTE: &str = "/dfs/data/read/response-chunk";
 pub const DFS_DATA_BULK_READ_ROUTE: &str = "/dfs/data/bulk-read";
 pub const DFS_DATA_BULK_READ_RESPONSE_ROUTE: &str = "/dfs/data/bulk-read/response";
 pub const DFS_DATA_WRITE_ROUTE: &str = "/dfs/data/write";
@@ -30,18 +28,14 @@ pub const DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE: &str = "/dfs/data/distribut
 pub const DFS_DATA_NAMESPACE_ROUTE: &str = "/dfs/data/namespace";
 pub const DFS_DATA_NAMESPACE_RESPONSE_ROUTE: &str = "/dfs/data/namespace/response";
 pub const DFS_DATA_STAGE_BLOB_ROUTE: &str = "/dfs/data/stage-blob";
-pub const DFS_DATA_STAGE_BLOB_CHUNK_ROUTE: &str = "/dfs/data/stage-blob/chunk";
 pub const DFS_DATA_STAGE_PATCH_ROUTE: &str = "/dfs/data/stage-patch";
-pub const DFS_DATA_STAGE_PATCH_CHUNK_ROUTE: &str = "/dfs/data/stage-patch/chunk";
 pub const DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE: &str = "/dfs/data/stage-blob/response";
 pub const DFS_DATA_COMMIT_VERSION_ROUTE: &str = "/dfs/data/commit-version";
 pub const DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE: &str = "/dfs/data/commit-version/response";
 pub const DFS_DATA_REPAIR_REPLICA_ROUTE: &str = "/dfs/data/repair-replica";
-pub const DFS_DATA_REPAIR_REPLICA_CHUNK_ROUTE: &str = "/dfs/data/repair-replica/chunk";
 pub const DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE: &str = "/dfs/data/repair-replica/response";
 pub const DFS_DATA_FETCH_BLOB_ROUTE: &str = "/dfs/data/fetch-blob";
 pub const DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE: &str = "/dfs/data/fetch-blob/response";
-pub const DFS_DATA_FETCH_BLOB_RESPONSE_CHUNK_ROUTE: &str = "/dfs/data/fetch-blob/response-chunk";
 pub const DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE: &str = "/dfs/data/metadata/journal-batch";
 pub const DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE: &str =
     "/dfs/data/metadata/journal-batch/response";
@@ -51,7 +45,6 @@ pub const DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE: &str =
 pub const DFS_MESSAGE_DATA_PLANE_ROUTES: &[&str] = &[
     DFS_DATA_READ_ROUTE,
     DFS_DATA_READ_RESPONSE_ROUTE,
-    DFS_DATA_READ_RESPONSE_CHUNK_ROUTE,
     DFS_DATA_BULK_READ_ROUTE,
     DFS_DATA_BULK_READ_RESPONSE_ROUTE,
     DFS_DATA_WRITE_ROUTE,
@@ -61,18 +54,14 @@ pub const DFS_MESSAGE_DATA_PLANE_ROUTES: &[&str] = &[
     DFS_DATA_NAMESPACE_ROUTE,
     DFS_DATA_NAMESPACE_RESPONSE_ROUTE,
     DFS_DATA_STAGE_BLOB_ROUTE,
-    DFS_DATA_STAGE_BLOB_CHUNK_ROUTE,
     DFS_DATA_STAGE_PATCH_ROUTE,
-    DFS_DATA_STAGE_PATCH_CHUNK_ROUTE,
     DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE,
     DFS_DATA_COMMIT_VERSION_ROUTE,
     DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE,
     DFS_DATA_REPAIR_REPLICA_ROUTE,
-    DFS_DATA_REPAIR_REPLICA_CHUNK_ROUTE,
     DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE,
     DFS_DATA_FETCH_BLOB_ROUTE,
     DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE,
-    DFS_DATA_FETCH_BLOB_RESPONSE_CHUNK_ROUTE,
     DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
     DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE,
     DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE,
@@ -91,7 +80,6 @@ pub const DFS_DATA_PLANE_ROUTES: &[&str] = &[
     DFS_DIRECT_READ_ROUTE,
     DFS_DATA_READ_ROUTE,
     DFS_DATA_READ_RESPONSE_ROUTE,
-    DFS_DATA_READ_RESPONSE_CHUNK_ROUTE,
     DFS_DATA_BULK_READ_ROUTE,
     DFS_DATA_BULK_READ_RESPONSE_ROUTE,
     DFS_DATA_WRITE_ROUTE,
@@ -101,18 +89,14 @@ pub const DFS_DATA_PLANE_ROUTES: &[&str] = &[
     DFS_DATA_NAMESPACE_ROUTE,
     DFS_DATA_NAMESPACE_RESPONSE_ROUTE,
     DFS_DATA_STAGE_BLOB_ROUTE,
-    DFS_DATA_STAGE_BLOB_CHUNK_ROUTE,
     DFS_DATA_STAGE_PATCH_ROUTE,
-    DFS_DATA_STAGE_PATCH_CHUNK_ROUTE,
     DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE,
     DFS_DATA_COMMIT_VERSION_ROUTE,
     DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE,
     DFS_DATA_REPAIR_REPLICA_ROUTE,
-    DFS_DATA_REPAIR_REPLICA_CHUNK_ROUTE,
     DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE,
     DFS_DATA_FETCH_BLOB_ROUTE,
     DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE,
-    DFS_DATA_FETCH_BLOB_RESPONSE_CHUNK_ROUTE,
     DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
     DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE,
     DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE,
@@ -130,7 +114,6 @@ pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
     DFS_DIRECT_READ_ROUTE,
     DFS_DATA_READ_ROUTE,
     DFS_DATA_READ_RESPONSE_ROUTE,
-    DFS_DATA_READ_RESPONSE_CHUNK_ROUTE,
     DFS_DATA_BULK_READ_ROUTE,
     DFS_DATA_BULK_READ_RESPONSE_ROUTE,
     DFS_DATA_WRITE_ROUTE,
@@ -140,18 +123,14 @@ pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
     DFS_DATA_NAMESPACE_ROUTE,
     DFS_DATA_NAMESPACE_RESPONSE_ROUTE,
     DFS_DATA_STAGE_BLOB_ROUTE,
-    DFS_DATA_STAGE_BLOB_CHUNK_ROUTE,
     DFS_DATA_STAGE_PATCH_ROUTE,
-    DFS_DATA_STAGE_PATCH_CHUNK_ROUTE,
     DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE,
     DFS_DATA_COMMIT_VERSION_ROUTE,
     DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE,
     DFS_DATA_REPAIR_REPLICA_ROUTE,
-    DFS_DATA_REPAIR_REPLICA_CHUNK_ROUTE,
     DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE,
     DFS_DATA_FETCH_BLOB_ROUTE,
     DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE,
-    DFS_DATA_FETCH_BLOB_RESPONSE_CHUNK_ROUTE,
     DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
     DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE,
     DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE,
@@ -223,7 +202,6 @@ fn dfs_message_route_for_network_message(message: &DfsNetworkMessage) -> &'stati
     match message {
         DfsNetworkMessage::ReadRequest(_) => DFS_DATA_READ_ROUTE,
         DfsNetworkMessage::ReadResponse(_) => DFS_DATA_READ_RESPONSE_ROUTE,
-        DfsNetworkMessage::ReadResponseChunk(_) => DFS_DATA_READ_RESPONSE_CHUNK_ROUTE,
         DfsNetworkMessage::BulkReadRequest(_) => DFS_DATA_BULK_READ_ROUTE,
         DfsNetworkMessage::BulkReadResponse(_) => DFS_DATA_BULK_READ_RESPONSE_ROUTE,
         DfsNetworkMessage::WriteRequest(_) => DFS_DATA_WRITE_ROUTE,
@@ -233,18 +211,14 @@ fn dfs_message_route_for_network_message(message: &DfsNetworkMessage) -> &'stati
         DfsNetworkMessage::NamespaceRequest(_) => DFS_DATA_NAMESPACE_ROUTE,
         DfsNetworkMessage::NamespaceResponse(_) => DFS_DATA_NAMESPACE_RESPONSE_ROUTE,
         DfsNetworkMessage::StageBlob(_) => DFS_DATA_STAGE_BLOB_ROUTE,
-        DfsNetworkMessage::StageBlobChunk(_) => DFS_DATA_STAGE_BLOB_CHUNK_ROUTE,
         DfsNetworkMessage::StagePatch(_) => DFS_DATA_STAGE_PATCH_ROUTE,
-        DfsNetworkMessage::StagePatchChunk(_) => DFS_DATA_STAGE_PATCH_CHUNK_ROUTE,
         DfsNetworkMessage::StageBlobResponse(_) => DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE,
         DfsNetworkMessage::CommitVersion(_) => DFS_DATA_COMMIT_VERSION_ROUTE,
         DfsNetworkMessage::CommitVersionResponse(_) => DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE,
         DfsNetworkMessage::RepairReplica(_) => DFS_DATA_REPAIR_REPLICA_ROUTE,
-        DfsNetworkMessage::RepairReplicaChunk(_) => DFS_DATA_REPAIR_REPLICA_CHUNK_ROUTE,
         DfsNetworkMessage::RepairReplicaResponse(_) => DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE,
         DfsNetworkMessage::FetchBlob(_) => DFS_DATA_FETCH_BLOB_ROUTE,
         DfsNetworkMessage::FetchBlobResponse(_) => DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE,
-        DfsNetworkMessage::FetchBlobResponseChunk(_) => DFS_DATA_FETCH_BLOB_RESPONSE_CHUNK_ROUTE,
         DfsNetworkMessage::MetadataJournalBatch(_) => DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
         DfsNetworkMessage::MetadataJournalBatchResponse(_) => {
             DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE
@@ -267,24 +241,11 @@ pub fn dfs_message_is_read_only_request(command: &DfsMessageCommand) -> bool {
     dfs_network_message_is_read_only_request(&command.routed_message.message)
 }
 
-/// Returns the exceptional first-response silence allowance for DFS messages
-/// that cannot emit transport progress while completing bounded durable work.
-pub fn dfs_network_message_no_progress_timeout(message: &DfsNetworkMessage) -> Option<Duration> {
-    match message {
-        DfsNetworkMessage::NamespaceRequest(_) => Some(crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT),
-        DfsNetworkMessage::DistributedWriteRequest(_) => {
-            Some(crate::DFS_ROUTED_DISTRIBUTED_WRITE_NO_PROGRESS_TIMEOUT)
-        }
-        _ => None,
-    }
-}
-
 fn dfs_network_message_uses_full_response_budget(message: &DfsNetworkMessage) -> bool {
     matches!(
         message,
         DfsNetworkMessage::ReadRequest(_)
             | DfsNetworkMessage::ReadResponse(_)
-            | DfsNetworkMessage::ReadResponseChunk(_)
             | DfsNetworkMessage::BulkReadRequest(_)
             | DfsNetworkMessage::BulkReadResponse(_)
             | DfsNetworkMessage::WriteRequest(_)
@@ -294,18 +255,14 @@ fn dfs_network_message_uses_full_response_budget(message: &DfsNetworkMessage) ->
             | DfsNetworkMessage::NamespaceRequest(_)
             | DfsNetworkMessage::NamespaceResponse(_)
             | DfsNetworkMessage::StageBlob(_)
-            | DfsNetworkMessage::StageBlobChunk(_)
             | DfsNetworkMessage::StagePatch(_)
-            | DfsNetworkMessage::StagePatchChunk(_)
             | DfsNetworkMessage::StageBlobResponse(_)
             | DfsNetworkMessage::CommitVersion(_)
             | DfsNetworkMessage::CommitVersionResponse(_)
             | DfsNetworkMessage::RepairReplica(_)
-            | DfsNetworkMessage::RepairReplicaChunk(_)
             | DfsNetworkMessage::RepairReplicaResponse(_)
             | DfsNetworkMessage::FetchBlob(_)
             | DfsNetworkMessage::FetchBlobResponse(_)
-            | DfsNetworkMessage::FetchBlobResponseChunk(_)
             | DfsNetworkMessage::MetadataJournalBatch(_)
             | DfsNetworkMessage::MetadataJournalBatchResponse(_)
             | DfsNetworkMessage::MetadataSnapshotInstall(_)
@@ -316,9 +273,7 @@ fn dfs_network_message_uses_full_response_budget(message: &DfsNetworkMessage) ->
 fn dfs_network_message_response_retry_safe(message: &DfsNetworkMessage) -> bool {
     matches!(
         message,
-        DfsNetworkMessage::DistributedWriteRequest(_)
-            | DfsNetworkMessage::RepairReplica(_)
-            | DfsNetworkMessage::RepairReplicaChunk(_)
+        DfsNetworkMessage::DistributedWriteRequest(_) | DfsNetworkMessage::RepairReplica(_)
     )
 }
 
@@ -435,17 +390,13 @@ pub fn dfs_message_rpc_request(
     if dfs_message_uses_full_response_budget(command) {
         request = request.with_full_response_budget();
     }
-    if let Some(timeout) = dfs_network_message_no_progress_timeout(&command.routed_message.message)
-    {
-        request = request.with_forwarded_response_idle_timeout(timeout);
-    }
     if dfs_network_message_response_retry_safe(&command.routed_message.message) {
         // Distributed writes carry a stable request identity and their outcome
         // is durably reconciled at the metadata primary. Repair writes are
-        // content-addressed and replay-identifiable; completed and duplicate
-        // chunks take idempotent durable fast paths. If a transport loses only
-        // the response, sinomo-network may therefore safely redispatch these
-        // commands instead of surfacing an ambiguous timeout.
+        // content-addressed and replay-identifiable; completed duplicate
+        // requests take idempotent durable fast paths. If a transport loses
+        // only the response, sinomo-network may therefore safely redispatch
+        // these commands instead of surfacing an ambiguous timeout.
         request = request.with_response_retry_safe();
     }
     if let Some(traceparent) = crate::current_dfs_traceparent() {

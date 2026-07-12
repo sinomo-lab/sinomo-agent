@@ -26,8 +26,6 @@ pub const ROLLOUT_TRANSITION_COMPLETED_EVENT_KIND: &str = "rollout.transition.co
 pub const ROLLOUT_RPC_CATEGORY: &str = "rollout";
 pub const ROLLOUT_DIAGNOSTICS_ROUTE: &str = "/rollout/diagnostics";
 pub const ROLLOUT_BINARY_ROUTE: &str = "/rollout/binary";
-pub const ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE: &str = "/rollout/binary-upload-chunk";
-pub const ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE: &str = "/rollout/binary-upload-finalize";
 pub const ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE: &str = "/rollout/native-dylib-module";
 pub const ROLLOUT_BUILD_ROUTE: &str = "/rollout/build";
 pub const ROLLOUT_FINALIZE_SHADOW_ROUTE: &str = "/rollout/finalize-shadow";
@@ -39,8 +37,6 @@ pub const SHADOW_START_DELAY_MS_ENV: &str = "SINOMO_SHADOW_START_DELAY_MS";
 pub const ROLLOUT_OBJECT_RPC_ROUTES: &[&str] = &[
     ROLLOUT_DIAGNOSTICS_ROUTE,
     ROLLOUT_BINARY_ROUTE,
-    ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
-    ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
     ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
     ROLLOUT_BUILD_ROUTE,
     ROLLOUT_FINALIZE_SHADOW_ROUTE,
@@ -103,13 +99,11 @@ pub use progress::{
     ClusterRolloutProgressUpdate, cluster_rollout_progress_status, rollout_timestamp_now,
 };
 pub use protocol::{
-    ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse,
-    ClusterRolloutBinaryUploadChunkRequest, ClusterRolloutBinaryUploadChunkResponse,
-    ClusterRolloutBinaryUploadFinalizeRequest, ClusterRolloutBinaryUploadManifest,
+    ClusterRolloutBinaryManifest, ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse,
     ClusterRolloutBuildRequest, ClusterRolloutNativeDylibModuleArtifact,
     ClusterRolloutNativeDylibModuleRequest, ClusterRolloutNativeDylibModuleResponse,
     ClusterRolloutNativeDylibModuleUploadSpec, ClusterRolloutUploadArtifactSpec,
-    prepare_cluster_rollout_binary_request, prepare_cluster_rollout_build_request,
+    prepare_cluster_rollout_binary_manifest, prepare_cluster_rollout_build_request,
     prepare_cluster_rollout_native_dylib_module_request, unique_rollout_targets,
 };
 pub use service::{RolloutService, register_services};
@@ -132,7 +126,7 @@ pub use state::{
     PendingShadowRollout, PendingShadowRolloutContext, ROLLOUT_DIAGNOSTIC_TAIL_BYTES,
     RecordedRolloutTransition, RolloutFailureDiagnostics, RolloutMainActivation,
     RolloutMainExitRecord, RolloutTelemetryAdvanceState, RolloutTelemetryGateConfig,
-    RolloutTransitionRecord, clear_rollout_status, read_pending_shadow_rollout,
+    RolloutTransitionRecord, clear_rollout_status, read_object, read_pending_shadow_rollout,
     read_rollout_main_activation, read_rollout_main_exit, read_rollout_runtime_state,
     read_rollout_status, read_rollout_telemetry_advance_state, read_rollout_telemetry_gate_config,
     read_tail_lossy, record_activation_failure, record_main_activation_staged,
@@ -145,8 +139,8 @@ pub use state::{
     rollout_telemetry_gate_config_definition, rollout_telemetry_gate_config_path,
     rollout_telemetry_gate_legacy_config_path, rollout_transition_history_dir,
     rollout_transition_record, stage_pending_shadow_rollout, write_json, write_main_activation,
-    write_rollout_runtime_state, write_rollout_status, write_rollout_telemetry_advance_state,
-    write_rollout_telemetry_gate_config,
+    write_object, write_rollout_runtime_state, write_rollout_status,
+    write_rollout_telemetry_advance_state, write_rollout_telemetry_gate_config,
 };
 pub use target::{
     cluster_rollout_should_use_remote_build, ensure_rollout_target_platform_matches_local,
@@ -197,18 +191,6 @@ pub fn rollout_module_surfaces() -> sinomo_module::ModuleSurfaces {
             ModuleRouteAuth::Admin,
         ))
         .with_object_rpc_route(ModuleObjectRpcRoute::new(
-            ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
-            ROLLOUT_RPC_CATEGORY,
-            "rollout.binary-upload.chunk",
-            ModuleRouteAuth::Admin,
-        ))
-        .with_object_rpc_route(ModuleObjectRpcRoute::new(
-            ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
-            ROLLOUT_RPC_CATEGORY,
-            "rollout.binary-upload.finalize",
-            ModuleRouteAuth::Admin,
-        ))
-        .with_object_rpc_route(ModuleObjectRpcRoute::new(
             ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
             ROLLOUT_RPC_CATEGORY,
             "rollout.module.native-dylib.apply",
@@ -250,8 +232,6 @@ pub fn rollout_module_capabilities() -> sinomo_core::ModuleCapabilities {
         exports: vec![
             rollout_capability("rollout.diagnostics.read"),
             rollout_capability("rollout.binary.apply"),
-            rollout_capability("rollout.binary-upload.chunk"),
-            rollout_capability("rollout.binary-upload.finalize"),
             rollout_capability("rollout.module.native-dylib.apply"),
             rollout_capability("rollout.build.apply"),
             rollout_capability("rollout.shadow.finalize"),

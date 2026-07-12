@@ -10,10 +10,6 @@ use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
 use sinomo_core::{DfsWriteReceipt, DfsWriteRequest};
 
-fn is_zero_u32(value: &u32) -> bool {
-    *value == 0
-}
-
 fn default_true() -> bool {
     true
 }
@@ -58,10 +54,6 @@ pub struct DfsReadRequest {
     pub range_offset: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range_max_bytes: Option<usize>,
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    pub start_chunk_index: u32,
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    pub max_chunks: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -78,26 +70,6 @@ pub struct DfsReadResponse {
     pub request_id: String,
     pub object_id: DfsObjectId,
     pub result: DfsReadResult,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsReadResponseChunk {
-    pub request_id: String,
-    pub object_id: DfsObjectId,
-    pub version: DfsVersion,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub range_offset: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub object_total_size_bytes: Option<u64>,
-    pub total_size_bytes: u64,
-    pub chunk_index: u32,
-    pub total_chunks: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chunk_hash: Option<String>,
-    #[serde(with = "serde_bytes")]
-    pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -563,29 +535,6 @@ pub struct DfsStageBlobResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsStageBlobChunkCommand {
-    pub request_id: String,
-    pub intent_id: String,
-    pub file_system_id: DfsFileSystemId,
-    pub object_id: DfsObjectId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_base_version: Option<DfsVersion>,
-    pub version: DfsVersion,
-    pub content_hash: String,
-    pub total_size_bytes: u64,
-    pub chunk_index: u32,
-    pub total_chunks: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chunk_hash: Option<String>,
-    #[serde(with = "serde_bytes")]
-    pub bytes: Vec<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub object_metadata: Option<DfsObjectMetadata>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authority_shard: Option<DfsMetadataShardConfig>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsStagePatchCommand {
     pub request_id: String,
     pub intent_id: String,
@@ -596,30 +545,6 @@ pub struct DfsStagePatchCommand {
     pub content_hash: String,
     pub offset: u64,
     pub patch_hash: String,
-    #[serde(with = "serde_bytes")]
-    pub bytes: Vec<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub object_metadata: Option<DfsObjectMetadata>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authority_shard: Option<DfsMetadataShardConfig>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsStagePatchChunkCommand {
-    pub request_id: String,
-    pub intent_id: String,
-    pub file_system_id: DfsFileSystemId,
-    pub object_id: DfsObjectId,
-    pub base_version: DfsVersion,
-    pub version: DfsVersion,
-    pub content_hash: String,
-    pub offset: u64,
-    pub patch_hash: String,
-    pub total_size_bytes: u64,
-    pub chunk_index: u32,
-    pub total_chunks: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chunk_hash: Option<String>,
     #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -685,29 +610,6 @@ pub struct DfsRepairReplicaResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsRepairReplicaChunkCommand {
-    pub request_id: String,
-    pub intent_id: String,
-    pub file_system_id: DfsFileSystemId,
-    pub object_id: DfsObjectId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_base_version: Option<DfsVersion>,
-    pub version: DfsVersion,
-    pub content_hash: String,
-    pub total_size_bytes: u64,
-    pub chunk_index: u32,
-    pub total_chunks: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chunk_hash: Option<String>,
-    #[serde(with = "serde_bytes")]
-    pub bytes: Vec<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub object_metadata: Option<DfsObjectMetadata>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authority_shard: Option<DfsMetadataShardConfig>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsFetchBlobCommand {
     pub request_id: String,
     pub intent_id: String,
@@ -716,10 +618,6 @@ pub struct DfsFetchBlobCommand {
     pub content_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_shard: Option<DfsMetadataShardConfig>,
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    pub start_chunk_index: u32,
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    pub max_chunks: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -730,23 +628,6 @@ pub struct DfsFetchBlobResponse {
     pub version: DfsVersion,
     pub source_node_id: NodeId,
     pub result: DfsFetchBlobResult,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsFetchBlobResponseChunk {
-    pub request_id: String,
-    pub intent_id: String,
-    pub object_id: DfsObjectId,
-    pub version: DfsVersion,
-    pub source_node_id: NodeId,
-    pub content_hash: String,
-    pub total_size_bytes: u64,
-    pub chunk_index: u32,
-    pub total_chunks: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chunk_hash: Option<String>,
-    #[serde(with = "serde_bytes")]
-    pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -878,7 +759,6 @@ pub enum DfsBlobTransferResult {
 pub enum DfsNetworkMessage {
     ReadRequest(DfsReadRequest),
     ReadResponse(DfsReadResponse),
-    ReadResponseChunk(DfsReadResponseChunk),
     BulkReadRequest(DfsBulkReadRequest),
     BulkReadResponse(DfsBulkReadResponse),
     WriteRequest(DfsWriteCommand),
@@ -888,18 +768,14 @@ pub enum DfsNetworkMessage {
     NamespaceRequest(DfsNamespaceCommand),
     NamespaceResponse(DfsNamespaceResponse),
     StageBlob(DfsStageBlobCommand),
-    StageBlobChunk(DfsStageBlobChunkCommand),
     StagePatch(DfsStagePatchCommand),
-    StagePatchChunk(DfsStagePatchChunkCommand),
     StageBlobResponse(DfsStageBlobResponse),
     CommitVersion(DfsCommitVersionCommand),
     CommitVersionResponse(DfsCommitVersionResponse),
     RepairReplica(DfsRepairReplicaCommand),
-    RepairReplicaChunk(DfsRepairReplicaChunkCommand),
     RepairReplicaResponse(DfsRepairReplicaResponse),
     FetchBlob(DfsFetchBlobCommand),
     FetchBlobResponse(DfsFetchBlobResponse),
-    FetchBlobResponseChunk(DfsFetchBlobResponseChunk),
     MetadataJournalBatch(DfsMetadataJournalBatchCommand),
     MetadataJournalBatchResponse(DfsMetadataJournalBatchResponse),
     MetadataSnapshotInstall(DfsMetadataSnapshotInstallCommand),

@@ -2,14 +2,13 @@
 //! docs/plans/r0-r1-crate-boundary-refactor.md).
 //!
 //! A network module owns one or more non-built-in cluster transports behind
-//! the [`NetworkModule`] trait: it can dial daemon RPCs to a
+//! the [`NetworkModule`] trait: it can open daemon RPC byte streams to a
 //! [`ClusterEndpointRecord`], optionally run a listener/proxy, advertise the
 //! endpoints it currently serves, and classify protocol-specific endpoint
 //! roles. Modules are registered in a [`NetworkModuleRegistry`]; routing code
 //! dispatches by endpoint transport kind and by address scheme.
 //!
-//! Loopback and LAN-TCP remain built-in transports inside this crate — their
-//! pooled/streamed raw dial paths never cross the module seam. The daemon
+//! Loopback and LAN-TCP remain built-in transports inside this crate. The daemon
 //! loads native-dylib network modules (see `network_module_abi`), registers
 //! them here, and installs the registry process-wide with
 //! [`set_network_module_registry`] (same pattern as the cluster directory
@@ -17,6 +16,8 @@
 
 use crate::error::NetworkError;
 use crate::object::DaemonRpcTimeouts;
+use crate::session::NetworkDuplexStream;
+use crate::transfer::NetworkHealthPolicy;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use sinomo_base::{ClusterEndpointRecord, ClusterTransportKind};
@@ -26,6 +27,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Daemon object-RPC route listing registered network modules and their
 /// enabled state ([`NetworkModuleListResponse`]).
@@ -132,9 +134,9 @@ pub struct NetworkModuleContext {
 
 /// A runtime-registered network transport implementation.
 ///
-/// Implementations must be safe to call from any thread; `dial_rpc` returns a
-/// boxed future so blocking FFI-backed modules can bridge through
-/// `spawn_blocking` (see `network_module_abi::FfiNetworkModule`).
+/// Implementations must be safe to call from any thread. The FFI adapter
+/// bridges its blocking opaque-stream callbacks through bounded async pipes
+/// (see `network_module_abi::FfiNetworkModule`).
 pub trait NetworkModule: Send + Sync {
     /// The module's static descriptor.
     fn descriptor(&self) -> NetworkModuleDescriptor;
@@ -147,6 +149,31 @@ pub trait NetworkModule: Send + Sync {
     /// may be started again (runtime toggle).
     fn stop(&self) -> Result<(), NetworkError>;
 
+    /// Opens one raw, full-duplex byte stream to the daemon endpoint.
+    ///
+    /// Object-RPC/session framing, authentication, transfer progress, and
+    /// retries live above this transport seam. Implementations must therefore
+    /// preserve byte order and half-close semantics without interpreting or
+    /// collecting the stream. The default keeps source compatibility for
+    /// dial-only test modules while making the missing capability explicit at
+    /// runtime.
+    fn open_rpc_stream(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+        _health: NetworkHealthPolicy,
+    ) -> NetworkFuture<Box<dyn NetworkDuplexStream>> {
+        let module_id = self.descriptor().id;
+        let endpoint = endpoint.address.clone();
+        Box::pin(async move {
+            Err(NetworkError::Io {
+                operation: "open network module RPC stream".to_string(),
+                detail: format!(
+                    "network module `{module_id}` does not support full-duplex streams for `{endpoint}`"
+                ),
+            })
+        })
+    }
+
     /// Dial a request/response daemon RPC to `endpoint`. `request` is the
     /// encoded object frame; the resolved bytes are the encoded response
     /// frame.
@@ -155,28 +182,50 @@ pub trait NetworkModule: Send + Sync {
         endpoint: &ClusterEndpointRecord,
         request: &[u8],
         timeouts: DaemonRpcTimeouts,
-    ) -> NetworkFuture<Vec<u8>>;
-
-    /// Dial a daemon RPC whose response may use raw streamed daemon-response
-    /// framing.
-    ///
-    /// The default decodes the module's normal response frame. Modules that
-    /// cross a proxy boundary must preserve any raw response body before
-    /// returning that frame so callers can dispatch by generic stream mode
-    /// instead of route-specific rules.
-    fn dial_rpc_raw_response(
-        &self,
-        endpoint: &ClusterEndpointRecord,
-        request: &[u8],
-        timeouts: DaemonRpcTimeouts,
-    ) -> NetworkFuture<crate::ObjectRpcResponse> {
-        let dial = self.dial_rpc(endpoint, request, timeouts);
+    ) -> NetworkFuture<Vec<u8>> {
+        let defaults = NetworkHealthPolicy::default();
+        let health = NetworkHealthPolicy::new(
+            timeouts.connect_timeout.unwrap_or(defaults.connect_timeout),
+            timeouts
+                .idle_timeout
+                .unwrap_or(defaults.no_progress_timeout),
+        );
+        let open = self.open_rpc_stream(endpoint, health);
+        let request = request.to_vec();
         Box::pin(async move {
-            let bytes = dial.await?;
-            crate::object::decode_single_object_frame_from_slice(
-                &bytes,
-                crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
-            )
+            let mut stream = open.await?;
+            stream.write_all(&request).await.map_err(|source| {
+                NetworkError::delivery_failed(
+                    "write network module RPC request",
+                    crate::NetworkDeliveryState::PossiblyApplied,
+                    source.to_string(),
+                )
+            })?;
+            stream.shutdown().await.map_err(|source| NetworkError::Io {
+                operation: "shutdown network module RPC request".to_string(),
+                detail: source.to_string(),
+            })?;
+            let mut response = Vec::new();
+            let max_response_bytes = crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES;
+            stream
+                .take(
+                    u64::try_from(max_response_bytes)
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(1),
+                )
+                .read_to_end(&mut response)
+                .await
+                .map_err(|source| NetworkError::Io {
+                    operation: "read network module RPC response".to_string(),
+                    detail: source.to_string(),
+                })?;
+            if response.len() > max_response_bytes {
+                return Err(NetworkError::FrameTooLarge {
+                    actual_bytes: response.len(),
+                    max_bytes: max_response_bytes,
+                });
+            }
+            Ok(response)
         })
     }
 
