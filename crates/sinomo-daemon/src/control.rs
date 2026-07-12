@@ -1195,12 +1195,30 @@ async fn handle_daemon_object_rpc_session_async(
     service_runtime: tokio::runtime::Handle,
     _stream_address: String,
 ) -> Result<bool, DaemonError> {
+    handle_daemon_object_rpc_stream_async(
+        Box::new(stream.into_inner()),
+        paths,
+        service_host,
+        service_runtime,
+    )
+    .await
+}
+
+/// Runs one transport-neutral canonical object-RPC session through the same
+/// authentication, authorization, registry, relay, and response path used by
+/// a directly accepted daemon TCP connection.
+pub(crate) async fn handle_daemon_object_rpc_stream_async(
+    stream: Box<dyn sinomo_core::network::NetworkDuplexStream>,
+    paths: DaemonPaths,
+    service_host: crate::service_adapter::DaemonServiceRegistryHost,
+    service_runtime: tokio::runtime::Handle,
+) -> Result<bool, DaemonError> {
     let data_dir = sinomo_core::local::SinomoDataDir::new(daemon_data_dir_path(&paths)?);
     let authenticated = Arc::new(Mutex::new(None::<AuthenticatedDaemonCommand>));
     let authenticated_slot = Arc::clone(&authenticated);
     let auth_paths = paths.clone();
     let (request, responder) = sinomo_core::network::accept_object_rpc_server_session(
-        Box::new(stream.into_inner()),
+        stream,
         data_dir,
         sinomo_core::network::NetworkCallPolicy::default(),
         move |request, claimed_link_node_id, claimed_link_public_key| {

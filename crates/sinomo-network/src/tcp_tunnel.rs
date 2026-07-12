@@ -44,6 +44,33 @@ pub enum ClusterTcpTunnelFrame {
         id: u64,
         response: ObjectRpcResponse,
     },
+    /// Opens one canonical full-duplex object-RPC byte stream inside the
+    /// persistent tunnel. Stream identifiers are allocated from disjoint
+    /// odd/even spaces by the two physical tunnel endpoints.
+    StreamOpen {
+        id: u64,
+    },
+    /// Confirms that the peer created the logical stream and attached its
+    /// canonical daemon session handler. Callers do not consume one-pass body
+    /// sources until this acknowledgement arrives.
+    StreamAccept {
+        id: u64,
+    },
+    /// Carries an ordered byte-stream fragment for one logical session.
+    StreamData {
+        id: u64,
+        bytes: Vec<u8>,
+    },
+    /// Half-closes the sender-to-receiver direction of one logical session.
+    StreamFinish {
+        id: u64,
+    },
+    /// Aborts both directions of one logical session without closing the
+    /// persistent tunnel or disturbing other multiplexed sessions.
+    StreamReset {
+        id: u64,
+        detail: String,
+    },
     Close {
         detail: String,
     },

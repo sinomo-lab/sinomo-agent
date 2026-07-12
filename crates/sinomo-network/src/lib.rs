@@ -212,6 +212,7 @@ pub use peer::{
     InProcessTransport,
 };
 pub use roaming::{
+    open_daemon_rpc_stream_to_cluster_endpoint_async,
     send_daemon_rpc_response_to_cluster_endpoint_async, send_daemon_rpc_to_cluster_endpoint_async,
 };
 pub use route::{

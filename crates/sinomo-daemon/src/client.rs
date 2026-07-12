@@ -1054,6 +1054,32 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonSignedObjec
         })
     }
 
+    fn open_object_rpc_session_stream_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        health: sinomo_core::network::NetworkHealthPolicy,
+    ) -> sinomo_core::network::ClusterSignedObjectRpcFuture<
+        'a,
+        Box<dyn sinomo_core::network::NetworkDuplexStream>,
+    > {
+        let runtime = self.runtime.clone();
+        let daemon_paths = self.paths.clone();
+        let use_tcp_tunnel = self.tcp_tunnel_available() && daemon_endpoint_is_tcp_tunnel(endpoint);
+        Box::pin(async move {
+            if use_tcp_tunnel {
+                return crate::tcp_tunnel::open_object_rpc_session_stream_via_tcp_tunnel(
+                    endpoint,
+                    health,
+                    &runtime,
+                    daemon_paths.as_ref(),
+                )
+                .await;
+            }
+            sinomo_core::network::open_daemon_rpc_stream_to_cluster_endpoint_async(endpoint, health)
+                .await
+        })
+    }
+
     fn send_signed_object_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
