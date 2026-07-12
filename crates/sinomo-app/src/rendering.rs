@@ -1,6 +1,6 @@
 //! Local window-rendering preferences for the SUI desktop surface.
 
-use sui::{WindowColorManagementMode, WindowRenderOptions};
+use sui::{WindowColorManagementMode, WindowRenderOptions, WindowStemDarkening, WindowTextHinting};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,5 +36,8 @@ impl AppRenderMode {
 /// and stem darkening make adjacent app labels look uneven on some Windows
 /// displays.
 pub fn resolve_render_options(mode: AppRenderMode) -> WindowRenderOptions {
-    WindowRenderOptions::new(true, 1.0).with_color_management_mode(mode.color_management_mode())
+    WindowRenderOptions::new(true, 1.0)
+        .with_text_hinting(WindowTextHinting::None)
+        .with_stem_darkening(WindowStemDarkening::None)
+        .with_color_management_mode(mode.color_management_mode())
 }

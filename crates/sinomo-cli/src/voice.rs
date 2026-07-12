@@ -5,6 +5,13 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+const MAX_CONSECUTIVE_NATIVE_VIDEO_FRAME_FAILURES: u8 = 3;
+
+fn native_voice_video_failure_is_terminal(failures: &mut u8) -> bool {
+    *failures = failures.saturating_add(1);
+    *failures >= MAX_CONSECUTIVE_NATIVE_VIDEO_FRAME_FAILURES
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum VoiceCliCommand {
     Help,
@@ -457,6 +464,7 @@ fn run_voice_call(options: VoiceCallOptions) -> Result<(), CliError> {
                     .max(1)
                     .min(u32::MAX as u64) as u32,
             ),
+            ..Default::default()
         });
     }
     if let Some(endpoint) = options.endpoint.as_deref() {
@@ -798,11 +806,7 @@ async fn run_native_voice_loop(
         None
     };
     let camera = if options.native_camera {
-        let camera_config = sinomo_video::NativeVideoCaptureConfig {
-            device: options.camera_device.clone(),
-            frame_interval_ms: options.video_frame_ms,
-            ..Default::default()
-        };
+        let camera_config = native_voice_camera_capture_config(options);
         Some(sinomo_video::start_native_camera_capture(camera_config).map_err(native_video_error)?)
     } else {
         None
@@ -810,6 +814,10 @@ async fn run_native_voice_loop(
     let deadline = Instant::now() + Duration::from_millis(options.call_ms.unwrap_or(30_000).max(1));
     let mut input_sequence = 0_u64;
     let mut video_sequence = initial_video_frames;
+    let video_send_interval = native_voice_model_frame_interval(config, options.video_frame_ms);
+    let mut next_video_send_at = Instant::now();
+    let mut latest_camera_sample = None;
+    let mut video_conversion_failures = 0_u8;
     while Instant::now() < deadline {
         let mut progressed = false;
         if let Some(microphone) = &microphone {
@@ -835,11 +843,38 @@ async fn run_native_voice_loop(
             }
         }
         if let Some(camera) = &camera {
-            if let Some(frame) = camera
-                .recv_timeout(Duration::from_millis(1))
+            if let Some(sample) = camera
+                .recv_sample_timeout(Duration::from_millis(1))
                 .map_err(native_video_error)?
             {
-                send_voice_video_frame_bytes(
+                latest_camera_sample = Some(sample);
+                progressed = true;
+            }
+            let now = Instant::now();
+            if now >= next_video_send_at
+                && let Some(sample) = latest_camera_sample.take()
+            {
+                let converted = tokio::task::spawn_blocking(move || {
+                    sinomo_video::native_video_sample_to_surface_frame(&sample)
+                })
+                .await
+                .map_err(|source| CliError::Parse {
+                    detail: format!("native camera conversion task failed: {source}"),
+                })?;
+                let frame = match converted {
+                    Ok(frame) => {
+                        video_conversion_failures = 0;
+                        frame
+                    }
+                    Err(error) => {
+                        next_video_send_at = now + video_send_interval;
+                        if native_voice_video_failure_is_terminal(&mut video_conversion_failures) {
+                            return Err(native_video_error(error));
+                        }
+                        continue;
+                    }
+                };
+                send_voice_raw_video_frame(
                     session,
                     state,
                     store,
@@ -847,15 +882,12 @@ async fn run_native_voice_loop(
                     provider_id,
                     model,
                     options,
-                    frame.bytes,
-                    sinomo_lm::RealtimeVideoFrameFormat::Jpeg,
+                    frame,
                     video_sequence,
-                    Some(video_sequence.saturating_mul(options.video_frame_ms)),
-                    Some(frame.width),
-                    Some(frame.height),
                 )
                 .await?;
                 video_sequence = video_sequence.saturating_add(1);
+                next_video_send_at = now + video_send_interval;
                 progressed = true;
             }
         }
@@ -892,6 +924,31 @@ async fn run_native_voice_loop(
         input_chunks: input_sequence,
         input_video_frames: video_sequence,
     })
+}
+
+fn native_voice_camera_capture_config(
+    options: &VoiceCallOptions,
+) -> sinomo_video::NativeVideoCaptureConfig {
+    sinomo_video::NativeVideoCaptureConfig {
+        device: options.camera_device.clone(),
+        // Keep native capture at interactive video cadence. Model sampling is
+        // independent and must not renegotiate the camera to a low frame rate.
+        frame_interval_ms: sinomo_video::NATIVE_VIDEO_PREVIEW_FRAME_INTERVAL_MS,
+        ..Default::default()
+    }
+}
+
+fn native_voice_model_frame_interval(
+    config: &sinomo_lm::RealtimeAudioSessionConfig,
+    fallback_ms: u64,
+) -> Duration {
+    let exact_interval = Duration::from_millis(fallback_ms.max(1));
+    config
+        .input_video
+        .as_ref()
+        .and_then(sinomo_lm::RealtimeVideoInputConfig::model_frame_interval)
+        .map(|configured| configured.max(exact_interval))
+        .unwrap_or(exact_interval)
 }
 
 async fn send_voice_audio_chunk(
@@ -933,7 +990,7 @@ async fn send_voice_audio_chunk(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn send_voice_video_frame_bytes(
+async fn send_voice_raw_video_frame(
     session: &mut sinomo_lm::RealtimeAudioSession,
     state: &mut VoiceCallState,
     store: &sinomo_agent::FileAgentSessionStore,
@@ -941,34 +998,51 @@ async fn send_voice_video_frame_bytes(
     provider_id: &str,
     model: &str,
     options: &VoiceCallOptions,
-    bytes: Vec<u8>,
-    format: sinomo_lm::RealtimeVideoFrameFormat,
+    frame: sinomo_video::NativeVideoSurfaceFrame,
     sequence: u64,
-    timestamp_ms: Option<u64>,
-    width: Option<u32>,
-    height: Option<u32>,
 ) -> Result<(), CliError> {
-    let mut frame_input = sinomo_lm::RealtimeVideoFrameInput::new(bytes.clone(), format, sequence);
+    let stride = usize::try_from(frame.width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or_else(|| CliError::Parse {
+            detail: "native camera frame stride overflowed".to_string(),
+        })?;
+    let timestamp_ms = Some(frame.timestamp_ns / 1_000_000);
+    let capture_sequence = frame.sequence;
+    let captured_at_unix_ms = frame.captured_at_unix_ms;
+    let mut frame_input = sinomo_lm::RealtimeVideoFrameInput::new(
+        frame.rgba,
+        sinomo_lm::RealtimeVideoPixelFormat::Rgba8,
+        frame.width,
+        frame.height,
+        stride,
+        sequence,
+    );
     frame_input.detail = options.video_detail;
     frame_input.timestamp_ms = timestamp_ms;
+    let encoded = session
+        .send_video_frame_and_return_encoded(&frame_input)
+        .await
+        .map_err(realtime_audio_error)?;
     let mut record_input = sinomo_agent::AgentVideoFrameInput::new(
         sinomo_agent::AgentVideoDirection::Input,
         sequence,
         provider_id.to_string(),
         model.to_string(),
-        format,
+        encoded.format,
     );
     record_input.provider_session_id = state.provider_session_id.clone();
-    record_input.timestamp_ms = frame_input.timestamp_ms;
-    record_input.width = width;
-    record_input.height = height;
+    record_input.timestamp_ms = encoded.timestamp_ms;
+    record_input.width = encoded.width;
+    record_input.height = encoded.height;
+    record_input.metadata = serde_json::json!({
+        "capture_sequence": capture_sequence,
+        "captured_at_unix_ms": captured_at_unix_ms,
+    });
     store
-        .append_video_frame(session_id, record_input, &bytes)
+        .append_video_frame(session_id, record_input, encoded.image.as_ref())
         .map_err(agent_session_store_error)?;
-    session
-        .send_video_frame(&frame_input)
-        .await
-        .map_err(realtime_audio_error)
+    Ok(())
 }
 
 async fn send_voice_video_frames(
@@ -1000,7 +1074,7 @@ async fn send_voice_video_frames(
                 ),
             })?;
         let mut frame_input =
-            sinomo_lm::RealtimeVideoFrameInput::new(bytes.clone(), format, sequence);
+            sinomo_lm::RealtimeEncodedVideoFrameInput::new(bytes.clone(), format, sequence);
         frame_input.detail = options.video_detail;
         frame_input.timestamp_ms = Some(sequence.saturating_mul(options.video_frame_ms));
         let mut record_input = sinomo_agent::AgentVideoFrameInput::new(
@@ -1016,7 +1090,7 @@ async fn send_voice_video_frames(
             .append_video_frame(session_id, record_input, &bytes)
             .map_err(agent_session_store_error)?;
         session
-            .send_video_frame(&frame_input)
+            .send_encoded_video_frame(&frame_input)
             .await
             .map_err(realtime_audio_error)?;
         sequence = sequence.saturating_add(1);
@@ -1367,6 +1441,41 @@ mod tests {
         assert_eq!(options.camera_device.as_deref(), Some("/dev/video0"));
         assert_eq!(options.speaker_device.as_deref(), Some("default"));
         assert_eq!(options.call_ms, Some(1500));
+
+        let capture = native_voice_camera_capture_config(&options);
+        assert_eq!(
+            capture.frame_interval_ms,
+            sinomo_video::NATIVE_VIDEO_PREVIEW_FRAME_INTERVAL_MS
+        );
+        assert_ne!(capture.frame_interval_ms, options.video_frame_ms);
+
+        let mut session = sinomo_lm::RealtimeAudioSessionConfig::new(
+            sinomo_lm::RealtimeAudioProvider::OpenAi,
+            "gpt-realtime-2",
+        );
+        session.input_video = Some(sinomo_lm::RealtimeVideoInputConfig {
+            max_frame_rate_hz: Some(4),
+            ..Default::default()
+        });
+        assert_eq!(
+            native_voice_model_frame_interval(&session, 250),
+            Duration::from_millis(250)
+        );
+        session
+            .input_video
+            .as_mut()
+            .expect("video config")
+            .max_frame_rate_hz = Some(1);
+        assert_eq!(
+            native_voice_model_frame_interval(&session, 2_000),
+            Duration::from_millis(2_000),
+            "integer FPS configuration must not make a slow exact cadence run faster"
+        );
+
+        let mut failures = 0;
+        assert!(!native_voice_video_failure_is_terminal(&mut failures));
+        assert!(!native_voice_video_failure_is_terminal(&mut failures));
+        assert!(native_voice_video_failure_is_terminal(&mut failures));
     }
 
     #[test]

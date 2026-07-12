@@ -3,7 +3,7 @@
 //! Device inventory, permission probes, and test streams stay in Sinomo. SUI
 //! only renders the resulting snapshots.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(test))]
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -27,12 +27,17 @@ use crate::backend::app_config::{
 
 #[cfg(not(test))]
 const SETUP_AUDIO_SAMPLE_RATE_HZ: u32 = 24_000;
-#[cfg(not(test))]
-const SETUP_CAMERA_FRAME_INTERVAL_MS: u64 = 500;
+const SETUP_CAMERA_FRAME_INTERVAL_MS: u64 = sinomo_video::NATIVE_VIDEO_PREVIEW_FRAME_INTERVAL_MS;
+const MAX_CONSECUTIVE_CAMERA_FRAME_FAILURES: u8 = 3;
 #[cfg(not(test))]
 const SPEAKER_TEST_DURATION: Duration = Duration::from_millis(650);
 #[cfg(not(test))]
 const SETUP_DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(65);
+
+pub(crate) fn camera_frame_failure_is_terminal(failures: &mut u8) -> bool {
+    *failures = failures.saturating_add(1);
+    *failures >= MAX_CONSECUTIVE_CAMERA_FRAME_FAILURES
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaDeviceOption {
@@ -150,29 +155,6 @@ pub struct MediaDeviceSelection {
     pub camera: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct MediaCameraPreview {
-    pub revision: u64,
-    pub sequence: u64,
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Arc<Vec<u8>>,
-}
-
-static NEXT_MEDIA_PREVIEW_REVISION: AtomicU64 = AtomicU64::new(1);
-
-impl MediaCameraPreview {
-    pub fn new(sequence: u64, width: u32, height: u32, rgba: Vec<u8>) -> Self {
-        Self {
-            revision: NEXT_MEDIA_PREVIEW_REVISION.fetch_add(1, Ordering::Relaxed),
-            sequence,
-            width,
-            height,
-            rgba: Arc::new(rgba),
-        }
-    }
-}
-
 #[cfg_attr(test, allow(dead_code))]
 struct MediaSetupRuntime {
     control_tx: Sender<MediaSetupControl>,
@@ -209,23 +191,52 @@ impl MediaSetupShutdown {
 #[derive(Default)]
 struct MediaSetupSnapshots {
     microphone_level: Option<f32>,
-    camera_preview: Option<MediaCameraPreview>,
-    clear_camera_preview: bool,
+    camera_surface_revision: Option<u64>,
+}
+
+/// Classifies the invalidation needed after draining media worker state.
+///
+/// Camera previews and microphone levels are paint-only. Inventory, access,
+/// and lifecycle events rebuild controls or their semantics and therefore
+/// require a full layout pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct MediaPumpChange {
+    pub(crate) paint: bool,
+    pub(crate) semantics: bool,
+    pub(crate) layout: bool,
+}
+
+impl MediaPumpChange {
+    pub(crate) fn mark_paint(&mut self) {
+        self.paint = true;
+    }
+
+    pub(crate) fn mark_semantics(&mut self) {
+        self.paint = true;
+        self.semantics = true;
+    }
+
+    pub(crate) fn mark_layout(&mut self) {
+        self.paint = true;
+        self.semantics = true;
+        self.layout = true;
+    }
+
+    pub(crate) fn changed(self) -> bool {
+        self.paint || self.semantics || self.layout
+    }
 }
 
 impl MediaSetupSnapshots {
     fn take(&mut self) -> Self {
         Self {
             microphone_level: self.microphone_level.take(),
-            camera_preview: self.camera_preview.take(),
-            clear_camera_preview: std::mem::take(&mut self.clear_camera_preview),
+            camera_surface_revision: self.camera_surface_revision.take(),
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.microphone_level.is_none()
-            && self.camera_preview.is_none()
-            && !self.clear_camera_preview
+        self.microphone_level.is_none() && self.camera_surface_revision.is_none()
     }
 }
 
@@ -260,7 +271,7 @@ pub struct MediaSetupState {
     pub speaker_access: MediaAccessState,
     pub camera_access: MediaAccessState,
     pub microphone_level: f32,
-    pub camera_preview: Option<MediaCameraPreview>,
+    pub(crate) camera_surface: Arc<sinomo_video::NativeVideoSurface>,
     pub speaker_test: SpeakerTestState,
     pub inventory_loading: bool,
     pub inventory_issues: Vec<String>,
@@ -293,7 +304,7 @@ impl MediaSetupState {
             speaker_access: MediaAccessState::Idle,
             camera_access: MediaAccessState::Idle,
             microphone_level: 0.0,
-            camera_preview: None,
+            camera_surface: Arc::new(sinomo_video::NativeVideoSurface::new()),
             speaker_test: SpeakerTestState::Idle,
             inventory_loading: false,
             inventory_issues: Vec::new(),
@@ -327,7 +338,7 @@ impl MediaSetupState {
             MediaAccessState::Idle
         };
         self.microphone_level = 0.0;
-        self.camera_preview = None;
+        self.camera_surface.clear();
         self.speaker_test = SpeakerTestState::Idle;
 
         #[cfg(test)]
@@ -361,6 +372,7 @@ impl MediaSetupState {
             let worker_microphone_enabled_signal = microphone_enabled_signal.clone();
             let camera_enabled_signal = Arc::new(AtomicBool::new(camera_enabled));
             let worker_camera_enabled_signal = camera_enabled_signal.clone();
+            let camera_surface = self.camera_surface.clone();
             let waker = self.waker.clone();
             match thread::Builder::new()
                 .name("sinomo-app-media-setup".to_string())
@@ -379,6 +391,7 @@ impl MediaSetupState {
                         worker_cancelled,
                         worker_microphone_enabled_signal,
                         worker_camera_enabled_signal,
+                        camera_surface,
                         waker,
                     )
                 }) {
@@ -409,7 +422,7 @@ impl MediaSetupState {
         let _ = self.begin_shutdown();
         self.inventory_loading = false;
         self.microphone_level = 0.0;
-        self.camera_preview = None;
+        self.camera_surface.clear();
         self.speaker_test = SpeakerTestState::Idle;
     }
 
@@ -460,7 +473,7 @@ impl MediaSetupState {
     pub fn set_camera_enabled(&mut self, enabled: bool) {
         self.camera_enabled = enabled;
         if !enabled {
-            self.camera_preview = None;
+            self.camera_surface.clear();
             self.camera_access = MediaAccessState::Idle;
         } else if self.running {
             self.camera_access = MediaAccessState::Checking;
@@ -601,9 +614,9 @@ impl MediaSetupState {
         self.preference_error = open_media_privacy_settings().err();
     }
 
-    pub fn pump(&mut self) -> bool {
+    pub(crate) fn pump(&mut self) -> MediaPumpChange {
         let Some(runtime) = self.runtime.as_mut() else {
-            return false;
+            return MediaPumpChange::default();
         };
         let mut events = Vec::new();
         let mut disconnected = false;
@@ -622,8 +635,10 @@ impl MediaSetupState {
                 }
             }
         }
-        if events.is_empty() && snapshots.is_empty() && !disconnected {
-            return false;
+        let snapshots_changed = !snapshots.is_empty();
+        let structural_changed = !events.is_empty() || disconnected;
+        if !snapshots_changed && !structural_changed {
+            return MediaPumpChange::default();
         }
         for event in events {
             self.apply_event(event);
@@ -631,16 +646,11 @@ impl MediaSetupState {
         if let Some(level) = snapshots.microphone_level {
             self.microphone_level = level.clamp(0.0, 1.0);
         }
-        if let Some(preview) = snapshots.camera_preview {
-            self.camera_preview = Some(preview);
-        } else if snapshots.clear_camera_preview {
-            self.camera_preview = None;
-        }
         if disconnected {
             self.running = false;
             self.runtime = None;
             self.microphone_level = 0.0;
-            self.camera_preview = None;
+            self.camera_surface.clear();
             for state in [
                 &mut self.microphone_access,
                 &mut self.speaker_access,
@@ -660,7 +670,14 @@ impl MediaSetupState {
                     SpeakerTestState::Failed("speaker test worker stopped".to_string());
             }
         }
-        true
+        let mut change = MediaPumpChange::default();
+        if snapshots_changed {
+            change.mark_paint();
+        }
+        if structural_changed {
+            change.mark_layout();
+        }
+        change
     }
 
     fn save_and_restart(&mut self) {
@@ -914,14 +931,15 @@ fn release_setup_camera_if_unrequested(
     camera: &mut Option<sinomo_video::NativeVideoCapture>,
     event_tx: &Sender<MediaSetupEvent>,
     snapshots: &Arc<Mutex<MediaSetupSnapshots>>,
+    camera_surface: &sinomo_video::NativeVideoSurface,
     waker: &Option<sui::UiHandle>,
 ) {
     if requested.load(Ordering::Acquire) || camera.take().is_none() {
         return;
     }
+    let revision = camera_surface.clear();
     publish_media_setup_snapshot(snapshots, waker, |snapshots| {
-        snapshots.camera_preview = None;
-        snapshots.clear_camera_preview = true;
+        snapshots.camera_surface_revision = Some(revision);
     });
     let _ = send_media_setup_event(
         event_tx,
@@ -1014,6 +1032,7 @@ fn run_media_setup_worker(
     cancelled: Arc<AtomicBool>,
     microphone_requested: Arc<AtomicBool>,
     camera_requested: Arc<AtomicBool>,
+    camera_surface: Arc<sinomo_video::NativeVideoSurface>,
     waker: Option<sui::UiHandle>,
 ) {
     if media_setup_stop_requested(&control_rx, &mut microphone_enabled, &mut camera_enabled) {
@@ -1179,6 +1198,7 @@ fn run_media_setup_worker(
     }
 
     let mut speaker_test_deadline = None;
+    let mut camera_frame_failures = 0_u8;
     loop {
         loop {
             match control_rx.try_recv() {
@@ -1244,6 +1264,7 @@ fn run_media_setup_worker(
                                         &mut camera,
                                         &event_tx,
                                         &snapshots,
+                                        &camera_surface,
                                         &waker,
                                     );
                                 },
@@ -1269,6 +1290,7 @@ fn run_media_setup_worker(
                 }
                 Ok(MediaSetupControl::SetCameraEnabled(enabled)) => {
                     camera_enabled = enabled;
+                    camera_frame_failures = 0;
                     if enabled {
                         if camera.is_none() {
                             let inventory_node = node_id.clone();
@@ -1347,9 +1369,9 @@ fn run_media_setup_worker(
                         }
                     } else {
                         camera = None;
+                        let revision = camera_surface.clear();
                         publish_media_setup_snapshot(&snapshots, &waker, |snapshots| {
-                            snapshots.camera_preview = None;
-                            snapshots.clear_camera_preview = true;
+                            snapshots.camera_surface_revision = Some(revision);
                         });
                         let _ = send_media_setup_event(
                             &event_tx,
@@ -1400,42 +1422,40 @@ fn run_media_setup_worker(
 
         let mut camera_failed = false;
         if camera_enabled && let Some(capture) = camera.as_ref() {
-            match capture.recv_timeout(Duration::ZERO) {
-                Ok(Some(frame)) => match sinomo_video::decode_native_video_preview(&frame) {
-                    Ok(preview) => {
-                        let preview = MediaCameraPreview::new(
-                            preview.sequence,
-                            preview.width,
-                            preview.height,
-                            preview.rgba,
-                        );
+            match capture.recv_sample_timeout(Duration::ZERO) {
+                Ok(Some(sample)) => match camera_surface.publish_sample(&sample) {
+                    Ok(frame) => {
+                        camera_frame_failures = 0;
                         publish_media_setup_snapshot(&snapshots, &waker, |snapshots| {
-                            snapshots.camera_preview = Some(preview);
-                            snapshots.clear_camera_preview = false;
+                            snapshots.camera_surface_revision = Some(frame.revision);
                         });
                     }
                     Err(error) => {
-                        camera_failed = true;
-                        publish_media_setup_snapshot(&snapshots, &waker, |snapshots| {
-                            snapshots.camera_preview = None;
-                            snapshots.clear_camera_preview = true;
-                        });
-                        let _ = send_media_setup_event(
-                            &event_tx,
-                            &waker,
-                            MediaSetupEvent::Access(
-                                MediaAccessKind::Camera,
-                                MediaAccessState::Unavailable(error.to_string()),
-                            ),
-                        );
+                        if camera_frame_failure_is_terminal(&mut camera_frame_failures) {
+                            camera_failed = true;
+                            let revision = camera_surface.clear();
+                            publish_media_setup_snapshot(&snapshots, &waker, |snapshots| {
+                                snapshots.camera_surface_revision = Some(revision);
+                            });
+                            let _ = send_media_setup_event(
+                                &event_tx,
+                                &waker,
+                                MediaSetupEvent::Access(
+                                    MediaAccessKind::Camera,
+                                    MediaAccessState::Unavailable(format!(
+                                        "camera produced {camera_frame_failures} invalid frames: {error}"
+                                    )),
+                                ),
+                            );
+                        }
                     }
                 },
                 Ok(None) => {}
                 Err(error) => {
                     camera_failed = true;
+                    let revision = camera_surface.clear();
                     publish_media_setup_snapshot(&snapshots, &waker, |snapshots| {
-                        snapshots.camera_preview = None;
-                        snapshots.clear_camera_preview = true;
+                        snapshots.camera_surface_revision = Some(revision);
                     });
                     let _ = send_media_setup_event(
                         &event_tx,
@@ -1603,6 +1623,15 @@ mod tests {
             NodeId::from_legacy_named("node_media_setup").expect("node"),
             None,
         )
+    }
+
+    #[test]
+    fn media_setup_camera_uses_the_responsive_native_preview_cadence() {
+        assert_eq!(SETUP_CAMERA_FRAME_INTERVAL_MS, 33);
+        assert_eq!(
+            SETUP_CAMERA_FRAME_INTERVAL_MS,
+            sinomo_video::NativeVideoCaptureConfig::default().frame_interval_ms
+        );
     }
 
     #[test]
@@ -1842,6 +1871,17 @@ mod tests {
     }
 
     #[test]
+    fn continuous_camera_stream_tolerates_isolated_bad_frames() {
+        let mut failures = 0;
+        assert!(!camera_frame_failure_is_terminal(&mut failures));
+        assert!(!camera_frame_failure_is_terminal(&mut failures));
+        assert!(camera_frame_failure_is_terminal(&mut failures));
+
+        failures = 0;
+        assert!(!camera_frame_failure_is_terminal(&mut failures));
+    }
+
+    #[test]
     fn speaker_test_failure_is_included_in_recovery_detail() {
         let mut state = temp_state("speaker-failure");
         state.speaker_access = MediaAccessState::Ready;
@@ -1858,33 +1898,56 @@ mod tests {
     }
 
     #[test]
-    fn latest_levels_and_preview_replace_previous_snapshots() {
+    fn latest_levels_and_surface_revisions_replace_previous_snapshots() {
         let mut state = temp_state("latest");
         let mut snapshots = MediaSetupSnapshots::default();
         snapshots.microphone_level = Some(0.25);
         snapshots.microphone_level = Some(0.75);
-        snapshots.camera_preview = Some(MediaCameraPreview::new(1, 1, 1, vec![0; 4]));
-        snapshots.camera_preview = Some(MediaCameraPreview::new(2, 1, 1, vec![255; 4]));
+        let first = state
+            .camera_surface
+            .publish(sinomo_video::NativeVideoSurfaceFrame {
+                revision: 0,
+                sequence: 1,
+                width: 1,
+                height: 1,
+                timestamp_ns: 0,
+                duration_ns: 33_333_333,
+                captured_at_unix_ms: 1,
+                rgba: Arc::<[u8]>::from([0, 0, 0, 255]),
+            });
+        snapshots.camera_surface_revision = Some(first.revision);
+        let second = state
+            .camera_surface
+            .publish(sinomo_video::NativeVideoSurfaceFrame {
+                revision: 0,
+                sequence: 2,
+                width: 1,
+                height: 1,
+                timestamp_ns: 33_333_333,
+                duration_ns: 33_333_333,
+                captured_at_unix_ms: 34,
+                rgba: Arc::<[u8]>::from([255, 255, 255, 255]),
+            });
+        snapshots.camera_surface_revision = Some(second.revision);
 
         let snapshots = snapshots.take();
         state.microphone_level = snapshots.microphone_level.expect("latest level");
-        state.camera_preview = snapshots.camera_preview;
 
         assert_eq!(state.microphone_level, 0.75);
         assert_eq!(
-            state.camera_preview.as_ref().map(|frame| frame.sequence),
+            state.camera_surface.latest().map(|frame| frame.sequence),
             Some(2)
         );
+        assert_eq!(snapshots.camera_surface_revision, Some(second.revision));
 
         let mut snapshots = MediaSetupSnapshots {
             microphone_level: Some(0.0),
-            camera_preview: None,
-            clear_camera_preview: true,
+            camera_surface_revision: Some(state.camera_surface.clear()),
         };
         let taken = snapshots.take();
         assert_eq!(taken.microphone_level, Some(0.0));
-        assert!(taken.camera_preview.is_none());
-        assert!(taken.clear_camera_preview);
+        assert!(taken.camera_surface_revision.is_some());
+        assert!(state.camera_surface.latest().is_none());
         assert!(snapshots.is_empty());
     }
 
