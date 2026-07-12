@@ -101,6 +101,27 @@ fn posix_error_is_routed_namespace_unavailable(error: &DfsPosixError) -> bool {
     matches!(error, DfsPosixError::Dfs(DfsError::Network { .. }))
 }
 
+fn select_posix_write_replica_candidates(
+    local_node_id: &NodeId,
+    replica_candidates: &[NodeId],
+    desired_replicas: usize,
+) -> Vec<NodeId> {
+    let mut selected = Vec::with_capacity(desired_replicas);
+    if desired_replicas == 0 {
+        return selected;
+    }
+    selected.push(local_node_id.clone());
+    for candidate in replica_candidates {
+        if selected.len() >= desired_replicas {
+            break;
+        }
+        if !selected.contains(candidate) {
+            selected.push(candidate.clone());
+        }
+    }
+    selected
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn settle_ready_write_outcome(
         &mut self,
@@ -189,10 +210,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object: &DfsObjectMetadata,
         options: &DfsWriteOptions,
     ) -> std::result::Result<Vec<NodeId>, DfsError> {
-        let mut candidates = options.replica_candidates.clone();
-        if !candidates.contains(&self.node_id) {
-            candidates.insert(0, self.node_id.clone());
-        }
+        let mut candidates = select_posix_write_replica_candidates(
+            &self.node_id,
+            &options.replica_candidates,
+            options.policy.desired_replicas,
+        );
 
         if options.policy.is_strict_confirmed()
             && options.policy.desired_replicas >= 2
@@ -1797,3 +1819,25 @@ fn namespace_job_id(
 
 #[allow(dead_code)]
 fn _assert_filesystem_send_sync<T: Send + Sync>(_: &DfsFileSystem) {}
+
+#[cfg(test)]
+mod replica_candidate_tests {
+    use super::*;
+
+    #[test]
+    fn posix_write_selects_local_plus_policy_sized_remote_set() {
+        let local = NodeId::from_legacy_named("node_posix_candidate_local").expect("local");
+        let remote_a =
+            NodeId::from_legacy_named("node_posix_candidate_remote_a").expect("remote A");
+        let remote_b =
+            NodeId::from_legacy_named("node_posix_candidate_remote_b").expect("remote B");
+
+        let selected = select_posix_write_replica_candidates(
+            &local,
+            &[remote_a.clone(), local.clone(), remote_b],
+            2,
+        );
+
+        assert_eq!(selected, vec![local, remote_a]);
+    }
+}

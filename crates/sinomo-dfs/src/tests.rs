@@ -28199,8 +28199,13 @@ fn sifs_cluster_routed_mkdir_all_repairs_primary_when_local_chain_exists() {
     replica
         .posix_mkdir_all(base)
         .expect("routed mkdir_all should repair primary despite local chain");
-    let mut write_options =
-        DfsWriteOptions::replicated_eventual(vec![replica_node, services_primary_node]);
+    let unused_content_candidate =
+        NodeId::from_legacy_named("node_sifs_routed_mkdir_unused_content").expect("unused node");
+    let mut write_options = DfsWriteOptions::replicated_eventual(vec![
+        replica_node,
+        services_primary_node,
+        unused_content_candidate,
+    ]);
     write_options.foreground_replica_repair = false;
     replica
         .posix_write_file(path, b"child", write_options)
