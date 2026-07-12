@@ -1373,6 +1373,10 @@ fn sandbox_extra_execute_paths(path_prefixes: &[PathBuf]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     paths.extend(path_prefixes.iter().cloned());
     paths.extend(current_path_dirs());
+    // Rustup installs executable proxies in CARGO_HOME/bin whose symlink targets live under
+    // RUSTUP_HOME. Landlock checks the resolved target, so allowing PATH alone makes an otherwise
+    // valid `cargo` or `rustc` invocation fail with EACCES.
+    paths.extend(toolchain_home_paths());
     dedup_pathbufs(paths)
 }
 
@@ -2162,6 +2166,18 @@ mod tests {
                 .as_deref()
                 .is_some_and(|path| path.starts_with("/sinomo/agents/") && path.ends_with("/home"))
         );
+    }
+
+    #[test]
+    fn simple_sandbox_execute_paths_include_toolchain_homes() {
+        let execute_paths = sandbox_extra_execute_paths(&[]);
+        for toolchain_home in toolchain_home_paths() {
+            assert!(
+                execute_paths.contains(&toolchain_home),
+                "toolchain executable target must be Landlock-allowed: {}",
+                toolchain_home.display()
+            );
+        }
     }
 
     #[test]

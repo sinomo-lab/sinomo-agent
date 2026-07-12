@@ -722,6 +722,8 @@ fn enumerate_native_devices_with_camera(
     node_id: NodeId,
     include_camera: bool,
 ) -> NativeDeviceInventory {
+    #[cfg(all(not(target_os = "android"), not(feature = "native-devices")))]
+    let _ = include_camera;
     let mut inventory = NativeDeviceInventory {
         node_id: node_id.clone(),
         devices: Vec::new(),

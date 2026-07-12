@@ -6957,6 +6957,8 @@ fn print_sandbox_command_outcome(
         }
     }
 
+    ensure_sandbox_stream_line_endings(&outcome.output_chunks)?;
+
     println!("sandbox command: {}", outcome.response.command_id);
     println!("exit status: {}", outcome.response.exit_status);
     println!("stdout: {}", outcome.response.stdout_ref);
@@ -6972,6 +6974,28 @@ fn print_sandbox_command_outcome(
         outcome.response.exit_status,
         Some(outcome.response.stderr_ref.as_str()),
     )
+}
+
+fn ensure_sandbox_stream_line_endings(
+    chunks: &[crate::SandboxOutputChunk],
+) -> Result<(), CliError> {
+    let stdout_needs_newline = chunks
+        .iter()
+        .rev()
+        .find(|chunk| chunk.stream == crate::SandboxOutputStream::Stdout)
+        .is_some_and(|chunk| !chunk.bytes.is_empty() && !chunk.bytes.ends_with(b"\n"));
+    let stderr_needs_newline = chunks
+        .iter()
+        .rev()
+        .find(|chunk| chunk.stream == crate::SandboxOutputStream::Stderr)
+        .is_some_and(|chunk| !chunk.bytes.is_empty() && !chunk.bytes.ends_with(b"\n"));
+    if stdout_needs_newline {
+        write_cli_stdout_bytes(b"\n").map_err(CliError::stdio)?;
+    }
+    if stderr_needs_newline {
+        write_cli_stderr_bytes(b"\n").map_err(CliError::stdio)?;
+    }
+    Ok(())
 }
 
 fn print_sandbox_process_plan_outcome(

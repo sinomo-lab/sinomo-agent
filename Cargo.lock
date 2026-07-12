@@ -8358,6 +8358,7 @@ dependencies = [
  "fuser",
  "libc",
  "sinomo-runtime",
+ "sinomo-testdir",
  "thiserror 2.0.18",
 ]
 

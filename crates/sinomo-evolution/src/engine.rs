@@ -4560,6 +4560,7 @@ where
         let input = AgentLoopInput {
             session,
             latest_event,
+            transient_system_context: None,
             async_update: None,
             context_attachments: vec![evolution_agent_context_attachment(packet, bundle)],
             tool_specs: evolution_agent_mutation_tools(),

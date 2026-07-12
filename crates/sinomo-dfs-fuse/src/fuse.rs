@@ -10,6 +10,9 @@ use fuser::{
 use sinomo_runtime::dfs::{self, DfsError, DfsObjectKind, DfsPosixError, DfsWriteOptions};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
+use std::io;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 use std::thread;
@@ -28,24 +31,89 @@ type SifsService = dfs::MountedSifsService;
 
 pub fn mount_sifs(mut options: DfsFuseMountOptions) -> Result<()> {
     options.root_path = normalize_sifs_root(&options.root_path)?;
+    let mount_helper = fuse_mount_helper();
     let mount_point = options.mount_point.clone();
     let fs = SifsFuseFileSystem::open(options.clone())?;
+    let mount_options = fuse_mount_options(&options, mount_helper.is_some());
+    fuser::mount2(fs, &mount_point, &mount_options)
+        .map_err(|source| map_mount_error(&mount_point, mount_helper.is_some(), source))
+}
+
+fn fuse_mount_options(
+    options: &DfsFuseMountOptions,
+    mount_helper_available: bool,
+) -> Vec<MountOption> {
     let mut mount_options = vec![
         MountOption::FSName(options.mount_name.clone()),
-        MountOption::AutoUnmount,
         MountOption::DefaultPermissions,
     ];
+    // fuser routes AutoUnmount mounts directly through fusermount. Omit it when
+    // no executable helper exists so privileged/systemd services can use the
+    // kernel /dev/fuse mount path instead.
+    if mount_helper_available {
+        mount_options.push(MountOption::AutoUnmount);
+    }
     if options.read_only {
         mount_options.push(MountOption::RO);
     }
     if options.allow_other {
         mount_options.push(MountOption::AllowOther);
     }
-    let _ = options.foreground;
-    fuser::mount2(fs, &mount_point, &mount_options).map_err(|source| DfsFuseError::Mount {
-        mount_point: mount_point.display().to_string(),
-        detail: source.to_string(),
+    mount_options
+}
+
+fn fuse_mount_helper() -> Option<PathBuf> {
+    fuse_mount_helper_on_path(std::env::var_os("PATH").as_deref()).or_else(|| {
+        ["/bin/fusermount3", "/bin/fusermount"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|candidate| is_executable_file(candidate))
     })
+}
+
+fn fuse_mount_helper_on_path(path: Option<&OsStr>) -> Option<PathBuf> {
+    let path = path?;
+    std::env::split_paths(path).find_map(|directory| {
+        ["fusermount3", "fusermount"]
+            .into_iter()
+            .map(|name| directory.join(name))
+            .find(|candidate| is_executable_file(candidate))
+    })
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+fn map_mount_error(
+    mount_point: &Path,
+    mount_helper_available: bool,
+    source: io::Error,
+) -> DfsFuseError {
+    let detail = if !mount_point.exists() {
+        format!("mount point does not exist: {source}")
+    } else if !Path::new("/dev/fuse").exists() {
+        format!("/dev/fuse is unavailable; load or enable the FUSE kernel device: {source}")
+    } else if !mount_helper_available
+        && matches!(
+            source.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+        )
+    {
+        format!(
+            "direct /dev/fuse mounting was not permitted and no executable `fusermount3` or \
+             `fusermount` helper was found; grant the service mount capability or install a FUSE \
+             helper: {source}"
+        )
+    } else {
+        source.to_string()
+    };
+    DfsFuseError::Mount {
+        mount_point: mount_point.display().to_string(),
+        detail,
+    }
 }
 
 #[derive(Debug)]
@@ -2399,6 +2467,36 @@ fn slice_bytes(bytes: &[u8], start: usize, len: usize) -> Vec<u8> {
 #[cfg(test)]
 mod errno_tests {
     use super::*;
+
+    #[test]
+    fn fuse_mount_helper_lookup_requires_an_executable_helper() {
+        let root = sinomo_testdir::TestDir::new("sinomo-fuse-helper-path");
+        let helper = root.join("fusermount3");
+        std::fs::write(&helper, b"helper").expect("write helper fixture");
+
+        assert!(fuse_mount_helper_on_path(Some(root.as_os_str())).is_none());
+        let mut permissions = std::fs::metadata(&helper)
+            .expect("helper metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).expect("make helper executable");
+        assert_eq!(
+            fuse_mount_helper_on_path(Some(root.as_os_str())),
+            Some(helper)
+        );
+        assert!(fuse_mount_helper_on_path(None).is_none());
+    }
+
+    #[test]
+    fn fuse_mount_without_helper_keeps_direct_mount_available() {
+        let options = DfsFuseMountOptions::new("/mnt/sinomo");
+
+        let direct_options = fuse_mount_options(&options, false);
+        assert!(!direct_options.contains(&MountOption::AutoUnmount));
+
+        let helper_options = fuse_mount_options(&options, true);
+        assert!(helper_options.contains(&MountOption::AutoUnmount));
+    }
 
     fn test_object_id(name: &str) -> dfs::DfsObjectId {
         dfs::DfsObjectId::from_legacy_named(name).expect("test object id")

@@ -2344,6 +2344,7 @@ fn publish_dfs_metadata_journal_from_data_dir(
 }
 
 pub(crate) fn run_dfs_mount_command(options: DfsMountOptions) -> Result<(), CliError> {
+    validate_dfs_mount_options_for_platform(&options)?;
     #[cfg(windows)]
     {
         run_dfs_cloud_files_mount_command(options)
@@ -2370,6 +2371,29 @@ pub(crate) fn run_dfs_mount_command(options: DfsMountOptions) -> Result<(), CliE
             detail: "SIFS FUSE support is disabled in this build; use a default Unix build or rebuild with `--features dfs-fuse`".to_string(),
         })
     }
+}
+
+pub(crate) fn validate_dfs_mount_options_for_platform(
+    options: &DfsMountOptions,
+) -> Result<(), CliError> {
+    #[cfg(not(windows))]
+    {
+        if !options.foreground {
+            return Err(CliError::Parse {
+                detail: "`--background` is not supported by the Unix FUSE mount yet; keep this command running in a supervised terminal or service".to_string(),
+            });
+        }
+        if options.sync_local_changes {
+            return Err(CliError::Parse {
+                detail: "`--sync-local-changes` is only supported by Windows Cloud Files; Unix FUSE writes are already sent directly to SIFS".to_string(),
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = options;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]

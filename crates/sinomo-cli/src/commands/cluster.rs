@@ -2065,6 +2065,35 @@ fn cluster_health_rows_for_cli(
     cluster_health_rows_from_local_state(paths, state)
 }
 
+/// Read cluster health for an explicitly selected Sinomo data directory.
+///
+/// Agent and app runtimes may operate on a non-default data directory, so
+/// daemon discovery must be anchored to that directory instead of consulting
+/// the process environment or the user's home directory.
+pub(crate) fn cluster_health_rows_for_data_dir(
+    data_dir: &SinomoDataDir,
+) -> Result<(ClusterBootstrapState, Vec<ClusterHealthRow>), CliError> {
+    let paths = ClusterPaths::new(data_dir);
+    if !cli_force_local_mode()
+        && let Some(status) = main_daemon_status_for_data_dir(data_dir)?
+        && let Ok(rows) = DaemonApiClient::at_address(status.address)
+            .with_timeout(CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT)
+            .cluster_health_with_peer_views()
+    {
+        return Ok((read_cluster_state(&paths)?, rows));
+    }
+
+    let state = match read_cluster_state(&paths) {
+        Ok(state) => state,
+        Err(_) => {
+            refresh_cluster_kv_from_local_daemon_for_data_dir(data_dir, &paths)?;
+            read_cluster_state(&paths)?
+        }
+    };
+    let rows = cluster_health_rows_from_local_state(&paths, &state)?;
+    Ok((state, rows))
+}
+
 fn cluster_health_rows_from_local_state(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,

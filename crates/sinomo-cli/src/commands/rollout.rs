@@ -1269,6 +1269,7 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
     }
 
     let mut completed_rollout_nodes = std::collections::BTreeSet::new();
+    let mut outcomes = ClusterRolloutOutcomeSummary::default();
     for target in targets {
         if target
             .rollout_node_id()
@@ -1276,10 +1277,12 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
         {
             continue;
         }
+        outcomes.begin_target();
         let target_status = match read_rollout_target_status(&target) {
             Ok(status) => status,
             Err(error) => {
                 println!("{}: failed: {error}", target.label());
+                outcomes.record_failure(target.label(), "failed", error.to_string());
                 continue;
             }
         };
@@ -1311,17 +1314,25 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
                         );
                     if source_head_mismatch {
                         println!("{}: rejected", target.label());
-                        println!(
-                            "  remote build did not acknowledge requested source head {}; target reported {}",
+                        let detail = format!(
+                            "remote build did not acknowledge requested source head {}; target reported {}",
                             request.source_head.as_deref().unwrap_or("unknown"),
                             response.source_head.as_deref().unwrap_or("unknown")
                         );
+                        println!("  {detail}");
+                        outcomes.record_failure(target.label(), "rejected", detail);
                     } else {
                         println!("{}: {}", target.label(), response.status);
                         if response.status == "accepted" {
                             if let Some(node_id) = target.rollout_node_id() {
                                 completed_rollout_nodes.insert(node_id.clone());
                             }
+                        } else {
+                            outcomes.record_failure(
+                                target.label(),
+                                &response.status,
+                                response.detail.clone(),
+                            );
                         }
                     }
                     if !response.detail.is_empty() {
@@ -1330,6 +1341,7 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
                 }
                 Err(error) => {
                     println!("{}: failed: {error}", target.label());
+                    outcomes.record_failure(target.label(), "failed", error.to_string());
                 }
             }
             continue;
@@ -1339,6 +1351,7 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
             ensure_rollout_target_platform_from_status(target.label(), &target_status)
         {
             println!("{}: skipped: {error}", target.label());
+            outcomes.record_failure(target.label(), "skipped", error.to_string());
             continue;
         }
         if binary_request.is_none() {
@@ -1368,15 +1381,129 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
                     if let Some(node_id) = target.rollout_node_id() {
                         completed_rollout_nodes.insert(node_id.clone());
                     }
+                } else {
+                    outcomes.record_failure(
+                        target.label(),
+                        &response.status,
+                        response.detail.clone(),
+                    );
                 }
                 if !response.detail.is_empty() {
                     println!("  {}", response.detail);
                 }
             }
-            Err(error) => println!("{}: failed: {error}", target.label()),
+            Err(error) => {
+                println!("{}: failed: {error}", target.label());
+                outcomes.record_failure(target.label(), "failed", error.to_string());
+            }
         }
     }
-    Ok(())
+    outcomes.finish()
+}
+
+#[derive(Default)]
+struct ClusterRolloutOutcomeSummary {
+    attempted: usize,
+    failures: Vec<String>,
+}
+
+impl ClusterRolloutOutcomeSummary {
+    fn begin_target(&mut self) {
+        self.attempted += 1;
+    }
+
+    fn record_failure(&mut self, target: &str, outcome: &str, detail: String) {
+        let detail = detail.trim();
+        if detail.is_empty() {
+            self.failures.push(format!("{target}: {outcome}"));
+        } else {
+            self.failures
+                .push(format!("{target}: {outcome} ({detail})"));
+        }
+    }
+
+    fn finish(self) -> Result<(), CliError> {
+        if self.failures.is_empty() {
+            return Ok(());
+        }
+
+        let target_noun = if self.attempted == 1 {
+            "target"
+        } else {
+            "targets"
+        };
+        let summary = if self.failures.len() == self.attempted {
+            format!(
+                "cluster rollout did not succeed on any of {} {target_noun}",
+                self.attempted
+            )
+        } else {
+            format!(
+                "cluster rollout did not succeed on {} of {} {target_noun}",
+                self.failures.len(),
+                self.attempted
+            )
+        };
+        Err(CliError::ExternalCommand {
+            command: "rollout cluster".to_string(),
+            detail: format!("{summary}: {}", self.failures.join("; ")),
+        })
+    }
+}
+
+#[cfg(test)]
+mod cluster_rollout_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn accepted_targets_keep_the_success_result() {
+        let mut outcomes = ClusterRolloutOutcomeSummary::default();
+        outcomes.begin_target();
+        outcomes.begin_target();
+
+        outcomes.finish().expect("accepted rollout must succeed");
+    }
+
+    #[test]
+    fn partial_target_failure_returns_an_aggregate_error() {
+        let mut outcomes = ClusterRolloutOutcomeSummary::default();
+        outcomes.begin_target();
+        outcomes.begin_target();
+        outcomes.record_failure(
+            "node-b:21353",
+            "rejected",
+            "candidate failed validation".to_string(),
+        );
+
+        let error = outcomes.finish().expect_err("partial rollout must fail");
+
+        assert!(matches!(error, CliError::ExternalCommand { .. }));
+        assert_eq!(
+            error.to_string(),
+            "command `rollout cluster` failed: cluster rollout did not succeed on 1 of 2 targets: node-b:21353: rejected (candidate failed validation)"
+        );
+    }
+
+    #[test]
+    fn total_target_failure_returns_every_target_in_the_aggregate_error() {
+        let mut outcomes = ClusterRolloutOutcomeSummary::default();
+        outcomes.begin_target();
+        outcomes.record_failure("node-a:21353", "failed", "connection refused".to_string());
+        outcomes.begin_target();
+        outcomes.record_failure(
+            "node-b:21353",
+            "skipped",
+            "target platform does not match".to_string(),
+        );
+
+        let error = outcomes.finish().expect_err("total rollout must fail");
+
+        assert!(matches!(error, CliError::ExternalCommand { .. }));
+        assert_eq!(
+            error.to_string(),
+            "command `rollout cluster` failed: cluster rollout did not succeed on any of 2 targets: node-a:21353: failed (connection refused); node-b:21353: skipped (target platform does not match)"
+        );
+    }
 }
 
 fn publish_cluster_rollout_desired(

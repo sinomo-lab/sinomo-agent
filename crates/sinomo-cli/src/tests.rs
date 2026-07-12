@@ -143,6 +143,17 @@ fn append_cluster_raft_command(
         .map_err(sinomo_runtime::network::NetworkError::directory)
 }
 
+fn append_cluster_raft_command_and_materialize(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    command: KvCommand,
+) -> Result<sinomo_runtime::kv::KvSnapshot, network::NetworkError> {
+    paths
+        .kv_paths()
+        .append_kv_command_and_publish(node_id, command, |_| false)
+        .map_err(sinomo_runtime::network::NetworkError::directory)
+}
+
 fn cluster_network_info_key(node_id: &NodeId) -> String {
     format!("/cluster/network/info/{node_id}")
 }
@@ -5659,8 +5670,11 @@ fn wasi_stdin_to_stdout_module() -> &'static str {
 }
 #[test]
 fn agent_run_parser_accepts_provider_model_account_and_prompt() {
+    let session_id = SessionId::generate();
     assert_eq!(
         super::parse_agent_run_options(&[
+            "--agent".to_string(),
+            "coding-agent".to_string(),
             "--provider".to_string(),
             "codex".to_string(),
             "--model".to_string(),
@@ -5669,14 +5683,249 @@ fn agent_run_parser_accepts_provider_model_account_and_prompt() {
             "work".to_string(),
             "--prompt".to_string(),
             "check the cluster".to_string(),
+            "--session".to_string(),
+            session_id.to_string(),
+            "--compact-after".to_string(),
+            "--json".to_string(),
         ])
         .expect("agent run"),
         AgentRunOptions {
             prompt: "check the cluster".to_string(),
+            agent: "coding-agent".to_string(),
             provider: "codex".to_string(),
             model: "gpt-5.2-codex".to_string(),
             account: Some("work".to_string()),
+            session_id: Some(session_id),
+            compact_after: true,
+            json: true,
         }
+    );
+
+    let defaults =
+        super::parse_agent_run_options(&["hello".to_string()]).expect("default agent run");
+    assert_eq!(defaults.agent, "main-agent");
+    assert!(defaults.session_id.is_none());
+    assert!(!defaults.compact_after);
+    assert!(!defaults.json);
+}
+
+#[test]
+fn agent_run_session_loader_creates_then_resumes_a_durable_snapshot() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-run-resume");
+    let data_dir = SinomoDataDir::new(&root);
+    let store = sinomo_agent::FileAgentSessionStore::for_data_dir(&data_dir);
+    let session_id = SessionId::generate();
+
+    let (mut created, resumed) = super::load_or_create_agent_run_session(
+        &store,
+        session_id.clone(),
+        sinomo_agent::AgentRole::Main,
+        None,
+    )
+    .expect("create durable session");
+    assert!(!resumed);
+    assert_eq!(created.session_id, session_id);
+    assert!(
+        sinomo_agent::AgentSessionStore::load_session(&store, &session_id)
+            .expect("load created snapshot")
+            .is_some()
+    );
+
+    created
+        .steering_queue
+        .push(sinomo_agent::AgentSteeringMessage::new("persisted input"));
+    sinomo_agent::AgentSessionStore::save_session(&store, &created).expect("save durable session");
+    let (loaded, resumed) = super::load_or_create_agent_run_session(
+        &store,
+        session_id.clone(),
+        sinomo_agent::AgentRole::Deliberation,
+        None,
+    )
+    .expect("resume durable session");
+
+    assert!(resumed);
+    assert_eq!(loaded.session_id, session_id);
+    assert_eq!(loaded.role, sinomo_agent::AgentRole::Deliberation);
+    assert_eq!(loaded.steering_queue.len(), 1);
+    assert_eq!(loaded.steering_queue[0].message, "persisted input");
+}
+
+#[test]
+fn coding_agent_session_resume_is_bound_to_its_original_workspace() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-workspace-binding");
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    let store = sinomo_agent::FileAgentSessionStore::for_data_dir(&data_dir);
+    let original_root = root.join("project-a");
+    let other_root = root.join("project-b");
+    fs::create_dir_all(&original_root).expect("create original workspace");
+    fs::create_dir_all(&other_root).expect("create other workspace");
+    let original_binding = sinomo_agent::WorkspaceRef::local_path(
+        fs::canonicalize(&original_root).expect("canonical original workspace"),
+    );
+    let other_binding = sinomo_agent::WorkspaceRef::local_path(
+        fs::canonicalize(&other_root).expect("canonical other workspace"),
+    );
+    let session_id = SessionId::generate();
+
+    let (created, resumed) = super::load_or_create_agent_run_session(
+        &store,
+        session_id.clone(),
+        sinomo_agent::AgentRole::Deliberation,
+        Some(&original_binding),
+    )
+    .expect("create workspace-bound session");
+    assert!(!resumed);
+    assert_eq!(created.workspace_binding.as_ref(), Some(&original_binding));
+
+    let (loaded, resumed) = super::load_or_create_agent_run_session(
+        &store,
+        session_id.clone(),
+        sinomo_agent::AgentRole::Deliberation,
+        Some(&original_binding),
+    )
+    .expect("resume from original workspace");
+    assert!(resumed);
+    assert_eq!(loaded.workspace_binding.as_ref(), Some(&original_binding));
+
+    let error = super::load_or_create_agent_run_session(
+        &store,
+        session_id.clone(),
+        sinomo_agent::AgentRole::Deliberation,
+        Some(&other_binding),
+    )
+    .expect_err("cross-workspace resume must be rejected");
+    assert!(matches!(
+        error,
+        CliError::Parse { detail }
+            if detail.contains("is bound to workspace")
+                && detail.contains(&original_root.display().to_string())
+                && detail.contains(&other_root.display().to_string())
+    ));
+
+    let persisted = sinomo_agent::AgentSessionStore::load_session(&store, &session_id)
+        .expect("load persisted binding")
+        .expect("workspace-bound snapshot");
+    assert_eq!(
+        persisted.workspace_binding.as_ref(),
+        Some(&original_binding),
+        "a rejected resume must not rewrite the durable binding"
+    );
+}
+
+#[test]
+fn coding_agent_refuses_unbound_legacy_session_with_durable_history() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-legacy-workspace-binding");
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    let store = sinomo_agent::FileAgentSessionStore::for_data_dir(&data_dir);
+    let workspace_root = root.join("project");
+    fs::create_dir_all(&workspace_root).expect("create workspace");
+    let binding = sinomo_agent::WorkspaceRef::local_path(
+        fs::canonicalize(&workspace_root).expect("canonical workspace"),
+    );
+    let session_id = SessionId::generate();
+    let mut legacy =
+        sinomo_agent::AgentSession::new(session_id.clone(), sinomo_agent::AgentRole::Deliberation);
+    legacy
+        .transcript
+        .push(sinomo_agent::AgentItem::UserMessage {
+            item_id: sinomo_agent::TaskId::generate(),
+            step_index: 0,
+            content: "legacy durable turn".to_string(),
+            event_id: None,
+        });
+    sinomo_agent::AgentSessionStore::save_session(&store, &legacy)
+        .expect("save unbound legacy session");
+
+    let error = super::load_or_create_agent_run_session(
+        &store,
+        session_id,
+        sinomo_agent::AgentRole::Deliberation,
+        Some(&binding),
+    )
+    .expect_err("unbound legacy history must not gain mutation authority");
+    assert!(matches!(
+        error,
+        CliError::Parse { detail }
+            if detail.contains("has no workspace binding")
+                && detail.contains("original workspace cannot be verified")
+    ));
+}
+
+#[test]
+fn coding_agent_refuses_an_unbound_empty_preexisting_session() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-empty-workspace-binding");
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    let store = sinomo_agent::FileAgentSessionStore::for_data_dir(&data_dir);
+    let workspace_root = root.join("project");
+    fs::create_dir_all(&workspace_root).expect("create workspace");
+    let binding = sinomo_agent::WorkspaceRef::local_path(
+        fs::canonicalize(&workspace_root).expect("canonical workspace"),
+    );
+    let session_id = SessionId::generate();
+    let empty =
+        sinomo_agent::AgentSession::new(session_id.clone(), sinomo_agent::AgentRole::Deliberation);
+    sinomo_agent::AgentSessionStore::save_session(&store, &empty)
+        .expect("save empty preexisting session");
+
+    let error = super::load_or_create_agent_run_session(
+        &store,
+        session_id,
+        sinomo_agent::AgentRole::Deliberation,
+        Some(&binding),
+    )
+    .expect_err("an empty snapshot is not proof that no earlier turn or tool call ran");
+    assert!(matches!(
+        error,
+        CliError::Parse { detail }
+            if detail.contains("has no workspace binding")
+                && detail.contains("original workspace cannot be verified")
+    ));
+}
+
+#[test]
+fn agent_run_compaction_evidence_requires_the_persisted_projection() {
+    let session_id = SessionId::generate();
+    let op_id = sinomo_agent::TaskId::generate();
+    let mut transcript = sinomo_agent::AgentTranscript::new();
+    transcript.push(sinomo_agent::AgentItem::UserMessage {
+        item_id: sinomo_agent::TaskId::generate(),
+        step_index: 0,
+        content: "retain this durable context".to_string(),
+        event_id: None,
+    });
+    let summary = sinomo_agent::AgentCompactor::default().compact(
+        &transcript,
+        "CLI --compact-after test",
+        42,
+    );
+    let event = sinomo_agent::AgentEvent::new(
+        op_id.clone(),
+        session_id.clone(),
+        sinomo_agent::AgentEventPayload::Compacted {
+            summary: summary.clone(),
+            item_count: 2,
+        },
+    );
+    let mut persisted = sinomo_agent::AgentSession::new(session_id, sinomo_agent::AgentRole::Main);
+    persisted.transcript = transcript.clone();
+    persisted.raw_transcript = transcript;
+    persisted.projection = Some(summary.projection.clone());
+
+    let evidence = super::agent_run_compaction_evidence(&op_id, &[event.clone()], &persisted)
+        .expect("matching persisted projection");
+
+    assert_eq!(evidence["op"], op_id.to_string());
+    assert_eq!(evidence["compaction_id"], summary.compaction_id.to_string());
+    assert_eq!(evidence["trigger"], "manual");
+    assert_eq!(evidence["token_estimate_before"], 42);
+    assert_eq!(evidence["projection"]["source_item_count"], 1);
+    assert_eq!(evidence["persisted"], true);
+
+    persisted.projection = None;
+    let error = super::agent_run_compaction_evidence(&op_id, &[event], &persisted)
+        .expect_err("missing persisted projection must fail");
+    assert!(
+        matches!(error, CliError::Parse { detail } if detail.contains("did not persist projection"))
     );
 }
 
@@ -7377,6 +7626,36 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
             ..
         })
     ));
+    #[cfg(not(windows))]
+    {
+        let background = match parse_dfs_command(&[
+            "mount".to_string(),
+            "/mnt/sifs".to_string(),
+            "--background".to_string(),
+        ])
+        .expect("parse background mount")
+        {
+            DfsCliCommand::Mount(options) => options,
+            other => panic!("expected mount options, got {other:?}"),
+        };
+        let error = crate::validate_dfs_mount_options_for_platform(&background)
+            .expect_err("Unix background mount must be rejected explicitly");
+        assert!(error.to_string().contains("--background"));
+
+        let sync_local = match parse_dfs_command(&[
+            "mount".to_string(),
+            "/mnt/sifs".to_string(),
+            "--sync-local-changes".to_string(),
+        ])
+        .expect("parse sync-local mount")
+        {
+            DfsCliCommand::Mount(options) => options,
+            other => panic!("expected mount options, got {other:?}"),
+        };
+        let error = crate::validate_dfs_mount_options_for_platform(&sync_local)
+            .expect_err("Unix Cloud Files flag must be rejected explicitly");
+        assert!(error.to_string().contains("Windows Cloud Files"));
+    }
     assert!(matches!(
         parse_dfs_command(&[
             "pin".to_string(),
@@ -10981,7 +11260,10 @@ fn daemon_node_status_publishes_version_and_rollout_to_kv() {
         time::OffsetDateTime::now_utc(),
     );
     let cluster_state = read_cluster_state(&cluster_paths).expect("read cluster state");
-    append_cluster_raft_command(
+    // Node-status writes may normally defer the materialized snapshot. This test reads through
+    // the snapshot-backed public API immediately, so publish eagerly instead of coupling the
+    // assertion to deferred-cache scheduling under the parallel test runner.
+    append_cluster_raft_command_and_materialize(
         &cluster_paths,
         &cluster_state.local_node_id,
         KvCommand::Txn(KvTxn {
@@ -13298,6 +13580,21 @@ fn captured_cli_command_collects_stdout_for_embedded_callers() {
 }
 
 #[test]
+fn agent_help_documents_selection_resume_and_json_run_output() {
+    let captured = super::execute_cli_command_captured(&["agent".to_string(), "help".to_string()]);
+
+    assert_eq!(captured.status, super::CliCommandStatus::Completed);
+    let stdout = String::from_utf8_lossy(&captured.output.stdout);
+    assert!(stdout.contains("--agent <agent-id>"));
+    assert!(stdout.contains("--session <session-id>"));
+    assert!(stdout.contains("--compact-after"));
+    assert!(stdout.contains("--json"));
+    assert!(stdout.contains("durable session"));
+    assert!(stdout.contains("context projection"));
+    assert!(captured.output.stderr.is_empty());
+}
+
+#[test]
 fn captured_cli_command_collects_registered_command_stdout() {
     let captured = super::execute_cli_command_captured(&["observe".to_string()]);
 
@@ -14274,6 +14571,252 @@ fn main_agent_tool_registry_exposes_config_catalog_and_workspace_tools() {
             .and_then(serde_json::Value::as_str),
         Some("workspace tool content\n")
     );
+}
+
+#[test]
+fn background_agent_cluster_status_tool_reads_the_selected_data_dir() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-cluster-status");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    let cluster_id = ClusterId::from_legacy_named("agent_cluster_status").expect("cluster");
+    let node_id = NodeId::from_legacy_named("agent_cluster_status_node").expect("node");
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(cluster_id.clone()),
+            node_id: Some(node_id.clone()),
+            name: "agent cluster status".to_string(),
+        },
+        &paths,
+    )
+    .expect("cluster init");
+    let session = InteractionSession::new(
+        SessionId::generate(),
+        node_id.clone(),
+        InteractionSurface::new("test", InteractionSurfaceKind::CommandLine),
+    );
+    let registry = super::agent_tool_registry_for_workspace(
+        &data_dir,
+        root.path(),
+        &sinomo_agent::AgentDefinition::background(),
+        Some(&session.session_id),
+        None,
+        false,
+    )
+    .expect("background registry");
+
+    let outcome = registry.execute(
+        &session,
+        0,
+        0,
+        &sinomo_agent::AgentToolCall {
+            call_id: None,
+            tool: "cluster_status".to_string(),
+            input: serde_json::json!({ "scope": "local" }),
+            r#async: false,
+            summary: "check cluster".to_string(),
+        },
+    );
+
+    assert_eq!(outcome.status, sinomo_agent::AgentToolStatus::Succeeded);
+    assert_eq!(outcome.output["cluster_id"], cluster_id.to_string());
+    assert_eq!(outcome.output["local_node_id"], node_id.to_string());
+    assert_eq!(outcome.output["summary"]["total"], 1);
+    assert_eq!(
+        outcome.output["nodes"][0]["member"]["node_id"],
+        node_id.to_string()
+    );
+}
+
+#[test]
+fn workspace_tool_registry_grants_mutation_only_to_builtin_coding_agent() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-authority");
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    let session = InteractionSession::new(
+        SessionId::generate(),
+        NodeId::from_legacy_named("node_agent_authority").expect("node"),
+        InteractionSurface::new("test", InteractionSurfaceKind::CommandLine),
+    );
+    let execute = |registry: &sinomo_agent::AgentToolRegistry,
+                   call_index: usize,
+                   tool: &str,
+                   input: serde_json::Value| {
+        registry.execute(
+            &session,
+            0,
+            call_index,
+            &sinomo_agent::AgentToolCall {
+                call_id: None,
+                tool: tool.to_string(),
+                input,
+                r#async: false,
+                summary: format!("test {tool}"),
+            },
+        )
+    };
+
+    let main_registry = super::agent_tool_registry_for_workspace(
+        &data_dir,
+        root.path(),
+        &sinomo_agent::AgentDefinition::main(),
+        Some(&session.session_id),
+        None,
+        false,
+    )
+    .expect("main registry");
+    let main_write = execute(
+        &main_registry,
+        0,
+        "write_file",
+        serde_json::json!({ "path": "main.txt", "content": "blocked\n" }),
+    );
+    let main_command = execute(
+        &main_registry,
+        1,
+        "run_command",
+        serde_json::json!({ "command": "printf blocked" }),
+    );
+    assert_eq!(main_write.status, sinomo_agent::AgentToolStatus::Blocked);
+    assert_eq!(main_command.status, sinomo_agent::AgentToolStatus::Blocked);
+    assert!(!root.join("main.txt").exists());
+
+    let coding_registry = super::agent_tool_registry_for_workspace(
+        &data_dir,
+        root.path(),
+        &sinomo_agent::AgentDefinition::coding(),
+        Some(&session.session_id),
+        None,
+        true,
+    )
+    .expect("coding registry");
+    let coding_write = execute(
+        &coding_registry,
+        2,
+        "write_file",
+        serde_json::json!({ "path": "coding.txt", "content": "allowed\n" }),
+    );
+    let coding_command = execute(
+        &coding_registry,
+        3,
+        "run_command",
+        serde_json::json!({ "command": "printf coding-ok" }),
+    );
+    assert_eq!(
+        coding_write.status,
+        sinomo_agent::AgentToolStatus::Succeeded
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("coding.txt")).expect("coding write"),
+        "allowed\n"
+    );
+    assert_ne!(
+        coding_command.status,
+        sinomo_agent::AgentToolStatus::Blocked,
+        "the built-in coding agent must reach the sandbox runtime"
+    );
+
+    let app_like_coding_registry = super::agent_tool_registry_for_workspace(
+        &data_dir,
+        root.path(),
+        &sinomo_agent::AgentDefinition::coding(),
+        Some(&session.session_id),
+        None,
+        false,
+    )
+    .expect("read-only app coding registry");
+    let app_like_write = execute(
+        &app_like_coding_registry,
+        4,
+        "write_file",
+        serde_json::json!({ "path": "app.txt", "content": "blocked\n" }),
+    );
+    assert_eq!(
+        app_like_write.status,
+        sinomo_agent::AgentToolStatus::Blocked
+    );
+    assert!(!root.join("app.txt").exists());
+
+    let imported_coding = sinomo_agent::AgentDefinition::coding().with_package_provenance(
+        sinomo_agent::AgentPackageProvenance::imported("coding-agent.json"),
+    );
+    let imported_registry = super::agent_tool_registry_for_workspace(
+        &data_dir,
+        root.path(),
+        &imported_coding,
+        Some(&session.session_id),
+        None,
+        true,
+    )
+    .expect("imported registry");
+    let imported_write = execute(
+        &imported_registry,
+        5,
+        "write_file",
+        serde_json::json!({ "path": "imported.txt", "content": "blocked\n" }),
+    );
+    let imported_command = execute(
+        &imported_registry,
+        6,
+        "run_command",
+        serde_json::json!({ "command": "printf blocked" }),
+    );
+    assert_eq!(
+        imported_write.status,
+        sinomo_agent::AgentToolStatus::Blocked
+    );
+    assert_eq!(
+        imported_command.status,
+        sinomo_agent::AgentToolStatus::Blocked
+    );
+    assert!(!root.join("imported.txt").exists());
+}
+
+#[test]
+fn coding_agent_rejects_unsafe_mutating_workspace_roots() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-unsafe-workspace");
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    let session_id = SessionId::generate();
+    let definition = sinomo_agent::AgentDefinition::coding();
+
+    let data_dir_error = super::agent_tool_registry_for_workspace(
+        &data_dir,
+        &data_dir.root(),
+        &definition,
+        Some(&session_id),
+        None,
+        true,
+    )
+    .err()
+    .expect("data directory must not become a mutating coding workspace");
+    assert!(data_dir_error.to_string().contains("unsafe workspace root"));
+
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let home_error = super::agent_tool_registry_for_workspace(
+            &data_dir,
+            std::path::Path::new(&home),
+            &definition,
+            Some(&session_id),
+            None,
+            true,
+        )
+        .err()
+        .expect("home directory must not become a mutating coding workspace");
+        assert!(home_error.to_string().contains("unsafe workspace root"));
+    }
+
+    #[cfg(unix)]
+    {
+        let root_error = super::agent_tool_registry_for_workspace(
+            &data_dir,
+            std::path::Path::new("/"),
+            &definition,
+            Some(&session_id),
+            None,
+            true,
+        )
+        .err()
+        .expect("filesystem root must not become a mutating coding workspace");
+        assert!(root_error.to_string().contains("unsafe workspace root"));
+    }
 }
 
 #[test]

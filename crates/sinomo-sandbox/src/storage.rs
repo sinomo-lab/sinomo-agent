@@ -20,6 +20,10 @@ pub fn register_storage_paths(layout: &mut StorageLayout) -> Result<(), StorageC
             "node-local sandbox runtime supervision state",
         ),
         (
+            "sandbox/agent-tools",
+            "node-local sandbox instances and command evidence for agent tool execution",
+        ),
+        (
             "sandbox/tmp",
             "node-local temporary scratch for active sandbox command execution",
         ),
@@ -42,4 +46,24 @@ pub fn register_storage_paths(layout: &mut StorageLayout) -> Result<(), StorageC
         .field("artifacts", "Vec<SandboxWasmModuleArtifact>"),
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_tool_sandbox_runtime_is_registered() {
+        let mut layout = StorageLayout::new();
+        register_storage_paths(&mut layout).expect("register sandbox storage");
+
+        let owner = layout
+            .owner_for("sandbox/agent-tools/instances/example/manifest.sobj")
+            .expect("agent tool sandbox owner");
+        let module = match owner {
+            sinomo_core::storage::StoragePathOwner::File(file) => file.module.as_str(),
+            sinomo_core::storage::StoragePathOwner::Escape(escape) => escape.module.as_str(),
+        };
+        assert_eq!(module, SANDBOX_STORAGE_MODULE);
+    }
 }

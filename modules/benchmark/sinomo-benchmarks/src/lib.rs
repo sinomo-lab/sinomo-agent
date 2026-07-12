@@ -353,7 +353,7 @@ pub fn agent_compaction_quality_plan() -> BenchmarkHarnessPlan {
             ),
         ],
         run_command: format!(
-            "python3 {} --mode run --provider codex --model gpt-5.2-codex --summary-out benchmark-results/agent-compaction/summary.json --progress-out benchmark-results/agent-compaction/progress.jsonl",
+            "python3 {} --mode run --agent coding-agent --provider codex --model gpt-5.5 --summary-out benchmark-results/agent-compaction/summary.json --progress-out benchmark-results/agent-compaction/progress.jsonl",
             benchmark_module_path("agent/run_compaction_eval.py")
         ),
         required_tools: required_tool_kinds(
@@ -367,6 +367,7 @@ pub fn agent_compaction_quality_plan() -> BenchmarkHarnessPlan {
         ),
         notes: vec![
             "This is a live/model eval harness for compaction quality, not a normal Rust unit test.".to_string(),
+            "Checkpoint turns use --compact-after to submit AgentOp::compact; continuation runs start a new CLI process and resume the resulting durable projection.".to_string(),
             "The checked-in plan covers long-session resume, constraint retention, coding after compaction, and cluster-ops after compaction.".to_string(),
             "Default plan/fixture modes are deterministic; --mode run calls the configured Sinomo agent and scores marker retention in generated summaries and post-compaction probes.".to_string(),
         ],
@@ -1279,7 +1280,13 @@ mod tests {
         assert!(runner.contains("cluster-ops-after-compaction"));
         assert!(runner.contains("SCENARIOS"));
         assert!(runner.contains("validate_scenario_definitions"));
-        assert!(runner.contains("generated_continuation_uses_compaction_summary"));
+        assert!(runner.contains("continuation_resumes_durable_cli_session"));
+        assert!(runner.contains("continuation_does_not_reinject_summary"));
+        assert!(runner.contains("phase_one_invokes_agent_op_compact"));
+        assert!(runner.contains("phase_one_requires_persisted_projection_evidence"));
+        assert!(runner.contains("--compact-after"));
+        assert!(runner.contains("compaction_evidence_issues"));
+        assert!(runner.contains("--session"));
         assert!(runner.contains("missing_marker_phases"));
     }
 

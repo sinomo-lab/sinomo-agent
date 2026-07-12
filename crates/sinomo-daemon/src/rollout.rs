@@ -23,16 +23,16 @@ use sinomo_rollout::{
     SHADOW_MAIN_PORT_ENV, SHADOW_START_DELAY_MS_ENV, SelfRolloutPaths,
     activate_staged_rollout_binary, classify_main_exit, clear_rollout_status,
     cluster_rollout_progress_status, deploy_managed_source_bundle_with_options,
-    ensure_rollout_layout, managed_source_status, read_object, read_pending_shadow_rollout,
-    read_rollout_main_activation, read_tail_lossy, record_activation_failure,
-    record_main_activation_staged, record_main_rollout_failure_with_diagnostics,
-    record_rollout_main_exit, record_shadow_rollout_finalized, remove_main_activation,
-    remove_shadow_finalize, restore_rollout_binary_from_backup, rollout_artifact_suffix,
-    rollout_build_dev_artifacts, rollout_main_activation_path, rollout_previous_binary_path,
-    rollout_remote_repo_path, rollout_shadow_finalize_path, rollout_staged_main_binary,
-    rollout_staged_shadow_binary, rollout_timestamp_now, source_heads_match,
-    stage_pending_shadow_rollout, stage_rollout_file, stage_rollout_file_pair, write_json,
-    write_main_activation, write_object, write_rollout_status,
+    ensure_rollout_layout, managed_source_status, prune_rollout_binary_recovery_backups,
+    read_object, read_pending_shadow_rollout, read_rollout_main_activation, read_tail_lossy,
+    record_activation_failure, record_main_activation_staged,
+    record_main_rollout_failure_with_diagnostics, record_rollout_main_exit,
+    record_shadow_rollout_finalized, remove_main_activation, remove_shadow_finalize,
+    restore_rollout_binary_from_backup, rollout_artifact_suffix, rollout_build_dev_artifacts,
+    rollout_main_activation_path, rollout_previous_binary_path, rollout_remote_repo_path,
+    rollout_shadow_finalize_path, rollout_staged_main_binary, rollout_staged_shadow_binary,
+    rollout_timestamp_now, source_heads_match, stage_pending_shadow_rollout, stage_rollout_file,
+    stage_rollout_file_pair, write_json, write_main_activation, write_object, write_rollout_status,
 };
 use std::collections::BTreeSet;
 use std::env;
@@ -590,6 +590,7 @@ fn complete_pending_shadow_rollout_after_start(
         "accepted",
         "shadow rollout finalized",
     )?;
+    prune_finalized_rollout_recovery_backups(&finalize.main_binary, &finalize.shadow_binary);
     remove_main_activation(rollout_paths);
     remove_shadow_finalize(rollout_paths);
     crate::append_operational_event_best_effort(
@@ -3011,8 +3012,31 @@ fn finalize_pending_shadow_rollout(
     }
 
     record_shadow_rollout_finalized(&rollout_paths, &finalize, status, &detail)?;
+    if status == "accepted" {
+        prune_finalized_rollout_recovery_backups(&finalize.main_binary, &finalize.shadow_binary);
+    }
     remove_shadow_finalize(&rollout_paths);
     Ok(format!("{status}: {detail}\n"))
+}
+
+fn prune_finalized_rollout_recovery_backups(main_binary: &Path, shadow_binary: &Path) {
+    let mut destinations = BTreeSet::new();
+    destinations.insert(main_binary.to_path_buf());
+    destinations.insert(shadow_binary.to_path_buf());
+    for destination in destinations {
+        match prune_rollout_binary_recovery_backups(&destination) {
+            Ok(removed) if removed > 0 => tracing::info!(
+                destination = %destination.display(),
+                removed,
+                "pruned finalized rollout recovery binaries"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                destination = %destination.display(),
+                "could not prune finalized rollout recovery binaries: {error}"
+            ),
+        }
+    }
 }
 
 pub fn handle_daemon_clear_rollout_status(paths: &DaemonPaths) -> Result<String, DaemonError> {
@@ -4454,6 +4478,20 @@ mod tests {
         let root = temp_rollout_test_root("shadow-start-completes");
         let rollout_paths = SelfRolloutPaths::new(&root);
         ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let main_name = rollout_paths
+            .main_binary
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("main binary name");
+        let recovery_backups = (1..=(sinomo_rollout::ROLLOUT_RECOVERY_BACKUP_RETENTION + 2))
+            .map(|generation| {
+                let path = rollout_paths
+                    .bin
+                    .join(format!("{main_name}.previous.7-{}-0", generation * 100));
+                write_test_executable(&path);
+                path
+            })
+            .collect::<Vec<_>>();
         let current_exe = env::current_exe().expect("current exe");
         let mut activation = test_main_activation(&rollout_paths);
         activation.shadow_binary = current_exe.clone();
@@ -4489,6 +4527,14 @@ mod tests {
             .expect("status");
         assert_eq!(status.status, "accepted");
         assert_eq!(status.phase.as_deref(), Some("shadow-finalized"));
+        assert!(!recovery_backups[0].exists());
+        assert!(!recovery_backups[1].exists());
+        for path in &recovery_backups[2..] {
+            assert!(
+                path.exists(),
+                "accepted finalization must retain the newest bounded recovery set: {path:?}"
+            );
+        }
     }
 
     #[test]

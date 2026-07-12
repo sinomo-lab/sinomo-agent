@@ -29,34 +29,37 @@ macro_rules! eprintln {
 use sinomo_agent::{
     AGENT_RPC_CATEGORY, AGENT_SESSION_FOLLOW_UP_ROUTE, AGENT_SESSION_INSPECT_ROUTE,
     AGENT_SESSION_INTERRUPT_ROUTE, AGENT_SESSION_PROGRESS_ROUTE, AGENT_SESSION_RESUME_ROUTE,
-    AGENT_SESSION_STEER_ROUTE, AGENT_SESSION_TERMINAL_RESULTS_ROUTE, Agent, AgentCatalog,
-    AgentDefinition, AgentDefinitionSifsStore, AgentDefinitionStore, AgentEventPayload,
-    AgentLoopDecision, AgentLoopInput, AgentModelEvent, AgentOp, AgentPackageProvenance,
-    AgentPackageSource, AgentReadinessCheckStatus, AgentReadinessReport, AgentRole,
-    AgentRuntimeEvent, AgentRuntimeEventCursor, AgentRuntimeEventPayload, AgentRuntimeStorage,
-    AgentSession, AgentSessionControlEventCursor, AgentSessionControlResponse,
+    AGENT_SESSION_STEER_ROUTE, AGENT_SESSION_TERMINAL_RESULTS_ROUTE, Agent, AgentCancellationToken,
+    AgentCatalog, AgentDefinition, AgentDefinitionSifsStore, AgentDefinitionStore,
+    AgentEventPayload, AgentLoopDecision, AgentLoopInput, AgentModelEvent, AgentOp,
+    AgentPackageProvenance, AgentPackageSource, AgentReadinessCheckStatus, AgentReadinessReport,
+    AgentRole, AgentRuntimeEvent, AgentRuntimeEventCursor, AgentRuntimeEventPayload,
+    AgentRuntimeStorage, AgentSession, AgentSessionControlEventCursor, AgentSessionControlResponse,
     AgentSessionFollowUpRequest, AgentSessionInspectRequest, AgentSessionInspectResponse,
     AgentSessionInterruptRequest, AgentSessionProgressRequest, AgentSessionProgressResponse,
     AgentSessionResumeRequest, AgentSessionResumeResponse, AgentSessionRuntime,
-    AgentSessionSteerRequest, AgentSessionTerminalResultsRequest,
-    AgentSessionTerminalResultsResponse, AgentTaskTerminalResult, AgentToolProgressEvent,
-    AgentToolRegistry, ConfigAgentToolConfig, EventEnvelopeExt, InteractionModel,
-    InteractionOutput, InteractionSession, InteractionSurface, InteractionSurfaceKind,
-    LocalWorkspaceAgentConfig, SkillActivationScope, SkillCatalogEntry, SkillCatalogSifsStore,
-    SkillCatalogSource, SkillCatalogSourceKind, SkillCatalogStore, SkillCatalogWrite, TaskId,
-    interaction_event, render_common_skill_markdown, run_local_agent_readiness_gate,
-    user_interaction_input_event,
+    AgentSessionSteerRequest, AgentSessionStore, AgentSessionTerminalResultsRequest,
+    AgentSessionTerminalResultsResponse, AgentTaskTerminalResult, AgentTool, AgentToolDescriptor,
+    AgentToolEvidence, AgentToolKind, AgentToolProgressEvent, AgentToolRegistry, AgentToolRequest,
+    AgentToolResult, AgentToolSpec, ConfigAgentToolConfig, EventEnvelopeExt, FileAgentSessionStore,
+    FileAgentTraceStore, InteractionModel, InteractionOutput, InteractionSession,
+    InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig, SkillActivationScope,
+    SkillCatalogEntry, SkillCatalogSifsStore, SkillCatalogSource, SkillCatalogSourceKind,
+    SkillCatalogStore, SkillCatalogWrite, TaskId, WorkspaceRef, interaction_event,
+    render_common_skill_markdown, run_local_agent_readiness_gate, user_interaction_input_event,
 };
 use sinomo_lm::{
     AnthropicProvider, CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, ClaudeProvider, CurrentDefaultModel,
     DEFAULT_PROVIDER_ACCOUNT, DeepSeekProvider, GeminiProvider, GitHubCopilotProvider,
     LM_PROVIDER_CONFIG_KEY, LM_PROVIDER_CONFIG_KV_KEY, LM_RUNTIME_CONFIG_KEY,
-    LM_RUNTIME_CONFIG_KV_KEY, LanguageModelError, LanguageModelModelOptions,
-    LanguageModelProviderOptions, LanguageModelProviderUsage, LanguageModelRequest,
-    LanguageModelResponse, LanguageModelStreamEvent, ModelConfig, ModelPaths, ModelRuntimeConfig,
-    NvidiaProvider, OpenAiProvider, ProviderAccountConfig, ProviderReasoningEffort,
-    ProviderTextVerbosity, claude_provider, codex_provider, collect_provider_model_catalogs,
-    collect_provider_usage, complete_configured_model_request_streaming_events_with_account,
+    LM_RUNTIME_CONFIG_KV_KEY, LanguageModelCancellation, LanguageModelError,
+    LanguageModelModelOptions, LanguageModelProviderOptions, LanguageModelProviderUsage,
+    LanguageModelRequest, LanguageModelResponse, LanguageModelStreamEvent, ModelConfig, ModelPaths,
+    ModelRuntimeConfig, NvidiaProvider, OpenAiProvider, ProviderAccountConfig,
+    ProviderReasoningEffort, ProviderTextVerbosity, claude_provider, codex_provider,
+    collect_provider_model_catalogs, collect_provider_usage,
+    complete_configured_model_request_streaming_events_with_account,
+    complete_configured_model_request_streaming_events_with_account_and_cancellation,
     complete_configured_model_request_with_account,
     current_default_model as resolve_current_default_model, default_model_provider_ids,
     github_copilot_provider, load_model_config, model_config_cluster_kv_txn,
@@ -1597,9 +1600,13 @@ pub(crate) struct AgentReadinessOptions {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct AgentRunOptions {
     pub prompt: String,
+    pub agent: String,
     pub provider: String,
     pub model: String,
     pub account: Option<String>,
+    pub session_id: Option<SessionId>,
+    pub compact_after: bool,
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -2352,15 +2359,27 @@ pub(crate) fn parse_agent_validate_options(
 
 pub(crate) fn parse_agent_run_options(args: &[String]) -> Result<AgentRunOptions, CliError> {
     let mut prompt = None;
+    let mut agent = "main-agent".to_string();
     let mut provider = CODEX_PROVIDER_ID.to_string();
     let mut model = CODEX_DEFAULT_MODEL.to_string();
     let mut account = None;
+    let mut session_id = None;
+    let mut compact_after = false;
+    let mut json = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--prompt" => {
                 index += 1;
-                prompt = args.get(index).cloned();
+                prompt = Some(args.get(index).cloned().ok_or_else(|| CliError::Parse {
+                    detail: "--prompt requires a value".to_string(),
+                })?);
+            }
+            "--agent" => {
+                index += 1;
+                agent = args.get(index).cloned().ok_or_else(|| CliError::Parse {
+                    detail: "--agent requires a value".to_string(),
+                })?;
             }
             "--provider" => {
                 index += 1;
@@ -2380,6 +2399,12 @@ pub(crate) fn parse_agent_run_options(args: &[String]) -> Result<AgentRunOptions
                     detail: "--account requires a value".to_string(),
                 })?);
             }
+            "--session" | "--session-id" => {
+                index += 1;
+                session_id = Some(parse_agent_session_id_arg(args.get(index), "--session")?);
+            }
+            "--compact-after" => compact_after = true,
+            "--json" => json = true,
             value if prompt.is_none() => {
                 prompt = Some(value.to_string());
             }
@@ -2395,9 +2420,13 @@ pub(crate) fn parse_agent_run_options(args: &[String]) -> Result<AgentRunOptions
         prompt: prompt.ok_or_else(|| CliError::Parse {
             detail: "agent run requires --prompt <text>".to_string(),
         })?,
+        agent,
         provider,
         model,
         account,
+        session_id,
+        compact_after,
+        json,
     })
 }
 
@@ -2564,6 +2593,52 @@ impl InteractionModel for ConfiguredInteractionModel {
             request,
             on_event,
         )
+    }
+
+    fn complete_streaming_events_with_cancellation(
+        &self,
+        request: &LanguageModelRequest,
+        cancellation_token: &AgentCancellationToken,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        if self.provider != MINICPM_PROVIDER_ID {
+            let token = cancellation_token.clone();
+            let cancellation = LanguageModelCancellation::new(move || token.is_cancelled());
+            return complete_configured_model_request_streaming_events_with_account_and_cancellation(
+                &self.data_dir,
+                &self.provider,
+                &self.model,
+                self.account.as_ref(),
+                None,
+                request,
+                &cancellation,
+                on_event,
+            );
+        }
+
+        if cancellation_token.is_cancelled() {
+            return Err(configured_model_cancelled_error(request, "before request"));
+        }
+        let response = self.complete_streaming_events(request, &mut |event| {
+            if !cancellation_token.is_cancelled() {
+                on_event(event);
+            }
+        })?;
+        if cancellation_token.is_cancelled() {
+            return Err(configured_model_cancelled_error(request, "during response"));
+        }
+        Ok(response)
+    }
+}
+
+fn configured_model_cancelled_error(
+    request: &LanguageModelRequest,
+    phase: &'static str,
+) -> LanguageModelError {
+    LanguageModelError::ProviderInvocationFailed {
+        provider: request.provider.clone(),
+        model: request.model.clone(),
+        detail: format!("model invocation cancelled {phase}"),
     }
 }
 
@@ -3936,21 +4011,46 @@ pub(crate) fn best_effort_skill_catalog_texts(
 
 pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
+    let catalog = load_agent_catalog_for_cli()?;
+    let definition = agent_definition_from_catalog(&catalog, &options.agent)?.clone();
+    let workspace_root = std::env::current_dir().map_err(|source| CliError::Io {
+        path: "current directory".to_string(),
+        detail: source.to_string(),
+    })?;
+    let workspace_binding = agent_definition_has_coding_authority(&definition)
+        .then(|| coding_agent_workspace_binding(&data_dir, &workspace_root))
+        .transpose()?;
     let account = if let Some(account_name) = options.account.as_deref() {
         let config = load_model_config(&ModelPaths::new(&data_dir))?;
         provider_account_config(&config, &options.provider, Some(account_name)).cloned()
     } else {
         None
     };
+    let session_id = options.session_id.unwrap_or_else(SessionId::generate);
+    let session_store = FileAgentSessionStore::for_data_dir(&data_dir);
+    let (agent_session, resumed) = load_or_create_agent_run_session(
+        &session_store,
+        session_id.clone(),
+        definition.role.clone(),
+        workspace_binding.as_ref(),
+    )?;
+    let node_id = match read_cluster_state(&ClusterPaths::new(&data_dir)) {
+        Ok(state) => state.local_node_id,
+        Err(CliError::ClusterOrphan) => {
+            NodeId::from_legacy_named("node_agent_cli").expect("legacy node id")
+        }
+        Err(error) => return Err(error),
+    };
     let session = InteractionSession::new(
-        SessionId::generate(),
-        NodeId::from_legacy_named("node_agent_cli").expect("legacy node id"),
+        session_id.clone(),
+        node_id,
         InteractionSurface::new("cli.agent", InteractionSurfaceKind::CommandLine),
     );
     let input_event = user_interaction_input_event(&session, &options.prompt);
     let input = AgentLoopInput {
         session,
         latest_event: input_event,
+        transient_system_context: None,
         async_update: None,
         context_attachments: Vec::new(),
         tool_specs: Vec::new(),
@@ -3958,7 +4058,14 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
     let provider = options.provider.clone();
     let model = options.model.clone();
     let (runtime_config, _) = load_model_runtime_config_for_node(&data_dir)?;
-    let tool_registry = main_agent_config_tool_registry(&data_dir)?;
+    let tool_registry = agent_tool_registry_for_workspace(
+        &data_dir,
+        &workspace_root,
+        &definition,
+        Some(&session_id),
+        None,
+        true,
+    )?;
     let skill_catalog = best_effort_reconciled_skill_catalog(&data_dir);
     let skill_catalog_texts = best_effort_skill_catalog_texts(&data_dir, &skill_catalog);
     let loop_model = ConfiguredInteractionModel {
@@ -3970,20 +4077,19 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         managed_pytorch: Mutex::new(None),
     };
     let agent_config = sinomo_agent::AgentConfig::new(provider.clone(), model.clone())
-        .with_agent_definition(AgentDefinition::main())
+        .with_agent_definition(definition.clone())
+        .with_workspace_root(&workspace_root)
         .with_skill_catalog(skill_catalog)
         .with_skill_catalog_texts(skill_catalog_texts);
     let agent = Agent::new(loop_model, provider, model)
         .with_config(agent_config)
         .with_tool_registry(tool_registry)
-        .with_tool_surface(sinomo_agent::AgentToolSurface::default_for_role(
-            AgentRole::Main,
+        .with_session_store(session_store)
+        .with_trace_store(FileAgentTraceStore::for_data_dir_session(
+            &data_dir,
+            &session_id,
         ));
-    let runtime = AgentSessionRuntime::with_data_dir_storage(
-        agent,
-        AgentSession::new(input.session.session_id.clone(), AgentRole::Main),
-        &data_dir,
-    );
+    let runtime = AgentSessionRuntime::with_data_dir_storage(agent, agent_session, &data_dir);
     let op = AgentOp::start_turn(input);
     let op_id = op.op_id.clone();
     let submit = runtime.submit_op(op)?;
@@ -3995,7 +4101,7 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
                 AgentEventPayload::OperationRejected { reason, .. } => Some(reason.clone()),
                 _ => None,
             })
-            .unwrap_or_else(|| "main agent turn was rejected".to_string());
+            .unwrap_or_else(|| format!("agent `{}` turn was rejected", definition.key()));
         return Err(CliError::Parse { detail: reason });
     }
     runtime.join_active_turn()?;
@@ -4004,9 +4110,67 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         .and_then(|outcome| outcome.run)
         .map(|run| run.final_decision)
         .ok_or_else(|| CliError::Parse {
-            detail: format!("main agent runtime turn `{op_id}` completed without a decision"),
+            detail: format!(
+                "agent `{}` runtime turn `{op_id}` completed without a decision",
+                definition.key()
+            ),
         })?;
-    if decision.text.trim().is_empty() {
+    let compaction_evidence = if options.compact_after {
+        let compact_op = AgentOp::compact(format!(
+            "CLI --compact-after following completed turn {op_id}"
+        ));
+        let compact_op_id = compact_op.op_id.clone();
+        let compact_submit = runtime.submit_op(compact_op)?;
+        if !compact_submit.accepted {
+            let reason = compact_submit
+                .events
+                .iter()
+                .find_map(|event| match &event.payload {
+                    AgentEventPayload::OperationRejected { reason, .. } => Some(reason.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| format!("agent `{}` compaction was rejected", definition.key()));
+            return Err(CliError::Parse { detail: reason });
+        }
+        let persisted_session = FileAgentSessionStore::for_data_dir(&data_dir)
+            .load_session(&session_id)
+            .map_err(|source| CliError::Parse {
+                detail: format!(
+                    "reload compacted agent session `{session_id}` failed: {source}"
+                ),
+            })?
+            .ok_or_else(|| CliError::Parse {
+                detail: format!(
+                    "compacted agent session `{session_id}` was not persisted after operation `{compact_op_id}`"
+                ),
+            })?;
+        Some(agent_run_compaction_evidence(
+            &compact_op_id,
+            &compact_submit.events,
+            &persisted_session,
+        )?)
+    } else {
+        None
+    };
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "session": session_id,
+                "op": op_id,
+                "agent": definition.key(),
+                "provider": options.provider,
+                "model": options.model,
+                "decision": decision,
+                "resumed": resumed,
+                "compaction": compaction_evidence.as_ref(),
+            }))
+            .map_err(|source| CliError::Json {
+                path: "<agent run>".to_string(),
+                detail: source.to_string(),
+            })?
+        );
+    } else if decision.text.trim().is_empty() {
         println!("{}", agent_decision_json(&decision)?);
     } else {
         println!("{}", decision.text);
@@ -4014,7 +4178,159 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
             println!("{}", agent_decision_json(&decision)?);
         }
     }
+    if !options.json {
+        if let Some(evidence) = compaction_evidence.as_ref() {
+            eprintln!(
+                "compaction: persisted projection {}",
+                evidence["projection"]["projection_id"]
+                    .as_str()
+                    .unwrap_or("<unknown>")
+            );
+        }
+        eprintln!(
+            "session: {session_id} (resume with `sinomo agent run --session {session_id} --prompt <text>`)"
+        );
+    }
     Ok(())
+}
+
+fn agent_run_compaction_evidence(
+    compact_op_id: &TaskId,
+    events: &[sinomo_agent::AgentEvent],
+    persisted_session: &AgentSession,
+) -> Result<serde_json::Value, CliError> {
+    let (summary, item_count_after) = events
+        .iter()
+        .find_map(|event| match &event.payload {
+            AgentEventPayload::Compacted {
+                summary,
+                item_count,
+            } => Some((summary, *item_count)),
+            _ => None,
+        })
+        .ok_or_else(|| CliError::Parse {
+            detail: format!(
+                "agent compaction operation `{compact_op_id}` completed without compaction evidence"
+            ),
+        })?;
+    let projection = persisted_session
+        .projection
+        .as_ref()
+        .filter(|projection| projection.projection_id == summary.projection.projection_id)
+        .ok_or_else(|| CliError::Parse {
+            detail: format!(
+                "agent compaction operation `{compact_op_id}` did not persist projection `{}`",
+                summary.projection.projection_id
+            ),
+        })?;
+    Ok(serde_json::json!({
+        "op": compact_op_id,
+        "compaction_id": summary.compaction_id,
+        "reason": summary.reason,
+        "strategy_id": summary.strategy_id,
+        "trigger": summary.trigger,
+        "summary": summary.summary,
+        "summary_model": summary.summary_model,
+        "fallback_reason": summary.fallback_reason,
+        "token_estimate_before": summary.token_estimate_before,
+        "retained_tail_count": summary.retained_tail_count,
+        "item_count_after": item_count_after,
+        "transcript_item_count_after": persisted_session.transcript.items.len(),
+        "raw_item_count_after": persisted_session.raw_transcript.items.len(),
+        "projection": projection,
+        "persisted": true,
+    }))
+}
+
+fn load_or_create_agent_run_session(
+    store: &FileAgentSessionStore,
+    session_id: SessionId,
+    role: AgentRole,
+    workspace_binding: Option<&WorkspaceRef>,
+) -> Result<(AgentSession, bool), CliError> {
+    let loaded = store
+        .load_session(&session_id)
+        .map_err(|source| CliError::Parse {
+            detail: format!("load agent session `{session_id}` failed: {source}"),
+        })?;
+    match loaded {
+        Some(mut session) => {
+            session.role = role;
+            if let Some(requested_binding) = workspace_binding {
+                match session.workspace_binding.as_ref() {
+                    Some(existing_binding) => validate_agent_session_workspace_binding(
+                        &session.session_id,
+                        existing_binding,
+                        requested_binding,
+                    )?,
+                    None => {
+                        return Err(CliError::Parse {
+                            detail: format!(
+                                "coding-agent session `{}` has no workspace binding; refusing a mutation-capable resume because its original workspace cannot be verified; start a new session without `--session`",
+                                session.session_id
+                            ),
+                        });
+                    }
+                }
+            }
+            Ok((session, true))
+        }
+        None => {
+            let mut session = AgentSession::new(session_id, role);
+            session.workspace_binding = workspace_binding.cloned();
+            store
+                .save_session(&session)
+                .map_err(|source| CliError::Parse {
+                    detail: format!(
+                        "create agent session `{}` failed: {source}",
+                        session.session_id
+                    ),
+                })?;
+            Ok((session, false))
+        }
+    }
+}
+
+fn coding_agent_workspace_binding(
+    data_dir: &SinomoDataDir,
+    workspace_root: &Path,
+) -> Result<WorkspaceRef, CliError> {
+    validate_mutating_workspace_root(data_dir, workspace_root)?;
+    Ok(WorkspaceRef::local_path(absolute_normalized_path(
+        workspace_root,
+    )?))
+}
+
+fn validate_agent_session_workspace_binding(
+    session_id: &SessionId,
+    existing_binding: &WorkspaceRef,
+    requested_binding: &WorkspaceRef,
+) -> Result<(), CliError> {
+    let existing_root = local_workspace_binding_root(session_id, existing_binding)?;
+    let requested_root = local_workspace_binding_root(session_id, requested_binding)?;
+    let existing_root = absolute_normalized_path(existing_root)?;
+    let requested_root = absolute_normalized_path(requested_root)?;
+    if existing_root == requested_root {
+        return Ok(());
+    }
+    Err(CliError::Parse {
+        detail: format!(
+            "coding-agent session `{session_id}` is bound to workspace `{}` and cannot be resumed from `{}`; run the command from the original workspace or start a new session without `--session`",
+            existing_root.display(),
+            requested_root.display()
+        ),
+    })
+}
+
+fn local_workspace_binding_root<'a>(
+    session_id: &SessionId,
+    binding: &'a WorkspaceRef,
+) -> Result<&'a Path, CliError> {
+    binding.local_root.as_deref().ok_or_else(|| CliError::Parse {
+        detail: format!(
+            "coding-agent session `{session_id}` has a non-local workspace binding and cannot be resumed by the local CLI"
+        ),
+    })
 }
 
 pub(crate) fn main_agent_config_tool_registry(
@@ -4031,26 +4347,145 @@ pub(crate) fn main_agent_tool_registry_for_workspace(
     data_dir: &SinomoDataDir,
     workspace_root: &Path,
 ) -> Result<AgentToolRegistry, CliError> {
+    agent_tool_registry_for_workspace(
+        data_dir,
+        workspace_root,
+        &AgentDefinition::main(),
+        None,
+        None,
+        false,
+    )
+}
+
+pub(crate) fn agent_tool_registry_for_workspace(
+    data_dir: &SinomoDataDir,
+    workspace_root: &Path,
+    definition: &AgentDefinition,
+    session_id: Option<&SessionId>,
+    sandbox_node_id: Option<NodeId>,
+    allow_coding_mutation: bool,
+) -> Result<AgentToolRegistry, CliError> {
     let registry = AgentToolRegistry::new();
-    main_agent_configure_tool_registry_for_workspace(
+    configure_agent_tool_registry_for_workspace(
         &registry,
         data_dir,
         workspace_root,
-        None,
-        None,
+        definition,
+        session_id,
+        sandbox_node_id,
+        allow_coding_mutation,
     )?;
     Ok(registry)
 }
 
-pub(crate) fn main_agent_configure_tool_registry_for_workspace(
+#[derive(Clone)]
+struct CliClusterStatusAgentTool {
+    data_dir: SinomoDataDir,
+}
+
+impl CliClusterStatusAgentTool {
+    fn new(data_dir: SinomoDataDir) -> Self {
+        Self { data_dir }
+    }
+}
+
+impl AgentTool for CliClusterStatusAgentTool {
+    fn descriptor(&self) -> AgentToolDescriptor {
+        AgentToolDescriptor::new(AgentToolSpec::new(
+            AgentToolKind::ClusterStatus,
+            "cluster_status",
+            "Read live health for every known node in the local Sinomo cluster.",
+            false,
+        ))
+        .with_input_schema(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["cluster", "local"],
+                    "description": "Optional compatibility hint; both values inspect the cluster reached through this local node."
+                }
+            },
+            "additionalProperties": false
+        }))
+        .with_output_schema(serde_json::json!({
+            "type": "object",
+            "required": ["cluster_id", "local_node_id", "summary", "nodes"],
+            "properties": {
+                "cluster_id": { "type": "string" },
+                "local_node_id": { "type": "string" },
+                "summary": {
+                    "type": "object",
+                    "required": ["online", "offline", "unknown", "total"]
+                },
+                "nodes": { "type": "array" }
+            }
+        }))
+    }
+
+    fn execute(&self, _request: AgentToolRequest<'_>) -> AgentToolResult {
+        let (state, rows) = match cluster_health_rows_for_data_dir(&self.data_dir) {
+            Ok(result) => result,
+            Err(error) => {
+                return AgentToolResult::failed(
+                    format!("cluster health is unavailable: {error}"),
+                    serde_json::json!({
+                        "error": "cluster_health_unavailable",
+                        "detail": error.to_string(),
+                    }),
+                );
+            }
+        };
+        let count = |availability: ClusterNodeAvailability| {
+            rows.iter()
+                .filter(|row| row.availability == availability)
+                .count()
+        };
+        let online = count(ClusterNodeAvailability::Online);
+        let offline = count(ClusterNodeAvailability::Offline);
+        let unknown = count(ClusterNodeAvailability::Unknown);
+        let output = serde_json::json!({
+            "cluster_id": state.cluster_id,
+            "local_node_id": state.local_node_id,
+            "summary": {
+                "online": online,
+                "offline": offline,
+                "unknown": unknown,
+                "total": rows.len(),
+            },
+            "nodes": rows,
+        });
+        AgentToolResult::succeeded(
+            format!("cluster health: {online} online, {offline} offline, {unknown} unknown"),
+            output.clone(),
+        )
+        .with_evidence(
+            AgentToolEvidence::availability_only(
+                true,
+                "read cluster health through the local Sinomo control plane",
+            )
+            .with_output_value(&output, false),
+        )
+    }
+}
+
+pub(crate) fn configure_agent_tool_registry_for_workspace(
     registry: &AgentToolRegistry,
     data_dir: &SinomoDataDir,
     workspace_root: &Path,
+    definition: &AgentDefinition,
     session_id: Option<&SessionId>,
     sandbox_node_id: Option<NodeId>,
+    allow_coding_mutation: bool,
 ) -> Result<(), CliError> {
     let store = main_agent_config_store()?;
     let mut config = LocalWorkspaceAgentConfig::new(workspace_root);
+    if allow_coding_mutation && agent_definition_has_coding_authority(definition) {
+        validate_mutating_workspace_root(data_dir, workspace_root)?;
+        config = config
+            .allowing_shell_commands(true)
+            .allowing_file_writes(true);
+    }
     if let Some(session_id) = session_id {
         config = config.with_data_dir_evidence(data_dir, session_id);
     }
@@ -4067,7 +4502,58 @@ pub(crate) fn main_agent_configure_tool_registry_for_workspace(
         registry,
         sinomo_agent::SkillAgentToolConfig::new(data_dir.clone()),
     );
+    registry.register(CliClusterStatusAgentTool::new(data_dir.clone()));
     Ok(())
+}
+
+fn agent_definition_has_coding_authority(definition: &AgentDefinition) -> bool {
+    definition.package.provenance.source == AgentPackageSource::BuiltIn
+        && definition.key() == "coding-agent"
+}
+
+fn validate_mutating_workspace_root(
+    data_dir: &SinomoDataDir,
+    workspace_root: &Path,
+) -> Result<(), CliError> {
+    let workspace_root = absolute_normalized_path(workspace_root)?;
+    if workspace_root.parent().is_none() {
+        return Err(unsafe_coding_workspace_error(&workspace_root));
+    }
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let home = absolute_normalized_path(Path::new(&home))?;
+        if workspace_root == home {
+            return Err(unsafe_coding_workspace_error(&workspace_root));
+        }
+    }
+    let data_root = absolute_normalized_path(&data_dir.root())?;
+    if workspace_root == data_root || workspace_root.starts_with(&data_root) {
+        return Err(unsafe_coding_workspace_error(&workspace_root));
+    }
+    Ok(())
+}
+
+fn absolute_normalized_path(path: &Path) -> Result<PathBuf, CliError> {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return Ok(canonical);
+    }
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|current| current.join(path))
+        .map_err(|source| CliError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })
+}
+
+fn unsafe_coding_workspace_error(workspace_root: &Path) -> CliError {
+    CliError::Parse {
+        detail: format!(
+            "coding-agent mutation is disabled for unsafe workspace root `{}`; run the command from an explicit project directory",
+            workspace_root.display()
+        ),
+    }
 }
 
 pub(crate) fn main_agent_config_store() -> Result<sinomo_runtime::config::ConfigStore, CliError> {

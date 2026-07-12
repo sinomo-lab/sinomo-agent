@@ -12,6 +12,28 @@ use sinomo_app::theme::AppThemeMode;
 use sinomo_app::{boot, build_runtime};
 use sui_testing::TestApp;
 
+#[test]
+fn headless_boot_isolated_from_operator_data_dir() {
+    let operator_root = sinomo_runtime::local::SinomoDataDir::from_env_or_home()
+        .ok()
+        .map(|data_dir| data_dir.root());
+    let shared = boot(Tab::Sinomo);
+    let headless_root = shared.borrow().data_dir.root();
+
+    assert_ne!(
+        Some(&headless_root),
+        operator_root.as_ref(),
+        "headless boot must not read or synchronize the operator's live cluster state"
+    );
+    assert!(
+        headless_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("sinomo-app-local-fallback-test-")),
+        "headless boot should use a visibly isolated data directory: {headless_root:?}"
+    );
+}
+
 fn capture(shared: sinomo_app::state::Shared, name: &str) {
     let dir = shots_dir();
     let runtime = build_runtime(shared).expect("build runtime");
@@ -1041,7 +1063,7 @@ fn new_chat_row_clears_visible_transcript() {
     app.run_until_idle().expect("settle chat layout");
 
     window
-        .get_by_role(SemanticsRole::ListItem)
+        .get_by_role(SemanticsRole::Button)
         .with_name("New chat")
         .click()
         .expect("click New chat row");

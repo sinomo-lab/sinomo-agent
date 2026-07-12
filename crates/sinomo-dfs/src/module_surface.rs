@@ -61,6 +61,10 @@ pub fn register_storage_paths(
             "durable per-replica DFS metadata journal replication cursors",
         ),
         (
+            "dfs/anti-entropy-cursors",
+            "durable per-filesystem DFS anti-entropy scan cursors",
+        ),
+        (
             "dfs/maintenance",
             "durable DFS maintenance cursors, retry ledgers, and suppression records",
         ),
@@ -289,6 +293,7 @@ mod tests {
             "dfs/content/blob-packs/index.sobj",
             "dfs/content/blob-packs/segments/0000000000000000.pack",
             "dfs/content/stats.sobj",
+            "dfs/anti-entropy-cursors/sifs.sobj",
             "dfs/metadata/services/records/tables/materialized.slog",
             "dfs/metadata/users/journal/segments/00000000000000000001.slog",
             "dfs/metadata/custom-shard/records/objects/example.sobj",

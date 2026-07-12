@@ -1,6 +1,6 @@
 use crate::session_store::{
     AgentSessionStore, AgentSessionStoreError, AgentSessionStoreRecord,
-    AgentSessionStoreRecordKind, NoopAgentSessionStore,
+    AgentSessionStoreRecordKind, FileAgentSessionStore, NoopAgentSessionStore,
 };
 use crate::tools::{
     AGENT_CODING_EVIDENCE_KIND, AGENT_SKILL_USAGE_EVIDENCE_KIND, AgentCodingToolEvidence,
@@ -117,6 +117,8 @@ fn is_false(value: &bool) -> bool {
 pub struct AgentSession {
     pub session_id: SessionId,
     pub role: AgentRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_binding: Option<WorkspaceRef>,
     pub transcript: AgentTranscript,
     #[serde(default, skip_serializing_if = "AgentTranscript::is_empty")]
     pub raw_transcript: AgentTranscript,
@@ -135,6 +137,7 @@ impl AgentSession {
         Self {
             session_id,
             role,
+            workspace_binding: None,
             transcript: AgentTranscript::new(),
             raw_transcript: AgentTranscript::new(),
             projection: None,
@@ -650,6 +653,23 @@ impl AgentTraceStore for FileAgentTraceStore {
                 path: self.path.display().to_string(),
                 detail: source.to_string(),
             })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SessionRoutedFileAgentTraceStore {
+    paths: AgentStoragePaths,
+}
+
+impl SessionRoutedFileAgentTraceStore {
+    fn new(paths: AgentStoragePaths) -> Self {
+        Self { paths }
+    }
+}
+
+impl AgentTraceStore for SessionRoutedFileAgentTraceStore {
+    fn append(&self, record: &AgentTraceRecord) -> Result<(), AgentTraceStoreError> {
+        FileAgentTraceStore::for_session(&self.paths, &record.session_id).append(record)
     }
 }
 
@@ -2140,7 +2160,14 @@ impl ContextAssembler {
         tool_descriptors: Vec<AgentToolDescriptor>,
         step_index: usize,
     ) -> Result<TurnContext, AgentError> {
-        let system_instructions = render_agent_package_system_prompt(&config.definition);
+        let mut system_instructions = render_agent_package_system_prompt(&config.definition);
+        let transient_system_context = transient_system_context(input);
+        if let Some(context) = transient_system_context {
+            if !system_instructions.is_empty() {
+                system_instructions.push_str("\n\n");
+            }
+            system_instructions.push_str(context);
+        }
         let rendered_system_instruction_bytes = language_model_system_instructions(
             &config.provider,
             &config.model,
@@ -2306,6 +2333,13 @@ impl ContextAssembler {
                 bytes: budget_estimate.workspace_facts_bytes,
             },
         ];
+        if let Some(context) = transient_system_context {
+            included.push(ContextSource {
+                kind: "transient_system_context".to_string(),
+                label: "surface-owned turn instructions".to_string(),
+                bytes: context.len(),
+            });
+        }
         if session_projection_bytes > 0 {
             included.push(ContextSource {
                 kind: "session_projection".to_string(),
@@ -3322,6 +3356,14 @@ fn working_state_from_items(
                 state: coding_state,
                 ..
             } => {
+                // CodingRunState is the reducer's point-in-time view. A newer state supersedes
+                // validation failures and blockers from earlier attempts (for example after an
+                // environment repair and successful rerun) instead of making them permanent.
+                state.verification_state = agent_verification_state_from_coding_validation(
+                    &coding_state.validation_status,
+                );
+                state.blockers.clear();
+                state.open_risks.clear();
                 for changed_file in &coding_state.changed_files {
                     push_unique(&mut state.files_modified, changed_file.clone());
                 }
@@ -3331,7 +3373,17 @@ fn working_state_from_items(
                         format!("coding run blocked: {blocked_reason:?}"),
                     );
                 }
-                state.open_risks.extend(coding_state.open_risks.clone());
+                for risk in coding_state
+                    .open_risks
+                    .iter()
+                    .chain(&coding_state.outstanding_evidence)
+                {
+                    if risk == "no patch has been produced yet" && !state.files_modified.is_empty()
+                    {
+                        continue;
+                    }
+                    push_unique(&mut state.open_risks, risk.clone());
+                }
             }
             AgentItem::Error { detail, .. } => {
                 push_unique(&mut state.blockers, compact_multiline(detail, 500));
@@ -3399,6 +3451,21 @@ fn merge_verification_state(
             AgentVerificationState::Passed
         }
         _ => AgentVerificationState::NotRun,
+    }
+}
+
+fn agent_verification_state_from_coding_validation(
+    status: &CodingValidationStatus,
+) -> AgentVerificationState {
+    match status {
+        CodingValidationStatus::NotRun => AgentVerificationState::NotRun,
+        CodingValidationStatus::Passed => AgentVerificationState::Passed,
+        CodingValidationStatus::FailedEnvironment | CodingValidationStatus::FailedCommandSetup => {
+            AgentVerificationState::Blocked
+        }
+        CodingValidationStatus::FailedPatchRelevant
+        | CodingValidationStatus::TimedOut
+        | CodingValidationStatus::Inconclusive => AgentVerificationState::Failed,
     }
 }
 
@@ -5580,6 +5647,7 @@ where
 #[derive(Clone, Default)]
 pub struct AgentRuntimeStorage {
     memory_record_store: Option<Arc<dyn MemoryRecordStore>>,
+    durable_paths: Option<AgentStoragePaths>,
 }
 
 impl AgentRuntimeStorage {
@@ -5588,7 +5656,10 @@ impl AgentRuntimeStorage {
     }
 
     pub fn from_data_dir(data_dir: &SinomoDataDir) -> Self {
-        Self::new().with_memory_record_store(DurableMemoryStore::from_data_dir(data_dir))
+        Self {
+            memory_record_store: Some(Arc::new(DurableMemoryStore::from_data_dir(data_dir))),
+            durable_paths: Some(AgentStoragePaths::from_data_dir(data_dir)),
+        }
     }
 
     pub fn with_memory_record_store<T>(mut self, store: T) -> Self
@@ -5608,17 +5679,37 @@ impl AgentRuntimeStorage {
         self.memory_record_store.clone()
     }
 
-    fn apply_to_agent<M>(&self, agent: Agent<M>) -> Agent<M>
+    pub fn load_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<AgentSession>, AgentSessionStoreError> {
+        let Some(paths) = &self.durable_paths else {
+            return Ok(None);
+        };
+        FileAgentSessionStore::new(paths.clone()).load_session(session_id)
+    }
+
+    fn apply_to_agent<M>(&self, mut agent: Agent<M>, _session_id: &SessionId) -> Agent<M>
     where
         M: InteractionModel,
     {
-        match (
+        agent = match (
             agent.memory_record_store.is_some() || agent.memory_context_provider.is_some(),
             &self.memory_record_store,
         ) {
             (false, Some(store)) => agent.with_shared_memory_store(store.clone()),
             _ => agent,
+        };
+        if let Some(paths) = &self.durable_paths {
+            if !agent.session_store_configured {
+                agent = agent.with_session_store(FileAgentSessionStore::new(paths.clone()));
+            }
+            if !agent.trace_store_configured {
+                agent =
+                    agent.with_trace_store(SessionRoutedFileAgentTraceStore::new(paths.clone()));
+            }
         }
+        agent
     }
 }
 
@@ -5642,7 +5733,8 @@ where
         session: AgentSession,
         storage: AgentRuntimeStorage,
     ) -> Self {
-        Self::new(storage.apply_to_agent(agent), session)
+        let session_id = session.session_id.clone();
+        Self::new(storage.apply_to_agent(agent, &session_id), session)
     }
 
     pub fn with_data_dir_storage(
@@ -7471,6 +7563,8 @@ pub struct Agent<M> {
     compaction_engine: Arc<RwLock<Box<dyn AgentCompactionEngine<M>>>>,
     trace_store: Box<dyn AgentTraceStore>,
     session_store: Box<dyn AgentSessionStore>,
+    trace_store_configured: bool,
+    session_store_configured: bool,
 }
 
 impl<M: InteractionModel> Agent<M> {
@@ -7493,6 +7587,8 @@ impl<M: InteractionModel> Agent<M> {
             ))),
             trace_store: Box::new(NoopAgentTraceStore),
             session_store: Box::new(NoopAgentSessionStore),
+            trace_store_configured: false,
+            session_store_configured: false,
         }
     }
 
@@ -7603,11 +7699,13 @@ impl<M: InteractionModel> Agent<M> {
 
     pub fn with_trace_store<T: AgentTraceStore + 'static>(mut self, trace_store: T) -> Self {
         self.trace_store = Box::new(trace_store);
+        self.trace_store_configured = true;
         self
     }
 
     pub fn with_session_store<T: AgentSessionStore + 'static>(mut self, session_store: T) -> Self {
         self.session_store = Box::new(session_store);
+        self.session_store_configured = true;
         self
     }
 
@@ -7856,7 +7954,11 @@ impl<M: InteractionModel> Agent<M> {
             return;
         };
         let policy = MemoryPolicy::default();
-        let _ = store.promote_event(&input.latest_event, &policy);
+        if transient_system_context(input).is_none() {
+            let _ = store.promote_event(&input.latest_event, &policy);
+        }
+        // Keep useful turn outcomes, but never promote surface orchestration
+        // instructions themselves into durable user memory.
         if let Some(record) = completed_turn_memory_record(self.config.definition.key(), input, run)
         {
             let _ = store.write_record(record);
@@ -8279,7 +8381,6 @@ impl<M: InteractionModel> Agent<M> {
                 run_context: self.config.run_context.clone(),
             },
         )?;
-        let initial_input = render_initial_agent_input(input)?;
         let mut transcript = transcript_prefix;
         let mut queued_agent_item = None;
         let queued_turn_context = render_queued_turn_context(steering, follow_ups)
@@ -8300,23 +8401,32 @@ impl<M: InteractionModel> Agent<M> {
             queued_agent_item = Some(queued_item);
             transcript.push(item);
         }
-        transcript.push(AgentTranscriptItem::user(0, initial_input.clone()));
+        let mut items = queued_agent_item.into_iter().collect::<Vec<_>>();
+        if transient_system_context(input).is_none() {
+            let initial_input = render_initial_agent_input(input)?;
+            transcript.push(AgentTranscriptItem::user(0, initial_input.clone()));
+            let initial_item = AgentItem::UserMessage {
+                item_id: input
+                    .latest_event
+                    .payload
+                    .get("agent_item_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| value.parse::<TaskId>().ok())
+                    .unwrap_or_else(TaskId::generate),
+                step_index: 0,
+                content: initial_input,
+                event_id: Some(input.latest_event.event_id.clone()),
+            };
+            self.trace(
+                &input.session.session_id,
+                AgentTraceRecordKind::Item {
+                    item: initial_item.clone(),
+                },
+            )?;
+            items.push(initial_item);
+        }
         let mut model_turns = Vec::new();
         let mut tool_results = Vec::new();
-        let initial_item = AgentItem::UserMessage {
-            item_id: TaskId::generate(),
-            step_index: 0,
-            content: initial_input,
-            event_id: Some(input.latest_event.event_id.clone()),
-        };
-        self.trace(
-            &input.session.session_id,
-            AgentTraceRecordKind::Item {
-                item: initial_item.clone(),
-            },
-        )?;
-        let mut items = queued_agent_item.into_iter().collect::<Vec<_>>();
-        items.push(initial_item);
         let mut context_reports = Vec::new();
         let mut model_events = Vec::new();
         let mut compactions = Vec::new();
@@ -9299,6 +9409,14 @@ fn render_initial_agent_input(input: &AgentLoopInput) -> Result<String, AgentErr
     .map_err(|source| AgentError::ModelRequest {
         detail: source.to_string(),
     })
+}
+
+fn transient_system_context(input: &AgentLoopInput) -> Option<&str> {
+    input
+        .transient_system_context
+        .as_deref()
+        .map(str::trim)
+        .filter(|context| !context.is_empty())
 }
 
 fn render_queued_turn_context(
@@ -11179,6 +11297,7 @@ mod tests {
         AgentLoopInput {
             session,
             latest_event,
+            transient_system_context: None,
             async_update: None,
             context_attachments: Vec::new(),
             tool_specs: default_coding_agent_tools(),
@@ -12394,6 +12513,107 @@ mod tests {
     }
 
     #[test]
+    fn transient_system_context_stays_out_of_two_turn_persisted_session() {
+        let data_root = sinomo_testdir::TestDir::new("sinomo-agent-transient-turn-context");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let store = crate::FileAgentSessionStore::for_data_dir(&data_dir);
+        let model = SequencedModel::new([
+            r#"{
+                "response_mode": "answer",
+                "text": "First channel reply.",
+                "tool_calls": [],
+                "background_handoff": null,
+                "next_state": "listening"
+            }"#,
+            r#"{
+                "response_mode": "answer",
+                "text": "Second channel reply.",
+                "tool_calls": [],
+                "background_handoff": null,
+                "next_state": "listening"
+            }"#,
+        ]);
+        let agent = Agent::new(model, "fake", "fake").with_session_store(store.clone());
+        let mut first_input = agent_input("");
+        first_input.transient_system_context =
+            Some("CHANNEL_CONTROL_TURN_ONE: reply only when useful".to_string());
+        let mut session =
+            AgentSession::new(first_input.session.session_id.clone(), AgentRole::Main);
+
+        let first_visible = AgentItem::UserMessage {
+            item_id: TaskId::generate(),
+            step_index: 0,
+            content: "User: first visible channel message".to_string(),
+            event_id: None,
+        };
+        session.transcript.push(first_visible.clone());
+        session.raw_transcript.push(first_visible);
+        agent
+            .start_turn(&mut session, &first_input)
+            .expect("first transient channel turn");
+
+        let second_visible = AgentItem::UserMessage {
+            item_id: TaskId::generate(),
+            step_index: 1,
+            content: "User: second visible channel message".to_string(),
+            event_id: None,
+        };
+        session.transcript.push(second_visible.clone());
+        session.raw_transcript.push(second_visible);
+        let mut second_input = agent_input("");
+        second_input.transient_system_context =
+            Some("CHANNEL_CONTROL_TURN_TWO: stay concise".to_string());
+        agent
+            .start_turn(&mut session, &second_input)
+            .expect("second transient channel turn");
+
+        let loaded = store
+            .load_session(&first_input.session.session_id)
+            .expect("load persisted session")
+            .expect("persisted session");
+        for transcript in [&loaded.transcript, &loaded.raw_transcript] {
+            let user_messages = transcript
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    AgentItem::UserMessage { content, .. } => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                user_messages,
+                vec![
+                    "User: first visible channel message",
+                    "User: second visible channel message"
+                ],
+                "each visible channel message must have exactly one durable representation"
+            );
+            assert!(
+                transcript.items.iter().all(|item| {
+                    !serde_json::to_string(item)
+                        .expect("serialize transcript item")
+                        .contains("CHANNEL_CONTROL_TURN_")
+                }),
+                "transient channel control context must not accumulate in persisted prompts"
+            );
+        }
+
+        let requests = agent.model.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        let system_message = |request: &LanguageModelRequest| {
+            request
+                .messages
+                .iter()
+                .find(|message| message.role == LanguageModelRole::System)
+                .map(|message| message.content.clone())
+                .expect("system message")
+        };
+        assert!(system_message(&requests[0]).contains("CHANNEL_CONTROL_TURN_ONE"));
+        assert!(system_message(&requests[1]).contains("CHANNEL_CONTROL_TURN_TWO"));
+        assert!(!system_message(&requests[1]).contains("CHANNEL_CONTROL_TURN_ONE"));
+    }
+
+    #[test]
     fn explicit_compaction_preserves_raw_history_and_records_working_state() {
         let model = SequencedModel::new(Vec::<String>::new());
         let agent = Agent::new(model, "fake", "fake").with_compactor(AgentCompactor {
@@ -12446,6 +12666,44 @@ mod tests {
                 .first()
                 .is_some_and(|item| matches!(item, AgentItem::CompactionSummary { .. }))
         );
+    }
+
+    #[test]
+    fn compaction_working_state_uses_latest_coding_validation_and_blockers() {
+        let changed_files = vec!["src/lib.rs".to_string()];
+        let items = vec![
+            AgentItem::CodingRunState {
+                item_id: TaskId::generate(),
+                step_index: 1,
+                state: CodingRunState {
+                    changed_files: changed_files.clone(),
+                    patch_status: CodingPatchStatus::Applied,
+                    validation_status: CodingValidationStatus::FailedEnvironment,
+                    blocked_reason: Some(CodingBlockedReason::Environment),
+                    open_risks: vec!["cargo was denied by the old sandbox policy".to_string()],
+                    ..CodingRunState::default()
+                },
+            },
+            AgentItem::CodingRunState {
+                item_id: TaskId::generate(),
+                step_index: 2,
+                state: CodingRunState {
+                    changed_files,
+                    patch_status: CodingPatchStatus::Applied,
+                    validation_status: CodingValidationStatus::Passed,
+                    outstanding_evidence: vec!["no patch has been produced yet".to_string()],
+                    stop_recommendation: CodingStopDecision::FinishWithPatch,
+                    ..CodingRunState::default()
+                },
+            },
+        ];
+
+        let state = working_state_from_items(&items, &[], &[], None);
+
+        assert_eq!(state.verification_state, AgentVerificationState::Passed);
+        assert!(state.blockers.is_empty());
+        assert!(state.open_risks.is_empty());
+        assert!(state.next_action.is_none());
     }
 
     #[test]
@@ -18474,6 +18732,140 @@ old
         assert_eq!(
             control.snapshot().tasks[0].status,
             AgentTaskLifecycleStatus::TimedOut
+        );
+    }
+
+    #[test]
+    fn agent_session_runtime_with_data_dir_storage_persists_completed_session_and_trace() {
+        let data_root = sinomo_testdir::TestDir::new("sinomo-agent-runtime-storage");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let input = agent_input("persist this completed runtime turn");
+        let session_id = input.session.session_id.clone();
+        let agent = Agent::new(
+            SequencedModel::new([r#"{
+                "response_mode": "answer",
+                "text": "Persisted runtime answer.",
+                "tool_calls": [],
+                "background_handoff": null,
+                "next_state": "listening"
+            }"#]),
+            "fake",
+            "fake",
+        );
+        let runtime = AgentSessionRuntime::with_data_dir_storage(
+            agent,
+            AgentSession::new(session_id.clone(), AgentRole::Main),
+            &data_dir,
+        );
+
+        let op = AgentOp::start_turn(input);
+        let op_id = op.op_id.clone();
+        let submitted = runtime.submit_op(op).expect("submit persisted turn");
+        assert!(submitted.accepted);
+        runtime.join_active_turn().expect("join persisted turn");
+        assert_eq!(
+            runtime
+                .turn_result(&op_id)
+                .expect("turn result")
+                .and_then(|outcome| outcome.run)
+                .expect("completed run")
+                .final_decision
+                .text,
+            "Persisted runtime answer."
+        );
+        let completed_session = runtime.session_snapshot().expect("completed session");
+        assert!(!completed_session.transcript.items.is_empty());
+        drop(runtime);
+
+        let storage = AgentRuntimeStorage::from_data_dir(&data_dir);
+        let loaded = storage
+            .load_session(&session_id)
+            .expect("reload runtime session")
+            .expect("persisted runtime session");
+        assert_eq!(loaded, completed_session);
+
+        let paths = AgentStoragePaths::from_data_dir(&data_dir);
+        assert!(
+            paths
+                .session_snapshot_path_for_session(&session_id)
+                .is_file()
+        );
+        let trace_records = fs::read_to_string(paths.trace_path_for_session(&session_id))
+            .expect("persisted runtime trace")
+            .lines()
+            .map(|line| serde_json::from_str::<AgentTraceRecord>(line).expect("trace record"))
+            .collect::<Vec<_>>();
+        assert!(
+            trace_records
+                .iter()
+                .all(|record| record.session_id == session_id)
+        );
+        assert!(
+            trace_records
+                .iter()
+                .any(|record| { matches!(record.record, AgentTraceRecordKind::RunStarted { .. }) })
+        );
+        assert!(trace_records.iter().any(|record| {
+            matches!(
+                &record.record,
+                AgentTraceRecordKind::RunCompleted { final_decision, .. }
+                    if final_decision.text == "Persisted runtime answer."
+            )
+        }));
+    }
+
+    #[test]
+    fn data_dir_runtime_routes_traces_after_session_replacement() {
+        let data_root = sinomo_testdir::TestDir::new("sinomo-agent-runtime-trace-routing");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let first_session_id = SessionId::generate();
+        let second_input = agent_input("trace only the replacement session");
+        let second_session_id = second_input.session.session_id.clone();
+        let agent = Agent::new(
+            SequencedModel::new([r#"{
+                "response_mode": "answer",
+                "text": "Replacement session answer.",
+                "tool_calls": [],
+                "background_handoff": null,
+                "next_state": "listening"
+            }"#]),
+            "fake",
+            "fake",
+        );
+        let runtime = AgentSessionRuntime::with_data_dir_storage(
+            agent,
+            AgentSession::new(first_session_id.clone(), AgentRole::Main),
+            &data_dir,
+        );
+        runtime
+            .replace_session(AgentSession::new(
+                second_session_id.clone(),
+                AgentRole::Main,
+            ))
+            .expect("replace runtime session");
+
+        let op = AgentOp::start_turn(second_input);
+        assert!(runtime.submit_op(op).expect("submit turn").accepted);
+        runtime.join_active_turn().expect("join replacement turn");
+
+        let paths = AgentStoragePaths::from_data_dir(&data_dir);
+        let second_trace = fs::read_to_string(paths.trace_path_for_session(&second_session_id))
+            .expect("replacement session trace");
+        assert!(!second_trace.trim().is_empty());
+        assert!(second_trace.lines().all(|line| {
+            serde_json::from_str::<AgentTraceRecord>(line)
+                .expect("trace record")
+                .session_id
+                == second_session_id
+        }));
+        let first_trace_path = paths.trace_path_for_session(&first_session_id);
+        assert!(
+            !first_trace_path.exists()
+                || fs::read_to_string(&first_trace_path)
+                    .expect("initial trace")
+                    .trim()
+                    .is_empty(),
+            "replacement turn must not cross-file traces into the initial session"
         );
     }
 

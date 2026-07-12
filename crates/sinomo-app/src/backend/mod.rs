@@ -16,7 +16,6 @@ pub mod evolution;
 pub mod modules;
 pub mod sifs;
 
-#[cfg(test)]
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
@@ -104,8 +103,10 @@ pub struct Backend {
     pub agent_runtime_control: sinomo_agent::AgentRuntimeControlRegistry,
     /// Keeps an app-started in-process daemon alive; `None` when attached to an external one.
     _daemon: Option<Arc<InProcessDaemon>>,
-    #[cfg(test)]
-    _test_data_dir_cleanup: Option<Arc<TestDataDirCleanup>>,
+    /// Keeps the isolated data directory used by [`Backend::local_fallback`] alive for exactly as
+    /// long as the headless backend. Integration tests compile this crate without `cfg(test)`, so
+    /// this cannot be test-only without silently falling back to the operator's real data dir.
+    _local_fallback_data_dir_cleanup: Option<Arc<LocalFallbackDataDirCleanup>>,
 }
 
 impl Backend {
@@ -174,8 +175,7 @@ impl Backend {
             config,
             agent_runtime_control,
             _daemon: daemon,
-            #[cfg(test)]
-            _test_data_dir_cleanup: None,
+            _local_fallback_data_dir_cleanup: None,
         }
     }
 
@@ -183,17 +183,10 @@ impl Backend {
     /// visual tests, which render the UI without the async connection (and without standing up a
     /// real daemon).
     pub fn local_fallback() -> Self {
-        let (data_dir, _test_data_dir_cleanup) = local_fallback_data_dir();
-        #[cfg(test)]
-        {
-            let mut backend = Self::local_fallback_for_data_dir(data_dir);
-            backend._test_data_dir_cleanup = _test_data_dir_cleanup;
-            backend
-        }
-        #[cfg(not(test))]
-        {
-            Self::local_fallback_for_data_dir(data_dir)
-        }
+        let (data_dir, cleanup) = local_fallback_data_dir();
+        let mut backend = Self::local_fallback_for_data_dir(data_dir);
+        backend._local_fallback_data_dir_cleanup = Some(cleanup);
+        backend
     }
 
     /// Build a daemonless backend around an explicit data directory. This is intended for
@@ -218,8 +211,7 @@ impl Backend {
             config,
             agent_runtime_control: sinomo_agent::AgentRuntimeControlRegistry::new(),
             _daemon: None,
-            #[cfg(test)]
-            _test_data_dir_cleanup: None,
+            _local_fallback_data_dir_cleanup: None,
         }
     }
 
@@ -384,13 +376,7 @@ pub(crate) fn run_with_timeout<T: Send + 'static>(
     }
 }
 
-#[cfg(not(test))]
-fn local_fallback_data_dir() -> (SinomoDataDir, ()) {
-    (app_config::default_data_dir(), ())
-}
-
-#[cfg(test)]
-fn local_fallback_data_dir() -> (SinomoDataDir, Option<Arc<TestDataDirCleanup>>) {
+fn local_fallback_data_dir() -> (SinomoDataDir, Arc<LocalFallbackDataDirCleanup>) {
     let path = std::env::temp_dir().join(format!(
         "sinomo-app-local-fallback-test-{}-{}",
         std::process::id(),
@@ -400,17 +386,15 @@ fn local_fallback_data_dir() -> (SinomoDataDir, Option<Arc<TestDataDirCleanup>>)
             .as_nanos()
     ));
     let _ = std::fs::remove_dir_all(&path);
-    let cleanup = Arc::new(TestDataDirCleanup { path: path.clone() });
-    (SinomoDataDir::new(path), Some(cleanup))
+    let cleanup = Arc::new(LocalFallbackDataDirCleanup { path: path.clone() });
+    (SinomoDataDir::new(path), cleanup)
 }
 
-#[cfg(test)]
-struct TestDataDirCleanup {
+struct LocalFallbackDataDirCleanup {
     path: PathBuf,
 }
 
-#[cfg(test)]
-impl Drop for TestDataDirCleanup {
+impl Drop for LocalFallbackDataDirCleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }

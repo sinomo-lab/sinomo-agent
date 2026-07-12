@@ -75,12 +75,12 @@ use sinomo_agent::{
     AgentChannelMessageKind, AgentChannelStore,
 };
 use sinomo_cli::app_api::{
-    AgentChannelMessagePage, AgentChannelTimelineOverview, AgentChannelTimelineSegment,
-    AgentChatSifsStorage, AgentSummary, ChatAttachmentInput, ChatContextSnapshot,
-    ChatHistoryMessage, ChatProcessSnapshot, ChatQueuedTurnInput, ChatQueuedTurnInputKind,
-    ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection, ChatUsageSnapshot,
-    ProviderSummary, SifsAgentChannelStore, agent_summaries, agent_summaries_with_error,
-    built_in_agent_summaries, reasoning_efforts,
+    AgentChannelMessagePage, AgentChannelMessageReconciliation, AgentChannelTimelineOverview,
+    AgentChannelTimelineSegment, AgentChatSifsStorage, AgentSummary, ChatAttachmentInput,
+    ChatContextSnapshot, ChatHistoryMessage, ChatProcessSnapshot, ChatQueuedTurnInput,
+    ChatQueuedTurnInputKind, ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection,
+    ChatUsageSnapshot, ProviderSummary, SifsAgentChannelStore, agent_summaries,
+    agent_summaries_with_error, built_in_agent_summaries, reasoning_efforts,
 };
 use sinomo_runtime::{config::ConfigClient, events::SessionId, local::SinomoDataDir};
 
@@ -143,6 +143,10 @@ const COMPOSER_INPUT_PAD_Y: f32 = 14.0;
 const COMPOSER_HINT_MIN_W: f32 = 560.0;
 const SESSION_LIST_UI_TIMEOUT: Duration = Duration::from_secs(8);
 const TRANSCRIPT_LOAD_UI_TIMEOUT: Duration = Duration::from_secs(8);
+/// Poll SIFS for remote-device catalog and timeline changes. SIFS remains the
+/// source of truth; this is only a bounded UI refresh cadence until DFS watch
+/// cursors are exposed through the app API.
+pub(crate) const MULTI_DEVICE_SYNC_INTERVAL_SECS: f64 = 2.0;
 /// Budget for the background SIFS-backed agent-catalog load; past this the app
 /// keeps the built-in agents and reports the catalog as degraded.
 const AGENT_CATALOG_LOAD_TIMEOUT: Duration = Duration::from_secs(10);
@@ -173,6 +177,9 @@ pub struct ChatMessage {
     pub text: String,
     pub source: ChatMessageSource,
     pub kind: ChatMessageKind,
+    /// Stable identity of a durable SIFS channel message. Local streaming and
+    /// placeholder rows have no id until they are reloaded from the store.
+    pub message_id: Option<String>,
     sequence: Option<u64>,
 }
 
@@ -197,6 +204,7 @@ impl ChatMessage {
             text: text.into(),
             source: ChatMessageSource::User,
             kind: ChatMessageKind::Message,
+            message_id: None,
             sequence: None,
         }
     }
@@ -207,6 +215,7 @@ impl ChatMessage {
             text: text.into(),
             source: ChatMessageSource::Model,
             kind: ChatMessageKind::Message,
+            message_id: None,
             sequence: None,
         }
     }
@@ -217,6 +226,7 @@ impl ChatMessage {
             text: text.into(),
             source: ChatMessageSource::System,
             kind: ChatMessageKind::Info,
+            message_id: None,
             sequence: None,
         }
     }
@@ -227,10 +237,18 @@ impl ChatMessage {
             text: text.into(),
             source: ChatMessageSource::System,
             kind: ChatMessageKind::Error,
+            message_id: None,
             sequence: None,
         }
     }
 
+    fn with_durable_identity(mut self, message_id: impl Into<String>, sequence: u64) -> Self {
+        self.message_id = Some(message_id.into());
+        self.sequence = Some(sequence);
+        self
+    }
+
+    #[cfg(test)]
     fn with_sequence(mut self, sequence: u64) -> Self {
         self.sequence = Some(sequence);
         self
@@ -868,6 +886,7 @@ struct ConversationTimelineState {
     has_older: bool,
     has_newer: bool,
     overview: Vec<ConversationTimelineSegment>,
+    discovered_message_ids: BTreeSet<String>,
 }
 
 impl ConversationTimelineState {
@@ -1010,14 +1029,23 @@ impl From<AgentChannelTimelineSegment> for ConversationTimelineSegment {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TranscriptLoadMode {
     Initial,
-    Older { before_sequence: u64 },
-    Newer { after_sequence: u64 },
+    Older {
+        before_sequence: u64,
+    },
+    Newer {
+        after_sequence: u64,
+    },
+    /// Re-read the bounded durable tail and reconcile it by stable message id.
+    /// Numeric cursors alone can miss a delayed record that is resequenced into
+    /// an already-loaded range.
+    ReconcileLatest,
 }
 
 struct ConversationTimelineLoad {
     messages: Vec<ChatMessage>,
     page: AgentChannelMessagePage,
     overview: Option<AgentChannelTimelineOverview>,
+    discovered_message_ids: Vec<String>,
 }
 
 /// State backing the chat tab.
@@ -1100,6 +1128,7 @@ pub struct ChatState {
     session_list_slow_notice_shown: bool,
     session_list_details_open: bool,
     session_list_refresh_queued: bool,
+    session_list_timeline_refresh_started: bool,
     channel_agent_idx: usize,
     /// Narrow-layout access to the agents/conversations surface. This is kept
     /// separately from session-edit state so opening a row editor can replace
@@ -1326,6 +1355,7 @@ impl ChatState {
             session_list_slow_notice_shown: false,
             session_list_details_open: false,
             session_list_refresh_queued: false,
+            session_list_timeline_refresh_started: false,
             channel_agent_idx: 0,
             compact_drawer_open: false,
         };
@@ -1553,6 +1583,7 @@ impl ChatState {
         }
         self.session_list_slow_notice_shown = false;
         self.session_list_details_open = false;
+        self.session_list_timeline_refresh_started = false;
         let (tx, rx) = mpsc::channel();
         let data_dir = self.data_dir.clone();
         let sifs_daemon = self.sifs_daemon.clone();
@@ -1612,8 +1643,20 @@ impl ChatState {
         self.session_list_started_at = Some(Instant::now());
     }
 
-    pub fn session_list_is_loading(&self) -> bool {
-        self.session_list_loading
+    /// Start a non-blocking refresh of the conversation catalog and the open
+    /// timeline. Calls are coalesced with in-flight workers, so the shell may
+    /// invoke this on every multi-device sync timer tick.
+    pub(crate) fn begin_multi_device_sync(&mut self) {
+        if !self.session_list_loading {
+            self.start_session_list_load(self.ui_waker.clone());
+        }
+        if !self.streaming
+            && !self.transcript_load_pending()
+            && let Some(session) = self.current_session_ref().cloned()
+        {
+            self.start_transcript_load(session, TranscriptLoadMode::ReconcileLatest);
+            self.session_list_timeline_refresh_started = true;
+        }
     }
 
     fn toggle_session_list_details(&mut self) {
@@ -1675,6 +1718,7 @@ impl ChatState {
                 self.session_list_started_at = None;
                 self.session_list_slow_notice_shown = false;
                 self.session_list_details_open = false;
+                self.session_list_timeline_refresh_started = false;
                 if std::mem::take(&mut self.session_list_refresh_queued) {
                     self.start_session_list_load(self.ui_waker.clone());
                 }
@@ -1719,6 +1763,16 @@ impl ChatState {
                 }
             }
         }
+        let timeline_refresh_already_started =
+            complete && std::mem::take(&mut self.session_list_timeline_refresh_started);
+        if complete
+            && !timeline_refresh_already_started
+            && !self.streaming
+            && !self.transcript_load_pending()
+            && let Some(session) = self.current_session_ref().cloned()
+        {
+            self.start_transcript_load(session, TranscriptLoadMode::ReconcileLatest);
+        }
     }
 
     fn upsert_session_ref(&mut self, session: SessionRef) {
@@ -1734,6 +1788,7 @@ impl ChatState {
         self.session_list_slow_notice_shown = false;
         self.session_list_details_open = false;
         self.session_list_refresh_queued = false;
+        self.session_list_timeline_refresh_started = false;
     }
 
     fn retry_chat_list_with_waker(&mut self, waker: Option<sui::UiHandle>) {
@@ -3215,6 +3270,7 @@ impl ChatState {
         let (tx, rx) = mpsc::channel();
         let data_dir = self.data_dir.clone();
         let sifs_daemon = self.sifs_daemon.clone();
+        let known_message_ids = self.timeline.discovered_message_ids.clone();
         let worker_session = session.clone();
         let worker_waker = self.ui_waker.clone();
         let spawn_result = thread::Builder::new()
@@ -3226,6 +3282,7 @@ impl ChatState {
                     &worker_session.id,
                     worker_session.kind,
                     mode,
+                    &known_message_ids,
                 );
                 let _ = tx.send(TranscriptLoadWorkerResult {
                     session: worker_session,
@@ -3330,93 +3387,127 @@ impl ChatState {
             return;
         }
         match result.result {
-            Ok(load) => match result.mode {
-                TranscriptLoadMode::Initial => {
-                    let history: Vec<ChatHistoryMessage> = load
-                        .messages
-                        .iter()
-                        .map(|m| ChatHistoryMessage {
-                            role: m.history_role().to_string(),
-                            text: m.text.clone(),
-                        })
-                        .collect();
-                    self.messages = load.messages;
-                    self.timeline.apply_page(&load.page);
-                    if let Some(overview) = load.overview {
-                        self.timeline.apply_overview(overview);
-                    }
-                    self.activity.retain(|entry| entry.title != "chat load");
-                    if self.notice.as_deref().is_some_and(|notice| {
-                        notice.starts_with("chat load failed:")
-                            || notice == "wait for this chat history to finish loading"
-                    }) {
-                        self.notice = None;
-                    }
-                    self.scroll = f32::MAX;
-                    self.stick_bottom = true;
-                    self.handle.send_command(ChatCommand::Resume {
-                        session_id: result.session.id,
-                        history,
-                    });
-                }
-                TranscriptLoadMode::Older { before_sequence } => {
-                    let added = prepend_timeline_messages(&mut self.messages, load.messages);
-                    self.timeline.apply_older_page(&load.page);
-                    let pruned = trim_timeline_window(&mut self.messages, TimelineTrimEdge::End);
-                    self.timeline
-                        .refresh_loaded_range_from_messages(&self.messages);
-                    if pruned > 0 {
-                        self.timeline.has_newer = true;
-                    }
-                    if added > 0 {
-                        self.scroll += added as f32 * TRANSCRIPT_PREPEND_ESTIMATED_MESSAGE_H;
-                        self.stick_bottom = false;
-                    }
-                    self.activity.retain(|entry| entry.title != "chat load");
-                    self.replace_activity(
-                        "chat history",
-                        if added == 0 {
-                            format!("No older messages before {before_sequence}")
-                        } else {
-                            format!(
-                                "Loaded {added} older message{}",
-                                if added == 1 { "" } else { "s" }
-                            )
-                        },
-                        ActivityTone::Good,
-                    );
-                }
-                TranscriptLoadMode::Newer { after_sequence } => {
-                    let added = append_timeline_messages(&mut self.messages, load.messages);
-                    self.timeline.apply_newer_page(&load.page);
-                    let pruned = trim_timeline_window(&mut self.messages, TimelineTrimEdge::Start);
-                    self.timeline
-                        .refresh_loaded_range_from_messages(&self.messages);
-                    if pruned > 0 {
-                        self.timeline.has_older = true;
-                        self.scroll = (self.scroll
-                            - pruned as f32 * TRANSCRIPT_PREPEND_ESTIMATED_MESSAGE_H)
-                            .max(0.0);
-                    }
-                    if !self.timeline.has_newer {
+            Ok(mut load) => {
+                self.timeline
+                    .discovered_message_ids
+                    .extend(std::mem::take(&mut load.discovered_message_ids));
+                match result.mode {
+                    TranscriptLoadMode::Initial => {
+                        let history: Vec<ChatHistoryMessage> = load
+                            .messages
+                            .iter()
+                            .map(|m| ChatHistoryMessage {
+                                role: m.history_role().to_string(),
+                                text: m.text.clone(),
+                            })
+                            .collect();
+                        self.messages = load.messages;
+                        self.timeline.apply_page(&load.page);
+                        if let Some(overview) = load.overview {
+                            self.timeline.apply_overview(overview);
+                        }
+                        self.activity.retain(|entry| entry.title != "chat load");
+                        if self.notice.as_deref().is_some_and(|notice| {
+                            notice.starts_with("chat load failed:")
+                                || notice == "wait for this chat history to finish loading"
+                        }) {
+                            self.notice = None;
+                        }
                         self.scroll = f32::MAX;
                         self.stick_bottom = true;
+                        self.handle.send_command(ChatCommand::Resume {
+                            session_id: result.session.id,
+                            history,
+                        });
                     }
-                    self.activity.retain(|entry| entry.title != "chat load");
-                    self.replace_activity(
-                        "chat history",
-                        if added == 0 {
-                            format!("No newer messages after {after_sequence}")
-                        } else {
-                            format!(
-                                "Loaded {added} newer message{}",
-                                if added == 1 { "" } else { "s" }
-                            )
-                        },
-                        ActivityTone::Good,
-                    );
+                    TranscriptLoadMode::Older { before_sequence } => {
+                        let added = prepend_timeline_messages(&mut self.messages, load.messages);
+                        self.timeline.apply_older_page(&load.page);
+                        let pruned =
+                            trim_timeline_window(&mut self.messages, TimelineTrimEdge::End);
+                        self.timeline
+                            .refresh_loaded_range_from_messages(&self.messages);
+                        if pruned > 0 {
+                            self.timeline.has_newer = true;
+                        }
+                        if added > 0 {
+                            self.scroll += added as f32 * TRANSCRIPT_PREPEND_ESTIMATED_MESSAGE_H;
+                            self.stick_bottom = false;
+                        }
+                        self.activity.retain(|entry| entry.title != "chat load");
+                        self.replace_activity(
+                            "chat history",
+                            if added == 0 {
+                                format!("No older messages before {before_sequence}")
+                            } else {
+                                format!(
+                                    "Loaded {added} older message{}",
+                                    if added == 1 { "" } else { "s" }
+                                )
+                            },
+                            ActivityTone::Good,
+                        );
+                    }
+                    TranscriptLoadMode::Newer { .. } => {
+                        let added = append_timeline_messages(&mut self.messages, load.messages);
+                        self.timeline.apply_newer_page(&load.page);
+                        let pruned =
+                            trim_timeline_window(&mut self.messages, TimelineTrimEdge::Start);
+                        self.timeline
+                            .refresh_loaded_range_from_messages(&self.messages);
+                        if pruned > 0 {
+                            self.timeline.has_older = true;
+                            self.scroll = (self.scroll
+                                - pruned as f32 * TRANSCRIPT_PREPEND_ESTIMATED_MESSAGE_H)
+                                .max(0.0);
+                        }
+                        if !self.timeline.has_newer {
+                            self.scroll = f32::MAX;
+                            self.stick_bottom = true;
+                        }
+                        self.activity.retain(|entry| entry.title != "chat load");
+                        if added > 0 {
+                            self.replace_activity(
+                                "chat history",
+                                format!(
+                                    "Loaded {added} newer message{}",
+                                    if added == 1 { "" } else { "s" }
+                                ),
+                                ActivityTone::Good,
+                            );
+                        }
+                    }
+                    TranscriptLoadMode::ReconcileLatest => {
+                        let added =
+                            reconcile_latest_timeline_messages(&mut self.messages, load.messages);
+                        self.timeline.apply_newer_page(&load.page);
+                        let pruned =
+                            trim_timeline_window(&mut self.messages, TimelineTrimEdge::Start);
+                        self.timeline
+                            .refresh_loaded_range_from_messages(&self.messages);
+                        if pruned > 0 {
+                            self.timeline.has_older = true;
+                            self.scroll = (self.scroll
+                                - pruned as f32 * TRANSCRIPT_PREPEND_ESTIMATED_MESSAGE_H)
+                                .max(0.0);
+                        }
+                        if !self.timeline.has_newer && self.stick_bottom {
+                            self.scroll = f32::MAX;
+                        }
+                        self.activity.retain(|entry| entry.title != "chat load");
+                        if added > 0 {
+                            self.replace_activity(
+                                "chat history",
+                                format!(
+                                    "Synced {added} message{} from another device",
+                                    if added == 1 { "" } else { "s" }
+                                ),
+                                ActivityTone::Good,
+                            );
+                        }
+                    }
                 }
-            },
+            }
             Err(detail) => {
                 if result.mode == TranscriptLoadMode::Initial {
                     self.messages = vec![transcript_load_error_message(result.session.kind)];
@@ -5434,10 +5525,13 @@ fn rename_chat_channel(
 
 #[cfg(test)]
 fn channel_messages(channel: &AgentChannel) -> Vec<ChatMessage> {
-    channel_messages_from_agent(&channel.transcript)
+    channel_messages_from_agent(&channel.transcript, channel.channel_kind)
 }
 
-fn channel_messages_from_agent(messages: &[sinomo_agent::AgentChannelMessage]) -> Vec<ChatMessage> {
+fn channel_messages_from_agent(
+    messages: &[sinomo_agent::AgentChannelMessage],
+    channel_kind: AgentChannelKind,
+) -> Vec<ChatMessage> {
     messages
         .iter()
         .filter_map(|message| {
@@ -5447,6 +5541,9 @@ fn channel_messages_from_agent(messages: &[sinomo_agent::AgentChannelMessage]) -
             let content = visible_channel_message_text(message);
             let chat_message = match &message.author {
                 AgentChannelAuthor::User { .. } => ChatMessage::user(content),
+                AgentChannelAuthor::Agent { .. } if channel_kind == AgentChannelKind::Chat => {
+                    ChatMessage::model(content)
+                }
                 AgentChannelAuthor::Agent { agent_name, .. } => {
                     let label = if agent_name.trim().is_empty() {
                         "Agent"
@@ -5463,7 +5560,10 @@ fn channel_messages_from_agent(messages: &[sinomo_agent::AgentChannelMessage]) -
                     }
                 }
             };
-            Some(chat_message.with_sequence(message.sequence))
+            Some(
+                chat_message
+                    .with_durable_identity(message.message_id.to_string(), message.sequence),
+            )
         })
         .collect()
 }
@@ -5475,10 +5575,15 @@ fn load_conversation_messages(
     id: &str,
     kind: ConversationKind,
 ) -> Result<Vec<ChatMessage>, String> {
-    Ok(
-        load_conversation_timeline(data_dir, sifs_daemon, id, kind, TranscriptLoadMode::Initial)?
-            .messages,
-    )
+    Ok(load_conversation_timeline(
+        data_dir,
+        sifs_daemon,
+        id,
+        kind,
+        TranscriptLoadMode::Initial,
+        &BTreeSet::new(),
+    )?
+    .messages)
 }
 
 fn load_conversation_timeline(
@@ -5487,8 +5592,10 @@ fn load_conversation_timeline(
     id: &str,
     kind: ConversationKind,
     mode: TranscriptLoadMode,
+    known_message_ids: &BTreeSet<String>,
 ) -> Result<ConversationTimelineLoad, String> {
-    let timeline = load_channel_timeline_from_sifs(data_dir, sifs_daemon, id, mode)?;
+    let timeline =
+        load_channel_timeline_from_sifs(data_dir, sifs_daemon, id, mode, known_message_ids)?;
     match (timeline, kind) {
         (Some(timeline), _) => Ok(timeline),
         (None, ConversationKind::Chat) => {
@@ -5504,6 +5611,7 @@ fn load_channel_timeline_from_sifs(
     sifs_daemon: Option<&SifsDaemonAccess>,
     id: &str,
     mode: TranscriptLoadMode,
+    known_message_ids: &BTreeSet<String>,
 ) -> Result<Option<ConversationTimelineLoad>, String> {
     let channel_id = parse_channel_id(id).map_err(|error| error.to_string())?;
     let store =
@@ -5518,21 +5626,34 @@ fn load_channel_timeline_from_sifs(
     if summary.deleted_at.is_some() {
         return Ok(None);
     }
-    let page = match mode {
-        TranscriptLoadMode::Initial => {
-            store.load_recent_message_page(&channel_id, TRANSCRIPT_PAGE_SIZE)
-        }
-        TranscriptLoadMode::Older { before_sequence } => {
-            store.load_message_page_before(&channel_id, before_sequence, TRANSCRIPT_PAGE_SIZE)
-        }
-        TranscriptLoadMode::Newer { after_sequence } => store.load_message_page_from(
+    let reconciliation = match mode {
+        TranscriptLoadMode::Initial => store.load_message_reconciliation_page(
             &channel_id,
-            after_sequence.saturating_add(1),
+            &BTreeSet::new(),
+            TRANSCRIPT_PAGE_SIZE,
+        ),
+        TranscriptLoadMode::Older { before_sequence } => store
+            .load_message_page_before(&channel_id, before_sequence, TRANSCRIPT_PAGE_SIZE)
+            .map(reconciliation_from_page),
+        TranscriptLoadMode::Newer { after_sequence } => store
+            .load_message_page_from(
+                &channel_id,
+                after_sequence.saturating_add(1),
+                TRANSCRIPT_PAGE_SIZE,
+            )
+            .map(reconciliation_from_page),
+        TranscriptLoadMode::ReconcileLatest => store.load_message_reconciliation_page(
+            &channel_id,
+            known_message_ids,
             TRANSCRIPT_PAGE_SIZE,
         ),
     }
     .map_err(channel_store_io_error)
     .map_err(|error| error.to_string())?;
+    let AgentChannelMessageReconciliation {
+        page,
+        discovered_message_ids,
+    } = reconciliation;
     let overview = if mode == TranscriptLoadMode::Initial {
         Some(
             store
@@ -5544,10 +5665,23 @@ fn load_channel_timeline_from_sifs(
         None
     };
     Ok(Some(ConversationTimelineLoad {
-        messages: channel_messages_from_agent(&page.messages),
+        messages: channel_messages_from_agent(&page.messages, summary.channel_kind),
         page,
         overview,
+        discovered_message_ids,
     }))
+}
+
+fn reconciliation_from_page(page: AgentChannelMessagePage) -> AgentChannelMessageReconciliation {
+    let discovered_message_ids = page
+        .messages
+        .iter()
+        .map(|message| message.message_id.to_string())
+        .collect();
+    AgentChannelMessageReconciliation {
+        page,
+        discovered_message_ids,
+    }
 }
 
 fn empty_conversation_timeline_load(channel_id: SessionId) -> ConversationTimelineLoad {
@@ -5572,6 +5706,7 @@ fn empty_conversation_timeline_load(channel_id: SessionId) -> ConversationTimeli
             chunk_size: 0,
             segments: Vec::new(),
         }),
+        discovered_message_ids: Vec::new(),
     }
 }
 
@@ -5582,15 +5717,28 @@ enum TimelineTrimEdge {
 }
 
 fn prepend_timeline_messages(messages: &mut Vec<ChatMessage>, older: Vec<ChatMessage>) -> usize {
-    let mut existing = messages
+    let mut existing_ids = messages
+        .iter()
+        .filter_map(|message| message.message_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut existing_sequences = messages
         .iter()
         .filter_map(|message| message.sequence)
         .collect::<BTreeSet<_>>();
     let mut unique = older
         .into_iter()
-        .filter(|message| match message.sequence {
-            Some(sequence) => existing.insert(sequence),
-            None => true,
+        .filter(|message| match &message.message_id {
+            Some(message_id) => {
+                let unique = existing_ids.insert(message_id.clone());
+                if unique && let Some(sequence) = message.sequence {
+                    existing_sequences.insert(sequence);
+                }
+                unique
+            }
+            None => match message.sequence {
+                Some(sequence) => existing_sequences.insert(sequence),
+                None => true,
+            },
         })
         .collect::<Vec<_>>();
     let added = unique.len();
@@ -5600,21 +5748,130 @@ fn prepend_timeline_messages(messages: &mut Vec<ChatMessage>, older: Vec<ChatMes
 }
 
 fn append_timeline_messages(messages: &mut Vec<ChatMessage>, newer: Vec<ChatMessage>) -> usize {
-    let mut existing = messages
+    let mut existing_ids = messages
+        .iter()
+        .filter_map(|message| message.message_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut existing_sequences = messages
         .iter()
         .filter_map(|message| message.sequence)
         .collect::<BTreeSet<_>>();
     let mut added = 0;
     for message in newer {
-        if let Some(sequence) = message.sequence {
-            if !existing.insert(sequence) {
+        if let Some(message_id) = &message.message_id {
+            if !existing_ids.insert(message_id.clone()) {
                 continue;
             }
+            if let Some(sequence) = message.sequence {
+                existing_sequences.insert(sequence);
+            }
+        } else if let Some(sequence) = message.sequence
+            && !existing_sequences.insert(sequence)
+        {
+            continue;
         }
         messages.push(message);
         added += 1;
     }
     added
+}
+
+fn reconcile_latest_timeline_messages(
+    messages: &mut Vec<ChatMessage>,
+    latest: Vec<ChatMessage>,
+) -> usize {
+    let mut deduplicated = Vec::with_capacity(messages.len().saturating_add(latest.len()));
+    for message in messages.drain(..) {
+        if timeline_message_position(&deduplicated, &message).is_none() {
+            deduplicated.push(message);
+        }
+    }
+
+    // A just-sent user row (and its streamed response) is visible before the
+    // durable SIFS reload gives it an id. Keep the original contiguous
+    // ephemeral tail bounded here so backdated or remote records appended
+    // during reconciliation cannot consume those rows. Only records beyond
+    // the sequence range that was already durable may promote the tail.
+    let durable_sequence_floor = deduplicated
+        .iter()
+        .filter_map(|message| message.sequence)
+        .max()
+        .unwrap_or(0);
+    let ephemeral_tail_end = deduplicated.len();
+    let mut ephemeral_tail_cursor = deduplicated
+        .iter()
+        .rposition(|message| message.message_id.is_some() || message.sequence.is_some())
+        .map(|index| index + 1)
+        .unwrap_or(0);
+
+    let mut added = 0;
+    for message in latest {
+        if let Some(index) = timeline_message_position(&deduplicated, &message) {
+            deduplicated[index] = message;
+        } else if let Some(index) = matching_ephemeral_tail_position(
+            &deduplicated,
+            &message,
+            durable_sequence_floor,
+            ephemeral_tail_cursor,
+            ephemeral_tail_end,
+        ) {
+            deduplicated[index] = message;
+            ephemeral_tail_cursor = index + 1;
+        } else {
+            deduplicated.push(message);
+            added += 1;
+        }
+    }
+    deduplicated.sort_by(|left, right| match (left.sequence, right.sequence) {
+        (Some(left_sequence), Some(right_sequence)) => left_sequence
+            .cmp(&right_sequence)
+            .then_with(|| left.message_id.cmp(&right.message_id)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    *messages = deduplicated;
+    added
+}
+
+fn matching_ephemeral_tail_position(
+    messages: &[ChatMessage],
+    candidate: &ChatMessage,
+    durable_sequence_floor: u64,
+    tail_start: usize,
+    tail_end: usize,
+) -> Option<usize> {
+    let sequence = candidate.sequence?;
+    if candidate.message_id.is_none() || sequence <= durable_sequence_floor {
+        return None;
+    }
+    messages
+        .iter()
+        .enumerate()
+        .take(tail_end)
+        .skip(tail_start)
+        .find_map(|(index, message)| {
+            (message.message_id.is_none()
+                && message.sequence.is_none()
+                && message.role == candidate.role
+                && message.source == candidate.source
+                && message.kind == candidate.kind
+                && message.text == candidate.text)
+                .then_some(index)
+        })
+}
+
+fn timeline_message_position(messages: &[ChatMessage], candidate: &ChatMessage) -> Option<usize> {
+    if let Some(message_id) = candidate.message_id.as_deref() {
+        return messages
+            .iter()
+            .position(|message| message.message_id.as_deref() == Some(message_id));
+    }
+    candidate.sequence.and_then(|sequence| {
+        messages
+            .iter()
+            .position(|message| message.sequence == Some(sequence))
+    })
 }
 
 fn trim_timeline_window(messages: &mut Vec<ChatMessage>, edge: TimelineTrimEdge) -> usize {
@@ -5690,6 +5947,7 @@ fn transcript_load_failed_notice(mode: TranscriptLoadMode, detail: &str) -> Stri
         TranscriptLoadMode::Initial => format!("chat load failed: {detail}"),
         TranscriptLoadMode::Older { .. } => format!("older history load failed: {detail}"),
         TranscriptLoadMode::Newer { .. } => format!("newer history load failed: {detail}"),
+        TranscriptLoadMode::ReconcileLatest => format!("chat sync failed: {detail}"),
     }
 }
 
@@ -17053,6 +17311,7 @@ mod tests {
                         })
                     })
                     .collect(),
+                discovered_message_ids: BTreeSet::new(),
             };
             chat.stick_bottom = false;
             chat.scroll = 0.0;
@@ -17303,11 +17562,295 @@ mod tests {
         });
 
         assert_eq!(state.messages[0].text, "original prompt");
-        assert_eq!(state.messages[1].text, "main-agent: original answer");
+        assert_eq!(state.messages[1].text, "original answer");
         assert_eq!(state.notice, None);
         assert!(
             state.can_send(),
             "composer should become available after the transcript loads"
+        );
+    }
+
+    #[test]
+    fn reconcile_latest_deduplicates_by_id_and_resequences_backdated_records() {
+        let mut visible = vec![
+            ChatMessage::user("first").with_durable_identity("message-first", 1),
+            ChatMessage::user("second").with_durable_identity("message-second", 2),
+        ];
+        let latest = vec![
+            ChatMessage::user("arrived late").with_durable_identity("message-delayed", 1),
+            ChatMessage::user("first").with_durable_identity("message-first", 2),
+            ChatMessage::user("second").with_durable_identity("message-second", 3),
+        ];
+
+        assert_eq!(
+            reconcile_latest_timeline_messages(&mut visible, latest.clone()),
+            1,
+            "the delayed immutable record is the only new message"
+        );
+        assert_eq!(
+            visible
+                .iter()
+                .map(|message| (message.message_id.as_deref(), message.sequence))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("message-delayed"), Some(1)),
+                (Some("message-first"), Some(2)),
+                (Some("message-second"), Some(3)),
+            ],
+            "stable ids must update the old rows to their canonical resequenced positions"
+        );
+
+        assert_eq!(
+            reconcile_latest_timeline_messages(&mut visible, latest),
+            0,
+            "polling the same durable tail must be idempotent"
+        );
+        assert_eq!(visible.len(), 3);
+    }
+
+    #[test]
+    fn reconcile_latest_promotes_local_send_tail_without_collapsing_repeated_messages() {
+        let mut visible = vec![
+            ChatMessage::user("repeat").with_durable_identity("message-existing", 1),
+            ChatMessage::user("repeat"),
+            ChatMessage::model("response"),
+        ];
+        let latest = vec![
+            // This different durable message has the same contents but was
+            // backdated into the loaded range; it must be added, not matched
+            // to the pending local row at the tail.
+            ChatMessage::user("repeat").with_durable_identity("message-backdated", 1),
+            ChatMessage::user("repeat").with_durable_identity("message-existing", 2),
+            // These two records are the durable forms of the local send and
+            // streamed response already visible above.
+            ChatMessage::user("repeat").with_durable_identity("message-local-user", 3),
+            ChatMessage::model("response").with_durable_identity("message-local-model", 4),
+        ];
+
+        assert_eq!(
+            reconcile_latest_timeline_messages(&mut visible, latest),
+            1,
+            "only the genuinely remote backdated record should add a visible row"
+        );
+        assert_eq!(visible.len(), 4, "local rows should be promoted in place");
+        assert_eq!(
+            visible
+                .iter()
+                .map(|message| message.message_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("message-backdated"),
+                Some("message-existing"),
+                Some("message-local-user"),
+                Some("message-local-model"),
+            ],
+            "identical durable messages remain distinct while the ordered ephemeral tail gains ids"
+        );
+    }
+
+    #[test]
+    fn timeline_merge_uses_sequence_only_when_message_id_is_absent() {
+        let mut durable =
+            vec![ChatMessage::user("first device").with_durable_identity("message-first", 7)];
+        assert_eq!(
+            append_timeline_messages(
+                &mut durable,
+                vec![ChatMessage::user("second device").with_durable_identity("message-second", 7),],
+            ),
+            1,
+            "different durable ids must not be discarded merely because a stale sequence collides"
+        );
+        assert_eq!(
+            append_timeline_messages(
+                &mut durable,
+                vec![ChatMessage::user("legacy view of second device").with_sequence(7)],
+            ),
+            0,
+            "an id-less compatibility row falls back to every sequence already in the merge"
+        );
+
+        let mut legacy = vec![ChatMessage::user("legacy").with_sequence(7)];
+        assert_eq!(
+            append_timeline_messages(
+                &mut legacy,
+                vec![ChatMessage::user("legacy duplicate").with_sequence(7)],
+            ),
+            0,
+            "sequence remains the compatibility fallback for rows without durable ids"
+        );
+    }
+
+    #[test]
+    fn multi_device_sync_pulls_remote_timeline_messages_without_reopening_chat() {
+        let (_backend, mut state) = isolated_chat_state("multi-device-timeline-sync");
+        seed_default_provider(&mut state);
+        let channel_id = SessionId::generate();
+        seed_backend_chat(
+            &state.data_dir,
+            &channel_id,
+            "Shared chat",
+            &[ChatMessage::user("first device")],
+        );
+        state.sessions = vec![SessionRef {
+            id: channel_id.to_string(),
+            title: "Shared chat".to_string(),
+            kind: ConversationKind::Chat,
+            updated_unix: 1,
+            participant_count: 1,
+            participant_names: Vec::new(),
+        }];
+        state.open_session(0);
+        wait_for(&mut state, Duration::from_secs(5), |state| {
+            !state.transcript_load_pending()
+                && state
+                    .messages
+                    .iter()
+                    .any(|message| message.text == "first device")
+        });
+
+        let store = SifsAgentChannelStore::open(&state.data_dir).expect("open second device store");
+        let mut remote = store
+            .load_channel(&channel_id)
+            .expect("load shared chat")
+            .expect("shared chat exists");
+        let message = remote.append_user_message(
+            "user.remote",
+            "Remote user",
+            "second device",
+            AgentChannelSource::app(),
+        );
+        store
+            .append_message(&channel_id, &message)
+            .expect("append remote message");
+        store.save_channel(&remote).expect("save remote snapshot");
+
+        state.begin_multi_device_sync();
+        wait_for(&mut state, Duration::from_secs(5), |state| {
+            !state.transcript_load_pending()
+                && state
+                    .messages
+                    .iter()
+                    .any(|message| message.text == "second device")
+        });
+
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .filter(|message| message.text == "second device")
+                .count(),
+            1,
+            "remote refresh should merge each immutable message once"
+        );
+    }
+
+    #[test]
+    fn multi_device_sync_reconciles_backdated_message_when_updated_timestamp_is_unchanged() {
+        let (_backend, mut state) = isolated_chat_state("multi-device-backdated-sync");
+        seed_default_provider(&mut state);
+        let channel_id = SessionId::generate();
+        let seeded = seed_backend_chat(
+            &state.data_dir,
+            &channel_id,
+            "Shared backdated chat",
+            &[ChatMessage::user("original message")],
+        );
+        let original_created_at = seeded
+            .transcript
+            .first()
+            .expect("seeded transcript")
+            .created_at;
+        state.sessions = vec![SessionRef {
+            id: channel_id.to_string(),
+            title: "Shared backdated chat".to_string(),
+            kind: ConversationKind::Chat,
+            updated_unix: 1,
+            participant_count: 1,
+            participant_names: Vec::new(),
+        }];
+        state.open_session(0);
+        wait_for(&mut state, Duration::from_secs(5), |state| {
+            !state.transcript_load_pending()
+                && state
+                    .messages
+                    .iter()
+                    .any(|message| message.text == "original message")
+        });
+        let original_message_id = state
+            .messages
+            .iter()
+            .find(|message| message.text == "original message")
+            .and_then(|message| message.message_id.clone())
+            .expect("durable original message id");
+
+        let store = SifsAgentChannelStore::open(&state.data_dir).expect("open second device store");
+        let mut remote = store
+            .load_channel(&channel_id)
+            .expect("load shared chat")
+            .expect("shared chat exists");
+        let mut delayed = remote.append_user_message(
+            "user.remote",
+            "Remote user",
+            "arrived before the cursor",
+            AgentChannelSource::app(),
+        );
+        delayed.created_at = original_created_at - time::Duration::seconds(1);
+        let delayed_message_id = delayed.message_id.to_string();
+        store
+            .append_message(&channel_id, &delayed)
+            .expect("append backdated remote message");
+        store.save_channel(&remote).expect("save remote snapshot");
+
+        let summary = store
+            .load_channel_summary(&channel_id)
+            .expect("load channel summary")
+            .expect("channel summary exists");
+        let same_updated_unix = summary.updated_at.unix_timestamp();
+        state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == channel_id.to_string())
+            .expect("active session")
+            .updated_unix = same_updated_unix;
+        assert_eq!(
+            state
+                .current_session_ref()
+                .expect("current session")
+                .updated_unix,
+            same_updated_unix,
+            "the periodic sync must not depend on detecting a newer second-resolution timestamp"
+        );
+
+        state.begin_multi_device_sync();
+        wait_for(&mut state, Duration::from_secs(5), |state| {
+            !state.transcript_load_pending()
+                && state.messages.iter().any(|message| {
+                    message.message_id.as_deref() == Some(delayed_message_id.as_str())
+                })
+        });
+
+        let delayed = state
+            .messages
+            .iter()
+            .find(|message| message.message_id.as_deref() == Some(delayed_message_id.as_str()))
+            .expect("backdated message synced");
+        let original = state
+            .messages
+            .iter()
+            .find(|message| message.message_id.as_deref() == Some(original_message_id.as_str()))
+            .expect("original message retained");
+        assert_eq!(delayed.sequence, Some(2));
+        assert_eq!(original.sequence, Some(1));
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .filter(|message| {
+                    message.message_id.as_deref() == Some(delayed_message_id.as_str())
+                })
+                .count(),
+            1,
+            "reconciliation must merge the immutable message exactly once"
         );
     }
 
@@ -17341,6 +17884,7 @@ mod tests {
             has_older: true,
             has_newer: false,
             overview: Vec::new(),
+            discovered_message_ids: BTreeSet::new(),
         };
 
         state.set_draft("follow up while history loads".to_string());
@@ -17379,6 +17923,7 @@ mod tests {
                     chunk_size: VISIBLE_TRANSCRIPT_RECENT_LIMIT as u64,
                 },
                 overview: None,
+                discovered_message_ids: Vec::new(),
             }),
         })
         .expect("queue older transcript page");
@@ -17736,7 +18281,7 @@ mod tests {
         assert_eq!(channel.title, "Renamed chat");
         let transcript = load_backend_chat_messages(&state.data_dir, &channel_id);
         assert_eq!(transcript[0].text, "original prompt");
-        assert_eq!(transcript[1].text, "main-agent: original answer");
+        assert_eq!(transcript[1].text, "original answer");
 
         state.persist();
         assert_eq!(
@@ -20389,6 +20934,29 @@ mod tests {
 
         assert_eq!(state.messages.len(), 2);
         assert_eq!(state.messages[1].text, "Hello");
+    }
+
+    #[test]
+    fn durable_agent_messages_match_live_speaker_labels_for_chat_and_channel() {
+        let mut conversation = AgentChannel::new(SessionId::generate(), "speaker labels");
+        let participant_id = conversation.ensure_participant("main-agent", "main-agent");
+        let participant = conversation
+            .participant(&participant_id)
+            .expect("participant")
+            .clone();
+        conversation.append_agent_message(&participant, "Hello", AgentChannelSource::app());
+
+        assert_eq!(
+            channel_messages(&conversation)[0].text,
+            "Hello",
+            "a restored direct chat must match its unprefixed live token row"
+        );
+        conversation.channel_kind = AgentChannelKind::Channel;
+        assert_eq!(
+            channel_messages(&conversation)[0].text,
+            "main-agent: Hello",
+            "multi-speaker channels retain the author label"
+        );
     }
 
     #[test]

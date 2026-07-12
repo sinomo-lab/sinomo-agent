@@ -1089,6 +1089,14 @@ trait TuiAgentRuntimeControl: InteractionEventHandler {
     ) -> Result<(), CliError> {
         Ok(())
     }
+
+    fn restore_tui_agent_session(
+        &mut self,
+        _session: &InteractionSession,
+        _transcript: sinomo_agent::AgentTranscript,
+    ) -> Result<(), CliError> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -3256,6 +3264,10 @@ fn resume_tui_session<H: TuiAgentRuntimeControl>(
         ),
         None => (Vec::new(), None, TuiTokenUsage::default()),
     };
+    runtime.handler.restore_tui_agent_session(
+        &record.session,
+        agent_transcript_from_tui_messages(&messages),
+    )?;
     state.replace_session(
         &record.session,
         restored_info,
@@ -3268,6 +3280,32 @@ fn resume_tui_session<H: TuiAgentRuntimeControl>(
         InteractionOutput::Line(format!("resumed session: {}", record.session.session_id)),
     );
     Ok(outputs)
+}
+
+fn agent_transcript_from_tui_messages(messages: &[TuiMessage]) -> sinomo_agent::AgentTranscript {
+    let mut transcript = sinomo_agent::AgentTranscript::new();
+    for (step_index, message) in messages.iter().enumerate() {
+        if message.text.trim().is_empty() {
+            continue;
+        }
+        match message.kind {
+            TuiMessageKind::User | TuiMessageKind::Command => {
+                transcript.push(sinomo_agent::AgentItem::UserMessage {
+                    item_id: TaskId::generate(),
+                    step_index,
+                    content: message.text.clone(),
+                    event_id: None,
+                });
+            }
+            TuiMessageKind::Agent => transcript.push(sinomo_agent::AgentItem::AssistantText {
+                item_id: TaskId::generate(),
+                step_index,
+                content: message.text.clone(),
+            }),
+            TuiMessageKind::Thinking | TuiMessageKind::System | TuiMessageKind::Error => {}
+        }
+    }
+    transcript
 }
 
 fn restore_tui_session_runtime_info<H: TuiAgentRuntimeControl>(
@@ -4993,6 +5031,110 @@ mod tui_tests {
     }
 
     #[test]
+    fn transient_system_context_does_not_accumulate_across_persisted_runtime_turns() {
+        let root = sinomo_testdir::TestDir::new("tui-transient-system-context");
+        let data_dir = SinomoDataDir::new(&root);
+        let session = InteractionSession::new(
+            SessionId::generate(),
+            NodeId::from_legacy_named("node_transient_context").expect("node"),
+            InteractionSurface::new(
+                "surface.transient-context",
+                InteractionSurfaceKind::CommandLine,
+            ),
+        );
+        let handler = RuntimeMainAgentInteractionHandler::with_thinking(
+            StaticTuiModel::new("channel reply"),
+            "fake",
+            "fake-model",
+            ThinkingControl::default(),
+        )
+        .with_runtime_storage(AgentRuntimeStorage::from_data_dir(&data_dir));
+        let mut runtime =
+            InteractionRuntime::new(InMemoryEventStore::new(), handler, session.clone());
+        let mut durable_session = AgentSession::new(session.session_id.clone(), AgentRole::Main);
+        let first_visible = sinomo_agent::AgentItem::UserMessage {
+            item_id: TaskId::generate(),
+            step_index: 0,
+            content: "User: first visible channel message".to_string(),
+            event_id: None,
+        };
+        durable_session.transcript.push(first_visible.clone());
+        durable_session.raw_transcript.push(first_visible);
+        runtime
+            .handler_mut()
+            .replace_full_agent_session(&session, durable_session)
+            .expect("attach first channel snapshot");
+
+        runtime
+            .ingest_transient_system_context_with_attachments_streaming(
+                "CHANNEL_CONTROL_TURN_ONE: reply only when useful",
+                Vec::new(),
+                &mut |_| {},
+            )
+            .expect("submit first channel turn");
+        runtime
+            .handler()
+            .join_active_tui_turn()
+            .expect("join first channel turn");
+
+        let mut durable_session = runtime
+            .handler()
+            .agent_session_snapshot()
+            .expect("first snapshot")
+            .expect("attached first snapshot");
+        let second_visible = sinomo_agent::AgentItem::UserMessage {
+            item_id: TaskId::generate(),
+            step_index: 1,
+            content: "User: second visible channel message".to_string(),
+            event_id: None,
+        };
+        durable_session.transcript.push(second_visible.clone());
+        durable_session.raw_transcript.push(second_visible);
+        runtime
+            .handler_mut()
+            .replace_full_agent_session(&session, durable_session)
+            .expect("attach second channel snapshot");
+        runtime
+            .ingest_transient_system_context_with_attachments_streaming(
+                "CHANNEL_CONTROL_TURN_TWO: stay concise",
+                Vec::new(),
+                &mut |_| {},
+            )
+            .expect("submit second channel turn");
+        runtime
+            .handler()
+            .join_active_tui_turn()
+            .expect("join second channel turn");
+
+        let persisted = FileAgentSessionStore::for_data_dir(&data_dir)
+            .load_session(&session.session_id)
+            .expect("load persisted session")
+            .expect("persisted session");
+        for transcript in [&persisted.transcript, &persisted.raw_transcript] {
+            let visible_messages = transcript
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    sinomo_agent::AgentItem::UserMessage { content, .. } => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                visible_messages,
+                vec![
+                    "User: first visible channel message",
+                    "User: second visible channel message"
+                ]
+            );
+            assert!(transcript.items.iter().all(|item| {
+                !serde_json::to_string(item)
+                    .expect("serialize transcript item")
+                    .contains("CHANNEL_CONTROL_TURN_")
+            }));
+        }
+    }
+
+    #[test]
     fn tui_chat_selection_mode_extends_with_keyboard() {
         let mut state = fixture_tui_state();
         state.push_message(TuiMessageKind::User, "one");
@@ -6144,6 +6286,48 @@ impl<S: EventStore, H: InteractionEventHandler> InteractionRuntime<S, H> {
             .handle_event_streaming(&mut self.store, &self.session, &event, emit)
     }
 
+    pub fn ingest_user_input_with_item_id_and_context_attachments_streaming(
+        &mut self,
+        text: &str,
+        item_id: sinomo_agent::TaskId,
+        context_attachments: Vec<sinomo_agent::AgentContextAttachment>,
+        emit: &mut dyn FnMut(InteractionOutput),
+    ) -> Result<Vec<InteractionOutput>, CliError> {
+        let mut event = user_interaction_input_event(&self.session, text);
+        event.payload["agent_item_id"] = serde_json::Value::String(item_id.to_string());
+        if !context_attachments.is_empty() {
+            event.payload["context_attachments"] = serde_json::to_value(&context_attachments)
+                .map_err(|source| CliError::Parse {
+                    detail: format!("serialize context attachments failed: {source}"),
+                })?;
+        }
+        self.store.append(event.clone())?;
+        self.handler
+            .handle_event_streaming(&mut self.store, &self.session, &event, emit)
+    }
+
+    /// Run a model turn with surface-owned system context without recording a
+    /// second user message in the durable agent session. The visible user
+    /// message must already have been reconciled into that session.
+    pub fn ingest_transient_system_context_with_attachments_streaming(
+        &mut self,
+        system_context: &str,
+        context_attachments: Vec<sinomo_agent::AgentContextAttachment>,
+        emit: &mut dyn FnMut(InteractionOutput),
+    ) -> Result<Vec<InteractionOutput>, CliError> {
+        let mut event = user_interaction_input_event(&self.session, "");
+        event.payload["transient_system_context"] = serde_json::json!(system_context);
+        if !context_attachments.is_empty() {
+            event.payload["context_attachments"] = serde_json::to_value(&context_attachments)
+                .map_err(|source| CliError::Parse {
+                    detail: format!("serialize context attachments failed: {source}"),
+                })?;
+        }
+        self.store.append(event.clone())?;
+        self.handler
+            .handle_event_streaming(&mut self.store, &self.session, &event, emit)
+    }
+
     pub fn append_session_context(&mut self, event: EventEnvelope) -> Result<(), CliError> {
         self.store.append(event)?;
         Ok(())
@@ -6279,6 +6463,35 @@ impl InteractionModel for DefaultMainAgentChatModel {
             Self::Configured(model) => {
                 on_delta("<sinomo_progress>waiting for configured model runtime</sinomo_progress>");
                 model.complete_streaming(request, on_delta)
+            }
+        }
+    }
+
+    fn complete_streaming_events_with_cancellation(
+        &self,
+        request: &LanguageModelRequest,
+        cancellation_token: &AgentCancellationToken,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        match self {
+            #[cfg(feature = "native-models")]
+            Self::RustMiniCpmV46(model) => model.complete_streaming_events_with_cancellation(
+                request,
+                cancellation_token,
+                on_event,
+            ),
+            Self::Configured(model) => {
+                if !cancellation_token.is_cancelled() {
+                    on_event(LanguageModelStreamEvent::TextDelta {
+                        delta: "<sinomo_progress>waiting for configured model runtime</sinomo_progress>"
+                            .to_string(),
+                    });
+                }
+                model.complete_streaming_events_with_cancellation(
+                    request,
+                    cancellation_token,
+                    on_event,
+                )
             }
         }
     }
@@ -6488,20 +6701,24 @@ where
             path: "current directory".to_string(),
             detail: source.to_string(),
         })?;
-        main_agent_configure_tool_registry_for_workspace(
+        configure_agent_tool_registry_for_workspace(
             &self.tool_registry,
             data_dir,
             &workspace_root,
+            &self.agent_definition,
             Some(session_id),
             sandbox_node_id,
+            false,
         )
     }
 
     fn build_runtime(&self, model: M, session: AgentSession) -> AgentSessionRuntime<M> {
         let mut session = session;
         session.role = self.agent_definition.role.clone();
+        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let config = sinomo_agent::AgentConfig::new(self.provider.clone(), self.model_name.clone())
             .with_agent_definition(self.agent_definition.clone())
+            .with_workspace_root(workspace_root)
             .with_skill_catalog(self.skill_catalog.clone())
             .with_skill_catalog_texts(self.skill_catalog_texts.clone());
         let agent = Agent::new(model, self.provider.clone(), self.model_name.clone())
@@ -6679,6 +6896,17 @@ where
             return Ok(None);
         };
         Ok(Some(runtime.session_snapshot()?))
+    }
+
+    pub(crate) fn load_persisted_agent_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<AgentSession>, CliError> {
+        self.runtime_storage
+            .load_session(session_id)
+            .map_err(|source| CliError::Parse {
+                detail: format!("load persisted agent session `{session_id}`: {source}"),
+            })
     }
 
     fn register_runtime_control(&self, runtime: &AgentSessionRuntime<M>) -> Result<(), CliError> {
@@ -6973,6 +7201,17 @@ impl TuiAgentRuntimeControl for RuntimeMainAgentInteractionHandler<DefaultMainAg
     ) -> Result<(), CliError> {
         self.configure_tool_runtime_for_session(data_dir, &session.session_id, sandbox_node_id)
     }
+
+    fn restore_tui_agent_session(
+        &mut self,
+        session: &InteractionSession,
+        transcript: sinomo_agent::AgentTranscript,
+    ) -> Result<(), CliError> {
+        match self.load_persisted_agent_session(&session.session_id)? {
+            Some(persisted) => self.replace_full_agent_session(session, persisted),
+            None => self.replace_agent_session(session, transcript),
+        }
+    }
 }
 
 impl<M> InteractionEventHandler for RuntimeMainAgentInteractionHandler<M>
@@ -7017,6 +7256,13 @@ where
             }
             None => Vec::new(),
         };
+        let transient_system_context = event
+            .payload
+            .get("transient_system_context")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|context| !context.is_empty())
+            .map(str::to_string);
 
         if let Some(args) = parse_slash_command(text)? {
             if let Some(output) =
@@ -7032,6 +7278,7 @@ where
             "interaction.message.received",
             serde_json::json!({
                 "input_event_id": event.event_id,
+                "agent_item_id": event.payload.get("agent_item_id").cloned(),
                 "text": text,
                 "context_attachments": context_attachments.clone(),
                 "state": "received",
@@ -7044,6 +7291,7 @@ where
         let input = AgentLoopInput {
             session: session.clone(),
             latest_event: message.clone(),
+            transient_system_context,
             async_update: None,
             context_attachments,
             tool_specs: Vec::new(),

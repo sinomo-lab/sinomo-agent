@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 use sinomo_lm::{
-    LanguageModelError, LanguageModelMessage, LanguageModelProvider, LanguageModelRequest,
-    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole,
+    LanguageModelCancellation, LanguageModelError, LanguageModelMessage, LanguageModelProvider,
+    LanguageModelRequest, LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole,
     LanguageModelStreamEvent, LanguageModelUsage,
 };
 use sinomo_runtime::core::{
@@ -60,6 +60,11 @@ impl AgentCancellationToken {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn language_model_cancellation(&self) -> LanguageModelCancellation {
+        let token = self.clone();
+        LanguageModelCancellation::new(move || token.is_cancelled())
     }
 }
 
@@ -1513,39 +1518,21 @@ fn parse_agent_role(value: &str) -> Option<AgentRole> {
 pub fn default_main_agent_tools() -> Vec<AgentToolSpec> {
     vec![
         AgentToolSpec::new(
-            AgentToolKind::StartAsyncTask,
-            "start_async_task",
-            "Start slow work and return a durable task id immediately.",
-            true,
-        ),
-        AgentToolSpec::new(
-            AgentToolKind::InspectAsyncTask,
-            "inspect_async_task",
-            "Read progress, result references, and cancellation state for a task.",
+            AgentToolKind::ReadFile,
+            "read_file",
+            "Read a workspace file or one-based line range into model-visible text with a bounded byte budget.",
             false,
         ),
         AgentToolSpec::new(
-            AgentToolKind::CancelAsyncTask,
-            "cancel_async_task",
-            "Request cancellation for an active background task.",
+            AgentToolKind::ListFiles,
+            "list_files",
+            "List workspace files and directories with bounded recursion.",
             false,
         ),
         AgentToolSpec::new(
-            AgentToolKind::RunShellCommand,
-            "run_shell_command",
-            "Run a bounded shell command on the selected node.",
-            true,
-        ),
-        AgentToolSpec::new(
-            AgentToolKind::HandoffToBackground,
-            "handoff_to_background",
-            "Delegate maintenance, cleanup, rollout, cluster-health, or filesystem work.",
-            true,
-        ),
-        AgentToolSpec::new(
-            AgentToolKind::ObserveVision,
-            "observe_vision",
-            "Attach a current screen/camera observation for multimodal reasoning.",
+            AgentToolKind::SearchFiles,
+            "search",
+            "Search workspace text files for a literal query.",
             false,
         ),
         AgentToolSpec::new(
@@ -1571,32 +1558,12 @@ pub fn default_main_agent_tools() -> Vec<AgentToolSpec> {
 
 pub fn default_background_agent_tools() -> Vec<AgentToolSpec> {
     let mut tools = default_main_agent_tools();
-    tools.extend([
-        AgentToolSpec::new(
-            AgentToolKind::ReadSifs,
-            "read_sifs",
-            "Read a file from the cluster root filesystem.",
-            false,
-        ),
-        AgentToolSpec::new(
-            AgentToolKind::WriteSifs,
-            "write_sifs",
-            "Write a file to an allowed SIFS path.",
-            true,
-        ),
-        AgentToolSpec::new(
-            AgentToolKind::ListSifs,
-            "list_sifs",
-            "List a SIFS directory with session-aware defaults.",
-            false,
-        ),
-        AgentToolSpec::new(
-            AgentToolKind::ClusterStatus,
-            "cluster_status",
-            "Summarize local quorum, node placement, and degraded services.",
-            false,
-        ),
-    ]);
+    tools.push(AgentToolSpec::new(
+        AgentToolKind::ClusterStatus,
+        "cluster_status",
+        "Read a live cluster-wide health summary from the local control plane.",
+        false,
+    ));
     tools
 }
 
@@ -1686,20 +1653,17 @@ pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
 fn main_agent_base_prompt() -> &'static str {
     r#"You are Sinomo, the user-facing main agent.
 
-Operate as a real-time, event-driven agent. Keep live interaction responsive:
-- never block the conversation on slow work;
-- start async tasks for slow shell, research, coding, maintenance, or file work;
-- treat async progress and results as session events;
-- hand cluster maintenance, cleanup, rollout, and diagnostics to the background agent by default;
-- use SIFS as the default filesystem root;
-- use runtime-provided model status and session context to decide when local live inference is enough, and delegate deliberate work to stronger configured models when useful.
+Operate as a responsive, event-driven agent. Answer directly when the request
+does not need a tool. Use only tools visible in the current request, and use
+read_file, list_files, search, or the configuration tools when they provide
+useful evidence. Keep tool work bounded; if the available tools cannot complete
+the request, explain the concrete limitation instead of promising unavailable
+background or asynchronous work.
 
-For direct model interaction, answer in the current turn when no slow tool or
-background handoff is required. Coding advice, document drafting, image/file
-reasoning from provided context, critique, and role-play should return the
-actual user-facing result in `text`, not a promise that you will produce it.
-Use short progress notes only when you are also starting tools, async work, or
-a background handoff."#
+Coding advice, document drafting, image/file reasoning from provided context,
+critique, and role-play should return the actual user-facing result in `text`,
+not a promise that you will produce it. Use a short progress note only while
+invoking an available tool in the current turn."#
 }
 
 fn background_agent_base_prompt() -> &'static str {
@@ -1865,6 +1829,14 @@ pub enum AsyncTaskNextAction {
 pub struct AgentLoopInput {
     pub session: InteractionSession,
     pub latest_event: EventEnvelope,
+    /// Per-turn control context that is visible to the model as system
+    /// instructions but is not appended to the durable session transcript.
+    ///
+    /// This is intended for surface-owned orchestration such as channel
+    /// participation policy. User-visible content belongs in `latest_event`
+    /// (or an already reconciled session item), not in this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transient_system_context: Option<String>,
     #[serde(default)]
     pub async_update: Option<AsyncTaskUpdate>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2234,6 +2206,21 @@ impl<T: LanguageModelProvider> InteractionModel for T {
     ) -> Result<LanguageModelResponse, LanguageModelError> {
         LanguageModelProvider::complete_streaming_events(self, request, on_event)
     }
+
+    fn complete_streaming_events_with_cancellation(
+        &self,
+        request: &LanguageModelRequest,
+        cancellation_token: &AgentCancellationToken,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        let cancellation = cancellation_token.language_model_cancellation();
+        LanguageModelProvider::complete_streaming_events_with_cancellation(
+            self,
+            request,
+            &cancellation,
+            on_event,
+        )
+    }
 }
 
 pub trait EventEnvelopeExt {
@@ -2385,6 +2372,7 @@ mod tests {
     use super::*;
     use sinomo_runtime::events::{EventId, EventStore, InMemoryEventStore};
     use sinomo_runtime::node::NodeId;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     struct FakeInteractionModel {
@@ -2444,6 +2432,94 @@ mod tests {
                 usage: None,
             })
         }
+    }
+
+    struct CancellationProbingProvider {
+        observed: Arc<AtomicBool>,
+    }
+
+    impl LanguageModelProvider for CancellationProbingProvider {
+        fn info(&self) -> sinomo_lm::LanguageModelProviderInfo {
+            sinomo_lm::LanguageModelProviderInfo {
+                provider: "probe".to_string(),
+                default_model: "probe".to_string(),
+                invocation: sinomo_lm::LanguageModelInvocation::InProcess,
+                supports_json_object: false,
+                supports_tool_permissions: false,
+            }
+        }
+
+        fn complete(
+            &self,
+            request: &LanguageModelRequest,
+        ) -> Result<LanguageModelResponse, LanguageModelError> {
+            Ok(LanguageModelResponse {
+                provider: request.provider.clone(),
+                model: request.model.clone(),
+                content: String::new(),
+                items: Vec::new(),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+
+        fn complete_streaming_events_with_cancellation(
+            &self,
+            request: &LanguageModelRequest,
+            cancellation: &LanguageModelCancellation,
+            _on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+        ) -> Result<LanguageModelResponse, LanguageModelError> {
+            self.observed.store(true, Ordering::SeqCst);
+            while !cancellation.is_cancelled() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(LanguageModelError::ProviderInvocationFailed {
+                provider: request.provider.clone(),
+                model: request.model.clone(),
+                detail: "cancelled by provider probe".to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn agent_cancellation_token_reaches_language_model_provider() {
+        let observed = Arc::new(AtomicBool::new(false));
+        let provider = CancellationProbingProvider {
+            observed: Arc::clone(&observed),
+        };
+        let request = LanguageModelRequest {
+            provider: "probe".to_string(),
+            model: "probe".to_string(),
+            messages: Vec::new(),
+            items: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            temperature: None,
+            max_output_tokens: None,
+            response_format: LanguageModelResponseFormat::Text,
+            metadata: serde_json::Value::Null,
+        };
+        let cancellation_token = AgentCancellationToken::new();
+        let cancel_worker = {
+            let cancellation_token = cancellation_token.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                cancellation_token.cancel();
+            })
+        };
+
+        let error = InteractionModel::complete_streaming_events_with_cancellation(
+            &provider,
+            &request,
+            &cancellation_token,
+            &mut |_| {},
+        )
+        .expect_err("provider invocation is cancelled");
+
+        cancel_worker.join().expect("cancellation worker");
+        assert!(observed.load(Ordering::SeqCst));
+        assert!(error.to_string().contains("cancelled by provider probe"));
     }
 
     #[test]
@@ -2547,16 +2623,62 @@ mod tests {
     }
 
     #[test]
-    fn main_agent_default_tools_exclude_cluster_and_sifs_tools() {
-        let names: Vec<_> = default_main_agent_tools()
+    fn main_and_background_packages_declare_production_inspection_tools() {
+        let expected = [
+            "read_file",
+            "list_files",
+            "search",
+            "config_search",
+            "config_get",
+            "config_set",
+        ];
+        let removed = [
+            "start_async_task",
+            "inspect_async_task",
+            "cancel_async_task",
+            "run_shell_command",
+            "handoff_to_background",
+            "observe_vision",
+            "read_sifs",
+            "write_sifs",
+            "list_sifs",
+        ];
+
+        for definition in [AgentDefinition::main(), AgentDefinition::background()] {
+            let names = definition
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>();
+            for expected in expected {
+                assert!(
+                    names.contains(&expected),
+                    "{} is missing {expected}",
+                    definition.key()
+                );
+            }
+            for removed in removed {
+                assert!(
+                    !names.contains(&removed),
+                    "{} still declares unavailable tool {removed}",
+                    definition.key()
+                );
+            }
+        }
+
+        let main_names = AgentDefinition::main()
+            .tools
             .into_iter()
             .map(|tool| tool.name)
-            .collect();
+            .collect::<Vec<_>>();
+        assert!(!main_names.iter().any(|name| name == "cluster_status"));
 
-        for excluded in ["cluster_status", "read_sifs", "write_sifs", "list_sifs"] {
-            assert!(!names.iter().any(|name| name == excluded), "{excluded}");
-        }
-        assert!(names.iter().any(|name| name == "handoff_to_background"));
+        let background_names = AgentDefinition::background()
+            .tools
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert!(background_names.iter().any(|name| name == "cluster_status"));
     }
 
     #[test]
@@ -2572,14 +2694,26 @@ mod tests {
     }
 
     #[test]
-    fn background_agent_default_tools_include_cluster_and_sifs_tools() {
-        let definition = AgentDefinition::background();
-        let names: Vec<_> = definition.tools.into_iter().map(|tool| tool.name).collect();
+    fn main_agent_prompt_uses_available_tools_without_fictional_handoffs() {
+        let prompt = AgentDefinition::main().system_prompt;
 
-        for expected in ["cluster_status", "read_sifs", "write_sifs", "list_sifs"] {
-            assert!(names.iter().any(|name| name == expected), "{expected}");
+        for expected in ["read_file", "list_files", "search", "configuration tools"] {
+            assert!(
+                prompt.contains(expected),
+                "missing prompt guidance for {expected}"
+            );
         }
-        assert!(names.iter().any(|name| name == "handoff_to_background"));
+        for removed in [
+            "start async tasks",
+            "hand cluster maintenance",
+            "background handoff",
+            "delegate deliberate work",
+        ] {
+            assert!(
+                !prompt.contains(removed),
+                "main prompt still promises unavailable behavior: {removed}"
+            );
+        }
     }
 
     #[test]
@@ -2926,6 +3060,7 @@ mod tests {
         let loop_input = AgentLoopInput {
             session,
             latest_event,
+            transient_system_context: None,
             async_update: None,
             context_attachments: Vec::new(),
             tool_specs: Vec::new(),
@@ -3019,6 +3154,7 @@ mod tests {
         let loop_input = AgentLoopInput {
             session,
             latest_event,
+            transient_system_context: None,
             async_update: Some(AsyncTaskUpdate {
                 kind: "async_task_update".to_string(),
                 task_id: TaskId::from_legacy_named("task_background").expect("task"),

@@ -123,6 +123,7 @@ fn sandbox_storage_paths_are_registered_by_sandbox_crate() {
         "sandbox/cache/toolchains/busybox.wasm",
         "sandbox/cache/modules/busybox.compiled",
         "sandbox/runtime/active.sobj",
+        "sandbox/agent-tools/instances/example/manifest.sobj",
         "sandbox/tmp/command-stdout.tmp",
     ] {
         let owner = layout.owner_for(path).expect("owner");

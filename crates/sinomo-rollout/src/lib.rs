@@ -50,8 +50,9 @@ pub enum RolloutActivationStrategy {
 }
 
 pub use artifact::{
-    activate_staged_rollout_binary, binary_should_update, current_executable_path,
-    current_executable_should_update, install_binary_atomically, install_current_executable,
+    ROLLOUT_RECOVERY_BACKUP_RETENTION, activate_staged_rollout_binary, binary_should_update,
+    current_executable_path, current_executable_should_update, install_binary_atomically,
+    install_current_executable, prune_rollout_binary_recovery_backups,
     restore_rollout_binary_from_backup, rollout_previous_binary_path, same_path_if_exists,
     stage_rollout_bytes, stage_rollout_bytes_pair, stage_rollout_file, stage_rollout_file_pair,
     stage_rollout_file_with_retry,

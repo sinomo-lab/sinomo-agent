@@ -1853,7 +1853,8 @@ mod tests {
         );
         assert_eq!(
             options.connect_timeout,
-            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT
+            Duration::from_secs(60),
+            "detached dispatch must preserve the transport's explicit connect timeout"
         );
     }
 
