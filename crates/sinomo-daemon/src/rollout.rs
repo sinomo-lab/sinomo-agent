@@ -2718,16 +2718,21 @@ fn request_main_shutdown_for_shadow_rollout(
     activation: &RolloutMainActivation,
 ) -> Result<(), DaemonError> {
     let main_paths = DaemonPaths::with_root(data_dir.join("daemon"));
-    let status = match probe_daemon_status(&main_paths, DAEMON_PROBE_TIMEOUT) {
+    let Some(status) = (match probe_daemon_status(&main_paths, DAEMON_PROBE_TIMEOUT) {
         DaemonProbeStatus::Running(status) => Some(status),
         DaemonProbeStatus::Locked { status } => status,
         DaemonProbeStatus::NotRunning => None,
+    }) else {
+        // Do not fall back to dialing the activation address. Without status
+        // from this data directory we have no evidence that a listener at that
+        // address is the main process owned by this shadow supervisor. The
+        // supervision loop will retry once an owned status becomes available.
+        return Ok(());
     };
-    let address = status
-        .as_ref()
-        .map(|status| status.address.clone())
-        .unwrap_or_else(|| daemon_connect_address(&activation.main_host, activation.main_port));
-    let _ = send_daemon_shutdown_request(&address, DAEMON_PROBE_TIMEOUT);
+    if status.host != activation.main_host || status.port != activation.main_port {
+        return Ok(());
+    }
+    let _ = send_daemon_shutdown_request(&status.address, DAEMON_PROBE_TIMEOUT);
     Ok(())
 }
 
@@ -4333,6 +4338,26 @@ mod tests {
         assert!(!pending_main_activation_ready_for_shutdown(&rollout_paths));
         std::thread::sleep(MAIN_ACTIVATION_SHUTDOWN_GRACE + Duration::from_millis(100));
         assert!(pending_main_activation_ready_for_shutdown(&rollout_paths));
+    }
+
+    #[test]
+    fn shadow_rollout_shutdown_never_contacts_an_unowned_fallback_listener() {
+        let root = temp_rollout_test_root("shadow-shutdown-owned-status");
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let mut activation = test_main_activation(&rollout_paths);
+        activation.main_port = listener.local_addr().expect("listener address").port();
+
+        request_main_shutdown_for_shadow_rollout(&root, &activation)
+            .expect("missing owned status is a no-op");
+
+        let error = listener
+            .accept()
+            .expect_err("unowned fallback listener must not be contacted");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
     }
 
     #[test]
