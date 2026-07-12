@@ -1,6 +1,6 @@
 use crate::error::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase};
 use crate::io_observer;
-use sinomo_object::{BorrowedDocumentBuilder, LengthMode, serde_ext};
+use sinomo_object::{BorrowedDocumentBuilder, DecodeLimits, DecodeOptions, LengthMode, serde_ext};
 use std::collections::HashMap;
 #[cfg(any(test, feature = "test-support"))]
 use std::io::{Read, Write};
@@ -1524,14 +1524,36 @@ impl SinomoObjectCodec {
     }
 
     pub fn decode<T: serde::de::DeserializeOwned>(self, bytes: &[u8]) -> Result<T, NetworkError> {
-        serde_ext::from_bytes(bytes).map_err(NetworkError::object)
+        serde_ext::from_bytes_with_options(bytes, self.decode_options(bytes.len())?)
+            .map_err(NetworkError::object)
     }
 
     pub fn decode_borrowed<'de, T>(self, bytes: &'de [u8]) -> Result<T, NetworkError>
     where
         T: serde::Deserialize<'de>,
     {
-        serde_ext::from_borrowed_bytes(bytes).map_err(NetworkError::object)
+        serde_ext::from_borrowed_bytes_with_options(bytes, self.decode_options(bytes.len())?)
+            .map_err(NetworkError::object)
+    }
+
+    fn decode_options(self, document_bytes: usize) -> Result<DecodeOptions, NetworkError> {
+        let document_bytes =
+            u64::try_from(document_bytes).map_err(|_| NetworkError::FrameTooLarge {
+                actual_bytes: usize::MAX,
+                max_bytes: usize::MAX,
+            })?;
+        Ok(DecodeOptions::new(DecodeLimits {
+            max_document_bytes: document_bytes,
+            max_container_items: document_bytes,
+            max_string_bytes: document_bytes,
+            max_bytes_value_bytes: document_bytes,
+            // The serde network codec only emits dynamic documents. Reject a
+            // schema section before its declared counts can amplify allocation.
+            max_schema_types: 0,
+            max_schema_fields_per_type: 0,
+            ..DecodeLimits::default()
+        })
+        .with_expected_version_id(self.version_id))
     }
 }
 
@@ -2608,6 +2630,25 @@ mod serde_bytes_tests {
         assert_eq!(decoded.payload, payload.as_slice());
         assert!(slice_is_borrowed_from(decoded.name.as_bytes(), &encoded));
         assert!(slice_is_borrowed_from(decoded.payload, &encoded));
+    }
+
+    #[test]
+    fn object_codec_rejects_a_document_from_another_version() {
+        let encoded = SinomoObjectCodec {
+            version_id: SINOMO_NETWORK_OBJECT_VERSION + 1,
+            length_mode: LengthMode::U64,
+        }
+        .encode(&"future-version")
+        .expect("encode future version");
+
+        let error = SinomoObjectCodec::network_frame()
+            .decode::<String>(&encoded)
+            .expect_err("network codec must enforce its configured version");
+        assert!(
+            matches!(error, NetworkError::Serialization { ref detail }
+                if detail.contains("unexpected version id")),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

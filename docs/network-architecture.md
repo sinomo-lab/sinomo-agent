@@ -29,14 +29,20 @@ cannot grant membership, mutate cluster state, or apply domain policy.
 
 ## Wire and Service Model
 
-Internal request/response traffic uses typed object RPC. Routes accept a SOBJ
-request document and return a SOBJ response document. Domain callers work with
-serde-compatible Rust values; object encoding remains inside the network
-boundary.
+The canonical target for internal request/response traffic is one body-aware
+typed object-RPC model. The current migration keeps legacy buffered and
+response-only stream adapters internal until every transport implements the
+session; higher-level protocols must not add new chunk-RPC paths meanwhile.
+Each direction has a small SOBJ head and an optional body. Domain callers work
+with serde-compatible heads and high-level body sources or sinks; object
+encoding, inline-versus-streamed selection, chunking, flow control, retries,
+and transfer state remain inside the network boundary.
 
-Streams extend object RPC for large or real-time payloads. A typed route opens
-a byte stream, transfers bounded chunks, and ends or resets it. Stream bytes are
-not repeatedly re-encoded as object documents.
+Small known bodies may be carried inline as an optimization of the same RPC
+session. Large files, readers, and generated bodies use bounded streaming in
+both directions and are not repeatedly re-encoded as object documents. Domain
+protocols may attach operation identities and expected content digests, but do
+not define transport chunk sizes or per-chunk RPC routes.
 
 Each route belongs to a discoverable service category and declares its input,
 output, and observation metadata. This gives the daemon one router and one
@@ -62,19 +68,20 @@ narrow lifecycle and diagnostic paths, not alternate domain routing systems.
 Routing proceeds in stages:
 
 1. Resolve the target node against the current authorized cluster directory.
-2. Reject local loops, exhausted local timeout budgets, exhausted hop limits,
-   and repeated nodes.
+2. Reject local loops, exhausted explicit operation deadlines, exhausted hop
+   limits, and repeated nodes.
 3. Build a graph from authorized endpoints and current connectivity evidence.
 4. Rank usable paths deterministically for the request's purpose.
-5. Attempt the preferred next hop within the caller's local retry budget.
+5. Attempt the preferred next hop within its connect and no-progress health
+   limits.
 6. Record success or failure and invalidate the failed edge for this delivery.
 7. Retry through a bounded alternate endpoint or path.
 8. Deliver locally only after request authentication. A route that accepts
    automatic retry also applies its own idempotency or replay checks.
 
-For normal node-addressed traffic, higher layers supply a target and timeout.
-They do not select LAN versus roaming, direct versus relay, or one transport
-module over another.
+For normal node-addressed traffic, higher layers supply a target and may supply
+an operation deadline. They do not select LAN versus roaming, direct versus
+relay, transport chunks, retry windows, or one transport module over another.
 
 ## Packet Invariants
 
@@ -142,14 +149,31 @@ When quorum is available, daemons publish their current source-owned
 observations through the cluster control plane so useful evidence becomes part
 of the shared directory rather than a second authority layer.
 
-## Retry and Failure Semantics
+## Retry, Health, and Failure Semantics
 
-The origin bounds its endpoint and fallback attempts with a local deadline.
-Relay envelopes carry a maximum per-hop timeout, not an absolute end-to-end
-expiry, so a downstream hop may continue after the origin has stopped waiting.
-The hop limit bounds path length rather than total wall-clock time. Operations
-that require strict end-to-end expiry or cancellation must carry and enforce
-that contract at the protocol layer.
+Object RPC has no end-to-end deadline by default. Connection establishment and
+each interval without validated network or transfer progress use the shared
+five-second health timeout. A progressing call may therefore run for an
+unbounded wall-clock duration. Callers that require strict end-to-end expiry
+provide an explicit operation deadline.
+
+During migration, the buffered local-daemon forwarding adapter cannot relay
+inner progress and retains a bounded compatibility idle allowance. It does not
+yet provide the unbounded-progress guarantee; body-aware forwarding removes
+that exception once progress frames are authenticated end to end.
+
+Route discovery remains finite through its attempt count, hop limit, and
+per-attempt health limits. Relay envelopes carry a maximum per-hop timeout, not
+an implicit absolute end-to-end expiry. Validated progress includes advancing
+body offsets, cumulative acknowledgements, or authenticated control progress;
+merely waiting longer does not extend an explicit operation deadline.
+
+The transfer migration is complete when replayable transfers reconnect with the
+same transfer identity and resume from the receiver's durable contiguous
+acknowledgement. Losing a completion reply must not commit a transfer twice.
+Generated one-pass bodies retain a bounded unacknowledged replay window or fail
+explicitly when safe resume is impossible; the network must not silently
+collect an unbounded producer into memory.
 
 Failures are classified so route learning remains useful:
 
@@ -157,10 +181,10 @@ Failures are classified so route learning remains useful:
 |---|---|
 | Authentication or identity mismatch | Suppress the endpoint and report an authorization failure. |
 | Unsupported transport or stream capability | Exclude the endpoint for this request shape. |
-| Connect or response timeout | Record degraded connectivity and try a bounded alternative. |
+| Connect or no-progress timeout | Record degraded connectivity and try a bounded alternative or resume. |
 | Explicit unreachable feedback | Exclude the edge until directory or probe evidence changes. |
 | No authorized route | Fail without exploratory delivery to an untrusted node. |
-| Local timeout or hop limit exhausted | Stop the current routing attempt and return the terminal delivery result. |
+| Explicit operation deadline or hop limit exhausted | Stop the current routing attempt and return the terminal delivery result. |
 
 Connectivity feedback changes route choice, not membership. A successful dial
 cannot promote a peer, and a failed dial cannot remove one.
@@ -203,21 +227,24 @@ loopback control uses the same authentication boundary for sensitive commands.
 
 ## Architectural Invariants
 
-1. Domain protocols use typed object RPC or its stream extension.
+1. Domain protocols converge on the single typed object-RPC session; new
+   protocols do not add separate chunk-RPC paths during migration. Inline and
+   streamed bodies are network-selected representations of that session.
 2. Network and KV have no production dependency on one another;
    `sinomo-cluster` is their only R0 bridge.
 3. Directory membership and connectivity are inputs to routing, not outputs of
    successful delivery.
 4. A relay cannot modify the signed inner route or payload of the attempt it
    forwards; target-node forwarding is authorized hop by hop.
-5. Origin retries use a local deadline; relay attempts use a per-hop cap and hop
-   limit rather than a propagated absolute deadline.
+5. Origin calls have no implicit whole-call deadline; explicit operation
+   deadlines are distinct from per-connect and per-progress health limits.
 6. Side-effecting routes that permit retry must provide operation-level
    idempotency; networking does not promise universal response replay.
 7. Route caches are versioned by every input that affects validity.
 8. Disabled or incompatible transports cannot consume attempt budgets.
 9. Remote requests are authorized again by the target service.
-10. Higher-level crates never bypass the network layer for cluster traffic.
+10. Higher-level crates never bypass the network layer for cluster traffic and
+    do not implement transport chunking, transfer retry, or resume protocols.
 
 Operation-level idempotency is a protocol requirement, not a universal current
 capability. Stable KV request IDs remain tracked in the

@@ -38,6 +38,10 @@ mod route_graph_read_model;
 mod rpc;
 mod rpc_future;
 mod tcp_tunnel;
+// The private session state/wire foundation lands before its TCP/module
+// integration so higher-level crates cannot depend on the low-level frames.
+#[allow(dead_code)]
+mod transfer;
 
 pub use connectivity::cluster_network_record_live;
 pub use connectivity::{
@@ -184,6 +188,9 @@ pub use route_graph_read_model::{
 pub use rpc::{
     CLUSTER_HEALTH_INCLUDE_PEER_VIEWS_METADATA_KEY, CLUSTER_HEALTH_SCOPE_LOCAL,
     CLUSTER_HEALTH_SCOPE_METADATA_KEY,
+};
+pub use transfer::{
+    NetworkCallPolicy, NetworkHealthPolicy, TransferDigest, TransferId, TransferReceipt,
 };
 // Unconditional since stage C: dylib network modules reuse the object frame
 // codec through the sinomo-core facade.

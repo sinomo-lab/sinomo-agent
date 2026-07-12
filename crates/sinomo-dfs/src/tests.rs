@@ -2310,8 +2310,8 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
     );
     assert_eq!(
         sinomo_core::network::cluster_object_rpc_effective_route_timeout(&namespace_request, None,),
-        crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
-        "namespace semantic and forwarded silence ceilings must cover the same bounded durable operation"
+        None,
+        "forwarded no-progress allowances must not become implicit whole-call deadlines"
     );
     assert!(
         !namespace_request.is_response_retry_safe(),

@@ -10,11 +10,13 @@ use serde::ser::{
 };
 
 use crate::{
-    AlignmentHint, Array, Document, ElementType, Error, Field, LengthMode, List, MAGIC, Object,
-    OptionalValue, Reader, Result, TypeId, Value, encode_element_type, patch_length,
-    read_element_type, read_schema, try_box, try_extend_from_slice, try_push_vec,
+    AlignmentHint, Array, DecodeOptions, Document, ElementType, Error, Field, LengthMode, List,
+    MAGIC, Object, OptionalValue, Reader, Result, TypeId, Value, duplicate_key_error,
+    encode_element_type, patch_length, read_document_header, read_element_type, read_schema,
+    try_box, try_extend_from_slice, try_hashset_with_capacity, try_push_vec, try_reserve_hashset,
     try_string_from_str, try_vec_with_capacity, write_bytes, write_length, write_string, write_u16,
 };
+use std::collections::HashSet;
 use std::ops::Range;
 
 pub fn to_value<T: Serialize + ?Sized>(value: &T) -> Result<Value> {
@@ -89,31 +91,33 @@ fn append_bytes_inner<T: Serialize + ?Sized>(
 }
 
 pub fn from_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    from_borrowed_bytes(bytes)
+    from_bytes_with_options(bytes, DecodeOptions::default())
+}
+
+pub fn from_bytes_with_options<T: DeserializeOwned>(
+    bytes: &[u8],
+    options: DecodeOptions,
+) -> Result<T> {
+    from_borrowed_bytes_with_options(bytes, options)
 }
 
 pub fn from_borrowed_bytes<'de, T>(bytes: &'de [u8]) -> Result<T>
 where
     T: serde::Deserialize<'de>,
 {
+    from_borrowed_bytes_with_options(bytes, DecodeOptions::default())
+}
+
+pub fn from_borrowed_bytes_with_options<'de, T>(
+    bytes: &'de [u8],
+    options: DecodeOptions,
+) -> Result<T>
+where
+    T: serde::Deserialize<'de>,
+{
     // Stream the value straight out of the document buffer rather than parsing it
     // into an `ElementView`/`Value` tree first.
-    let mut reader = Reader::new(bytes, LengthMode::U64);
-    if reader.take(4)? != MAGIC {
-        return Err(Error::InvalidMagic);
-    }
-    let _version_id = reader.read_u16()?;
-    let length_mode = LengthMode::from_code(reader.read_u8()?)?;
-    reader.mode = length_mode;
-    let _alignment_hint = AlignmentHint::from_code(reader.read_u8()?)?;
-    let document_length = reader.read_length()?;
-    let actual = u64::try_from(bytes.len()).map_err(|_| Error::LengthTooLarge)?;
-    if document_length != actual {
-        return Err(Error::DocumentLengthMismatch {
-            expected: document_length,
-            actual,
-        });
-    }
+    let (mut reader, _) = read_document_header(bytes, options)?;
     let schema = read_schema(&mut reader)?;
     if !schema.types.is_empty() {
         return Err(Error::Serde(
@@ -393,12 +397,14 @@ impl<'a> ser::Serializer for ByteSerializer<'a> {
     fn serialize_map(self, _len: Option<usize>) -> Result<ByteMapSerializer<'a>> {
         let length_offset = self.out.len();
         write_length(self.out, self.mode, 0)?; // patched in `end`
+        let keys = try_hashset_with_capacity(_len.unwrap_or(0), "serde map keys")?;
         Ok(ByteMapSerializer {
             out: self.out,
             mode: self.mode,
             length_offset,
             count: 0,
             pending_key: None,
+            keys,
         })
     }
 
@@ -407,6 +413,9 @@ impl<'a> ser::Serializer for ByteSerializer<'a> {
         Ok(ByteStructSerializer {
             out: self.out,
             mode: self.mode,
+            expected_fields: len,
+            written_fields: 0,
+            keys: InlineKeySet::default(),
         })
     }
 
@@ -430,6 +439,9 @@ impl<'a> ser::Serializer for ByteSerializer<'a> {
             inner: ByteStructSerializer {
                 out: self.out,
                 mode: self.mode,
+                expected_fields: len,
+                written_fields: 0,
+                keys: InlineKeySet::default(),
             },
         })
     }
@@ -578,6 +590,7 @@ struct ByteMapSerializer<'a> {
     length_offset: usize,
     count: u64,
     pending_key: Option<String>,
+    keys: HashSet<String>,
 }
 
 impl<'a> SerializeMap for ByteMapSerializer<'a> {
@@ -594,9 +607,14 @@ impl<'a> SerializeMap for ByteMapSerializer<'a> {
             .pending_key
             .take()
             .ok_or_else(|| Error::Serde("map value serialized before key".to_owned()))?;
+        if self.keys.contains(&key) {
+            return Err(Error::DuplicateKey(key));
+        }
+        try_reserve_hashset(&mut self.keys, 1, "serde map keys")?;
         write_string(self.out, self.mode, &key)?;
+        self.keys.insert(key);
         serialize_element_into(self.out, self.mode, value)?;
-        self.count += 1;
+        self.count = self.count.checked_add(1).ok_or(Error::SizeOverflow)?;
         Ok(())
     }
 
@@ -611,17 +629,91 @@ impl<'a> SerializeMap for ByteMapSerializer<'a> {
     }
 }
 
+const INLINE_OBJECT_KEY_CAPACITY: usize = 16;
+
+/// Avoids a heap allocation for the common RPC object while retaining
+/// canonical duplicate-key validation. Larger objects spill into a HashSet.
+struct InlineKeySet<'a> {
+    inline: [Option<&'a str>; INLINE_OBJECT_KEY_CAPACITY],
+    len: usize,
+    overflow: Option<HashSet<&'a str>>,
+}
+
+impl Default for InlineKeySet<'_> {
+    fn default() -> Self {
+        Self {
+            inline: [None; INLINE_OBJECT_KEY_CAPACITY],
+            len: 0,
+            overflow: None,
+        }
+    }
+}
+
+impl<'a> InlineKeySet<'a> {
+    fn insert(&mut self, key: &'a str, context: &'static str) -> Result<bool> {
+        if let Some(keys) = &mut self.overflow {
+            if keys.contains(key) {
+                return Ok(false);
+            }
+            try_reserve_hashset(keys, 1, context)?;
+            keys.insert(key);
+            return Ok(true);
+        }
+        if self.inline[..self.len]
+            .iter()
+            .flatten()
+            .any(|existing| *existing == key)
+        {
+            return Ok(false);
+        }
+        if self.len < INLINE_OBJECT_KEY_CAPACITY {
+            self.inline[self.len] = Some(key);
+            self.len += 1;
+            return Ok(true);
+        }
+
+        let mut keys = try_hashset_with_capacity(self.len + 1, context)?;
+        keys.extend(self.inline.iter().flatten().copied());
+        keys.insert(key);
+        self.overflow = Some(keys);
+        Ok(true)
+    }
+}
+
 /// Streams a struct into `out` as an object. The field count is known up front, so
 /// the object length is written immediately and each field is appended in place.
 struct ByteStructSerializer<'a> {
     out: &'a mut Vec<u8>,
     mode: LengthMode,
+    expected_fields: usize,
+    written_fields: usize,
+    keys: InlineKeySet<'static>,
 }
 
 impl<'a> ByteStructSerializer<'a> {
     fn field<T: Serialize + ?Sized>(&mut self, key: &'static str, value: &T) -> Result<()> {
+        if self.written_fields >= self.expected_fields {
+            return Err(Error::Serde(
+                "struct serialized more fields than declared".to_string(),
+            ));
+        }
+        if !self.keys.insert(key, "serde struct keys")? {
+            return duplicate_key_error(key);
+        }
         write_string(self.out, self.mode, key)?;
-        serialize_element_into(self.out, self.mode, value)
+        serialize_element_into(self.out, self.mode, value)?;
+        self.written_fields += 1;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<ElementType> {
+        if self.written_fields != self.expected_fields {
+            return Err(Error::Serde(format!(
+                "struct declared {} fields but serialized {}",
+                self.expected_fields, self.written_fields
+            )));
+        }
+        Ok(ElementType::Object)
     }
 }
 
@@ -638,7 +730,7 @@ impl<'a> SerializeStruct for ByteStructSerializer<'a> {
     }
 
     fn end(self) -> Result<ElementType> {
-        Ok(ElementType::Object)
+        self.finish()
     }
 }
 
@@ -660,7 +752,7 @@ impl<'a> SerializeStructVariant for ByteVariantStructSerializer<'a> {
     }
 
     fn end(self) -> Result<ElementType> {
-        Ok(ElementType::Object)
+        self.inner.finish()
     }
 }
 
@@ -787,19 +879,23 @@ where
         }
         TypeId::String => visitor.visit_borrowed_str(reader.read_string()?),
         TypeId::Bytes => visitor.visit_borrowed_bytes(reader.read_bytes()?),
-        TypeId::Object => {
-            let remaining = reader.read_len_usize()?;
-            visitor.visit_map(ObjectMapAccess { reader, remaining })
-        }
-        TypeId::List => {
+        TypeId::Object => reader.with_nesting(|reader| {
+            let remaining = reader.read_container_len()?;
+            visitor.visit_map(ObjectMapAccess {
+                reader,
+                remaining,
+                keys: InlineKeySet::default(),
+            })
+        }),
+        TypeId::List => reader.with_nesting(|reader| {
             let element_type = read_element_type(reader)?;
-            let remaining = reader.read_len_usize()?;
+            let remaining = reader.read_container_len()?;
             visitor.visit_seq(ListSeqAccess {
                 reader,
                 element_type,
                 remaining,
             })
-        }
+        }),
         // serde never serializes a fixed-size `array` (only `list`s), so serde-encoded
         // data never contains one. Externally-built array payloads must be read
         // through the dynamic `Value`/`from_value` API instead.
@@ -807,7 +903,7 @@ where
             "array values are not supported by serde decoding; use the dynamic Value API"
                 .to_owned(),
         )),
-        TypeId::Optional => {
+        TypeId::Optional => reader.with_nesting(|reader| {
             let element_type = read_element_type(reader)?;
             match reader.read_u8()? {
                 0 => visitor.visit_none(),
@@ -817,7 +913,7 @@ where
                 }),
                 other => Err(Error::InvalidBoolean(other)),
             }
-        }
+        }),
         TypeId::Padding | TypeId::Document => Err(Error::UnsupportedTypeId(type_id.byte())),
     }
 }
@@ -881,19 +977,19 @@ where
         let SobjDeserializer { reader, shape } = self;
         let type_id = Self::type_id(reader, &shape)?;
         match type_id {
-            TypeId::Optional => {
+            TypeId::Optional => reader.with_nesting(|reader| {
                 read_element_type(reader)?;
                 match reader.read_u8()? {
                     0 => visitor.visit_unit(),
                     other => Err(Error::InvalidBoolean(other)),
                 }
-            }
-            TypeId::Object => {
-                if reader.read_len_usize()? != 0 {
+            }),
+            TypeId::Object => reader.with_nesting(|reader| {
+                if reader.read_container_len()? != 0 {
                     return Err(Error::Serde("expected unit".to_owned()));
                 }
                 visitor.visit_unit()
-            }
+            }),
             _ => Err(Error::Serde("expected unit".to_owned())),
         }
     }
@@ -930,15 +1026,15 @@ where
                     value: None,
                 })
             }
-            TypeId::Object => {
-                if reader.read_len_usize()? != 1 {
+            TypeId::Object => reader.with_nesting(|reader| {
+                if reader.read_container_len()? != 1 {
                     return Err(Error::Serde(
                         "expected single-field object for enum variant".to_owned(),
                     ));
                 }
                 let variant = reader.read_string()?;
                 visitor.visit_enum(StreamEnumAccess { reader, variant })
-            }
+            }),
             _ => Err(Error::Serde("expected enum representation".to_owned())),
         }
     }
@@ -952,6 +1048,7 @@ where
 struct ObjectMapAccess<'r, 'a> {
     reader: &'r mut Reader<'a>,
     remaining: usize,
+    keys: InlineKeySet<'a>,
 }
 
 impl<'de, 'r, 'a> MapAccess<'de> for ObjectMapAccess<'r, 'a>
@@ -966,6 +1063,9 @@ where
         }
         self.remaining -= 1;
         let key = self.reader.read_string()?;
+        if !self.keys.insert(key, "serde object keys")? {
+            return duplicate_key_error(key);
+        }
         seed.deserialize(SobjStrDeserializer {
             value: key,
             context: "object key",
@@ -2062,14 +2162,15 @@ mod streaming_tests {
 
     #[test]
     fn streaming_accessors_expose_size_hints_for_fast_preallocation() {
-        let mut map_reader = Reader::new(&[], LengthMode::U64);
+        let mut map_reader = Reader::with_limits(&[], LengthMode::U64, Default::default());
         let map = ObjectMapAccess {
             reader: &mut map_reader,
             remaining: 7,
+            keys: InlineKeySet::default(),
         };
         assert_eq!(map.size_hint(), Some(7));
 
-        let mut seq_reader = Reader::new(&[], LengthMode::U64);
+        let mut seq_reader = Reader::with_limits(&[], LengthMode::U64, Default::default());
         let seq = ListSeqAccess {
             reader: &mut seq_reader,
             element_type: ElementType::Builtin(TypeId::Uint8),
@@ -2254,6 +2355,119 @@ mod streaming_tests {
         .expect_err("heterogeneous tuple should fail");
         assert_eq!(error, Error::TypeMismatch);
         assert_eq!(out, before);
+    }
+
+    #[test]
+    fn serde_decode_options_enforce_version_and_limits() {
+        let encoded = to_bytes(&vec![1_u8, 2, 3, 4], 7, LengthMode::U32).expect("encode");
+        let version_error = from_bytes_with_options::<Vec<u8>>(
+            &encoded,
+            DecodeOptions::default().with_expected_version_id(8),
+        )
+        .expect_err("version mismatch");
+        assert_eq!(
+            version_error,
+            Error::UnexpectedVersionId {
+                expected: 8,
+                actual: 7,
+            }
+        );
+
+        let limit_error = from_bytes_with_options::<Vec<u8>>(
+            &encoded,
+            DecodeOptions::new(crate::DecodeLimits {
+                max_container_items: 3,
+                ..Default::default()
+            }),
+        )
+        .expect_err("container limit");
+        assert!(matches!(
+            limit_error,
+            Error::DecodeLimitExceeded {
+                limit: "container items",
+                max: 3,
+                actual: 4,
+            }
+        ));
+    }
+
+    #[test]
+    fn serde_map_encoder_rejects_duplicate_keys() {
+        struct DuplicateKeyMap;
+
+        impl Serialize for DuplicateKeyMap {
+            fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("same", &1_u8)?;
+                map.serialize_entry("same", &2_u8)?;
+                map.end()
+            }
+        }
+
+        assert!(matches!(
+            to_bytes(&DuplicateKeyMap, 1, LengthMode::U32),
+            Err(Error::DuplicateKey(key)) if key == "same"
+        ));
+    }
+
+    #[test]
+    fn serde_struct_encoder_rejects_duplicate_and_incorrect_field_counts() {
+        struct DuplicateKeyStruct;
+
+        impl Serialize for DuplicateKeyStruct {
+            fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                let mut value = serializer.serialize_struct("DuplicateKeyStruct", 2)?;
+                value.serialize_field("same", &1_u8)?;
+                value.serialize_field("same", &2_u8)?;
+                value.end()
+            }
+        }
+
+        struct ShortStruct;
+
+        impl Serialize for ShortStruct {
+            fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                let mut value = serializer.serialize_struct("ShortStruct", 2)?;
+                value.serialize_field("only", &1_u8)?;
+                value.end()
+            }
+        }
+
+        assert!(matches!(
+            to_bytes(&DuplicateKeyStruct, 1, LengthMode::U32),
+            Err(Error::DuplicateKey(key)) if key == "same"
+        ));
+        assert!(matches!(
+            to_bytes(&ShortStruct, 1, LengthMode::U32),
+            Err(Error::Serde(detail)) if detail.contains("declared 2 fields but serialized 1")
+        ));
+    }
+
+    #[test]
+    fn serde_map_decoder_rejects_duplicate_keys_before_visiting_target() {
+        let mut map = BTreeMap::new();
+        map.insert("keya".to_owned(), 1_u8);
+        map.insert("keyb".to_owned(), 2_u8);
+        let mut encoded = to_bytes(&map, 1, LengthMode::U32).expect("encode map");
+        let key_offset = encoded
+            .windows(4)
+            .position(|window| window == b"keyb")
+            .expect("second key");
+        encoded[key_offset..key_offset + 4].copy_from_slice(b"keya");
+
+        assert!(matches!(
+            from_bytes::<BTreeMap<String, u8>>(&encoded),
+            Err(Error::DuplicateKey(key)) if key == "keya"
+        ));
     }
 
     #[test]

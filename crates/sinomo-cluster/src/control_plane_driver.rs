@@ -281,15 +281,15 @@ mod tests {
         let requested = Some(Duration::from_secs(30));
         assert_eq!(
             sinomo_network::cluster_object_rpc_effective_route_timeout(&append, requested),
-            Duration::from_secs(30)
+            Some(Duration::from_secs(30))
         );
         assert_eq!(
             sinomo_network::cluster_object_rpc_effective_route_timeout(&vote, requested),
-            sinomo_network::DEFAULT_NETWORK_TIMEOUT
+            Some(Duration::from_secs(30))
         );
         assert_eq!(
             sinomo_network::cluster_object_rpc_effective_route_timeout(&general, requested),
-            sinomo_network::DEFAULT_NETWORK_TIMEOUT
+            Some(Duration::from_secs(30))
         );
     }
 }

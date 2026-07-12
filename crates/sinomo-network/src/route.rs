@@ -11,8 +11,8 @@ use crate::file_mark::{ClusterFileMark, cluster_file_mark};
 use crate::prelude::*;
 use crate::{
     ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityState, ClusterPaths,
-    DEFAULT_NETWORK_TIMEOUT, DaemonControlRequest, DaemonRpcTimeouts, NetworkDeliveryState,
-    NetworkError, NetworkTimeoutPhase, ObjectRpcRequest, ObjectRpcResponse,
+    DEFAULT_NETWORK_TIMEOUT, DaemonControlRequest, DaemonRpcTimeouts, NetworkCallPolicy,
+    NetworkDeliveryState, NetworkError, NetworkTimeoutPhase, ObjectRpcRequest, ObjectRpcResponse,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
@@ -40,21 +40,13 @@ const CLUSTER_RELAY_DEFAULT_TTL: u8 = 8;
 const CLUSTER_RELAY_MAX_FAILURE_DETAILS: usize = 8;
 const CLUSTER_RELAY_FAILURE_DETAIL_MAX_CHARS: usize = 512;
 const CLUSTER_OBJECT_RPC_TRACE_FAILURE_DETAIL_MAX_CHARS: usize = 256;
-// App/control RPCs stay on the short routing budget. Data-plane requests that
-// explicitly opt into a full response budget may wait for bounded remote durable
-// work, but never beyond the 60-second total transfer deadline. Active stream
-// progress remains independently bounded by DEFAULT_NETWORK_TIMEOUT.
-const CLUSTER_TARGET_FULL_RESPONSE_ROUTE_DEADLINE_MAX: Duration = Duration::from_secs(60);
+// Origin-side explicit operation deadlines are preserved across relay hops,
+// while calls without an explicit deadline have no total wall-clock limit.
+// Connect and no-progress stalls remain independently bounded by the selected
+// health policy (five seconds by default).
 // Unverified endpoints are capped below the whole-route deadline so a stale
 // candidate cannot consume the fallback budget.
 const CLUSTER_TARGET_UNVERIFIED_ENDPOINT_ATTEMPT_MAX: Duration = Duration::from_secs(2);
-const CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED: Duration =
-    Duration::from_millis(3500);
-// A verified endpoint gets more time for an explicitly long response while
-// alternatives remain, without consuming the entire 60-second route budget.
-const CLUSTER_TARGET_VERIFIED_DIRECT_FULL_RESPONSE_ATTEMPT_MAX: Duration = Duration::from_secs(10);
-const CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_FALLBACK_RESERVE: Duration =
-    Duration::from_millis(500);
 const CLUSTER_DELIVERY_DEGRADED_LINK_COST: u64 = 50_000;
 const CLUSTER_DELIVERY_UNOBSERVED_TARGET_COST: u64 = CLUSTER_DELIVERY_DEGRADED_LINK_COST / 2;
 const CLUSTER_DELIVERY_UNOBSERVED_NEIGHBOR_COST: u64 = 75_000;
@@ -2144,9 +2136,9 @@ pub struct ClusterObjectRpcOptions {
 }
 
 impl ClusterObjectRpcOptions {
-    /// Override transport phases while retaining the network-owned whole-call
-    /// deadline. Connect and idle limits are not reinterpreted as operation
-    /// deadlines; callers with a domain budget must use `with_overall_timeout`.
+    /// Override transport phases without creating a whole-call deadline.
+    /// Connect and idle limits are not reinterpreted as operation deadlines;
+    /// callers with a domain budget must use `with_overall_timeout`.
     pub fn new(timeouts: DaemonRpcTimeouts) -> Self {
         Self {
             timeouts,
@@ -2155,6 +2147,15 @@ impl ClusterObjectRpcOptions {
             // `new` preserves the phase-only contract of legacy callers. A
             // connect-only override must not silently become a body deadline.
             enforce_stream_deadline: false,
+        }
+    }
+
+    /// Builds routed-call options from the canonical health/deadline policy.
+    pub fn from_call_policy(policy: NetworkCallPolicy) -> Self {
+        let options = Self::new(policy.health.into());
+        match policy.overall_timeout {
+            Some(timeout) => options.with_overall_timeout(timeout),
+            None => options,
         }
     }
 
@@ -2189,6 +2190,12 @@ impl ClusterObjectRpcOptions {
         self.enforce_stream_deadline
             .then_some(deadline.deadline_at)
             .flatten()
+    }
+}
+
+impl From<NetworkCallPolicy> for ClusterObjectRpcOptions {
+    fn from(policy: NetworkCallPolicy) -> Self {
+        Self::from_call_policy(policy)
     }
 }
 
@@ -2756,10 +2763,10 @@ where
                 detail: "cluster target RPC requires a route context".to_string(),
             });
         };
-        let route_timeout = Some(cluster_object_rpc_effective_route_timeout(
+        let route_timeout = cluster_object_rpc_effective_route_timeout(
             request,
             options.requested_overall_timeout(),
-        ));
+        );
         let deadline = ClusterEndpointRpcDeadline::new(route_timeout);
         let timeout_error = cluster_target_rpc_timeout_error(
             target_node_id,
@@ -2816,10 +2823,10 @@ where
                 detail: "cluster target stream RPC requires a route context".to_string(),
             });
         };
-        let route_timeout = Some(cluster_object_rpc_effective_route_timeout(
+        let route_timeout = cluster_object_rpc_effective_route_timeout(
             request,
             options.requested_overall_timeout(),
-        ));
+        );
         let deadline = ClusterEndpointRpcDeadline::new(route_timeout);
         let timeout_error = cluster_target_rpc_timeout_error(
             target_node_id,
@@ -3118,11 +3125,6 @@ where
                 };
                 let final_hop = &route_plan.next_hop == target_node_id;
                 let endpoints_left = route_endpoint_count.saturating_sub(endpoint_index).max(1);
-                let reserve_fallback_budget =
-                    cluster_target_endpoint_should_reserve_fallback_budget(
-                        &endpoint,
-                        endpoints_left,
-                    );
                 let endpoint_attempt_budget = cluster_target_endpoint_attempt_budget_for_endpoint(
                     &local_connectivity,
                     &endpoint,
@@ -3140,28 +3142,8 @@ where
                         relay_has_direct_target_fallback,
                     )
                 };
-                let hop_verified_endpoint =
-                    cluster_endpoint_has_healthy_route_evidence(&local_connectivity, &endpoint)
-                        && !reserve_fallback_budget;
-                let hop_budget_endpoints_left = endpoints_left
-                    .saturating_add(usize::from(!final_hop && relay_has_direct_target_fallback));
                 let hop_full_response_budget = use_full_response_budget;
-                let bounded_hop_attempt_budget = if final_hop || hop_full_response_budget {
-                    cluster_target_final_hop_attempt_budget(
-                        remaining,
-                        hop_budget_endpoints_left,
-                        endpoint_attempt_budget,
-                        hop_verified_endpoint,
-                        hop_full_response_budget,
-                    )
-                } else {
-                    endpoint_attempt_budget
-                };
-                let hop_attempt_budget = cluster_buffered_response_attempt_budget(
-                    remaining,
-                    bounded_hop_attempt_budget,
-                    hop_full_response_budget,
-                );
+                let hop_attempt_budget = cluster_response_attempt_budget(remaining);
                 let hop_timeouts = if final_hop || hop_full_response_budget {
                     cluster_target_final_hop_transport_timeouts(
                         options.timeouts,
@@ -3175,6 +3157,7 @@ where
                         options.timeouts,
                         options.extended_idle_timeout,
                         endpoint_attempt_budget,
+                        remaining,
                     )
                 };
                 let attempt_deadline = deadline.capped_by(hop_attempt_budget);
@@ -3251,6 +3234,13 @@ where
                     )
                 } else {
                     let outer_build_started_at = Instant::now();
+                    let Some(remaining_route_timeout) = deadline.checked_remaining() else {
+                        return Err(deadline.timeout_error(
+                            "cluster relay rpc envelope",
+                            NetworkTimeoutPhase::Overall,
+                            NetworkDeliveryState::DefinitelyNotSent,
+                        ));
+                    };
                     let outer = relay_request_for_signed_rpc_with_max_hop_timeout(
                         &state.cluster_id,
                         target_node_id,
@@ -3259,7 +3249,7 @@ where
                         std::iter::once(state.local_node_id.clone()),
                         &route_plan.path,
                         &relay_target_endpoints,
-                        route_timeout,
+                        remaining_route_timeout,
                         cluster_relay_request_extended_idle_timeout(options, false),
                     )?;
                     let outer_build_us = cluster_object_rpc_elapsed_us(outer_build_started_at);
@@ -3755,11 +3745,6 @@ where
                 };
                 let final_hop = &route_plan.next_hop == target_node_id;
                 let endpoints_left = route_endpoint_count.saturating_sub(endpoint_index).max(1);
-                let reserve_fallback_budget =
-                    cluster_target_endpoint_should_reserve_fallback_budget(
-                        &endpoint,
-                        endpoints_left,
-                    );
                 let endpoint_attempt_budget = cluster_target_endpoint_attempt_budget_for_endpoint(
                     &local_connectivity,
                     &endpoint,
@@ -3777,25 +3762,8 @@ where
                         relay_has_direct_target_fallback,
                     )
                 };
-                let hop_verified_endpoint =
-                    cluster_endpoint_has_healthy_route_evidence(&local_connectivity, &endpoint)
-                        && !reserve_fallback_budget;
-                let hop_budget_endpoints_left = endpoints_left
-                    .saturating_add(usize::from(!final_hop && relay_has_direct_target_fallback));
-                let hop_full_response_budget = use_full_response_budget
-                    && !reserve_fallback_budget
-                    && (endpoints_left <= 1 || hop_verified_endpoint);
-                let hop_attempt_budget = if final_hop || hop_full_response_budget {
-                    cluster_target_final_hop_attempt_budget(
-                        remaining,
-                        hop_budget_endpoints_left,
-                        endpoint_attempt_budget,
-                        hop_verified_endpoint,
-                        hop_full_response_budget,
-                    )
-                } else {
-                    endpoint_attempt_budget
-                };
+                let hop_full_response_budget = use_full_response_budget;
+                let hop_attempt_budget = cluster_response_attempt_budget(remaining);
                 let hop_timeouts = if final_hop || hop_full_response_budget {
                     cluster_target_final_hop_transport_timeouts(
                         options.timeouts,
@@ -3809,6 +3777,7 @@ where
                         options.timeouts,
                         None,
                         endpoint_attempt_budget,
+                        remaining,
                     )
                 };
                 let attempt_deadline = deadline.capped_by(hop_attempt_budget);
@@ -3885,6 +3854,13 @@ where
                     )
                 } else {
                     let outer_build_started_at = Instant::now();
+                    let Some(remaining_route_timeout) = deadline.checked_remaining() else {
+                        return Err(deadline.timeout_error(
+                            "cluster relay stream rpc envelope",
+                            NetworkTimeoutPhase::Overall,
+                            NetworkDeliveryState::DefinitelyNotSent,
+                        ));
+                    };
                     let outer = relay_request_for_signed_rpc_with_max_hop_timeout(
                         &state.cluster_id,
                         target_node_id,
@@ -3893,7 +3869,7 @@ where
                         std::iter::once(state.local_node_id.clone()),
                         &route_plan.path,
                         &relay_target_endpoints,
-                        route_timeout,
+                        remaining_route_timeout,
                         cluster_relay_request_extended_idle_timeout(options, true),
                     )?;
                     let outer_build_us = cluster_object_rpc_elapsed_us(outer_build_started_at);
@@ -4468,19 +4444,8 @@ fn cluster_endpoint_transport_timeouts(
     };
     let requested_idle_timeout = extended_idle_timeout.or(timeouts.idle_timeout);
     let idle_timeout = match (requested_idle_timeout, remaining_route_budget) {
-        (Some(idle_timeout), Some(remaining)) => {
-            let idle_timeout = if extended_idle_timeout.is_some() {
-                idle_timeout
-            } else {
-                idle_timeout.min(DEFAULT_NETWORK_TIMEOUT)
-            };
-            Some(idle_timeout.min(remaining))
-        }
-        (Some(idle_timeout), None) => Some(if extended_idle_timeout.is_some() {
-            idle_timeout
-        } else {
-            idle_timeout.min(DEFAULT_NETWORK_TIMEOUT)
-        }),
+        (Some(idle_timeout), Some(remaining)) => Some(idle_timeout.min(remaining)),
+        (Some(idle_timeout), None) => Some(idle_timeout),
         (None, _) => None,
     };
     timeouts
@@ -4491,9 +4456,25 @@ fn cluster_endpoint_transport_timeouts(
 fn cluster_relay_hop_transport_timeouts(
     timeouts: DaemonRpcTimeouts,
     extended_idle_timeout: Option<Duration>,
+    endpoint_connect_budget: Option<Duration>,
     remaining_route_budget: Option<Duration>,
 ) -> DaemonRpcTimeouts {
-    cluster_endpoint_transport_timeouts(timeouts, extended_idle_timeout, remaining_route_budget)
+    let connect_timeout = match (timeouts.connect_timeout, endpoint_connect_budget) {
+        (Some(connect_timeout), Some(budget)) => Some(connect_timeout.min(budget)),
+        (Some(connect_timeout), None) => Some(connect_timeout),
+        (None, Some(budget)) => Some(budget),
+        (None, None) => None,
+    };
+    let idle_timeout = extended_idle_timeout
+        .or(timeouts.idle_timeout)
+        .map(|idle_timeout| {
+            remaining_route_budget
+                .map(|remaining| idle_timeout.min(remaining))
+                .unwrap_or(idle_timeout)
+        });
+    timeouts
+        .with_connect_timeout(connect_timeout)
+        .with_idle_timeout(idle_timeout)
 }
 
 fn cluster_target_final_hop_transport_timeouts(
@@ -4512,11 +4493,7 @@ fn cluster_target_final_hop_transport_timeouts(
     let idle_timeout = extended_idle_timeout
         .or(timeouts.idle_timeout)
         .map(|idle_timeout| {
-            let mut capped = if extended_idle_timeout.is_some() {
-                idle_timeout
-            } else {
-                idle_timeout.min(DEFAULT_NETWORK_TIMEOUT)
-            };
+            let mut capped = idle_timeout;
             if let Some(remaining) = remaining_route_budget {
                 capped = capped.min(remaining);
             }
@@ -4599,69 +4576,8 @@ fn cluster_target_endpoint_should_reserve_fallback_budget(
 /// endpoint's connect/fallback slot has elapsed. Keep that slot as the connect
 /// timeout, but let the outer attempt observe the full remaining route budget;
 /// the transport-owned idle timeout still terminates a stalled response.
-fn cluster_buffered_response_attempt_budget(
-    remaining_route_budget: Option<Duration>,
-    bounded_attempt_budget: Option<Duration>,
-    use_full_response_budget: bool,
-) -> Option<Duration> {
-    if use_full_response_budget {
-        remaining_route_budget
-    } else {
-        bounded_attempt_budget
-    }
-}
-
-fn cluster_target_final_hop_attempt_budget(
-    remaining_route_budget: Option<Duration>,
-    endpoints_left: usize,
-    endpoint_attempt_budget: Option<Duration>,
-    verified_endpoint: bool,
-    use_full_response_budget: bool,
-) -> Option<Duration> {
-    if use_full_response_budget
-        && verified_endpoint
-        && endpoints_left > 1
-        && let Some(remaining) = remaining_route_budget
-    {
-        let fallback_reserve_count = endpoints_left.saturating_sub(1).min(u32::MAX as usize) as u32;
-        let fallback_reserve = CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_FALLBACK_RESERVE
-            .saturating_mul(fallback_reserve_count);
-        let response_budget = remaining.saturating_sub(fallback_reserve);
-        if !response_budget.is_zero() {
-            return Some(
-                response_budget.min(CLUSTER_TARGET_VERIFIED_DIRECT_FULL_RESPONSE_ATTEMPT_MAX),
-            );
-        }
-    }
-    if use_full_response_budget && endpoints_left <= 1 {
-        return remaining_route_budget;
-    }
-    if use_full_response_budget && !verified_endpoint {
-        return endpoint_attempt_budget;
-    }
-    if verified_endpoint
-        && let (Some(budget), Some(remaining)) = (endpoint_attempt_budget, remaining_route_budget)
-    {
-        let preferred =
-            cluster_target_verified_direct_endpoint_attempt_preferred(remaining, endpoints_left);
-        if preferred > Duration::ZERO {
-            return Some(preferred.min(remaining));
-        }
-        return Some(budget.min(remaining));
-    }
-    endpoint_attempt_budget
-}
-
-fn cluster_target_verified_direct_endpoint_attempt_preferred(
-    remaining_route_budget: Duration,
-    endpoints_left: usize,
-) -> Duration {
-    let fallback_reserve_count = endpoints_left.saturating_sub(1).min(u32::MAX as usize) as u32;
-    let fallback_reserve = CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_FALLBACK_RESERVE
-        .saturating_mul(fallback_reserve_count);
+fn cluster_response_attempt_budget(remaining_route_budget: Option<Duration>) -> Option<Duration> {
     remaining_route_budget
-        .saturating_sub(fallback_reserve)
-        .min(CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED)
 }
 
 fn cluster_endpoint_has_healthy_route_evidence(
@@ -4742,7 +4658,6 @@ fn relay_envelope_hop_timeout(envelope: &RelayEnvelope) -> Option<Duration> {
     envelope
         .max_hop_timeout_ms
         .map(|timeout_ms| Duration::from_millis(timeout_ms.max(1)))
-        .map(|timeout| timeout.min(CLUSTER_TARGET_FULL_RESPONSE_ROUTE_DEADLINE_MAX))
 }
 
 fn relay_envelope_extended_idle_timeout(envelope: &RelayEnvelope) -> Option<Duration> {
@@ -4752,45 +4667,36 @@ fn relay_envelope_extended_idle_timeout(envelope: &RelayEnvelope) -> Option<Dura
     envelope
         .extended_idle_timeout_ms
         .map(|timeout_ms| Duration::from_millis(timeout_ms.max(1)))
-        .map(|timeout| timeout.min(CLUSTER_TARGET_FULL_RESPONSE_ROUTE_DEADLINE_MAX))
 }
 
 fn cluster_target_route_timeout(
     timeout: Option<Duration>,
-    use_full_response_budget: bool,
+    _use_full_response_budget: bool,
 ) -> Option<Duration> {
-    let maximum = if use_full_response_budget {
-        CLUSTER_TARGET_FULL_RESPONSE_ROUTE_DEADLINE_MAX
-    } else {
-        DEFAULT_NETWORK_TIMEOUT
-    };
-    Some(timeout.unwrap_or(maximum).min(maximum))
+    timeout
 }
 
-/// Returns the bounded whole-route budget that routed object RPC uses for this
-/// request. Callers that wrap the routed call behind another transport can use
-/// this to keep the outer wrapper from racing an actively progressing inner
-/// response.
+/// Returns the optional explicit whole-route budget for a routed object RPC.
+///
+/// Calls without an explicit semantic deadline return `None`; transport
+/// connect and no-progress timeouts remain independently active. Callers that
+/// proxy the routed call must preserve `None` rather than synthesizing a
+/// whole-call deadline in an outer transport.
 pub fn cluster_object_rpc_effective_route_timeout(
     request: &ObjectRpcRequest,
     requested_overall_timeout: Option<Duration>,
-) -> Duration {
+) -> Option<Duration> {
     cluster_target_route_timeout(
         requested_overall_timeout,
         cluster_target_final_hop_request_uses_full_response_budget(request),
     )
-    .unwrap_or(DEFAULT_NETWORK_TIMEOUT)
 }
 
 fn cluster_endpoint_rpc_timeout(
     timeout: Option<Duration>,
-    use_full_response_budget: bool,
+    _use_full_response_budget: bool,
 ) -> Option<Duration> {
-    timeout.or(Some(if use_full_response_budget {
-        CLUSTER_TARGET_FULL_RESPONSE_ROUTE_DEADLINE_MAX
-    } else {
-        DEFAULT_NETWORK_TIMEOUT
-    }))
+    timeout
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -5045,7 +4951,7 @@ async fn handle_cluster_relay_envelope_async_with_host(
                 cluster_endpoint_transport_timeouts(
                     options.timeouts,
                     extended_idle_timeout,
-                    relay_envelope_hop_timeout(&envelope).or(options.timeouts.connect_timeout),
+                    relay_envelope_hop_timeout(&envelope),
                 ),
             )
             .await
@@ -5138,9 +5044,7 @@ async fn handle_cluster_relay_envelope_async_with_host(
     let mut failures = Vec::new();
     let mut failed_edges = ClusterDeliveryFailedEdges::default();
     let max_route_attempts = state.members.len().saturating_mul(2).max(1) + 2;
-    let relay_deadline = ClusterEndpointRpcDeadline::new(
-        relay_envelope_hop_timeout(&envelope).or(options.timeouts.connect_timeout),
-    );
+    let relay_deadline = ClusterEndpointRpcDeadline::new(relay_envelope_hop_timeout(&envelope));
     'route_attempts: for _ in 0..max_route_attempts {
         let plan_started_at = Instant::now();
         let Some(route_plan) = cluster_relay_forward_plan(
@@ -5202,8 +5106,6 @@ async fn handle_cluster_relay_envelope_async_with_host(
                 break 'route_attempts;
             };
             let endpoints_left = route_endpoint_count.saturating_sub(endpoint_index).max(1);
-            let reserve_fallback_budget =
-                cluster_target_endpoint_should_reserve_fallback_budget(&endpoint, endpoints_left);
             let endpoint_attempt_budget = cluster_target_endpoint_attempt_budget_for_endpoint(
                 &local_connectivity,
                 &endpoint,
@@ -5212,26 +5114,8 @@ async fn handle_cluster_relay_envelope_async_with_host(
                 route_endpoint_count,
             );
             let final_hop = &route_plan.next_hop == &envelope.target_node_id;
-            let hop_verified_endpoint =
-                cluster_endpoint_has_healthy_route_evidence(&local_connectivity, &endpoint)
-                    && !reserve_fallback_budget;
             let hop_full_response_budget = use_full_response_budget;
-            let bounded_hop_attempt_budget = if final_hop || hop_full_response_budget {
-                cluster_target_final_hop_attempt_budget(
-                    remaining,
-                    endpoints_left,
-                    endpoint_attempt_budget,
-                    hop_verified_endpoint,
-                    hop_full_response_budget,
-                )
-            } else {
-                endpoint_attempt_budget
-            };
-            let hop_attempt_budget = cluster_buffered_response_attempt_budget(
-                remaining,
-                bounded_hop_attempt_budget,
-                hop_full_response_budget,
-            );
+            let hop_attempt_budget = cluster_response_attempt_budget(remaining);
             let hop_timeouts = if final_hop || hop_full_response_budget {
                 cluster_target_final_hop_transport_timeouts(
                     options.timeouts,
@@ -5245,6 +5129,7 @@ async fn handle_cluster_relay_envelope_async_with_host(
                     options.timeouts,
                     extended_idle_timeout,
                     endpoint_attempt_budget,
+                    remaining,
                 )
             };
             let response = if final_hop {
@@ -5560,9 +5445,7 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
     let mut failures = Vec::new();
     let mut failed_edges = ClusterDeliveryFailedEdges::default();
     let max_route_attempts = state.members.len().saturating_mul(2).max(1) + 2;
-    let relay_deadline = ClusterEndpointRpcDeadline::new(
-        relay_envelope_hop_timeout(&envelope).or(options.timeouts.connect_timeout),
-    );
+    let relay_deadline = ClusterEndpointRpcDeadline::new(relay_envelope_hop_timeout(&envelope));
     'route_attempts: for _ in 0..max_route_attempts {
         let plan_started_at = Instant::now();
         let Some(route_plan) = cluster_relay_forward_plan(
@@ -5630,8 +5513,6 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
                 break 'route_attempts;
             };
             let endpoints_left = route_endpoint_count.saturating_sub(endpoint_index).max(1);
-            let reserve_fallback_budget =
-                cluster_target_endpoint_should_reserve_fallback_budget(&endpoint, endpoints_left);
             let endpoint_attempt_budget = cluster_target_endpoint_attempt_budget_for_endpoint(
                 &local_connectivity,
                 &endpoint,
@@ -5640,23 +5521,8 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
                 route_endpoint_count,
             );
             let final_hop = &route_plan.next_hop == &envelope.target_node_id;
-            let hop_verified_endpoint =
-                cluster_endpoint_has_healthy_route_evidence(&local_connectivity, &endpoint)
-                    && !reserve_fallback_budget;
-            let hop_full_response_budget = use_full_response_budget
-                && !reserve_fallback_budget
-                && (endpoints_left <= 1 || hop_verified_endpoint);
-            let hop_attempt_budget = if final_hop || hop_full_response_budget {
-                cluster_target_final_hop_attempt_budget(
-                    remaining,
-                    endpoints_left,
-                    endpoint_attempt_budget,
-                    hop_verified_endpoint,
-                    hop_full_response_budget,
-                )
-            } else {
-                endpoint_attempt_budget
-            };
+            let hop_full_response_budget = use_full_response_budget;
+            let hop_attempt_budget = cluster_response_attempt_budget(remaining);
             let hop_timeouts = if final_hop || hop_full_response_budget {
                 cluster_target_final_hop_transport_timeouts(
                     options.timeouts,
@@ -5670,6 +5536,7 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
                     options.timeouts,
                     None,
                     endpoint_attempt_budget,
+                    remaining,
                 )
             };
             let mut forwarded = envelope.clone();
@@ -5686,12 +5553,20 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
             };
             forwarded.max_hop_timeout_ms = forward_remaining_ms;
             let outer = forwarded.into_request()?;
-            // Stream forwarding can remain healthy for longer than one route attempt as long as
-            // chunks continue to make progress. The transport's connect and idle timeouts bound
-            // stalls; an outer wall-clock timeout here would abort large, active transfers.
-            match host
-                .send_relay_stream_forward_async(&endpoint, &outer, hop_timeouts)
-                .await
+            // A default stream has no wall-clock limit and relies on transport
+            // progress. An explicit semantic deadline remains terminal even
+            // while the stream is active.
+            let timeout_error = relay_deadline.timeout_error(
+                "cluster relay stream forward",
+                NetworkTimeoutPhase::Overall,
+                NetworkDeliveryState::PossiblyApplied,
+            );
+            match cluster_object_rpc_call_with_deadline(
+                host.send_relay_stream_forward_async(&endpoint, &outer, hop_timeouts),
+                relay_deadline,
+                timeout_error,
+            )
+            .await
             {
                 Ok(ClusterRelayStreamSendOutcome::Forwarded) => {
                     cluster_relay_record_attempt_us(
@@ -6535,6 +6410,7 @@ mod tests {
         sends: Vec<(ClusterEndpointRecord, ObjectRpcRequest, DaemonRpcTimeouts)>,
         first_error: Option<NetworkError>,
         routing_response: Option<ObjectRpcResponse>,
+        stall_first_send: Option<Duration>,
     }
 
     impl ClusterRelayStreamForwardAsyncHost for RecordingRelayStreamHost {
@@ -6554,9 +6430,13 @@ mod tests {
             let request = request.clone();
             let first_error = self.first_error.clone().filter(|_| self.sends.is_empty());
             let routing_response = self.routing_response.clone();
+            let stall = self.stall_first_send.filter(|_| self.sends.is_empty());
             let sends = &mut self.sends;
             Box::pin(async move {
                 sends.push((endpoint, request, timeouts));
+                if let Some(stall) = stall {
+                    tokio::time::sleep(stall).await;
+                }
                 if let Some(error) = first_error {
                     return Err(error);
                 }
@@ -6797,7 +6677,9 @@ mod tests {
         stream_error_first_send: bool,
         stall_first_send: Option<Duration>,
         stall_second_send: Option<Duration>,
+        idle_timeout_first_send: bool,
         stall_first_stream_send: Option<Duration>,
+        timeout_first_stream_send: bool,
         stall_first_sign: Option<Duration>,
     }
 
@@ -6861,6 +6743,7 @@ mod tests {
             let stall_second = self
                 .stall_second_send
                 .filter(|_| self.target_sends.len() == 1);
+            let should_idle_timeout = self.idle_timeout_first_send && self.target_sends.is_empty();
             let sends = &mut self.target_sends;
             let auths = &mut self.target_auths;
             let auth = _auth.to_vec();
@@ -6874,7 +6757,16 @@ mod tests {
                 if let Some(stall) = stall_second {
                     tokio::time::sleep(stall).await;
                 }
-                if should_timeout {
+                if should_idle_timeout {
+                    let idle_timeout = timeouts.idle_timeout.unwrap_or(DEFAULT_NETWORK_TIMEOUT);
+                    tokio::time::sleep(idle_timeout).await;
+                    Err(NetworkError::timeout(
+                        "test target response progress",
+                        NetworkTimeoutPhase::Idle,
+                        idle_timeout,
+                        NetworkDeliveryState::PossiblyApplied,
+                    ))
+                } else if should_timeout {
                     Err(NetworkError::timeout(
                         "connect test target endpoint",
                         NetworkTimeoutPhase::Connect,
@@ -6934,6 +6826,8 @@ mod tests {
             let should_report_outcome_unknown =
                 self.relay_outcome_unknown_first_stream_send && self.stream_target_sends.is_empty();
             let should_error = self.stream_error_first_send && self.stream_target_sends.is_empty();
+            let should_timeout =
+                self.timeout_first_stream_send && self.stream_target_sends.is_empty();
             let stall = self
                 .stall_first_stream_send
                 .filter(|_| self.stream_target_sends.is_empty());
@@ -6946,6 +6840,14 @@ mod tests {
                 auths.push(auth);
                 if let Some(stall) = stall {
                     tokio::time::sleep(stall).await;
+                }
+                if should_timeout {
+                    return Err(NetworkError::timeout(
+                        "connect test target stream endpoint",
+                        NetworkTimeoutPhase::Connect,
+                        timeouts.connect_timeout.unwrap_or(DEFAULT_NETWORK_TIMEOUT),
+                        NetworkDeliveryState::DefinitelyNotSent,
+                    ));
                 }
                 if let Some(delivery_state) = stale_pool_delivery_state {
                     return Err(NetworkError::StalePooledConnection {
@@ -7126,6 +7028,148 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn endpoint_rpc_default_has_no_whole_call_deadline() {
+        let node_id = NodeId::from_legacy_named("node_unbounded_sign_target").expect("node id");
+        let endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &node_id,
+            "127.0.0.1:21353".to_string(),
+            0,
+        );
+        let request =
+            ObjectRpcRequest::encode_body("/test/unbounded-sign-deadline", "test", &"body")
+                .expect("request");
+        let mut host = RecordingSignedHost {
+            stall_first_sign: Some(Duration::from_secs(60)),
+            ..RecordingSignedHost::default()
+        };
+        let mut client = ClusterObjectRpcClient::endpoint_only(&mut host);
+        let started_at = tokio::time::Instant::now();
+
+        client
+            .call_endpoint(&endpoint, &request, ClusterObjectRpcOptions::default())
+            .await
+            .expect("default call must not impose a whole-call deadline");
+
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started_at),
+            Duration::from_secs(60)
+        );
+        assert_eq!(host.target_sends.len(), 1);
+        assert_eq!(host.target_sends[0].2, DaemonRpcTimeouts::default());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn routed_rpc_default_has_no_whole_call_deadline() {
+        let (_root, paths, state, _local_node, target_node, _endpoints) =
+            relay_retry_test_fixture("target_unbounded_sign_deadline");
+        let request =
+            ObjectRpcRequest::encode_body("/test/routed-unbounded-sign-deadline", "test", &"body")
+                .expect("request");
+        let mut host = RecordingSignedHost {
+            stall_first_sign: Some(Duration::from_secs(60)),
+            ..RecordingSignedHost::default()
+        };
+        let runtime = tokio::runtime::Handle::current();
+        let mut client = ClusterObjectRpcClient::routed(&mut host, &runtime, &paths);
+        let started_at = tokio::time::Instant::now();
+
+        client
+            .call_target(
+                &state,
+                &target_node,
+                &request,
+                ClusterObjectRpcOptions::default(),
+            )
+            .await
+            .expect("default routed call must not impose a whole-call deadline");
+
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started_at),
+            Duration::from_secs(60)
+        );
+        assert_eq!(host.target_sends.len(), 1);
+        assert_eq!(host.target_sends[0].2, DaemonRpcTimeouts::default());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn routed_rpc_explicit_deadline_is_not_shortened_to_the_connect_slot() {
+        let (_root, paths, state, _local_node, target_node, _endpoints) =
+            relay_retry_test_fixture("target_explicit_response_deadline");
+        let request = ObjectRpcRequest::encode_body(
+            "/test/routed-explicit-response-deadline",
+            "test",
+            &"body",
+        )
+        .expect("request");
+        let mut host = RecordingSignedHost {
+            stall_first_send: Some(Duration::from_secs(10)),
+            ..RecordingSignedHost::default()
+        };
+        let runtime = tokio::runtime::Handle::current();
+        let mut client = ClusterObjectRpcClient::routed(&mut host, &runtime, &paths);
+        let started_at = tokio::time::Instant::now();
+
+        client
+            .call_target(
+                &state,
+                &target_node,
+                &request,
+                ClusterObjectRpcOptions::from(NetworkCallPolicy {
+                    health: crate::NetworkHealthPolicy::new(
+                        Duration::from_secs(5),
+                        Duration::from_secs(30),
+                    ),
+                    overall_timeout: Some(Duration::from_secs(30)),
+                }),
+            )
+            .await
+            .expect("progressing response may outlive the connect slot");
+
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started_at),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_default_does_not_turn_connect_timeout_into_a_hop_deadline() {
+        let (_root, paths, state, local_node, target_node, endpoints) =
+            relay_retry_test_fixture("relay_unbounded_target_response");
+        let inner =
+            ObjectRpcRequest::encode_body("/test/relay-unbounded-target-response", "test", &"body")
+                .expect("request");
+        let mut envelope = RelayEnvelope::new(state.cluster_id.clone(), target_node.clone(), inner);
+        envelope.planned_path = vec![local_node.clone(), target_node];
+        envelope.target_endpoints = endpoints.to_vec();
+        let request = envelope.into_request().expect("relay request");
+        let mut host = RecordingRelayHost {
+            stall_first_target_send: Some(Duration::from_secs(60)),
+            ..RecordingRelayHost::default()
+        };
+        let runtime = tokio::runtime::Handle::current();
+        let started_at = tokio::time::Instant::now();
+
+        handle_cluster_relay_async_with_host(
+            &runtime,
+            &paths,
+            &state,
+            &local_node,
+            &request,
+            ClusterRelayOptions::new(DaemonRpcTimeouts::default()),
+            &mut host,
+        )
+        .await
+        .expect("relay call must not use connect timeout as a total hop deadline");
+
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started_at),
+            Duration::from_secs(60)
+        );
+        assert_eq!(host.target_sends.len(), 1);
+        assert_eq!(host.target_sends[0].2, DaemonRpcTimeouts::default());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn endpoint_stream_body_retains_whole_call_deadline() {
         let node_id = NodeId::from_legacy_named("node_stream_deadline_target").expect("node id");
         let endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
@@ -7166,6 +7210,36 @@ mod tests {
         ));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn endpoint_stream_body_default_has_no_whole_call_deadline() {
+        let node_id = NodeId::from_legacy_named("node_unbounded_stream_target").expect("node id");
+        let endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &node_id,
+            "127.0.0.1:21353".to_string(),
+            0,
+        );
+        let mut request =
+            ObjectRpcRequest::encode_body("/test/unbounded-stream-target", "test", &"body")
+                .expect("request");
+        crate::set_object_rpc_request_stream_mode(
+            &mut request,
+            crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
+        );
+        let mut host = RecordingSignedHost::default();
+        let mut client = ClusterObjectRpcClient::endpoint_only(&mut host);
+        let mut response = client
+            .call_endpoint_stream(&endpoint, &request, ClusterObjectRpcOptions::default())
+            .await
+            .expect("stream response header");
+
+        tokio::time::advance(Duration::from_secs(120)).await;
+        assert_eq!(
+            response.body.read_next_chunk().await.expect("body chunk"),
+            Some(b"stre".to_vec()),
+            "active streams must not inherit the former 60-second wall-clock deadline"
+        );
+    }
+
     #[test]
     fn cluster_object_rpc_defaults_use_shared_network_progress_timeout() {
         let options = ClusterObjectRpcOptions::default();
@@ -7180,23 +7254,50 @@ mod tests {
     }
 
     #[test]
-    fn phase_only_connect_timeout_does_not_become_a_stream_body_deadline() {
+    fn canonical_call_policy_maps_health_without_inventing_a_deadline() {
+        let options = ClusterObjectRpcOptions::from(NetworkCallPolicy::default());
+        assert_eq!(options.timeouts, DaemonRpcTimeouts::default());
+        assert_eq!(options.requested_overall_timeout(), None);
+
+        let options = ClusterObjectRpcOptions::from(
+            NetworkCallPolicy::default().with_overall_timeout(Duration::from_secs(90)),
+        );
+        assert_eq!(options.timeouts, DaemonRpcTimeouts::default());
+        assert_eq!(
+            options.requested_overall_timeout(),
+            Some(Duration::from_secs(90))
+        );
+
+        let custom = ClusterObjectRpcOptions::from(NetworkCallPolicy {
+            health: crate::NetworkHealthPolicy::new(
+                Duration::from_secs(7),
+                Duration::from_secs(30),
+            ),
+            overall_timeout: None,
+        });
+        let transport = cluster_endpoint_transport_timeouts(custom.timeouts, None, None);
+        assert_eq!(transport.connect_timeout, Some(Duration::from_secs(7)));
+        assert_eq!(transport.idle_timeout, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn only_explicit_overall_timeout_becomes_a_stream_body_deadline() {
         let phase_only =
             ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_only(Duration::from_secs(5)));
-        let deadline = ClusterEndpointRpcDeadline::new(Some(Duration::from_secs(5)));
+        let unbounded = ClusterEndpointRpcDeadline::new(None);
+        let explicit = ClusterEndpointRpcDeadline::new(Some(Duration::from_secs(5)));
 
         assert_eq!(phase_only.requested_overall_timeout(), None);
-        assert_eq!(phase_only.stream_deadline(deadline), None);
-        assert!(
-            ClusterObjectRpcOptions::default()
-                .stream_deadline(deadline)
-                .is_some(),
-            "network-owned defaults should still bound the whole streamed call"
+        assert_eq!(phase_only.stream_deadline(explicit), None);
+        assert_eq!(
+            ClusterObjectRpcOptions::default().stream_deadline(unbounded),
+            None,
+            "network-owned defaults must not synthesize a stream body deadline"
         );
         assert!(
             phase_only
                 .with_overall_timeout(Duration::from_secs(5))
-                .stream_deadline(deadline)
+                .stream_deadline(explicit)
                 .is_some(),
             "an explicit semantic whole-call timeout must include the body"
         );
@@ -7336,7 +7437,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_target_final_hop_transport_timeouts_keep_progress_limit_inside_response_budget() {
+    fn cluster_target_final_hop_transport_timeouts_preserve_custom_progress_limit() {
         let base = DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(15));
         let shaped = cluster_target_final_hop_transport_timeouts(
             base,
@@ -7347,11 +7448,11 @@ mod tests {
         );
 
         assert_eq!(shaped.connect_timeout, Some(Duration::from_secs(2)));
-        assert_eq!(shaped.idle_timeout, Some(DEFAULT_NETWORK_TIMEOUT));
+        assert_eq!(shaped.idle_timeout, Some(Duration::from_secs(12)));
     }
 
     #[test]
-    fn ordinary_buffered_response_idle_timeout_stays_capped_on_every_route_path() {
+    fn ordinary_buffered_response_preserves_custom_idle_timeout_on_every_route_path() {
         let base = DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(30));
         let remaining = Some(Duration::from_secs(20));
 
@@ -7359,11 +7460,11 @@ mod tests {
         let final_hop = cluster_target_final_hop_transport_timeouts(
             base, None, remaining, remaining, remaining,
         );
-        let relay = cluster_relay_hop_transport_timeouts(base, None, remaining);
+        let relay = cluster_relay_hop_transport_timeouts(base, None, remaining, remaining);
 
-        assert_eq!(direct.idle_timeout, Some(DEFAULT_NETWORK_TIMEOUT));
-        assert_eq!(final_hop.idle_timeout, Some(DEFAULT_NETWORK_TIMEOUT));
-        assert_eq!(relay.idle_timeout, Some(DEFAULT_NETWORK_TIMEOUT));
+        assert_eq!(direct.idle_timeout, remaining);
+        assert_eq!(final_hop.idle_timeout, remaining);
+        assert_eq!(relay.idle_timeout, remaining);
     }
 
     #[test]
@@ -7382,8 +7483,12 @@ mod tests {
             Some(Duration::from_secs(9)),
             Some(Duration::from_secs(11)),
         );
-        let relay =
-            cluster_relay_hop_transport_timeouts(base, extended, Some(Duration::from_secs(7)));
+        let relay = cluster_relay_hop_transport_timeouts(
+            base,
+            extended,
+            Some(Duration::from_secs(7)),
+            Some(Duration::from_secs(7)),
+        );
 
         assert_eq!(direct.idle_timeout, Some(Duration::from_secs(12)));
         assert_eq!(final_hop.connect_timeout, Some(Duration::from_secs(4)));
@@ -7454,13 +7559,13 @@ mod tests {
         oversized.extended_idle_timeout_ms = Some(u64::MAX);
         assert_eq!(
             relay_envelope_hop_timeout(&oversized),
-            Some(CLUSTER_TARGET_FULL_RESPONSE_ROUTE_DEADLINE_MAX),
-            "a member-supplied relay envelope must not expand the route deadline"
+            Some(Duration::from_millis(u64::MAX)),
+            "an authenticated explicit deadline must survive the relay envelope exactly"
         );
         assert_eq!(
             relay_envelope_extended_idle_timeout(&oversized),
-            Some(CLUSTER_TARGET_FULL_RESPONSE_ROUTE_DEADLINE_MAX),
-            "a member-supplied relay envelope must not expand the bounded data-plane policy"
+            Some(Duration::from_millis(u64::MAX)),
+            "a custom no-progress policy remains authoritative until an overall deadline caps it"
         );
 
         oversized
@@ -7521,9 +7626,8 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
-        let options = ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
-            Duration::from_secs(15),
-        ));
+        let options =
+            ClusterObjectRpcOptions::default().with_overall_timeout(Duration::from_secs(15));
         let mut unsafe_host = RecordingSignedHost {
             fail_first_send: true,
             ..RecordingSignedHost::default()
@@ -7537,7 +7641,7 @@ mod tests {
         assert_eq!(unsafe_host.target_sends.len(), 1);
 
         let mut host = RecordingSignedHost {
-            fail_first_send: true,
+            timeout_first_send: true,
             ..RecordingSignedHost::default()
         };
         let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
@@ -7558,7 +7662,7 @@ mod tests {
             first_connect,
             CLUSTER_TARGET_UNVERIFIED_ENDPOINT_ATTEMPT_MAX
         );
-        assert_eq!(first_idle, CLUSTER_TARGET_UNVERIFIED_ENDPOINT_ATTEMPT_MAX);
+        assert_eq!(first_idle, DEFAULT_NETWORK_TIMEOUT);
 
         let second_timeouts = &host.target_sends[1].2;
         let second_connect = second_timeouts
@@ -7569,7 +7673,7 @@ mod tests {
             second_connect,
             CLUSTER_TARGET_UNVERIFIED_ENDPOINT_ATTEMPT_MAX
         );
-        assert_eq!(second_idle, CLUSTER_TARGET_UNVERIFIED_ENDPOINT_ATTEMPT_MAX);
+        assert_eq!(second_idle, DEFAULT_NETWORK_TIMEOUT);
     }
 
     #[test]
@@ -8217,79 +8321,19 @@ mod tests {
     }
 
     #[test]
-    fn cluster_target_final_hop_attempt_budget_expands_verified_direct_response_window() {
-        let split_budget = Some(Duration::from_millis(800));
-        let preferred = cluster_target_final_hop_attempt_budget(
-            Some(Duration::from_secs(4)),
-            5,
-            split_budget,
-            true,
-            false,
-        )
-        .expect("preferred budget");
-
-        assert_eq!(preferred, Duration::from_secs(2));
-
-        let unverified = cluster_target_final_hop_attempt_budget(
-            Some(Duration::from_secs(4)),
-            5,
-            split_budget,
-            false,
-            false,
-        )
-        .expect("unverified budget");
-        assert_eq!(unverified, Duration::from_millis(800));
-
-        let streamed = cluster_target_final_hop_attempt_budget(
-            Some(Duration::from_secs(4)),
-            5,
-            split_budget,
-            true,
-            true,
-        )
-        .expect("streamed budget");
-        assert_eq!(streamed, Duration::from_secs(2));
-
-        let streamed_last_endpoint = cluster_target_final_hop_attempt_budget(
-            Some(Duration::from_secs(4)),
-            1,
-            split_budget,
-            true,
-            true,
-        )
-        .expect("streamed last endpoint budget");
-        assert_eq!(streamed_last_endpoint, Duration::from_secs(4));
-    }
-
-    #[test]
-    fn cluster_target_final_hop_attempt_budget_keeps_unverified_full_response_fair() {
-        let split_budget = Some(Duration::from_millis(1000));
-        let budget = cluster_target_final_hop_attempt_budget(
-            Some(Duration::from_secs(5)),
-            5,
-            split_budget,
-            false,
-            true,
-        )
-        .expect("full response budget");
-
-        assert_eq!(budget, split_budget.expect("split budget"));
-    }
-
-    #[test]
-    fn buffered_full_response_keeps_connect_slot_but_uses_route_attempt_budget() {
+    fn buffered_response_keeps_connect_slot_but_uses_route_attempt_budget() {
         let remaining = Some(Duration::from_secs(15));
         let unverified_connect_slot = Some(CLUSTER_TARGET_UNVERIFIED_ENDPOINT_ATTEMPT_MAX);
 
         assert_eq!(
-            cluster_buffered_response_attempt_budget(remaining, unverified_connect_slot, true,),
+            cluster_response_attempt_budget(remaining),
             remaining,
             "response progress must not be cut off by the endpoint connect slot"
         );
         assert_eq!(
-            cluster_buffered_response_attempt_budget(remaining, unverified_connect_slot, false,),
-            unverified_connect_slot,
-            "ordinary buffered calls retain the bounded endpoint attempt"
+            cluster_response_attempt_budget(remaining),
+            remaining,
+            "ordinary response progress must not be cut off by the endpoint connect slot"
         );
 
         let shaped = cluster_target_final_hop_transport_timeouts(
@@ -8304,10 +8348,10 @@ mod tests {
     }
 
     #[test]
-    fn cluster_target_route_timeout_preserves_bounded_full_response_budget() {
+    fn cluster_rpc_timeout_preserves_explicit_deadlines_and_unbounded_defaults() {
         assert_eq!(
             cluster_target_route_timeout(Some(Duration::from_secs(60)), false),
-            Some(DEFAULT_NETWORK_TIMEOUT)
+            Some(Duration::from_secs(60))
         );
         assert_eq!(
             cluster_target_route_timeout(Some(Duration::from_secs(30)), true),
@@ -8315,65 +8359,31 @@ mod tests {
         );
         assert_eq!(
             cluster_target_route_timeout(Some(Duration::from_secs(120)), true),
-            Some(CLUSTER_TARGET_FULL_RESPONSE_ROUTE_DEADLINE_MAX)
+            Some(Duration::from_secs(120))
         );
-        assert_eq!(
-            cluster_target_route_timeout(None, true),
-            Some(CLUSTER_TARGET_FULL_RESPONSE_ROUTE_DEADLINE_MAX)
-        );
+        assert_eq!(cluster_target_route_timeout(None, true), None);
         assert_eq!(
             cluster_endpoint_rpc_timeout(Some(Duration::from_secs(90)), false),
             Some(Duration::from_secs(90)),
             "explicit bootstrap endpoint deadlines are not routed-call caps"
         );
+        assert_eq!(cluster_endpoint_rpc_timeout(None, false), None);
+
+        let ordinary = ObjectRpcRequest::from_encoded_body("/test/control", "test", Vec::new());
+        let full_response = ordinary.clone().with_full_response_budget();
         assert_eq!(
-            cluster_endpoint_rpc_timeout(None, false),
-            Some(DEFAULT_NETWORK_TIMEOUT)
+            cluster_object_rpc_effective_route_timeout(&ordinary, None),
+            None
         );
-    }
-
-    #[test]
-    fn cluster_target_final_hop_attempt_budget_reserves_each_fallback_slot() {
-        let split_budget = Some(Duration::from_millis(750));
-        let budget = cluster_target_final_hop_attempt_budget(
-            Some(Duration::from_secs(3)),
-            4,
-            split_budget,
-            true,
-            true,
-        )
-        .expect("verified budget");
-
-        assert_eq!(budget, Duration::from_millis(1500));
-    }
-
-    #[test]
-    fn cluster_target_final_hop_attempt_budget_caps_ordinary_and_bounds_full_response() {
-        let budget = cluster_target_final_hop_attempt_budget(
-            Some(Duration::from_secs(60)),
-            3,
-            Some(DEFAULT_NETWORK_TIMEOUT),
-            true,
-            false,
-        )
-        .expect("ordinary budget");
-
         assert_eq!(
-            budget,
-            CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED
+            cluster_object_rpc_effective_route_timeout(&full_response, None),
+            None,
+            "full-response compatibility metadata must not create a total deadline"
         );
-
-        let streamed = cluster_target_final_hop_attempt_budget(
-            Some(Duration::from_secs(60)),
-            3,
-            Some(DEFAULT_NETWORK_TIMEOUT),
-            true,
-            true,
-        )
-        .expect("streamed budget");
         assert_eq!(
-            streamed,
-            CLUSTER_TARGET_VERIFIED_DIRECT_FULL_RESPONSE_ATTEMPT_MAX
+            cluster_object_rpc_effective_route_timeout(&ordinary, Some(Duration::from_secs(600)),),
+            Some(Duration::from_secs(600)),
+            "an explicit origin deadline must be preserved exactly"
         );
     }
 
@@ -8389,82 +8399,18 @@ mod tests {
         assert!(cluster_target_final_hop_request_uses_full_response_budget(
             &data_plane
         ));
-
-        let budget = cluster_target_final_hop_attempt_budget(
-            Some(Duration::from_secs(60)),
-            3,
-            Some(DEFAULT_NETWORK_TIMEOUT),
-            true,
-            cluster_target_final_hop_request_uses_full_response_budget(&data_plane),
-        )
-        .expect("data-plane budget");
-        assert_eq!(
-            budget,
-            CLUSTER_TARGET_VERIFIED_DIRECT_FULL_RESPONSE_ATTEMPT_MAX
-        );
-
-        let last_endpoint_budget = cluster_target_final_hop_attempt_budget(
-            Some(Duration::from_secs(60)),
-            1,
-            Some(DEFAULT_NETWORK_TIMEOUT),
-            true,
-            cluster_target_final_hop_request_uses_full_response_budget(&data_plane),
-        )
-        .expect("data-plane last endpoint budget");
-        assert_eq!(last_endpoint_budget, Duration::from_secs(60));
     }
 
     #[test]
-    fn network_attempt_budget_matches_bounded_model_cases() {
-        let ordinary_unverified = cluster_target_final_hop_attempt_budget(
-            Some(Duration::from_secs(5)),
-            5,
-            Some(Duration::from_secs(1)),
-            false,
-            false,
-        )
-        .expect("ordinary unverified budget");
-        assert_eq!(ordinary_unverified, Duration::from_secs(1));
-
-        let full_response_unverified = cluster_target_final_hop_attempt_budget(
-            Some(Duration::from_secs(5)),
-            5,
-            Some(Duration::from_secs(1)),
-            false,
-            true,
-        )
-        .expect("full response unverified budget");
-        assert_eq!(full_response_unverified, Duration::from_secs(1));
-
-        let verified_direct = cluster_target_final_hop_attempt_budget(
-            Some(Duration::from_secs(5)),
-            5,
-            Some(Duration::from_secs(1)),
-            true,
-            false,
-        )
-        .expect("verified direct budget");
-        assert_eq!(verified_direct, Duration::from_secs(3));
-
-        let full_response_last_endpoint = cluster_target_final_hop_attempt_budget(
-            Some(Duration::from_secs(5)),
-            1,
-            Some(Duration::from_secs(1)),
-            false,
-            true,
-        )
-        .expect("last endpoint full response budget");
-        assert_eq!(full_response_last_endpoint, Duration::from_secs(5));
-
-        let full_response_verified_direct = cluster_target_final_hop_attempt_budget(
-            Some(Duration::from_secs(5)),
-            5,
-            Some(Duration::from_secs(1)),
-            true,
-            true,
-        )
-        .expect("verified full response budget");
-        assert_eq!(full_response_verified_direct, Duration::from_secs(3));
+    fn network_attempt_budget_separates_connect_fairness_from_response_progress() {
+        let route_budget = Some(Duration::from_secs(5));
+        let connect_budget = cluster_target_endpoint_attempt_budget(route_budget, 5, 5);
+        assert_eq!(connect_budget, Some(Duration::from_secs(1)));
+        assert_eq!(
+            cluster_response_attempt_budget(route_budget),
+            route_budget,
+            "a progressing response keeps the explicit route budget after connecting"
+        );
     }
 
     #[test]
@@ -8905,7 +8851,7 @@ mod tests {
             .build()
             .expect("runtime");
         let mut host = RecordingSignedHost {
-            stall_first_send: Some(Duration::from_secs(60)),
+            timeout_first_send: true,
             ..RecordingSignedHost::default()
         };
         let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
@@ -8916,9 +8862,7 @@ mod tests {
                 &state,
                 &target_node,
                 &request,
-                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
-                    Duration::from_secs(30),
-                )),
+                ClusterObjectRpcOptions::default().with_overall_timeout(Duration::from_secs(4)),
             ))
             .expect("fallback endpoint should be attempted within the target timeout");
 
@@ -8938,7 +8882,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_target_rpc_does_not_let_slow_reachable_data_plane_endpoint_starve_fallback() {
+    fn cluster_target_rpc_preserves_custom_health_policy_during_connect_fallback() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-target-data-plane-budget");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -9084,14 +9028,15 @@ mod tests {
             .2
             .idle_timeout
             .expect("direct idle timeout");
-        assert!(
-            direct_idle_timeout <= DEFAULT_NETWORK_TIMEOUT,
-            "direct data-plane idle timeout should stay inside route budget, got {direct_idle_timeout:?}"
+        assert_eq!(
+            direct_idle_timeout,
+            Duration::from_secs(60),
+            "the explicit no-progress policy must not be replaced by the default"
         );
     }
 
     #[test]
-    fn cluster_target_rpc_preserves_full_response_total_budget_but_caps_no_progress() {
+    fn cluster_target_rpc_has_unbounded_total_but_default_connect_and_no_progress_timeouts() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-target-route-budget-cap");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -9156,9 +9101,7 @@ mod tests {
                 &state,
                 &target_node,
                 &request,
-                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
-                    Duration::from_secs(60),
-                )),
+                ClusterObjectRpcOptions::default(),
             ))
             .expect("target rpc");
 
@@ -9168,14 +9111,8 @@ mod tests {
             .connect_timeout
             .expect("connect timeout");
         let idle_timeout = host.target_sends[0].2.idle_timeout.expect("idle timeout");
-        assert!(
-            connect_timeout <= DEFAULT_NETWORK_TIMEOUT,
-            "connect timeout should be capped by route budget, got {connect_timeout:?}"
-        );
-        assert!(
-            idle_timeout <= DEFAULT_NETWORK_TIMEOUT,
-            "full-response no-progress timeout should use the network default, got {idle_timeout:?}"
-        );
+        assert_eq!(connect_timeout, DEFAULT_NETWORK_TIMEOUT);
+        assert_eq!(idle_timeout, DEFAULT_NETWORK_TIMEOUT);
 
         let mut extended_host = RecordingSignedHost::default();
         let mut extended_client =
@@ -9301,7 +9238,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_target_rpc_reserves_fallback_budget_for_verified_streamed_request() {
+    fn cluster_target_rpc_preserves_stream_health_timeout_after_connecting() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-target-verified-response-budget");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -9416,8 +9353,8 @@ mod tests {
             .idle_timeout
             .expect("idle timeout");
         assert!(
-            idle_timeout >= Duration::from_millis(2400) && idle_timeout <= Duration::from_secs(3),
-            "idle timeout should reserve fallback budget for later endpoints, got {idle_timeout:?}"
+            idle_timeout >= Duration::from_millis(3900) && idle_timeout <= Duration::from_secs(4),
+            "response no-progress timeout should remain independent of the connect slot, got {idle_timeout:?}"
         );
     }
 
@@ -9527,9 +9464,9 @@ mod tests {
             .idle_timeout
             .expect("first endpoint idle timeout");
         assert!(
-            first_idle_timeout >= Duration::from_secs(3)
-                && first_idle_timeout <= Duration::from_millis(3500),
-            "healthy direct endpoint should keep the preferred app-facing response budget, got {first_idle_timeout:?}"
+            first_idle_timeout >= Duration::from_millis(3800)
+                && first_idle_timeout <= Duration::from_secs(4),
+            "the custom no-progress timeout should only be capped by the remaining overall deadline, got {first_idle_timeout:?}"
         );
         assert_eq!(
             host.target_sends[1].0.endpoint_id,
@@ -9634,7 +9571,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_target_rpc_hard_times_out_endpoint_attempts() {
+    fn cluster_target_rpc_falls_back_after_definitely_unsent_connect_timeout() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-target-hard-attempt-timeout");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -9681,7 +9618,7 @@ mod tests {
             .build()
             .expect("runtime");
         let mut host = RecordingSignedHost {
-            stall_first_send: Some(Duration::from_millis(200)),
+            timeout_first_send: true,
             ..RecordingSignedHost::default()
         };
         let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
@@ -9699,11 +9636,11 @@ mod tests {
                     .with_overall_timeout(Duration::from_millis(120)),
                 ),
             )
-            .expect("second endpoint should be attempted after hard timeout");
+            .expect("second endpoint should be attempted after a definitely-unsent timeout");
 
         assert!(
             started.elapsed() < Duration::from_millis(180),
-            "hard endpoint timeout should abort the stalled send before it sleeps fully"
+            "connect failure should preserve the explicit overall budget for fallback"
         );
         assert_eq!(host.target_sends.len(), 2);
         assert_eq!(host.target_sends[0].0.address, "stall-target.test:21353");
@@ -9920,20 +9857,23 @@ mod tests {
             .build()
             .expect("runtime");
         let mut host = RecordingSignedHost {
-            stall_first_stream_send: Some(Duration::from_secs(60)),
+            timeout_first_stream_send: true,
             ..RecordingSignedHost::default()
         };
         let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
 
         let mut response = runtime
-            .block_on(client.call_target_stream(
-                &state,
-                &target_node,
-                &request,
-                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
-                    Duration::from_secs(4),
-                )),
-            ))
+            .block_on(
+                client.call_target_stream(
+                    &state,
+                    &target_node,
+                    &request,
+                    ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
+                        Duration::from_secs(4),
+                    ))
+                    .with_overall_timeout(Duration::from_secs(4)),
+                ),
+            )
             .expect("fallback stream endpoint should be attempted");
         let body = runtime
             .block_on(response.body.collect_to_vec())
@@ -9991,13 +9931,17 @@ mod tests {
     }
 
     #[test]
-    fn cluster_relay_hop_transport_timeouts_cap_response_budget() {
+    fn cluster_relay_hop_transport_timeouts_preserve_custom_progress_limit() {
         let base = DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(15));
-        let shaped =
-            cluster_relay_hop_transport_timeouts(base, None, Some(Duration::from_secs(12)));
+        let shaped = cluster_relay_hop_transport_timeouts(
+            base,
+            None,
+            Some(Duration::from_secs(12)),
+            Some(Duration::from_secs(12)),
+        );
 
         assert_eq!(shaped.connect_timeout, Some(Duration::from_secs(12)));
-        assert_eq!(shaped.idle_timeout, Some(DEFAULT_NETWORK_TIMEOUT));
+        assert_eq!(shaped.idle_timeout, Some(Duration::from_secs(12)));
     }
 
     fn route_test_connectivity_record(
@@ -10207,7 +10151,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_final_hop_splits_hop_budget_across_target_endpoints() {
+    fn relay_final_hop_does_not_cut_progress_at_the_connect_slot() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-relay-target-endpoint-budget");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -10265,14 +10209,16 @@ mod tests {
             healthy_endpoint.clone(),
             backup_endpoint,
         ];
-        envelope.max_hop_timeout_ms = Some(2_000);
+        envelope.max_hop_timeout_ms = Some(200);
         let request = envelope.into_request().expect("relay request");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
         let mut host = RecordingRelayHost {
-            stall_first_target_send: Some(Duration::from_millis(1_200)),
+            // The mock delay represents a response that continues making
+            // transport progress; only the explicit 200ms deadline may stop it.
+            stall_first_target_send: Some(Duration::from_millis(120)),
             ..RecordingRelayHost::default()
         };
 
@@ -10288,31 +10234,33 @@ mod tests {
                 ))),
                 &mut host,
             ))
-            .expect("second endpoint should complete within relay budget");
+            .expect("progressing first endpoint should complete within the relay deadline");
 
         assert_eq!(
             response.decode_body::<String>().expect("response body"),
             "ok"
         );
-        assert_eq!(host.target_sends.len(), 2);
+        assert_eq!(host.target_sends.len(), 1);
         assert_eq!(
             host.target_sends[0].0.endpoint_id,
             stalled_endpoint.endpoint_id
-        );
-        assert_eq!(
-            host.target_sends[1].0.endpoint_id,
-            healthy_endpoint.endpoint_id
         );
         let first_timeout = host.target_sends[0]
             .2
             .connect_timeout
             .expect("first timeout");
         assert!(
-            first_timeout > Duration::from_millis(600)
-                && first_timeout <= Duration::from_millis(700),
-            "first endpoint should get roughly one third of the 2s relay hop budget, got {first_timeout:?}"
+            first_timeout > Duration::from_millis(60) && first_timeout <= Duration::from_millis(70),
+            "first endpoint should get roughly one third of the 200ms relay connect budget, got {first_timeout:?}"
         );
-        assert_eq!(host.target_sends[0].2.idle_timeout, Some(first_timeout));
+        let idle_timeout = host.target_sends[0]
+            .2
+            .idle_timeout
+            .expect("first idle timeout");
+        assert!(
+            idle_timeout > Duration::from_millis(150) && idle_timeout <= Duration::from_millis(200),
+            "response progress should retain the remaining overall budget, got {idle_timeout:?}"
+        );
     }
 
     #[test]
@@ -10521,6 +10469,21 @@ mod tests {
     }
 
     #[test]
+    fn relay_preserves_explicit_deadlines_longer_than_sixty_seconds() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_long_relay_deadline").expect("cluster id");
+        let target = NodeId::from_legacy_named("node_long_relay_deadline").expect("node id");
+        let inner = ObjectRpcRequest::from_encoded_body("/test/long-relay", "test", Vec::new());
+        let mut envelope = RelayEnvelope::new(cluster_id, target, inner);
+        envelope.max_hop_timeout_ms = Some(120_000);
+
+        assert_eq!(
+            relay_envelope_hop_timeout(&envelope),
+            Some(Duration::from_secs(120))
+        );
+    }
+
+    #[test]
     fn relay_propagates_fresh_signature_marker_across_an_intermediate_hop() {
         let (
             _root,
@@ -10631,6 +10594,56 @@ mod tests {
         assert!(relay_response_requires_fresh_origin_signature(&response));
         assert_eq!(host.sends.len(), 1);
         assert_eq!(host.sends[0].0.endpoint_id, bridge_endpoint.endpoint_id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_relay_honors_an_explicit_overall_deadline() {
+        let (_root, paths, state, local_node, target_node, endpoints) =
+            relay_retry_test_fixture("stream_relay_explicit_deadline");
+        let mut inner = ObjectRpcRequest::from_encoded_body(
+            "/test/stream-relay-explicit-deadline",
+            "test",
+            Vec::new(),
+        );
+        crate::set_object_rpc_request_stream_mode(
+            &mut inner,
+            crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
+        );
+        let mut envelope = RelayEnvelope::new(state.cluster_id.clone(), target_node.clone(), inner);
+        envelope.planned_path = vec![local_node.clone(), target_node];
+        envelope.target_endpoints = endpoints.to_vec();
+        envelope.max_hop_timeout_ms = Some(100);
+        let request = envelope.into_request().expect("relay request");
+        let mut host = RecordingRelayStreamHost {
+            stall_first_send: Some(Duration::from_secs(1)),
+            ..RecordingRelayStreamHost::default()
+        };
+        let started_at = tokio::time::Instant::now();
+
+        let outcome = handle_cluster_relay_stream_forward_async_with_host(
+            &tokio::runtime::Handle::current(),
+            &paths,
+            &state,
+            &local_node,
+            &request,
+            ClusterRelayOptions::new(DaemonRpcTimeouts::default()),
+            &mut host,
+        )
+        .await
+        .expect("relay converts terminal delivery state into an inner response");
+
+        let ClusterRelayStreamForwardOutcome::ErrorResponse(response) = outcome else {
+            panic!("explicit deadline must terminate the relay stream");
+        };
+        assert!(relay_response_reports_outcome_unknown(&response));
+        let detail = relay_response_outcome_unknown_detail(&response);
+        assert!(detail.contains("Overall"), "unexpected detail: {detail}");
+        assert!(detail.contains("100ms"), "unexpected detail: {detail}");
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started_at),
+            Duration::from_millis(100)
+        );
+        assert_eq!(host.sends.len(), 1);
     }
 
     #[test]

@@ -111,14 +111,22 @@ impl DaemonApiClient {
 
     fn object_rpc_forward_control_timeouts(
         &self,
-        effective_inner_timeout: Duration,
+        effective_inner_timeout: Option<Duration>,
     ) -> sinomo_core::network::DaemonRpcTimeouts {
         if self.timeout_overridden {
             sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(self.timeout)
-        } else {
+        } else if let Some(effective_inner_timeout) = effective_inner_timeout {
             let idle_timeout = effective_inner_timeout
                 .saturating_add(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT);
             sinomo_core::network::DaemonRpcTimeouts::default().with_idle_timeout(Some(idle_timeout))
+        } else {
+            // Buffered daemon forwarding cannot relay inner progress yet. Keep
+            // the loopback wrapper alive long enough for the inner transport's
+            // 5s health timeout (or the existing bounded domain allowance) to
+            // return a terminal outcome. The full-duplex progress protocol will
+            // remove this compatibility exception.
+            sinomo_core::network::DaemonRpcTimeouts::default()
+                .with_idle_timeout(Some(DAEMON_API_CLUSTER_CONTROL_TIMEOUT))
         }
     }
 
@@ -227,7 +235,7 @@ impl DaemonApiClient {
                 request,
                 connect_timeout,
                 None,
-                Some(effective_overall_timeout),
+                effective_overall_timeout,
                 observe_connectivity,
                 self.object_rpc_forward_stream_control_timeouts(),
             );
@@ -238,7 +246,7 @@ impl DaemonApiClient {
             request,
             connect_timeout,
             None,
-            Some(effective_overall_timeout),
+            effective_overall_timeout,
             observe_connectivity,
             false,
         )?;
@@ -315,7 +323,7 @@ impl DaemonApiClient {
                 request,
                 options.connect_timeout,
                 options.no_progress_timeout,
-                Some(effective_overall_timeout),
+                effective_overall_timeout,
                 options.observe_connectivity,
                 self.object_rpc_forward_stream_control_timeouts(),
             );
@@ -326,7 +334,7 @@ impl DaemonApiClient {
             request,
             options.connect_timeout,
             options.no_progress_timeout,
-            Some(effective_overall_timeout),
+            effective_overall_timeout,
             options.observe_connectivity,
             false,
         )?;
@@ -972,7 +980,7 @@ mod tests {
     fn forwarded_object_rpc_control_timeout_uses_client_budget() {
         let client =
             DaemonApiClient::at_address("127.0.0.1:21353").with_timeout(Duration::from_secs(6));
-        let timeouts = client.object_rpc_forward_control_timeouts(Duration::from_secs(10));
+        let timeouts = client.object_rpc_forward_control_timeouts(Some(Duration::from_secs(10)));
         assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(6)));
         assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(6)));
     }
@@ -980,7 +988,7 @@ mod tests {
     #[test]
     fn forwarded_object_rpc_deadline_gets_loopback_grace() {
         let client = DaemonApiClient::at_address("127.0.0.1:21353");
-        let timeouts = client.object_rpc_forward_control_timeouts(Duration::from_secs(10));
+        let timeouts = client.object_rpc_forward_control_timeouts(Some(Duration::from_secs(10)));
         assert_eq!(
             timeouts.connect_timeout,
             Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
@@ -1012,26 +1020,29 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_buffered_full_response_outlives_the_inner_route_budget() {
+    fn forwarded_buffered_rpc_uses_compatibility_idle_until_progress_frames_exist() {
         let client = DaemonApiClient::at_address("127.0.0.1:21353");
         let request = ObjectRpcRequest::from_encoded_body("/test/data", "test", Vec::new())
             .with_full_response_budget();
         let inner_timeout =
             sinomo_core::network::cluster_object_rpc_effective_route_timeout(&request, None);
         let timeouts = client.object_rpc_forward_control_timeouts(inner_timeout);
-        assert_eq!(inner_timeout, Duration::from_secs(60));
+        assert_eq!(inner_timeout, None);
         assert_eq!(
             timeouts.connect_timeout,
             Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
         );
-        assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(65)));
+        assert_eq!(
+            timeouts.idle_timeout,
+            Some(DAEMON_API_CLUSTER_CONTROL_TIMEOUT)
+        );
     }
 
     #[test]
     fn forwarded_buffered_object_rpc_honors_explicit_client_timeout() {
         let client =
             DaemonApiClient::at_address("127.0.0.1:21353").with_timeout(Duration::from_secs(6));
-        let timeouts = client.object_rpc_forward_control_timeouts(Duration::from_secs(60));
+        let timeouts = client.object_rpc_forward_control_timeouts(Some(Duration::from_secs(60)));
         assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(6)));
         assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(6)));
     }
@@ -1039,7 +1050,7 @@ mod tests {
     #[test]
     fn forwarded_bounded_object_rpc_gets_loopback_grace() {
         let client = DaemonApiClient::at_address("127.0.0.1:21353");
-        let timeouts = client.object_rpc_forward_control_timeouts(Duration::from_secs(15));
+        let timeouts = client.object_rpc_forward_control_timeouts(Some(Duration::from_secs(15)));
         assert_eq!(
             timeouts.connect_timeout,
             Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
@@ -1103,6 +1114,30 @@ mod tests {
         assert_eq!(payload.no_progress_timeout_millis, None);
         assert_eq!(payload.overall_timeout_millis, Some(10_000));
         assert!(!payload.raw_response);
+    }
+
+    #[test]
+    fn generic_forward_request_preserves_an_unbounded_overall_deadline() {
+        let target_node_id =
+            NodeId::from_legacy_named("node_generic_forward_unbounded").expect("node id");
+        let inner_request =
+            ObjectRpcRequest::encode_body("/test/unbounded", "test", &()).expect("inner request");
+        let request = object_rpc_forward_request(
+            DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+            &target_node_id,
+            &inner_request,
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            None,
+            None,
+            true,
+            false,
+        )
+        .expect("forward request");
+        let payload: DaemonObjectRpcForwardRequest =
+            request.decode_body().expect("forward payload");
+
+        assert_eq!(payload.overall_timeout_millis, None);
+        assert_eq!(payload.no_progress_timeout_millis, None);
     }
 
     #[test]

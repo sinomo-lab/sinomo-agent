@@ -27,6 +27,14 @@ pub enum Error {
     InvalidAlignmentHint(u8),
     #[error("document length mismatch: expected {expected}, actual {actual}")]
     DocumentLengthMismatch { expected: u64, actual: u64 },
+    #[error("unexpected version id: expected {expected}, actual {actual}")]
+    UnexpectedVersionId { expected: u16, actual: u16 },
+    #[error("decode limit `{limit}` exceeded: maximum {max}, actual {actual}")]
+    DecodeLimitExceeded {
+        limit: &'static str,
+        max: u64,
+        actual: u64,
+    },
     #[error("invalid type id 0x{0:02X}")]
     InvalidTypeId(u8),
     #[error("unsupported type id 0x{0:02X}")]
@@ -68,6 +76,72 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Resource limits applied while decoding an untrusted SOBJ document.
+///
+/// The default keeps historical size behavior while bounding recursive shape
+/// depth. Network and storage boundaries should select tighter values for their
+/// own trust and resource budgets through [`DecodeOptions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeLimits {
+    pub max_document_bytes: u64,
+    pub max_nesting_depth: usize,
+    pub max_container_items: u64,
+    pub max_string_bytes: u64,
+    pub max_bytes_value_bytes: u64,
+    pub max_schema_types: u64,
+    pub max_schema_fields_per_type: u64,
+}
+
+impl DecodeLimits {
+    pub const fn standard() -> Self {
+        Self {
+            max_document_bytes: u64::MAX,
+            max_nesting_depth: 128,
+            max_container_items: u64::MAX,
+            max_string_bytes: u64::MAX,
+            max_bytes_value_bytes: u64::MAX,
+            // Schema ids are u16 and must be unique, so a larger value can
+            // never describe a valid document.
+            max_schema_types: u16::MAX as u64 + 1,
+            max_schema_fields_per_type: u64::MAX,
+        }
+    }
+}
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        Self::standard()
+    }
+}
+
+/// Decode policy shared by borrowed views, cursors, and serde adapters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DecodeOptions {
+    pub expected_version_id: Option<u16>,
+    pub limits: DecodeLimits,
+}
+
+impl DecodeOptions {
+    pub const fn new(limits: DecodeLimits) -> Self {
+        Self {
+            expected_version_id: None,
+            limits,
+        }
+    }
+
+    pub const fn with_expected_version_id(mut self, version_id: u16) -> Self {
+        self.expected_version_id = Some(version_id);
+        self
+    }
+}
+
+fn ensure_decode_limit(limit: &'static str, actual: u64, max: u64) -> Result<()> {
+    if actual > max {
+        return Err(Error::DecodeLimitExceeded { limit, max, actual });
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LengthMode {
@@ -301,6 +375,27 @@ where
             requested_bytes,
         })?;
     Ok(set)
+}
+
+#[cfg(feature = "serde")]
+fn try_reserve_hashset<T>(
+    set: &mut HashSet<T>,
+    additional: usize,
+    context: &'static str,
+) -> Result<()>
+where
+    T: Eq + std::hash::Hash,
+{
+    let requested_items = set
+        .len()
+        .checked_add(additional)
+        .ok_or(Error::SizeOverflow)?;
+    let requested_bytes = allocation_bytes::<T>(requested_items)?;
+    set.try_reserve(additional)
+        .map_err(|_| Error::ResourceExhausted {
+            context,
+            requested_bytes,
+        })
 }
 
 fn try_push_vec<T>(vec: &mut Vec<T>, value: T, context: &'static str) -> Result<()> {
@@ -1053,36 +1148,29 @@ pub struct DocumentView<'a> {
 
 impl<'a> DocumentView<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self> {
-        let mut reader = Reader::new(bytes, LengthMode::U64);
-        let magic = reader.take(4)?;
-        if magic != MAGIC {
-            return Err(Error::InvalidMagic);
-        }
-        let version_id = reader.read_u16()?;
-        let length_mode = LengthMode::from_code(reader.read_u8()?)?;
-        reader.mode = length_mode;
-        let alignment_hint = AlignmentHint::from_code(reader.read_u8()?)?;
-        let document_length = reader.read_length()?;
-        let actual = u64::try_from(bytes.len()).map_err(|_| Error::LengthTooLarge)?;
-        if document_length != actual {
-            return Err(Error::DocumentLengthMismatch {
-                expected: document_length,
-                actual,
-            });
-        }
-        let metadata = Metadata {
-            version_id,
-            length_mode,
-            alignment_hint,
-            document_length,
-        };
+        Self::parse_with_options(bytes, DecodeOptions::default())
+    }
+
+    pub fn parse_with_options(bytes: &'a [u8], options: DecodeOptions) -> Result<Self> {
+        let (mut reader, metadata) = read_document_header(bytes, options)?;
         let schema = read_schema(&mut reader)?;
         let payload = if schema.types.is_empty() {
             PayloadView::Dynamic(reader.read_element()?)
         } else {
             let root_schema_type_id = reader.read_u16()?;
             let root_count = reader.read_length()?;
+            ensure_decode_limit(
+                "container items",
+                root_count,
+                reader.limits.max_container_items,
+            )?;
             let data = reader.remaining_bytes();
+            ensure_decode_limit(
+                "bytes value bytes",
+                u64::try_from(data.len()).map_err(|_| Error::LengthTooLarge)?,
+                reader.limits.max_bytes_value_bytes,
+            )?;
+            validate_schema_payload_data(&schema, root_schema_type_id, root_count, data.len())?;
             reader.pos = bytes.len();
             PayloadView::Schema {
                 root_schema_type_id,
@@ -1159,36 +1247,29 @@ pub struct DocumentCursor<'a> {
 
 impl<'a> DocumentCursor<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self> {
-        let mut reader = Reader::new(bytes, LengthMode::U64);
-        let magic = reader.take(4)?;
-        if magic != MAGIC {
-            return Err(Error::InvalidMagic);
-        }
-        let version_id = reader.read_u16()?;
-        let length_mode = LengthMode::from_code(reader.read_u8()?)?;
-        reader.mode = length_mode;
-        let alignment_hint = AlignmentHint::from_code(reader.read_u8()?)?;
-        let document_length = reader.read_length()?;
-        let actual = u64::try_from(bytes.len()).map_err(|_| Error::LengthTooLarge)?;
-        if document_length != actual {
-            return Err(Error::DocumentLengthMismatch {
-                expected: document_length,
-                actual,
-            });
-        }
-        let metadata = Metadata {
-            version_id,
-            length_mode,
-            alignment_hint,
-            document_length,
-        };
+        Self::parse_with_options(bytes, DecodeOptions::default())
+    }
+
+    pub fn parse_with_options(bytes: &'a [u8], options: DecodeOptions) -> Result<Self> {
+        let (mut reader, metadata) = read_document_header(bytes, options)?;
         let schema = read_schema(&mut reader)?;
         let payload = if schema.types.is_empty() {
             PayloadCursor::Dynamic(read_element_cursor(&mut reader)?)
         } else {
             let root_schema_type_id = reader.read_u16()?;
             let root_count = reader.read_length()?;
+            ensure_decode_limit(
+                "container items",
+                root_count,
+                reader.limits.max_container_items,
+            )?;
             let data = reader.remaining_bytes();
+            ensure_decode_limit(
+                "bytes value bytes",
+                u64::try_from(data.len()).map_err(|_| Error::LengthTooLarge)?,
+                reader.limits.max_bytes_value_bytes,
+            )?;
+            validate_schema_payload_data(&schema, root_schema_type_id, root_count, data.len())?;
             reader.pos = bytes.len();
             PayloadCursor::Schema {
                 root_schema_type_id,
@@ -1230,6 +1311,7 @@ pub struct ElementCursor<'a> {
     next_offset: usize,
     bytes: &'a [u8],
     mode: LengthMode,
+    limits: DecodeLimits,
 }
 
 impl<'a> ElementCursor<'a> {
@@ -1272,10 +1354,11 @@ impl<'a> ElementCursor<'a> {
             return Err(Error::TypeMismatch);
         }
         let mut reader = self.value_reader();
-        let field_count = reader.read_len_usize()?;
+        let field_count = reader.read_container_len()?;
         Ok(ObjectCursor {
             bytes: self.bytes,
             mode: self.mode,
+            limits: self.limits,
             field_count,
             fields_offset: reader.pos,
             end_offset: self.next_offset,
@@ -1288,10 +1371,11 @@ impl<'a> ElementCursor<'a> {
         }
         let mut reader = self.value_reader();
         let element_type = read_element_type(&mut reader)?;
-        let len = reader.read_len_usize()?;
+        let len = reader.read_container_len()?;
         Ok(ListCursor {
             bytes: self.bytes,
             mode: self.mode,
+            limits: self.limits,
             element_type,
             len,
             values_offset: reader.pos,
@@ -1314,6 +1398,8 @@ impl<'a> ElementCursor<'a> {
             bytes: self.bytes,
             pos: self.value_offset,
             mode: self.mode,
+            limits: self.limits,
+            nesting_depth: 0,
         }
     }
 
@@ -1330,6 +1416,7 @@ impl<'a> ElementCursor<'a> {
 pub struct ObjectCursor<'a> {
     bytes: &'a [u8],
     mode: LengthMode,
+    limits: DecodeLimits,
     field_count: usize,
     fields_offset: usize,
     end_offset: usize,
@@ -1346,6 +1433,8 @@ impl<'a> ObjectCursor<'a> {
                 bytes: self.bytes,
                 pos: self.fields_offset,
                 mode: self.mode,
+                limits: self.limits,
+                nesting_depth: 0,
             },
             remaining: self.field_count,
             end_offset: self.end_offset,
@@ -1402,6 +1491,7 @@ impl<'a> Iterator for ObjectCursorIter<'a> {
 pub struct ListCursor<'a> {
     bytes: &'a [u8],
     mode: LengthMode,
+    limits: DecodeLimits,
     element_type: ElementType,
     len: usize,
     values_offset: usize,
@@ -1427,6 +1517,8 @@ impl<'a> ListCursor<'a> {
                 bytes: self.bytes,
                 pos: self.values_offset,
                 mode: self.mode,
+                limits: self.limits,
+                nesting_depth: 0,
             },
             element_type: self.element_type.clone(),
             remaining: self.len,
@@ -1540,18 +1632,22 @@ pub struct OptionalView<'a> {
     pub value: Option<Box<ElementView<'a>>>,
 }
 
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     bytes: &'a [u8],
     pos: usize,
     mode: LengthMode,
+    limits: DecodeLimits,
+    nesting_depth: usize,
 }
 
 impl<'a> Reader<'a> {
-    const fn new(bytes: &'a [u8], mode: LengthMode) -> Self {
+    const fn with_limits(bytes: &'a [u8], mode: LengthMode, limits: DecodeLimits) -> Self {
         Self {
             bytes,
             pos: 0,
             mode,
+            limits,
+            nesting_depth: 0,
         }
     }
 
@@ -1610,19 +1706,60 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn read_len_usize(&mut self) -> Result<usize> {
-        usize::try_from(self.read_length()?).map_err(|_| Error::LengthTooLarge)
+    fn read_limited_len_usize(&mut self, limit: &'static str, max: u64) -> Result<usize> {
+        let len = self.read_length()?;
+        ensure_decode_limit(limit, len, max)?;
+        usize::try_from(len).map_err(|_| Error::LengthTooLarge)
+    }
+
+    fn read_container_len(&mut self) -> Result<usize> {
+        let len =
+            self.read_limited_len_usize("container items", self.limits.max_container_items)?;
+        // Every dynamic object/list item consumes at least one byte. Reject an
+        // impossible count before serde or a view attempts capacity allocation.
+        if len > self.remaining() {
+            return Err(Error::LengthTooLarge);
+        }
+        Ok(len)
+    }
+
+    fn ensure_count_fits_remaining(
+        &self,
+        limit: &'static str,
+        count: usize,
+        minimum_item_bytes: usize,
+    ) -> Result<()> {
+        let maximum = self.remaining() / minimum_item_bytes.max(1);
+        ensure_decode_limit(limit, count as u64, maximum as u64)
     }
 
     fn read_string(&mut self) -> Result<&'a str> {
-        let len = self.read_len_usize()?;
+        let len = self.read_limited_len_usize("string bytes", self.limits.max_string_bytes)?;
         let bytes = self.take(len)?;
         std::str::from_utf8(bytes).map_err(|_| Error::InvalidUtf8)
     }
 
     fn read_bytes(&mut self) -> Result<&'a [u8]> {
-        let len = self.read_len_usize()?;
+        let len =
+            self.read_limited_len_usize("bytes value bytes", self.limits.max_bytes_value_bytes)?;
         self.take(len)
+    }
+
+    fn with_nesting<T>(&mut self, decode: impl FnOnce(&mut Reader<'a>) -> Result<T>) -> Result<T> {
+        let next_depth = self
+            .nesting_depth
+            .checked_add(1)
+            .ok_or(Error::SizeOverflow)?;
+        ensure_decode_limit(
+            "nesting depth",
+            u64::try_from(next_depth).unwrap_or(u64::MAX),
+            u64::try_from(self.limits.max_nesting_depth).unwrap_or(u64::MAX),
+        )?;
+        let previous_depth = self.nesting_depth;
+        self.nesting_depth = next_depth;
+        let result = decode(self);
+        self.nesting_depth = previous_depth;
+        result
     }
 
     fn skip_padding(&mut self) {
@@ -1675,7 +1812,11 @@ impl<'a> Reader<'a> {
     }
 
     fn read_object(&mut self) -> Result<ObjectView<'a>> {
-        let len = self.read_len_usize()?;
+        self.with_nesting(Self::read_object_inner)
+    }
+
+    fn read_object_inner(&mut self) -> Result<ObjectView<'a>> {
+        let len = self.read_container_len()?;
         let mut keys = try_hashset_with_capacity(len, "object keys")?;
         let mut fields = try_vec_with_capacity(len, "object fields")?;
         for _ in 0..len {
@@ -1690,8 +1831,12 @@ impl<'a> Reader<'a> {
     }
 
     fn read_list(&mut self) -> Result<ListView<'a>> {
+        self.with_nesting(Self::read_list_inner)
+    }
+
+    fn read_list_inner(&mut self) -> Result<ListView<'a>> {
         let element_type = read_element_type(self)?;
-        let len = self.read_len_usize()?;
+        let len = self.read_container_len()?;
         let mut values = try_vec_with_capacity(len, "list values")?;
         for _ in 0..len {
             let value = self.read_typed_value(&element_type)?;
@@ -1704,6 +1849,10 @@ impl<'a> Reader<'a> {
     }
 
     fn read_array(&mut self) -> Result<ArrayView<'a>> {
+        self.with_nesting(Self::read_array_inner)
+    }
+
+    fn read_array_inner(&mut self) -> Result<ArrayView<'a>> {
         let element_type = read_element_type(self)?;
         let element_size = self.read_length()?;
         if element_size == 0 {
@@ -1716,7 +1865,13 @@ impl<'a> Reader<'a> {
             try_push_vec(&mut dimensions, dimension, "array dimensions")?;
         }
         let count = product(&dimensions)?;
+        ensure_decode_limit("container items", count, self.limits.max_container_items)?;
         let byte_len_u64 = count.checked_mul(element_size).ok_or(Error::SizeOverflow)?;
+        ensure_decode_limit(
+            "bytes value bytes",
+            byte_len_u64,
+            self.limits.max_bytes_value_bytes,
+        )?;
         let byte_len = usize::try_from(byte_len_u64).map_err(|_| Error::LengthTooLarge)?;
         if let ElementType::Builtin(type_id) = element_type {
             if let Some(size) = type_id.fixed_size() {
@@ -1735,6 +1890,10 @@ impl<'a> Reader<'a> {
     }
 
     fn read_optional(&mut self) -> Result<OptionalView<'a>> {
+        self.with_nesting(Self::read_optional_inner)
+    }
+
+    fn read_optional_inner(&mut self) -> Result<OptionalView<'a>> {
         let element_type = read_element_type(self)?;
         let present = self.read_u8()?;
         let value = match present {
@@ -1769,12 +1928,12 @@ impl<'a> Reader<'a> {
                 }
                 ElementView::array(array)
             }
-            ElementType::Optional(inner) => {
-                let present = self.read_u8()?;
+            ElementType::Optional(inner) => self.with_nesting(|reader| {
+                let present = reader.read_u8()?;
                 let value = match present {
                     0 => None,
                     1 => Some(try_box(
-                        self.read_typed_value(inner)?,
+                        reader.read_typed_value(inner)?,
                         "optional typed view inner value",
                     )?),
                     other => return Err(Error::InvalidBoolean(other)),
@@ -1783,7 +1942,7 @@ impl<'a> Reader<'a> {
                     element_type: (**inner).clone(),
                     value,
                 })
-            }
+            }),
             ElementType::SchemaRef(_) | ElementType::Extension(_) => {
                 Err(Error::UnsupportedTypeId(0x40))
             }
@@ -1793,6 +1952,48 @@ impl<'a> Reader<'a> {
     fn remaining_bytes(&self) -> &'a [u8] {
         &self.bytes[self.pos..]
     }
+}
+
+pub(crate) fn read_document_header(
+    bytes: &[u8],
+    options: DecodeOptions,
+) -> Result<(Reader<'_>, Metadata)> {
+    let actual = u64::try_from(bytes.len()).map_err(|_| Error::LengthTooLarge)?;
+    ensure_decode_limit("document bytes", actual, options.limits.max_document_bytes)?;
+
+    let mut reader = Reader::with_limits(bytes, LengthMode::U64, options.limits);
+    if reader.take(4)? != MAGIC {
+        return Err(Error::InvalidMagic);
+    }
+    let version_id = reader.read_u16()?;
+    if let Some(expected) = options.expected_version_id
+        && version_id != expected
+    {
+        return Err(Error::UnexpectedVersionId {
+            expected,
+            actual: version_id,
+        });
+    }
+    let length_mode = LengthMode::from_code(reader.read_u8()?)?;
+    reader.mode = length_mode;
+    let alignment_hint = AlignmentHint::from_code(reader.read_u8()?)?;
+    let document_length = reader.read_length()?;
+    if document_length != actual {
+        return Err(Error::DocumentLengthMismatch {
+            expected: document_length,
+            actual,
+        });
+    }
+
+    Ok((
+        reader,
+        Metadata {
+            version_id,
+            length_mode,
+            alignment_hint,
+            document_length,
+        },
+    ))
 }
 
 fn read_element_cursor<'a>(reader: &mut Reader<'a>) -> Result<ElementCursor<'a>> {
@@ -1809,6 +2010,7 @@ fn read_element_cursor<'a>(reader: &mut Reader<'a>) -> Result<ElementCursor<'a>>
         next_offset: reader.pos,
         bytes: reader.bytes,
         mode: reader.mode,
+        limits: reader.limits,
     })
 }
 
@@ -1825,6 +2027,7 @@ fn read_typed_value_cursor<'a>(
         next_offset: reader.pos,
         bytes: reader.bytes,
         mode: reader.mode,
+        limits: reader.limits,
     })
 }
 
@@ -1843,7 +2046,14 @@ fn cursor_type_id_for_element_type(element_type: &ElementType) -> Result<TypeId>
 
 fn skip_value(reader: &mut Reader<'_>, type_id: TypeId) -> Result<()> {
     match type_id {
-        TypeId::Boolean | TypeId::Uint8 | TypeId::Int8 => {
+        TypeId::Boolean => {
+            match reader.read_u8()? {
+                0 | 1 => {}
+                other => return Err(Error::InvalidBoolean(other)),
+            }
+            Ok(())
+        }
+        TypeId::Uint8 | TypeId::Int8 => {
             reader.take(1)?;
             Ok(())
         }
@@ -1862,12 +2072,15 @@ fn skip_value(reader: &mut Reader<'_>, type_id: TypeId) -> Result<()> {
         TypeId::Object => skip_object(reader),
         TypeId::List => skip_list(reader).map(|_| ()),
         TypeId::Array => skip_array(reader).map(|_| ()),
-        TypeId::String | TypeId::Bytes => {
-            let len = reader.read_len_usize()?;
-            reader.take(len)?;
+        TypeId::String => {
+            reader.read_string()?;
             Ok(())
         }
-        TypeId::Optional => {
+        TypeId::Bytes => {
+            reader.read_bytes()?;
+            Ok(())
+        }
+        TypeId::Optional => reader.with_nesting(|reader| {
             let element_type = read_element_type(reader)?;
             let present = reader.read_u8()?;
             match present {
@@ -1875,7 +2088,7 @@ fn skip_value(reader: &mut Reader<'_>, type_id: TypeId) -> Result<()> {
                 1 => skip_typed_value(reader, &element_type),
                 other => Err(Error::InvalidBoolean(other)),
             }
-        }
+        }),
         TypeId::Padding => Err(Error::InvalidTypeId(TypeId::Padding.byte())),
         TypeId::Document => Err(Error::UnsupportedTypeId(type_id.byte())),
     }
@@ -1901,14 +2114,14 @@ fn skip_typed_value(reader: &mut Reader<'_>, element_type: &ElementType) -> Resu
                 Err(Error::TypeMismatch)
             }
         }
-        ElementType::Optional(inner) => {
+        ElementType::Optional(inner) => reader.with_nesting(|reader| {
             let present = reader.read_u8()?;
             match present {
                 0 => Ok(()),
                 1 => skip_typed_value(reader, inner),
                 other => Err(Error::InvalidBoolean(other)),
             }
-        }
+        }),
         ElementType::SchemaRef(_) | ElementType::Extension(_) => {
             Err(Error::UnsupportedTypeId(0x40))
         }
@@ -1916,7 +2129,11 @@ fn skip_typed_value(reader: &mut Reader<'_>, element_type: &ElementType) -> Resu
 }
 
 fn skip_object(reader: &mut Reader<'_>) -> Result<()> {
-    let len = reader.read_len_usize()?;
+    reader.with_nesting(skip_object_inner)
+}
+
+fn skip_object_inner(reader: &mut Reader<'_>) -> Result<()> {
+    let len = reader.read_container_len()?;
     let mut keys = try_hashset_with_capacity(len, "object keys")?;
     for _ in 0..len {
         let key = reader.read_string()?;
@@ -1929,8 +2146,12 @@ fn skip_object(reader: &mut Reader<'_>) -> Result<()> {
 }
 
 fn skip_list(reader: &mut Reader<'_>) -> Result<ElementType> {
+    reader.with_nesting(skip_list_inner)
+}
+
+fn skip_list_inner(reader: &mut Reader<'_>) -> Result<ElementType> {
     let element_type = read_element_type(reader)?;
-    let len = reader.read_len_usize()?;
+    let len = reader.read_container_len()?;
     for _ in 0..len {
         skip_typed_value(reader, &element_type)?;
     }
@@ -1938,6 +2159,10 @@ fn skip_list(reader: &mut Reader<'_>) -> Result<ElementType> {
 }
 
 fn skip_array(reader: &mut Reader<'_>) -> Result<ElementType> {
+    reader.with_nesting(skip_array_inner)
+}
+
+fn skip_array_inner(reader: &mut Reader<'_>) -> Result<ElementType> {
     let element_type = read_element_type(reader)?;
     let element_size = reader.read_length()?;
     if element_size == 0 {
@@ -1950,7 +2175,13 @@ fn skip_array(reader: &mut Reader<'_>) -> Result<ElementType> {
             .checked_mul(reader.read_length()?)
             .ok_or(Error::SizeOverflow)?;
     }
+    ensure_decode_limit("container items", count, reader.limits.max_container_items)?;
     let byte_len_u64 = count.checked_mul(element_size).ok_or(Error::SizeOverflow)?;
+    ensure_decode_limit(
+        "bytes value bytes",
+        byte_len_u64,
+        reader.limits.max_bytes_value_bytes,
+    )?;
     let byte_len = usize::try_from(byte_len_u64).map_err(|_| Error::LengthTooLarge)?;
     if let ElementType::Builtin(type_id) = &element_type {
         if let Some(size) = type_id.fixed_size() {
@@ -2018,7 +2249,13 @@ fn encode_typed_value(
 }
 
 fn read_schema(reader: &mut Reader<'_>) -> Result<Schema> {
-    let type_count = reader.read_len_usize()?;
+    let type_count =
+        reader.read_limited_len_usize("schema types", reader.limits.max_schema_types)?;
+    reader.ensure_count_fits_remaining(
+        "schema types fitting document",
+        type_count,
+        2 + reader.mode.width() * 3,
+    )?;
     let mut types = try_vec_with_capacity(type_count, "schema types")?;
     let mut ids = try_hashset_with_capacity(type_count, "schema type ids")?;
     for _ in 0..type_count {
@@ -2028,7 +2265,15 @@ fn read_schema(reader: &mut Reader<'_>) -> Result<Schema> {
         }
         let name = try_string_from_str(reader.read_string()?, "schema type name")?;
         let payload_size = reader.read_length()?;
-        let field_count = reader.read_len_usize()?;
+        let field_count = reader.read_limited_len_usize(
+            "schema fields per type",
+            reader.limits.max_schema_fields_per_type,
+        )?;
+        reader.ensure_count_fits_remaining(
+            "schema fields fitting document",
+            field_count,
+            reader.mode.width() + 1,
+        )?;
         let mut fields = try_vec_with_capacity(field_count, "schema fields")?;
         for _ in 0..field_count {
             let name = try_string_from_str(reader.read_string()?, "schema field name")?;
@@ -2050,7 +2295,25 @@ fn read_schema(reader: &mut Reader<'_>) -> Result<Schema> {
             "schema types",
         )?;
     }
+    for schema_type in &types {
+        for field in &schema_type.fields {
+            validate_schema_element_type_references(&field.element_type, &ids)?;
+        }
+    }
     Ok(Schema { types })
+}
+
+fn validate_schema_element_type_references(
+    element_type: &ElementType,
+    schema_type_ids: &HashSet<u16>,
+) -> Result<()> {
+    match element_type {
+        ElementType::SchemaRef(id) if !schema_type_ids.contains(id) => Err(Error::TypeMismatch),
+        ElementType::List(inner) | ElementType::Array(inner) | ElementType::Optional(inner) => {
+            validate_schema_element_type_references(inner, schema_type_ids)
+        }
+        _ => Ok(()),
+    }
 }
 
 fn encode_element_type(
@@ -2087,21 +2350,38 @@ fn encode_element_type(
 }
 
 fn read_element_type(reader: &mut Reader<'_>) -> Result<ElementType> {
+    read_element_type_at_depth(reader, 1)
+}
+
+fn read_element_type_at_depth(
+    reader: &mut Reader<'_>,
+    element_type_depth: usize,
+) -> Result<ElementType> {
+    let total_depth = reader
+        .nesting_depth
+        .checked_add(element_type_depth)
+        .ok_or(Error::SizeOverflow)?;
+    ensure_decode_limit(
+        "nesting depth",
+        u64::try_from(total_depth).unwrap_or(u64::MAX),
+        u64::try_from(reader.limits.max_nesting_depth).unwrap_or(u64::MAX),
+    )?;
     let byte = reader.read_u8()?;
+    let next_depth = || element_type_depth.checked_add(1).ok_or(Error::SizeOverflow);
     match byte {
         0x01..=0x0B | 0x24 | 0x25 => Ok(ElementType::Builtin(TypeId::from_byte(byte)?)),
         0x40 => Ok(ElementType::SchemaRef(reader.read_u16()?)),
         0x41 => Ok(ElementType::List(try_box(
-            read_element_type(reader)?,
+            read_element_type_at_depth(reader, next_depth()?)?,
             "list element type",
         )?)),
         0x42 => Ok(ElementType::Array(try_box(
-            read_element_type(reader)?,
+            read_element_type_at_depth(reader, next_depth()?)?,
             "array element type",
         )?)),
         0x43 => Ok(ElementType::Object),
         0x44 => Ok(ElementType::Optional(try_box(
-            read_element_type(reader)?,
+            read_element_type_at_depth(reader, next_depth()?)?,
             "optional element type",
         )?)),
         0x80..=0xFF => {
@@ -2398,6 +2678,163 @@ mod tests {
     }
 
     #[test]
+    fn decode_options_enforce_expected_version_for_views_and_cursors() {
+        let bytes = Document::dynamic(7, LengthMode::U32, Value::Uint8(1))
+            .to_bytes()
+            .unwrap();
+        let options = DecodeOptions::default().with_expected_version_id(8);
+
+        for error in [
+            DocumentView::parse_with_options(&bytes, options).unwrap_err(),
+            DocumentCursor::parse_with_options(&bytes, options).unwrap_err(),
+        ] {
+            assert_eq!(
+                error,
+                Error::UnexpectedVersionId {
+                    expected: 8,
+                    actual: 7,
+                }
+            );
+        }
+
+        DocumentView::parse_with_options(
+            &bytes,
+            DecodeOptions::default().with_expected_version_id(7),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn decode_limits_bound_document_and_payload_sizes() {
+        let string_bytes = Document::dynamic(1, LengthMode::U32, Value::String("four".to_owned()))
+            .to_bytes()
+            .unwrap();
+        let string_options = DecodeOptions::new(DecodeLimits {
+            max_string_bytes: 3,
+            ..DecodeLimits::default()
+        });
+        assert!(matches!(
+            DocumentView::parse_with_options(&string_bytes, string_options),
+            Err(Error::DecodeLimitExceeded {
+                limit: "string bytes",
+                max: 3,
+                actual: 4,
+            })
+        ));
+
+        let payload_bytes = Document::dynamic(1, LengthMode::U32, Value::Bytes(vec![1, 2, 3, 4]))
+            .to_bytes()
+            .unwrap();
+        let payload_options = DecodeOptions::new(DecodeLimits {
+            max_bytes_value_bytes: 3,
+            ..DecodeLimits::default()
+        });
+        assert!(matches!(
+            DocumentCursor::parse_with_options(&payload_bytes, payload_options),
+            Err(Error::DecodeLimitExceeded {
+                limit: "bytes value bytes",
+                max: 3,
+                actual: 4,
+            })
+        ));
+
+        let document_options = DecodeOptions::new(DecodeLimits {
+            max_document_bytes: payload_bytes.len() as u64 - 1,
+            ..DecodeLimits::default()
+        });
+        assert!(matches!(
+            DocumentView::parse_with_options(&payload_bytes, document_options),
+            Err(Error::DecodeLimitExceeded {
+                limit: "document bytes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn decode_limits_bound_container_items_and_nesting_depth() {
+        let list = Document::dynamic(
+            1,
+            LengthMode::U32,
+            Value::list(List::new(
+                ElementType::Builtin(TypeId::Uint8),
+                vec![
+                    Value::Uint8(1),
+                    Value::Uint8(2),
+                    Value::Uint8(3),
+                    Value::Uint8(4),
+                ],
+            )),
+        )
+        .to_bytes()
+        .unwrap();
+        let list_options = DecodeOptions::new(DecodeLimits {
+            max_container_items: 3,
+            ..DecodeLimits::default()
+        });
+        assert!(matches!(
+            DocumentView::parse_with_options(&list, list_options),
+            Err(Error::DecodeLimitExceeded {
+                limit: "container items",
+                max: 3,
+                actual: 4,
+            })
+        ));
+
+        let mut nested = Value::Uint8(1);
+        for _ in 0..4 {
+            nested = Value::Object(Object::new(vec![Field::new("next", nested)]));
+        }
+        let nested = Document::dynamic(1, LengthMode::U32, nested)
+            .to_bytes()
+            .unwrap();
+        let nesting_options = DecodeOptions::new(DecodeLimits {
+            max_nesting_depth: 3,
+            ..DecodeLimits::default()
+        });
+        assert!(matches!(
+            DocumentCursor::parse_with_options(&nested, nesting_options),
+            Err(Error::DecodeLimitExceeded {
+                limit: "nesting depth",
+                max: 3,
+                actual: 4,
+            })
+        ));
+    }
+
+    #[test]
+    fn decode_limits_bound_schema_shape() {
+        let schema = Schema {
+            types: vec![SchemaType {
+                id: 7,
+                name: "byte".to_owned(),
+                payload_size: 1,
+                fields: vec![SchemaField {
+                    name: "value".to_owned(),
+                    element_type: ElementType::Builtin(TypeId::Uint8),
+                }],
+            }],
+        };
+        let bytes = BorrowedDocumentBuilder::schema_payload(1, LengthMode::U32, schema, 7, 1, &[9])
+            .unwrap()
+            .to_vec()
+            .unwrap();
+        let options = DecodeOptions::new(DecodeLimits {
+            max_schema_fields_per_type: 0,
+            ..DecodeLimits::default()
+        });
+
+        assert!(matches!(
+            DocumentView::parse_with_options(&bytes, options),
+            Err(Error::DecodeLimitExceeded {
+                limit: "schema fields per type",
+                max: 0,
+                actual: 1,
+            })
+        ));
+    }
+
+    #[test]
     fn dynamic_object_with_impossible_field_count_fails_before_allocation() {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(MAGIC);
@@ -2417,6 +2854,43 @@ mod tests {
             ),
             "unexpected error for impossible object length: {error:?}"
         );
+    }
+
+    #[test]
+    fn impossible_schema_count_fails_before_allocation() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.push(LengthMode::U64.code());
+        bytes.push(AlignmentHint::NotAligned.code());
+        bytes.extend_from_slice(&24_u64.to_le_bytes());
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+
+        let options = DecodeOptions::new(DecodeLimits {
+            max_schema_types: u64::MAX,
+            ..DecodeLimits::default()
+        });
+        assert!(matches!(
+            DocumentView::parse_with_options(&bytes, options),
+            Err(Error::DecodeLimitExceeded {
+                limit: "schema types fitting document",
+                max: 0,
+                actual: u64::MAX,
+            })
+        ));
+    }
+
+    #[test]
+    fn document_cursor_rejects_invalid_boolean_payloads() {
+        let mut bytes = Document::dynamic(1, LengthMode::U32, Value::Boolean(false))
+            .to_bytes()
+            .unwrap();
+        *bytes.last_mut().expect("boolean byte") = 2;
+
+        assert!(matches!(
+            DocumentCursor::parse(&bytes),
+            Err(Error::InvalidBoolean(2))
+        ));
     }
 
     #[test]

@@ -2025,7 +2025,13 @@ fn send_rollout_object_rpc_with_timeouts(
                 .to_string(),
         })?;
         sinomo_runtime::api::DaemonApiClient::at_address(status.address)
-            .object_rpc_to_target(node_id, request, connect_timeout, true)
+            .object_rpc_to_target_with_deadline(
+                node_id,
+                request,
+                connect_timeout,
+                timeouts.idle_timeout,
+                true,
+            )
             .map_err(Into::into)
     } else if let Some(endpoint) = &target.endpoint {
         if rollout_request_allows_legacy_auth_fallback(request) {
