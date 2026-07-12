@@ -2274,7 +2274,13 @@ fn write_rollout_binary_receipt(
 }
 
 fn sync_rollout_control_file(path: &Path) -> Result<(), DaemonError> {
-    fs::File::open(path)
+    // Windows' FlushFileBuffers requires a handle opened with write access.
+    // `File::open` is read-only and therefore made every streamed rollout fail
+    // after persisting its manifest or receipt with ERROR_ACCESS_DENIED.
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
         .and_then(|file| file.sync_all())
         .map_err(|source| DaemonError::Io {
             path: path.display().to_string(),
