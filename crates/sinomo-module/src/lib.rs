@@ -2504,7 +2504,14 @@ fn remove_file_if_exists(path: &Path) -> Result<(), ModuleLoaderStoreError> {
 }
 
 fn sync_module_loader_file(path: &Path) -> Result<(), ModuleLoaderStoreError> {
-    fs::File::open(path)
+    // `File::open` only requests read access. Unix permits flushing that
+    // handle, but Windows' `FlushFileBuffers` rejects it with
+    // ERROR_ACCESS_DENIED. Reopen the state file with write access so the
+    // durability barrier has the same semantics on every supported platform.
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
         .and_then(|file| file.sync_all())
         .map_err(|source| ModuleLoaderStoreError::Io {
             path: path.display().to_string(),
@@ -5645,7 +5652,7 @@ mod tests {
     fn native_dylib_loader_state_roundtrips_from_data_dir() {
         let root = unique_temp("native-dylib-loader-state");
         let module_id = ModuleId::from_legacy_named("module.sandbox.wasix").expect("module");
-        let state = NativeDylibModuleLoaderState {
+        let mut state = NativeDylibModuleLoaderState {
             module_id: module_id.clone(),
             artifact_id: Some(
                 ArtifactId::from_legacy_named("artifact_wasix_dylib").expect("artifact"),
@@ -5669,6 +5676,18 @@ mod tests {
             .expect("read state")
             .expect("state");
         assert_eq!(read_back, state);
+
+        // Rollouts update an existing module record. In particular, this
+        // exercises the writable durability handle required by Windows.
+        state.content_hash = "blake3:def".to_string();
+        state.activated_at = module_loader_applied_at_now();
+        write_native_dylib_module_loader_state(&root, &state).expect("overwrite state");
+        assert_eq!(
+            read_native_dylib_module_loader_state(&root, &module_id)
+                .expect("read overwritten state")
+                .expect("overwritten state"),
+            state
+        );
     }
 
     #[test]
