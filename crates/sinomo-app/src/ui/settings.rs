@@ -49,13 +49,13 @@ use crate::backend::agents::{
 use crate::backend::cluster::{AppClusterInvite, AppClusterStatus, ClusterSnapshot};
 use crate::backend::config::{
     CONFIGURABLE_PROVIDERS, ConfigEditKind, ConfigItem, ProviderForm, REASONING_EFFORT_OPTIONS,
-    TEXT_VERBOSITY_OPTIONS, add_provider_account, cluster_provider_summaries,
-    provider_default_model, provider_display_name, provider_forms, reasoning_effort_index,
-    remove_provider_account, resolve_items, run_provider_device_login, set_bool,
-    set_provider_api_key, set_provider_base_url, set_provider_chat_default, set_provider_effort,
-    set_provider_enabled, set_provider_model, set_provider_reasoning_budget,
-    set_provider_text_verbosity, set_provider_vendor_options, set_value, test_provider_connection,
-    text_verbosity_index,
+    TEXT_VERBOSITY_OPTIONS, add_provider_account, cluster_provider_summaries, load_provider_health,
+    mark_provider_health_stale, provider_default_model, provider_display_name, provider_forms,
+    reasoning_effort_index, remove_provider_account, remove_provider_health, resolve_items,
+    run_provider_device_login, set_bool, set_provider_api_key, set_provider_base_url,
+    set_provider_chat_default, set_provider_effort, set_provider_enabled, set_provider_model,
+    set_provider_reasoning_budget, set_provider_text_verbosity, set_provider_vendor_options,
+    set_value, test_provider_connection, text_verbosity_index,
 };
 use crate::backend::modules::ModuleConfigSnapshot;
 use crate::rendering::AppRenderMode;
@@ -199,6 +199,7 @@ pub struct SettingsState {
     next_operation_request_id: u64,
     pending_operations: HashMap<SettingsOperationScope, u64>,
     provider_refresh_needed: bool,
+    provider_refresh_health_invalidation: Option<(String, String)>,
     server_generations: SettingsGenerations,
     draft_generations: SettingsGenerations,
     connection_detail_expanded: Vec<Tab>,
@@ -323,7 +324,9 @@ enum SettingsOperation {
         base_url: String,
         uses_device_login: bool,
     },
-    RefreshProviders,
+    RefreshProviders {
+        invalidate_health: Option<(String, String)>,
+    },
     SetProviderEnabled {
         provider: String,
         account: String,
@@ -426,7 +429,7 @@ enum SettingsOperationPayload {
 struct ProviderHealthOperationResult {
     provider: String,
     account: String,
-    result: Result<crate::backend::config::ProviderHealthCheck, String>,
+    result: Result<sinomo_lm::LanguageModelProviderHealthSnapshot, String>,
 }
 
 struct ConfigOperationSuccess {
@@ -438,6 +441,7 @@ struct ProviderOperationSuccess {
     items: Vec<ConfigItem>,
     forms: Vec<ProviderForm>,
     chat_providers: Vec<ProviderSummary>,
+    health: HashMap<String, ProviderHealthState>,
     effect: ProviderOperationEffect,
 }
 
@@ -551,6 +555,22 @@ struct ProviderHealthState {
     usage: Option<sinomo_lm::LanguageModelProviderUsage>,
     usage_error: Option<String>,
     stale: bool,
+}
+
+impl ProviderHealthState {
+    fn from_snapshot(snapshot: sinomo_lm::LanguageModelProviderHealthSnapshot) -> Self {
+        Self {
+            checking: false,
+            last_verified_at_unix: snapshot.last_verified_at_unix,
+            last_checked_at_unix: Some(snapshot.checked_at_unix),
+            error: snapshot.error,
+            models: snapshot.models,
+            model_discovery_error: snapshot.model_discovery_error,
+            usage: snapshot.usage,
+            usage_error: snapshot.usage_error,
+            stale: snapshot.stale,
+        }
+    }
 }
 
 /// An in-progress provider OAuth device-login flow (codex / github-copilot), driven on a
@@ -734,6 +754,7 @@ impl SettingsState {
             Err(error) => (Vec::new(), Some(error.to_string())),
         };
         let provider_forms = provider_forms(config.as_ref());
+        let provider_health = provider_health_states(load_provider_health(config.as_ref()));
         let data_dir = backend.data_dir.clone();
         let skills_include_all = true;
         let skills_data_dir = data_dir.clone();
@@ -826,7 +847,7 @@ impl SettingsState {
             provider_add_error: None,
             provider_action_error: None,
             provider_action_status: None,
-            provider_health: HashMap::new(),
+            provider_health,
             agent_snapshot,
             agent_selected_id,
             agent_form,
@@ -853,6 +874,7 @@ impl SettingsState {
             next_operation_request_id: 0,
             pending_operations: HashMap::new(),
             provider_refresh_needed: false,
+            provider_refresh_health_invalidation: None,
             server_generations: SettingsGenerations::default(),
             draft_generations: SettingsGenerations::default(),
             connection_detail_expanded: Vec::new(),
@@ -947,6 +969,7 @@ impl SettingsState {
             next_operation_request_id: 0,
             pending_operations: HashMap::new(),
             provider_refresh_needed: false,
+            provider_refresh_health_invalidation: None,
             server_generations: SettingsGenerations::default(),
             draft_generations: SettingsGenerations::default(),
             connection_detail_expanded: Vec::new(),
@@ -1042,6 +1065,7 @@ impl SettingsState {
         self.pending_operations.clear();
         self.operation_lane = None;
         self.provider_refresh_needed = false;
+        self.provider_refresh_health_invalidation = None;
         self.initial_load_rx = None;
         self.initial_load_started = false;
         self.config = backend.config.clone();
@@ -1076,6 +1100,7 @@ impl SettingsState {
         }
         if self.server_generations.providers == result.server_generations.providers {
             self.provider_forms = loaded.provider_forms;
+            self.provider_health = loaded.provider_health;
         }
         if self.server_generations.cluster == result.server_generations.cluster {
             self.clustered = loaded.clustered;
@@ -1220,7 +1245,7 @@ impl SettingsState {
                 self.provider_action_error = None;
                 self.provider_action_status = None;
             }
-            SettingsOperation::RefreshProviders => {}
+            SettingsOperation::RefreshProviders { .. } => {}
             SettingsOperation::SetProviderEnabled {
                 provider, account, ..
             }
@@ -1364,6 +1389,7 @@ impl SettingsState {
                     self.config_items = success.items;
                     self.config_error = None;
                     self.provider_forms = success.forms;
+                    self.provider_health = success.health;
                     effects.chat_providers = Some(success.chat_providers);
                     self.provider_action_error = None;
                     self.provider_remove_confirming = None;
@@ -1426,26 +1452,21 @@ impl SettingsState {
                 }
                 SettingsOperationPayload::ProviderHealth(health_result) => {
                     let key = provider_account_key(&health_result.provider, &health_result.account);
-                    let health = self.provider_health.entry(key).or_default();
-                    health.checking = false;
-                    health.last_checked_at_unix = Some(current_settings_unix_timestamp());
                     match health_result.result {
                         Ok(snapshot) => {
-                            health.last_verified_at_unix = Some(snapshot.verified_at_unix);
-                            health.last_checked_at_unix = Some(snapshot.verified_at_unix);
-                            health.error = None;
-                            health.models = snapshot.models;
-                            health.model_discovery_error = snapshot.model_discovery_error;
-                            health.usage = snapshot.usage;
-                            health.usage_error = snapshot.usage_error;
-                            health.stale = false;
-                            self.set_provider_status(
-                                snapshot.provider,
-                                snapshot.account,
-                                "Connection verified",
-                            );
+                            let healthy = snapshot.healthy;
+                            let provider = snapshot.provider.clone();
+                            let account = snapshot.account.clone();
+                            self.provider_health
+                                .insert(key, ProviderHealthState::from_snapshot(snapshot));
+                            if healthy {
+                                self.set_provider_status(provider, account, "Connection verified");
+                            }
                         }
                         Err(error) => {
+                            let health = self.provider_health.entry(key).or_default();
+                            health.checking = false;
+                            health.last_checked_at_unix = Some(current_settings_unix_timestamp());
                             health.error = Some(error);
                             health.stale = health.last_verified_at_unix.is_some();
                         }
@@ -2253,11 +2274,12 @@ impl SettingsState {
             None
         };
         if done {
-            if let Some((provider, account)) = done_account {
+            if let Some((provider, account)) = done_account.clone() {
                 self.invalidate_provider_health(&provider, &account);
                 self.set_provider_status(provider, account, "Sign-in saved to lm.providers");
             }
             self.provider_refresh_needed = true;
+            self.provider_refresh_health_invalidation = done_account;
             self.device_login = None;
         }
         true
@@ -2375,9 +2397,14 @@ fn execute_settings_operation(
                 },
             )
         })()),
-        SettingsOperation::RefreshProviders => SettingsOperationPayload::Providers(
-            provider_operation_success(backend, ProviderOperationEffect::Refreshed),
-        ),
+        SettingsOperation::RefreshProviders { invalidate_health } => {
+            SettingsOperationPayload::Providers((|| {
+                if let Some((provider, account)) = invalidate_health {
+                    mark_provider_health_stale(backend.config.as_ref(), &provider, &account)?;
+                }
+                provider_operation_success(backend, ProviderOperationEffect::Refreshed)
+            })())
+        }
         SettingsOperation::SetProviderEnabled {
             provider,
             account,
@@ -2417,6 +2444,7 @@ fn execute_settings_operation(
         SettingsOperation::RemoveProvider { provider, account } => {
             SettingsOperationPayload::Providers((|| {
                 remove_provider_account(backend.config.as_ref(), &provider, &account)?;
+                remove_provider_health(backend.config.as_ref(), &provider, &account)?;
                 provider_operation_success(
                     backend,
                     ProviderOperationEffect::Removed { provider, account },
@@ -2450,6 +2478,7 @@ fn execute_settings_operation(
                     set_provider_vendor_options(backend.config.as_ref(), &provider, &account, &raw)
                 }
             }?;
+            mark_provider_health_stale(backend.config.as_ref(), &provider, &account)?;
             provider_operation_success(
                 backend,
                 ProviderOperationEffect::Updated {
@@ -2467,6 +2496,7 @@ fn execute_settings_operation(
             effort_index,
         } => SettingsOperationPayload::Providers((|| {
             set_provider_effort(backend.config.as_ref(), &provider, &account, effort_index)?;
+            mark_provider_health_stale(backend.config.as_ref(), &provider, &account)?;
             provider_operation_success(
                 backend,
                 ProviderOperationEffect::Updated {
@@ -2489,6 +2519,7 @@ fn execute_settings_operation(
                 &account,
                 verbosity_index,
             )?;
+            mark_provider_health_stale(backend.config.as_ref(), &provider, &account)?;
             provider_operation_success(
                 backend,
                 ProviderOperationEffect::Updated {
@@ -2687,6 +2718,7 @@ fn provider_operation_success(
         items: resolve_items(backend.config.as_ref()),
         forms: provider_forms(backend.config.as_ref()),
         chat_providers: cluster_provider_summaries(backend.config.as_ref()),
+        health: provider_health_states(load_provider_health(backend.config.as_ref())),
         effect,
     })
 }
@@ -2868,7 +2900,17 @@ fn provider_field_saved_message(field: ProviderField) -> &'static str {
 }
 
 fn provider_account_key(provider: &str, account: &str) -> String {
-    format!("{provider}:{account}")
+    sinomo_lm::provider_health_account_key(provider, account)
+}
+
+fn provider_health_states(
+    config: sinomo_lm::LanguageModelProviderHealthConfig,
+) -> HashMap<String, ProviderHealthState> {
+    config
+        .accounts
+        .into_iter()
+        .map(|(key, snapshot)| (key, ProviderHealthState::from_snapshot(snapshot)))
+        .collect()
 }
 
 fn provider_enabled_count(forms: &[ProviderForm]) -> usize {
@@ -3679,15 +3721,18 @@ fn queue_settings_operation(
 }
 
 pub(crate) fn pump_background_operations(shared: &Shared) -> bool {
-    let refresh_providers = {
+    let (refresh_providers, invalidate_health) = {
         let mut settings = shared.settings_mut();
-        std::mem::take(&mut settings.provider_refresh_needed)
+        (
+            std::mem::take(&mut settings.provider_refresh_needed),
+            settings.provider_refresh_health_invalidation.take(),
+        )
     };
     if refresh_providers {
         queue_settings_operation(
             shared,
             SettingsOperationScope::Providers,
-            SettingsOperation::RefreshProviders,
+            SettingsOperation::RefreshProviders { invalidate_health },
         );
     }
     let effects = { shared.settings_mut().pump_operations() };
@@ -9427,10 +9472,13 @@ mod tests {
                 payload: SettingsOperationPayload::ProviderHealth(ProviderHealthOperationResult {
                     provider: provider.clone(),
                     account: account.clone(),
-                    result: Ok(crate::backend::config::ProviderHealthCheck {
+                    result: Ok(sinomo_lm::LanguageModelProviderHealthSnapshot {
                         provider: provider.clone(),
                         account: account.clone(),
-                        verified_at_unix: 1_750_000_000,
+                        checked_at_unix: 1_750_000_000,
+                        last_verified_at_unix: Some(1_750_000_000),
+                        healthy: true,
+                        error: None,
                         models: vec!["gpt-5.5".to_string()],
                         model_discovery_error: None,
                         usage: Some(sinomo_lm::LanguageModelProviderUsage {
@@ -9441,6 +9489,7 @@ mod tests {
                             credits: None,
                         }),
                         usage_error: None,
+                        stale: false,
                     }),
                 }),
             })

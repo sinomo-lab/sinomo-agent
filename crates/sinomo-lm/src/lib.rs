@@ -969,8 +969,10 @@ pub struct ProviderAccountInfo {
 
 pub const DEFAULT_PROVIDER_ACCOUNT: &str = "default";
 pub const LM_PROVIDER_CONFIG_KEY: &str = "lm.providers";
+pub const LM_PROVIDER_HEALTH_CONFIG_KEY: &str = "lm.provider_health";
 pub const LM_RUNTIME_CONFIG_KEY: &str = "lm.runtime";
 pub const LM_PROVIDER_CONFIG_KV_KEY: &str = "/config/lm/providers";
+pub const LM_PROVIDER_HEALTH_CONFIG_KV_KEY: &str = "/config/lm/provider_health";
 pub const LM_RUNTIME_CONFIG_KV_KEY: &str = "/config/lm/runtime";
 const LM_CREDENTIALS_DOCUMENT_PREFIX: &str = "lm.credentials";
 
@@ -980,6 +982,41 @@ fn default_provider_account_name() -> String {
 
 fn provider_account_enabled_default() -> bool {
     true
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct LanguageModelProviderHealthConfig {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub accounts: BTreeMap<String, LanguageModelProviderHealthSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LanguageModelProviderHealthSnapshot {
+    pub provider: String,
+    pub account: String,
+    pub checked_at_unix: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verified_at_unix: Option<i64>,
+    pub healthy: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_discovery_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<LanguageModelProviderUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_error: Option<String>,
+    #[serde(default)]
+    pub stale: bool,
+}
+
+pub fn provider_health_account_key(provider: &str, account: &str) -> String {
+    let provider =
+        normalize_model_provider(provider).unwrap_or_else(|| provider.trim().to_string());
+    let account = normalize_provider_account_name(Some(account));
+    format!("{provider}:{account}")
 }
 
 pub fn normalize_provider_account_name(account: Option<&str>) -> String {
@@ -1200,6 +1237,24 @@ pub fn model_runtime_config_definition()
     Ok(definition)
 }
 
+pub fn provider_health_config_definition()
+-> Result<sinomo_runtime::config::ConfigDefinition, LanguageModelError> {
+    let definition = sinomo_runtime::config::ConfigDefinition::new(
+        LM_PROVIDER_HEALTH_CONFIG_KEY,
+        "sinomo-lm",
+        sinomo_runtime::config::ConfigValueType::Object {
+            schema_name: "LanguageModelProviderHealthConfig".to_string(),
+        },
+        "Cluster-visible provider verification, model discovery, and usage snapshots.",
+        sinomo_runtime::config::ConfigClusterMode::ClusterOverrideLocal,
+    )
+    .map_err(map_lm_config_error)?
+    .with_default(&LanguageModelProviderHealthConfig::default())
+    .map_err(map_lm_config_error)?;
+    debug_assert_eq!(definition.cluster_key(), LM_PROVIDER_HEALTH_CONFIG_KV_KEY);
+    Ok(definition)
+}
+
 fn provider_credentials_document_key(provider: &str) -> Result<String, LanguageModelError> {
     let provider = normalize_model_provider(provider).unwrap_or_else(|| provider.to_string());
     let key = format!("{LM_CREDENTIALS_DOCUMENT_PREFIX}.{provider}");
@@ -1214,6 +1269,8 @@ pub fn register_config_definitions(
         .register(model_config_definition()?)
         .map_err(map_lm_config_error)?
         .register(model_runtime_config_definition()?)
+        .map_err(map_lm_config_error)?
+        .register(provider_health_config_definition()?)
         .map_err(map_lm_config_error)
 }
 
@@ -3850,9 +3907,22 @@ mod tests {
 
         assert!(keys.iter().any(|key| key == LM_PROVIDER_CONFIG_KEY));
         assert!(keys.iter().any(|key| key == LM_RUNTIME_CONFIG_KEY));
+        assert!(keys.iter().any(|key| key == LM_PROVIDER_HEALTH_CONFIG_KEY));
         assert!(
             !keys.iter().any(|key| key.starts_with("lm.credentials.")),
             "provider credentials are represented by account entries in lm.providers"
+        );
+    }
+
+    #[test]
+    fn provider_health_config_is_cluster_authoritative() {
+        let definition = provider_health_config_definition().expect("health definition");
+
+        assert_eq!(definition.key.as_str(), LM_PROVIDER_HEALTH_CONFIG_KEY);
+        assert_eq!(definition.cluster_key(), LM_PROVIDER_HEALTH_CONFIG_KV_KEY);
+        assert_eq!(
+            definition.cluster_mode,
+            sinomo_runtime::config::ConfigClusterMode::ClusterOverrideLocal
         );
     }
 
