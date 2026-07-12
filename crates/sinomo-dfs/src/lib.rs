@@ -468,9 +468,11 @@ pub use service_state::{
     NetworkedDfsRangeReadOutcome, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
     NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
 };
+pub use service_trace::with_dfs_traceparent;
 pub(crate) use service_trace::{
-    dfs_distributed_write_result_trace_label, dfs_namespace_operation_trace_label,
-    dfs_network_message_trace_label, dfs_perf_trace, dfs_perf_trace_enabled,
+    current_dfs_traceparent, dfs_distributed_write_result_trace_label,
+    dfs_namespace_operation_trace_label, dfs_network_message_trace_label, dfs_perf_trace,
+    dfs_perf_trace_enabled,
 };
 use sinomo_core::node::NodeId;
 pub(crate) use smoke::run_cluster_dfs_smoke_with_message_sender;

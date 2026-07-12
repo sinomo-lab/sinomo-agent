@@ -1387,15 +1387,30 @@ async fn prepare_cluster_dfs_metadata_journal_publish_async(
     cluster_paths: &ClusterPaths,
     options: DfsMetadataJournalReplicationOptions,
 ) -> Result<Option<DfsPreparedClusterMetadataJournalPublish>, DfsError> {
+    let trace_started = Instant::now();
     let data_dir = data_dir.clone();
     let cluster_paths = cluster_paths.clone();
-    tokio::task::spawn_blocking(move || {
+    let prepared = tokio::task::spawn_blocking(move || {
         prepare_cluster_dfs_metadata_journal_publish(data_dir, cluster_paths, options)
     })
     .await
     .map_err(|source| DfsError::Metadata {
         message: format!("DFS metadata publish planning task failed: {source}"),
-    })?
+    })??;
+    let (outcomes, targets) = prepared
+        .as_ref()
+        .map(|prepared| (prepared.outcomes.len(), prepared.targets.len()))
+        .unwrap_or_default();
+    let traceparent = crate::current_dfs_traceparent().unwrap_or_default();
+    tracing::trace!(
+        target: "sinomo.dfs.perf",
+        traceparent = %traceparent,
+        outcomes,
+        targets,
+        total_ms = trace_started.elapsed().as_millis(),
+        "metadata-publish-plan"
+    );
+    Ok(prepared)
 }
 
 pub(crate) fn prepare_dfs_metadata_journal_publish_with_host(

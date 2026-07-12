@@ -117,7 +117,16 @@ struct PlannedWrittenJournalTableOps {
 }
 
 fn metadata_backend_perf_trace(args: std::fmt::Arguments<'_>) {
-    tracing::trace!(target: "sinomo.dfs.perf", detail = %args, "dfs metadata backend perf");
+    if !tracing::enabled!(target: "sinomo.dfs.perf", tracing::Level::TRACE) {
+        return;
+    }
+    let traceparent = crate::current_dfs_traceparent().unwrap_or_default();
+    tracing::trace!(
+        target: "sinomo.dfs.perf",
+        traceparent = %traceparent,
+        detail = %args,
+        "dfs metadata backend perf"
+    );
 }
 
 #[cfg(test)]
@@ -159,10 +168,13 @@ impl LocalSobjMetadataBackend {
     /// journal entries not yet reflected in tables, and finishes interrupted
     /// namespace or visible-version commits.
     pub fn new(shard_id: DfsMetadataShardId, root: impl Into<PathBuf>) -> Result<Self> {
+        let trace_started = Instant::now();
         let root = root.into();
+        let create_dirs_started = Instant::now();
         create_dir_all(root.join("records"))?;
         create_dir_all(root.join("journal"))?;
         create_dir_all(root.join("journal").join("segments"))?;
+        let create_dirs_ms = create_dirs_started.elapsed().as_millis();
         let mut backend = Self {
             shard_id,
             root,
@@ -173,6 +185,7 @@ impl LocalSobjMetadataBackend {
             table_snapshot_fingerprint: None,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
         };
+        let local_recovery_started = Instant::now();
         {
             let _lock = backend.metadata_write_lock()?;
             migrate_legacy_journal_entries(&backend.root)?;
@@ -187,9 +200,32 @@ impl LocalSobjMetadataBackend {
             backend.reconcile_local_materialization_cursor(materialized_through_sequence)?;
             backend.recover_unmaterialized_local_journal_entries()?;
         }
+        let local_recovery_ms = local_recovery_started.elapsed().as_millis();
+        let namespace_recovery_started = Instant::now();
         backend.recover_namespace_transactions()?;
+        let namespace_recovery_ms = namespace_recovery_started.elapsed().as_millis();
+        let visible_recovery_started = Instant::now();
         backend.recover_visible_version_commits()?;
+        let visible_recovery_ms = visible_recovery_started.elapsed().as_millis();
+        let location_recovery_started = Instant::now();
         backend.recover_object_locations_from_visible_versions()?;
+        let location_recovery_ms = location_recovery_started.elapsed().as_millis();
+        let traceparent = crate::current_dfs_traceparent().unwrap_or_default();
+        tracing::trace!(
+            target: "sinomo.dfs.perf",
+            traceparent = %traceparent,
+            shard = %backend.shard_id.0,
+            root = %backend.root.display(),
+            next_sequence = backend.next_sequence,
+            materialized_through_sequence = backend.materialized_through_sequence,
+            create_dirs_ms,
+            local_recovery_ms,
+            namespace_recovery_ms,
+            visible_recovery_ms,
+            location_recovery_ms,
+            total_ms = trace_started.elapsed().as_millis(),
+            "metadata-backend-open"
+        );
         Ok(backend)
     }
 

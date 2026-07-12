@@ -25,7 +25,8 @@ fn parse_network_fallible_vec_resource_exhaustion(detail: &str) -> Option<(Strin
 ///
 /// This is deliberately transport-oriented. Service execution deadlines and
 /// domain retry state remain owned by the crate that defines the operation.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum NetworkTimeoutPhase {
     Route,
     Signing,
@@ -40,7 +41,8 @@ pub enum NetworkTimeoutPhase {
 ///
 /// `PossiblyApplied` must be treated conservatively: the peer may have handled
 /// the request even though its response was not observed.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum NetworkDeliveryState {
     DefinitelyNotSent,
     PossiblyApplied,

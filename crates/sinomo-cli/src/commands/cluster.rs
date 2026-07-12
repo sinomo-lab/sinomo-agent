@@ -2069,14 +2069,76 @@ fn cluster_health_rows_from_local_state(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<Vec<ClusterHealthRow>, CliError> {
-    cluster::cluster_health_rows_with_probe(
+    let mut rows = cluster::cluster_health_rows_with_probe(
         paths,
         state,
         &CliClusterStatusProbe { paths },
         false,
         OffsetDateTime::now_utc(),
     )
-    .map_err(Into::into)
+    .map_err(CliError::from)?;
+    let availability = authoritative_local_main_daemon_availability(paths, state);
+    apply_authoritative_local_main_availability(state, &mut rows, availability);
+    Ok(rows)
+}
+
+fn authoritative_local_main_daemon_availability(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> ClusterNodeAvailability {
+    let Some(member) = state
+        .members
+        .iter()
+        .find(|member| member.node_id == state.local_node_id)
+    else {
+        return ClusterNodeAvailability::Unknown;
+    };
+    let Some(data_dir) = paths.root.parent() else {
+        return ClusterNodeAvailability::Unknown;
+    };
+    let probe = probe_daemon_status(
+        &DaemonPaths::with_root(data_dir.join("daemon")),
+        CLUSTER_HEALTH_PROBE_TIMEOUT,
+    );
+    local_main_daemon_availability_from_probe(state, member, &probe)
+}
+
+fn local_main_daemon_availability_from_probe(
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+    probe: &DaemonProbeStatus,
+) -> ClusterNodeAvailability {
+    match probe {
+        DaemonProbeStatus::Running(status) => {
+            let Some(cluster) = status.cluster.as_ref() else {
+                return ClusterNodeAvailability::Unknown;
+            };
+            if cluster.cluster_id != state.cluster_id
+                || cluster.node_id != member.node_id
+                || cluster.process != DAEMON_MAIN_CLUSTER_ROLE
+            {
+                return ClusterNodeAvailability::Unknown;
+            }
+            ClusterNodeAvailability::Online
+        }
+        DaemonProbeStatus::Locked { .. } => ClusterNodeAvailability::Unknown,
+        DaemonProbeStatus::NotRunning => ClusterNodeAvailability::Offline,
+    }
+}
+
+fn apply_authoritative_local_main_availability(
+    state: &ClusterBootstrapState,
+    rows: &mut [ClusterHealthRow],
+    availability: ClusterNodeAvailability,
+) {
+    let Some(row) = rows
+        .iter_mut()
+        .find(|row| row.member.node_id == state.local_node_id)
+    else {
+        return;
+    };
+    row.availability = availability.clone();
+    row.status.availability = availability;
 }
 
 /// Cluster health rows from the daemon's `/cluster/health` aggregation via
@@ -2961,6 +3023,110 @@ pub(crate) fn format_member_state(state: &ClusterMemberState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_main_probe_distinguishes_down_from_unresponsive() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_cli_local_health").expect("cluster id");
+        let node_id = NodeId::from_legacy_named("node_cli_local_health").expect("node id");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "cli local health",
+            node_id,
+            "local",
+            "public-key",
+            now,
+        );
+        state.members[0].capabilities = vec![
+            sinomo_runtime::core::CapabilityName::new(
+                sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY,
+            )
+            .expect("main capability"),
+        ];
+        let member = state
+            .members
+            .iter()
+            .find(|member| member.node_id == state.local_node_id)
+            .expect("local main member");
+
+        assert_eq!(
+            local_main_daemon_availability_from_probe(
+                &state,
+                member,
+                &DaemonProbeStatus::NotRunning,
+            ),
+            ClusterNodeAvailability::Offline
+        );
+        assert_eq!(
+            local_main_daemon_availability_from_probe(
+                &state,
+                member,
+                &DaemonProbeStatus::Locked { status: None },
+            ),
+            ClusterNodeAvailability::Unknown
+        );
+    }
+
+    #[test]
+    fn local_main_availability_override_preserves_remote_rows() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_cli_health_override").expect("cluster id");
+        let node_id = NodeId::from_legacy_named("node_cli_health_override").expect("node id");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "cli health override",
+            node_id,
+            "local",
+            "public-key",
+            now,
+        );
+        state.members[0].capabilities = vec![
+            sinomo_runtime::core::CapabilityName::new(
+                sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY,
+            )
+            .expect("main capability"),
+        ];
+        let local_member = state
+            .members
+            .iter()
+            .find(|member| member.node_id == state.local_node_id)
+            .expect("local main member")
+            .clone();
+        let mut remote_member = local_member.clone();
+        remote_member.node_id =
+            NodeId::from_legacy_named("node_cli_health_override_remote").expect("remote node");
+        let online_row = |member: ClusterMemberRecord| {
+            let mut status = cluster::unknown_cluster_node_status(&state, &member, now);
+            status.availability = ClusterNodeAvailability::Online;
+            ClusterHealthRow {
+                member,
+                status,
+                availability: ClusterNodeAvailability::Online,
+            }
+        };
+        let mut rows = vec![online_row(local_member), online_row(remote_member.clone())];
+
+        apply_authoritative_local_main_availability(
+            &state,
+            &mut rows,
+            ClusterNodeAvailability::Offline,
+        );
+
+        let local = rows
+            .iter()
+            .find(|row| row.member.node_id == state.local_node_id)
+            .expect("local row");
+        assert_eq!(local.availability, ClusterNodeAvailability::Offline);
+        assert_eq!(local.status.availability, ClusterNodeAvailability::Offline);
+        let remote = rows
+            .iter()
+            .find(|row| row.member.node_id == remote_member.node_id)
+            .expect("remote row");
+        assert_eq!(remote.availability, ClusterNodeAvailability::Online);
+        assert_eq!(remote.status.availability, ClusterNodeAvailability::Online);
+    }
 
     #[test]
     fn repair_member_endpoint_replaces_same_address_with_canonical_identity() {

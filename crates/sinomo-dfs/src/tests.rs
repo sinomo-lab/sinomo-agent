@@ -2270,6 +2270,14 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         decode_dfs_message_rpc_request(&message_request).expect("validated message request"),
         message_command
     );
+    let correlated_traceparent = "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01";
+    let correlated_request = crate::with_dfs_traceparent(Some(correlated_traceparent), || {
+        dfs_message_rpc_request(&message_command).expect("correlated message request")
+    });
+    assert_eq!(
+        correlated_request.traceparent(),
+        Some(correlated_traceparent)
+    );
     let namespace_command = DfsMessageCommand {
         request_id: "namespace-request".to_string(),
         routed_message: DfsRoutedMessage {
@@ -2332,6 +2340,64 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
     assert_eq!(
         distributed_request.forwarded_response_idle_timeout(),
         Some(crate::DFS_ROUTED_DISTRIBUTED_WRITE_NO_PROGRESS_TIMEOUT)
+    );
+    let repair_object_id = DfsObjectId::generate();
+    let repair_version = DfsVersion::generate();
+    let repair_request = dfs_message_rpc_request(&DfsMessageCommand {
+        request_id: "repair-request".to_string(),
+        routed_message: DfsRoutedMessage {
+            source_node_id: local.clone(),
+            target_node_id: remote.clone(),
+            frame_id: 10,
+            message_id: 11,
+            message: DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
+                request_id: "repair-request".to_string(),
+                intent_id: "repair-intent".to_string(),
+                file_system_id: sifs_file_system_id(),
+                object_id: repair_object_id.clone(),
+                expected_base_version: None,
+                version: repair_version.clone(),
+                content_hash: "blake3:repair".to_string(),
+                bytes: b"repair".to_vec(),
+                object_metadata: None,
+                authority_shard: None,
+            }),
+        },
+    })
+    .expect("repair message request");
+    assert!(
+        repair_request.is_response_retry_safe(),
+        "content-addressed repair commands are safe to redispatch after a lost response"
+    );
+    let repair_chunk_request = dfs_message_rpc_request(&DfsMessageCommand {
+        request_id: "repair-chunk-request".to_string(),
+        routed_message: DfsRoutedMessage {
+            source_node_id: local.clone(),
+            target_node_id: remote.clone(),
+            frame_id: 12,
+            message_id: 13,
+            message: DfsNetworkMessage::RepairReplicaChunk(DfsRepairReplicaChunkCommand {
+                request_id: "repair-chunk-request".to_string(),
+                intent_id: "repair-intent".to_string(),
+                file_system_id: sifs_file_system_id(),
+                object_id: repair_object_id,
+                expected_base_version: None,
+                version: repair_version,
+                content_hash: "blake3:repair".to_string(),
+                total_size_bytes: 6,
+                chunk_index: 0,
+                total_chunks: 1,
+                chunk_hash: None,
+                bytes: b"repair".to_vec(),
+                object_metadata: None,
+                authority_shard: None,
+            }),
+        },
+    })
+    .expect("repair chunk message request");
+    assert!(
+        repair_chunk_request.is_response_retry_safe(),
+        "stable repair chunk identities are safe to redispatch after a lost response"
     );
     let mismatched_route_request = sinomo_core::network::ObjectRpcRequest::encode_body(
         DFS_DATA_WRITE_ROUTE,
@@ -20625,23 +20691,21 @@ fn repair_command_accepts_current_replica_after_metadata_primary_moves() {
     dfs.add_object_metadata(object.clone()).expect("metadata");
     let bytes = b"repair bytes from current replica after metadata primary moved";
     let content_hash = content_hash(bytes);
+    let command = DfsRepairReplicaCommand {
+        request_id: "dfs_net_req_repair_moved_primary".to_string(),
+        intent_id: "dfs_intent_repair_moved_primary".to_string(),
+        file_system_id: file_system.file_system_id,
+        object_id: object_id.clone(),
+        expected_base_version: Some(version_1),
+        version: version_2.clone(),
+        content_hash: content_hash.clone(),
+        bytes: bytes.to_vec(),
+        object_metadata: Some(object),
+        authority_shard: None,
+    };
 
     let event = dfs
-        .handle_repair_replica(
-            source.clone(),
-            DfsRepairReplicaCommand {
-                request_id: "dfs_net_req_repair_moved_primary".to_string(),
-                intent_id: "dfs_intent_repair_moved_primary".to_string(),
-                file_system_id: file_system.file_system_id,
-                object_id: object_id.clone(),
-                expected_base_version: Some(version_1),
-                version: version_2.clone(),
-                content_hash: content_hash.clone(),
-                bytes: bytes.to_vec(),
-                object_metadata: Some(object),
-                authority_shard: None,
-            },
-        )
+        .handle_repair_replica(source.clone(), command.clone())
         .expect("repair command");
 
     assert!(matches!(
@@ -20652,6 +20716,13 @@ fn repair_command_accepts_current_replica_after_metadata_primary_moves() {
             ..
         } if repaired_object_id == object_id && replica_node_id == target
     ));
+    let replayed = dfs
+        .handle_repair_replica(source, command)
+        .expect("replayed repair command");
+    assert!(
+        matches!(replayed, NetworkedDfsServiceEvent::ReplicaRepaired { .. }),
+        "a lost repair response must be safe to recover by redispatching the stable command"
+    );
     let manifest = dfs
         .content()
         .read_manifest(object_id.as_str(), version_2.as_str())

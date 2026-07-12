@@ -9582,8 +9582,15 @@ fn networked_dfs_chunked_repair_retry_uses_latest_request_id() {
         &mut owner_transport,
         &owner,
         &replica,
+        DfsNetworkMessage::RepairReplicaChunk(retry_first.clone()),
+    );
+    send_dfs_test_message(
+        &mut owner_transport,
+        &owner,
+        &replica,
         DfsNetworkMessage::RepairReplicaChunk(retry_first),
     );
+    let replayed_final_chunk = retry_second.clone();
     send_dfs_test_message(
         &mut owner_transport,
         &owner,
@@ -9596,6 +9603,30 @@ fn networked_dfs_chunked_repair_retry_uses_latest_request_id() {
     let responses =
         drain_dfs_test_message_payloads(&mut owner_transport, "owner receives repair response");
     assert!(responses.iter().any(|message| {
+        matches!(
+            message,
+            DfsNetworkMessage::RepairReplicaResponse(DfsRepairReplicaResponse {
+                request_id,
+                result: DfsBlobTransferResult::Committed { .. },
+                ..
+            }) if request_id == "dfs_net_req_repair_retry_new"
+        )
+    }));
+
+    send_dfs_test_message(
+        &mut owner_transport,
+        &owner,
+        &replica,
+        DfsNetworkMessage::RepairReplicaChunk(replayed_final_chunk),
+    );
+    replica_dfs
+        .process_incoming()
+        .expect("late duplicate repair chunk uses durable fast path");
+    let replay_responses = drain_dfs_test_message_payloads(
+        &mut owner_transport,
+        "owner receives replayed repair response",
+    );
+    assert!(replay_responses.iter().any(|message| {
         matches!(
             message,
             DfsNetworkMessage::RepairReplicaResponse(DfsRepairReplicaResponse {

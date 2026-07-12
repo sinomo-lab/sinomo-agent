@@ -245,8 +245,10 @@ pub(crate) fn append_segmented_journal_entries(
         sync_dir(parent)?;
     }
     let sync_dir_ms = sync_dir_started.elapsed().as_millis();
+    let traceparent = crate::current_dfs_traceparent().unwrap_or_default();
     tracing::trace!(
         target: "sinomo.dfs.perf",
+        traceparent = %traceparent,
         entries = entries.len(),
         bytes = records_len,
         segment = segment_id,
@@ -324,8 +326,10 @@ pub(crate) fn write_local_journal_entries(
         chunk_count += 1;
         chunk_start = chunk_end;
     }
+    let traceparent = crate::current_dfs_traceparent().unwrap_or_default();
     tracing::trace!(
         target: "sinomo.dfs.perf",
+        traceparent = %traceparent,
         shard = %shard_id.0,
         entries = entries.len(),
         chunks = chunk_count,
@@ -578,6 +582,7 @@ fn segmented_journal_entries_since_limited(
     max_entries: usize,
     known_next_sequence: Option<u64>,
 ) -> Result<Vec<DfsMetadataJournalEntry>> {
+    let trace_started = Instant::now();
     if max_entries == 0 {
         return Ok(Vec::new());
     }
@@ -610,12 +615,15 @@ fn segmented_journal_entries_since_limited(
             paths.insert(segment_id, path);
         }
     }
+    let candidate_segments = paths.len();
+    let mut opened_segments = 0_usize;
     let mut entries = Vec::new();
     for path in paths.into_values() {
         let remaining = max_entries.saturating_sub(entries.len());
         if remaining == 0 {
             break;
         }
+        opened_segments = opened_segments.saturating_add(1);
         entries.extend(read_segmented_journal_file_since_limited(
             &path,
             after_sequence,
@@ -627,6 +635,18 @@ fn segmented_journal_entries_since_limited(
     }
     entries.sort_by_key(|entry| entry.sequence);
     entries.truncate(max_entries);
+    let traceparent = crate::current_dfs_traceparent().unwrap_or_default();
+    tracing::trace!(
+        target: "sinomo.dfs.perf",
+        traceparent = %traceparent,
+        after_sequence,
+        max_entries,
+        candidate_segments,
+        opened_segments,
+        returned_entries = entries.len(),
+        total_ms = trace_started.elapsed().as_millis(),
+        "metadata-journal-suffix-scan"
+    );
     Ok(entries)
 }
 
@@ -635,12 +655,21 @@ pub(crate) fn read_segmented_journal_file_since_limited(
     after_sequence: u64,
     max_entries: usize,
 ) -> Result<Vec<DfsMetadataJournalEntry>> {
+    let trace_enabled = tracing::enabled!(target: "sinomo.dfs.perf", tracing::Level::TRACE);
+    let trace_started = Instant::now();
     let mut file = fs::File::open(path).map_err(|source| MetadataBackendError::Io {
         path: path.to_owned(),
         source,
     })?;
+    let file_bytes = if trace_enabled {
+        file.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+    } else {
+        0
+    };
     let mut entries = Vec::new();
+    let mut decoded_records = 0_usize;
     while let Some(entry) = read_next_segmented_journal_entry(&mut file, path)? {
+        decoded_records = decoded_records.saturating_add(1);
         if entry.sequence > after_sequence {
             entries.push(entry);
             if entries.len() >= max_entries {
@@ -648,6 +677,25 @@ pub(crate) fn read_segmented_journal_file_since_limited(
             }
         }
     }
+    let scanned_bytes = if trace_enabled {
+        file.stream_position().unwrap_or(0)
+    } else {
+        0
+    };
+    let traceparent = crate::current_dfs_traceparent().unwrap_or_default();
+    tracing::trace!(
+        target: "sinomo.dfs.perf",
+        traceparent = %traceparent,
+        path = %path.display(),
+        after_sequence,
+        max_entries,
+        file_bytes,
+        scanned_bytes,
+        decoded_records,
+        returned_entries = entries.len(),
+        total_ms = trace_started.elapsed().as_millis(),
+        "metadata-journal-segment-scan"
+    );
     Ok(entries)
 }
 

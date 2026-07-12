@@ -4,8 +4,59 @@ use crate::{
     DfsDistributedWriteResult, DfsNamespaceOperation, DfsNetworkMessage, NetworkedDfsWriteOutcome,
 };
 
+thread_local! {
+    static DFS_TRACEPARENT: std::cell::RefCell<Option<String>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+struct DfsTraceparentGuard(Option<String>);
+
+impl Drop for DfsTraceparentGuard {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        DFS_TRACEPARENT.with(|traceparent| {
+            traceparent.replace(previous);
+        });
+    }
+}
+
+/// Run synchronous DFS work with the originating object-RPC trace context.
+///
+/// DFS crosses async and blocking boundaries in the daemon. Callers carry the
+/// traceparent explicitly to the blocking boundary and install it here so
+/// internal routed RPCs and performance events retain one end-to-end identity.
+pub fn with_dfs_traceparent<T>(traceparent: Option<&str>, task: impl FnOnce() -> T) -> T {
+    let previous = DFS_TRACEPARENT.with(|current| {
+        current.replace(
+            traceparent
+                .map(str::trim)
+                .filter(|traceparent| !traceparent.is_empty())
+                .map(ToString::to_string),
+        )
+    });
+    let _guard = DfsTraceparentGuard(previous);
+    task()
+}
+
+pub(crate) fn current_dfs_traceparent() -> Option<String> {
+    DFS_TRACEPARENT.with(|traceparent| traceparent.borrow().clone())
+}
+
 pub(crate) fn dfs_perf_trace(args: std::fmt::Arguments<'_>) {
-    tracing::trace!(target: "sinomo.dfs.perf", detail = %args, "dfs perf");
+    if !dfs_perf_trace_enabled() {
+        return;
+    }
+    if let Some(traceparent) = current_dfs_traceparent() {
+        tracing::trace!(
+            target: "sinomo.dfs.perf",
+            traceparent = %traceparent,
+            detail = %args,
+            "dfs perf"
+        );
+    } else {
+        tracing::trace!(target: "sinomo.dfs.perf", detail = %args, "dfs perf");
+    }
 }
 
 pub(crate) fn dfs_perf_trace_enabled() -> bool {
@@ -93,5 +144,27 @@ pub(crate) fn dfs_distributed_write_result_trace_label(
             }
             NetworkedDfsWriteOutcome::Conflict { .. } => "conflict",
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scoped_traceparent_is_nested_and_restored() {
+        assert_eq!(current_dfs_traceparent(), None);
+        with_dfs_traceparent(Some("outer"), || {
+            assert_eq!(current_dfs_traceparent().as_deref(), Some("outer"));
+            with_dfs_traceparent(Some("inner"), || {
+                assert_eq!(current_dfs_traceparent().as_deref(), Some("inner"));
+            });
+            assert_eq!(current_dfs_traceparent().as_deref(), Some("outer"));
+            with_dfs_traceparent(None, || {
+                assert_eq!(current_dfs_traceparent(), None);
+            });
+            assert_eq!(current_dfs_traceparent().as_deref(), Some("outer"));
+        });
+        assert_eq!(current_dfs_traceparent(), None);
     }
 }

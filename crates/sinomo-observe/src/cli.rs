@@ -18,6 +18,7 @@ use std::sync::Arc;
 use time::format_description::well_known::Rfc3339;
 
 const OBSERVE_DEFAULT_LIMIT: usize = 40;
+const OBSERVE_FANOUT_MAX_WORKERS: usize = 8;
 const OBSERVE_POLICY: CliCommandPolicy = CliCommandPolicy::local_capable();
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -39,6 +40,7 @@ struct ObserveOptions {
     target_node_id: Option<String>,
     target_all: bool,
     traceparent: Option<String>,
+    capture_id: Option<String>,
     limit: usize,
     json: bool,
 }
@@ -53,6 +55,7 @@ impl Default for ObserveOptions {
             target_node_id: None,
             target_all: false,
             traceparent: None,
+            capture_id: None,
             limit: OBSERVE_DEFAULT_LIMIT,
             json: false,
         }
@@ -65,6 +68,10 @@ struct ObserveControlOptions {
     quiet_filter_directives: Vec<String>,
     clear_quiet_filter_directives: bool,
     reset: bool,
+    capture_id: Option<String>,
+    clear_capture: bool,
+    expected_capture_id: Option<String>,
+    clear_traces: bool,
     target_node_id: Option<String>,
     target_all: bool,
     json: bool,
@@ -231,10 +238,10 @@ fn observe_cli_help() -> CliCommandHelp {
             "      Read local daemon/shadow operational logs from the data directory.",
             "  sinomo observe metrics [--name <prefix>] [--target <node-id> | --all] [--limit <n>] [--json]",
             "      Read live runtime metrics.",
-            "  sinomo observe traces [--target-prefix <prefix>] [--traceparent <id>] [--target <node-id> | --all] [--limit <n>] [--json]",
+            "  sinomo observe traces [--target-prefix <prefix>] [--traceparent <id>] [--capture <id>] [--target <node-id> | --all] [--limit <n>] [--json]",
             "      Read live bounded trace events.",
-            "  sinomo observe control [--filter <directive>] [--quiet-filter <directive>...] [--clear-quiet-filters | --reset] [--target <node-id> | --all] [--json]",
-            "      Read or update live trace filtering.",
+            "  sinomo observe control [--filter <directive>] [--quiet-filter <directive>...] [--capture <id> | --clear-capture --expected-capture <id>] [--clear-traces] [--clear-quiet-filters | --reset] [--target <node-id> | --all] [--json]",
+            "      Read or update live tracing; capture-owned filters restore on clear or after the ten-minute lease.",
         ],
     )
 }
@@ -317,6 +324,11 @@ fn observe_cli_autocomplete() -> CliAutocompleteSpec {
                     CliAutocompleteValue::new("id", "traceparent id", []),
                 ),
                 CliAutocompleteOption::with_value(
+                    "--capture",
+                    "cluster-wide capture id",
+                    CliAutocompleteValue::new("id", "capture id", []),
+                ),
+                CliAutocompleteOption::with_value(
                     "--target",
                     "target node id",
                     CliAutocompleteValue::new("node-id", "target node id", []),
@@ -346,6 +358,18 @@ fn observe_cli_autocomplete() -> CliAutocompleteSpec {
                     CliAutocompleteValue::new("node-id", "target node id", []),
                 ),
                 CliAutocompleteOption::flag("--clear-quiet-filters", "clear quiet filters"),
+                CliAutocompleteOption::with_value(
+                    "--capture",
+                    "tag new traces with a capture id",
+                    CliAutocompleteValue::new("id", "capture id", []),
+                ),
+                CliAutocompleteOption::flag("--clear-capture", "stop the active capture"),
+                CliAutocompleteOption::with_value(
+                    "--expected-capture",
+                    "capture id required before clearing",
+                    CliAutocompleteValue::new("id", "expected capture id", []),
+                ),
+                CliAutocompleteOption::flag("--clear-traces", "clear buffered traces"),
                 CliAutocompleteOption::flag("--all", "query every cluster node"),
                 CliAutocompleteOption::flag("--reset", "reset trace filter"),
                 CliAutocompleteOption::flag("--json", "emit JSON"),
@@ -360,16 +384,16 @@ fn parse_observe_command(args: &[String]) -> Result<ObserveCliCommand, CliParseE
             Ok(ObserveCliCommand::Help)
         }
         Some((command, rest)) if matches!(command.as_str(), "events" | "event") => Ok(
-            ObserveCliCommand::Events(parse_observe_options(rest, true)?),
+            ObserveCliCommand::Events(parse_observe_options(rest, true, false)?),
         ),
-        Some((command, rest)) if matches!(command.as_str(), "logs" | "log") => {
-            Ok(ObserveCliCommand::Logs(parse_observe_options(rest, false)?))
-        }
+        Some((command, rest)) if matches!(command.as_str(), "logs" | "log") => Ok(
+            ObserveCliCommand::Logs(parse_observe_options(rest, false, false)?),
+        ),
         Some((command, rest)) if matches!(command.as_str(), "metrics" | "metric") => Ok(
-            ObserveCliCommand::Metrics(parse_observe_options(rest, false)?),
+            ObserveCliCommand::Metrics(parse_observe_options(rest, false, false)?),
         ),
         Some((command, rest)) if matches!(command.as_str(), "traces" | "trace") => Ok(
-            ObserveCliCommand::Traces(parse_observe_options(rest, false)?),
+            ObserveCliCommand::Traces(parse_observe_trace_options(rest)?),
         ),
         Some((command, rest)) if matches!(command.as_str(), "control" | "ctl") => Ok(
             ObserveCliCommand::Control(parse_observe_control_options(rest)?),
@@ -378,9 +402,20 @@ fn parse_observe_command(args: &[String]) -> Result<ObserveCliCommand, CliParseE
     }
 }
 
+fn parse_observe_trace_options(args: &[String]) -> Result<ObserveOptions, CliParseError> {
+    let mut options = parse_observe_options(args, false, true)?;
+    if !args.iter().any(|argument| argument == "--limit") {
+        // Trace capture is a diagnostic artifact: default to the complete
+        // bounded ring and make explicit limits opt-in.
+        options.limit = 0;
+    }
+    Ok(options)
+}
+
 fn parse_observe_options(
     args: &[String],
     allow_kind: bool,
+    allow_capture: bool,
 ) -> Result<ObserveOptions, CliParseError> {
     let mut options = ObserveOptions::default();
     let mut index = 0;
@@ -430,6 +465,14 @@ fn parse_observe_options(
                 };
                 options.traceparent = Some(non_empty_observe_value("--traceparent", traceparent)?);
             }
+            "--capture" if allow_capture => {
+                index += 1;
+                let Some(capture_id) = args.get(index) else {
+                    return Err(CliParseError::Usage);
+                };
+                options.capture_id = Some(non_empty_observe_value("--capture", capture_id)?);
+            }
+            "--capture" => return Err(CliParseError::Usage),
             "--target" | "--node" => {
                 index += 1;
                 let Some(target_node_id) = args.get(index) else {
@@ -466,6 +509,10 @@ fn parse_observe_control_options(args: &[String]) -> Result<ObserveControlOption
         quiet_filter_directives: Vec::new(),
         clear_quiet_filter_directives: false,
         reset: false,
+        capture_id: None,
+        clear_capture: false,
+        expected_capture_id: None,
+        clear_traces: false,
         target_node_id: None,
         target_all: false,
         json: false,
@@ -493,6 +540,23 @@ fn parse_observe_control_options(args: &[String]) -> Result<ObserveControlOption
                 options.clear_quiet_filter_directives = true;
             }
             "--reset" => options.reset = true,
+            "--capture" => {
+                index += 1;
+                let Some(capture_id) = args.get(index) else {
+                    return Err(CliParseError::Usage);
+                };
+                options.capture_id = Some(non_empty_observe_value("--capture", capture_id)?);
+            }
+            "--clear-capture" => options.clear_capture = true,
+            "--expected-capture" => {
+                index += 1;
+                let Some(capture_id) = args.get(index) else {
+                    return Err(CliParseError::Usage);
+                };
+                options.expected_capture_id =
+                    Some(non_empty_observe_value("--expected-capture", capture_id)?);
+            }
+            "--clear-traces" => options.clear_traces = true,
             "--target" | "--node" => {
                 index += 1;
                 let Some(target_node_id) = args.get(index) else {
@@ -510,6 +574,23 @@ fn parse_observe_control_options(args: &[String]) -> Result<ObserveControlOption
         return Err(CliParseError::Usage);
     }
     if options.clear_quiet_filter_directives && !options.quiet_filter_directives.is_empty() {
+        return Err(CliParseError::Usage);
+    }
+    if options.clear_capture && options.capture_id.is_some() {
+        return Err(CliParseError::Usage);
+    }
+    if options.expected_capture_id.is_some() && !options.clear_capture {
+        return Err(CliParseError::Usage);
+    }
+    if options.clear_capture && options.expected_capture_id.is_none() {
+        return Err(CliParseError::Usage);
+    }
+    if options.clear_capture
+        && (options.filter.is_some()
+            || !options.quiet_filter_directives.is_empty()
+            || options.clear_quiet_filter_directives
+            || options.reset)
+    {
         return Err(CliParseError::Usage);
     }
     Ok(options)
@@ -770,6 +851,7 @@ fn observe_traces(
     let request = ObserveTracesRequest {
         target_prefix: options.component.clone(),
         traceparent: options.traceparent.clone(),
+        capture_id: options.capture_id.clone(),
         limit: options.limit,
     };
     if options.target_all {
@@ -779,11 +861,14 @@ fn observe_traces(
             OBSERVE_TRACES_ROUTE,
             &request,
         )?;
+        if request.capture_id.is_some() {
+            validate_cluster_trace_collection(&response)?;
+        }
         return print_observe_fanout(
             context,
             response,
             options.json,
-            |context, response, json| print_observe_trace_records(context, response.records, json),
+            print_observe_trace_response,
         );
     }
     let response = if rpc.is_some() {
@@ -796,27 +881,64 @@ fn observe_traces(
     } else {
         read_observe_traces(&request)
     };
-    print_observe_trace_records(context, response.records, options.json)
+    print_observe_trace_response(context, response, options.json)
 }
 
-fn print_observe_trace_records(
+fn validate_cluster_trace_collection(
+    response: &ObserveFanoutResponse<ObserveTracesResponse>,
+) -> Result<(), CliCommandError> {
+    let mut issues = response
+        .errors
+        .iter()
+        .map(|error| format!("{}: {}", error.target_node_id, error.error))
+        .collect::<Vec<_>>();
+    issues.extend(response.targets.iter().filter_map(|target| {
+        target.response.truncated.then(|| {
+            format!(
+                "{}: trace buffer incomplete (dropped_records={})",
+                target.target_node_id, target.response.dropped_records
+            )
+        })
+    }));
+    issues.extend(response.targets.iter().filter_map(|target| {
+        (target.response.capture_active != Some(true)).then(|| {
+            format!(
+                "{}: requested capture is no longer active",
+                target.target_node_id
+            )
+        })
+    }));
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(CliCommandError::new(format!(
+            "cluster-wide observe capture collection is incomplete: {}",
+            issues.join("; ")
+        )))
+    }
+}
+
+fn print_observe_trace_response(
     context: &mut CliCommandContext<'_>,
-    records: Vec<crate::ObserveTraceRecord>,
+    response: ObserveTracesResponse,
     json: bool,
 ) -> Result<(), CliCommandError> {
     if json {
-        let json = serde_json::to_string_pretty(&ObserveTracesResponse {
-            records: records.clone(),
-        })
-        .map_err(command_error)?;
+        let json = serde_json::to_string_pretty(&response).map_err(command_error)?;
         context.stdout_line(format_args!("{json}"))?;
         return Ok(());
     }
-    if records.is_empty() {
+    if response.truncated {
+        context.stdout_line(format_args!(
+            "warning: observe trace response is truncated (dropped_records={})",
+            response.dropped_records
+        ))?;
+    }
+    if response.records.is_empty() {
         context.stdout_line(format_args!("no observe traces found"))?;
         return Ok(());
     }
-    for record in records {
+    for record in response.records {
         let time = record.timestamp.format(&Rfc3339).map_err(command_error)?;
         let fields = if record.fields.is_null() {
             String::new()
@@ -828,9 +950,14 @@ fn print_observe_trace_records(
             .as_deref()
             .map(|traceparent| format!(" traceparent={traceparent}"))
             .unwrap_or_default();
+        let capture = record
+            .capture_id
+            .as_deref()
+            .map(|capture_id| format!(" capture={capture_id}"))
+            .unwrap_or_default();
         context.stdout_line(format_args!(
-            "{time} {:<5} {:<32} {}{}{}",
-            record.level, record.target, record.name, traceparent, fields
+            "{time} {:<5} {:<32} {}{}{}{}",
+            record.level, record.target, record.name, traceparent, capture, fields
         ))?;
     }
     Ok(())
@@ -848,6 +975,10 @@ fn observe_control(
             .then_some(options.quiet_filter_directives.clone()),
         clear_quiet_filter_directives: options.clear_quiet_filter_directives,
         reset: options.reset,
+        capture_id: options.capture_id.clone(),
+        clear_capture: options.clear_capture,
+        expected_capture_id: options.expected_capture_id.clone(),
+        clear_traces: options.clear_traces,
     };
     if options.target_all {
         let response = observe_rpc_all::<_, ObserveControlResponse>(
@@ -856,6 +987,9 @@ fn observe_control(
             OBSERVE_CONTROL_ROUTE,
             &request,
         )?;
+        if request.capture_id.is_some() || request.clear_capture {
+            validate_cluster_capture_control(rpc, &request, &response)?;
+        }
         return print_observe_fanout(
             context,
             response,
@@ -874,12 +1008,101 @@ fn observe_control(
         || request.quiet_filter_directives.is_some()
         || request.clear_quiet_filter_directives
         || request.reset
+        || request.capture_id.is_some()
+        || request.clear_capture
+        || request.clear_traces
     {
         update_observe_control(request).map_err(command_error)?
     } else {
         observe_control_snapshot()
     };
     print_observe_control_response(context, response, options.json)
+}
+
+fn validate_cluster_capture_control(
+    rpc: Option<&ObserveCliRpc>,
+    request: &ObserveControlRequest,
+    response: &ObserveFanoutResponse<ObserveControlResponse>,
+) -> Result<(), CliCommandError> {
+    let mut issues = response
+        .errors
+        .iter()
+        .map(|error| format!("{}: {}", error.target_node_id, error.error))
+        .collect::<Vec<_>>();
+    for target in &response.targets {
+        let matches = if let Some(capture_id) = request.capture_id.as_deref() {
+            target.response.active_capture_id.as_deref() == Some(capture_id)
+        } else if request.clear_capture {
+            target.response.active_capture_id.is_none()
+        } else {
+            true
+        };
+        if !matches {
+            issues.push(format!(
+                "{}: capture acknowledgement mismatch (active={})",
+                target.target_node_id,
+                target
+                    .response
+                    .active_capture_id
+                    .as_deref()
+                    .unwrap_or("<none>")
+            ));
+        }
+    }
+    if issues.is_empty() {
+        return Ok(());
+    }
+
+    let mut rollback_issues = Vec::new();
+    if let Some(capture_id) = request.capture_id.as_ref() {
+        let rollback = ObserveControlRequest {
+            filter: None,
+            quiet_filter_directives: None,
+            clear_quiet_filter_directives: false,
+            reset: false,
+            capture_id: None,
+            clear_capture: true,
+            expected_capture_id: Some(capture_id.clone()),
+            clear_traces: false,
+        };
+        let rollback_targets = response
+            .targets
+            .iter()
+            .map(|target| target.target_node_id.clone())
+            .chain(
+                response
+                    .errors
+                    .iter()
+                    .map(|error| error.target_node_id.clone()),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
+        for target_node_id in rollback_targets {
+            match observe_rpc::<_, ObserveControlResponse>(
+                rpc,
+                Some(target_node_id.as_str()),
+                OBSERVE_CONTROL_ROUTE,
+                &rollback,
+            ) {
+                Ok(response) if response.active_capture_id.is_none() => {}
+                Ok(response) => rollback_issues.push(format!(
+                    "{}: capture remained active as {}",
+                    target_node_id,
+                    response.active_capture_id.as_deref().unwrap_or("<none>")
+                )),
+                Err(error) => rollback_issues.push(format!("{target_node_id}: {error}")),
+            }
+        }
+    }
+
+    let mut detail = format!(
+        "cluster-wide observe capture was not acknowledged by every target: {}",
+        issues.join("; ")
+    );
+    if !rollback_issues.is_empty() {
+        detail.push_str("; rollback failures: ");
+        detail.push_str(&rollback_issues.join("; "));
+    }
+    Err(CliCommandError::new(detail))
 }
 
 fn print_observe_control_response(
@@ -906,6 +1129,16 @@ fn print_observe_control_response(
             response.quiet_filter_directives.join(",")
         };
         context.stdout_line(format_args!("observe quiet filters: {quiet_filters}"))?;
+        context.stdout_line(format_args!(
+            "observe capture: {}",
+            response.active_capture_id.as_deref().unwrap_or("<none>")
+        ))?;
+        if response.cleared_trace_count > 0 {
+            context.stdout_line(format_args!(
+                "observe traces cleared: {}",
+                response.cleared_trace_count
+            ))?;
+        }
     }
     Ok(())
 }
@@ -958,10 +1191,54 @@ where
         sinomo_core::network::ObjectRpcRequest::encode_body(route, OBSERVE_RPC_CATEGORY, body)
             .map_err(command_error)?
             .with_trace_context_if_missing();
+    // A broken node must not make cluster-wide diagnostics wait once per target.
+    // Each transport call has its own bounded no-progress timeout; issuing them
+    // concurrently makes the fan-out bound the slowest target instead of the sum.
+    let next_target = std::sync::atomic::AtomicUsize::new(0);
+    let target_results =
+        std::sync::Mutex::new((0..targets.len()).map(|_| None).collect::<Vec<Option<_>>>());
+    std::thread::scope(|scope| {
+        let worker_count = targets.len().min(OBSERVE_FANOUT_MAX_WORKERS);
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            workers.push(scope.spawn(|| {
+                loop {
+                    let index = next_target.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(target_node_id) = targets.get(index).cloned() else {
+                        break;
+                    };
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        rpc(Some(target_node_id.as_str()), request.clone())
+                    }))
+                    .unwrap_or_else(|_| Err("observe RPC worker panicked".to_string()));
+                    if let Ok(mut results) = target_results.lock() {
+                        results[index] = Some((target_node_id, result));
+                    }
+                }
+            }));
+        }
+        for worker in workers {
+            let _ = worker.join();
+        }
+    });
+    let target_results = target_results
+        .into_inner()
+        .map_err(|_| CliCommandError::new("observe fan-out result lock is poisoned"))?
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            result.unwrap_or_else(|| {
+                (
+                    targets[index].clone(),
+                    Err("observe RPC worker did not return a result".to_string()),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
     let mut responses = Vec::new();
     let mut errors = Vec::new();
-    for target_node_id in targets {
-        match rpc(Some(target_node_id.as_str()), request.clone()) {
+    for (target_node_id, result) in target_results {
+        match result {
             Ok(response) => match response.decode_body() {
                 Ok(response) => responses.push(ObserveTargetResponse {
                     target_node_id,
@@ -1155,6 +1432,8 @@ mod tests {
             "sinomo.network".to_string(),
             "--traceparent".to_string(),
             "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01".to_string(),
+            "--capture".to_string(),
+            "cluster-capture-a".to_string(),
         ])
         .expect("parse traces");
         match command {
@@ -1164,6 +1443,8 @@ mod tests {
                     options.traceparent.as_deref(),
                     Some("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01")
                 );
+                assert_eq!(options.capture_id.as_deref(), Some("cluster-capture-a"));
+                assert_eq!(options.limit, 0);
             }
             other => panic!("expected traces command, got {other:?}"),
         }
@@ -1178,6 +1459,9 @@ mod tests {
             "hyper=error".to_string(),
             "--target".to_string(),
             "01hxy6qa9k0t9vr4g9n8d3q5d4".to_string(),
+            "--capture".to_string(),
+            "cluster-capture-a".to_string(),
+            "--clear-traces".to_string(),
         ])
         .expect("parse control");
         match command {
@@ -1195,6 +1479,8 @@ mod tests {
                     Some("01hxy6qa9k0t9vr4g9n8d3q5d4")
                 );
                 assert!(!options.reset);
+                assert_eq!(options.capture_id.as_deref(), Some("cluster-capture-a"));
+                assert!(options.clear_traces);
             }
             other => panic!("expected control command, got {other:?}"),
         }
@@ -1230,6 +1516,236 @@ mod tests {
             "hyper=error".to_string(),
         ]);
         assert_eq!(result, Err(CliParseError::Usage));
+
+        let result = parse_observe_command(&[
+            "control".to_string(),
+            "--capture".to_string(),
+            "cluster-capture-a".to_string(),
+            "--clear-capture".to_string(),
+        ]);
+        assert_eq!(result, Err(CliParseError::Usage));
+
+        let result = parse_observe_command(&[
+            "control".to_string(),
+            "--expected-capture".to_string(),
+            "cluster-capture-a".to_string(),
+        ]);
+        assert_eq!(result, Err(CliParseError::Usage));
+
+        let result = parse_observe_command(&[
+            "control".to_string(),
+            "--clear-capture".to_string(),
+            "--reset".to_string(),
+        ]);
+        assert_eq!(result, Err(CliParseError::Usage));
+    }
+
+    #[test]
+    fn observe_all_queries_targets_concurrently_and_preserves_partial_results() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let rpc: ObserveCliRpc = {
+            let in_flight = Arc::clone(&in_flight);
+            let max_in_flight = Arc::clone(&max_in_flight);
+            Arc::new(move |target_node_id, _request| {
+                let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_in_flight.fetch_max(current, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(30));
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                let target_node_id = target_node_id.expect("target node id");
+                if target_node_id == "node-b" {
+                    return Err("node-b unavailable".to_string());
+                }
+                sinomo_core::network::ObjectRpcResponse::encode_body(
+                    OBSERVE_METRICS_ROUTE,
+                    &ObserveMetricsResponse {
+                        metrics: Vec::new(),
+                    },
+                )
+                .map_err(|error| error.to_string())
+            })
+        };
+        let target_lister: ObserveCliTargetLister = Arc::new(|| {
+            Ok(vec![
+                "node-a".to_string(),
+                "node-b".to_string(),
+                "node-c".to_string(),
+            ])
+        });
+
+        let response = observe_rpc_all::<_, ObserveMetricsResponse>(
+            Some(&rpc),
+            Some(&target_lister),
+            OBSERVE_METRICS_ROUTE,
+            &ObserveMetricsRequest::default(),
+        )
+        .expect("fan-out response");
+
+        assert!(max_in_flight.load(Ordering::SeqCst) >= 2);
+        assert_eq!(
+            response
+                .targets
+                .iter()
+                .map(|target| target.target_node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["node-a", "node-c"]
+        );
+        assert_eq!(response.errors.len(), 1);
+        assert_eq!(response.errors[0].target_node_id, "node-b");
+        assert_eq!(response.errors[0].error, "node-b unavailable");
+    }
+
+    #[test]
+    fn observe_all_bounds_worker_count_for_large_membership() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let rpc: ObserveCliRpc = {
+            let in_flight = Arc::clone(&in_flight);
+            let max_in_flight = Arc::clone(&max_in_flight);
+            Arc::new(move |_target_node_id, _request| {
+                let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_in_flight.fetch_max(current, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(20));
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                sinomo_core::network::ObjectRpcResponse::encode_body(
+                    OBSERVE_METRICS_ROUTE,
+                    &ObserveMetricsResponse {
+                        metrics: Vec::new(),
+                    },
+                )
+                .map_err(|error| error.to_string())
+            })
+        };
+        let target_lister: ObserveCliTargetLister = Arc::new(|| {
+            Ok((0..(OBSERVE_FANOUT_MAX_WORKERS * 2 + 1))
+                .map(|index| format!("node-{index:02}"))
+                .collect())
+        });
+
+        let response = observe_rpc_all::<_, ObserveMetricsResponse>(
+            Some(&rpc),
+            Some(&target_lister),
+            OBSERVE_METRICS_ROUTE,
+            &ObserveMetricsRequest::default(),
+        )
+        .expect("fan-out response");
+
+        assert_eq!(response.errors.len(), 0);
+        assert_eq!(response.targets.len(), OBSERVE_FANOUT_MAX_WORKERS * 2 + 1);
+        assert!(max_in_flight.load(Ordering::SeqCst) >= 2);
+        assert!(max_in_flight.load(Ordering::SeqCst) <= OBSERVE_FANOUT_MAX_WORKERS);
+    }
+
+    #[test]
+    fn partial_cluster_capture_is_rejected_and_acknowledged_nodes_are_rolled_back() {
+        let rollbacks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rpc: ObserveCliRpc = {
+            let rollbacks = Arc::clone(&rollbacks);
+            Arc::new(move |target_node_id, request| {
+                let target_node_id = target_node_id.expect("rollback target").to_string();
+                let body: ObserveControlRequest = request.decode_body().expect("control request");
+                assert!(body.clear_capture);
+                assert_eq!(
+                    body.expected_capture_id.as_deref(),
+                    Some("cluster-capture-a")
+                );
+                rollbacks.lock().expect("rollbacks").push(target_node_id);
+                sinomo_core::network::ObjectRpcResponse::encode_body(
+                    OBSERVE_CONTROL_ROUTE,
+                    &ObserveControlResponse {
+                        active_filter: "warn,sinomo=info".to_string(),
+                        base_filter: "warn,sinomo=info".to_string(),
+                        quiet_filter_directives: Vec::new(),
+                        active_capture_id: None,
+                        cleared_trace_count: 0,
+                        changed: true,
+                    },
+                )
+                .map_err(|error| error.to_string())
+            })
+        };
+        let request = ObserveControlRequest {
+            filter: None,
+            quiet_filter_directives: None,
+            clear_quiet_filter_directives: false,
+            reset: false,
+            capture_id: Some("cluster-capture-a".to_string()),
+            clear_capture: false,
+            expected_capture_id: None,
+            clear_traces: true,
+        };
+        let response = ObserveFanoutResponse {
+            targets: vec![
+                ObserveTargetResponse {
+                    target_node_id: "node-a".to_string(),
+                    response: ObserveControlResponse {
+                        active_filter: "warn,sinomo=info".to_string(),
+                        base_filter: "warn,sinomo=info".to_string(),
+                        quiet_filter_directives: Vec::new(),
+                        active_capture_id: Some("cluster-capture-a".to_string()),
+                        cleared_trace_count: 0,
+                        changed: true,
+                    },
+                },
+                ObserveTargetResponse {
+                    target_node_id: "node-b".to_string(),
+                    response: ObserveControlResponse {
+                        active_filter: "warn,sinomo=info".to_string(),
+                        base_filter: "warn,sinomo=info".to_string(),
+                        quiet_filter_directives: Vec::new(),
+                        active_capture_id: None,
+                        cleared_trace_count: 0,
+                        changed: true,
+                    },
+                },
+            ],
+            errors: vec![ObserveTargetError {
+                target_node_id: "node-c".to_string(),
+                error: "unreachable".to_string(),
+            }],
+        };
+
+        let error = validate_cluster_capture_control(Some(&rpc), &request, &response)
+            .expect_err("partial capture must fail");
+
+        assert!(error.to_string().contains("node-b"));
+        assert!(error.to_string().contains("node-c"));
+        assert_eq!(
+            rollbacks.lock().expect("rollbacks").as_slice(),
+            ["node-a", "node-b", "node-c"]
+        );
+    }
+
+    #[test]
+    fn capture_collection_rejects_missing_or_truncated_node_records() {
+        let response = ObserveFanoutResponse {
+            targets: vec![ObserveTargetResponse {
+                target_node_id: "node-a".to_string(),
+                response: ObserveTracesResponse {
+                    records: Vec::new(),
+                    capture_active: Some(true),
+                    dropped_records: 3,
+                    truncated: true,
+                },
+            }],
+            errors: vec![ObserveTargetError {
+                target_node_id: "node-b".to_string(),
+                error: "unreachable".to_string(),
+            }],
+        };
+
+        let error = validate_cluster_trace_collection(&response)
+            .expect_err("incomplete collection must fail");
+
+        assert!(error.to_string().contains("node-a"));
+        assert!(error.to_string().contains("dropped_records=3"));
+        assert!(error.to_string().contains("node-b"));
     }
 
     #[test]

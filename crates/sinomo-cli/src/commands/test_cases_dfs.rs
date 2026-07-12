@@ -2437,7 +2437,7 @@ fn run_rename(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let backend = open_backend_until(ctx, deadline)?;
     let node = backend.node_label();
     loop {
-        match backend.rename(&from, &to) {
+        match backend.rename_with_deadline(&from, &to, deadline) {
             Ok(()) => {
                 ctx.record("node", &node);
                 ctx.record("from", &from);
@@ -2468,21 +2468,20 @@ fn run_rename(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 
 fn run_remove(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let path = ctx.required_parameter("path")?.to_string();
-    let backend = open_backend(ctx)?;
+    let timeout = expect_timeout(ctx)?;
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let backend = open_backend_until(ctx, deadline)?;
     let node = backend.node_label();
-    let metadata = backend.stat(&path).map_err(SinomoTestError::failed)?;
-    match metadata.kind {
-        crate::file_manager::FileManagerEntryKind::Directory => {
-            backend.delete_dir(&path).map_err(SinomoTestError::failed)?
-        }
-        _ => backend
-            .delete_file(&path)
-            .map_err(SinomoTestError::failed)?,
-    }
+    backend
+        .remove_with_deadline(&path, deadline)
+        .map_err(SinomoTestError::failed)?;
     ctx.record("node", &node);
     ctx.record("path", &path);
+    ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
     Ok(SinomoTestOutcome::passed(format!(
-        "removed {path} on node {node}"
+        "removed {path} on node {node} after {}ms",
+        started.elapsed().as_millis()
     )))
 }
 
@@ -3203,11 +3202,30 @@ fn open_backend(ctx: &SinomoTestContext) -> Result<SifsFileManagerBackend, Sinom
         .map_err(|error| SinomoTestError::failed(format!("cannot open SIFS backend: {error}")))
 }
 
+fn open_backend_with_deadline(
+    ctx: &SinomoTestContext,
+    deadline: Instant,
+) -> Result<SifsFileManagerBackend, SinomoTestError> {
+    let data_dir = SinomoDataDir::new(ctx.data_dir());
+    SifsFileManagerBackend::open_with_deadline(&data_dir, deadline)
+        .map_err(|error| SinomoTestError::failed(format!("cannot open SIFS backend: {error}")))
+}
+
 fn open_read_only_backend(
     ctx: &SinomoTestContext,
 ) -> Result<SifsFileManagerBackend, SinomoTestError> {
     let data_dir = SinomoDataDir::new(ctx.data_dir());
     SifsFileManagerBackend::open_read_only(&data_dir).map_err(|error| {
+        SinomoTestError::failed(format!("cannot open read-only SIFS backend: {error}"))
+    })
+}
+
+fn open_read_only_backend_with_deadline(
+    ctx: &SinomoTestContext,
+    deadline: Instant,
+) -> Result<SifsFileManagerBackend, SinomoTestError> {
+    let data_dir = SinomoDataDir::new(ctx.data_dir());
+    SifsFileManagerBackend::open_read_only_with_deadline(&data_dir, deadline).map_err(|error| {
         SinomoTestError::failed(format!("cannot open read-only SIFS backend: {error}"))
     })
 }
@@ -3219,24 +3237,38 @@ fn open_backend_until(
     ctx: &SinomoTestContext,
     deadline: Instant,
 ) -> Result<SifsFileManagerBackend, SinomoTestError> {
-    loop {
-        match open_backend(ctx) {
-            Ok(backend) => return Ok(backend),
-            Err(error) if Instant::now() >= deadline => return Err(error),
-            Err(_) => std::thread::sleep(EXPECT_POLL_INTERVAL),
-        }
-    }
+    retry_backend_open_until(deadline, "SIFS backend", || {
+        open_backend_with_deadline(ctx, deadline)
+    })
 }
 
 fn open_read_only_backend_until(
     ctx: &SinomoTestContext,
     deadline: Instant,
 ) -> Result<SifsFileManagerBackend, SinomoTestError> {
+    retry_backend_open_until(deadline, "read-only SIFS backend", || {
+        open_read_only_backend_with_deadline(ctx, deadline)
+    })
+}
+
+fn retry_backend_open_until<T>(
+    deadline: Instant,
+    label: &str,
+    mut open: impl FnMut() -> Result<T, SinomoTestError>,
+) -> Result<T, SinomoTestError> {
     loop {
-        match open_read_only_backend(ctx) {
+        match open() {
+            Ok(_) if Instant::now() >= deadline => {
+                return Err(SinomoTestError::failed(format!(
+                    "{label} opened after the operation deadline"
+                )));
+            }
             Ok(backend) => return Ok(backend),
             Err(error) if Instant::now() >= deadline => return Err(error),
-            Err(_) => std::thread::sleep(EXPECT_POLL_INTERVAL),
+            Err(_) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(EXPECT_POLL_INTERVAL.min(remaining));
+            }
         }
     }
 }
@@ -4067,6 +4099,22 @@ mod tests {
         ClusterEndpointSource, ClusterMemberRecord, ClusterTransportKind,
     };
     use sinomo_runtime::node::ClusterId;
+
+    #[test]
+    fn backend_open_completed_after_deadline_is_rejected_before_mutation() {
+        let deadline = Instant::now() + Duration::from_millis(5);
+        let error = retry_backend_open_until(deadline, "test backend", || {
+            std::thread::sleep(Duration::from_millis(15));
+            Ok(())
+        })
+        .expect_err("late backend open must not authorize a mutation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("opened after the operation deadline")
+        );
+    }
 
     #[test]
     fn concurrent_dir_presence_distinguishes_absence_from_probe_failure() {

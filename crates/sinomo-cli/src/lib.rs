@@ -145,7 +145,8 @@ use sinomo_runtime::daemon::{
     send_daemon_rpc as daemon_send_daemon_rpc,
     send_daemon_rpc_to_endpoint as daemon_send_daemon_rpc_to_endpoint,
     send_daemon_rpc_with_timeouts as daemon_send_daemon_rpc_with_timeouts,
-    send_daemon_shutdown_request, send_object_rpc_to_target as daemon_send_object_rpc_to_target,
+    send_daemon_shutdown_request,
+    send_object_rpc_to_target_with_options as daemon_send_object_rpc_to_target_with_options,
     send_object_rpc_to_target_with_timeouts as daemon_send_object_rpc_to_target_with_timeouts,
     shadow_main_binary_from_env as daemon_shadow_main_binary_from_env,
     shadow_main_options_from_env as daemon_shadow_main_options_from_env,
@@ -207,11 +208,10 @@ use sinomo_runtime::kv::{InProcessKvStore, KvError, KvOp, KvSnapshot, KvTxn, KvT
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::module::ModuleReplayReport;
 use sinomo_runtime::network::{self, ClusterPaths};
-#[cfg(test)]
-use sinomo_runtime::node::DAEMON_MAIN_CLUSTER_ROLE;
 use sinomo_runtime::node::{
-    ClusterId, NodeId, cluster_member_expected_daemon_process, cluster_member_is_local_process,
-    load_or_create_main_node_identity, load_or_create_shadow_node_identity, shadow_daemon_node_id,
+    ClusterId, DAEMON_MAIN_CLUSTER_ROLE, NodeId, cluster_member_expected_daemon_process,
+    cluster_member_is_local_process, load_or_create_main_node_identity,
+    load_or_create_shadow_node_identity, shadow_daemon_node_id,
 };
 #[cfg(not(test))]
 use sinomo_runtime::rollout::install_current_executable;
@@ -1348,10 +1348,10 @@ fn observe_cli_rpc(
         let target_node_id = NodeId::new(target_node_id.to_string()).map_err(|source| {
             format!("invalid observe target node id `{target_node_id}`: {source}")
         })?;
-        return daemon_send_object_rpc_to_target(
+        return daemon_send_object_rpc_to_target_with_options(
             &target_node_id,
             &request,
-            OBSERVE_RPC_TIMEOUT,
+            network::ClusterObjectRpcOptions::default().with_overall_timeout(OBSERVE_RPC_TIMEOUT),
             true,
         )
         .map_err(|source| source.to_string());

@@ -314,7 +314,12 @@ fn dfs_network_message_uses_full_response_budget(message: &DfsNetworkMessage) ->
 }
 
 fn dfs_network_message_response_retry_safe(message: &DfsNetworkMessage) -> bool {
-    matches!(message, DfsNetworkMessage::DistributedWriteRequest(_))
+    matches!(
+        message,
+        DfsNetworkMessage::DistributedWriteRequest(_)
+            | DfsNetworkMessage::RepairReplica(_)
+            | DfsNetworkMessage::RepairReplicaChunk(_)
+    )
 }
 
 pub fn dfs_message_uses_full_response_budget(command: &DfsMessageCommand) -> bool {
@@ -436,12 +441,18 @@ pub fn dfs_message_rpc_request(
     }
     if dfs_network_message_response_retry_safe(&command.routed_message.message) {
         // Distributed writes carry a stable request identity and their outcome
-        // is durably reconciled at the metadata primary. If a transport loses
-        // only the response, sinomo-network may safely redispatch the command
-        // instead of surfacing an ambiguous timeout.
+        // is durably reconciled at the metadata primary. Repair writes are
+        // content-addressed and replay-identifiable; completed and duplicate
+        // chunks take idempotent durable fast paths. If a transport loses only
+        // the response, sinomo-network may therefore safely redispatch these
+        // commands instead of surfacing an ambiguous timeout.
         request = request.with_response_retry_safe();
     }
-    request.ensure_trace_context();
+    if let Some(traceparent) = crate::current_dfs_traceparent() {
+        request = request.with_traceparent(traceparent);
+    } else {
+        request.ensure_trace_context();
+    }
     Ok(request)
 }
 

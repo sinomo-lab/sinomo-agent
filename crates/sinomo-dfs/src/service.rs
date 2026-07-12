@@ -144,6 +144,7 @@ pub trait DfsDataPlaneHost: Send + Sync {
     fn handle_message<'a>(
         &'a self,
         command: DfsMessageCommand,
+        traceparent: Option<String>,
     ) -> DfsDataPlaneHostFuture<'a, DfsMessageResponse>;
 }
 
@@ -305,10 +306,11 @@ impl Service for DfsDataPlaneService {
                     ObjectRpcResponse::encode_body(DFS_SMOKE_ROUTE, &report)?
                 }
                 route if dfs_route_is_message_data_plane(route) => {
+                    let traceparent = request.traceparent().map(ToString::to_string);
                     let command = decode_dfs_message_rpc_request(&request)?;
                     let message_response = service
                         .host
-                        .handle_message(command)
+                        .handle_message(command, traceparent)
                         .await
                         .map_err(service_error)?;
                     ObjectRpcResponse::encode_body(route, &message_response)?
@@ -594,6 +596,7 @@ mod tests {
     struct StubDfsDataPlaneHost {
         smoke_calls: Mutex<usize>,
         message_request_ids: Mutex<Vec<String>>,
+        message_traceparents: Mutex<Vec<Option<String>>>,
     }
 
     impl DfsDataPlaneHost for StubDfsDataPlaneHost {
@@ -632,12 +635,17 @@ mod tests {
         fn handle_message<'a>(
             &'a self,
             command: DfsMessageCommand,
+            traceparent: Option<String>,
         ) -> DfsDataPlaneHostFuture<'a, DfsMessageResponse> {
             Box::pin(async move {
                 self.message_request_ids
                     .lock()
                     .expect("message request ids")
                     .push(command.request_id.clone());
+                self.message_traceparents
+                    .lock()
+                    .expect("message traceparents")
+                    .push(traceparent);
                 Ok(DfsMessageResponse {
                     request_id: command.request_id,
                     outbound_messages: Vec::new(),
@@ -666,7 +674,9 @@ mod tests {
             signer: ServiceSigner::Local,
             sink: Box::new(sink),
         };
-        let request = ObjectRpcRequest::encode_body(route, DFS_RPC_CATEGORY, body).expect("encode");
+        let request = ObjectRpcRequest::encode_body(route, DFS_RPC_CATEGORY, body)
+            .expect("encode")
+            .with_traceparent("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01");
         let disposition = registry.dispatch(ctx, request).await.expect("dispatch");
         let response = frames
             .lock()
@@ -1135,6 +1145,15 @@ mod tests {
                 .expect("message request ids")
                 .as_slice(),
             ["message-route-1"]
+        );
+        assert_eq!(
+            host.message_traceparents
+                .lock()
+                .expect("message traceparents")
+                .as_slice(),
+            [Some(
+                "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01".to_string()
+            )]
         );
         assert!(!registry.owns("/dfs/protocol/frame"));
     }

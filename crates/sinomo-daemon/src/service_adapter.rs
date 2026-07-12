@@ -2334,6 +2334,7 @@ impl Service for DaemonDfsBrowserService {
         let runtime = self.runtime.clone();
         Box::pin(async move {
             let route = request.route.clone();
+            let request_traceparent = request.traceparent().map(ToString::to_string);
             let data_dir = Arc::clone(&ctx.data_dir);
             let response = match route.as_str() {
                 DAEMON_DFS_BROWSER_STATUS_ROUTE => {
@@ -2436,34 +2437,48 @@ impl Service for DaemonDfsBrowserService {
                     let payload = request.decode_body()?;
                     let backend_data_dir = Arc::clone(&data_dir);
                     let publish_data_dir = Arc::clone(&data_dir);
+                    let traceparent = request_traceparent.clone();
                     let result = run_blocking_service_task(
                         route.clone(),
                         "DFS browser write file",
                         move || {
-                            DaemonDfsBrowserBackend::for_data_dir(backend_data_dir)?
-                                .write_file(payload)
+                            sinomo_dfs::with_dfs_traceparent(traceparent.as_deref(), || {
+                                DaemonDfsBrowserBackend::for_data_dir(backend_data_dir)?
+                                    .write_file(payload)
+                            })
                         },
                     )
                     .await?;
-                    publish_daemon_sifs_metadata(publish_data_dir.as_ref(), runtime.as_ref())
-                        .await?;
+                    publish_daemon_sifs_metadata(
+                        publish_data_dir.as_ref(),
+                        runtime.as_ref(),
+                        request_traceparent.as_deref(),
+                    )
+                    .await?;
                     ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, &result)?
                 }
                 DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE => {
                     let payload = request.decode_body()?;
                     let backend_data_dir = Arc::clone(&data_dir);
                     let publish_data_dir = Arc::clone(&data_dir);
+                    let traceparent = request_traceparent.clone();
                     let result = run_blocking_service_task(
                         route.clone(),
                         "DFS browser create dir all",
                         move || {
-                            DaemonDfsBrowserBackend::for_data_dir(backend_data_dir)?
-                                .create_dir_all(payload)
+                            sinomo_dfs::with_dfs_traceparent(traceparent.as_deref(), || {
+                                DaemonDfsBrowserBackend::for_data_dir(backend_data_dir)?
+                                    .create_dir_all(payload)
+                            })
                         },
                     )
                     .await?;
-                    publish_daemon_sifs_metadata(publish_data_dir.as_ref(), runtime.as_ref())
-                        .await?;
+                    publish_daemon_sifs_metadata(
+                        publish_data_dir.as_ref(),
+                        runtime.as_ref(),
+                        request_traceparent.as_deref(),
+                    )
+                    .await?;
                     ObjectRpcResponse::encode_body(
                         DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
                         &result,
@@ -2473,26 +2488,42 @@ impl Service for DaemonDfsBrowserService {
                     let payload = request.decode_body()?;
                     let backend_data_dir = Arc::clone(&data_dir);
                     let publish_data_dir = Arc::clone(&data_dir);
+                    let traceparent = request_traceparent.clone();
                     let result =
                         run_blocking_service_task(route.clone(), "DFS browser rename", move || {
-                            DaemonDfsBrowserBackend::for_data_dir(backend_data_dir)?.rename(payload)
+                            sinomo_dfs::with_dfs_traceparent(traceparent.as_deref(), || {
+                                DaemonDfsBrowserBackend::for_data_dir(backend_data_dir)?
+                                    .rename(payload)
+                            })
                         })
                         .await?;
-                    publish_daemon_sifs_metadata(publish_data_dir.as_ref(), runtime.as_ref())
-                        .await?;
+                    publish_daemon_sifs_metadata(
+                        publish_data_dir.as_ref(),
+                        runtime.as_ref(),
+                        request_traceparent.as_deref(),
+                    )
+                    .await?;
                     ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_RENAME_ROUTE, &result)?
                 }
                 DAEMON_DFS_BROWSER_DELETE_ROUTE => {
                     let payload = request.decode_body()?;
                     let backend_data_dir = Arc::clone(&data_dir);
                     let publish_data_dir = Arc::clone(&data_dir);
+                    let traceparent = request_traceparent.clone();
                     let result =
                         run_blocking_service_task(route.clone(), "DFS browser delete", move || {
-                            DaemonDfsBrowserBackend::for_data_dir(backend_data_dir)?.delete(payload)
+                            sinomo_dfs::with_dfs_traceparent(traceparent.as_deref(), || {
+                                DaemonDfsBrowserBackend::for_data_dir(backend_data_dir)?
+                                    .delete(payload)
+                            })
                         })
                         .await?;
-                    publish_daemon_sifs_metadata(publish_data_dir.as_ref(), runtime.as_ref())
-                        .await?;
+                    publish_daemon_sifs_metadata(
+                        publish_data_dir.as_ref(),
+                        runtime.as_ref(),
+                        request_traceparent.as_deref(),
+                    )
+                    .await?;
                     ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_DELETE_ROUTE, &result)?
                 }
                 DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE => {
@@ -2755,7 +2786,9 @@ fn daemon_dfs_browser_object_health(
 async fn publish_daemon_sifs_metadata(
     data_dir: &SinomoDataDir,
     runtime: Option<&tokio::runtime::Handle>,
+    traceparent: Option<&str>,
 ) -> Result<(), ServiceError> {
+    let trace_started = std::time::Instant::now();
     let runtime = require_service_runtime(runtime, "DFS browser metadata publish")?.clone();
     let daemon_paths = crate::DaemonPaths::new(data_dir);
     let batch_runtime = runtime.clone();
@@ -2814,7 +2847,7 @@ async fn publish_daemon_sifs_metadata(
             })
         });
     let cluster_paths = ClusterPaths::new(data_dir);
-    sinomo_dfs::publish_cluster_dfs_metadata_journal_async(
+    let report = sinomo_dfs::publish_cluster_dfs_metadata_journal_async(
         data_dir,
         &cluster_paths,
         batch_sender,
@@ -2822,8 +2855,15 @@ async fn publish_daemon_sifs_metadata(
         sinomo_dfs::DfsMetadataJournalReplicationOptions::default(),
     )
     .await
-    .map(|_| ())
-    .map_err(dfs_browser_service_error)
+    .map_err(dfs_browser_service_error)?;
+    tracing::trace!(
+        target: "sinomo.dfs.perf",
+        traceparent = %traceparent.unwrap_or_default(),
+        outcomes = report.outcomes.len(),
+        total_ms = trace_started.elapsed().as_millis(),
+        "dfs-browser-metadata-publish"
+    );
+    Ok(())
 }
 
 fn sifs_browser_write_options(

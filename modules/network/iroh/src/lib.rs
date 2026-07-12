@@ -28,7 +28,8 @@ use sinomo_core::network::network_module_abi::{
     SINOMO_NETWORK_MODULE_ABI_VERSION, SINOMO_NETWORK_MODULE_STATUS_INVALID_ARGUMENT,
     SINOMO_NETWORK_MODULE_STATUS_OK, SINOMO_NETWORK_MODULE_STATUS_RUNTIME_ERROR,
     SinomoNetworkByteBuffer, SinomoNetworkByteSlice, SinomoNetworkModuleConfigV1,
-    SinomoNetworkModuleStatusCode, SinomoNetworkModuleVtableV1, encode_network_module_sobj,
+    SinomoNetworkModuleStatusCode, SinomoNetworkModuleVtableV1, encode_network_module_rpc_error,
+    encode_network_module_sobj,
 };
 use sinomo_core::network::{
     ClusterPaths, DaemonRpcTimeouts, NetworkError, NetworkModuleDescriptor,
@@ -461,6 +462,19 @@ fn network_error_status(
     }
 }
 
+fn network_rpc_error_status(
+    out: *mut SinomoNetworkByteBuffer,
+    error: &NetworkError,
+) -> SinomoNetworkModuleStatusCode {
+    let bytes =
+        encode_network_module_rpc_error(error).unwrap_or_else(|_| error.to_string().into_bytes());
+    write_network_buffer(out, bytes);
+    match error {
+        NetworkError::Serialization { .. } => SINOMO_NETWORK_MODULE_STATUS_INVALID_ARGUMENT,
+        _ => SINOMO_NETWORK_MODULE_STATUS_RUNTIME_ERROR,
+    }
+}
+
 unsafe extern "C" fn iroh_network_module_descriptor_ffi(
     out: *mut SinomoNetworkByteBuffer,
 ) -> SinomoNetworkModuleStatusCode {
@@ -560,7 +574,7 @@ unsafe extern "C" fn iroh_network_module_dial_rpc_ffi(
                 write_network_buffer(response_out, response);
                 SINOMO_NETWORK_MODULE_STATUS_OK
             }
-            Err(error) => network_error_status(response_out, &error),
+            Err(error) => network_rpc_error_status(response_out, &error),
         }
     }));
     result.unwrap_or(SINOMO_NETWORK_MODULE_STATUS_RUNTIME_ERROR)

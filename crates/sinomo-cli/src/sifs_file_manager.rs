@@ -67,9 +67,44 @@ impl SifsFileManagerBackend {
         Self::from_service(data_dir, rpc_runtime, service)
     }
 
+    pub(crate) fn open_with_deadline(
+        data_dir: &SinomoDataDir,
+        deadline: Instant,
+    ) -> Result<Self, String> {
+        let operation_deadline = Some(deadline);
+        sifs_operation_remaining(operation_deadline, "creating the SIFS RPC runtime")?;
+        let rpc_runtime = SifsRpcRuntime::new()?;
+        sifs_operation_remaining(operation_deadline, "creating the SIFS RPC runtime")?;
+        let service = open_sifs_service_with_hydration_until(
+            data_dir,
+            &rpc_runtime,
+            false,
+            operation_deadline,
+        )?;
+        sifs_operation_remaining(operation_deadline, "opening the SIFS backend")?;
+        Self::from_service(data_dir, rpc_runtime, service)
+    }
+
     pub(crate) fn open_read_only(data_dir: &SinomoDataDir) -> Result<Self, String> {
         let rpc_runtime = SifsRpcRuntime::new()?;
         Self::open_read_only_with_runtime(data_dir, rpc_runtime)
+    }
+
+    pub(crate) fn open_read_only_with_deadline(
+        data_dir: &SinomoDataDir,
+        deadline: Instant,
+    ) -> Result<Self, String> {
+        let operation_deadline = Some(deadline);
+        sifs_operation_remaining(operation_deadline, "creating the SIFS RPC runtime")?;
+        let rpc_runtime = SifsRpcRuntime::new()?;
+        let service = open_sifs_service_with_hydration_until(
+            data_dir,
+            &rpc_runtime,
+            false,
+            operation_deadline,
+        )?;
+        sifs_operation_remaining(operation_deadline, "opening the read-only SIFS backend")?;
+        Self::from_service(data_dir, rpc_runtime, service)
     }
 
     fn open_read_only_with_runtime(
@@ -455,6 +490,26 @@ impl SifsFileManagerBackend {
         deadline: Instant,
     ) -> Result<(), String> {
         self.delete_file_with_operation_deadline(path, Some(deadline))
+    }
+
+    pub(crate) fn remove_with_deadline(&self, path: &str, deadline: Instant) -> Result<(), String> {
+        let path = normalize_sifs_path(path)?;
+        self.run_namespace_mutation_with_deadline(
+            Some(deadline),
+            "SIFS path remove",
+            |service| match service.posix_unlink(&path) {
+                Ok(_) => Ok(()),
+                Err(DfsPosixError::IsDirectory { .. }) => service
+                    .posix_rmdir(&path)
+                    .map(|_| ())
+                    .map_err(|error| {
+                        format!(
+                            "cannot delete SIFS directory {path}: {error}; only empty directories can be deleted"
+                        )
+                    }),
+                Err(error) => Err(format!("cannot delete SIFS file {path}: {error}")),
+            },
+        )
     }
 
     fn run_namespace_mutation_with_deadline(
@@ -1265,20 +1320,33 @@ fn open_sifs_service_with_hydration(
     rpc_runtime: &SifsRpcRuntime,
     hydrate_metadata: bool,
 ) -> Result<NetworkedDfsService<DfsNodeTransport>, String> {
+    open_sifs_service_with_hydration_until(data_dir, rpc_runtime, hydrate_metadata, None)
+}
+
+fn open_sifs_service_with_hydration_until(
+    data_dir: &SinomoDataDir,
+    rpc_runtime: &SifsRpcRuntime,
+    hydrate_metadata: bool,
+    operation_deadline: Option<Instant>,
+) -> Result<NetworkedDfsService<DfsNodeTransport>, String> {
+    sifs_operation_remaining(operation_deadline, "preparing the Sinomo data directory")?;
     data_dir
         .ensure_root_layout()
         .map_err(|error| format!("cannot prepare Sinomo data directory: {error}"))?;
+    sifs_operation_remaining(operation_deadline, "preparing the Sinomo data directory")?;
     let cluster_paths = ClusterPaths::new(data_dir);
-    let peer_transport = Arc::new(SifsDfsPeerTransport::new(
-        rpc_runtime.clone(),
-        data_dir.clone(),
-    ));
+    let peer_transport = Arc::new(
+        SifsDfsPeerTransport::new(rpc_runtime.clone(), data_dir.clone())
+            .with_operation_deadline(operation_deadline),
+    );
     let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
     let _ = refresh_sifs_cluster_kv_snapshot(data_dir, &cluster_paths);
+    sifs_operation_remaining(operation_deadline, "refreshing the local cluster snapshot")?;
     let _ = refresh_cluster_dfs_kv_snapshot_with_peer_transport(
         &cluster_paths,
         Arc::clone(&sync_peer_transport),
     );
+    sifs_operation_remaining(operation_deadline, "refreshing the DFS cluster snapshot")?;
     let (local_node_id, peer_node_ids) = if cluster_paths.state.exists() {
         let state = cluster::read_cluster_state_without_kv(&cluster_paths)
             .map_err(|error| format!("cannot read local cluster state: {error}"))?;
@@ -1289,6 +1357,7 @@ fn open_sifs_service_with_hydration(
     };
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
         .map_err(|error| format!("cannot open DFS content store: {error}"))?;
+    sifs_operation_remaining(operation_deadline, "opening the DFS content store")?;
     let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer_transport;
     let mut service = NetworkedDfsService::new(
         DfsNodeTransport::with_peer_transports_for_nodes(
@@ -1304,6 +1373,7 @@ fn open_sifs_service_with_hydration(
         service =
             service.with_control_plane(SifsControlPlaneKvClient::new(data_dir, &cluster_paths));
     }
+    sifs_operation_remaining(operation_deadline, "opening DFS metadata shards")?;
     let service =
         if let Some(metadata) = open_sifs_sharded_metadata_backend(data_dir, &cluster_paths)? {
             if hydrate_metadata {
@@ -1328,10 +1398,18 @@ fn open_sifs_service_with_hydration(
                     .map_err(|error| format!("cannot open local SIFS metadata: {error}"))?
             }
         };
+    sifs_operation_remaining(operation_deadline, "opening DFS metadata shards")?;
     let mut service = service;
-    service
+    let previous_deadline =
+        operation_deadline.map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
+    let bootstrap = service
         .bootstrap_distributed_sifs()
-        .map_err(|error| format!("cannot bootstrap SIFS namespace: {error}"))?;
+        .map_err(|error| format!("cannot bootstrap SIFS namespace: {error}"));
+    if let Some(previous_deadline) = previous_deadline {
+        service.set_transport_operation_deadline(previous_deadline);
+    }
+    bootstrap?;
+    sifs_operation_remaining(operation_deadline, "bootstrapping the SIFS namespace")?;
     Ok(service)
 }
 
@@ -2221,6 +2299,12 @@ mod tests {
                 backend.delete_file_with_deadline("/services/contended-delete.txt", deadline)
             }),
         );
+        run_contended(
+            "path remove",
+            Box::new(|backend, deadline| {
+                backend.remove_with_deadline("/services/contended-remove.txt", deadline)
+            }),
+        );
         drop(service_guard);
     }
 
@@ -2240,6 +2324,31 @@ mod tests {
         manager.delete_selected("DELETE").expect("delete file");
         manager.go_parent().expect("parent");
         manager.delete_selected("DELETE").expect("delete dir");
+    }
+
+    #[test]
+    fn sifs_remove_with_deadline_handles_files_and_empty_directories() {
+        let root = temp_sifs_data_dir("remove-with-deadline");
+        let data_dir = SinomoDataDir::new(&root);
+        let backend = SifsFileManagerBackend::open(&data_dir).expect("backend");
+        let file = "/services/remove-with-deadline.txt";
+        let directory = "/services/remove-with-deadline-dir";
+
+        backend.write_file(file, b"remove me").expect("write file");
+        backend.create_dir(directory).expect("create directory");
+
+        backend
+            .remove_with_deadline(file, Instant::now() + Duration::from_secs(2))
+            .expect("remove file");
+        backend
+            .remove_with_deadline(directory, Instant::now() + Duration::from_secs(2))
+            .expect("remove directory");
+
+        assert!(backend.stat(file).is_err(), "removed file must be absent");
+        assert!(
+            backend.stat(directory).is_err(),
+            "removed directory must be absent"
+        );
     }
 
     #[test]

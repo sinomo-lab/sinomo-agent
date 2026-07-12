@@ -6,7 +6,9 @@ use metrics::{
 use serde::{Deserialize, Serialize};
 use sinomo_core::local::SinomoDataDir;
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tracing::{Event, Subscriber, field};
 use tracing_subscriber::filter::EnvFilter;
@@ -20,6 +22,8 @@ pub const OBSERVE_DEFAULT_FILTER: &str = "warn,sinomo=info,iroh::net_report::rep
 pub const OBSERVE_DEFAULT_QUIET_FILTER_DIRECTIVES: &[&str] = &["iroh::net_report::report=error"];
 pub const OBSERVE_BUILT_IN_QUIET_FILTER_DIRECTIVES: &[&str] = &["iroh::net_report::report=error"];
 const TRACE_BUFFER_LIMIT: usize = 4096;
+const CAPTURE_ID_MAX_BYTES: usize = 128;
+const CAPTURE_LEASE: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObserveRuntimeConfig {
@@ -60,6 +64,19 @@ pub struct ObserveControlRequest {
     pub clear_quiet_filter_directives: bool,
     #[serde(default)]
     pub reset: bool,
+    /// Tag newly recorded trace events with a cluster-wide capture identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_id: Option<String>,
+    /// Stop tagging newly recorded trace events with the active capture.
+    #[serde(default)]
+    pub clear_capture: bool,
+    /// Internal compare-and-clear guard used when rolling back a partial
+    /// cluster-wide capture start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_capture_id: Option<String>,
+    /// Clear the bounded in-memory trace buffer before starting a capture.
+    #[serde(default)]
+    pub clear_traces: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -67,6 +84,10 @@ pub struct ObserveControlResponse {
     pub active_filter: String,
     pub base_filter: String,
     pub quiet_filter_directives: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_capture_id: Option<String>,
+    #[serde(default)]
+    pub cleared_trace_count: usize,
     pub changed: bool,
 }
 
@@ -89,6 +110,8 @@ pub struct ObserveTracesRequest {
     pub target_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traceparent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_id: Option<String>,
     #[serde(default)]
     pub limit: usize,
 }
@@ -96,6 +119,17 @@ pub struct ObserveTracesRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ObserveTracesResponse {
     pub records: Vec<ObserveTraceRecord>,
+    /// Whether the requested capture is still active on this process. `None`
+    /// means the request did not filter by capture ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_active: Option<bool>,
+    /// Records evicted from the bounded ring since it was last cleared.
+    #[serde(default)]
+    pub dropped_records: u64,
+    /// True when either the ring overflowed or this response's limit omitted
+    /// otherwise available records.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -171,6 +205,8 @@ pub struct ObserveTraceRecord {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traceparent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_id: Option<String>,
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub fields: serde_json::Value,
 }
@@ -182,6 +218,30 @@ struct ObserveRuntime {
     filter_handle: reload::Handle<EnvFilter, Registry>,
     metrics: Arc<ObserveMetricsRecorder>,
     traces: Arc<Mutex<VecDeque<ObserveTraceRecord>>>,
+    dropped_traces: Arc<AtomicU64>,
+    capture: Arc<Mutex<Option<ActiveObserveCapture>>>,
+    control_update: Arc<Mutex<()>>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveObserveCapture {
+    id: String,
+    expires_at: Instant,
+    restore_filter: Option<ObserveFilterState>,
+}
+
+impl ActiveObserveCapture {
+    fn new(id: String, restore_filter: Option<ObserveFilterState>) -> Self {
+        Self {
+            id,
+            expires_at: Instant::now() + CAPTURE_LEASE,
+            restore_filter,
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        Instant::now() >= self.expires_at
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -260,11 +320,16 @@ fn init_observe_runtime_inner(
     let (filter_layer, filter_handle) = reload::Layer::new(filter);
     let metrics = Arc::new(ObserveMetricsRecorder::default());
     let traces = Arc::new(Mutex::new(VecDeque::with_capacity(TRACE_BUFFER_LIMIT)));
+    let dropped_traces = Arc::new(AtomicU64::new(0));
+    let capture = Arc::new(Mutex::new(None));
     let runtime = ObserveRuntime {
         filter: Arc::new(Mutex::new(initial_state)),
         filter_handle,
         metrics: Arc::clone(&metrics),
         traces: Arc::clone(&traces),
+        dropped_traces: Arc::clone(&dropped_traces),
+        capture: Arc::clone(&capture),
+        control_update: Arc::new(Mutex::new(())),
         config,
     };
 
@@ -279,7 +344,11 @@ fn init_observe_runtime_inner(
     });
     tracing_subscriber::registry()
         .with(filter_layer)
-        .with(ObserveTraceLayer { traces })
+        .with(ObserveTraceLayer {
+            traces,
+            dropped_traces,
+            capture,
+        })
         .with(fmt::layer().with_target(true))
         .with(file_layer)
         .try_init()
@@ -300,44 +369,175 @@ pub fn update_observe_control(
             detail: "observe control cannot both set and clear quiet filter directives".to_string(),
         });
     }
-    if !request.changes_filter_state() {
-        return Ok(runtime.control_snapshot(false));
+    if request.clear_capture && request.capture_id.is_some() {
+        return Err(ObserveError::Runtime {
+            detail: "observe control cannot both set and clear the active capture".to_string(),
+        });
+    }
+    if request.expected_capture_id.is_some() && !request.clear_capture {
+        return Err(ObserveError::Runtime {
+            detail: "observe expected capture id requires clear_capture".to_string(),
+        });
+    }
+    if request.clear_capture && request.changes_filter_state() {
+        return Err(ObserveError::Runtime {
+            detail: "observe capture clearing and filter changes must be separate control requests"
+                .to_string(),
+        });
+    }
+    if let Some(capture_id) = request.capture_id.as_deref() {
+        if capture_id.trim().is_empty() {
+            return Err(ObserveError::Runtime {
+                detail: "observe capture id cannot be empty".to_string(),
+            });
+        }
+        if capture_id.len() > CAPTURE_ID_MAX_BYTES {
+            return Err(ObserveError::Runtime {
+                detail: format!("observe capture id exceeds {CAPTURE_ID_MAX_BYTES} bytes"),
+            });
+        }
+    }
+    if !request.changes_runtime_state() {
+        return Ok(runtime.control_snapshot(false, 0));
     }
 
-    let next_state = {
-        let current = runtime.current_filter_state();
-        if request.reset {
+    let _control_update = runtime
+        .control_update
+        .lock()
+        .map_err(|_| ObserveError::Runtime {
+            detail: "observe control update lock is poisoned".to_string(),
+        })?;
+    if let Some(restore_filter) = runtime.take_expired_capture_restore()? {
+        runtime.install_filter_state(restore_filter)?;
+    }
+    let previous_filter_state = runtime.try_current_filter_state()?;
+    let capture = runtime.capture.lock().map_err(|_| ObserveError::Runtime {
+        detail: "observe capture state lock is poisoned".to_string(),
+    })?;
+    if let Some(requested_capture_id) = request.capture_id.as_ref()
+        && let Some(active_capture) = capture.as_ref()
+        && active_capture.id != *requested_capture_id
+    {
+        return Err(ObserveError::Runtime {
+            detail: format!(
+                "observe capture `{}` is already active; clear it before starting `{requested_capture_id}`",
+                active_capture.id
+            ),
+        });
+    }
+    if request.clear_capture
+        && let Some(expected_capture_id) = request.expected_capture_id.as_ref()
+        && let Some(active_capture) = capture.as_ref()
+        && active_capture.id != *expected_capture_id
+    {
+        return Err(ObserveError::Runtime {
+            detail: format!(
+                "observe capture `{}` replaced `{expected_capture_id}` before it could be cleared",
+                active_capture.id
+            ),
+        });
+    }
+    drop(capture);
+
+    if request.changes_filter_state() {
+        let next_state = if request.reset {
             ObserveFilterState::default()
         } else {
-            let base_filter = request.filter.unwrap_or(current.base_filter);
+            let base_filter = request
+                .filter
+                .clone()
+                .unwrap_or_else(|| previous_filter_state.base_filter.clone());
             let quiet_filter_directives = if request.clear_quiet_filter_directives {
                 Vec::new()
             } else {
                 request
                     .quiet_filter_directives
-                    .unwrap_or(current.quiet_filter_directives)
+                    .clone()
+                    .unwrap_or_else(|| previous_filter_state.quiet_filter_directives.clone())
             };
             ObserveFilterState::new(base_filter, quiet_filter_directives)
-        }
-    };
-    let parsed = EnvFilter::try_new(next_state.active_filter.as_str()).map_err(|source| {
-        ObserveError::Runtime {
-            detail: format!(
-                "invalid observe filter `{}`: {source}",
-                next_state.active_filter
-            ),
-        }
-    })?;
-    runtime
-        .filter_handle
-        .modify(|filter| *filter = parsed)
-        .map_err(|source| ObserveError::Runtime {
-            detail: format!("failed to reload observe filter: {source}"),
-        })?;
-    if let Ok(mut filter) = runtime.filter.lock() {
-        *filter = next_state;
+        };
+        runtime.install_filter_state(next_state)?;
     }
-    Ok(runtime.control_snapshot(true))
+
+    let mut capture = runtime.capture.lock().map_err(|_| ObserveError::Runtime {
+        detail: "observe capture state lock is poisoned".to_string(),
+    })?;
+    // Capture activation and buffer clearing are atomic relative to the trace
+    // layer (which takes the same capture -> traces lock order). No event can
+    // acquire the new capture tag and then be erased by this start request.
+    let cleared_trace_count = if request.clear_traces {
+        let cleared = runtime
+            .traces
+            .lock()
+            .map_err(|_| ObserveError::Runtime {
+                detail: "observe trace buffer lock is poisoned".to_string(),
+            })
+            .map(|mut traces| {
+                let count = traces.len();
+                traces.clear();
+                count
+            })?;
+        runtime.dropped_traces.store(0, Ordering::Relaxed);
+        cleared
+    } else {
+        0
+    };
+    let capture_owns_filter = request.changes_filter_state();
+    let mut schedule_capture_expiry = false;
+    let restore_filter = if request.clear_capture {
+        capture
+            .take()
+            .and_then(|active_capture| active_capture.restore_filter)
+    } else if let Some(capture_id) = request.capture_id.as_ref() {
+        if let Some(active_capture) = capture
+            .as_mut()
+            .filter(|active_capture| active_capture.id == *capture_id)
+        {
+            if active_capture.restore_filter.is_none() && capture_owns_filter {
+                active_capture.restore_filter = Some(previous_filter_state.clone());
+            }
+        } else {
+            let restore_filter = capture_owns_filter.then(|| previous_filter_state.clone());
+            *capture = Some(ActiveObserveCapture::new(
+                capture_id.clone(),
+                restore_filter,
+            ));
+            schedule_capture_expiry = true;
+        }
+        None
+    } else {
+        None
+    };
+    let capture_expiry = schedule_capture_expiry.then(|| {
+        let capture = capture.as_ref().expect("new capture is active");
+        (capture.id.clone(), capture.expires_at)
+    });
+    drop(capture);
+    if let Some(restore_filter) = restore_filter {
+        runtime.install_filter_state(restore_filter)?;
+    }
+    if let Some((capture_id, expires_at)) = capture_expiry {
+        if let Err(error) = runtime.schedule_capture_expiry(capture_id.clone(), expires_at) {
+            let restore_filter = runtime
+                .capture
+                .lock()
+                .ok()
+                .and_then(|mut capture| {
+                    (capture
+                        .as_ref()
+                        .is_some_and(|capture| capture.id == capture_id))
+                    .then(|| capture.take())
+                    .flatten()
+                })
+                .and_then(|capture| capture.restore_filter);
+            if let Some(restore_filter) = restore_filter {
+                runtime.install_filter_state(restore_filter)?;
+            }
+            return Err(error);
+        }
+    }
+    Ok(runtime.control_snapshot(true, cleared_trace_count))
 }
 
 pub fn observe_filter_with_builtin_quiet_directives(filter: &str) -> String {
@@ -406,8 +606,8 @@ fn is_filter_level(value: &str) -> bool {
 pub fn observe_control_snapshot() -> ObserveControlResponse {
     OBSERVE_RUNTIME
         .get()
-        .map(|runtime| runtime.control_snapshot(false))
-        .unwrap_or_else(|| ObserveFilterState::default().to_control_response(false))
+        .map(|runtime| runtime.control_snapshot(false, 0))
+        .unwrap_or_else(|| ObserveFilterState::default().to_control_response(None, false, 0))
 }
 
 pub fn read_observe_metrics(request: &ObserveMetricsRequest) -> ObserveMetricsResponse {
@@ -482,11 +682,23 @@ pub fn read_observe_traces(request: &ObserveTracesRequest) -> ObserveTracesRespo
     let Some(runtime) = OBSERVE_RUNTIME.get() else {
         return ObserveTracesResponse {
             records: Vec::new(),
+            capture_active: request.capture_id.as_ref().map(|_| false),
+            dropped_records: 0,
+            truncated: false,
         };
     };
+    // Resolve capture state before taking the trace-buffer lock; the trace
+    // layer uses capture -> traces ordering.
+    let capture_active = request
+        .capture_id
+        .as_ref()
+        .map(|capture_id| runtime.current_capture_id().as_ref() == Some(capture_id));
     let Ok(traces) = runtime.traces.lock() else {
         return ObserveTracesResponse {
             records: Vec::new(),
+            capture_active,
+            dropped_records: runtime.dropped_traces.load(Ordering::Relaxed),
+            truncated: true,
         };
     };
     let mut records = traces
@@ -500,30 +712,138 @@ pub fn read_observe_traces(request: &ObserveTracesRequest) -> ObserveTracesRespo
                     .traceparent
                     .as_ref()
                     .is_none_or(|traceparent| record.traceparent.as_ref() == Some(traceparent))
+                && request
+                    .capture_id
+                    .as_ref()
+                    .is_none_or(|capture_id| record.capture_id.as_ref() == Some(capture_id))
         })
         .cloned()
         .collect::<Vec<_>>();
-    if request.limit > 0 && records.len() > request.limit {
+    let limit_truncated = request.limit > 0 && records.len() > request.limit;
+    if limit_truncated {
         records = records.split_off(records.len() - request.limit);
     }
-    ObserveTracesResponse { records }
+    let dropped_records = runtime.dropped_traces.load(Ordering::Relaxed);
+    ObserveTracesResponse {
+        records,
+        capture_active,
+        dropped_records,
+        truncated: dropped_records > 0 || limit_truncated,
+    }
 }
 
 impl ObserveRuntime {
-    fn current_filter_state(&self) -> ObserveFilterState {
+    fn try_current_filter_state(&self) -> Result<ObserveFilterState, ObserveError> {
         self.filter
             .lock()
             .map(|filter| filter.clone())
-            .unwrap_or_else(|_| {
-                ObserveFilterState::new(
-                    self.config.filter.clone(),
-                    self.config.quiet_filter_directives.clone(),
-                )
+            .map_err(|_| ObserveError::Runtime {
+                detail: "observe filter state lock is poisoned".to_string(),
             })
     }
 
-    fn control_snapshot(&self, changed: bool) -> ObserveControlResponse {
-        self.current_filter_state().to_control_response(changed)
+    fn current_filter_state(&self) -> ObserveFilterState {
+        self.try_current_filter_state().unwrap_or_else(|_| {
+            ObserveFilterState::new(
+                self.config.filter.clone(),
+                self.config.quiet_filter_directives.clone(),
+            )
+        })
+    }
+
+    fn install_filter_state(&self, next_state: ObserveFilterState) -> Result<(), ObserveError> {
+        let parsed = EnvFilter::try_new(next_state.active_filter.as_str()).map_err(|source| {
+            ObserveError::Runtime {
+                detail: format!(
+                    "invalid observe filter `{}`: {source}",
+                    next_state.active_filter
+                ),
+            }
+        })?;
+        self.filter_handle
+            .modify(|filter| *filter = parsed)
+            .map_err(|source| ObserveError::Runtime {
+                detail: format!("failed to reload observe filter: {source}"),
+            })?;
+        let mut filter = self.filter.lock().map_err(|_| ObserveError::Runtime {
+            detail: "observe filter state lock is poisoned".to_string(),
+        })?;
+        *filter = next_state;
+        Ok(())
+    }
+
+    fn take_expired_capture_restore(&self) -> Result<Option<ObserveFilterState>, ObserveError> {
+        let mut capture = self.capture.lock().map_err(|_| ObserveError::Runtime {
+            detail: "observe capture state lock is poisoned".to_string(),
+        })?;
+        if !capture
+            .as_ref()
+            .is_some_and(ActiveObserveCapture::is_expired)
+        {
+            return Ok(None);
+        }
+        Ok(capture.take().and_then(|capture| capture.restore_filter))
+    }
+
+    fn schedule_capture_expiry(
+        &self,
+        capture_id: String,
+        expires_at: Instant,
+    ) -> Result<(), ObserveError> {
+        let runtime = self.clone();
+        std::thread::Builder::new()
+            .name("sinomo-observe-capture-expiry".to_string())
+            .spawn(move || {
+                std::thread::sleep(expires_at.saturating_duration_since(Instant::now()));
+                let Ok(_control_update) = runtime.control_update.lock() else {
+                    return;
+                };
+                let restore_filter = runtime.capture.lock().ok().and_then(|mut capture| {
+                    let should_expire = capture.as_ref().is_some_and(|capture| {
+                        capture.id == capture_id
+                            && capture.expires_at == expires_at
+                            && capture.is_expired()
+                    });
+                    should_expire
+                        .then(|| capture.take())
+                        .flatten()
+                        .and_then(|capture| capture.restore_filter)
+                });
+                if let Some(restore_filter) = restore_filter
+                    && let Err(error) = runtime.install_filter_state(restore_filter)
+                {
+                    tracing::warn!(
+                        "failed to restore observe filter after capture expiry: {error}"
+                    );
+                }
+            })
+            .map(|_| ())
+            .map_err(|source| ObserveError::Runtime {
+                detail: format!("failed to schedule observe capture expiry: {source}"),
+            })
+    }
+
+    fn control_snapshot(
+        &self,
+        changed: bool,
+        cleared_trace_count: usize,
+    ) -> ObserveControlResponse {
+        let capture_id = self.current_capture_id();
+        self.current_filter_state()
+            .to_control_response(capture_id, changed, cleared_trace_count)
+    }
+
+    fn current_capture_id(&self) -> Option<String> {
+        let Ok(capture) = self.capture.lock() else {
+            return None;
+        };
+        if capture
+            .as_ref()
+            .is_some_and(ActiveObserveCapture::is_expired)
+        {
+            return None;
+        }
+        capture.as_ref().map(|capture| capture.id.clone())
     }
 }
 
@@ -539,11 +859,18 @@ impl ObserveFilterState {
         }
     }
 
-    fn to_control_response(&self, changed: bool) -> ObserveControlResponse {
+    fn to_control_response(
+        &self,
+        active_capture_id: Option<String>,
+        changed: bool,
+        cleared_trace_count: usize,
+    ) -> ObserveControlResponse {
         ObserveControlResponse {
             active_filter: self.active_filter.clone(),
             base_filter: self.base_filter.clone(),
             quiet_filter_directives: self.quiet_filter_directives.clone(),
+            active_capture_id,
+            cleared_trace_count,
             changed,
         }
     }
@@ -564,6 +891,13 @@ impl ObserveControlRequest {
             || self.filter.is_some()
             || self.quiet_filter_directives.is_some()
             || self.clear_quiet_filter_directives
+    }
+
+    fn changes_runtime_state(&self) -> bool {
+        self.changes_filter_state()
+            || self.capture_id.is_some()
+            || self.clear_capture
+            || self.clear_traces
     }
 }
 
@@ -602,6 +936,8 @@ fn observe_quiet_filter_directives_from_env() -> Vec<String> {
 #[derive(Clone)]
 struct ObserveTraceLayer {
     traces: Arc<Mutex<VecDeque<ObserveTraceRecord>>>,
+    dropped_traces: Arc<AtomicU64>,
+    capture: Arc<Mutex<Option<ActiveObserveCapture>>>,
 }
 
 impl<S> Layer<S> for ObserveTraceLayer
@@ -616,18 +952,27 @@ where
             .fields
             .get("traceparent")
             .and_then(serde_json::Value::as_str)
+            .filter(|traceparent| !traceparent.is_empty())
             .map(ToString::to_string);
+        let capture_id = self.capture.lock().ok().and_then(|capture| {
+            capture
+                .as_ref()
+                .filter(|capture| !capture.is_expired())
+                .map(|capture| capture.id.clone())
+        });
         let record = ObserveTraceRecord {
             timestamp: OffsetDateTime::now_utc(),
             level: metadata.level().to_string(),
             target: metadata.target().to_string(),
             name: metadata.name().to_string(),
             traceparent,
+            capture_id,
             fields: serde_json::Value::Object(visitor.fields),
         };
         if let Ok(mut traces) = self.traces.lock() {
             if traces.len() >= TRACE_BUFFER_LIMIT {
                 traces.pop_front();
+                self.dropped_traces.fetch_add(1, Ordering::Relaxed);
             }
             traces.push_back(record);
         }
@@ -969,6 +1314,114 @@ mod tests {
         });
 
         assert_eq!(observed.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn trace_layer_tags_each_record_with_capture_active_at_event_time() {
+        let traces = Arc::new(Mutex::new(VecDeque::new()));
+        let capture = Arc::new(Mutex::new(Some(ActiveObserveCapture::new(
+            "cluster-capture-a".to_string(),
+            None,
+        ))));
+        let subscriber = Registry::default().with(ObserveTraceLayer {
+            traces: Arc::clone(&traces),
+            dropped_traces: Arc::new(AtomicU64::new(0)),
+            capture: Arc::clone(&capture),
+        });
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "sinomo.test.capture",
+                traceparent = "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+                "captured event"
+            );
+            *capture.lock().expect("capture") = Some(ActiveObserveCapture {
+                id: "expired-capture".to_string(),
+                expires_at: Instant::now(),
+                restore_filter: None,
+            });
+            tracing::info!(target: "sinomo.test.capture", "event after capture lease");
+        });
+
+        let traces = traces.lock().expect("trace records");
+        assert_eq!(traces.len(), 2);
+        assert_eq!(traces[0].capture_id.as_deref(), Some("cluster-capture-a"));
+        assert_eq!(
+            traces[0].traceparent.as_deref(),
+            Some("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01")
+        );
+        assert_eq!(traces[1].capture_id, None);
+    }
+
+    #[test]
+    fn trace_layer_counts_ring_overflow() {
+        let template = ObserveTraceRecord {
+            timestamp: OffsetDateTime::now_utc(),
+            level: "INFO".to_string(),
+            target: "sinomo.test".to_string(),
+            name: "test".to_string(),
+            traceparent: None,
+            capture_id: None,
+            fields: serde_json::Value::Null,
+        };
+        let traces = Arc::new(Mutex::new(VecDeque::from(vec![
+            template;
+            TRACE_BUFFER_LIMIT
+        ])));
+        let dropped_traces = Arc::new(AtomicU64::new(0));
+        let subscriber = Registry::default().with(ObserveTraceLayer {
+            traces: Arc::clone(&traces),
+            dropped_traces: Arc::clone(&dropped_traces),
+            capture: Arc::new(Mutex::new(None)),
+        });
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "sinomo.test.capture", "overflow event");
+        });
+
+        assert_eq!(traces.lock().expect("traces").len(), TRACE_BUFFER_LIMIT);
+        assert_eq!(dropped_traces.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn capture_expiry_restores_owned_filter_state() {
+        let original = ObserveFilterState::new("warn,sinomo=info".to_string(), Vec::new());
+        let capture_filter =
+            ObserveFilterState::new("warn,sinomo.dfs.perf=trace".to_string(), Vec::new());
+        let filter = EnvFilter::try_new(original.active_filter.as_str()).expect("filter");
+        let (_filter_layer, filter_handle) = reload::Layer::new(filter);
+        let runtime = ObserveRuntime {
+            config: ObserveRuntimeConfig {
+                process_role: "test".to_string(),
+                node_id: None,
+                filter: original.base_filter.clone(),
+                quiet_filter_directives: original.quiet_filter_directives.clone(),
+            },
+            filter: Arc::new(Mutex::new(original.clone())),
+            filter_handle,
+            metrics: Arc::new(ObserveMetricsRecorder::default()),
+            traces: Arc::new(Mutex::new(VecDeque::new())),
+            dropped_traces: Arc::new(AtomicU64::new(0)),
+            capture: Arc::new(Mutex::new(None)),
+            control_update: Arc::new(Mutex::new(())),
+        };
+        runtime
+            .install_filter_state(capture_filter.clone())
+            .expect("install capture filter");
+        let expires_at = Instant::now() + Duration::from_millis(20);
+        *runtime.capture.lock().expect("capture") = Some(ActiveObserveCapture {
+            id: "expiring-capture".to_string(),
+            expires_at,
+            restore_filter: Some(original.clone()),
+        });
+        runtime
+            .schedule_capture_expiry("expiring-capture".to_string(), expires_at)
+            .expect("schedule expiry");
+
+        std::thread::sleep(Duration::from_millis(80));
+
+        assert_eq!(runtime.current_capture_id(), None);
+        assert_eq!(runtime.current_filter_state(), original);
     }
 
     struct CountingLayer {

@@ -17,8 +17,10 @@
 //!   `local_endpoints`) are allocated by the module and must be released
 //!   through the module's own `free_buffer` — allocators may differ across the
 //!   dylib boundary.
-//! - On a non-OK status the module MAY fill the output buffer with UTF-8
-//!   error detail instead of payload bytes.
+//! - On a non-OK `dial_rpc` status the module SHOULD fill the output buffer
+//!   with a name-keyed SOBJ [`NetworkModuleRpcErrorV1`]. The host retains a
+//!   legacy UTF-8 fallback for older modules. Other functions MAY fill the
+//!   output buffer with UTF-8 error detail.
 //! - Descriptor/endpoint payloads are name-keyed SOBJ documents encoded with
 //!   [`encode_network_module_sobj`] (`SINOMO_NETWORK_MODULE_OBJECT_VERSION`).
 //! - Timeouts are milliseconds; `0` means "no timeout".
@@ -26,14 +28,14 @@
 //! Report deviations rather than changing this ABI: it is pinned for stage C
 //! of docs/plans/r0-r1-crate-boundary-refactor.md.
 
-use crate::error::NetworkError;
+use crate::error::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase};
 use crate::network_module::{
     NetworkFuture, NetworkModule, NetworkModuleContext, NetworkModuleDescriptor,
     NetworkModuleEndpointRole,
 };
 use crate::object::DaemonRpcTimeouts;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use sinomo_base::ClusterEndpointRecord;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::any::Any;
@@ -215,15 +217,82 @@ pub fn decode_network_module_sobj<T: DeserializeOwned>(bytes: &[u8]) -> Result<T
     })
 }
 
+/// Structured error returned by a v1 network module's `dial_rpc` function.
+///
+/// Keeping delivery certainty across the dylib boundary is load-bearing: the
+/// route layer may retry another endpoint when bytes were definitely not sent,
+/// but must remain conservative after a possibly-applied request. The detail
+/// string preserves the module-specific cause while the optional timeout keeps
+/// phase-aware connectivity demotion working in the host.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NetworkModuleRpcErrorV1 {
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<NetworkModuleRpcTimeoutV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_state: Option<NetworkDeliveryState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NetworkModuleRpcTimeoutV1 {
+    pub phase: NetworkTimeoutPhase,
+    pub timeout_millis: u64,
+}
+
+impl NetworkModuleRpcErrorV1 {
+    pub fn from_network_error(error: &NetworkError) -> Self {
+        let timeout = match error {
+            NetworkError::Timeout { phase, timeout, .. } => Some(NetworkModuleRpcTimeoutV1 {
+                phase: *phase,
+                timeout_millis: duration_millis_for_network_module(*timeout),
+            }),
+            _ => None,
+        };
+        Self {
+            detail: error.to_string(),
+            timeout,
+            delivery_state: error.delivery_state(),
+        }
+    }
+
+    fn into_network_error(self, operation: &str) -> NetworkError {
+        if let Some(timeout) = self.timeout {
+            return NetworkError::timeout(
+                operation,
+                timeout.phase,
+                Duration::from_millis(timeout.timeout_millis.max(1)),
+                self.delivery_state
+                    .unwrap_or(NetworkDeliveryState::PossiblyApplied),
+            );
+        }
+        if let Some(delivery_state) = self.delivery_state {
+            return NetworkError::delivery_failed(operation, delivery_state, self.detail);
+        }
+        NetworkError::Io {
+            operation: operation.to_string(),
+            detail: self.detail,
+        }
+    }
+}
+
+/// Encodes a dial failure without discarding its delivery or timeout state.
+pub fn encode_network_module_rpc_error(error: &NetworkError) -> Result<Vec<u8>, NetworkError> {
+    encode_network_module_sobj(&NetworkModuleRpcErrorV1::from_network_error(error))
+}
+
+fn duration_millis_for_network_module(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1)
+}
+
 /// Maps host-side optional timeouts onto the ABI's millisecond convention
 /// (`0` = no timeout; sub-millisecond timeouts round up to 1ms).
 fn network_module_timeout_ms(timeout: Option<Duration>) -> u64 {
     match timeout {
         None => 0,
         Some(timeout) if timeout.is_zero() => 1,
-        Some(timeout) => u64::try_from(timeout.as_millis())
-            .unwrap_or(u64::MAX)
-            .max(1),
+        Some(timeout) => duration_millis_for_network_module(timeout),
     }
 }
 
@@ -419,7 +488,7 @@ impl NetworkModule for FfiNetworkModule {
                 let bytes =
                     unsafe { copy_and_free_network_buffer(response, shared.vtable.free_buffer) };
                 if status != SINOMO_NETWORK_MODULE_STATUS_OK {
-                    return Err(network_module_status_error(
+                    return Err(network_module_rpc_status_error(
                         "dial network module rpc",
                         status,
                         &bytes,
@@ -504,6 +573,17 @@ unsafe fn copy_and_free_network_buffer(
     bytes
 }
 
+fn network_module_rpc_status_error(
+    operation: &str,
+    status: SinomoNetworkModuleStatusCode,
+    detail_bytes: &[u8],
+) -> NetworkError {
+    if let Ok(error) = decode_network_module_sobj::<NetworkModuleRpcErrorV1>(detail_bytes) {
+        return error.into_network_error(operation);
+    }
+    network_module_status_error(operation, status, detail_bytes)
+}
+
 /// Builds the host-side error for a non-OK module status; `detail_bytes` is
 /// the (possibly empty) UTF-8 error detail the module wrote into the output
 /// buffer.
@@ -563,6 +643,78 @@ mod tests {
         assert_eq!(
             network_module_timeout_ms(Some(Duration::from_secs(2))),
             2_000
+        );
+    }
+
+    #[test]
+    fn network_module_rpc_error_preserves_definitely_unsent_connect_timeout() {
+        let encoded = encode_network_module_rpc_error(&NetworkError::timeout(
+            "send iroh daemon command",
+            NetworkTimeoutPhase::Connect,
+            Duration::from_secs(2),
+            NetworkDeliveryState::DefinitelyNotSent,
+        ))
+        .expect("encode module RPC error");
+
+        let decoded = network_module_rpc_status_error(
+            "dial network module rpc",
+            SINOMO_NETWORK_MODULE_STATUS_RUNTIME_ERROR,
+            &encoded,
+        );
+
+        assert_eq!(
+            decoded,
+            NetworkError::timeout(
+                "dial network module rpc",
+                NetworkTimeoutPhase::Connect,
+                Duration::from_secs(2),
+                NetworkDeliveryState::DefinitelyNotSent,
+            )
+        );
+    }
+
+    #[test]
+    fn network_module_rpc_error_preserves_possibly_applied_delivery() {
+        let encoded = encode_network_module_rpc_error(&NetworkError::delivery_failed(
+            "send iroh daemon command",
+            NetworkDeliveryState::PossiblyApplied,
+            "peer closed before the response",
+        ))
+        .expect("encode module RPC error");
+
+        let decoded = network_module_rpc_status_error(
+            "dial network module rpc",
+            SINOMO_NETWORK_MODULE_STATUS_RUNTIME_ERROR,
+            &encoded,
+        );
+
+        assert_eq!(
+            decoded.delivery_state(),
+            Some(NetworkDeliveryState::PossiblyApplied)
+        );
+        assert!(matches!(decoded, NetworkError::DeliveryFailed { .. }));
+        assert!(
+            decoded
+                .to_string()
+                .contains("peer closed before the response")
+        );
+    }
+
+    #[test]
+    fn network_module_rpc_error_keeps_legacy_utf8_fallback() {
+        let decoded = network_module_rpc_status_error(
+            "dial network module rpc",
+            SINOMO_NETWORK_MODULE_STATUS_RUNTIME_ERROR,
+            b"legacy module failure",
+        );
+
+        assert_eq!(
+            decoded,
+            NetworkError::Io {
+                operation: "dial network module rpc".to_string(),
+                detail: "network module status 3 (runtime error): legacy module failure"
+                    .to_string(),
+            }
         );
     }
 }

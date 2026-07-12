@@ -363,11 +363,12 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
     fn handle_message<'a>(
         &'a self,
         command: DfsMessageCommand,
+        traceparent: Option<String>,
     ) -> DfsDataPlaneHostFuture<'a, DfsMessageResponse> {
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
         Box::pin(async move {
-            handle_daemon_dfs_message_async(&paths, command, &runtime)
+            handle_daemon_dfs_message_async(&paths, command, traceparent, &runtime)
                 .await
                 .map_err(daemon_dfs_data_plane_error)
         })
@@ -672,6 +673,18 @@ fn daemon_dfs_perf_trace(args: std::fmt::Arguments<'_>) {
     tracing::trace!(target: "sinomo.dfs.perf", detail = %args, "daemon dfs perf");
 }
 
+fn daemon_dfs_perf_trace_with_traceparent(
+    traceparent: Option<&str>,
+    args: std::fmt::Arguments<'_>,
+) {
+    tracing::trace!(
+        target: "sinomo.dfs.perf",
+        traceparent = %traceparent.unwrap_or_default(),
+        detail = %args,
+        "daemon dfs perf"
+    );
+}
+
 fn read_daemon_dfs_message_peer_snapshot(
     cluster_paths: &ClusterPaths,
 ) -> Result<Option<DaemonDfsMessagePeerSnapshot>, sinomo_dfs::DfsError> {
@@ -929,6 +942,7 @@ fn process_daemon_dfs_message_command_on_runtime(
 async fn handle_daemon_dfs_message_async(
     paths: &DaemonPaths,
     command: DfsMessageCommand,
+    traceparent: Option<String>,
     runtime: &tokio::runtime::Handle,
 ) -> Result<DfsMessageResponse, DaemonError> {
     let trace_started = Instant::now();
@@ -942,21 +956,27 @@ async fn handle_daemon_dfs_message_async(
     let frame_id = command.routed_message.frame_id;
     let message_id = command.routed_message.message_id;
     let message_kind = daemon_dfs_message_kind(&command.routed_message.message);
-    daemon_dfs_perf_trace(format_args!(
-        "dfs-message-handler-start request={} kind={} source={} target={} frame_id={} message_id={}",
-        request_id, message_kind, source_node_id, target_node_id, frame_id, message_id
-    ));
+    daemon_dfs_perf_trace_with_traceparent(
+        traceparent.as_deref(),
+        format_args!(
+            "dfs-message-handler-start request={} kind={} source={} target={} frame_id={} message_id={}",
+            request_id, message_kind, source_node_id, target_node_id, frame_id, message_id
+        ),
+    );
     let process_data_dir = data_dir.clone();
     let process_cluster_paths = cluster_paths.clone();
     let process_runtime = runtime.clone();
+    let process_traceparent = traceparent.clone();
     let spawn_started = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
-        process_daemon_dfs_message_command_on_runtime(
-            &process_data_dir,
-            &process_cluster_paths,
-            command,
-            &process_runtime,
-        )
+        sinomo_dfs::with_dfs_traceparent(process_traceparent.as_deref(), || {
+            process_daemon_dfs_message_command_on_runtime(
+                &process_data_dir,
+                &process_cluster_paths,
+                command,
+                &process_runtime,
+            )
+        })
     })
     .await
     .map_err(|source| DaemonError::Network {
@@ -989,14 +1009,17 @@ async fn handle_daemon_dfs_message_async(
         );
         schedule_daemon_dfs_message_deferred_work(message_cache_key);
     }
-    daemon_dfs_perf_trace(format_args!(
-        "dfs-message-handler request={} spawn_blocking_ms={} publish_metadata={} outbound_messages={} total_ms={}",
-        request_id,
-        spawn_blocking_ms,
-        should_publish_metadata,
-        response.outbound_messages.len(),
-        trace_started.elapsed().as_millis()
-    ));
+    daemon_dfs_perf_trace_with_traceparent(
+        traceparent.as_deref(),
+        format_args!(
+            "dfs-message-handler request={} spawn_blocking_ms={} publish_metadata={} outbound_messages={} total_ms={}",
+            request_id,
+            spawn_blocking_ms,
+            should_publish_metadata,
+            response.outbound_messages.len(),
+            trace_started.elapsed().as_millis()
+        ),
+    );
     Ok(response)
 }
 
