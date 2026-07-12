@@ -395,9 +395,18 @@ compact projection of authority epoch, journal head, object and namespace
 revision counters, visible-authority/head counts, and canonical conflict count.
 Local writes, local durability barriers, crashes, branch sealing,
 reconciliation planning, and local conflict preservation stutter under that
-projection. The focused file and namespace slices still consume seven compact
-publication facts: quorum, current authority, matching epoch and plan head,
-content policy, metadata prepare, and atomic publication.
+projection. The standalone file and namespace slices still consume seven
+compact publication facts: quorum, current authority, matching epoch and plan
+head, content policy, metadata prepare, and atomic publication. The composed
+file and namespace slices replace that assumption at the branch boundary:
+planning and waiting remain nonterminal, and the only exposed terminal action
+pairs the branch result with the gateway journal commit in the same transition.
+Consequently `BranchTerminal` holds exactly when the matching gateway entry is
+committed; result-table and conflict-sidecar materialization may still lag and
+replay from that committed envelope. The file composition closes its
+two-manifest domain by allowing one dirty local sync before sealing, and the
+namespace composition reserves one bounded journal slot for its terminal entry
+so environment commits cannot exhaust the finite model before reconciliation.
 
 A separate one-shard reconciliation gateway now refines those facts into a
 typed permit. Its quorum, authority, content-receipt, and metadata-prepare
@@ -409,11 +418,14 @@ primary, configuration, or payload invalidates the permit instead of relying on
 a caller-supplied Boolean. The gateway explicitly models volatile planning,
 append, quorum commit, crash before and after commit, journal replay,
 materialization, lost replies, exact retry, and changed-payload rejection.
-This closes the abstract action-level result-recording gap for the bounded
-gateway, but it is not yet direct composition with Raft, advisory locks,
-`fsync`, partition recovery, or the Rust journal. Under the derived permit, a
-publication retains one visible authority and head and creates no canonical
-conflict record.
+The branch-to-gateway compositions close the abstract action-level
+result-recording gap for the bounded terminal protocols. They admit two exact
+one-sync file manifests and seven named one-operation namespace manifests, and
+map applicable, converged, conflict, and superseded results to distinct atomic
+envelopes. This is not yet composition with Raft, advisory locks, canonical
+`fsync`, partition recovery, no-conflict enforcement, or the Rust journal.
+Under the derived permit, a publication retains one visible authority and head
+and creates no canonical conflict record.
 
 The target protocol gives each branch a durable incarnation, monotonic
 operation identities, an immutable base checkpoint, exact object-version and
@@ -434,23 +446,25 @@ conflicted, superseded, dependency-blocked, and rejected outcomes. The bounded
 file slice exercises apply, converge, and conflict; the namespace slice adds
 superseded. An applicable operation becomes one canonical metadata
 transaction. In the focused branch models, a conflict leaves the quorum winner
-at the canonical path and retains a symbolic file-content value or a set of namespace
-object identities in a disjoint sidecar. Those slices do not prove storage
-retention receipts, retained subtree bytes, or post-crash reachability of those
-objects. The gateway adds a bounded receipt certificate from two distinct
-symbolic holders and proves that it intersects the metadata-prepare quorum. It
-still does not validate concrete bytes, hashes, holder persistence, subtree
-closure, or post-crash object reachability. File reconciliation records are
-keyed by the full modeled payload, so
+at the canonical path and retains a symbolic file-content value or a set of
+namespace object identities in a disjoint sidecar; superseded creates no
+sidecar. Those slices do not prove storage retention receipts, retained subtree
+bytes, or post-crash reachability of those objects. The gateway adds a bounded
+receipt certificate from two distinct symbolic holders and proves that it
+intersects the metadata-prepare quorum. It still does not validate concrete
+bytes, hashes, holder persistence, subtree closure, or post-crash object
+reachability. File reconciliation records are keyed by the full modeled payload, so
 a lost reply can be replayed exactly while changed content, base head, or local
 sync generation is rejected. In the gateway, the committed journal envelope is
 the durable source of the terminal result and canonical effect; table and
 sidecar materialization may lag and recover idempotently from that envelope. A
 modeled process restart clears the transient reply but preserves the committed
 envelope before replay. The byte-level WAL and Rust metadata-transaction
-refinement remain open. The namespace slice proves
-only that retrying its deterministic terminal branch is an idempotent stutter; it
-does not model a payload-keyed retry record. A changed canonical journal head
+refinement remain open. The namespace composition binds each reachable finite
+manifest shape to a distinct symbolic digest and couples its deterministic
+terminal retry to the gateway result. It still fixes one request identity and
+does not model arbitrary payload hashes, multiple requests, or a general
+payload-keyed namespace replay table. A changed canonical journal head
 invalidates either plan and requires reclassification. Explicit conflict
 resolution is itself a target strong compare-and-swap transaction.
 
@@ -465,7 +479,10 @@ concrete byte-validated retention receipts, byte-range locks, and full
 open-unlinked lifetime. The Rust
 DFS still takes the conservative strong-path behavior described above; the
 local-first slices are target-hardening models, not a claim that degraded
-mutation is implemented end to end.
+mutation is implemented end to end. The new terminal compositions verify the
+bounded branch/gateway boundary only; they do not turn the separate local
+durability, lock, canonical sync, partition, or Raft models into one end-to-end
+refinement.
 
 ## Reads and Caches
 

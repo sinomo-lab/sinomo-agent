@@ -46,8 +46,9 @@ module dfs_local_first_file_branch_safety {
       | CanonicalConcurrentWrite => StrongCanonicalCommitStep
       | ReconcileApplied => ReconcileCanonicalCommitStep
       | ReconcilePlanCreated => ReconcilePlanningStep
+      | ReconcileGatewayProgressed => ReconcilePlanningStep
       | StaleReconcilePlanRejected => ReconcilePlanningStep
-      | ReconcileConverged => ReconcilePlanningStep
+      | ReconcileConverged => ReconcileCanonicalCommitStep
       | ExactReconcileRetryReplayed => ReconcilePlanningStep
       | ChangedReconcileRetryRejected => ReconcilePlanningStep
       | ReconcileProcessRestarted => LocalDurabilityStep
@@ -60,6 +61,7 @@ module dfs_local_first_file_branch_safety {
     val plan = unwrapOr(lfPlan, defaultPlan)
     val reconciliationPublishes = any {
       lfLastDecision == ReconcileApplied,
+      lfLastDecision == ReconcileConverged,
       lfLastDecision == ReconcileConflictMaterialized,
     }
     {
@@ -151,7 +153,7 @@ module dfs_local_first_file_branch_safety {
 
   /// This consumes the shared extension contract directly: every local,
   /// durability, planning, and conflict-sidecar action stutters on canonical
-  /// state, while the two publishing actions refine one authorized journal
+  /// state, while the three publishing actions refine one authorized journal
   /// step with a single visible authority and head.
   def everyStepRefinesCanonicalProjection: bool =
     lfLastDecision == NoFileBranchDecision or
@@ -324,7 +326,7 @@ module dfs_local_first_file_branch_safety {
         lfCanonicalHead == plan.observedHead,
         lfCanonicalHead == lfLastAudit.canonicalBefore,
         lfConflictRecord == lfLastAudit.conflictBefore,
-        lfEffectCount == lfLastAudit.effectCountBefore,
+        lfEffectCount == lfLastAudit.effectCountBefore + 1,
       }
     }
 

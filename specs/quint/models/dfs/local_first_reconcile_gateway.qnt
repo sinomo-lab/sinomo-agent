@@ -54,6 +54,7 @@ module dfs_local_first_reconcile_gateway {
     | GatewayExactRetryReplayed
     | GatewayChangedRetryRejected
     | GatewayStrongHeadAdvanced
+    | GatewayStrongHeadOnlyAdvanced
     | GatewayAuthorityEpochAdvanced
     | GatewayTerminalStutter
 
@@ -633,6 +634,35 @@ module dfs_local_first_reconcile_gateway {
     gatewayAudit' = currentGatewayAudit,
   }
 
+  /// An unrelated canonical metadata transaction consumes a journal slot but
+  /// does not change the bounded data revision. Namespace composition uses
+  /// this for strong work outside its finite entry map.
+  action advanceStrongCanonicalHeadOnly: bool = all {
+    gatewayPhase != GatewayStopped,
+    not(gatewayJournal.committed),
+    hasQuorum(gatewayOnline),
+    gatewayCanonical.journalHead < MaxGatewayJournalHead,
+    gatewayCanonical' = {
+      primary: gatewayCanonical.primary,
+      authorityEpoch: gatewayCanonical.authorityEpoch,
+      configRevision: gatewayCanonical.configRevision,
+      journalHead: gatewayCanonical.journalHead + 1,
+      objectRevision: gatewayCanonical.objectRevision,
+      canonicalConflictCount: gatewayCanonical.canonicalConflictCount,
+    },
+    gatewayOnline' = gatewayOnline,
+    gatewayPhase' = gatewayPhase,
+    gatewayPlan' = gatewayPlan,
+    gatewayEvidence' = gatewayEvidence,
+    gatewayPermit' = gatewayPermit,
+    gatewayJournal' = gatewayJournal,
+    gatewayMaterialized' = gatewayMaterialized,
+    gatewayLastResponse' = NoGatewayResponse,
+    gatewayLastDecision' = GatewayStrongHeadOnlyAdvanced,
+    gatewayLastSuppliedPayload' = None,
+    gatewayAudit' = currentGatewayAudit,
+  }
+
   /// A committed authority movement changes epoch and consumes a journal slot.
   /// Any old appended reconciliation stays uncommitted and must be rejected.
   action advanceGatewayAuthority(newPrimary: Node): bool = all {
@@ -830,6 +860,7 @@ module dfs_local_first_reconcile_gateway {
       commitReconcileEntry(deliverReply)
     },
     advanceStrongCanonicalHead,
+    advanceStrongCanonicalHeadOnly,
     {
       nondet newPrimary = oneOf(Nodes)
       advanceGatewayAuthority(newPrimary)

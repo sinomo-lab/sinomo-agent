@@ -11,10 +11,30 @@ module dfs_local_first_reconcile_permit {
   import dfs_local_first_projection.* from "local_first_projection"
 
   type ReconcileRequestId = GatewayRequest | GatewayRequestReserved
-  type ReconcilePayloadDigest = PayloadA | PayloadB
+  /// `PayloadA`/`PayloadB` remain the gateway's generic file/retry values.
+  /// The named namespace values are exact digests for the finite one-operation
+  /// manifests admitted by the branch-to-gateway composition slice.
+  type ReconcilePayloadDigest =
+    | PayloadA
+    | PayloadB
+    | NamespaceCreateRootPayload
+    | NamespaceCreateChildPayload
+    | NamespaceMkdirPayload
+    | NamespaceUnlinkPayload
+    | NamespaceRmdirPayload
+    | NamespaceRenameFilePayload
+    | NamespaceRenameDirectoryPayload
   type RetainedArtifactDigest = ArtifactA | ArtifactB
-  type ReconcileOutcome = PublishApply | PublishConverged | PublishConflict
-  type ReconcileResultDigest = ResultApplied | ResultConverged | ResultConflict
+  type ReconcileOutcome =
+    | PublishApply
+    | PublishConverged
+    | PublishConflict
+    | PublishSuperseded
+  type ReconcileResultDigest =
+    | ResultApplied
+    | ResultConverged
+    | ResultConflict
+    | ResultSuperseded
 
   type ReconcilePublicationPlan = {
     requestId: ReconcileRequestId,
@@ -95,10 +115,19 @@ module dfs_local_first_reconcile_permit {
     publication: AtomicReconcilePublication,
   }
 
-  pure val ReconcilePayloads: Set[ReconcilePayloadDigest] =
-    Set(PayloadA, PayloadB)
+  pure val ReconcilePayloads: Set[ReconcilePayloadDigest] = Set(
+    PayloadA,
+    PayloadB,
+    NamespaceCreateRootPayload,
+    NamespaceCreateChildPayload,
+    NamespaceMkdirPayload,
+    NamespaceUnlinkPayload,
+    NamespaceRmdirPayload,
+    NamespaceRenameFilePayload,
+    NamespaceRenameDirectoryPayload
+  )
   pure val ReconcileOutcomes: Set[ReconcileOutcome] =
-    Set(PublishApply, PublishConverged, PublishConflict)
+    Set(PublishApply, PublishConverged, PublishConflict, PublishSuperseded)
   pure val contentReceiptThreshold: int = 2
 
   pure def retainedArtifactFor(
@@ -106,7 +135,14 @@ module dfs_local_first_reconcile_permit {
   ): RetainedArtifactDigest =
     match payload {
       | PayloadA => ArtifactA
-      | PayloadB => ArtifactB
+      | PayloadB => ArtifactA
+      | NamespaceCreateRootPayload => ArtifactB
+      | NamespaceCreateChildPayload => ArtifactB
+      | NamespaceMkdirPayload => ArtifactB
+      | NamespaceUnlinkPayload => ArtifactB
+      | NamespaceRmdirPayload => ArtifactB
+      | NamespaceRenameFilePayload => ArtifactB
+      | NamespaceRenameDirectoryPayload => ArtifactB
     }
 
   pure def resultDigestFor(outcome: ReconcileOutcome): ReconcileResultDigest =
@@ -114,6 +150,7 @@ module dfs_local_first_reconcile_permit {
       | PublishApply => ResultApplied
       | PublishConverged => ResultConverged
       | PublishConflict => ResultConflict
+      | PublishSuperseded => ResultSuperseded
     }
 
   pure def targetObjectRevisionFor(

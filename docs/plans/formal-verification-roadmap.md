@@ -1,6 +1,6 @@
 # Formal Verification Roadmap
 
-Status: active backlog. Last reviewed 2026-07-10.
+Status: active backlog. Last reviewed 2026-07-11.
 
 This plan tracks the next bounded verification slices. Current models,
 properties, and execution instructions live in the
@@ -114,14 +114,19 @@ stranding durable jobs with path reservations held.
    predecessor head, successor index, payload, and one atomic effect/result
    envelope. Its journal lifecycle covers append, commit, pre/post-commit crash,
    recovery materialization, exact retry, changed-payload rejection, and stale
-   head/epoch fencing. This removes assumed action-level atomic result recording
-   inside the gateway, but the file and namespace branch models do not yet feed
-   it directly and it is not a Raft or Rust-journal refinement. Next, in order:
-   connect branch terminal actions to the gateway; compose the gateway permit
-   with canonical lock, sync, partition, no-conflict, and Raft evidence; refine
-   symbolic holders into byte-validated file/subtree retention receipts; then
-   add POSIX rename replacement, payload-keyed namespace replay, open-handle
-   rename/unlink, and only afterward multi-operation dependency graphs,
-   cross-shard branches, hardlinks and symlinks, branch gossip, and explicit
-   service-produced merge candidates before Rust implementation claims
-   conformance.
+   head/epoch fencing. Added later 2026-07-11: direct file and namespace
+   composition modules now expose terminal branch actions only when paired with
+   the gateway commit in the same transition. They align journal/data revisions,
+   bind two exact one-sync file manifests and seven named finite namespace
+   manifests to the permit, distinguish Applicable/Converged/Conflict/
+   Superseded results, and allow physical materialization to lag the committed
+   envelope. This removes assumed action-level atomic result recording at the
+   bounded branch/gateway boundary, but it is not a Raft or Rust-journal
+   refinement and still fixes one request identity. Next, in order: compose the
+   gateway permit with canonical lock, sync, partition, no-conflict, and Raft
+   evidence; refine symbolic holders into byte-validated file/subtree retention
+   receipts; then add POSIX rename replacement, general payload-keyed namespace
+   replay, open-handle rename/unlink, and only afterward multi-operation
+   dependency graphs, cross-shard branches, hardlinks and symlinks, branch
+   gossip, and explicit service-produced merge candidates before Rust
+   implementation claims conformance.

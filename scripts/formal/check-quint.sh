@@ -66,7 +66,9 @@ register_case dfs-posix-partitioned-operation specs/quint/checks/dfs/posix_parti
 register_case dfs-local-first-file specs/quint/checks/dfs/local_first_file_branch_safety.qnt dfs_local_first_file_branch_safety "${QUINT_DFS_LOCAL_FIRST_FILE_VERIFY_MAX_STEPS:-4}" apalache step step fast "witnessVolatileWriteLostOnCrash witnessLocallySyncedTruncateSurvivesCrash witnessStalePlanRejected witnessLocalBranchApplied witnessLocalBranchConverged witnessLocalBranchConflictRetained witnessLostReplyExactRetry witnessChangedRetryRejected witnessChangedRetryBaseRejected witnessChangedRetryGenerationRejected witnessAuthorityReturnSealsDirtyBranch witnessAuthorityReturnFreezesUnsyncedBranch witnessFrozenBranchSurvivesRouteLoss witnessCleanFrozenBranchClosed witnessCanonicalQuorumLost witnessCanonicalQuorumRestored witnessRouteRestoredWithoutQuorum witnessExactRetryAfterProcessRestart witnessExactRetryWithConcurrentBase"
 register_case dfs-local-first-namespace specs/quint/checks/dfs/local_first_namespace_safety.qnt dfs_local_first_namespace_safety "${QUINT_DFS_LOCAL_FIRST_NAMESPACE_VERIFY_MAX_STEPS:-4}" apalache step step fast "witnessApplicable witnessConverged witnessConflictPreserved witnessSuperseded witnessStalePlanRejected witnessSameObjectAbaSuperseded witnessChildParentChangeConflicts witnessDirectoryRenamePreservesConcurrentChild witnessRmdirConcurrentChildConflicts"
 register_case dfs-local-first-namespace-durability specs/quint/checks/dfs/local_first_namespace_durability_safety.qnt dfs_local_first_namespace_durability_safety "${QUINT_DFS_LOCAL_FIRST_NAMESPACE_DURABILITY_VERIFY_MAX_STEPS:-8}" apalache step step fast "witnessReturnedMutationIsVolatile witnessVolatileMutationLostOnCrash witnessDirectoryFsyncMadeMutationDurable witnessDurableMutationSurvivesCrash witnessSealedExactDurableNamespace"
-register_case dfs-local-first-reconcile-gateway specs/quint/checks/dfs/local_first_reconcile_gateway_safety.qnt dfs_local_first_reconcile_gateway_safety "${QUINT_DFS_LOCAL_FIRST_RECONCILE_GATEWAY_VERIFY_MAX_STEPS:-4}" apalache step step fast "witnessPermitBuilt witnessApplyCommitted witnessConvergedCommitted witnessConflictCommitted witnessUncommittedAppendDiscardedByCrash witnessCommittedEntrySurvivesCrash witnessCommittedEntryMaterialized witnessExactRetryFromJournal witnessChangedPayloadRetryRejected witnessStaleHeadRejected witnessStaleEpochRejected witnessInsufficientEvidenceRejected"
+register_case dfs-local-first-reconcile-gateway specs/quint/checks/dfs/local_first_reconcile_gateway_safety.qnt dfs_local_first_reconcile_gateway_safety "${QUINT_DFS_LOCAL_FIRST_RECONCILE_GATEWAY_VERIFY_MAX_STEPS:-4}" apalache step step fast "witnessPermitBuilt witnessApplyCommitted witnessConvergedCommitted witnessConflictCommitted witnessSupersededCommitted witnessUncommittedAppendDiscardedByCrash witnessCommittedEntrySurvivesCrash witnessCommittedEntryMaterialized witnessExactRetryFromJournal witnessChangedPayloadRetryRejected witnessStaleHeadRejected witnessStaleEpochRejected witnessInsufficientEvidenceRejected"
+register_case dfs-local-first-file-gateway-composition specs/quint/checks/dfs/local_first_file_gateway_composition_safety.qnt dfs_local_first_file_gateway_composition_safety "${QUINT_DFS_LOCAL_FIRST_FILE_GATEWAY_COMPOSITION_VERIFY_MAX_STEPS:-4}" apalache step step fast "witnessComposedFileApplyPlanned witnessComposedFileConverged witnessComposedFileConflict witnessComposedFilePrecommitCrash witnessComposedFilePostcommitRecovery witnessComposedFileExactRetry witnessComposedFileChangedRetry"
+register_case dfs-local-first-namespace-gateway-composition specs/quint/checks/dfs/local_first_namespace_gateway_composition_safety.qnt dfs_local_first_namespace_gateway_composition_safety "${QUINT_DFS_LOCAL_FIRST_NAMESPACE_GATEWAY_COMPOSITION_VERIFY_MAX_STEPS:-4}" apalache step step fast "witnessComposedNamespaceApplicablePlanned witnessComposedNamespaceConverged witnessComposedNamespaceConflict witnessComposedNamespaceSuperseded witnessComposedNamespacePrecommitCrash witnessComposedNamespacePostcommitRecovery witnessComposedNamespaceExactRetry"
 register_case dfs-primary-failover specs/quint/checks/dfs/metadata_primary_failover_safety.qnt dfs_metadata_primary_failover_safety "${QUINT_DFS_PRIMARY_FAILOVER_VERIFY_MAX_STEPS:-3}"
 register_case dfs-namespace-command-replay specs/quint/checks/dfs/namespace_command_replay_safety.qnt dfs_namespace_command_replay_safety "${QUINT_DFS_NAMESPACE_REPLAY_VERIFY_MAX_STEPS:-5}" apalache step step deep "witnessExactResidentRetryReplays witnessSameRequestIdChangedPayloadExecutes witnessCancelledCommandStillExecutes witnessEvictedExactRetryReexecutes witnessRestartClearedRetryReexecutes witnessCancelledFreshIdRetryExecutes"
 register_case dfs-namespace-transaction specs/quint/checks/dfs/namespace_transaction_safety.qnt dfs_namespace_transaction_safety "${QUINT_DFS_NAMESPACE_VERIFY_MAX_STEPS:-$verify_steps}"
@@ -350,6 +352,18 @@ run_smoke_scenarios() {
     18 \
     1
   run_scenario \
+    dfs-local-first-file-gateway-composition \
+    specs/quint/scenarios/dfs/local_first_gateway_composition.qnt \
+    dfs_local_first_file_gateway_composition_scenario \
+    26 \
+    1
+  run_scenario \
+    dfs-local-first-namespace-gateway-composition \
+    specs/quint/scenarios/dfs/local_first_gateway_composition.qnt \
+    dfs_local_first_namespace_gateway_composition_scenario \
+    16 \
+    200
+  run_scenario \
     system-smoke \
     specs/quint/scenarios/system/smoke.qnt \
     system_smoke \
@@ -517,6 +531,103 @@ verify_cases() {
       16 \
       apalache \
       gatewayFencingFullSafetyStep
+  fi
+  if case_selected dfs-local-first-file-gateway-composition; then
+    verify_check \
+      dfs-local-first-file-gateway-composition-apply-full-safety \
+      specs/quint/checks/dfs/local_first_file_gateway_composition_safety.qnt \
+      dfs_local_first_file_gateway_composition_safety \
+      17 \
+      apalache \
+      fileGatewayApplyFullSafetyStep
+    verify_check \
+      dfs-local-first-file-gateway-composition-converge-full-safety \
+      specs/quint/checks/dfs/local_first_file_gateway_composition_safety.qnt \
+      dfs_local_first_file_gateway_composition_safety \
+      12 \
+      apalache \
+      fileGatewayConvergeFullSafetyStep
+    verify_check \
+      dfs-local-first-file-gateway-composition-truncate-apply-full-safety \
+      specs/quint/checks/dfs/local_first_file_gateway_composition_safety.qnt \
+      dfs_local_first_file_gateway_composition_safety \
+      17 \
+      apalache \
+      fileGatewayTruncateApplyFullSafetyStep
+    verify_check \
+      dfs-local-first-file-gateway-composition-conflict-full-safety \
+      specs/quint/checks/dfs/local_first_file_gateway_composition_safety.qnt \
+      dfs_local_first_file_gateway_composition_safety \
+      12 \
+      apalache \
+      fileGatewayConflictFullSafetyStep
+  fi
+  if case_selected dfs-local-first-namespace-gateway-composition; then
+    verify_check \
+      dfs-local-first-namespace-gateway-composition-applicable-full-safety \
+      specs/quint/checks/dfs/local_first_namespace_gateway_composition_safety.qnt \
+      dfs_local_first_namespace_gateway_composition_safety \
+      11 \
+      apalache \
+      namespaceGatewayApplicableFullSafetyStep
+  fi
+  if [[ "$requested_tier" == "all" ]] && case_selected dfs-local-first-namespace-gateway-composition; then
+    verify_check \
+      dfs-local-first-namespace-gateway-composition-converged-full-safety \
+      specs/quint/checks/dfs/local_first_namespace_gateway_composition_safety.qnt \
+      dfs_local_first_namespace_gateway_composition_safety \
+      11 \
+      apalache \
+      namespaceGatewayConvergedFullSafetyStep
+    verify_check \
+      dfs-local-first-namespace-gateway-composition-conflict-full-safety \
+      specs/quint/checks/dfs/local_first_namespace_gateway_composition_safety.qnt \
+      dfs_local_first_namespace_gateway_composition_safety \
+      11 \
+      apalache \
+      namespaceGatewayConflictFullSafetyStep
+    verify_check \
+      dfs-local-first-namespace-gateway-composition-superseded-full-safety \
+      specs/quint/checks/dfs/local_first_namespace_gateway_composition_safety.qnt \
+      dfs_local_first_namespace_gateway_composition_safety \
+      11 \
+      apalache \
+      namespaceGatewaySupersededFullSafetyStep
+    verify_check \
+      dfs-local-first-namespace-gateway-composition-create-child-full-safety \
+      specs/quint/checks/dfs/local_first_namespace_gateway_composition_safety.qnt \
+      dfs_local_first_namespace_gateway_composition_safety \
+      11 \
+      apalache \
+      namespaceGatewayCreateChildFullSafetyStep
+    verify_check \
+      dfs-local-first-namespace-gateway-composition-mkdir-full-safety \
+      specs/quint/checks/dfs/local_first_namespace_gateway_composition_safety.qnt \
+      dfs_local_first_namespace_gateway_composition_safety \
+      11 \
+      apalache \
+      namespaceGatewayMkdirFullSafetyStep
+    verify_check \
+      dfs-local-first-namespace-gateway-composition-rmdir-full-safety \
+      specs/quint/checks/dfs/local_first_namespace_gateway_composition_safety.qnt \
+      dfs_local_first_namespace_gateway_composition_safety \
+      11 \
+      apalache \
+      namespaceGatewayRmdirFullSafetyStep
+    verify_check \
+      dfs-local-first-namespace-gateway-composition-rename-file-full-safety \
+      specs/quint/checks/dfs/local_first_namespace_gateway_composition_safety.qnt \
+      dfs_local_first_namespace_gateway_composition_safety \
+      11 \
+      apalache \
+      namespaceGatewayRenameFileFullSafetyStep
+    verify_check \
+      dfs-local-first-namespace-gateway-composition-rename-directory-full-safety \
+      specs/quint/checks/dfs/local_first_namespace_gateway_composition_safety.qnt \
+      dfs_local_first_namespace_gateway_composition_safety \
+      11 \
+      apalache \
+      namespaceGatewayRenameDirectoryFullSafetyStep
   fi
 
   if [[ -n "$verify_lock_fd" ]]; then
