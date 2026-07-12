@@ -651,10 +651,12 @@ fn sandbox_cli_help() -> CliCommandHelp {
         [
             "  sinomo sandbox",
             "      Show sandbox commands.",
-            "  sinomo sandbox create [--daemon] [--id <sandbox-id>] [--toolchain <toolchain-id>] [--memory-mb <n>] [--wall-time-ms <n>] [--tmp clear|retain] [--mount <sifs-path>:<mount-path>[:ro|rw]]",
+            "  sinomo sandbox create [--daemon] [--id <lowercase-ulid>] [--toolchain <toolchain-id>] [--memory-mb <n>] [--wall-time-ms <ms>] [--tmp clear|retain] [--mount <sifs-path>:<mount-path>[:ro|rw]]",
             "      Create a sandbox instance.",
-            "  sinomo sandbox status|config|logs|ls|cat|write <sandbox-id> ... [--daemon]",
+            "  sinomo sandbox status|config|doctor|logs|ls|cat|write|fetch <sandbox-id> ... [--daemon]",
             "      View and manage sandbox metadata and files.",
+            "  sinomo sandbox checkpoint|resume|reboot|destroy <sandbox-id> ... [--daemon]",
+            "      Manage the sandbox lifecycle, including durable cleanup with `destroy`.",
             "  sinomo sandbox run <sandbox-id> [--daemon|--simple-native|--container-runtime docker|podman --container-image <image>] [--stdin] [--timeout-ms <ms>] <command> -- [args...]",
             "      Run a pinned toolchain command, native host command, container command, or explicit WASI module.",
             "  sinomo sandbox process-plan <sandbox-id> [--daemon|--simple-native|--container-runtime docker|podman --container-image <image>] <plan.json> [--timeout-ms <ms>]",
@@ -8129,6 +8131,23 @@ fn sandbox_mount_mode_label(mode: &crate::SandboxMountMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_help_exposes_lifecycle_and_id_requirements() {
+        let help = sandbox_cli_help();
+
+        assert!(
+            help.lines
+                .iter()
+                .any(|line| line.contains("<lowercase-ulid>"))
+        );
+        for command in ["checkpoint", "resume", "reboot", "destroy"] {
+            assert!(
+                help.lines.iter().any(|line| line.contains(command)),
+                "sandbox help is missing lifecycle command {command}"
+            );
+        }
+    }
 
     #[test]
     fn sandbox_doctor_reports_coding_toolchain_readiness() {
