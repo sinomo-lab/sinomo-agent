@@ -334,6 +334,7 @@ pub use mounted_sifs::{
     MountedSifsService, OpenedMountedSifsService, discover_mounted_sifs_content_replica_candidates,
     open_mounted_sifs_service, open_mounted_sifs_service_with_cancellation,
     open_mounted_sifs_service_with_peer_transports,
+    open_mounted_sifs_service_with_peer_transports_and_default_control_plane,
 };
 pub use namespace::{
     SIFS_NODES_PATH, SIFS_ROOT_PATH, SIFS_SERVICES_PATH, SIFS_SINOMO_PATH, SIFS_USERS_PATH,

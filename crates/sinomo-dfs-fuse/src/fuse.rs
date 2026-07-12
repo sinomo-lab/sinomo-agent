@@ -8,6 +8,7 @@ use fuser::{
     TimeOrNow,
 };
 use sinomo_runtime::dfs::{self, DfsError, DfsObjectKind, DfsPosixError, DfsWriteOptions};
+use sinomo_runtime::local::SinomoDataDir;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io;
@@ -131,11 +132,36 @@ struct SifsFuseFileSystem {
 
 impl SifsFuseFileSystem {
     fn open(options: DfsFuseMountOptions) -> Result<Self> {
+        let data_dir = match options.data_dir {
+            Some(path) => SinomoDataDir::new(path),
+            None => SinomoDataDir::from_env_or_home()
+                .map_err(|source| DfsFuseError::LocalData(source.to_string()))?,
+        };
         let dfs::OpenedMountedSifsService {
             service,
             replica_candidates,
-        } = dfs::open_mounted_sifs_service(options.data_dir)
-            .map_err(|source| DfsFuseError::Dfs(source.to_string()))?;
+        } = if sinomo_runtime::network::ClusterPaths::new(&data_dir)
+            .state
+            .exists()
+        {
+            let peer_transport = Arc::new(
+                sinomo_runtime::api::DaemonDfsPeerTransport::connect(data_dir.clone())
+                    .map_err(|source| DfsFuseError::Dfs(source.to_string()))?,
+            );
+            let sync_peer_transport: Arc<dyn dfs::DfsPeerTransport> = peer_transport.clone();
+            let async_peer_transport: Arc<dyn dfs::AsyncDfsPeerTransport> = peer_transport;
+            dfs::open_mounted_sifs_service_with_peer_transports_and_default_control_plane(
+                data_dir,
+                sync_peer_transport,
+                async_peer_transport,
+            )
+            .map_err(|source| DfsFuseError::Dfs(source.to_string()))?
+        } else {
+            // A standalone one-node data directory has no daemon-owned cluster
+            // transport to share, so retain the local-only mounted service.
+            dfs::open_mounted_sifs_service(Some(data_dir.root()))
+                .map_err(|source| DfsFuseError::Dfs(source.to_string()))?
+        };
         let dfs = Arc::new(Mutex::new(service));
         let state = Arc::new(Mutex::new(FuseState::new(options.root_path.clone())));
         let lock_mount_session_id = format!(

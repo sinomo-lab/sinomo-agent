@@ -605,6 +605,26 @@ pub(crate) async fn send_object_rpc_session_to_target_async_with_daemon_paths_an
     runtime: &tokio::runtime::Handle,
     observe_connectivity: bool,
 ) -> Result<ObjectRpcSessionResult, DaemonError> {
+    send_object_rpc_session_to_target_async_with_daemon_paths_and_network_error(
+        daemon_paths,
+        target_node_id,
+        call,
+        options,
+        runtime,
+        observe_connectivity,
+    )
+    .await
+    .map_err(DaemonError::from)
+}
+
+pub(crate) async fn send_object_rpc_session_to_target_async_with_daemon_paths_and_network_error(
+    daemon_paths: &DaemonPaths,
+    target_node_id: &NodeId,
+    call: ObjectRpcSessionCall,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+    runtime: &tokio::runtime::Handle,
+    observe_connectivity: bool,
+) -> Result<ObjectRpcSessionResult, sinomo_core::network::NetworkError> {
     let data_dir = daemon_data_dir_from_paths(daemon_paths)?;
     let paths = sinomo_core::network::ClusterPaths::new(&data_dir);
     let state = sinomo_core::cluster::read_cluster_state(&paths)?;
@@ -615,7 +635,6 @@ pub(crate) async fn send_object_rpc_session_to_target_async_with_daemon_paths_an
     client
         .call_target_session(&state, target_node_id, call, options)
         .await
-        .map_err(DaemonError::from)
 }
 
 fn block_on_daemon_client<F, T>(future: F) -> Result<T, DaemonError>

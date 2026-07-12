@@ -23,7 +23,9 @@ use sinomo_core::cluster::{
     ClusterHealthRow,
 };
 use sinomo_core::local::SinomoDataDir;
-use sinomo_core::network::{ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_core::network::{
+    ObjectRpcRequest, ObjectRpcResponse, ObjectRpcSessionCall, ObjectRpcSessionResult,
+};
 use sinomo_core::node::NodeId;
 use std::time::Duration;
 
@@ -236,26 +238,34 @@ impl DaemonApiClient {
         request: &ObjectRpcRequest,
         options: sinomo_dfs::DfsObjectRpcSendOptions,
     ) -> Result<ObjectRpcResponse, DaemonApiError> {
-        let effective_overall_timeout =
-            sinomo_core::network::cluster_object_rpc_effective_route_timeout(
-                request,
-                options.overall_timeout,
-            );
-        let request = object_rpc_forward_request(
-            DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
-            target_node_id,
-            request,
-            options.connect_timeout,
-            effective_overall_timeout,
-            options.observe_connectivity,
-        )?;
-        let response = send_daemon_rpc_with_timeouts(
-            &self.address,
-            &request,
-            self.object_rpc_forward_control_timeouts(effective_overall_timeout),
-        )?;
-        response.error_detail()?;
-        decode_daemon_object_rpc_forward_response(&response)
+        let data_dir = SinomoDataDir::from_env_or_home()?;
+        let address = self.address.clone();
+        let outer_timeouts =
+            sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(self.timeout);
+        let target_node_id = target_node_id.clone();
+        let request = request.clone();
+        block_on_daemon_client(async move {
+            let runtime = tokio::runtime::Handle::current();
+            let result = send_daemon_dfs_object_rpc_session_async(
+                data_dir,
+                &address,
+                &target_node_id,
+                ObjectRpcSessionCall::buffered(request),
+                options,
+                outer_timeouts,
+                None,
+                &runtime,
+            )
+            .await?;
+            let (mut response, body) = result.into_parts();
+            if !body.is_empty() {
+                response.body = body
+                    .collect_to_vec(sinomo_core::network::OBJECT_RPC_UNARY_ADAPTER_MAX_BODY_BYTES)
+                    .await?;
+            }
+            response.error_detail()?;
+            Ok(response)
+        })
     }
 
     fn call_control_payload(
@@ -467,6 +477,317 @@ fn decode_daemon_object_rpc_forward_response(
         // ObjectRpcResponse directly. Accept that legacy body until every node
         // runs the new envelope format.
         Err(_) => response.decode_body().map_err(DaemonApiError::from),
+    }
+}
+
+fn daemon_object_rpc_forward_error(
+    detail: String,
+    delivery_state: Option<DaemonObjectRpcForwardDeliveryState>,
+) -> DaemonApiError {
+    DaemonApiError::ForwardNetwork {
+        detail,
+        delivery_state: delivery_state.map(|state| match state {
+            DaemonObjectRpcForwardDeliveryState::DefinitelyNotSent => {
+                sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent
+            }
+            DaemonObjectRpcForwardDeliveryState::PossiblyApplied => {
+                sinomo_core::network::NetworkDeliveryState::PossiblyApplied
+            }
+        }),
+    }
+}
+
+fn decode_daemon_object_rpc_forward_session_response(
+    result: ObjectRpcSessionResult,
+) -> Result<ObjectRpcSessionResult, DaemonApiError> {
+    result.response.error_detail()?;
+    match result
+        .response
+        .decode_body::<DaemonObjectRpcForwardResponse>()
+    {
+        Ok(DaemonObjectRpcForwardResponse::Success { response }) => {
+            Ok(ObjectRpcSessionResult::new(response, result.body))
+        }
+        Ok(DaemonObjectRpcForwardResponse::NetworkError {
+            detail,
+            delivery_state,
+        }) => Err(daemon_object_rpc_forward_error(detail, delivery_state)),
+        Err(source) => Err(DaemonApiError::Parse {
+            detail: format!("invalid daemon DFS session-forward response: {source}"),
+        }),
+    }
+}
+
+async fn call_loopback_daemon_session_async(
+    data_dir: SinomoDataDir,
+    address: &str,
+    call: ObjectRpcSessionCall,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+    runtime: &tokio::runtime::Handle,
+) -> Result<ObjectRpcSessionResult, DaemonApiError> {
+    if !sinomo_core::network::is_loopback_connect_address(address) {
+        return Err(DaemonApiError::Network {
+            address: address.to_string(),
+            detail: "daemon-mediated DFS transport requires the local daemon loopback address"
+                .to_string(),
+        });
+    }
+    let mut host = DaemonApiSessionHost {
+        data_dir: data_dir.clone(),
+        runtime: runtime.clone(),
+    };
+    let ObjectRpcSessionCall { mut request, body } = call;
+    request.auth = None;
+    sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host)
+        .call_loopback_session(
+            &data_dir,
+            address,
+            ObjectRpcSessionCall::new(request, body),
+            options,
+        )
+        .await
+        .map_err(Into::into)
+}
+
+async fn send_daemon_dfs_object_rpc_session_async(
+    data_dir: SinomoDataDir,
+    address: &str,
+    target_node_id: &NodeId,
+    call: ObjectRpcSessionCall,
+    options: sinomo_dfs::DfsObjectRpcSendOptions,
+    outer_timeouts: sinomo_core::network::DaemonRpcTimeouts,
+    known_local_node_id: Option<&NodeId>,
+    runtime: &tokio::runtime::Handle,
+) -> Result<ObjectRpcSessionResult, DaemonApiError> {
+    let effective_overall_timeout =
+        sinomo_core::network::cluster_object_rpc_effective_route_timeout(
+            &call.request,
+            options.overall_timeout,
+        );
+    let target_is_local = match known_local_node_id {
+        Some(local_node_id) => target_node_id == local_node_id,
+        None => {
+            let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+            let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+            target_node_id == &state.local_node_id
+        }
+    };
+    if target_is_local {
+        let mut local_options = sinomo_core::network::ClusterObjectRpcOptions::new(outer_timeouts);
+        if let Some(overall_timeout) = effective_overall_timeout {
+            local_options = local_options.with_overall_timeout(overall_timeout);
+        }
+        return call_loopback_daemon_session_async(data_dir, address, call, local_options, runtime)
+            .await;
+    }
+    let forward_request = object_rpc_forward_request(
+        DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
+        target_node_id,
+        &call.request,
+        options.connect_timeout,
+        effective_overall_timeout,
+        options.observe_connectivity,
+    )?;
+    let outer = ObjectRpcSessionCall::new(forward_request, call.body);
+    let result = call_loopback_daemon_session_async(
+        data_dir,
+        address,
+        outer,
+        sinomo_core::network::ClusterObjectRpcOptions::new(outer_timeouts),
+        runtime,
+    )
+    .await?;
+    decode_daemon_object_rpc_forward_session_response(result)
+}
+
+/// DFS peer transport that deliberately terminates at the running local
+/// daemon. The daemon owns endpoint selection, retries, authentication, and
+/// canonical TCP tunnels; mounted clients never open a competing cluster
+/// router or fall back to direct advertised endpoints.
+#[derive(Clone, Debug)]
+pub struct DaemonDfsPeerTransport {
+    data_dir: SinomoDataDir,
+    address: String,
+    local_node_id: NodeId,
+    runtime: std::sync::Arc<tokio::runtime::Runtime>,
+}
+
+impl DaemonDfsPeerTransport {
+    /// Discovers and probes the main daemon for `data_dir` once, when a mounted
+    /// service is opened. Clustered mounts fail closed when no local daemon is
+    /// available instead of silently changing transport semantics.
+    pub fn connect(data_dir: SinomoDataDir) -> Result<Self, DaemonApiError> {
+        data_dir.ensure_root_layout()?;
+        let client = DaemonApiClient::connect_for_paths(&DaemonPaths::new(&data_dir))?;
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        let local_node_id =
+            sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?.local_node_id;
+        let runtime = daemon_dfs_peer_runtime()?;
+        Ok(Self {
+            data_dir,
+            address: client.address,
+            local_node_id,
+            runtime,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn at_address(
+        data_dir: SinomoDataDir,
+        address: impl Into<String>,
+        local_node_id: NodeId,
+    ) -> Self {
+        Self {
+            data_dir,
+            address: address.into(),
+            local_node_id,
+            runtime: daemon_dfs_peer_runtime().expect("daemon DFS peer runtime"),
+        }
+    }
+
+    async fn call_session_inner(
+        &self,
+        target_node_id: &NodeId,
+        call: ObjectRpcSessionCall,
+        options: sinomo_dfs::DfsObjectRpcSendOptions,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<ObjectRpcSessionResult, DaemonApiError> {
+        send_daemon_dfs_object_rpc_session_async(
+            self.data_dir.clone(),
+            &self.address,
+            target_node_id,
+            call,
+            options,
+            sinomo_core::network::DaemonRpcTimeouts::default(),
+            Some(&self.local_node_id),
+            runtime,
+        )
+        .await
+    }
+}
+
+fn daemon_dfs_peer_runtime() -> Result<std::sync::Arc<tokio::runtime::Runtime>, DaemonApiError> {
+    static SHARED: std::sync::OnceLock<Result<std::sync::Arc<tokio::runtime::Runtime>, String>> =
+        std::sync::OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("sinomo-daemon-dfs-peer")
+                .enable_all()
+                .build()
+                .map(std::sync::Arc::new)
+                .map_err(|source| source.to_string())
+        })
+        .clone()
+        .map_err(|detail| DaemonApiError::Network {
+            address: "daemon DFS peer runtime".to_string(),
+            detail,
+        })
+}
+
+impl sinomo_dfs::DfsPeerTransport for DaemonDfsPeerTransport {
+    fn call_object_rpc(
+        &self,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        options: sinomo_dfs::DfsObjectRpcSendOptions,
+    ) -> Result<ObjectRpcResponse, sinomo_dfs::DfsPeerTransportError> {
+        let call = ObjectRpcSessionCall::buffered(request.clone());
+        let runtime = self.runtime.handle().clone();
+        block_on_daemon_client_on_owner_runtime(&runtime, async {
+            let result = self
+                .call_session_inner(target_node_id, call, options, &runtime)
+                .await?;
+            let (mut response, body) = result.into_parts();
+            if !body.is_empty() {
+                response.body = body
+                    .collect_to_vec(sinomo_core::network::OBJECT_RPC_UNARY_ADAPTER_MAX_BODY_BYTES)
+                    .await?;
+            }
+            response.error_detail()?;
+            Ok(response)
+        })
+        .map_err(|source| sinomo_dfs::DfsPeerTransportError::new(source.to_string()))
+    }
+
+    fn call_object_rpc_session(
+        &self,
+        target_node_id: &NodeId,
+        call: ObjectRpcSessionCall,
+        options: sinomo_dfs::DfsObjectRpcSendOptions,
+    ) -> Result<ObjectRpcSessionResult, sinomo_dfs::DfsPeerTransportError> {
+        let runtime = self.runtime.handle().clone();
+        block_on_daemon_client_on_owner_runtime(&runtime, async {
+            self.call_session_inner(target_node_id, call, options, &runtime)
+                .await
+        })
+        .and_then(|result| {
+            result.response.error_detail()?;
+            Ok(result)
+        })
+        .map_err(|source| sinomo_dfs::DfsPeerTransportError::new(source.to_string()))
+    }
+}
+
+impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsPeerTransport {
+    fn call_object_rpc_async<'a>(
+        &'a self,
+        target_node_id: &'a NodeId,
+        request: &'a ObjectRpcRequest,
+        options: sinomo_dfs::DfsObjectRpcSendOptions,
+    ) -> sinomo_dfs::DfsPeerTransportFuture<
+        'a,
+        Result<ObjectRpcResponse, sinomo_dfs::DfsPeerTransportError>,
+    > {
+        Box::pin(async move {
+            let runtime = tokio::runtime::Handle::try_current()
+                .map_err(|source| sinomo_dfs::DfsPeerTransportError::new(source.to_string()))?;
+            let result = self
+                .call_session_inner(
+                    target_node_id,
+                    ObjectRpcSessionCall::buffered(request.clone()),
+                    options,
+                    &runtime,
+                )
+                .await
+                .map_err(|source| sinomo_dfs::DfsPeerTransportError::new(source.to_string()))?;
+            let (mut response, body) = result.into_parts();
+            if !body.is_empty() {
+                response.body = body
+                    .collect_to_vec(sinomo_core::network::OBJECT_RPC_UNARY_ADAPTER_MAX_BODY_BYTES)
+                    .await
+                    .map_err(|source| sinomo_dfs::DfsPeerTransportError::new(source.to_string()))?;
+            }
+            response
+                .error_detail()
+                .map_err(|source| sinomo_dfs::DfsPeerTransportError::new(source.to_string()))?;
+            Ok(response)
+        })
+    }
+
+    fn call_object_rpc_session_async<'a>(
+        &'a self,
+        target_node_id: &'a NodeId,
+        call: ObjectRpcSessionCall,
+        options: sinomo_dfs::DfsObjectRpcSendOptions,
+    ) -> sinomo_dfs::DfsPeerTransportFuture<
+        'a,
+        Result<ObjectRpcSessionResult, sinomo_dfs::DfsPeerTransportError>,
+    > {
+        Box::pin(async move {
+            let runtime = tokio::runtime::Handle::try_current()
+                .map_err(|source| sinomo_dfs::DfsPeerTransportError::new(source.to_string()))?;
+            let result = self
+                .call_session_inner(target_node_id, call, options, &runtime)
+                .await
+                .map_err(|source| sinomo_dfs::DfsPeerTransportError::new(source.to_string()))?;
+            result
+                .response
+                .error_detail()
+                .map_err(|source| sinomo_dfs::DfsPeerTransportError::new(source.to_string()))?;
+            Ok(result)
+        })
     }
 }
 
@@ -1214,6 +1535,30 @@ mod tests {
     }
 
     #[test]
+    fn forward_session_response_preserves_trusted_delivery_state() {
+        let outer = ObjectRpcResponse::encode_body(
+            DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
+            &DaemonObjectRpcForwardResponse::NetworkError {
+                detail: "session forward failed".to_string(),
+                delivery_state: Some(DaemonObjectRpcForwardDeliveryState::PossiblyApplied),
+            },
+        )
+        .expect("outer response");
+        let error = decode_daemon_object_rpc_forward_session_response(
+            ObjectRpcSessionResult::buffered(outer),
+        )
+        .expect_err("forward session response must fail");
+
+        assert!(matches!(
+            error,
+            DaemonApiError::ForwardNetwork {
+                delivery_state: Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied),
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn forward_response_decoder_accepts_legacy_inner_response_body() {
         let inner = ObjectRpcResponse::encode_body("/test/legacy", &"ok").expect("inner response");
         let outer = ObjectRpcResponse::encode_body(DAEMON_OBJECT_RPC_FORWARD_ROUTE, &inner)
@@ -1222,6 +1567,122 @@ mod tests {
         assert_eq!(
             decode_daemon_object_rpc_forward_response(&outer).expect("legacy response"),
             inner
+        );
+    }
+
+    #[test]
+    fn dfs_forward_session_preserves_the_client_outer_health_timeout() {
+        let client =
+            DaemonApiClient::at_address("127.0.0.1:21353").with_timeout(Duration::from_secs(9));
+        let timeouts = client.object_rpc_forward_control_timeouts(None);
+
+        assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(9)));
+        assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(9)));
+    }
+
+    #[tokio::test]
+    async fn daemon_dfs_peer_transport_dispatches_local_target_directly_with_bodies() {
+        let root = sinomo_testdir::TestDir::new("sinomo-api-dfs-local-target-session");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data directory");
+        let identity = sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
+            .expect("main identity");
+        let local_node =
+            NodeId::from_legacy_named("node_api_dfs_local_target_session").expect("local node");
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_api_dfs_local_target_session")
+                .expect("cluster id"),
+            "API DFS local target session",
+            local_node.clone(),
+            "local",
+            identity.public_key,
+            time::OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+
+        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("listener address");
+        let request_body = vec![0x41_u8; 512 * 1024 + 31];
+        let response_body = vec![0x52_u8; 768 * 1024 + 47];
+        let expected_request = request_body.clone();
+        let server_response = response_body.clone();
+        let server_data_dir = data_dir.clone();
+        let server = tokio::spawn(async move {
+            let stream = listener
+                .accept()
+                .await
+                .expect("accept local daemon session");
+            let (incoming, responder) = sinomo_core::network::accept_object_rpc_server_session(
+                Box::new(stream.into_inner()),
+                server_data_dir,
+                sinomo_core::network::NetworkCallPolicy::default(),
+                |_request, _node_id, _public_key| Ok(()),
+            )
+            .await
+            .expect("accept authenticated session");
+            assert_eq!(
+                incoming.request.route,
+                sinomo_core::kv::CLUSTER_KV_TXN_ROUTE
+            );
+            assert_eq!(
+                incoming
+                    .body
+                    .collect_to_vec(1024 * 1024)
+                    .await
+                    .expect("local request body"),
+                expected_request
+            );
+            responder
+                .respond(sinomo_core::network::ObjectRpcSessionResponse {
+                    response: ObjectRpcResponse::encode_body(
+                        sinomo_core::kv::CLUSTER_KV_TXN_ROUTE,
+                        &"local-ok",
+                    )
+                    .expect("local response head"),
+                    body: sinomo_core::network::ObjectRpcBodySource::bytes(server_response),
+                })
+                .await
+                .expect("local response");
+        });
+
+        let transport = DaemonDfsPeerTransport::at_address(data_dir, address, local_node.clone());
+        let request = ObjectRpcRequest::encode_body(
+            sinomo_core::kv::CLUSTER_KV_TXN_ROUTE,
+            sinomo_core::kv::CLUSTER_KV_RPC_CATEGORY,
+            &"local-request",
+        )
+        .expect("local request head");
+        let result = sinomo_dfs::AsyncDfsPeerTransport::call_object_rpc_session_async(
+            &transport,
+            &local_node,
+            ObjectRpcSessionCall::new(
+                request,
+                sinomo_core::network::ObjectRpcBodySource::bytes(request_body),
+            ),
+            sinomo_dfs::DfsObjectRpcSendOptions::default()
+                .with_overall_timeout(Duration::from_secs(30)),
+        )
+        .await
+        .expect("local target session");
+        server.await.expect("server task");
+
+        assert_eq!(
+            result
+                .response
+                .decode_body::<String>()
+                .expect("local response"),
+            "local-ok"
+        );
+        assert_eq!(
+            result
+                .body
+                .collect_to_vec(1024 * 1024)
+                .await
+                .expect("local response body"),
+            response_body
         );
     }
 }
