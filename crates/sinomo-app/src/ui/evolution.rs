@@ -8,11 +8,13 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 use sui::{
-    ArrangeCtx, Button, Color, Constraints, DefaultTheme, Event, EventCtx, FontWeight, IconGlyph,
-    KeyState, MeasureCtx, PaintCtx, Path, PointerButton, PointerEventKind, Rect, ScrollDelta,
-    Select, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Size,
-    StrokeStyle, TextInput, Widget, WidgetId, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    WindowEvent,
+    Alignment, ArrangeCtx, Button, Color, Constraints, ControlSize, DefaultTheme, DetailRow,
+    EmptyState, Event, EventCtx, Flex, FlexItem, FontWeight, IconGlyph, Insets, KeyState, Label,
+    MeasureCtx, PaintCtx, PanelSection, Path, PointerButton, PointerEventKind, PropertyRow, Rect,
+    ScrollDelta, ScrollView, SectionLabel, Select, SemanticTone, SemanticsAction, SemanticsCtx,
+    SemanticsNode, SemanticsRole, SemanticsValue, Size, SizedBox, StatusBadge, StrokeStyle,
+    Surface, SurfaceAppearance, SurfaceBorder, SurfaceRole, TextInput, Widget, WidgetId, WidgetPod,
+    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
 };
 
 use crate::backend::Backend;
@@ -29,17 +31,16 @@ use sinomo_runtime::local::SinomoDataDir;
 const HEADER_H: f32 = 78.0;
 const PAD: f32 = 20.0;
 const GAP: f32 = 14.0;
-const START_WIDE_H: f32 = 124.0;
-const START_NARROW_COLLAPSED_H: f32 = 206.0;
-const START_NARROW_EXPANDED_H: f32 = 270.0;
+const START_WIDE_HEADER_H: f32 = 42.0;
+const START_NARROW_HEADER_H: f32 = 60.0;
 const START_BREAKPOINT: f32 = 760.0;
-const CONTROL_LABEL_H: f32 = 14.0;
+const CONTROL_LABEL_H: f32 = 18.0;
 const CONTROL_LABEL_GAP: f32 = 4.0;
-/// Form controls ride the Mesh large control height (`--sm-ctl-h-lg`).
-const CONTROL_H: f32 = 34.0;
+/// Evolution's start form is a dense configuration surface, so its fields use Small.
+const CONTROL_H: f32 = 28.0;
 const CONTROL_GAP: f32 = 8.0;
 const STARTER_ACTION_COUNT: usize = 3;
-const STARTER_ACTION_H: f32 = 30.0;
+const STARTER_ACTION_H: f32 = 28.0;
 const STARTER_ACTION_GAP: f32 = 8.0;
 const START_OPTIONS_W: f32 = 112.0;
 const START_BUTTON_W: f32 = 112.0;
@@ -48,17 +49,92 @@ const TRUNCATION_MARKER: &str = "...";
 const QUEUE_W: f32 = 306.0;
 const RAIL_W: f32 = 318.0;
 const QUEUE_HEADER_H: f32 = 48.0;
-const ROW_H: f32 = 78.0;
+const QUEUE_ROW_MIN_H: f32 = 78.0;
+const QUEUE_ROW_TOP_PAD: f32 = 8.0;
+const QUEUE_ROW_LINE_GAP: f32 = 2.0;
+const QUEUE_ROW_BOTTOM_PAD: f32 = 8.0;
 const QUEUE_SCROLLBAR_W: f32 = 3.0;
-const SECTION_GAP: f32 = 16.0;
 const DECISION_SECTION_H: f32 = 146.0;
 const NARROW_ACTION_BAR_H: f32 = 72.0;
-/// Decision actions use the Mesh control height (`--sm-ctl-h`).
+/// Sticky queue decisions remain Small so the review surface keeps priority.
 const DECISION_BUTTON_H: f32 = 28.0;
 const READINESS_DETAIL_BUTTON_W: f32 = 136.0;
 const OBJECTIVE_PLACEHOLDER: &str = "Describe the improvement or task";
 const SCOPE_PLACEHOLDER: &str = "Optional: path globs, comma-separated";
 const EVOLUTION_EMPTY_SUBTITLE: &str = "Describe an objective above, then Start.";
+const LIFECYCLE_MIN_H: f32 = 66.0;
+const LIFECYCLE_TOP_PAD: f32 = 8.0;
+const LIFECYCLE_DOT_RADIUS: f32 = 10.0;
+const LIFECYCLE_LABEL_GAP: f32 = 4.0;
+const LIFECYCLE_BOTTOM_PAD: f32 = 8.0;
+const LIFECYCLE_LABEL_HORIZONTAL_GAP: f32 = 4.0;
+
+#[derive(Clone, Copy, Debug)]
+struct QueueRowMetrics {
+    height: f32,
+    title_top: f32,
+    title_line_height: f32,
+    meta_top: f32,
+    meta_line_height: f32,
+    target_top: f32,
+    target_line_height: f32,
+}
+
+impl QueueRowMetrics {
+    fn for_theme(theme: &DefaultTheme) -> Self {
+        let title_line_height = theme.text.sm.line_height.max(1.0);
+        let meta_line_height = theme.text.xs.line_height.max(1.0);
+        let target_line_height = theme.text.xs.line_height.max(1.0);
+        let title_top = QUEUE_ROW_TOP_PAD;
+        let meta_top = title_top + title_line_height + QUEUE_ROW_LINE_GAP;
+        let target_top = meta_top + meta_line_height + QUEUE_ROW_LINE_GAP;
+        let natural_height = target_top + target_line_height + QUEUE_ROW_BOTTOM_PAD;
+        Self {
+            height: natural_height.max(QUEUE_ROW_MIN_H),
+            title_top,
+            title_line_height,
+            meta_top,
+            meta_line_height,
+            target_top,
+            target_line_height,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LifecycleMetrics {
+    height: f32,
+    track_center_y: f32,
+    label_top: f32,
+    label_line_height: f32,
+}
+
+impl LifecycleMetrics {
+    fn for_theme(theme: &DefaultTheme) -> Self {
+        let label_line_height = theme.text.xs.line_height.max(1.0);
+        let track_center_y = LIFECYCLE_TOP_PAD + LIFECYCLE_DOT_RADIUS;
+        let label_top = track_center_y + LIFECYCLE_DOT_RADIUS + LIFECYCLE_LABEL_GAP;
+        let natural_height = label_top + label_line_height + LIFECYCLE_BOTTOM_PAD;
+        Self {
+            height: natural_height.max(LIFECYCLE_MIN_H),
+            track_center_y,
+            label_top,
+            label_line_height,
+        }
+    }
+
+    fn label_center_y(self) -> f32 {
+        self.label_top + self.label_line_height * 0.5
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LifecycleLabelPlacement {
+    index: usize,
+    center_x: f32,
+    left: f32,
+    right: f32,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct EvolutionDashboardRequestId(u64);
@@ -721,27 +797,14 @@ fn theme_reader(shared: &Shared) -> ThemeReader {
     Rc::new(move || shared.theme())
 }
 
+fn small_theme_reader(shared: &Shared) -> ThemeReader {
+    let shared = shared.clone();
+    Rc::new(move || shared.theme().with_size(ControlSize::Small))
+}
+
 fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     let reader = Rc::clone(reader);
     move || reader()
-}
-
-/// Quiet Mesh neutral treatment for secondary actions: surface-2 fill,
-/// hairline border, ink label. Keeps the accent budget for the one primary
-/// action per view.
-fn secondary_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
-    let reader = Rc::clone(reader);
-    move || {
-        let mut theme = reader();
-        theme.palette.accent = theme.palette.control;
-        theme.palette.accent_hover = theme.palette.control_hover;
-        theme.palette.accent_pressed = theme.palette.control_active;
-        theme.palette.accent_border = theme.palette.border;
-        theme.palette.accent_border_hover = theme.palette.border_hover;
-        theme.palette.accent_border_focus = theme.palette.border_focus;
-        theme.palette.accent_text = theme.palette.text;
-        theme
-    }
 }
 
 struct RebuildOnChange<K: PartialEq + Clone> {
@@ -836,13 +899,862 @@ fn ready_backend(shared: &Shared) -> Option<Backend> {
         .map(|ready| ready.backend.clone())
 }
 
+fn evolution_theme_signature(shared: &Shared) -> String {
+    let app = shared.borrow();
+    format!("{:?}:{:?}", app.theme_mode, app.text_scale)
+}
+
+fn evolution_header_signature(shared: &Shared) -> String {
+    let theme = evolution_theme_signature(shared);
+    let state = shared.evolution();
+    format!(
+        "{theme}|{:?}|{}|{:?}",
+        state.dashboard,
+        state.dashboard_refresh_pending(),
+        state.dashboard_refresh_error()
+    )
+}
+
+fn evolution_header_host(shared: &Shared, reader: &ThemeReader) -> sui::RebuildOnChange<String> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    sui::RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || evolution_header_signature(&s)
+        },
+        move |_key| {
+            let build_s = s.clone();
+            let build_r = Rc::clone(&r);
+            WidgetPod::new(sui::RebuildOnConstraints::new(
+                true,
+                move |constraints| {
+                    let width = if constraints.max.width.is_finite() {
+                        constraints.max.width
+                    } else {
+                        constraints.min.width
+                    };
+                    width >= 740.0
+                },
+                move |show_metrics| build_evolution_header(&build_s, &build_r, *show_metrics),
+            ))
+        },
+    )
+}
+
+fn build_evolution_header(shared: &Shared, reader: &ThemeReader, show_metrics: bool) -> WidgetPod {
+    let (dashboard, refresh_pending, refresh_error) = {
+        let state = shared.evolution();
+        (
+            state.dashboard.clone(),
+            state.dashboard_refresh_pending(),
+            state.dashboard_refresh_error().map(str::to_string),
+        )
+    };
+    let theme = shared.theme();
+    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
+    let subtitle = evolution_header_subtitle_with_refresh(
+        &dashboard,
+        refresh_pending,
+        refresh_error.as_deref(),
+    );
+    let subtitle_color = if refresh_error.is_some() {
+        pal.bad
+    } else if refresh_pending {
+        pal.accent_text
+    } else {
+        pal.text_muted
+    };
+
+    let summary = Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .gap(2.0)
+        .with_child(Label::new("Evolution").style(pal.text_style(
+            &theme,
+            theme.text.xl.size,
+            FontWeight::SEMIBOLD,
+            pal.text,
+        )))
+        .with_child(Label::new(subtitle).style(pal.text_style(
+            &theme,
+            theme.text.sm.size,
+            FontWeight::NORMAL,
+            subtitle_color,
+        )));
+    let mut row = Flex::horizontal()
+        .align_items(Alignment::Center)
+        .gap(8.0)
+        .with_item(summary, FlexItem::flex(1.0).min_width(0.0));
+    if show_metrics {
+        row.push(
+            StatusBadge::new(format!("{} awaiting", dashboard.awaiting_decision_count()))
+                .tone(SemanticTone::Warning)
+                .theme_when(clone_reader(reader)),
+        );
+        row.push(
+            StatusBadge::new(format!("{} failed", dashboard.failed_count()))
+                .tone(SemanticTone::Danger)
+                .theme_when(clone_reader(reader)),
+        );
+        row.push(
+            StatusBadge::new(format!("{} promoted", dashboard.promoted_count()))
+                .tone(SemanticTone::Success)
+                .theme_when(clone_reader(reader)),
+        );
+    }
+
+    WidgetPod::new(
+        Surface::window(row)
+            .border(SurfaceBorder::Bottom)
+            .padding(Insets {
+                left: PAD,
+                right: PAD,
+                top: 10.0,
+                bottom: 10.0,
+            })
+            .fill()
+            .theme_when(clone_reader(reader)),
+    )
+}
+
+fn evolution_queue_header_host(
+    shared: &Shared,
+    reader: &ThemeReader,
+) -> sui::RebuildOnChange<String> {
+    let s = shared.clone();
+    let build_s = shared.clone();
+    let r = Rc::clone(reader);
+    sui::RebuildOnChange::new(
+        move || evolution_theme_signature(&s),
+        move |_key| {
+            let theme = r();
+            let pal = Palette::from_theme(&theme, widgets::theme_is_dark(&build_s));
+            let column = Flex::vertical()
+                .align_items(Alignment::Stretch)
+                .gap(1.0)
+                .with_child(Label::new("Candidate queue").style(pal.text_style(
+                    &theme,
+                    theme.text.sm.size,
+                    FontWeight::SEMIBOLD,
+                    pal.text,
+                )))
+                .with_child(Label::new("Observed to promoted").style(pal.text_style(
+                    &theme,
+                    theme.text.xs.size,
+                    FontWeight::NORMAL,
+                    pal.text_faint,
+                )));
+            WidgetPod::new(
+                Surface::new(SurfaceRole::Sidebar, column)
+                    .border(SurfaceBorder::Bottom)
+                    .padding(Insets {
+                        left: PAD,
+                        top: 6.0,
+                        right: PAD,
+                        bottom: 6.0,
+                    })
+                    .fill()
+                    .theme_when(clone_reader(&r)),
+            )
+        },
+    )
+}
+
+fn evolution_queue_empty_signature(shared: &Shared) -> String {
+    let theme = evolution_theme_signature(shared);
+    let state = shared.evolution();
+    format!(
+        "{theme}|{}|{:?}",
+        state.dashboard.jobs.is_empty(),
+        state.dashboard.error
+    )
+}
+
+fn evolution_queue_empty_host(
+    shared: &Shared,
+    reader: &ThemeReader,
+) -> sui::RebuildOnChange<String> {
+    let s = shared.clone();
+    let build_s = shared.clone();
+    let r = Rc::clone(reader);
+    sui::RebuildOnChange::new(
+        move || evolution_queue_empty_signature(&s),
+        move |_key| {
+            let message = build_s
+                .evolution()
+                .dashboard
+                .error
+                .clone()
+                .unwrap_or_else(|| "Start a job to create the first candidate".to_string());
+            WidgetPod::new(
+                EmptyState::new("No candidates", compact(&message, 48))
+                    .name("Evolution candidate queue empty")
+                    .icon(IconGlyph::Sparkles)
+                    .transparent()
+                    .theme_when(clone_reader(&r)),
+            )
+        },
+    )
+}
+
+fn evolution_start_signature(shared: &Shared) -> String {
+    let theme = evolution_theme_signature(shared);
+    let state = shared.evolution();
+    format!(
+        "{theme}|{}|{}|{}|{}|{:?}|{:?}|{:?}",
+        state.objective_draft,
+        state.scope_draft,
+        state.target_ring_index,
+        state.start_advanced_open,
+        state.start_status,
+        state.start_error,
+        state.dashboard
+    )
+}
+
+fn evolution_start_chrome_host(
+    shared: &Shared,
+    reader: &ThemeReader,
+) -> sui::RebuildOnChange<String> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    sui::RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || evolution_start_signature(&s)
+        },
+        move |_key| {
+            let build_s = s.clone();
+            let build_r = Rc::clone(&r);
+            WidgetPod::new(sui::RebuildOnConstraints::new(
+                (true, true),
+                move |constraints| {
+                    let width = if constraints.max.width.is_finite() {
+                        constraints.max.width
+                    } else {
+                        constraints.min.width
+                    };
+                    (width >= 640.0, (width - PAD * 2.0) >= START_BREAKPOINT)
+                },
+                move |(inline, wide_header)| {
+                    build_evolution_start_chrome(&build_s, &build_r, *inline, *wide_header)
+                },
+            ))
+        },
+    )
+}
+
+fn evolution_start_status(shared: &Shared) -> (String, SemanticTone) {
+    let state = shared.evolution();
+    if let Some(error) = &state.start_error {
+        return (
+            format!("Failed - {}", compact(error, 108)),
+            SemanticTone::Danger,
+        );
+    }
+    if let Some(status) = &state.start_status {
+        return (
+            compact(status, 108),
+            if state.is_starting() {
+                SemanticTone::Accent
+            } else {
+                SemanticTone::Success
+            },
+        );
+    }
+    let objective = state.objective_draft.trim();
+    if objective.is_empty() {
+        let label = if state.dashboard.jobs.is_empty() {
+            "Enter an objective to start a supervised evolution job".to_string()
+        } else {
+            format!(
+                "Enter an objective to start - {} jobs tracked",
+                state.dashboard.jobs.len()
+            )
+        };
+        return (label, SemanticTone::Neutral);
+    }
+    if state.start_advanced_open {
+        let ring = EVOLUTION_TARGET_RINGS
+            .get(state.target_ring_index)
+            .map(|option| option.label)
+            .unwrap_or("R1 runtime");
+        let scope_count = parse_scope_paths(&state.scope_draft).len();
+        let scope = match scope_count {
+            0 => "workspace policy scope".to_string(),
+            1 => "1 scoped path".to_string(),
+            count => format!("{count} scoped paths"),
+        };
+        (format!("Ready for {ring} - {scope}"), SemanticTone::Accent)
+    } else {
+        (
+            "Ready to start - use Options for scope and target ring".to_string(),
+            SemanticTone::Accent,
+        )
+    }
+}
+
+fn build_evolution_start_chrome(
+    shared: &Shared,
+    reader: &ThemeReader,
+    inline: bool,
+    wide_header: bool,
+) -> WidgetPod {
+    let theme = shared.theme();
+    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
+    let (status, tone) = evolution_start_status(shared);
+    let status_color = if tone == SemanticTone::Neutral {
+        pal.text_muted
+    } else {
+        theme.semantic_tone_color(tone)
+    };
+    let title = Label::new("Start job").style(pal.text_style(
+        &theme,
+        theme.text.base.size,
+        FontWeight::SEMIBOLD,
+        pal.text,
+    ));
+    let status = Label::new(status).style(pal.text_style(
+        &theme,
+        theme.text.sm.size,
+        FontWeight::MEDIUM,
+        status_color,
+    ));
+    let header = if inline {
+        Flex::horizontal()
+            .align_items(Alignment::Center)
+            .gap(18.0)
+            .with_child(title)
+            .with_item(status, FlexItem::flex(1.0).min_width(0.0))
+    } else {
+        Flex::vertical()
+            .align_items(Alignment::Stretch)
+            .gap(1.0)
+            .with_child(title)
+            .with_child(status)
+    };
+    let header_height = if wide_header {
+        START_WIDE_HEADER_H
+    } else {
+        START_NARROW_HEADER_H
+    };
+    let header = Surface::window(header)
+        .padding(Insets {
+            left: PAD,
+            right: PAD,
+            top: if inline { 8.0 } else { 7.0 },
+            bottom: if inline { 8.0 } else { 7.0 },
+        })
+        .fill_width()
+        .theme_when(clone_reader(reader));
+    let body = Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .with_child(SizedBox::new().height(header_height).with_child(header))
+        .spacer();
+    WidgetPod::new(
+        Surface::window(body)
+            .border(SurfaceBorder::Bottom)
+            .fill()
+            .theme_when(clone_reader(reader)),
+    )
+}
+
+fn evolution_detail_signature(shared: &Shared) -> String {
+    let theme = evolution_theme_signature(shared);
+    let state = shared.evolution();
+    let selected = state
+        .selected
+        .and_then(|index| state.dashboard.jobs.get(index));
+    format!(
+        "{theme}|{:?}|{}|{}|{:?}|{:?}",
+        selected,
+        state.can_start(),
+        state.is_starting(),
+        state.start_status,
+        state.start_error
+    )
+}
+
+fn evolution_detail_host(shared: &Shared, reader: &ThemeReader) -> sui::RebuildOnChange<String> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    sui::RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || evolution_detail_signature(&s)
+        },
+        move |_key| build_evolution_detail(&s, &r),
+    )
+}
+
+fn phase_tone(phase: EvolutionPhase) -> SemanticTone {
+    match phase {
+        EvolutionPhase::Active => SemanticTone::Accent,
+        EvolutionPhase::AwaitingDecision => SemanticTone::Warning,
+        EvolutionPhase::Passed => SemanticTone::Success,
+        EvolutionPhase::Failed => SemanticTone::Danger,
+        EvolutionPhase::Recovered => SemanticTone::Neutral,
+    }
+}
+
+fn detail_rows_surface(rows: Vec<(String, String)>, reader: &ThemeReader) -> Surface {
+    let mut column = Flex::vertical().align_items(Alignment::Stretch).gap(8.0);
+    for (label, value) in rows {
+        column.push(
+            DetailRow::new(label, value)
+                .max_value_lines(2)
+                .theme_when(clone_reader(reader)),
+        );
+    }
+    Surface::panel(column)
+        .padding(Insets::all(12.0))
+        .fill_width()
+        .theme_when(clone_reader(reader))
+}
+
+fn evolution_summary_grid(job: &EvolutionJobSummary, reader: &ThemeReader) -> Surface {
+    let entries = [
+        ("Target", job.target_ring.clone()),
+        (
+            "Verification",
+            job.verification_outcome
+                .clone()
+                .unwrap_or_else(|| "not recorded".to_string()),
+        ),
+        ("Changed files", job.changed_files.len().to_string()),
+        ("Commands", job.verification_command_count.to_string()),
+        ("Replay reports", job.module_replay_count.to_string()),
+        ("Artifacts", job.artifact_ref_count.to_string()),
+    ];
+    let mut grid = Flex::vertical().align_items(Alignment::Stretch).gap(10.0);
+    for pair in entries.chunks(2) {
+        let mut row = Flex::horizontal().align_items(Alignment::Stretch).gap(16.0);
+        for (label, value) in pair {
+            row.push_item(
+                DetailRow::new(*label, value.clone())
+                    .max_value_lines(1)
+                    .theme_when(clone_reader(reader)),
+                FlexItem::fill().min_width(0.0),
+            );
+        }
+        grid.push(row);
+    }
+    Surface::panel(grid)
+        .padding(Insets::all(12.0))
+        .fill_width()
+        .theme_when(clone_reader(reader))
+}
+
+fn build_evolution_detail(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let (job, start_ready, starting) = {
+        let state = shared.evolution();
+        (
+            state
+                .selected
+                .and_then(|index| state.dashboard.jobs.get(index))
+                .cloned(),
+            state.can_start(),
+            state.is_starting(),
+        )
+    };
+    let Some(job) = job else {
+        let detail = empty_detail_rows(start_ready, starting)
+            .into_iter()
+            .map(|(label, value)| format!("{label}: {value}"))
+            .collect::<Vec<_>>()
+            .join(". ");
+        return WidgetPod::new(
+            EmptyState::new(
+                "No evolution job selected",
+                empty_detail_subtitle(start_ready, starting),
+            )
+            .icon(IconGlyph::Sparkles)
+            .detail(detail)
+            .transparent()
+            .theme_when(clone_reader(reader)),
+        );
+    };
+
+    let theme = shared.theme();
+    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
+    let header = Flex::horizontal()
+        .align_items(Alignment::Center)
+        .gap(12.0)
+        .with_item(
+            Label::new(job.objective.clone()).style(pal.text_style(
+                &theme,
+                theme.text.xl.size,
+                FontWeight::SEMIBOLD,
+                pal.text,
+            )),
+            FlexItem::flex(1.0).min_width(0.0),
+        )
+        .with_child(
+            StatusBadge::new(job.status_label.clone())
+                .tone(phase_tone(job.phase))
+                .theme_when(clone_reader(reader)),
+        );
+    let meta = Label::new(format!(
+        "{} - created {} - branch {}",
+        job.short_id,
+        compact(&job.created_at, 24),
+        compact(&job.candidate_branch, 28)
+    ))
+    .style(pal.text_style(
+        &theme,
+        theme.text.sm.size,
+        FontWeight::NORMAL,
+        pal.text_muted,
+    ));
+    let lifecycle_height = LifecycleMetrics::for_theme(&theme).height;
+    let lifecycle = PanelSection::new(
+        "Lifecycle",
+        SizedBox::new()
+            .height(lifecycle_height)
+            .with_child(EvolutionLifecycle::new(shared.clone(), job.clone())),
+    )
+    .theme_when(clone_reader(reader));
+    let evidence = PanelSection::new("Evidence", detail_rows_surface(evidence_rows(&job), reader))
+        .theme_when(clone_reader(reader));
+    let scope = PanelSection::new("Scope", detail_rows_surface(scope_rows(&job), reader))
+        .theme_when(clone_reader(reader));
+    let content = Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .gap(14.0)
+        .with_child(header)
+        .with_child(meta)
+        .with_child(lifecycle)
+        .with_child(evolution_summary_grid(&job, reader))
+        .with_child(evidence)
+        .with_child(scope);
+    let content = Surface::window(content)
+        .padding(Insets::all(PAD))
+        .fill_width()
+        .theme_when(clone_reader(reader));
+    WidgetPod::new(
+        ScrollView::vertical(content)
+            .name("Evolution candidate details")
+            .theme(theme)
+            .viewport_width_hint(true),
+    )
+}
+
+fn evolution_rail_signature(shared: &Shared) -> String {
+    let theme = evolution_theme_signature(shared);
+    let state = shared.evolution();
+    let selected = state
+        .selected
+        .and_then(|index| state.dashboard.jobs.get(index));
+    format!(
+        "{theme}|{:?}|{:?}|{:?}|{}|{:?}|{:?}",
+        selected,
+        state.decision_status,
+        state.decision_error,
+        state.is_deciding(),
+        state.readiness_details_open,
+        state.dashboard
+    )
+}
+
+fn evolution_rail_host(shared: &Shared, reader: &ThemeReader) -> sui::RebuildOnChange<String> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    sui::RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || evolution_rail_signature(&s)
+        },
+        move |_key| build_evolution_rail(&s, &r),
+    )
+}
+
+fn compact_property_rows_surface(
+    rows: Vec<(String, String)>,
+    reader: &ThemeReader,
+    reserve_action_space: bool,
+    state_tone: Option<SemanticTone>,
+) -> Surface {
+    let theme = reader();
+    let mut column = Flex::vertical().align_items(Alignment::Stretch).gap(5.0);
+    for (index, (label, value)) in rows.into_iter().enumerate() {
+        let color = if index == 0 {
+            state_tone
+                .map(|tone| theme.semantic_tone_color(tone))
+                .unwrap_or(theme.palette.text)
+        } else {
+            theme.palette.text
+        };
+        let value = Label::new(value).style({
+            let mut style = theme.body_text_style();
+            style.font_size = theme.text.xs.size;
+            style.line_height = theme.text.xs.line_height;
+            style.color = color;
+            style
+        });
+        column.push(
+            PropertyRow::new(label, value)
+                .inline()
+                .label_width(82.0)
+                .gap(6.0)
+                .theme_when(clone_reader(reader)),
+        );
+    }
+    if reserve_action_space {
+        column.push(SizedBox::new().height(34.0));
+    }
+    Surface::panel(column)
+        .padding(Insets::all(11.0))
+        .fill_width()
+        .theme_when(clone_reader(reader))
+}
+
+fn decision_state_tone(action: &DecisionActionStatus) -> SemanticTone {
+    if action.error.is_some() {
+        SemanticTone::Danger
+    } else if action.deciding {
+        SemanticTone::Accent
+    } else {
+        SemanticTone::Neutral
+    }
+}
+
+fn build_evolution_rail(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let (dashboard, job, action, readiness_details_open) = {
+        let state = shared.evolution();
+        (
+            state.dashboard.clone(),
+            state
+                .selected
+                .and_then(|index| state.dashboard.jobs.get(index))
+                .cloned(),
+            DecisionActionStatus {
+                status: state.decision_status.clone(),
+                error: state.decision_error.clone(),
+                deciding: state.is_deciding(),
+            },
+            state.readiness_details_open,
+        )
+    };
+    let theme = shared.theme();
+    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
+    let title = Label::new("Safety and evidence").style(pal.text_style(
+        &theme,
+        theme.text.base.size,
+        FontWeight::SEMIBOLD,
+        pal.text,
+    ));
+    let mut content = Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .gap(14.0)
+        .with_child(title);
+    if let Some(job) = job {
+        content.push(
+            PanelSection::new(
+                "Operator decision",
+                compact_property_rows_surface(
+                    decision_action_rows(&job, &action),
+                    reader,
+                    true,
+                    Some(decision_state_tone(&action)),
+                ),
+            )
+            .theme_when(clone_reader(reader)),
+        );
+        content.push(
+            PanelSection::new(
+                "Review summary",
+                compact_property_rows_surface(selected_review_rows(&job), reader, false, None),
+            )
+            .theme_when(clone_reader(reader)),
+        );
+    } else {
+        content.push(
+            PanelSection::new(
+                "Readiness",
+                compact_property_rows_surface(
+                    readiness_rows(&dashboard, readiness_details_open),
+                    reader,
+                    false,
+                    None,
+                ),
+            )
+            .theme_when(clone_reader(reader)),
+        );
+    }
+    let content = Surface::new(SurfaceRole::Sidebar, content)
+        .padding(Insets::all(PAD))
+        .fill_width()
+        .theme_when(clone_reader(reader));
+    let scroll = ScrollView::vertical(content)
+        .name("Evolution safety and evidence")
+        .theme(theme)
+        .viewport_width_hint(true);
+    WidgetPod::new(
+        Surface::new(SurfaceRole::Sidebar, scroll)
+            .border(SurfaceBorder::Left)
+            .fill()
+            .theme_when(clone_reader(reader)),
+    )
+}
+
+fn evolution_narrow_action_signature(shared: &Shared) -> String {
+    let theme = evolution_theme_signature(shared);
+    let state = shared.evolution();
+    let selected = state
+        .selected
+        .and_then(|index| state.dashboard.jobs.get(index));
+    format!(
+        "{theme}|{:?}|{:?}|{:?}|{}",
+        selected,
+        state.decision_status,
+        state.decision_error,
+        state.is_deciding()
+    )
+}
+
+fn evolution_narrow_action_host(
+    shared: &Shared,
+    reader: &ThemeReader,
+) -> sui::RebuildOnChange<String> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    sui::RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || evolution_narrow_action_signature(&s)
+        },
+        move |_key| build_evolution_narrow_action(&s, &r),
+    )
+}
+
+fn build_evolution_narrow_action(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let (job, action) = {
+        let state = shared.evolution();
+        (
+            state
+                .selected
+                .and_then(|index| state.dashboard.jobs.get(index))
+                .cloned(),
+            DecisionActionStatus {
+                status: state.decision_status.clone(),
+                error: state.decision_error.clone(),
+                deciding: state.is_deciding(),
+            },
+        )
+    };
+    let (label, tone, icon) = if let Some(error) = action.error.as_deref() {
+        (
+            format!("Decision failed - {}", compact(error, 72)),
+            SemanticTone::Danger,
+            IconGlyph::Alert,
+        )
+    } else if let Some(status) = action.status.as_deref() {
+        (
+            compact(status, 84),
+            if action.deciding {
+                SemanticTone::Accent
+            } else {
+                SemanticTone::Neutral
+            },
+            if action.deciding {
+                IconGlyph::Sparkles
+            } else {
+                IconGlyph::Check
+            },
+        )
+    } else if let Some(job) = job {
+        (
+            format!("{} - {}", job.short_id, job.status_label),
+            phase_tone(job.phase),
+            IconGlyph::FileText,
+        )
+    } else {
+        (
+            "Select a candidate to review".to_string(),
+            SemanticTone::Neutral,
+            IconGlyph::FileText,
+        )
+    };
+    let status = Flex::horizontal()
+        .align_items(Alignment::Center)
+        .with_child(
+            StatusBadge::new(label)
+                .icon(icon)
+                .tone(tone)
+                .theme_when(clone_reader(reader)),
+        )
+        .spacer();
+    WidgetPod::new(
+        Surface::new(SurfaceRole::Sidebar, status)
+            .appearance(SurfaceAppearance::Standard)
+            .border(SurfaceBorder::Top)
+            .padding(Insets {
+                left: PAD,
+                right: PAD,
+                top: 6.0,
+                bottom: 40.0,
+            })
+            .fill()
+            .theme_when(clone_reader(reader)),
+    )
+}
+
+struct EvolutionLifecycle {
+    shared: Shared,
+    job: EvolutionJobSummary,
+}
+
+impl EvolutionLifecycle {
+    fn new(shared: Shared, job: EvolutionJobSummary) -> Self {
+        Self { shared, job }
+    }
+}
+
+impl Widget for EvolutionLifecycle {
+    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let width = if constraints.max.width.is_finite() {
+            constraints.max.width
+        } else {
+            480.0
+        };
+        let height = LifecycleMetrics::for_theme(&self.shared.theme()).height;
+        constraints.clamp(Size::new(width, height))
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let theme = self.shared.theme();
+        let pal = Palette::from_theme(&theme, widgets::theme_is_dark(&self.shared));
+        paint_lifecycle_track(ctx, &theme, &pal, ctx.bounds(), &self.job);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let mut node =
+            SemanticsNode::new(ctx.widget_id(), SemanticsRole::ProgressBar, ctx.bounds());
+        node.name = Some("Evolution lifecycle".to_string());
+        node.value = Some(SemanticsValue::Text(format!(
+            "{}; stage {} of 11",
+            self.job.status_label,
+            stage_index(&self.job.status_key) + 1
+        )));
+        ctx.push(node);
+    }
+}
+
 pub fn view(shared: Shared) -> impl Widget {
     EvolutionView::new(shared)
 }
 
 struct EvolutionView {
     shared: Shared,
+    header: WidgetPod,
+    start_chrome: WidgetPod,
     start: WidgetPod,
+    queue_surface: WidgetPod,
+    queue_header: WidgetPod,
+    queue_empty: WidgetPod,
+    detail: WidgetPod,
+    rail: WidgetPod,
+    narrow_action_status: WidgetPod,
     readiness_show: WidgetPod,
     readiness_hide: WidgetPod,
     approve: WidgetPod,
@@ -857,15 +1769,28 @@ struct EvolutionView {
 impl EvolutionView {
     fn new(shared: Shared) -> Self {
         let reader = theme_reader(&shared);
+        let header = evolution_header_host(&shared, &reader);
+        let start_chrome = evolution_start_chrome_host(&shared, &reader);
         let start = WidgetPod::new(StartControls::new(shared.clone()));
+        let queue_surface = Surface::sidebar(SizedBox::new())
+            .fill()
+            .theme_when(clone_reader(&reader));
+        let queue_header = evolution_queue_header_host(&shared, &reader);
+        let queue_empty = evolution_queue_empty_host(&shared, &reader);
+        let detail = evolution_detail_host(&shared, &reader);
+        let rail = evolution_rail_host(&shared, &reader);
+        let narrow_action_status = evolution_narrow_action_host(&shared, &reader);
         let readiness_show = {
             let s = shared.clone();
             Button::new("Show details")
                 .icon(IconGlyph::ChevronDown)
                 .min_height(DECISION_BUTTON_H)
-                .theme_when(secondary_button_theme(&reader))
+                .theme_when(clone_reader(&reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
                 .on_press_with_ctx(move |ctx| {
                     s.evolution_mut().set_readiness_details_open(true);
+                    ctx.request_measure();
                     ctx.request_arrange();
                     ctx.request_paint();
                 })
@@ -875,9 +1800,12 @@ impl EvolutionView {
             Button::new("Hide details")
                 .icon(IconGlyph::ChevronUp)
                 .min_height(DECISION_BUTTON_H)
-                .theme_when(secondary_button_theme(&reader))
+                .theme_when(clone_reader(&reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
                 .on_press_with_ctx(move |ctx| {
                     s.evolution_mut().set_readiness_details_open(false);
+                    ctx.request_measure();
                     ctx.request_arrange();
                     ctx.request_paint();
                 })
@@ -888,6 +1816,8 @@ impl EvolutionView {
                 .icon(IconGlyph::Check)
                 .min_height(DECISION_BUTTON_H)
                 .theme_when(clone_reader(&reader))
+                .appearance(sui::ButtonAppearance::Filled)
+                .tone(SemanticTone::Success)
                 .enabled_when({
                     let s = s.clone();
                     move || s.evolution().can_decide_selected()
@@ -895,6 +1825,8 @@ impl EvolutionView {
                 .on_press_with_ctx(move |ctx| {
                     s.evolution_mut()
                         .decide_selected(EvolutionDecisionAction::Approve);
+                    ctx.request_measure();
+                    ctx.request_arrange();
                     ctx.request_animation_frame();
                     ctx.request_paint();
                 })
@@ -904,7 +1836,9 @@ impl EvolutionView {
             Button::new("Reject")
                 .icon(IconGlyph::Close)
                 .min_height(DECISION_BUTTON_H)
-                .theme_when(secondary_button_theme(&reader))
+                .theme_when(clone_reader(&reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Danger)
                 .enabled_when({
                     let s = s.clone();
                     move || s.evolution().can_decide_selected()
@@ -912,13 +1846,23 @@ impl EvolutionView {
                 .on_press_with_ctx(move |ctx| {
                     s.evolution_mut()
                         .decide_selected(EvolutionDecisionAction::Reject);
+                    ctx.request_measure();
+                    ctx.request_arrange();
                     ctx.request_animation_frame();
                     ctx.request_paint();
                 })
         };
         Self {
             shared,
+            header: WidgetPod::new(header),
+            start_chrome: WidgetPod::new(start_chrome),
             start,
+            queue_surface: WidgetPod::new(queue_surface),
+            queue_header: WidgetPod::new(queue_header),
+            queue_empty: WidgetPod::new(queue_empty),
+            detail: WidgetPod::new(detail),
+            rail: WidgetPod::new(rail),
+            narrow_action_status: WidgetPod::new(narrow_action_status),
             readiness_show: WidgetPod::new(readiness_show),
             readiness_hide: WidgetPod::new(readiness_hide),
             approve: WidgetPod::new(approve),
@@ -959,6 +1903,8 @@ impl EvolutionView {
             start_changed || decision_changed || dashboard_changed
         };
         if changed {
+            ctx.request_measure();
+            ctx.request_arrange();
             ctx.request_paint();
             ctx.request_semantics();
         }
@@ -974,7 +1920,8 @@ impl EvolutionView {
     }
 
     fn queue_scroll_limit(&self, queue: Rect, job_count: usize) -> f32 {
-        queue_scroll_limit(queue, job_count)
+        let metrics = QueueRowMetrics::for_theme(&self.shared.theme());
+        queue_scroll_limit(queue, job_count, metrics.height)
     }
 
     fn set_queue_scroll(&self, queue: Rect, job_count: usize, scroll_y: f32) -> bool {
@@ -991,12 +1938,13 @@ impl EvolutionView {
         if viewport_h <= 0.0 || index >= job_count {
             return;
         }
+        let row_height = QueueRowMetrics::for_theme(&self.shared.theme()).height;
         let mut scroll_y = self
             .queue_scroll_y
             .get()
             .clamp(0.0, self.queue_scroll_limit(queue, job_count));
-        let row_top = index as f32 * ROW_H;
-        let row_bottom = row_top + ROW_H;
+        let row_top = index as f32 * row_height;
+        let row_bottom = row_top + row_height;
         if row_top < scroll_y {
             scroll_y = row_top;
         } else if row_bottom > scroll_y + viewport_h {
@@ -1093,6 +2041,8 @@ impl EvolutionView {
             return;
         };
         self.shared.evolution_mut().select(index);
+        ctx.request_measure();
+        ctx.request_arrange();
         ctx.request_paint();
         ctx.request_semantics();
         ctx.set_handled();
@@ -1115,6 +2065,7 @@ struct StartControlsLayout {
 
 struct StartControls {
     shared: Shared,
+    labels: [WidgetPod; 4],
     objective: WidgetPod,
     options: WidgetPod,
     scope: WidgetPod,
@@ -1125,7 +2076,7 @@ struct StartControls {
 
 impl StartControls {
     fn new(shared: Shared) -> Self {
-        let reader = theme_reader(&shared);
+        let reader = small_theme_reader(&shared);
 
         let objective = {
             let s = shared.clone();
@@ -1143,7 +2094,9 @@ impl StartControls {
             let s = shared.clone();
             Button::new("Options")
                 .icon(IconGlyph::ChevronDown)
-                .theme_when(secondary_button_theme(&reader))
+                .theme_when(clone_reader(&reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
                 .on_press_with_ctx(move |ctx| {
                     s.evolution_mut().toggle_start_advanced();
                     ctx.request_measure();
@@ -1203,10 +2156,20 @@ impl StartControls {
                     move || s.evolution().can_start()
                 })
                 .theme_when(clone_reader(&reader))
-                .on_press(move || {
+                .appearance(sui::ButtonAppearance::Filled)
+                .tone(SemanticTone::Accent)
+                .on_press_with_ctx(move |ctx| {
                     s.evolution_mut().start();
+                    request_window_relayout(ctx);
                 })
         };
+        let labels = ["Objective", "Advanced", "Scope", "Target ring"].map(|label| {
+            WidgetPod::new(
+                SectionLabel::new(label)
+                    .semantic_name(format!("Evolution {label}"))
+                    .theme_when(clone_reader(&reader)),
+            )
+        });
         let starter_actions = std::array::from_fn(|index| {
             let action = EvolutionStarterObjective::ALL[index];
             let s = shared.clone();
@@ -1217,7 +2180,9 @@ impl StartControls {
                     .icon(action.icon())
                     .min_height(STARTER_ACTION_H)
                     .enabled_when(move || !enabled_shared.evolution().is_starting())
-                    .theme_when(secondary_button_theme(&reader))
+                    .theme_when(clone_reader(&reader))
+                    .appearance(sui::ButtonAppearance::Tonal)
+                    .tone(SemanticTone::Neutral)
                     .on_press_with_ctx(move |ctx| {
                         s.evolution_mut().apply_starter_objective(action);
                         request_window_relayout(ctx);
@@ -1227,6 +2192,7 @@ impl StartControls {
 
         Self {
             shared,
+            labels,
             objective: WidgetPod::new(objective),
             options: WidgetPod::new(options),
             scope: WidgetPod::new(scope),
@@ -1259,6 +2225,16 @@ impl Widget for StartControls {
                 Constraints::tight(rect_size(layout.starter_actions[index])),
             );
         }
+        for (index, label) in self.labels.iter_mut().enumerate() {
+            let rect = match index {
+                0 => layout.objective_label,
+                1 => layout.options_label,
+                2 if advanced_open => layout.scope_label,
+                3 if advanced_open => layout.target_label,
+                _ => Rect::ZERO,
+            };
+            label.measure(ctx, Constraints::tight(rect_size(rect)));
+        }
         self.objective
             .measure(ctx, Constraints::tight(rect_size(layout.objective)));
         self.options
@@ -1283,6 +2259,16 @@ impl Widget for StartControls {
         for (index, action) in self.starter_actions.iter_mut().enumerate() {
             action.arrange(ctx, layout.starter_actions[index]);
         }
+        for (index, label) in self.labels.iter_mut().enumerate() {
+            let rect = match index {
+                0 => layout.objective_label,
+                1 => layout.options_label,
+                2 if advanced_open => layout.scope_label,
+                3 if advanced_open => layout.target_label,
+                _ => Rect::ZERO,
+            };
+            label.arrange(ctx, rect);
+        }
         self.objective.arrange(ctx, layout.objective);
         self.options.arrange(ctx, layout.options);
         if advanced_open {
@@ -1300,6 +2286,12 @@ impl Widget for StartControls {
         for action in &self.starter_actions {
             action.paint(ctx);
         }
+        self.labels[0].paint(ctx);
+        self.labels[1].paint(ctx);
+        if advanced_open {
+            self.labels[2].paint(ctx);
+            self.labels[3].paint(ctx);
+        }
         self.objective.paint(ctx);
         self.options.paint(ctx);
         if advanced_open {
@@ -1314,6 +2306,12 @@ impl Widget for StartControls {
         for action in &self.starter_actions {
             action.semantics(ctx);
         }
+        self.labels[0].semantics(ctx);
+        self.labels[1].semantics(ctx);
+        if advanced_open {
+            self.labels[2].semantics(ctx);
+            self.labels[3].semantics(ctx);
+        }
         self.objective.semantics(ctx);
         self.options.semantics(ctx);
         if advanced_open {
@@ -1327,6 +2325,9 @@ impl Widget for StartControls {
         for action in &self.starter_actions {
             visitor.visit(action);
         }
+        for label in &self.labels {
+            visitor.visit(label);
+        }
         visitor.visit(&self.objective);
         visitor.visit(&self.options);
         visitor.visit(&self.scope);
@@ -1337,6 +2338,9 @@ impl Widget for StartControls {
     fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
         for action in &mut self.starter_actions {
             visitor.visit(action);
+        }
+        for label in &mut self.labels {
+            visitor.visit(label);
         }
         visitor.visit(&mut self.objective);
         visitor.visit(&mut self.options);
@@ -1571,10 +2575,12 @@ impl Widget for EvolutionView {
                 let advanced_open = self.shared.evolution().start_advanced_open;
                 let layout = layout_for(ctx.bounds(), advanced_open);
                 let job_count = self.shared.evolution().dashboard.jobs.len();
+                let row_height = QueueRowMetrics::for_theme(&self.shared.theme()).height;
                 if let Some(index) = queue_index_at(
                     layout.queue,
                     self.queue_scroll_y.get(),
                     job_count,
+                    row_height,
                     pointer.position,
                 ) && self.focus_job_index(index)
                 {
@@ -1592,14 +2598,18 @@ impl Widget for EvolutionView {
                 let advanced_open = self.shared.evolution().start_advanced_open;
                 let layout = layout_for(ctx.bounds(), advanced_open);
                 let job_count = self.shared.evolution().dashboard.jobs.len();
+                let row_height = QueueRowMetrics::for_theme(&self.shared.theme()).height;
                 if let Some(index) = queue_index_at(
                     layout.queue,
                     self.queue_scroll_y.get(),
                     job_count,
+                    row_height,
                     pointer.position,
                 ) {
                     self.focus_job_index(index);
                     self.shared.evolution_mut().select(index);
+                    ctx.request_measure();
+                    ctx.request_arrange();
                     ctx.request_paint();
                     ctx.request_semantics();
                     ctx.set_handled();
@@ -1678,8 +2688,46 @@ impl Widget for EvolutionView {
             Rect::new(0.0, 0.0, constraints.max.width, constraints.max.height),
             advanced_open,
         );
+        self.header
+            .measure(ctx, Constraints::tight(rect_size(layout.header)));
+        self.start_chrome
+            .measure(ctx, Constraints::tight(rect_size(layout.start)));
         self.start
             .measure(ctx, Constraints::tight(rect_size(layout.start_controls)));
+        self.queue_surface
+            .measure(ctx, Constraints::tight(rect_size(layout.queue)));
+        let queue_header = Rect::new(
+            layout.queue.x(),
+            layout.queue.y(),
+            layout.queue.width(),
+            QUEUE_HEADER_H,
+        );
+        self.queue_header
+            .measure(ctx, Constraints::tight(rect_size(queue_header)));
+        if self.shared.evolution().dashboard.jobs.is_empty() {
+            self.queue_empty.measure(
+                ctx,
+                Constraints::tight(rect_size(queue_viewport(layout.queue))),
+            );
+        } else {
+            self.queue_empty
+                .measure(ctx, Constraints::tight(Size::ZERO));
+        }
+        self.detail
+            .measure(ctx, Constraints::tight(rect_size(layout.detail)));
+        if let Some(rail) = layout.rail {
+            self.rail.measure(ctx, Constraints::tight(rect_size(rail)));
+            self.narrow_action_status
+                .measure(ctx, Constraints::tight(Size::ZERO));
+        } else if let Some(action_bar) = layout.action_bar {
+            self.rail.measure(ctx, Constraints::tight(Size::ZERO));
+            self.narrow_action_status
+                .measure(ctx, Constraints::tight(rect_size(action_bar)));
+        } else {
+            self.rail.measure(ctx, Constraints::tight(Size::ZERO));
+            self.narrow_action_status
+                .measure(ctx, Constraints::tight(Size::ZERO));
+        }
         let (show_readiness_toggle, readiness_details_open) = {
             let evolution = self.shared.evolution();
             let selected_job = evolution
@@ -1725,7 +2773,35 @@ impl Widget for EvolutionView {
         self.bounds = bounds;
         let advanced_open = self.shared.evolution().start_advanced_open;
         let layout = layout_for(bounds, advanced_open);
+        self.header.arrange(ctx, layout.header);
+        self.start_chrome.arrange(ctx, layout.start);
         self.start.arrange(ctx, layout.start_controls);
+        self.queue_surface.arrange(ctx, layout.queue);
+        self.queue_header.arrange(
+            ctx,
+            Rect::new(
+                layout.queue.x(),
+                layout.queue.y(),
+                layout.queue.width(),
+                QUEUE_HEADER_H,
+            ),
+        );
+        if self.shared.evolution().dashboard.jobs.is_empty() {
+            self.queue_empty.arrange(ctx, queue_viewport(layout.queue));
+        } else {
+            self.queue_empty.arrange(ctx, Rect::ZERO);
+        }
+        self.detail.arrange(ctx, layout.detail);
+        if let Some(rail) = layout.rail {
+            self.rail.arrange(ctx, rail);
+            self.narrow_action_status.arrange(ctx, Rect::ZERO);
+        } else if let Some(action_bar) = layout.action_bar {
+            self.rail.arrange(ctx, Rect::ZERO);
+            self.narrow_action_status.arrange(ctx, action_bar);
+        } else {
+            self.rail.arrange(ctx, Rect::ZERO);
+            self.narrow_action_status.arrange(ctx, Rect::ZERO);
+        }
         let (show_readiness_toggle, readiness_details_open) = {
             let evolution = self.shared.evolution();
             let selected_job = evolution
@@ -1761,66 +2837,38 @@ impl Widget for EvolutionView {
     fn paint(&self, ctx: &mut PaintCtx) {
         let (theme, pal) = self.palette();
         let bounds = ctx.bounds();
-        let (
-            dashboard,
-            selected,
-            advanced_open,
-            readiness_details_open,
-            start_ready,
-            starting,
-            refresh_pending,
-            refresh_error,
-            completed_dashboard_id,
-        ) = {
+        let (dashboard, selected, advanced_open, readiness_details_open, completed_dashboard_id) = {
             let state = self.shared.evolution();
             (
                 state.dashboard.clone(),
                 state.selected,
                 state.start_advanced_open,
                 state.readiness_details_open,
-                state.can_start(),
-                state.is_starting(),
-                state.dashboard_refresh_pending(),
-                state.dashboard_refresh_error().map(str::to_string),
                 state.completed_dashboard_id,
             )
         };
         let layout = layout_for(bounds, advanced_open);
         let selected_job = selected.and_then(|index| dashboard.jobs.get(index));
         let job_count = dashboard.jobs.len();
+        let queue_metrics = QueueRowMetrics::for_theme(&theme);
         let focused_job = self.reconcile_focus_after_refresh(
             layout.queue,
             &dashboard,
             selected,
             completed_dashboard_id,
         );
-        let queue_scroll_y = self
-            .queue_scroll_y
-            .get()
-            .clamp(0.0, queue_scroll_limit(layout.queue, job_count));
+        let queue_scroll_y = self.queue_scroll_y.get().clamp(
+            0.0,
+            queue_scroll_limit(layout.queue, job_count, queue_metrics.height),
+        );
         self.queue_scroll_y.set(queue_scroll_y);
 
         ctx.fill_bounds(pal.window);
-        paint_header(
-            ctx,
-            &theme,
-            &pal,
-            layout.header,
-            &dashboard,
-            refresh_pending,
-            refresh_error.as_deref(),
-        );
-        paint_start_panel(
-            ctx,
-            &theme,
-            &pal,
-            layout.start,
-            layout.start_controls,
-            &dashboard,
-            &self.shared,
-            advanced_open,
-        );
+        self.header.paint(ctx);
+        self.start_chrome.paint(ctx);
         self.start.paint(ctx);
+        self.queue_surface.paint(ctx);
+        self.queue_header.paint(ctx);
         paint_queue(
             ctx,
             &theme,
@@ -1831,35 +2879,14 @@ impl Widget for EvolutionView {
             focused_job,
             ctx.is_focused(),
             queue_scroll_y,
+            queue_metrics,
         );
-        paint_detail(
-            ctx,
-            &theme,
-            &pal,
-            layout.detail,
-            selected_job,
-            start_ready,
-            starting,
-        );
-        if let Some(rail) = layout.rail {
-            let action = {
-                let state = self.shared.evolution();
-                DecisionActionStatus {
-                    status: state.decision_status.clone(),
-                    error: state.decision_error.clone(),
-                    deciding: state.is_deciding(),
-                }
-            };
-            paint_rail(
-                ctx,
-                &theme,
-                &pal,
-                rail,
-                &dashboard,
-                selected_job,
-                &action,
-                readiness_details_open,
-            );
+        if dashboard.jobs.is_empty() {
+            self.queue_empty.paint(ctx);
+        }
+        self.detail.paint(ctx);
+        if layout.rail.is_some() {
+            self.rail.paint(ctx);
             if readiness_detail_toggle_visible(&dashboard, selected_job) {
                 if readiness_details_open {
                     self.readiness_hide.paint(ctx);
@@ -1872,16 +2899,8 @@ impl Widget for EvolutionView {
                 self.reject.paint(ctx);
             }
         }
-        if let Some(action_bar) = layout.action_bar {
-            let action = {
-                let state = self.shared.evolution();
-                DecisionActionStatus {
-                    status: state.decision_status.clone(),
-                    error: state.decision_error.clone(),
-                    deciding: state.is_deciding(),
-                }
-            };
-            paint_narrow_action_bar(ctx, &theme, &pal, action_bar, selected_job, &action);
+        if layout.action_bar.is_some() {
+            self.narrow_action_status.paint(ctx);
             self.approve.paint(ctx);
             self.reject.paint(ctx);
         }
@@ -1909,6 +2928,7 @@ impl Widget for EvolutionView {
             )
         };
         let layout = layout_for(ctx.bounds(), advanced_open);
+        let queue_metrics = QueueRowMetrics::for_theme(&self.shared.theme());
         let focused = self.reconcile_focus_after_refresh(
             layout.queue,
             &dashboard,
@@ -1935,10 +2955,10 @@ impl Widget for EvolutionView {
         node.state.focused = ctx.is_focused();
         node.actions = vec![SemanticsAction::Focus];
         ctx.push(node);
-        let scroll_y = self
-            .queue_scroll_y
-            .get()
-            .clamp(0.0, queue_scroll_limit(layout.queue, dashboard.jobs.len()));
+        let scroll_y = self.queue_scroll_y.get().clamp(
+            0.0,
+            queue_scroll_limit(layout.queue, dashboard.jobs.len(), queue_metrics.height),
+        );
         self.queue_scroll_y.set(scroll_y);
         let queue_id = evolution_queue_widget_id(ctx.widget_id());
         let viewport = queue_viewport(layout.queue);
@@ -1954,11 +2974,17 @@ impl Widget for EvolutionView {
             .map(|job| SemanticsValue::Text(job.objective.clone()));
         queue.actions = vec![SemanticsAction::Focus, SemanticsAction::SetValue];
         ctx.push(queue);
-        for index in visible_queue_range(layout.queue, dashboard.jobs.len(), scroll_y) {
+        for index in visible_queue_range(
+            layout.queue,
+            dashboard.jobs.len(),
+            scroll_y,
+            queue_metrics.height,
+        ) {
             let Some(job) = dashboard.jobs.get(index) else {
                 continue;
             };
-            let Some(row) = queue_row_rect(layout.queue, index, scroll_y).intersection(viewport)
+            let Some(row) = queue_row_rect(layout.queue, index, scroll_y, queue_metrics.height)
+                .intersection(viewport)
             else {
                 continue;
             };
@@ -2004,13 +3030,35 @@ impl Widget for EvolutionView {
                 self.readiness_show.semantics(ctx);
             }
         }
+        self.header.semantics(ctx);
+        self.start_chrome.semantics(ctx);
         self.start.semantics(ctx);
+        self.queue_surface.semantics(ctx);
+        self.queue_header.semantics(ctx);
+        if dashboard.jobs.is_empty() {
+            self.queue_empty.semantics(ctx);
+        }
+        self.detail.semantics(ctx);
+        if layout.rail.is_some() {
+            self.rail.semantics(ctx);
+        }
+        if layout.action_bar.is_some() {
+            self.narrow_action_status.semantics(ctx);
+        }
         self.approve.semantics(ctx);
         self.reject.semantics(ctx);
     }
 
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.header);
+        visitor.visit(&self.start_chrome);
         visitor.visit(&self.start);
+        visitor.visit(&self.queue_surface);
+        visitor.visit(&self.queue_header);
+        visitor.visit(&self.queue_empty);
+        visitor.visit(&self.detail);
+        visitor.visit(&self.rail);
+        visitor.visit(&self.narrow_action_status);
         visitor.visit(&self.readiness_show);
         visitor.visit(&self.readiness_hide);
         visitor.visit(&self.approve);
@@ -2018,7 +3066,15 @@ impl Widget for EvolutionView {
     }
 
     fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.header);
+        visitor.visit(&mut self.start_chrome);
         visitor.visit(&mut self.start);
+        visitor.visit(&mut self.queue_surface);
+        visitor.visit(&mut self.queue_header);
+        visitor.visit(&mut self.queue_empty);
+        visitor.visit(&mut self.detail);
+        visitor.visit(&mut self.rail);
+        visitor.visit(&mut self.narrow_action_status);
         visitor.visit(&mut self.readiness_show);
         visitor.visit(&mut self.readiness_hide);
         visitor.visit(&mut self.approve);
@@ -2165,16 +3221,12 @@ fn readiness_detail_toggle_visible(
 
 fn start_height_for(width: f32, advanced_open: bool) -> f32 {
     let controls_w = (width - PAD * 2.0).max(0.0);
-    let starter_extra = starter_actions_height_for(controls_w) + CONTROL_GAP;
-    if controls_w >= START_BREAKPOINT && advanced_open {
-        START_WIDE_H + starter_extra + control_block_height() + CONTROL_GAP
-    } else if controls_w >= START_BREAKPOINT {
-        START_WIDE_H + starter_extra
-    } else if advanced_open {
-        START_NARROW_EXPANDED_H + starter_extra
+    let header_h = if controls_w >= START_BREAKPOINT {
+        START_WIDE_HEADER_H
     } else {
-        START_NARROW_COLLAPSED_H + starter_extra
-    }
+        START_NARROW_HEADER_H
+    };
+    header_h + start_controls_height_for(controls_w, advanced_open) + PAD
 }
 
 fn start_controls_height_for(width: f32, advanced_open: bool) -> f32 {
@@ -2194,214 +3246,6 @@ fn rect_size(rect: Rect) -> Size {
     Size::new(rect.width(), rect.height())
 }
 
-fn paint_header(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    rect: Rect,
-    dashboard: &EvolutionDashboard,
-    refresh_pending: bool,
-    refresh_error: Option<&str>,
-) {
-    ctx.fill_rect(rect, pal.window);
-    let title = pal.text_style(theme, 20.0, FontWeight::SEMIBOLD, pal.text);
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(rect.x() + PAD, rect.y() + 12.0, 260.0, 28.0),
-        "Evolution",
-        title,
-    );
-
-    let subtitle =
-        evolution_header_subtitle_with_refresh(dashboard, refresh_pending, refresh_error);
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(
-            rect.x() + PAD,
-            rect.y() + 43.0,
-            (rect.width() - PAD * 2.0).max(0.0),
-            22.0,
-        ),
-        &subtitle,
-        pal.text_style(theme, 14.0, FontWeight::NORMAL, pal.text_muted),
-    );
-
-    if rect.width() > 740.0 {
-        let metrics = [
-            ("Awaiting", dashboard.awaiting_decision_count(), pal.warn),
-            ("Failed", dashboard.failed_count(), pal.bad),
-            ("Promoted", dashboard.promoted_count(), pal.good),
-        ];
-        let mut x = rect.max_x() - PAD - 100.0 * metrics.len() as f32;
-        for (label, value, color) in metrics {
-            paint_metric(
-                ctx,
-                theme,
-                pal,
-                Rect::new(x, rect.y() + 18.0, 88.0, 42.0),
-                label,
-                value,
-                color,
-            );
-            x += 100.0;
-        }
-    }
-
-    widgets::hairline_bottom(ctx, rect, pal.border);
-}
-
-fn paint_metric(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    rect: Rect,
-    label: &str,
-    value: usize,
-    color: Color,
-) {
-    widgets::round_panel(ctx, rect, pal.panel, pal.border, 10.0);
-    ctx.fill(
-        Path::circle(widgets::point(rect.x() + 14.0, rect.y() + 15.0), 4.0),
-        color,
-    );
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(rect.x() + 24.0, rect.y() + 5.0, rect.width() - 30.0, 18.0),
-        label,
-        pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.text_muted),
-    );
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(rect.x() + 14.0, rect.y() + 21.0, rect.width() - 20.0, 18.0),
-        &value.to_string(),
-        pal.text_style(theme, 16.0, FontWeight::SEMIBOLD, pal.text),
-    );
-}
-
-fn paint_start_panel(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    rect: Rect,
-    controls_rect: Rect,
-    dashboard: &EvolutionDashboard,
-    shared: &Shared,
-    advanced_open: bool,
-) {
-    ctx.fill_rect(rect, pal.window);
-    widgets::hairline_bottom(ctx, rect, pal.border);
-
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(rect.x() + PAD, rect.y() + 10.0, 150.0, 22.0),
-        "Start job",
-        pal.text_style(theme, 14.0, FontWeight::SEMIBOLD, pal.text),
-    );
-
-    let (status, status_color) = {
-        let evolution = shared.evolution();
-        if let Some(error) = &evolution.start_error {
-            (format!("failed - {}", compact(error, 108)), pal.bad)
-        } else if let Some(status) = &evolution.start_status {
-            (
-                compact(status, 108),
-                if evolution.is_starting() {
-                    pal.accent
-                } else {
-                    pal.good
-                },
-            )
-        } else {
-            let objective = evolution.objective_draft.trim();
-            if objective.is_empty() {
-                let label = if dashboard.jobs.is_empty() {
-                    "Enter an objective to start a supervised evolution job".to_string()
-                } else {
-                    format!(
-                        "Enter an objective to start - {} jobs tracked",
-                        dashboard.jobs.len()
-                    )
-                };
-                (label, pal.text_muted)
-            } else {
-                if advanced_open {
-                    let ring = EVOLUTION_TARGET_RINGS
-                        .get(evolution.target_ring_index)
-                        .map(|option| option.label)
-                        .unwrap_or("R1 runtime");
-                    let scope_count = parse_scope_paths(&evolution.scope_draft).len();
-                    let scope = if scope_count == 0 {
-                        "workspace policy scope".to_string()
-                    } else if scope_count == 1 {
-                        "1 scoped path".to_string()
-                    } else {
-                        format!("{scope_count} scoped paths")
-                    };
-                    (format!("Ready for {ring} - {scope}"), pal.accent)
-                } else {
-                    (
-                        "Ready to start - use Options for scope and target ring".to_string(),
-                        pal.accent,
-                    )
-                }
-            }
-        }
-    };
-    let status_rect = if rect.width() >= 640.0 {
-        Rect::new(
-            rect.x() + 170.0,
-            rect.y() + 11.0,
-            (rect.width() - 190.0).max(0.0),
-            22.0,
-        )
-    } else {
-        Rect::new(
-            rect.x() + PAD,
-            rect.y() + 32.0,
-            (rect.width() - PAD * 2.0).max(0.0),
-            20.0,
-        )
-    };
-    widgets::draw_text_in(
-        ctx,
-        status_rect,
-        &status,
-        pal.text_style(theme, 12.0, FontWeight::MEDIUM, status_color),
-    );
-    paint_start_labels(ctx, theme, pal, controls_rect, advanced_open);
-}
-
-fn paint_start_labels(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    controls_rect: Rect,
-    advanced_open: bool,
-) {
-    let layout = start_controls_layout(controls_rect, advanced_open);
-    paint_start_label(ctx, theme, pal, layout.objective_label, "Objective");
-    paint_start_label(ctx, theme, pal, layout.options_label, "Advanced");
-    if advanced_open {
-        paint_start_label(ctx, theme, pal, layout.scope_label, "Scope");
-        paint_start_label(ctx, theme, pal, layout.target_label, "Target ring");
-    }
-}
-
-fn paint_start_label(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    rect: Rect,
-    label: &str,
-) {
-    widgets::draw_text_in(
-        ctx,
-        rect,
-        label,
-        pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.text_faint),
-    );
-}
-
 fn paint_queue(
     ctx: &mut PaintCtx,
     theme: &sui::DefaultTheme,
@@ -2412,84 +3256,45 @@ fn paint_queue(
     focused: Option<usize>,
     list_focused: bool,
     scroll_y: f32,
+    metrics: QueueRowMetrics,
 ) {
-    ctx.fill_rect(rect, pal.sidebar);
-    widgets::hairline_right(ctx, rect, pal.border);
-    widgets::hairline_bottom(
-        ctx,
-        Rect::new(rect.x(), rect.y(), rect.width(), QUEUE_HEADER_H),
-        pal.border,
-    );
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(
-            rect.x() + PAD,
-            rect.y() + 8.0,
-            rect.width() - PAD * 2.0,
-            20.0,
-        ),
-        "Candidate queue",
-        pal.text_style(theme, 14.0, FontWeight::SEMIBOLD, pal.text),
-    );
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(
-            rect.x() + PAD,
-            rect.y() + 27.0,
-            rect.width() - PAD * 2.0,
-            18.0,
-        ),
-        "Observed through promoted lifecycle",
-        pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text_faint),
-    );
-
     if dashboard.jobs.is_empty() {
-        let message = dashboard
-            .error
-            .as_deref()
-            .unwrap_or("Start a job to create the first candidate");
-        widgets::draw_centered(
-            ctx,
-            "No candidates",
-            pal.text_style(theme, 16.0, FontWeight::SEMIBOLD, pal.text_muted),
-            rect.x() + rect.width() / 2.0,
-            rect.y() + rect.height() / 2.0 - 12.0,
-        );
-        widgets::draw_centered(
-            ctx,
-            &compact(message, 48),
-            pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text_faint),
-            rect.x() + rect.width() / 2.0,
-            rect.y() + rect.height() / 2.0 + 15.0,
-        );
         return;
     }
 
     let viewport = queue_viewport(rect);
     ctx.push_clip_rect(viewport);
-    for index in visible_queue_range(rect, dashboard.jobs.len(), scroll_y) {
+    for index in visible_queue_range(rect, dashboard.jobs.len(), scroll_y, metrics.height) {
         let Some(job) = dashboard.jobs.get(index) else {
             continue;
         };
-        let row = queue_row_rect(rect, index, scroll_y);
+        let row = queue_row_rect(rect, index, scroll_y, metrics.height);
         let selected_here = selected == Some(index);
         if selected_here {
-            // Mesh selected row: accent wash plus a 2px accent rail.
-            ctx.fill_rect(row.inflate(-1.0, -1.0), pal.accent_soft);
-            ctx.fill_rect(Rect::new(row.x(), row.y(), 2.0, row.height()), pal.accent);
+            // Match SUI data rows: a persistent inset selection wash. Keyboard focus remains a
+            // separate ring so selection and navigation focus never collapse into one state.
+            ctx.fill_rect(row.inflate(-1.0, -1.0), pal.selected);
         }
-        paint_queue_row(ctx, theme, pal, row, job, selected_here);
+        paint_queue_row(ctx, theme, pal, row, job, selected_here, metrics);
         if list_focused && focused == Some(index) {
+            let outset = theme.metrics.focus_ring_outset;
             ctx.stroke(
-                Path::rounded_rect(row.inflate(-3.0, -3.0), 5.0),
-                pal.accent,
-                StrokeStyle::new(1.5),
+                Path::rounded_rect(row.inflate(outset, outset), 5.0),
+                pal.focus,
+                StrokeStyle::new(theme.metrics.focus_ring_width),
             );
         }
         widgets::hairline_bottom(ctx, row, pal.border_subtle);
     }
     ctx.pop_clip();
-    paint_queue_scrollbar(ctx, pal, viewport, dashboard.jobs.len(), scroll_y);
+    paint_queue_scrollbar(
+        ctx,
+        pal,
+        viewport,
+        dashboard.jobs.len(),
+        scroll_y,
+        metrics.height,
+    );
 }
 
 fn queue_viewport(queue: Rect) -> Rect {
@@ -2501,30 +3306,37 @@ fn queue_viewport(queue: Rect) -> Rect {
     )
 }
 
-fn queue_scroll_limit(queue: Rect, job_count: usize) -> f32 {
-    (job_count as f32 * ROW_H - queue_viewport(queue).height()).max(0.0)
+fn queue_scroll_limit(queue: Rect, job_count: usize, row_height: f32) -> f32 {
+    (job_count as f32 * row_height.max(1.0) - queue_viewport(queue).height()).max(0.0)
 }
 
-fn visible_queue_range(queue: Rect, job_count: usize, scroll_y: f32) -> Range<usize> {
+fn visible_queue_range(
+    queue: Rect,
+    job_count: usize,
+    scroll_y: f32,
+    row_height: f32,
+) -> Range<usize> {
     if job_count == 0 || queue_viewport(queue).height() <= 0.0 {
         return 0..0;
     }
-    let scroll_y = scroll_y.clamp(0.0, queue_scroll_limit(queue, job_count));
-    let first = (scroll_y / ROW_H).floor() as usize;
+    let row_height = row_height.max(1.0);
+    let scroll_y = scroll_y.clamp(0.0, queue_scroll_limit(queue, job_count, row_height));
+    let first = (scroll_y / row_height).floor() as usize;
     let visible_bottom = scroll_y + queue_viewport(queue).height();
-    let end = ((visible_bottom / ROW_H).ceil() as usize)
+    let end = ((visible_bottom / row_height).ceil() as usize)
         .max(first + 1)
         .min(job_count);
     first.min(job_count)..end
 }
 
-fn queue_row_rect(queue: Rect, index: usize, scroll_y: f32) -> Rect {
+fn queue_row_rect(queue: Rect, index: usize, scroll_y: f32, row_height: f32) -> Rect {
     let viewport = queue_viewport(queue);
+    let row_height = row_height.max(1.0);
     Rect::new(
         viewport.x(),
-        viewport.y() + index as f32 * ROW_H - scroll_y,
+        viewport.y() + index as f32 * row_height - scroll_y,
         viewport.width(),
-        ROW_H,
+        row_height,
     )
 }
 
@@ -2532,14 +3344,16 @@ fn queue_index_at(
     queue: Rect,
     scroll_y: f32,
     job_count: usize,
+    row_height: f32,
     position: sui::Point,
 ) -> Option<usize> {
     let viewport = queue_viewport(queue);
     if !viewport.contains(position) {
         return None;
     }
-    let scroll_y = scroll_y.clamp(0.0, queue_scroll_limit(queue, job_count));
-    let index = ((position.y - viewport.y() + scroll_y) / ROW_H).floor() as usize;
+    let row_height = row_height.max(1.0);
+    let scroll_y = scroll_y.clamp(0.0, queue_scroll_limit(queue, job_count, row_height));
+    let index = ((position.y - viewport.y() + scroll_y) / row_height).floor() as usize;
     (index < job_count).then_some(index)
 }
 
@@ -2570,8 +3384,9 @@ fn paint_queue_scrollbar(
     viewport: Rect,
     job_count: usize,
     scroll_y: f32,
+    row_height: f32,
 ) {
-    let content_h = job_count as f32 * ROW_H;
+    let content_h = job_count as f32 * row_height.max(1.0);
     if viewport.height() <= 0.0 || content_h <= viewport.height() {
         return;
     }
@@ -2596,10 +3411,17 @@ fn paint_queue_row(
     rect: Rect,
     job: &EvolutionJobSummary,
     selected: bool,
+    metrics: QueueRowMetrics,
 ) {
     let dot = tone_color(pal, job.phase);
     ctx.fill(
-        Path::circle(widgets::point(rect.x() + PAD, rect.y() + 18.0), 5.0),
+        Path::circle(
+            widgets::point(
+                rect.x() + PAD,
+                rect.y() + metrics.title_top + metrics.title_line_height * 0.5,
+            ),
+            5.0,
+        ),
         dot,
     );
     let objective = compact(
@@ -2610,9 +3432,9 @@ fn paint_queue_row(
         ctx,
         Rect::new(
             rect.x() + PAD + 16.0,
-            rect.y() + 8.0,
+            rect.y() + metrics.title_top,
             rect.width() - PAD * 2.0 - 16.0,
-            22.0,
+            metrics.title_line_height,
         ),
         &objective,
         pal.text_style(
@@ -2634,9 +3456,9 @@ fn paint_queue_row(
         ctx,
         Rect::new(
             rect.x() + PAD + 16.0,
-            rect.y() + 33.0,
+            rect.y() + metrics.meta_top,
             rect.width() - PAD * 2.0 - 16.0,
-            18.0,
+            metrics.meta_line_height,
         ),
         &compact(
             &meta,
@@ -2653,162 +3475,15 @@ fn paint_queue_row(
         ctx,
         Rect::new(
             rect.x() + PAD + 16.0,
-            rect.y() + 53.0,
+            rect.y() + metrics.target_top,
             rect.width() - PAD * 2.0 - 16.0,
-            18.0,
+            metrics.target_line_height,
         ),
         &compact(
             &target,
             ((rect.width() - 64.0) / 8.7).clamp(18.0, 38.0) as usize,
         ),
         pal.text_style(theme, 11.0, FontWeight::NORMAL, pal.text_faint),
-    );
-}
-
-fn paint_detail(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    rect: Rect,
-    job: Option<&EvolutionJobSummary>,
-    start_ready: bool,
-    starting: bool,
-) {
-    let inner = rect.inflate(-PAD, -PAD);
-    let Some(job) = job else {
-        paint_detail_empty(ctx, theme, pal, inner, start_ready, starting);
-        return;
-    };
-
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(inner.x(), inner.y(), inner.width() - 124.0, 30.0),
-        &compact(
-            &job.objective,
-            ((inner.width() - 136.0) / 12.8).clamp(24.0, 52.0) as usize,
-        ),
-        pal.text_style(theme, 20.0, FontWeight::SEMIBOLD, pal.text),
-    );
-    paint_status_pill(
-        ctx,
-        theme,
-        pal,
-        Rect::new(inner.max_x() - 116.0, inner.y() + 3.0, 116.0, 24.0),
-        &job.status_label,
-        job.phase,
-    );
-
-    let meta = format!(
-        "{} - created {} - branch {}",
-        job.short_id,
-        compact(&job.created_at, 24),
-        compact(&job.candidate_branch, 28)
-    );
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(inner.x(), inner.y() + 34.0, inner.width(), 21.0),
-        &meta,
-        pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text_muted),
-    );
-
-    let mut y = inner.y() + 72.0;
-    paint_lifecycle(
-        ctx,
-        theme,
-        pal,
-        Rect::new(inner.x(), y, inner.width(), 92.0),
-        job,
-    );
-    y += 104.0;
-
-    let summary_h = 86.0;
-    widgets::round_panel(
-        ctx,
-        Rect::new(inner.x(), y, inner.width(), summary_h),
-        pal.panel,
-        pal.border,
-        8.0,
-    );
-    paint_kv_grid(
-        ctx,
-        theme,
-        pal,
-        Rect::new(
-            inner.x() + 14.0,
-            y + 12.0,
-            inner.width() - 28.0,
-            summary_h - 24.0,
-        ),
-        job,
-    );
-    y += summary_h + SECTION_GAP;
-
-    paint_section_title(ctx, theme, pal, inner.x(), y, "Evidence");
-    y += 28.0;
-    let evidence = evidence_rows(job);
-    paint_rows(
-        ctx,
-        theme,
-        pal,
-        Rect::new(inner.x(), y, inner.width(), 112.0),
-        &evidence,
-    );
-    y += 126.0;
-
-    paint_section_title(ctx, theme, pal, inner.x(), y, "Scope");
-    y += 28.0;
-    let scope = scope_rows(job);
-    paint_rows(
-        ctx,
-        theme,
-        pal,
-        Rect::new(inner.x(), y, inner.width(), 96.0),
-        &scope,
-    );
-}
-
-fn paint_detail_empty(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    rect: Rect,
-    start_ready: bool,
-    starting: bool,
-) {
-    let panel_w = rect.width().min(420.0);
-    let panel_h = 154.0;
-    let panel = Rect::new(
-        rect.x() + (rect.width() - panel_w) / 2.0,
-        rect.y() + (rect.height() - panel_h) / 2.0,
-        panel_w,
-        panel_h,
-    );
-    widgets::round_panel(ctx, panel, pal.panel, pal.border, 10.0);
-    widgets::draw_centered(
-        ctx,
-        "No evolution job selected",
-        pal.text_style(theme, 18.0, FontWeight::SEMIBOLD, pal.text_muted),
-        panel.x() + panel.width() / 2.0,
-        panel.y() + 32.0,
-    );
-    widgets::draw_centered(
-        ctx,
-        empty_detail_subtitle(start_ready, starting),
-        pal.text_style(theme, 14.0, FontWeight::NORMAL, pal.text_faint),
-        panel.x() + panel.width() / 2.0,
-        panel.y() + 58.0,
-    );
-    paint_rows(
-        ctx,
-        theme,
-        pal,
-        Rect::new(
-            panel.x() + 14.0,
-            panel.y() + 80.0,
-            panel.width() - 28.0,
-            60.0,
-        ),
-        &empty_detail_rows(start_ready, starting),
     );
 }
 
@@ -2842,47 +3517,13 @@ fn empty_detail_rows(start_ready: bool, starting: bool) -> Vec<(String, String)>
     ]
 }
 
-fn paint_status_pill(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    rect: Rect,
-    label: &str,
-    phase: EvolutionPhase,
-) {
-    // Mesh status badge: translucent status wash, status-text ink, a solid
-    // status dot for peripheral legibility. Never a heavy filled block.
-    let color = tone_color(pal, phase);
-    let (soft, ink) = tone_badge_colors(pal, phase);
-    widgets::fill_round_rect(ctx, rect, soft, 4.0);
-    ctx.fill(
-        Path::circle(
-            widgets::point(rect.x() + 13.0, rect.y() + rect.height() / 2.0),
-            3.5,
-        ),
-        color,
-    );
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(
-            rect.x() + 22.0,
-            rect.y(),
-            rect.width() - 26.0,
-            rect.height(),
-        ),
-        &compact(label, 9),
-        pal.text_style(theme, 11.0, FontWeight::SEMIBOLD, ink),
-    );
-}
-
-fn paint_lifecycle(
+fn paint_lifecycle_track(
     ctx: &mut PaintCtx,
     theme: &sui::DefaultTheme,
     pal: &Palette,
     rect: Rect,
     job: &EvolutionJobSummary,
 ) {
-    paint_section_title(ctx, theme, pal, rect.x(), rect.y(), "Lifecycle");
     let stages = [
         ("observed", "Observed"),
         ("scoped", "Scoped"),
@@ -2897,7 +3538,8 @@ fn paint_lifecycle(
         ("promoted", "Promoted"),
     ];
     let current = stage_index(&job.status_key);
-    let y = rect.y() + 52.0;
+    let metrics = LifecycleMetrics::for_theme(theme);
+    let y = rect.y() + metrics.track_center_y;
     let left = rect.x() + 12.0;
     let right = rect.max_x() - 12.0;
     let step = if stages.len() > 1 {
@@ -2921,7 +3563,7 @@ fn paint_lifecycle(
             .line_to(widgets::point(x2, y));
         ctx.stroke(builder.build(), color, StrokeStyle::new(1.0));
     }
-    for (index, (_, label)) in stages.iter().enumerate() {
+    for (index, _) in stages.iter().enumerate() {
         let x = left + step * index as f32;
         let center = widgets::point(x, y);
         if index == current {
@@ -2940,289 +3582,85 @@ fn paint_lifecycle(
                 StrokeStyle::new(1.5),
             );
         }
-        if index % 2 == 0 || step > 54.0 {
-            widgets::draw_centered(
-                ctx,
-                label,
-                pal.text_style(theme, 10.0, FontWeight::NORMAL, pal.text_faint),
-                x,
-                y + 22.0,
-            );
+    }
+
+    let label_style = pal.text_style(theme, 10.0, FontWeight::NORMAL, pal.text_faint);
+    let label_widths = stages
+        .iter()
+        .map(|(_, label)| {
+            ctx.measure_text(*label, label_style.clone())
+                .map(|measurement| measurement.width + 2.0)
+                .unwrap_or_else(|_| {
+                    label.chars().count() as f32 * label_style.font_size * 0.56 + 2.0
+                })
+        })
+        .collect::<Vec<_>>();
+    for placement in lifecycle_label_placements(rect, step, &label_widths, current) {
+        widgets::draw_centered(
+            ctx,
+            stages[placement.index].1,
+            label_style.clone(),
+            placement.center_x,
+            rect.y() + metrics.label_center_y(),
+        );
+    }
+}
+
+fn lifecycle_label_placements(
+    rect: Rect,
+    step: f32,
+    widths: &[f32],
+    current: usize,
+) -> Vec<LifecycleLabelPlacement> {
+    if widths.is_empty() || rect.width() <= 0.0 {
+        return Vec::new();
+    }
+
+    let available_left = rect.x() + 2.0;
+    let available_right = rect.max_x() - 2.0;
+    let available_width = (available_right - available_left).max(0.0);
+    if available_width <= 0.0 {
+        return Vec::new();
+    }
+
+    // The active stage is the most useful caption. Endpoints come next, then remaining stages are
+    // admitted only when their measured bounds do not collide with captions already selected.
+    let last = widths.len() - 1;
+    let current = current.min(last);
+    let mut priority = Vec::with_capacity(widths.len());
+    for index in [current, 0, last].into_iter().chain(0..widths.len()) {
+        if !priority.contains(&index) {
+            priority.push(index);
         }
     }
-}
 
-fn paint_kv_grid(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    rect: Rect,
-    job: &EvolutionJobSummary,
-) {
-    let cols = if rect.width() > 520.0 { 3 } else { 2 };
-    let col_w = rect.width() / cols as f32;
-    let entries = [
-        ("Target", job.target_ring.clone()),
-        (
-            "Verification",
-            job.verification_outcome
-                .clone()
-                .unwrap_or_else(|| "not recorded".to_string()),
-        ),
-        ("Changed files", job.changed_files.len().to_string()),
-        ("Commands", job.verification_command_count.to_string()),
-        ("Replay reports", job.module_replay_count.to_string()),
-        ("Artifacts", job.artifact_ref_count.to_string()),
-    ];
-    for (index, (label, value)) in entries.iter().enumerate() {
-        let col = index % cols;
-        let row = index / cols;
-        let x = rect.x() + col as f32 * col_w;
-        let y = rect.y() + row as f32 * 30.0;
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(x, y, col_w - 10.0, 14.0),
-            label,
-            pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.text_faint),
-        );
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(x, y + 14.0, col_w - 10.0, 18.0),
-            &compact(value, (col_w / 7.0).max(12.0) as usize),
-            pal.text_style(theme, 12.0, FontWeight::SEMIBOLD, pal.text),
-        );
-    }
-}
-
-fn paint_rows(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    rect: Rect,
-    rows: &[(String, String)],
-) {
-    widgets::round_panel(ctx, rect, pal.panel, pal.border, 10.0);
-    let mut y = rect.y() + 9.0;
-    for (index, (label, value)) in rows.iter().take(4).enumerate() {
-        let row = Rect::new(rect.x() + 12.0, y, rect.width() - 24.0, 22.0);
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(row.x(), row.y(), 122.0, row.height()),
-            label,
-            pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text_muted),
-        );
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(row.x() + 126.0, row.y(), row.width() - 126.0, row.height()),
-            &compact(value, ((row.width() - 126.0) / 7.0).max(18.0) as usize),
-            pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text),
-        );
-        y += 24.0;
-        if index < rows.len() - 1 {
-            ctx.fill_rect(
-                Rect::new(rect.x() + 12.0, y - 1.0, rect.width() - 24.0, 1.0),
-                pal.border.with_alpha(0.56),
-            );
-        }
-    }
-}
-
-fn paint_section_title(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    x: f32,
-    y: f32,
-    label: &str,
-) {
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(x, y, 220.0, 22.0),
-        label,
-        pal.text_style(theme, 14.0, FontWeight::SEMIBOLD, pal.text),
-    );
-}
-
-fn paint_narrow_action_bar(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    rect: Rect,
-    job: Option<&EvolutionJobSummary>,
-    action: &DecisionActionStatus,
-) {
-    ctx.fill_rect(rect, pal.sidebar);
-    widgets::hairline_top(ctx, rect, pal.border);
-    let (label, color) = if let Some(error) = action.error.as_deref() {
-        (format!("Decision failed - {error}"), pal.bad)
-    } else if let Some(status) = action.status.as_deref() {
-        (
-            status.to_string(),
-            if action.deciding {
-                pal.accent
-            } else {
-                pal.text_muted
-            },
-        )
-    } else if let Some(job) = job {
-        (
-            format!("{} - {}", job.short_id, job.status_label),
-            tone_color(pal, job.phase),
-        )
-    } else {
-        ("Select a candidate to review".to_string(), pal.text_muted)
-    };
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(
-            rect.x() + PAD,
-            rect.y() + 7.0,
-            (rect.width() - PAD * 2.0).max(0.0),
-            18.0,
-        ),
-        &compact(
-            &label,
-            ((rect.width() - PAD * 2.0) / 7.2).max(16.0) as usize,
-        ),
-        pal.text_style(theme, 11.0, FontWeight::MEDIUM, color),
-    );
-}
-
-fn paint_rail(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    rect: Rect,
-    dashboard: &EvolutionDashboard,
-    job: Option<&EvolutionJobSummary>,
-    action: &DecisionActionStatus,
-    readiness_details_open: bool,
-) {
-    ctx.fill_rect(rect, pal.sidebar);
-    widgets::hairline_left(ctx, rect, pal.border);
-    let inner = rect.inflate(-PAD, -PAD);
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(inner.x(), inner.y(), inner.width(), 24.0),
-        "Safety and evidence",
-        pal.text_style(theme, 14.0, FontWeight::SEMIBOLD, pal.text),
-    );
-    let Some(job) = job else {
-        let rows = readiness_rows(dashboard, readiness_details_open);
-        let section_h = readiness_section_height(readiness_details_open);
-        paint_rail_section(
-            ctx,
-            theme,
-            pal,
-            Rect::new(inner.x(), inner.y() + 38.0, inner.width(), section_h),
-            "Readiness",
-            &rows,
-        );
-        return;
-    };
-
-    let mut y = inner.y() + 38.0;
-    y = paint_decision_action_section(
-        ctx,
-        theme,
-        pal,
-        Rect::new(inner.x(), y, inner.width(), DECISION_SECTION_H),
-        job,
-        action,
-    );
-    y += SECTION_GAP;
-    paint_rail_section(
-        ctx,
-        theme,
-        pal,
-        Rect::new(inner.x(), y, inner.width(), 150.0),
-        "Review summary",
-        &selected_review_rows(job),
-    );
-}
-
-fn paint_decision_action_section(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    rect: Rect,
-    job: &EvolutionJobSummary,
-    action: &DecisionActionStatus,
-) -> f32 {
-    widgets::round_panel(ctx, rect, pal.panel, pal.border, 10.0);
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(rect.x() + 12.0, rect.y() + 10.0, rect.width() - 24.0, 20.0),
-        "Operator decision",
-        pal.text_style(theme, 12.0, FontWeight::SEMIBOLD, pal.text),
-    );
-    let mut y = rect.y() + 36.0;
-    for (label, value) in decision_action_rows(job, action).iter().take(3) {
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(rect.x() + 12.0, y, 78.0, 18.0),
-            label,
-            pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.text_faint),
-        );
-        let color = if label == "State" && action.error.is_some() {
-            pal.bad
-        } else if label == "State" && action.deciding {
-            pal.accent
+    let track_left = rect.x() + 12.0;
+    let mut placements = Vec::<LifecycleLabelPlacement>::new();
+    for index in priority {
+        let width = widths[index].max(1.0).min(available_width);
+        let half_width = width * 0.5;
+        let nominal_center = track_left + step * index as f32;
+        let center_x = if width >= available_width {
+            available_left + available_width * 0.5
         } else {
-            pal.text
+            nominal_center.clamp(available_left + half_width, available_right - half_width)
         };
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(rect.x() + 90.0, y, rect.width() - 102.0, 18.0),
-            &compact(value, ((rect.width() - 102.0) / 6.6).max(14.0) as usize),
-            pal.text_style(theme, 11.0, FontWeight::NORMAL, color),
-        );
-        y += 21.0;
+        let left = center_x - half_width;
+        let right = center_x + half_width;
+        if placements.iter().all(|existing| {
+            right + LIFECYCLE_LABEL_HORIZONTAL_GAP <= existing.left
+                || left >= existing.right + LIFECYCLE_LABEL_HORIZONTAL_GAP
+        }) {
+            placements.push(LifecycleLabelPlacement {
+                index,
+                center_x,
+                left,
+                right,
+            });
+        }
     }
-    ctx.fill_rect(
-        Rect::new(
-            rect.x() + 12.0,
-            rect.max_y() - DECISION_BUTTON_H - 18.0,
-            rect.width() - 24.0,
-            1.0,
-        ),
-        pal.border.with_alpha(0.56),
-    );
-    rect.max_y()
-}
-
-fn paint_rail_section(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    rect: Rect,
-    title: &str,
-    rows: &[(String, String)],
-) -> f32 {
-    widgets::round_panel(ctx, rect, pal.panel, pal.border, 10.0);
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(rect.x() + 12.0, rect.y() + 10.0, rect.width() - 24.0, 20.0),
-        title,
-        pal.text_style(theme, 12.0, FontWeight::SEMIBOLD, pal.text),
-    );
-    let mut y = rect.y() + 36.0;
-    for (label, value) in rows.iter().take(5) {
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(rect.x() + 12.0, y, 88.0, 18.0),
-            label,
-            pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.text_faint),
-        );
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(rect.x() + 100.0, y, rect.width() - 112.0, 18.0),
-            &compact(value, ((rect.width() - 112.0) / 6.6).max(14.0) as usize),
-            pal.text_style(theme, 11.0, FontWeight::NORMAL, pal.text),
-        );
-        y += 22.0;
-    }
-    rect.max_y()
+    placements.sort_by_key(|placement| placement.index);
+    placements
 }
 
 fn readiness_rows(dashboard: &EvolutionDashboard, details_open: bool) -> Vec<(String, String)> {
@@ -3515,6 +3953,7 @@ mod tests {
     use super::*;
     use crate::backend::Backend;
     use crate::state::{AppState, Shared};
+    use crate::theme::{AppTextScale, AppThemeMode, resolve_theme_with_preferences};
 
     fn candidate(index: usize) -> EvolutionJobSummary {
         EvolutionJobSummary {
@@ -3641,26 +4080,115 @@ mod tests {
 
     #[test]
     fn virtual_queue_window_tracks_scroll_and_hit_testing() {
-        let queue = Rect::new(0.0, 0.0, 300.0, QUEUE_HEADER_H + ROW_H * 2.5);
-        let scroll_y = ROW_H * 7.0 + 10.0;
+        let theme = resolve_theme_with_preferences(AppThemeMode::Dark, AppTextScale::Standard);
+        let row_height = QueueRowMetrics::for_theme(&theme).height;
+        let queue = Rect::new(0.0, 0.0, 300.0, QUEUE_HEADER_H + row_height * 2.5);
+        let scroll_y = row_height * 7.0 + 10.0;
 
-        assert_eq!(visible_queue_range(queue, 40, scroll_y), 7..10);
+        assert_eq!(visible_queue_range(queue, 40, scroll_y, row_height), 7..10);
         assert_eq!(
             queue_index_at(
                 queue,
                 scroll_y,
                 40,
+                row_height,
                 sui::Point::new(40.0, QUEUE_HEADER_H + 5.0),
             ),
             Some(7)
         );
-        let bottom = queue_scroll_limit(queue, 40);
-        let bottom_range = visible_queue_range(queue, 40, bottom);
+        let bottom = queue_scroll_limit(queue, 40, row_height);
+        let bottom_range = visible_queue_range(queue, 40, bottom, row_height);
         assert_eq!(bottom_range.end, 40);
         assert!(
             bottom_range.len() < 40,
             "only viewport rows are materialized"
         );
+    }
+
+    #[test]
+    fn extra_large_queue_rows_expand_from_token_line_heights_without_overlap() {
+        let standard = resolve_theme_with_preferences(AppThemeMode::Dark, AppTextScale::Standard);
+        let extra_large =
+            resolve_theme_with_preferences(AppThemeMode::Dark, AppTextScale::ExtraLarge);
+        let standard_metrics = QueueRowMetrics::for_theme(&standard);
+        let metrics = QueueRowMetrics::for_theme(&extra_large);
+
+        assert_eq!(standard_metrics.height, QUEUE_ROW_MIN_H);
+        assert!(metrics.height > standard_metrics.height);
+        assert!(
+            metrics.meta_top >= metrics.title_top + metrics.title_line_height + QUEUE_ROW_LINE_GAP
+        );
+        assert!(
+            metrics.target_top >= metrics.meta_top + metrics.meta_line_height + QUEUE_ROW_LINE_GAP
+        );
+        assert!(
+            metrics.height
+                >= metrics.target_top + metrics.target_line_height + QUEUE_ROW_BOTTOM_PAD
+        );
+
+        let queue = Rect::new(0.0, 0.0, 300.0, QUEUE_HEADER_H + metrics.height * 2.5);
+        let scroll_y = metrics.height * 7.0 + 10.0;
+        assert_eq!(
+            visible_queue_range(queue, 40, scroll_y, metrics.height),
+            7..10,
+            "virtualization must use the same scaled row height as painting"
+        );
+        assert_eq!(
+            queue_index_at(
+                queue,
+                scroll_y,
+                40,
+                metrics.height,
+                sui::Point::new(40.0, QUEUE_HEADER_H + metrics.height + 1.0),
+            ),
+            Some(8),
+            "scaled hit testing must agree with the virtual row window"
+        );
+    }
+
+    #[test]
+    fn extra_large_lifecycle_labels_clear_the_track_and_each_other() {
+        let theme = resolve_theme_with_preferences(AppThemeMode::Dark, AppTextScale::ExtraLarge);
+        let metrics = LifecycleMetrics::for_theme(&theme);
+        assert!(
+            metrics.label_top
+                >= metrics.track_center_y + LIFECYCLE_DOT_RADIUS + LIFECYCLE_LABEL_GAP
+        );
+        assert!(
+            metrics.height >= metrics.label_top + metrics.label_line_height + LIFECYCLE_BOTTOM_PAD
+        );
+
+        let labels = [
+            "Observed",
+            "Scoped",
+            "Proposed",
+            "Implemented",
+            "Built",
+            "Evaluated",
+            "Approved",
+            "Staged",
+            "Shadowed",
+            "Canary",
+            "Promoted",
+        ];
+        let widths = labels
+            .iter()
+            .map(|label| label.chars().count() as f32 * theme.text.xs.size * 0.62 + 2.0)
+            .collect::<Vec<_>>();
+        let rect = Rect::new(0.0, 0.0, 480.0, metrics.height);
+        let step = (rect.width() - 24.0) / (labels.len() as f32 - 1.0);
+        let placements = lifecycle_label_placements(rect, step, &widths, 5);
+
+        assert!(placements.iter().any(|placement| placement.index == 5));
+        for (index, placement) in placements.iter().enumerate() {
+            for other in placements.iter().skip(index + 1) {
+                assert!(
+                    placement.right + LIFECYCLE_LABEL_HORIZONTAL_GAP <= other.left
+                        || other.right + LIFECYCLE_LABEL_HORIZONTAL_GAP <= placement.left,
+                    "measured lifecycle captions must not overlap"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3674,8 +4202,9 @@ mod tests {
         }
         let view = EvolutionView::new(shared.clone());
         *view.focused_job_id.borrow_mut() = Some("candidate-02".to_string());
-        view.queue_scroll_y.set(ROW_H * 2.0);
-        let queue = Rect::new(0.0, 0.0, 300.0, QUEUE_HEADER_H + ROW_H);
+        let row_height = QueueRowMetrics::for_theme(&shared.theme()).height;
+        view.queue_scroll_y.set(row_height * 2.0);
+        let queue = Rect::new(0.0, 0.0, 300.0, QUEUE_HEADER_H + row_height);
 
         let (dashboard, selected, completed_id) = {
             let mut evolution = shared.evolution_mut();
@@ -3820,6 +4349,106 @@ mod tests {
             .with_name("Reject")
             .expect()
             .to_be_visible()?;
+        Ok(())
+    }
+
+    #[test]
+    fn composed_evolution_detail_uses_semantic_sections_and_status_widgets() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut evolution = shared.evolution_mut();
+            let mut job = candidate(3);
+            job.verification_outcome = Some("passed".to_string());
+            job.changed_files = vec!["crates/sinomo-app/src/ui/evolution.rs".to_string()];
+            evolution.dashboard = EvolutionDashboard {
+                source: "test".to_string(),
+                jobs: vec![job],
+                error: None,
+            };
+            evolution.selected = Some(0);
+        }
+        let window = test_window(
+            "Evolution composed detail",
+            view(shared),
+            Size::new(1200.0, 820.0),
+        )?;
+
+        window
+            .get_by_role(SemanticsRole::Text)
+            .with_name("awaiting approval")
+            .expect()
+            .to_be_visible()?;
+        for section in ["Lifecycle", "Evidence", "Scope", "Operator decision"] {
+            window
+                .get_by_role(SemanticsRole::GenericContainer)
+                .with_name(section)
+                .expect()
+                .to_be_visible()?;
+        }
+        window
+            .get_by_role(SemanticsRole::ProgressBar)
+            .with_name("Evolution lifecycle")
+            .expect()
+            .to_have_value("awaiting approval; stage 6 of 11")?;
+        window
+            .get_by_role(SemanticsRole::GenericContainer)
+            .with_name("Outcome")
+            .expect()
+            .to_have_value("passed")?;
+        Ok(())
+    }
+
+    #[test]
+    fn evolution_header_and_start_status_receive_usable_text_width() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut evolution = shared.evolution_mut();
+            evolution.dashboard = EvolutionDashboard {
+                source: "test".to_string(),
+                jobs: vec![candidate(0), candidate(1), candidate(2)],
+                error: None,
+            };
+            evolution.selected = Some(0);
+            evolution.objective_draft = "Improve DFS performance".to_string();
+        }
+        let window = test_window(
+            "Evolution header layout",
+            view(shared),
+            Size::new(1280.0, 720.0),
+        )?;
+        let snapshot = window.snapshot()?;
+
+        let title = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Text && node.name.as_deref() == Some("Evolution")
+            })
+            .expect("Evolution page title");
+        assert!(
+            title.bounds.width() > 300.0 && title.bounds.height() < 40.0,
+            "page title should be laid out as a wide single line, got {:?}",
+            title.bounds
+        );
+
+        let status = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Text
+                    && node.name.as_deref()
+                        == Some("Ready to start - use Options for scope and target ring")
+            })
+            .expect("Evolution start readiness status");
+        assert!(
+            status.bounds.width() > 300.0 && status.bounds.height() < 40.0,
+            "readiness should be laid out as a wide single line, got {:?}",
+            status.bounds
+        );
         Ok(())
     }
 

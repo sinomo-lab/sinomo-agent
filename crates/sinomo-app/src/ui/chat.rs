@@ -29,8 +29,8 @@
 //!   animation frame — the same wiring the old `ChatView::pump` had.
 //!
 //! The agents/chats sidebar and the composer are stock widgets. The composer
-//! follows the Mesh design language: one field surface ([`ComposerFieldFrame`])
-//! holding queued-steering chips, attachment chips, the borderless message
+//! follows the Mesh design language: one shared [`FramedField`] holding
+//! queued-steering chips, attachment chips, the borderless message
 //! `TextArea` and the action bar (attach · voice · model/context/activity ·
 //! Send-becomes-Stop). Each region is wrapped in a [`RebuildOnChange`] keyed on
 //! a small signature of the state it renders; the provider/model/effort
@@ -48,24 +48,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sui::{
     ActionTilePaint, Alignment, ArrangeCtx, CalloutPaint, CodePanelPaint, CodeTextLine,
-    CodeTextPaint, CodeTextSpan, Color, CommandButtonPaint, Constraints, ContextMenu, CustomEvent,
-    DefaultTheme, DisclosureButtonPaint, Dock, EmptyStatePaint, Event, EventCtx, FixedPaneSplit,
-    Flex, FlexItem, FlexWrap, FontWeight, Icon, IconButton, IconButtonPaint, IconGlyph,
-    ImageHandle, ImageSource, Insets, KeyState, Label, ListItem, ListView, MeasureCtx,
-    MeasuredBottomDock, MenuItem, PaintCtx, Path, Point, PointerButton, PointerEventKind,
-    RebuildOnChange, RebuildOnConstraints, Rect, RegisteredImage, RichTextSourceMap, ScrollBar,
-    ScrollDelta, ScrollState, ScrollView, SectionLabel, SectionPanelPaint, SegmentedControl,
-    SegmentedControlItem, SelectionScope, SemanticRegion, SemanticTone, SemanticsAction,
-    SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Separator, SignalMeter, Size,
-    SizedBox, Stack, StackHostOptions, StatusBadge, Surface, SurfaceBorder, SurfaceRole,
-    SwitchView, TextArea, TextBlockPaint, TextCellPaint, TextCommand, TextDocument, TextInput,
-    TextLayout, TextLayoutRequest, TextParagraph, TextParagraphStyle, TextSpan, TextStyle,
-    TextWrap, TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    CodeTextPaint, CodeTextSpan, Color, Constraints, ContextMenu, ControlSize, CustomEvent,
+    DefaultTheme, Dock, EmptyState, Event, EventCtx, FieldAppearance, FixedPaneSplit, Flex,
+    FlexItem, FlexWrap, FontWeight, FramedField, Icon, IconButton, IconGlyph, ImageHandle,
+    ImageSource, Insets, KeyState, Label, ListItem, ListView, MeasureCtx, MeasuredBottomDock,
+    MenuItem, PaintCtx, Path, Point, PointerButton, PointerEventKind, RebuildOnChange,
+    RebuildOnConstraints, Rect, RegisteredImage, RichText, RichTextSourceMap, ScrollBar,
+    ScrollDelta, ScrollState, ScrollView, SectionLabel, SegmentedControl, SegmentedControlItem,
+    SelectionScope, SemanticRegion, SemanticTone, SemanticsAction, SemanticsCtx, SemanticsNode,
+    SemanticsRole, SemanticsValue, Separator, SideSheet, SideSheetPlacement, SignalMeter, Size,
+    SizedBox, Stack, StackHostOptions, StatusBadge, Surface, SurfaceAppearance, SurfaceBorder,
+    SurfaceRole, SwitchView, TextArea, TextBlockPaint, TextCellPaint, TextCommand, TextDocument,
+    TextInput, TextLayout, TextLayoutRequest, TextParagraph, TextParagraphStyle, TextSpan,
+    TextStyle, TextWrap, TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
     containers::Padding as WidgetPadding, draw_glyph, paint_action_tile, paint_callout,
-    paint_code_lines, paint_code_panel, paint_command_button, paint_disclosure_button,
-    paint_empty_state, paint_icon_button, paint_rounded_panel, paint_rounded_rect,
-    paint_section_label_detail, paint_section_panel, paint_text_block, paint_text_cell,
-    wrap_text_lines,
+    paint_code_lines, paint_code_panel, paint_rounded_panel, paint_rounded_rect,
+    paint_section_label_detail, paint_text_block, paint_text_cell, wrap_text_lines,
 };
 
 #[cfg(test)]
@@ -90,7 +88,7 @@ use crate::backend::chat_engine::{
 };
 use crate::backend::sifs::SifsDaemonAccess;
 use crate::state::{Shared, Tab};
-use crate::theme::Palette;
+use crate::theme::{AppTextScale, Palette};
 use crate::ui::chat_render::{
     self, ChatCodeBlock, ChatMarkdownRender, ChatMarkdownStyles, ChatRichRenderBlock,
 };
@@ -107,14 +105,15 @@ use crate::ui::widgets;
 const WIDE_THRESHOLD: f32 = 620.0;
 const SIDEBAR_W: f32 = 250.0;
 const COMPACT_HEADER_H: f32 = 54.0;
-// Expanded media content is 341px tall at its fixed row sizes. Keep a small
-// buffer for theme rounding without taking an extra transcript row.
+// Small media instruments preserve the useful 16:9 preview without consuming transcript space.
 const MEDIA_CALL_H: f32 = 352.0;
 const MEDIA_CALL_COMPACT_H: f32 = 46.0;
 const CHAT_MEDIA_DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(65);
 #[cfg(not(test))]
 static CHAT_MEDIA_CAMERA_OPEN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 const PAD: f32 = 16.0;
+// Agent and conversation rows carry two short lines, so they sit one step above a one-line Small
+// data row while remaining denser than a standard content row.
 const SIDEBAR_ROW_H: f32 = 36.0;
 const SIDEBAR_ROW_EDIT_W: f32 = 26.0;
 const SIDEBAR_ROW_EDIT_H: f32 = 24.0;
@@ -125,10 +124,6 @@ const ATTACHMENT_ENTRY_H: f32 = 30.0;
 const ATTACHMENT_CHIPS_H: f32 = 22.0;
 const COMPOSER_PAD_Y: f32 = 12.0;
 const COMPOSER_SECTION_GAP: f32 = 10.0;
-/// Mesh `--sm-r-3`: the composer field surface radius.
-const COMPOSER_FIELD_RADIUS: f32 = 10.0;
-/// Mesh focus-within halo: `box-shadow: 0 0 0 3px var(--sm-accent-soft)`.
-const COMPOSER_FOCUS_RING_W: f32 = 3.0;
 /// Chip rows inside the field ride `padding: 8px 10px 0` (`.sm-ctx-row`, `.sm-composer-queue`).
 const COMPOSER_CHIP_ROW_PAD_X: f32 = 10.0;
 const COMPOSER_CHIP_ROW_PAD_TOP: f32 = 8.0;
@@ -136,9 +131,9 @@ const COMPOSER_CHIP_ROW_PAD_TOP: f32 = 8.0;
 const COMPOSER_BAR_PAD_X: f32 = 8.0;
 const COMPOSER_BAR_PAD_Y: f32 = 6.0;
 const COMPOSER_BAR_GAP: f32 = 4.0;
-/// Quiet bar controls are compact; Send is the one primary action and reads larger.
+/// Quiet bar controls use the Small size; Send remains a Medium primary action.
 const COMPOSER_GHOST_BUTTON_SIZE: f32 = 28.0;
-const SEND_BUTTON_SIZE: f32 = 36.0;
+const SEND_BUTTON_SIZE: f32 = 32.0;
 const COMPOSER_INPUT_MIN_LINES: usize = 2;
 /// The docked composer input grows to 160px, then scrolls (Mesh layout spec).
 const COMPOSER_INPUT_MAX_H: f32 = 160.0;
@@ -416,18 +411,6 @@ impl ChatQuickAction {
         }
     }
 
-    fn subtitle(self) -> &'static str {
-        match self {
-            Self::PlanChange => "coding-agent",
-            Self::CheckCluster => "background-agent",
-            Self::DraftDocument => "Structured note",
-            Self::ReasonImage => "SIFS metadata",
-            Self::RolePlay => "Persona test",
-            Self::ManageChannel => "Agents and title",
-            Self::NewChannel => "Shared timeline",
-        }
-    }
-
     fn preferred_agent_key(self) -> Option<&'static str> {
         match self {
             Self::PlanChange => Some("coding-agent"),
@@ -453,6 +436,40 @@ fn quick_actions_for_chat(chat: &ChatState) -> &'static [ChatQuickAction] {
         &ChatQuickAction::CHANNEL
     } else {
         &ChatQuickAction::CHAT
+    }
+}
+
+fn activate_transcript_quick_action(shared: &Shared, action: ChatQuickAction) {
+    if action == ChatQuickAction::NewChannel {
+        let waker = { shared.borrow().waker.clone() };
+        shared.chat_mut().new_channel(waker);
+    } else {
+        shared.chat_mut().apply_quick_action(action);
+    }
+}
+
+fn activate_transcript_recovery_action(shared: &Shared, action: RecoveryCardAction) {
+    match action {
+        RecoveryCardAction::RetryChatList => {
+            let waker = { shared.borrow().waker.clone() };
+            shared.chat_mut().retry_chat_list_with_waker(waker);
+        }
+        RecoveryCardAction::CheckSifs => open_files_tab(shared),
+        RecoveryCardAction::OpenConnectionSettings => {
+            open_settings_section(shared, SettingsSection::Connection)
+        }
+        RecoveryCardAction::OpenProviderSetup => open_provider_setup(shared),
+    }
+}
+
+fn activate_transcript_runtime_action(shared: &Shared, action: &RuntimeTranscriptAction) {
+    match action {
+        RuntimeTranscriptAction::ToggleToolChain => {
+            shared.chat_mut().toggle_tool_chain_expanded();
+        }
+        RuntimeTranscriptAction::ToggleToolDetail(key) => {
+            shared.chat_mut().toggle_tool_detail(key.clone());
+        }
     }
 }
 
@@ -6465,86 +6482,14 @@ fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     move || reader()
 }
 
+fn small_control_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || reader().with_size(ControlSize::Small)
+}
+
 fn composer_control_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     let reader = Rc::clone(reader);
-    move || {
-        let mut theme = reader();
-        theme.typography.body_font_size = theme.text.base.size;
-        theme.typography.body_line_height = theme.text.base.line_height;
-        theme
-    }
-}
-
-/// The composer's borderless `TextArea`: the field frame paints the composer's
-/// fill, border and focus halo, so the input's own chrome goes fully
-/// transparent (`.sm-composer-input` — no background, no border, no outline).
-fn composer_input_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
-    let reader = Rc::clone(reader);
-    move || {
-        let mut theme = reader();
-        theme.typography.body_font_size = theme.text.base.size;
-        theme.typography.body_line_height = theme.text.base.line_height;
-        theme.palette.field = Color::TRANSPARENT;
-        theme.palette.surface = Color::TRANSPARENT;
-        theme.palette.surface_focus = Color::TRANSPARENT;
-        theme.palette.border = Color::TRANSPARENT;
-        theme.palette.border_hover = Color::TRANSPARENT;
-        theme.palette.border_focus = Color::TRANSPARENT;
-        theme.palette.focus_ring = Color::TRANSPARENT;
-        theme
-    }
-}
-
-/// Ghost bar controls (Mesh `sm-btn--ghost`): transparent at rest, neutral
-/// hover well, no hairline. Keyboard focus keeps the shared focus ring, and a
-/// selected toggle (the mic) keeps the stock accent wash + accent icon.
-fn ghost_icon_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
-    let reader = Rc::clone(reader);
-    move || {
-        let mut theme = reader();
-        theme.palette.control = Color::TRANSPARENT;
-        theme.palette.border = Color::TRANSPARENT;
-        theme.palette.border_hover = Color::TRANSPARENT;
-        theme
-    }
-}
-
-/// The composer's one primary action (Send / Stop): an accent-filled icon
-/// button, unlike the neutral `control` family stock `IconButton`s ride.
-fn primary_icon_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
-    let reader = Rc::clone(reader);
-    move || {
-        let mut theme = reader();
-        theme.palette.control = theme.palette.accent;
-        theme.palette.control_hover = theme.palette.accent_hover;
-        theme.palette.control_active = theme.palette.accent_pressed;
-        theme.palette.border = theme.palette.accent_border;
-        theme.palette.border_hover = theme.palette.accent_border_hover;
-        theme.palette.text = theme.surfaces.on_accent;
-        theme
-    }
-}
-
-/// Mesh chip surface: `--sm-surface-2` fill with the standard hairline.
-fn context_chip_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
-    let reader = Rc::clone(reader);
-    move || {
-        let mut theme = reader();
-        theme.surfaces.field = theme.surfaces.surface_2;
-        theme
-    }
-}
-
-/// Queued-steering chip surface: accent wash + accent hairline
-/// (`.sm-queue-chip` — `--sm-accent-soft` on `--sm-accent-border`).
-fn queue_chip_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
-    let reader = Rc::clone(reader);
-    move || {
-        let mut theme = reader();
-        theme.surfaces.field = theme.surfaces.accent_soft;
-        theme.surfaces.border = theme.surfaces.accent_border;
-        theme
-    }
+    move || reader().with_size(ControlSize::Small)
 }
 
 #[cfg(not(test))]
@@ -7800,39 +7745,6 @@ fn app_native_audio_format(
     }
 }
 
-fn secondary_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
-    let reader = Rc::clone(reader);
-    move || {
-        let mut theme = reader();
-        theme.palette.accent = theme.palette.control;
-        theme.palette.accent_hover = theme.palette.control_hover;
-        theme.palette.accent_pressed = theme.palette.control_active;
-        theme.palette.accent_border = theme.palette.border;
-        theme.palette.accent_border_hover = theme.palette.border_hover;
-        theme.palette.accent_border_focus = theme.palette.border_focus;
-        theme.palette.accent_text = theme.palette.text;
-        theme
-    }
-}
-
-fn danger_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
-    let reader = Rc::clone(reader);
-    move || {
-        let mut theme = reader();
-        let danger = theme.palette.danger;
-        let contrast = theme.palette.danger_text;
-        theme.palette.accent = danger;
-        theme.palette.accent_hover = theme.palette.danger_hover;
-        theme.palette.accent_pressed = theme.palette.danger_hover;
-        theme.palette.accent_border = danger;
-        theme.palette.accent_border_hover = theme.palette.danger_hover;
-        theme.palette.accent_border_focus = danger;
-        theme.palette.accent_text = contrast;
-        // The focus ring stays the shared Mesh focus color: one ring, everywhere.
-        theme
-    }
-}
-
 /// Resolve the app chrome palette for the current theme (used by the `Label` color readers and the
 /// bespoke painters so muted/accent text matches the chrome).
 fn palette(shared: &Shared) -> Palette {
@@ -7882,8 +7794,8 @@ fn context_overview_summary(chat: &ChatState) -> String {
 
     if let Some(target) = chat.runtime_recovery_target() {
         return match target {
-            RuntimeRecoveryTarget::Providers => "Context waits for provider setup".to_string(),
-            RuntimeRecoveryTarget::Connection => "Context waits for cluster connection".to_string(),
+            RuntimeRecoveryTarget::Providers => "Provider setup needed".to_string(),
+            RuntimeRecoveryTarget::Connection => "Cluster connection needed".to_string(),
         };
     }
 
@@ -8078,6 +7990,10 @@ fn tool_detail_key(call: &ChatToolActivity, section: ToolDetailSection) -> Strin
         ToolDetailSection::Output => "output",
     };
     format!("{}:{suffix}", tool_call_key(call))
+}
+
+fn tool_detail_collapsible(raw: &str) -> bool {
+    raw.chars().count() > TOOL_DETAIL_COLLAPSE_CHARS || raw.lines().count() > 12
 }
 
 fn runtime_action_label(action: &RuntimeTranscriptAction) -> &'static str {
@@ -8403,10 +8319,8 @@ fn heading(shared: &Shared, text: &str) -> Label {
         .style({
             let theme = shared.theme();
             sui::TextStyle {
-                font_size: 11.0,
-                line_height: 18.0,
                 weight: FontWeight::SEMIBOLD,
-                ..theme.body_text_style()
+                ..small_theme_text_style(&theme)
             }
         })
         .color_when(move || palette(&s).text_faint)
@@ -8428,7 +8342,24 @@ fn chats_heading(shared: &Shared) -> impl Widget + use<> {
 
 fn muted_label(shared: &Shared, text: impl Into<String>) -> Label {
     let s = shared.clone();
-    Label::new(text).color_when(move || palette(&s).text_muted)
+    small_label(shared, text).color_when(move || palette(&s).text_muted)
+}
+
+fn small_text_style(shared: &Shared) -> sui::TextStyle {
+    let theme = shared.theme();
+    small_theme_text_style(&theme)
+}
+
+fn small_theme_text_style(theme: &DefaultTheme) -> sui::TextStyle {
+    sui::TextStyle {
+        font_size: theme.text.sm.size,
+        line_height: theme.text.sm.line_height,
+        ..theme.body_text_style()
+    }
+}
+
+fn small_label(shared: &Shared, text: impl Into<String>) -> Label {
+    Label::new(text).style(small_text_style(shared))
 }
 
 fn dialog_section_label(shared: &Shared, text: impl Into<String>) -> Label {
@@ -8436,10 +8367,8 @@ fn dialog_section_label(shared: &Shared, text: impl Into<String>) -> Label {
     let theme = shared.theme();
     Label::new(text)
         .style(sui::TextStyle {
-            font_size: 12.0,
-            line_height: 18.0,
             weight: FontWeight::SEMIBOLD,
-            ..theme.body_text_style()
+            ..small_theme_text_style(&theme)
         })
         .color_when(move || palette(&s).text_muted)
 }
@@ -8559,6 +8488,7 @@ fn session_kind_filter_count(sessions: &[SessionRef], kind_filter: SessionKindFi
         .count()
 }
 
+#[cfg(test)]
 fn session_kind_filter_count_label(
     sessions: &[SessionRef],
     kind_filter: SessionKindFilter,
@@ -8725,7 +8655,7 @@ fn agents_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     ListView::new("chat-agents")
         .items(items)
         .row_height(SIDEBAR_ROW_H)
-        .theme_when(clone_reader(reader))
+        .theme_when(small_control_reader(reader))
         .selected_when({
             let s = s.clone();
             move || {
@@ -8849,7 +8779,7 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             }
         })
         .row_height(SIDEBAR_ROW_H)
-        .theme_when(clone_reader(reader))
+        .theme_when(small_control_reader(reader))
         .on_change(move |index, _label| {
             let mut chat = s.chat_mut();
             if chat.session_list_loading && chat.sessions.is_empty() {
@@ -8868,12 +8798,16 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 }
 
 fn session_create_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let small_reader: ThemeReader = {
+        let reader = Rc::clone(reader);
+        Rc::new(move || reader().with_size(ControlSize::Small))
+    };
     let new_chat = {
         let s = shared.clone();
         sui::Button::new("New chat")
             .icon(IconGlyph::Chat)
-            .min_height(32.0)
-            .theme_when(clone_reader(reader))
+            .min_height(28.0)
+            .theme_when(clone_reader(&small_reader))
             .on_press(move || {
                 s.chat_mut().new_session();
             })
@@ -8882,8 +8816,10 @@ fn session_create_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget 
         let s = shared.clone();
         sui::Button::new("New channel")
             .icon(IconGlyph::Add)
-            .min_height(32.0)
-            .theme_when(secondary_button_theme(reader))
+            .min_height(28.0)
+            .theme_when(clone_reader(&small_reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press_with_ctx(move |ctx| {
                 let waker = { s.borrow().waker.clone() };
                 s.chat_mut().new_channel(waker);
@@ -8915,7 +8851,7 @@ fn session_filter_input(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         .value(value)
         .placeholder("Search conversations")
         .leading_icon(IconGlyph::Search)
-        .theme_when(clone_reader(reader))
+        .theme_when(small_control_reader(reader))
         .on_change(move |value| {
             s.chat_mut().set_session_filter(value);
         })
@@ -9005,15 +8941,9 @@ fn session_kind_filter_control(shared: &Shared, reader: &ThemeReader) -> impl Wi
             .iter()
             .copied()
             .map(|filter| {
-                let label = format!(
-                    "{} {}",
-                    filter.label(),
-                    session_kind_filter_count_label(
-                        &chat.sessions,
-                        filter,
-                        chat.session_list_loading
-                    )
-                );
+                // Counts remain in the semantic description and the active section heading. Keep
+                // the three visible segments short enough to survive large text in the sidebar.
+                let label = filter.label().to_string();
                 let description = if chat.session_list_loading && chat.sessions.is_empty() {
                     "Loading conversations".to_string()
                 } else {
@@ -9057,143 +8987,6 @@ fn session_row_description(session: &SessionRef) -> String {
     }
 }
 
-struct CompactSidebarRowBody {
-    icon: IconGlyph,
-    icon_color: Color,
-    icon_size: f32,
-    icon_slot_width: f32,
-    gap: f32,
-    title: String,
-    title_style: TextStyle,
-    subtitle: Option<String>,
-    subtitle_style: Option<TextStyle>,
-}
-
-impl CompactSidebarRowBody {
-    fn new(
-        icon: IconGlyph,
-        icon_color: Color,
-        title: impl Into<String>,
-        title_style: TextStyle,
-    ) -> Self {
-        Self {
-            icon,
-            icon_color,
-            icon_size: 16.0,
-            icon_slot_width: 20.0,
-            gap: 7.0,
-            title: title.into(),
-            title_style,
-            subtitle: None,
-            subtitle_style: None,
-        }
-    }
-
-    fn subtitle(mut self, subtitle: impl Into<String>, style: TextStyle) -> Self {
-        self.subtitle = Some(subtitle.into());
-        self.subtitle_style = Some(style);
-        self
-    }
-}
-
-impl Widget for CompactSidebarRowBody {
-    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let width = if constraints.max.width.is_finite() {
-            constraints.max.width
-        } else {
-            self.icon_slot_width + self.gap + 160.0
-        };
-        let height = if constraints.max.height.is_finite() {
-            constraints.max.height
-        } else {
-            self.title_style.line_height
-                + self
-                    .subtitle_style
-                    .as_ref()
-                    .map(|style| style.line_height)
-                    .unwrap_or(0.0)
-        };
-        constraints.clamp(Size::new(width.max(0.0), height.max(1.0)))
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        let bounds = ctx.bounds();
-        if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
-            return;
-        }
-
-        let icon_slot = self.icon_slot_width.min(bounds.width()).max(0.0);
-        let icon_rect = Rect::new(bounds.x(), bounds.y(), icon_slot, bounds.height());
-        draw_glyph(
-            ctx,
-            self.icon,
-            center_square_for_sidebar_row(icon_rect, self.icon_size),
-            self.icon_color,
-        );
-
-        let text_x = bounds.x() + icon_slot + self.gap;
-        let text_width = (bounds.max_x() - text_x).max(0.0);
-        if text_width <= 0.0 {
-            return;
-        }
-
-        let subtitle_line = self
-            .subtitle_style
-            .as_ref()
-            .map(|style| style.line_height.max(1.0))
-            .unwrap_or(0.0);
-        let title_line = self.title_style.line_height.max(1.0);
-        let text_height = if self.subtitle.is_some() {
-            title_line + subtitle_line
-        } else {
-            title_line
-        };
-        let text_y = bounds.y() + ((bounds.height() - text_height).max(0.0) * 0.5);
-        let title_rect = Rect::new(text_x, text_y, text_width, title_line);
-        paint_sidebar_single_line_text(ctx, title_rect, &self.title, &self.title_style);
-
-        if let (Some(subtitle), Some(style)) = (&self.subtitle, &self.subtitle_style) {
-            let subtitle_rect = Rect::new(text_x, title_rect.max_y(), text_width, subtitle_line);
-            paint_sidebar_single_line_text(ctx, subtitle_rect, subtitle, style);
-        }
-    }
-}
-
-fn center_square_for_sidebar_row(rect: Rect, side: f32) -> Rect {
-    let side = side.min(rect.width()).min(rect.height()).max(0.0);
-    Rect::new(
-        rect.x() + ((rect.width() - side).max(0.0) * 0.5),
-        rect.y() + ((rect.height() - side).max(0.0) * 0.5),
-        side,
-        side,
-    )
-}
-
-fn paint_sidebar_single_line_text(ctx: &mut PaintCtx, rect: Rect, text: &str, style: &TextStyle) {
-    if rect.width() <= 0.0 || rect.height() <= 0.0 || text.is_empty() {
-        return;
-    }
-
-    let color = style.color;
-    let mut layout_style = style.clone();
-    layout_style.color = Color::WHITE;
-    let mut document = TextDocument::from_plain_text(text.to_string(), layout_style);
-    for paragraph in &mut document.paragraphs {
-        paragraph.style.wrap = TextWrap::NoWrap;
-    }
-
-    ctx.push_clip_rect(rect);
-    if let Ok(layout) = ctx.layout_text_document(
-        TextLayoutRequest::new(document)
-            .with_box_size(Size::new(rect.width().max(1.0), rect.height().max(1.0))),
-    ) {
-        ctx.draw_text_layout_with_color(rect.origin, &layout, color);
-    } else {
-        ctx.draw_text(rect, text.to_string(), style.clone());
-    }
-    ctx.pop_clip();
-}
-
 fn session_row_content(
     shared: &Shared,
     reader: &ThemeReader,
@@ -9212,13 +9005,20 @@ fn session_row_content(
         ConversationKind::Channel => pal.accent,
     };
 
-    let body = CompactSidebarRowBody::new(
-        IconGlyph::Chat,
-        icon_color,
-        session.title.clone(),
-        title_style,
-    )
-    .subtitle(session_meta_label(&session), meta_style);
+    let labels = Flex::vertical()
+        .align_items(Alignment::Start)
+        .with_child(Label::new(session.title.clone()).style(title_style))
+        .with_child(Label::new(session_meta_label(&session)).style(meta_style));
+    let body = Flex::horizontal()
+        .main_gap(7.0)
+        .align_items(Alignment::Center)
+        .with_child(
+            SizedBox::new()
+                .width(20.0)
+                .height(20.0)
+                .with_child(Icon::new(IconGlyph::Chat).size(16.0).color(icon_color)),
+        )
+        .with_item(labels, FlexItem::flex(1.0).min_width(0.0));
 
     let s = shared.clone();
     let session_id = session.id.clone();
@@ -9226,7 +9026,9 @@ fn session_row_content(
         .size(SIDEBAR_ROW_EDIT_H)
         .icon_size(14.0)
         .selected(editing)
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press_with_ctx(move |ctx| {
             s.chat_mut().begin_edit_session(&session_id);
             ctx.request_measure();
@@ -9402,7 +9204,9 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
             })
             .min_height(26.0)
             .min_width(78.0)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press(move || {
                 s.chat_mut().toggle_session_list_details();
             })
@@ -9426,7 +9230,9 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
             .icon(IconGlyph::Storage)
             .min_height(28.0)
             .min_width(112.0)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press(move || open_files_tab(&s))
     };
     let connection = {
@@ -9435,7 +9241,9 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
             .icon(IconGlyph::Alert)
             .min_height(28.0)
             .min_width(128.0)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press(move || open_settings_section(&s, SettingsSection::Connection))
     };
 
@@ -9451,7 +9259,7 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
             FlexItem::flex(1.35).min_width(112.0),
         );
     let summary = TrailingSlotRow::new(
-        dialog_section_label(shared, "History diagnostics").font_size(11.0),
+        dialog_section_label(shared, "History diagnostics"),
         Flex::horizontal()
             .align_items(Alignment::Center)
             .spacer()
@@ -9467,13 +9275,10 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
 
     if details_open {
         body = body
-            .with_child(
-                muted_label(
-                    shared,
-                    "Chat and channel history stays in SIFS. You can keep chatting while it syncs.",
-                )
-                .font_size(10.5),
-            )
+            .with_child(muted_label(
+                shared,
+                "Chat and channel history stays in SIFS. You can keep chatting while it syncs.",
+            ))
             .with_child(SizedBox::new().height(28.0).with_child(actions))
             .with_child(SizedBox::new().height(28.0).with_child(connection));
     }
@@ -9630,11 +9435,28 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         let s = shared.clone();
         sui::Button::new("Done")
             .icon(IconGlyph::Close)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press_with_ctx(move |ctx| {
                 s.chat_mut().close_session_edit();
                 ctx.request_measure();
                 ctx.request_paint();
+            })
+    };
+    let close = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::Close, "Close edit dialog")
+            .size(28.0)
+            .icon_size(14.0)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Ghost)
+            .tone(SemanticTone::Neutral)
+            .on_press_with_ctx(move |ctx| {
+                s.chat_mut().close_session_edit();
+                ctx.request_measure();
+                ctx.request_paint();
+                ctx.request_semantics();
             })
     };
     let details_toggle = {
@@ -9649,7 +9471,9 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         } else {
             IconGlyph::ChevronDown
         })
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press_with_ctx(move |ctx| {
             s.chat_mut().toggle_session_edit_details();
             ctx.request_measure();
@@ -9661,25 +9485,24 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     let mut body = Stack::vertical()
         .spacing(10.0)
         .alignment(Alignment::Stretch)
-        .with_child(dialog_section_label(shared, "Name"))
+        .with_child(
+            TrailingSlotRow::new(dialog_section_label(shared, "Name"), close)
+                .trailing_width(28.0)
+                .trailing_height(28.0)
+                .gap(8.0),
+        )
         .with_child(SizedBox::new().height(32.0).with_child(input));
     if is_untitled_channel(&session) {
-        body = body.with_child(
-            muted_label(
-                shared,
-                "Untitled channel. Rename it so it is easy to recognize in the sidebar.",
-            )
-            .font_size(11.0),
-        );
+        body = body.with_child(muted_label(
+            shared,
+            "Untitled channel. Rename it so it is easy to recognize in the sidebar.",
+        ));
     }
     if let Some(error) = rename_error {
-        body = body.with_child(
-            muted_label(
-                shared,
-                format!("Rename failed: {error}. Edit the title or retry Save."),
-            )
-            .font_size(11.0),
-        );
+        body = body.with_child(muted_label(
+            shared,
+            format!("Rename failed: {error}. Edit the title or retry Save."),
+        ));
     }
     body = body
         .with_child(
@@ -9733,7 +9556,9 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             let s = shared.clone();
             sui::Button::new(delete_label)
                 .icon(IconGlyph::Trash)
-                .theme_when(danger_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Filled)
+                .tone(SemanticTone::Danger)
                 .on_press_with_ctx(move |ctx| {
                     let waker = s.borrow().waker.clone();
                     s.chat_mut().confirm_delete_session(waker);
@@ -9745,7 +9570,9 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             let s = shared.clone();
             sui::Button::new("Cancel")
                 .icon(IconGlyph::Close)
-                .theme_when(secondary_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
                 .on_press_with_ctx(move |ctx| {
                     s.chat_mut().cancel_delete_session();
                     ctx.request_measure();
@@ -9773,7 +9600,9 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             let s = shared.clone();
             sui::Button::new(delete_label)
                 .icon(IconGlyph::Trash)
-                .theme_when(danger_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Filled)
+                .tone(SemanticTone::Danger)
                 .enabled_when({
                     let s = s.clone();
                     move || {
@@ -9807,10 +9636,20 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     }
 
     let s = shared.clone();
+    let body = SizedBox::new().height(520.0).with_child(
+        ScrollView::vertical(body)
+            .name("chat-session-editor-scroll")
+            .state(ScrollState::new())
+            .theme(reader()),
+    );
     Some(WidgetPod::new(
-        SessionEditPopup::new(title, body, shared.theme()).on_dismiss(move || {
-            s.chat_mut().close_session_edit();
-        }),
+        sui::Dialog::new(title, body)
+            .theme(shared.theme())
+            .max_width(760.0)
+            .dismiss_on_scrim(true)
+            .on_dismiss(move || {
+                s.chat_mut().close_session_edit();
+            }),
     ))
 }
 
@@ -9928,7 +9767,9 @@ fn channel_agents_editor(
                     let s = shared.clone();
                     sui::Button::new("Open connection settings")
                         .icon(IconGlyph::Alert)
-                        .theme_when(secondary_button_theme(reader))
+                        .theme_when(clone_reader(reader))
+                        .appearance(sui::ButtonAppearance::Tonal)
+                        .tone(SemanticTone::Neutral)
                         .on_press(move || open_settings_section(&s, SettingsSection::Connection))
                 };
                 list = list
@@ -10052,7 +9893,7 @@ fn channel_agent_row(
         .align_items(Alignment::Center)
         .with_item(icon, FlexItem::new().no_shrink())
         .with_item(
-            Label::new(label).font_size(12.5).color_when(text_color),
+            small_label(shared, label).color_when(text_color),
             FlexItem::new().grow(1.0).min_width(0.0),
         );
     let row = TrailingSlotRow::new(body, action)
@@ -10071,303 +9912,6 @@ fn channel_agent_row(
             .fill()
             .theme_when(clone_reader(reader)),
     )
-}
-
-struct SessionEditPopup {
-    theme: Box<DefaultTheme>,
-    title: String,
-    body: WidgetPod,
-    panel_rect: Rect,
-    body_rect: Rect,
-    body_content_height: f32,
-    body_scroll_y: f32,
-    close_hovered: bool,
-    close_semantic_name: String,
-    close_semantic_description: String,
-    on_dismiss: Option<Box<dyn FnMut()>>,
-}
-
-impl SessionEditPopup {
-    const OUTER_MARGIN: f32 = 24.0;
-    const PANEL_MAX_WIDTH: f32 = 460.0;
-    const PANEL_MIN_WIDTH: f32 = 300.0;
-    const PANEL_PADDING: f32 = 16.0;
-    const TITLE_HEIGHT: f32 = 26.0;
-    const BODY_GAP: f32 = 12.0;
-    const CORNER_RADIUS: f32 = 10.0;
-    const CLOSE_SIZE: f32 = 28.0;
-
-    fn new<W>(title: impl Into<String>, body: W, theme: DefaultTheme) -> Self
-    where
-        W: Widget + 'static,
-    {
-        Self {
-            theme: Box::new(theme),
-            title: title.into(),
-            body: WidgetPod::new(body),
-            panel_rect: Rect::ZERO,
-            body_rect: Rect::ZERO,
-            body_content_height: 0.0,
-            body_scroll_y: 0.0,
-            close_hovered: false,
-            close_semantic_name: "Close edit dialog".to_string(),
-            close_semantic_description: "Dismiss this editor without saving pending title changes"
-                .to_string(),
-            on_dismiss: None,
-        }
-    }
-
-    fn close_semantics(mut self, name: impl Into<String>, description: impl Into<String>) -> Self {
-        self.close_semantic_name = name.into();
-        self.close_semantic_description = description.into();
-        self
-    }
-
-    fn on_dismiss<F>(mut self, on_dismiss: F) -> Self
-    where
-        F: FnMut() + 'static,
-    {
-        self.on_dismiss = Some(Box::new(on_dismiss));
-        self
-    }
-
-    fn dismiss(&mut self, ctx: &mut EventCtx) {
-        if let Some(on_dismiss) = &mut self.on_dismiss {
-            on_dismiss();
-        }
-        ctx.request_measure();
-        ctx.request_paint();
-        ctx.request_semantics();
-        ctx.set_handled();
-    }
-
-    fn close_rect(&self) -> Rect {
-        Rect::new(
-            self.panel_rect.max_x() - Self::PANEL_PADDING - Self::CLOSE_SIZE,
-            self.panel_rect.y() + Self::PANEL_PADDING - 2.0,
-            Self::CLOSE_SIZE,
-            Self::CLOSE_SIZE,
-        )
-    }
-
-    fn clamp_scroll_y(&self, offset: f32) -> f32 {
-        let max = (self.body_content_height - self.body_rect.height()).max(0.0);
-        offset.clamp(0.0, max)
-    }
-}
-
-impl Widget for SessionEditPopup {
-    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        match event {
-            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
-                let hovered = self.close_rect().contains(pointer.position);
-                if self.close_hovered != hovered {
-                    self.close_hovered = hovered;
-                    ctx.request_paint();
-                    ctx.request_semantics();
-                }
-            }
-            Event::Pointer(pointer)
-                if pointer.kind == PointerEventKind::Down
-                    && pointer.button == Some(PointerButton::Primary)
-                    && self.close_rect().contains(pointer.position) =>
-            {
-                self.dismiss(ctx);
-            }
-            Event::Pointer(pointer)
-                if pointer.kind == PointerEventKind::Down
-                    && pointer.button == Some(PointerButton::Primary)
-                    && !self.panel_rect.contains(pointer.position) =>
-            {
-                self.dismiss(ctx);
-            }
-            Event::Pointer(pointer)
-                if matches!(
-                    pointer.kind,
-                    PointerEventKind::Leave | PointerEventKind::Cancel
-                ) =>
-            {
-                if self.close_hovered {
-                    self.close_hovered = false;
-                    ctx.request_paint();
-                    ctx.request_semantics();
-                }
-            }
-            Event::Keyboard(key) if key.state == KeyState::Pressed && key.key == "Escape" => {
-                self.dismiss(ctx);
-            }
-            Event::Pointer(pointer)
-                if pointer.kind == PointerEventKind::Scroll
-                    && self.body_rect.contains(pointer.position) =>
-            {
-                if let Some(delta) = pointer.scroll_delta {
-                    let dy = match delta {
-                        ScrollDelta::Lines(v) => v.y * 42.0,
-                        ScrollDelta::Pixels(v) => v.y,
-                    };
-                    let next = self.clamp_scroll_y(self.body_scroll_y - dy);
-                    if (next - self.body_scroll_y).abs() > f32::EPSILON {
-                        self.body_scroll_y = next;
-                        ctx.request_arrange();
-                        ctx.request_paint();
-                        ctx.request_semantics();
-                        ctx.set_handled();
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let viewport = constraints.clamp(Size::new(
-            if constraints.max.width.is_finite() {
-                constraints.max.width
-            } else {
-                920.0
-            },
-            if constraints.max.height.is_finite() {
-                constraints.max.height
-            } else {
-                640.0
-            },
-        ));
-        let available_width = (viewport.width - Self::OUTER_MARGIN * 2.0).max(0.0);
-        let fallback_min = available_width.min(Self::PANEL_MIN_WIDTH);
-        let panel_width = available_width
-            .min(Self::PANEL_MAX_WIDTH)
-            .max(fallback_min)
-            .max(0.0);
-        let body_width = (panel_width - Self::PANEL_PADDING * 2.0).max(0.0);
-        let body_max_height = (viewport.height
-            - Self::OUTER_MARGIN * 2.0
-            - Self::PANEL_PADDING * 2.0
-            - Self::TITLE_HEIGHT
-            - Self::BODY_GAP)
-            .max(0.0);
-        let body_size = self.body.measure(
-            ctx,
-            Constraints::new(Size::ZERO, Size::new(body_width, f32::INFINITY)),
-        );
-        self.body_content_height = body_size.height;
-        let body_height = body_size.height.min(body_max_height);
-        let panel_height =
-            Self::PANEL_PADDING * 2.0 + Self::TITLE_HEIGHT + Self::BODY_GAP + body_height;
-        let panel_x = ((viewport.width - panel_width) * 0.5).max(0.0);
-        let panel_y = ((viewport.height - panel_height) * 0.5).max(Self::OUTER_MARGIN);
-        self.panel_rect = Rect::new(panel_x, panel_y, panel_width, panel_height);
-        self.body_rect = Rect::new(
-            panel_x + Self::PANEL_PADDING,
-            panel_y + Self::PANEL_PADDING + Self::TITLE_HEIGHT + Self::BODY_GAP,
-            body_width,
-            body_height,
-        );
-        self.body_scroll_y = self.clamp_scroll_y(self.body_scroll_y);
-        viewport
-    }
-
-    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        let panel_width = self.panel_rect.width().min(bounds.width().max(0.0));
-        let panel_height = self.panel_rect.height().min(bounds.height().max(0.0));
-        let panel_x = bounds.x() + ((bounds.width() - panel_width) * 0.5).max(0.0);
-        let panel_y = bounds.y()
-            + ((bounds.height() - panel_height) * 0.5)
-                .max(Self::OUTER_MARGIN.min(bounds.height().max(0.0)));
-        self.panel_rect = Rect::new(panel_x, panel_y, panel_width, panel_height);
-        let measured = self.body.measured_size();
-        self.body_content_height = measured.height;
-        self.body_scroll_y = self.clamp_scroll_y(self.body_scroll_y);
-        self.body_rect = Rect::new(
-            panel_x + Self::PANEL_PADDING,
-            panel_y + Self::PANEL_PADDING + Self::TITLE_HEIGHT + Self::BODY_GAP,
-            measured.width,
-            (panel_height - Self::PANEL_PADDING * 2.0 - Self::TITLE_HEIGHT - Self::BODY_GAP)
-                .max(0.0),
-        );
-        self.body.arrange(
-            ctx,
-            Rect::new(
-                self.body_rect.x(),
-                self.body_rect.y() - self.body_scroll_y,
-                measured.width,
-                measured.height,
-            ),
-        );
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        let panel = self.panel_rect;
-        // Mesh scrim token; Void darkens further while Light stays airy.
-        ctx.fill_rect(ctx.bounds(), self.theme.surfaces.overlay_scrim);
-        sui::paint_theme_shadow(
-            ctx,
-            panel,
-            [Self::CORNER_RADIUS; 4],
-            &self.theme.shadows.box_shadow.xl,
-        );
-        paint_section_panel(
-            ctx,
-            &self.theme,
-            panel,
-            &self.title,
-            SectionPanelPaint::new()
-                .fill(self.theme.surfaces.overlay)
-                .border(self.theme.palette.border_strong)
-                .title_color(self.theme.palette.text)
-                .radius(Self::CORNER_RADIUS)
-                .header_height(Self::PANEL_PADDING + Self::TITLE_HEIGHT + Self::BODY_GAP)
-                .content_padding(Insets {
-                    left: Self::PANEL_PADDING,
-                    top: 0.0,
-                    right: Self::PANEL_PADDING,
-                    bottom: Self::PANEL_PADDING,
-                })
-                .title_inset_x(Self::PANEL_PADDING)
-                .title_token(self.theme.text.lg)
-                .title_weight(FontWeight::SEMIBOLD)
-                .trailing_width(Self::CLOSE_SIZE + 8.0),
-        );
-        let close = self.close_rect();
-        paint_icon_button(
-            ctx,
-            &self.theme,
-            close,
-            IconGlyph::Close,
-            IconButtonPaint::new()
-                .hovered(self.close_hovered)
-                .icon_size(16.0),
-        );
-        ctx.push_clip_rect(self.body_rect);
-        self.body.paint(ctx);
-        ctx.pop_clip();
-    }
-
-    fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let dialog_id = ctx.widget_id();
-        let mut node = SemanticsNode::new(dialog_id, SemanticsRole::Dialog, self.panel_rect);
-        node.name = Some(self.title.clone());
-        ctx.push(node);
-        let mut close = SemanticsNode::new(
-            sui::WidgetId::new(dialog_id.get().wrapping_mul(41).wrapping_add(7_133)),
-            SemanticsRole::Button,
-            self.close_rect(),
-        );
-        close.parent = Some(dialog_id);
-        close.name = Some(self.close_semantic_name.clone());
-        close.description = Some(self.close_semantic_description.clone());
-        close.actions = vec![SemanticsAction::Activate];
-        close.state.hovered = self.close_hovered;
-        ctx.push(close);
-        self.body.semantics(ctx);
-    }
-
-    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
-        visitor.visit(&self.body);
-    }
-
-    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
-        visitor.visit(&mut self.body);
-    }
 }
 
 fn session_edit_dialog_signature(shared: &Shared) -> String {
@@ -10434,16 +9978,24 @@ fn compact_chat_drawer(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         return None;
     }
     let scroll_state = ScrollState::new();
-    let body = SizedBox::new()
-        .height(520.0)
-        .with_child(sidebar(shared, reader, &scroll_state));
+    let body = sidebar(shared, reader, &scroll_state);
     let dismiss_shared = shared.clone();
+    let close_shared = shared.clone();
     Some(WidgetPod::new(
-        SessionEditPopup::new("Conversations and agents", body, shared.theme())
-            .close_semantics(
-                "Close conversation drawer",
-                "Return to the active conversation",
+        SideSheet::new("Conversations and agents", body)
+            .placement(SideSheetPlacement::Left)
+            .width(336.0)
+            .header_action(
+                IconButton::new(IconGlyph::Close, "Close conversation drawer")
+                    .description("Return to the active conversation")
+                    .appearance(sui::ButtonAppearance::Ghost)
+                    .tone(SemanticTone::Neutral)
+                    .theme_when(clone_reader(reader))
+                    .on_press(move || {
+                        close_shared.chat_mut().set_compact_drawer_open(false);
+                    }),
             )
+            .theme_when(clone_reader(reader))
             .on_dismiss(move || {
                 dismiss_shared.chat_mut().set_compact_drawer_open(false);
             }),
@@ -10689,12 +10241,11 @@ fn media_call_compact_body(
     signature: &MediaCallPanelSignature,
 ) -> impl Widget + use<> {
     let details = media_call_details_button(shared, reader, signature.details_open);
-    // The compact panel has 36px after vertical padding. A status-badge title
-    // plus a second 15px summary line cannot fit without clipping, and the
-    // provider/model already remains in the panel's accessibility summary.
+    // Keep the compact panel to one reflow-safe title row; provider/model detail remains in the
+    // panel's accessibility summary.
     let row = TrailingSlotRow::new(media_call_title_line(shared, reader), details)
         .trailing_width(100.0)
-        .trailing_height(26.0)
+        .trailing_height(30.0)
         .gap(10.0);
     WidgetPadding::symmetric(PAD, 5.0, row).fill_child()
 }
@@ -10709,7 +10260,7 @@ fn media_call_expanded_body(
         media_call_details_button(shared, reader, signature.details_open),
     )
     .trailing_width(78.0)
-    .trailing_height(26.0)
+    .trailing_height(30.0)
     .gap(10.0);
 
     let tiles = Flex::horizontal()
@@ -10717,39 +10268,39 @@ fn media_call_expanded_body(
         .align_items(Alignment::Stretch)
         .with_item(
             media_call_video_tile(shared, reader, signature, MediaCallTile::Remote),
-            FlexItem::flex(1.0).min_width(84.0).min_height(140.0),
+            FlexItem::flex(1.0).min_width(84.0).min_height(145.0),
         )
         .with_item(
             media_call_video_tile(shared, reader, signature, MediaCallTile::Local),
-            FlexItem::fixed(168.0).min_height(140.0),
+            FlexItem::fixed(168.0).min_height(145.0),
         );
 
     let body = Stack::vertical()
         .spacing(3.0)
         .alignment(Alignment::Stretch)
-        .with_child(SizedBox::new().height(26.0).with_child(header))
-        .with_child(SizedBox::new().height(140.0).with_child(tiles))
+        .with_child(SizedBox::new().height(30.0).with_child(header))
+        .with_child(SizedBox::new().height(145.0).with_child(tiles))
         .with_child(
             SizedBox::new()
-                .height(26.0)
+                .height(30.0)
                 .with_child(media_setup_access_row(shared, reader)),
         )
         .with_child(
             SizedBox::new()
-                .height(42.0)
+                .height(34.0)
                 .with_child(media_setup_device_selectors(shared, reader, signature)),
         )
         .with_child(
             SizedBox::new()
-                .height(26.0)
+                .height(30.0)
                 .with_child(media_setup_test_row(shared, reader)),
         )
         .with_child(
             SizedBox::new()
-                .height(22.0)
+                .height(24.0)
                 .with_child(media_setup_recovery_row(shared, reader)),
         );
-    let body = Dock::new(body).bottom(30.0, media_call_controls_row(shared, reader, signature));
+    let body = Dock::new(body).bottom(34.0, media_call_controls_row(shared, reader, signature));
 
     WidgetPadding::symmetric(PAD, 7.0, body).fill_child()
 }
@@ -10770,15 +10321,10 @@ fn media_call_title_line(shared: &Shared, reader: &ThemeReader) -> impl Widget +
                     }
                 }),
         )
-        .with_child(
-            Label::new("Media call")
-                .font_size(12.0)
-                .line_height(16.0)
-                .color_when({
-                    let s = shared.clone();
-                    move || palette(&s).text
-                }),
-        )
+        .with_child(small_label(shared, "Media call").color_when({
+            let s = shared.clone();
+            move || palette(&s).text
+        }))
         .with_child(media_call_status_badge(shared, reader))
 }
 
@@ -10901,7 +10447,7 @@ fn media_call_video_tile(
         )
         .with_child(
             SizedBox::new()
-                .height(84.0)
+                .height(82.0)
                 .with_child(MediaCameraPreviewWidget::new(shared.clone())),
         );
     let icon_shared = shared.clone();
@@ -10924,10 +10470,7 @@ fn media_call_video_tile(
                     }
                 }))
                 .with_child(
-                    Label::new(title)
-                        .font_size(10.5)
-                        .line_height(14.0)
-                        .color_when(move || palette(&title_shared).text),
+                    small_label(shared, title).color_when(move || palette(&title_shared).text),
                 ),
         )
         .with_child(signal)
@@ -11120,7 +10663,9 @@ fn media_setup_access_row_body(
         .description("Check devices again after allowing microphone or camera access")
         .size(26.0)
         .icon_size(14.0)
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .enabled_when({
             let enabled_shared = shared.clone();
             move || {
@@ -11252,13 +10797,13 @@ where
     C: FnMut(usize, String) + 'static,
 {
     let label_reader = Rc::clone(reader);
+    let label_style = small_theme_text_style(&reader());
     Stack::vertical()
         .spacing(2.0)
         .alignment(Alignment::Stretch)
         .with_child(
             Label::new(label)
-                .font_size(9.5)
-                .line_height(12.0)
+                .style(label_style)
                 .color_when(move || label_reader().palette.text_muted),
         )
         .with_child(
@@ -11343,7 +10888,9 @@ fn media_setup_speaker_test_button(shared: &Shared, reader: &ThemeReader) -> imp
                     .description(detail)
                     .icon(IconGlyph::AudioLines)
                     .min_height(26.0)
-                    .theme_when(secondary_button_theme(&build_reader))
+                    .theme_when(clone_reader(&build_reader))
+                    .appearance(sui::ButtonAppearance::Tonal)
+                    .tone(SemanticTone::Neutral)
                     .enabled(
                         !signature.active
                             && matches!(signature.access, MediaAccessState::Ready)
@@ -11361,8 +10908,7 @@ fn media_setup_recovery_row(shared: &Shared, reader: &ThemeReader) -> impl Widge
     let label = Label::dynamic("Saved on this node.", move || {
         media_setup_recovery_label(&text_shared.chat()).to_string()
     })
-    .font_size(9.5)
-    .line_height(12.0)
+    .style(small_text_style(shared))
     .color_when(move || palette(&color_shared).text_faint);
     let settings_shared = shared.clone();
     let enabled_shared = shared.clone();
@@ -11371,7 +10917,9 @@ fn media_setup_recovery_row(shared: &Shared, reader: &ThemeReader) -> impl Widge
         .description("Open operating system microphone and camera privacy settings")
         .icon(IconGlyph::Lock)
         .min_height(22.0)
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .enabled_when(move || {
             let chat = enabled_shared.chat();
             !chat.media_call.active && chat.media_setup.permission_settings_available()
@@ -11465,7 +11013,9 @@ fn media_call_details_button(
         .min_width(0.0)
         .min_height(26.0)
         .padding(media_call_button_padding())
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press_with_ctx(move |ctx| {
             s.chat_mut().toggle_media_call_details();
             request_chat_window_relayout(ctx);
@@ -11487,7 +11037,9 @@ fn media_call_mic_button(shared: &Shared, reader: &ThemeReader, enabled: bool) -
         .min_width(0.0)
         .min_height(28.0)
         .padding(media_call_button_padding())
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press_with_ctx(move |ctx| {
             s.chat_mut().toggle_media_call_mic();
             request_chat_window_relayout(ctx);
@@ -11511,7 +11063,10 @@ fn media_call_toggle_button(shared: &Shared, reader: &ThemeReader, active: bool)
         .min_height(28.0)
         .padding(media_call_button_padding());
     let button = if active {
-        button.theme_when(danger_button_theme(reader))
+        button
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Filled)
+            .tone(SemanticTone::Danger)
     } else {
         button.theme_when(clone_reader(reader))
     };
@@ -11538,7 +11093,9 @@ fn media_call_camera_button(shared: &Shared, reader: &ThemeReader, enabled: bool
         .min_width(0.0)
         .min_height(28.0)
         .padding(media_call_button_padding())
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press_with_ctx(move |ctx| {
             s.chat_mut().toggle_media_call_camera();
             request_chat_window_relayout(ctx);
@@ -11691,7 +11248,9 @@ fn activity_close_button(shared: &Shared, reader: &ThemeReader) -> IconButton {
         .description("Hide the runtime activity panel")
         .size(26.0)
         .icon_size(13.0)
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press_with_ctx(move |ctx| {
             s.chat_mut().close_activity_panel();
             request_chat_window_relayout(ctx);
@@ -11734,7 +11293,9 @@ fn activity_detail_toggle_button(
             top: 2.0,
             bottom: 2.0,
         })
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press_with_ctx(move |ctx| {
             expanded_state.set(!expanded_state.get());
             request_chat_window_relayout(ctx);
@@ -11769,14 +11330,10 @@ fn activity_status_card(
             .spacing(6.0)
             .alignment(Alignment::Stretch)
             .with_child(header)
-            .with_child(
-                Label::new(compact_line(&status, 84))
-                    .font_size(12.0)
-                    .color_when({
-                        let s = s.clone();
-                        move || palette(&s).text
-                    }),
-            )
+            .with_child(small_label(shared, compact_line(&status, 84)).color_when({
+                let s = s.clone();
+                move || palette(&s).text
+            }))
             .with_child(muted_label(shared, compact_line(&work_summary, 84))),
     )
     .padding(Insets {
@@ -11806,9 +11363,7 @@ fn activity_detail_card(
                     .theme_when(clone_reader(reader)),
             )
             .with_child(
-                Label::new(compact_line(&entry.detail, 120))
-                    .font_size(11.0)
-                    .line_height(15.0)
+                small_label(shared, compact_line(&entry.detail, 120))
                     .color_when(move || palette(&s).text_muted),
             ),
     )
@@ -11819,7 +11374,9 @@ fn activity_detail_card(
         bottom: 8.0,
     })
     .fill_width()
-    .theme_when(secondary_button_theme(reader))
+    .theme_when(clone_reader(reader))
+    .appearance(SurfaceAppearance::Raised)
+    .tone(SemanticTone::Neutral)
 }
 
 fn activity_section_label(reader: &ThemeReader, label: &'static str) -> impl Widget + use<> {
@@ -11834,16 +11391,12 @@ fn activity_item_card(
     tone: ActivityTone,
 ) -> impl Widget + use<> {
     let s = shared.clone();
-    let title_label = Label::new(compact_line(&title, 46))
-        .font_size(12.0)
-        .color_when({
-            let s = s.clone();
-            move || palette(&s).text
-        });
-    let detail_label = Label::new(compact_line(&detail, 64))
-        .font_size(10.5)
-        .line_height(14.0)
-        .color_when(move || palette(&s).text_muted);
+    let title_label = small_label(shared, compact_line(&title, 46)).color_when({
+        let s = s.clone();
+        move || palette(&s).text
+    });
+    let detail_label =
+        small_label(shared, compact_line(&detail, 64)).color_when(move || palette(&s).text_muted);
     let text = Stack::vertical()
         .spacing(1.0)
         .alignment(Alignment::Stretch)
@@ -11868,7 +11421,9 @@ fn activity_item_card(
         bottom: 7.0,
     })
     .fill_width()
-    .theme_when(secondary_button_theme(reader))
+    .theme_when(clone_reader(reader))
+    .appearance(SurfaceAppearance::Raised)
+    .tone(SemanticTone::Neutral)
 }
 
 fn activity_popup_content(
@@ -12088,8 +11643,6 @@ enum TranscriptLaidTool {
 struct TranscriptLaidToolDetail {
     section: ToolDetailSection,
     title: String,
-    key: String,
-    expanded: bool,
     collapsible: bool,
     code: Option<ChatCodeBlock>,
     text: Option<String>,
@@ -12163,20 +11716,48 @@ fn vertical_distance(rect: Rect, y: f32) -> f32 {
     }
 }
 
+/// The transcript lays out the same rich text during measure (for positioning
+/// real child controls) and paint (for its specialized canvas). Keep that
+/// shaping path shared so stock buttons cannot drift from the bubbles and tool
+/// details they belong to.
+trait TranscriptLayoutContext {
+    fn transcript_layout_document(&self, request: TextLayoutRequest) -> sui::Result<TextLayout>;
+
+    fn transcript_measure_text_width(&self, text: &str, style: TextStyle) -> f32;
+}
+
+impl TranscriptLayoutContext for MeasureCtx {
+    fn transcript_layout_document(&self, request: TextLayoutRequest) -> sui::Result<TextLayout> {
+        self.layout().layout_document(request)
+    }
+
+    fn transcript_measure_text_width(&self, text: &str, style: TextStyle) -> f32 {
+        self.layout()
+            .measure_text(text.to_string(), style)
+            .map(|measurement| measurement.width)
+            .unwrap_or(0.0)
+    }
+}
+
+impl TranscriptLayoutContext for PaintCtx {
+    fn transcript_layout_document(&self, request: TextLayoutRequest) -> sui::Result<TextLayout> {
+        self.layout_text_document(request)
+    }
+
+    fn transcript_measure_text_width(&self, text: &str, style: TextStyle) -> f32 {
+        self.measure_text(text.to_string(), style)
+            .map(|measurement| measurement.width)
+            .unwrap_or(0.0)
+    }
+}
+
 struct TranscriptView {
     shared: Shared,
     selection_scope: SelectionScope,
+    controls: WidgetPod,
     content_height: Cell<f32>,
     viewport_height: Cell<f32>,
     bounds: Cell<Rect>,
-    hovered_recovery_action: Cell<Option<RecoveryCardAction>>,
-    pressed_recovery_action: Cell<Option<RecoveryCardAction>>,
-    hovered_quick_action: Cell<Option<ChatQuickAction>>,
-    pressed_quick_action: Cell<Option<ChatQuickAction>>,
-    hovered_runtime_action: RefCell<Option<RuntimeTranscriptAction>>,
-    pressed_runtime_action: RefCell<Option<RuntimeTranscriptAction>>,
-    transcript_recovery_actions: RefCell<Vec<(RecoveryCardAction, Rect)>>,
-    runtime_actions: RefCell<Vec<(RuntimeTranscriptAction, Rect)>>,
     transcript_text_hits: RefCell<Vec<TranscriptTextHit>>,
     transcript_message_sources: RefCell<Vec<TranscriptMessageSource>>,
     transcript_message_semantics: RefCell<Vec<TranscriptMessageSemantic>>,
@@ -12187,20 +11768,14 @@ struct TranscriptView {
 
 impl TranscriptView {
     fn new(shared: Shared, selection_scope: SelectionScope) -> Self {
+        let controls = WidgetPod::new(TranscriptControls::new(shared.clone()));
         Self {
             shared,
             selection_scope,
+            controls,
             content_height: Cell::new(0.0),
             viewport_height: Cell::new(0.0),
             bounds: Cell::new(Rect::ZERO),
-            hovered_recovery_action: Cell::new(None),
-            pressed_recovery_action: Cell::new(None),
-            hovered_quick_action: Cell::new(None),
-            pressed_quick_action: Cell::new(None),
-            hovered_runtime_action: RefCell::new(None),
-            pressed_runtime_action: RefCell::new(None),
-            transcript_recovery_actions: RefCell::new(Vec::new()),
-            runtime_actions: RefCell::new(Vec::new()),
             transcript_text_hits: RefCell::new(Vec::new()),
             transcript_message_sources: RefCell::new(Vec::new()),
             transcript_message_semantics: RefCell::new(Vec::new()),
@@ -12674,108 +12249,6 @@ impl TranscriptView {
             .collect()
     }
 
-    fn recovery_action_at(&self, bounds: Rect, position: Point) -> Option<RecoveryCardAction> {
-        let target = {
-            let chat = self.shared.chat();
-            chat.messages
-                .is_empty()
-                .then(|| chat.runtime_recovery_target())
-                .flatten()
-        };
-        if let Some(target) = target {
-            let chat = self.shared.chat();
-            return Self::recovery_action_rects(bounds, target, &chat)
-                .into_iter()
-                .find_map(|(action, rect)| rect.contains(position).then_some(action));
-        }
-
-        self.transcript_recovery_actions
-            .borrow()
-            .iter()
-            .find_map(|(action, rect)| rect.contains(position).then_some(*action))
-    }
-
-    fn runtime_action_at(&self, position: Point) -> Option<RuntimeTranscriptAction> {
-        self.runtime_actions
-            .borrow()
-            .iter()
-            .find_map(|(action, rect)| rect.contains(position).then(|| action.clone()))
-    }
-
-    fn quick_action_at(&self, bounds: Rect, position: Point) -> Option<ChatQuickAction> {
-        {
-            let chat = self.shared.chat();
-            if !chat.messages.is_empty() || chat.runtime_recovery_target().is_some() {
-                return None;
-            }
-            let actions = Self::quick_actions(&chat).to_vec();
-            return Self::quick_action_rects(bounds, &actions)
-                .into_iter()
-                .find_map(|(action, rect)| rect.contains(position).then_some(action));
-        }
-    }
-
-    fn activate_recovery_action(&self, action: RecoveryCardAction) {
-        match action {
-            RecoveryCardAction::RetryChatList => {
-                let waker = { self.shared.borrow().waker.clone() };
-                self.shared.chat_mut().retry_chat_list_with_waker(waker);
-            }
-            RecoveryCardAction::CheckSifs => open_files_tab(&self.shared),
-            RecoveryCardAction::OpenConnectionSettings => {
-                open_settings_section(&self.shared, SettingsSection::Connection)
-            }
-            RecoveryCardAction::OpenProviderSetup => open_provider_setup(&self.shared),
-        }
-    }
-
-    fn activate_quick_action(&self, action: ChatQuickAction) {
-        if action == ChatQuickAction::NewChannel {
-            let waker = { self.shared.borrow().waker.clone() };
-            self.shared.chat_mut().new_channel(waker);
-        } else {
-            self.shared.chat_mut().apply_quick_action(action);
-        }
-    }
-
-    fn activate_runtime_action(&self, action: RuntimeTranscriptAction) {
-        match action {
-            RuntimeTranscriptAction::ToggleToolChain => {
-                self.shared.chat_mut().toggle_tool_chain_expanded();
-            }
-            RuntimeTranscriptAction::ToggleToolDetail(key) => {
-                self.shared.chat_mut().toggle_tool_detail(key);
-            }
-        }
-    }
-
-    fn recovery_action_widget_id(parent: sui::WidgetId, slot: usize) -> sui::WidgetId {
-        sui::WidgetId::new(
-            parent
-                .get()
-                .wrapping_mul(37)
-                .wrapping_add(8_001 + slot as u64),
-        )
-    }
-
-    fn quick_action_widget_id(parent: sui::WidgetId, slot: usize) -> sui::WidgetId {
-        sui::WidgetId::new(
-            parent
-                .get()
-                .wrapping_mul(41)
-                .wrapping_add(9_101 + slot as u64),
-        )
-    }
-
-    fn runtime_action_widget_id(parent: sui::WidgetId, slot: usize) -> sui::WidgetId {
-        sui::WidgetId::new(
-            parent
-                .get()
-                .wrapping_mul(47)
-                .wrapping_add(9_801 + slot as u64),
-        )
-    }
-
     fn timeline_header_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
         sui::WidgetId::new(parent.get().wrapping_mul(53).wrapping_add(10_301))
     }
@@ -12851,7 +12324,7 @@ impl TranscriptView {
                 text_color,
             )
         });
-        let mut inline_code = body.clone();
+        let mut inline_code = theme.mono_text_style(body.color);
         inline_code.font_size = theme.text.sm.size;
         inline_code.line_height = theme.text.base.line_height;
         inline_code.weight = FontWeight::MEDIUM;
@@ -12900,7 +12373,12 @@ impl TranscriptView {
         Self::plain_rich_render(text, styles.body)
     }
 
-    fn code_text_document(code: &ChatCodeBlock, dark: bool, pal: &Palette) -> TextDocument {
+    fn code_text_document(
+        code: &ChatCodeBlock,
+        dark: bool,
+        pal: &Palette,
+        theme: &sui::DefaultTheme,
+    ) -> TextDocument {
         let highlighted = chat_render::highlight_code(code.language.as_deref(), &code.text, dark);
         let source_lines = code.text.split('\n').collect::<Vec<_>>();
         let mut paragraphs = highlighted
@@ -12917,9 +12395,9 @@ impl TranscriptView {
                     .iter()
                     .map(|span| {
                         let color = span.rgb.map(color_from_rgb).unwrap_or(fallback);
-                        let mut style = TextStyle::new(color);
-                        style.font_size = 12.0;
-                        style.line_height = 17.0;
+                        let mut style = theme.mono_text_style(color);
+                        style.font_size = theme.text.sm.size;
+                        style.line_height = theme.text.sm.line_height;
                         TextSpan::new(&span.text, style)
                     })
                     .collect::<Vec<_>>();
@@ -12933,16 +12411,16 @@ impl TranscriptView {
             })
             .collect::<Vec<_>>();
         if paragraphs.is_empty() {
-            let mut style = TextStyle::new(pal.text);
-            style.font_size = 12.0;
-            style.line_height = 17.0;
+            let mut style = theme.mono_text_style(pal.text);
+            style.font_size = theme.text.sm.size;
+            style.line_height = theme.text.sm.line_height;
             paragraphs.push(TextParagraph::new("", style));
         }
         TextDocument { paragraphs }
     }
 
-    fn layout_message(
-        ctx: &mut PaintCtx,
+    fn layout_message<C: TranscriptLayoutContext>(
+        ctx: &C,
         pal: &Palette,
         theme: &sui::DefaultTheme,
         message: &ChatMessage,
@@ -12963,7 +12441,7 @@ impl TranscriptView {
                     display_range,
                 } => {
                     let layout = ctx
-                        .layout_text_document(
+                        .transcript_layout_document(
                             TextLayoutRequest::new(document)
                                 .with_box_size(Size::new(inner_w.max(1.0), 1.0)),
                         )
@@ -12982,9 +12460,9 @@ impl TranscriptView {
                     code,
                     display_range,
                 } => {
-                    let document = Self::code_text_document(&code, pal.dark, pal);
+                    let document = Self::code_text_document(&code, pal.dark, pal, theme);
                     let layout = ctx
-                        .layout_text_document(
+                        .transcript_layout_document(
                             TextLayoutRequest::new(document)
                                 .with_box_size(Size::new((inner_w - 20.0).max(1.0), 1.0)),
                         )
@@ -13025,8 +12503,8 @@ impl TranscriptView {
         30.0 + line_count * 17.0 + 12.0
     }
 
-    fn tool_trace_layout(
-        ctx: &mut PaintCtx,
+    fn tool_trace_layout<C: TranscriptLayoutContext>(
+        ctx: &C,
         pal: &Palette,
         theme: &sui::DefaultTheme,
         chat: &ChatState,
@@ -13065,8 +12543,8 @@ impl TranscriptView {
         items
     }
 
-    fn layout_tool_call(
-        ctx: &mut PaintCtx,
+    fn layout_tool_call<C: TranscriptLayoutContext>(
+        ctx: &C,
         pal: &Palette,
         theme: &sui::DefaultTheme,
         chat: &ChatState,
@@ -13093,8 +12571,8 @@ impl TranscriptView {
         }
     }
 
-    fn layout_tool_input(
-        ctx: &mut PaintCtx,
+    fn layout_tool_input<C: TranscriptLayoutContext>(
+        ctx: &C,
         pal: &Palette,
         theme: &sui::DefaultTheme,
         chat: &ChatState,
@@ -13126,7 +12604,6 @@ impl TranscriptView {
             theme,
             ToolDetailSection::Input,
             title,
-            key,
             raw,
             code,
             expanded,
@@ -13134,8 +12611,8 @@ impl TranscriptView {
         ))
     }
 
-    fn layout_tool_output(
-        ctx: &mut PaintCtx,
+    fn layout_tool_output<C: TranscriptLayoutContext>(
+        ctx: &C,
         pal: &Palette,
         theme: &sui::DefaultTheme,
         chat: &ChatState,
@@ -13169,7 +12646,6 @@ impl TranscriptView {
             theme,
             ToolDetailSection::Output,
             "Output".to_string(),
-            key,
             output,
             code,
             expanded,
@@ -13177,21 +12653,18 @@ impl TranscriptView {
         ))
     }
 
-    fn layout_tool_detail(
-        ctx: &mut PaintCtx,
+    fn layout_tool_detail<C: TranscriptLayoutContext>(
+        ctx: &C,
         pal: &Palette,
         theme: &sui::DefaultTheme,
         section: ToolDetailSection,
         title: String,
-        key: String,
         raw: String,
         code: Option<ChatCodeBlock>,
         expanded: bool,
         inner_w: f32,
     ) -> TranscriptLaidToolDetail {
-        let raw_chars = raw.chars().count();
-        let raw_lines = raw.lines().count();
-        let collapsible = raw_chars > TOOL_DETAIL_COLLAPSE_CHARS || raw_lines > 12;
+        let collapsible = tool_detail_collapsible(&raw);
         let visible_text = if collapsible && !expanded {
             preview_multiline(&raw, TOOL_DETAIL_PREVIEW_CHARS, 8)
         } else {
@@ -13208,9 +12681,7 @@ impl TranscriptView {
                 Self::transcript_text_style(pal, theme, TranscriptTextStyleKind::Muted, pal.text);
             let measure_style = style.clone();
             let lines = wrap_text_lines(&visible_text, inner_w, |s| {
-                ctx.measure_text(s, measure_style.clone())
-                    .map(|m| m.width)
-                    .unwrap_or(0.0)
+                ctx.transcript_measure_text_width(s, measure_style.clone())
             });
             lines.len().max(1) as f32 * style.line_height + 8.0
         };
@@ -13218,8 +12689,6 @@ impl TranscriptView {
         TranscriptLaidToolDetail {
             section,
             title,
-            key,
-            expanded,
             collapsible,
             code: visible_code,
             text: if code.is_none() {
@@ -13411,7 +12880,6 @@ impl TranscriptView {
         y: f32,
         mode: TranscriptLayoutMode,
         message_key: u64,
-        action_rects: &mut Vec<(RecoveryCardAction, Rect)>,
     ) {
         let is_error = item.kind == ChatMessageKind::Error;
         let bubble_radius = theme.radius._2xl.min(14.0);
@@ -13538,18 +13006,6 @@ impl TranscriptView {
                 }
             }
         }
-
-        if let Some(action) = item.action {
-            let action_w = Self::recovery_card_action_width(action).min(content_w);
-            let action_rect = Rect::new(
-                content_x,
-                container.y() + item.bubble_h - 38.0,
-                action_w,
-                28.0,
-            );
-            self.paint_recovery_action(ctx, theme, pal, action, action_rect, true);
-            action_rects.push((action, action_rect));
-        }
     }
 
     fn paint_code_block(
@@ -13625,8 +13081,8 @@ impl TranscriptView {
             &painted_lines,
             CodeTextPaint::new()
                 .color(pal.text)
-                .font_size(12.0)
-                .line_height(17.0)
+                .font_size(theme.text.sm.size)
+                .line_height(theme.text.sm.line_height)
                 .x_padding(2.0),
         );
     }
@@ -13639,7 +13095,6 @@ impl TranscriptView {
         area: Rect,
         item: &TranscriptLaidTool,
         y: f32,
-        runtime_actions: &mut Vec<(RuntimeTranscriptAction, Rect)>,
     ) {
         match item {
             TranscriptLaidTool::ChainCollapsed {
@@ -13663,16 +13118,6 @@ impl TranscriptView {
                         .icon_color(pal.accent)
                         .trailing_width(76.0),
                 );
-                let button = Rect::new(bubble.max_x() - 76.0, y + 18.0, 60.0, 28.0);
-                paint_disclosure_button(
-                    ctx,
-                    theme,
-                    button,
-                    "Show",
-                    false,
-                    DisclosureButtonPaint::new(),
-                );
-                runtime_actions.push((RuntimeTranscriptAction::ToggleToolChain, button));
             }
             TranscriptLaidTool::ChainHeader {
                 call_count,
@@ -13691,16 +13136,6 @@ impl TranscriptView {
                     None,
                     Self::tool_card_paint(pal).trailing_width(70.0),
                 );
-                let button = Rect::new(bubble.max_x() - 72.0, y + 7.0, 56.0, 28.0);
-                paint_disclosure_button(
-                    ctx,
-                    theme,
-                    button,
-                    "Hide",
-                    true,
-                    DisclosureButtonPaint::new(),
-                );
-                runtime_actions.push((RuntimeTranscriptAction::ToggleToolChain, button));
             }
             TranscriptLaidTool::Call {
                 call,
@@ -13734,7 +13169,6 @@ impl TranscriptView {
                         Rect::new(bx + 12.0, ty, bubble.width() - 24.0, input.height),
                         input,
                         dark,
-                        runtime_actions,
                     );
                     ty += input.height;
                 }
@@ -13746,7 +13180,6 @@ impl TranscriptView {
                         Rect::new(bx + 12.0, ty, bubble.width() - 24.0, output.height),
                         output,
                         dark,
-                        runtime_actions,
                     );
                 }
             }
@@ -13771,7 +13204,6 @@ impl TranscriptView {
         rect: Rect,
         detail: &TranscriptLaidToolDetail,
         dark: bool,
-        runtime_actions: &mut Vec<(RuntimeTranscriptAction, Rect)>,
     ) {
         let section_label = match detail.section {
             ToolDetailSection::Input => "Input",
@@ -13806,25 +13238,6 @@ impl TranscriptView {
                     .color(pal.text),
             );
         }
-        if detail.collapsible {
-            let button = Rect::new(rect.x(), rect.max_y() - 30.0, 126.0, 24.0);
-            paint_disclosure_button(
-                ctx,
-                theme,
-                button,
-                if detail.expanded {
-                    "Show less"
-                } else {
-                    "Show more"
-                },
-                detail.expanded,
-                DisclosureButtonPaint::new(),
-            );
-            runtime_actions.push((
-                RuntimeTranscriptAction::ToggleToolDetail(detail.key.clone()),
-                button,
-            ));
-        }
     }
 
     fn request_recovery_action_refresh(ctx: &mut EventCtx) {
@@ -13838,32 +13251,714 @@ impl TranscriptView {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TranscriptEmptyControlState {
+    Standard {
+        title: String,
+        hint: String,
+        context: Option<String>,
+        actions: Vec<ChatQuickAction>,
+    },
+    Recovery {
+        target: RuntimeRecoveryTarget,
+        title: String,
+        detail: String,
+        hint: String,
+        actions: Vec<RecoveryCardAction>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TranscriptRuntimeControlSpec {
+    action: RuntimeTranscriptAction,
+    expanded: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct TranscriptControlSignature {
+    empty: Option<TranscriptEmptyControlState>,
+    message_actions: Vec<RecoveryCardAction>,
+    runtime_actions: Vec<TranscriptRuntimeControlSpec>,
+}
+
+impl TranscriptControlSignature {
+    fn current(shared: &Shared) -> Self {
+        let chat = shared.chat();
+        if chat.messages.is_empty() {
+            let empty = if let Some(target) = chat.runtime_recovery_target() {
+                Some(TranscriptEmptyControlState::Recovery {
+                    target,
+                    title: chat.recovery_empty_title(target).to_string(),
+                    detail: chat.recovery_empty_detail(target).to_string(),
+                    hint: chat.recovery_empty_hint(target).to_string(),
+                    actions: TranscriptView::recovery_card_actions(&chat, target),
+                })
+            } else {
+                Some(TranscriptEmptyControlState::Standard {
+                    title: chat.empty_conversation_title(),
+                    hint: chat.empty_conversation_hint(),
+                    context: chat.empty_conversation_context(),
+                    actions: TranscriptView::quick_actions(&chat).to_vec(),
+                })
+            };
+            return Self {
+                empty,
+                ..Self::default()
+            };
+        }
+
+        let message_actions = chat
+            .messages
+            .iter()
+            .filter_map(transcript_message_recovery_action)
+            .collect();
+        let mut runtime_actions = Vec::new();
+        if !chat.tool_calls.is_empty() {
+            let chain_expanded = chat.tool_chain_expanded();
+            runtime_actions.push(TranscriptRuntimeControlSpec {
+                action: RuntimeTranscriptAction::ToggleToolChain,
+                expanded: chain_expanded,
+            });
+            if chain_expanded {
+                for call in &chat.tool_calls {
+                    let input = chat_render::file_edit_render(&call.tool, &call.input)
+                        .map(|edit| edit.code.text)
+                        .unwrap_or_else(|| call.input.clone());
+                    if !input.trim().is_empty() && tool_detail_collapsible(&input) {
+                        let key = tool_detail_key(call, ToolDetailSection::Input);
+                        runtime_actions.push(TranscriptRuntimeControlSpec {
+                            expanded: chat.tool_detail_expanded(&key),
+                            action: RuntimeTranscriptAction::ToggleToolDetail(key),
+                        });
+                    }
+                    let output = tool_output_text(call);
+                    if !output.trim().is_empty() && tool_detail_collapsible(&output) {
+                        let key = tool_detail_key(call, ToolDetailSection::Output);
+                        runtime_actions.push(TranscriptRuntimeControlSpec {
+                            expanded: chat.tool_detail_expanded(&key),
+                            action: RuntimeTranscriptAction::ToggleToolDetail(key),
+                        });
+                    }
+                }
+            }
+        }
+
+        Self {
+            empty: None,
+            message_actions,
+            runtime_actions,
+        }
+    }
+}
+
+struct TranscriptControls {
+    shared: Shared,
+    signature: TranscriptControlSignature,
+    empty_body: Option<WidgetPod>,
+    empty_body_rect: Rect,
+    empty_actions: Vec<WidgetPod>,
+    empty_action_rects: Vec<Option<Rect>>,
+    message_actions: Vec<WidgetPod>,
+    message_action_rects: Vec<Option<Rect>>,
+    runtime_actions: Vec<WidgetPod>,
+    runtime_action_rects: Vec<Option<Rect>>,
+}
+
+impl TranscriptControls {
+    fn new(shared: Shared) -> Self {
+        Self {
+            shared,
+            signature: TranscriptControlSignature::default(),
+            empty_body: None,
+            empty_body_rect: Rect::ZERO,
+            empty_actions: Vec::new(),
+            empty_action_rects: Vec::new(),
+            message_actions: Vec::new(),
+            message_action_rects: Vec::new(),
+            runtime_actions: Vec::new(),
+            runtime_action_rects: Vec::new(),
+        }
+    }
+
+    fn button_theme(shared: &Shared) -> impl Fn() -> DefaultTheme + 'static {
+        let shared = shared.clone();
+        move || shared.theme().with_size(ControlSize::Small)
+    }
+
+    fn refresh_after_activation(ctx: &mut EventCtx) {
+        TranscriptView::request_recovery_action_refresh(ctx);
+    }
+
+    fn build_standard_empty_body(
+        shared: &Shared,
+        title: &str,
+        hint: &str,
+        context: Option<&str>,
+    ) -> WidgetPod {
+        let mut empty = EmptyState::new(title, hint)
+            .name("Conversation empty state")
+            .icon(IconGlyph::Sparkles)
+            .transparent()
+            .theme_when({
+                let shared = shared.clone();
+                move || shared.theme()
+            });
+        if let Some(context) = context {
+            empty = empty.detail(context);
+        }
+        WidgetPod::new(empty)
+    }
+
+    fn build_recovery_empty_body(
+        shared: &Shared,
+        title: &str,
+        detail: &str,
+        hint: &str,
+    ) -> WidgetPod {
+        let theme = shared.theme();
+        let mut title_style = theme.body_text_style();
+        title_style.font_size = theme.text.lg.size;
+        title_style.line_height = theme.text.lg.line_height;
+        title_style.weight = FontWeight::SEMIBOLD;
+        let mut body_style = theme.body_text_style();
+        body_style.font_size = theme.text.sm.size;
+        body_style.line_height = theme.text.sm.line_height;
+        body_style.color = theme.palette.text_muted;
+        let mut hint_style = body_style.clone();
+        hint_style.font_size = theme.text.xs.size;
+        hint_style.line_height = theme.text.xs.line_height;
+        hint_style.color = theme.palette.text_muted;
+
+        let header = Flex::horizontal()
+            .main_gap(12.0)
+            .align_items(Alignment::Center)
+            .with_child(
+                Icon::new(IconGlyph::Alert)
+                    .size(28.0)
+                    .color(theme.palette.warning),
+            )
+            .with_item(
+                Label::new(title).style(title_style),
+                FlexItem::flex(1.0).min_width(0.0),
+            );
+        let body = Flex::vertical()
+            .main_gap(8.0)
+            .align_items(Alignment::Stretch)
+            .with_child(header)
+            .with_child(RichText::from_plain_text(detail, body_style))
+            .with_child(RichText::from_plain_text(hint, hint_style))
+            .with_child(SizedBox::new().height(38.0));
+        WidgetPod::new(
+            Surface::panel(body)
+                .appearance(SurfaceAppearance::Soft)
+                .tone(SemanticTone::Warning)
+                .padding(Insets {
+                    left: 18.0,
+                    top: 18.0,
+                    right: 18.0,
+                    bottom: 14.0,
+                })
+                .fill_width()
+                .theme_when({
+                    let shared = shared.clone();
+                    move || shared.theme()
+                }),
+        )
+    }
+
+    fn build_quick_action(shared: &Shared, action: ChatQuickAction) -> WidgetPod {
+        let activation_shared = shared.clone();
+        let primary = matches!(
+            action,
+            ChatQuickAction::PlanChange
+                | ChatQuickAction::ManageChannel
+                | ChatQuickAction::NewChannel
+        );
+        WidgetPod::new(
+            sui::Button::new(action.label())
+                .description(action.description())
+                .icon(action.icon())
+                .min_width(TranscriptView::quick_action_width(action))
+                .min_height(44.0)
+                .theme_when(Self::button_theme(shared))
+                .appearance(if primary {
+                    sui::ButtonAppearance::Tonal
+                } else {
+                    sui::ButtonAppearance::Outline
+                })
+                .tone(if primary {
+                    SemanticTone::Accent
+                } else {
+                    SemanticTone::Neutral
+                })
+                .on_press_with_ctx(move |ctx| {
+                    activate_transcript_quick_action(&activation_shared, action);
+                    Self::refresh_after_activation(ctx);
+                }),
+        )
+    }
+
+    fn build_recovery_action(
+        shared: &Shared,
+        action: RecoveryCardAction,
+        primary: bool,
+    ) -> WidgetPod {
+        let activation_shared = shared.clone();
+        WidgetPod::new(
+            sui::Button::new(action.label())
+                .description(action.description())
+                .icon(action.icon())
+                .min_width(TranscriptView::recovery_card_action_width(action))
+                .min_height(28.0)
+                .theme_when(Self::button_theme(shared))
+                .appearance(if primary {
+                    sui::ButtonAppearance::Filled
+                } else {
+                    sui::ButtonAppearance::Tonal
+                })
+                .tone(match action {
+                    RecoveryCardAction::OpenConnectionSettings if !primary => SemanticTone::Warning,
+                    _ if primary => SemanticTone::Accent,
+                    _ => SemanticTone::Neutral,
+                })
+                .on_press_with_ctx(move |ctx| {
+                    activate_transcript_recovery_action(&activation_shared, action);
+                    Self::refresh_after_activation(ctx);
+                }),
+        )
+    }
+
+    fn build_runtime_action(shared: &Shared, spec: &TranscriptRuntimeControlSpec) -> WidgetPod {
+        let activation_shared = shared.clone();
+        let action = spec.action.clone();
+        let (label, min_width, min_height) = match &action {
+            RuntimeTranscriptAction::ToggleToolChain => {
+                (if spec.expanded { "Hide" } else { "Show" }, 56.0, 28.0)
+            }
+            RuntimeTranscriptAction::ToggleToolDetail(_) => (
+                if spec.expanded {
+                    "Show less"
+                } else {
+                    "Show more"
+                },
+                126.0,
+                24.0,
+            ),
+        };
+        let description = match &action {
+            RuntimeTranscriptAction::ToggleToolChain => "Show or hide the chain of tool calls",
+            RuntimeTranscriptAction::ToggleToolDetail(_) => {
+                "Show or hide long tool input or output"
+            }
+        };
+        WidgetPod::new(
+            sui::Button::new(label)
+                .semantic_name(runtime_action_label(&action))
+                .description(description)
+                .icon(if spec.expanded {
+                    IconGlyph::ChevronUp
+                } else {
+                    IconGlyph::ChevronDown
+                })
+                .min_width(min_width)
+                .min_height(min_height)
+                .theme_when(Self::button_theme(shared))
+                .appearance(sui::ButtonAppearance::Ghost)
+                .tone(SemanticTone::Neutral)
+                .on_press_with_ctx(move |ctx| {
+                    activate_transcript_runtime_action(&activation_shared, &action);
+                    Self::refresh_after_activation(ctx);
+                }),
+        )
+    }
+
+    fn sync_controls(&mut self) {
+        let signature = TranscriptControlSignature::current(&self.shared);
+        if signature == self.signature {
+            return;
+        }
+
+        self.empty_body = None;
+        self.empty_actions.clear();
+        self.message_actions.clear();
+        self.runtime_actions.clear();
+        if let Some(empty) = &signature.empty {
+            match empty {
+                TranscriptEmptyControlState::Standard {
+                    title,
+                    hint,
+                    context,
+                    actions,
+                } => {
+                    self.empty_body = Some(Self::build_standard_empty_body(
+                        &self.shared,
+                        title,
+                        hint,
+                        context.as_deref(),
+                    ));
+                    self.empty_actions = actions
+                        .iter()
+                        .copied()
+                        .map(|action| Self::build_quick_action(&self.shared, action))
+                        .collect();
+                }
+                TranscriptEmptyControlState::Recovery {
+                    target,
+                    title,
+                    detail,
+                    hint,
+                    actions,
+                } => {
+                    self.empty_body = Some(Self::build_recovery_empty_body(
+                        &self.shared,
+                        title,
+                        detail,
+                        hint,
+                    ));
+                    let chat = self.shared.chat();
+                    self.empty_actions = actions
+                        .iter()
+                        .copied()
+                        .map(|action| {
+                            Self::build_recovery_action(
+                                &self.shared,
+                                action,
+                                TranscriptView::recovery_action_is_primary(&chat, *target, action),
+                            )
+                        })
+                        .collect();
+                }
+            }
+        }
+        self.message_actions = signature
+            .message_actions
+            .iter()
+            .copied()
+            .map(|action| Self::build_recovery_action(&self.shared, action, true))
+            .collect();
+        self.runtime_actions = signature
+            .runtime_actions
+            .iter()
+            .map(|spec| Self::build_runtime_action(&self.shared, spec))
+            .collect();
+        self.empty_action_rects = vec![None; self.empty_actions.len()];
+        self.message_action_rects = vec![None; self.message_actions.len()];
+        self.runtime_action_rects = vec![None; self.runtime_actions.len()];
+        self.signature = signature;
+    }
+
+    fn rect_is_visible(area: Rect, rect: Rect) -> bool {
+        rect.max_y() >= area.y()
+            && rect.y() <= area.max_y()
+            && rect.max_x() >= area.x()
+            && rect.x() <= area.max_x()
+    }
+
+    fn measure_pod_for_rect(pod: &mut WidgetPod, ctx: &mut MeasureCtx, rect: Rect) {
+        pod.measure(ctx, Constraints::tight(rect.size));
+    }
+
+    fn compute_nonempty_rects(&mut self, ctx: &MeasureCtx, area: Rect) {
+        self.message_action_rects.fill(None);
+        self.runtime_action_rects.fill(None);
+        let theme = self.shared.theme();
+        let pal = palette(&self.shared);
+        let chat = self.shared.chat();
+        let layout_mode = TranscriptLayoutMode::for_width(area.width());
+        let max_bubble = match layout_mode {
+            TranscriptLayoutMode::Row => (area.width() - PAD * 2.0 - 34.0).clamp(260.0, 760.0),
+            TranscriptLayoutMode::Bubble => (area.width() * 0.85).clamp(200.0, 620.0),
+        };
+        let inner_w = max_bubble - 24.0;
+        let message_gap = layout_mode.message_gap();
+        let laid = chat
+            .messages
+            .iter()
+            .map(|message| TranscriptView::layout_message(ctx, &pal, &theme, message, inner_w))
+            .collect::<Vec<_>>();
+        let tool_layout =
+            TranscriptView::tool_trace_layout(ctx, &pal, &theme, &chat, inner_w, max_bubble);
+        let timeline_header_h = TranscriptView::timeline_header_height(&chat);
+        let mut total = PAD + timeline_header_h;
+        for item in &laid {
+            total += item.bubble_h + message_gap;
+        }
+        for item in &tool_layout {
+            let height = match item {
+                TranscriptLaidTool::ChainCollapsed { bubble_h, .. }
+                | TranscriptLaidTool::ChainHeader { bubble_h, .. }
+                | TranscriptLaidTool::Call { bubble_h, .. } => *bubble_h,
+            };
+            total += height + 10.0;
+        }
+        total += PAD;
+        let max_scroll = (total - area.height()).max(0.0);
+        let scroll = if chat.stick_bottom {
+            max_scroll
+        } else {
+            chat.scroll.clamp(0.0, max_scroll)
+        };
+
+        let mut y = area.y() + PAD - scroll + timeline_header_h;
+        let mut message_slot = 0usize;
+        for item in &laid {
+            if let Some(action) = item.action {
+                let (container, content_x, content_w, _) =
+                    TranscriptView::message_content_geometry(area, item, y, layout_mode);
+                let action_w = TranscriptView::recovery_card_action_width(action).min(content_w);
+                let rect = Rect::new(
+                    content_x,
+                    container.y() + item.bubble_h - 38.0,
+                    action_w,
+                    28.0,
+                );
+                if let Some(slot) = self.message_action_rects.get_mut(message_slot)
+                    && Self::rect_is_visible(area, rect)
+                {
+                    *slot = Some(rect);
+                }
+                message_slot += 1;
+            }
+            y += item.bubble_h + message_gap;
+        }
+
+        let mut runtime_slot = 0usize;
+        for item in &tool_layout {
+            let height = match item {
+                TranscriptLaidTool::ChainCollapsed {
+                    bubble_w, bubble_h, ..
+                } => {
+                    let bubble = Rect::new(area.x() + PAD, y, *bubble_w, *bubble_h);
+                    let rect = Rect::new(bubble.max_x() - 76.0, y + 18.0, 60.0, 28.0);
+                    if let Some(slot) = self.runtime_action_rects.get_mut(runtime_slot)
+                        && Self::rect_is_visible(area, rect)
+                    {
+                        *slot = Some(rect);
+                    }
+                    runtime_slot += 1;
+                    *bubble_h
+                }
+                TranscriptLaidTool::ChainHeader {
+                    bubble_w, bubble_h, ..
+                } => {
+                    let bubble = Rect::new(area.x() + PAD, y, *bubble_w, *bubble_h);
+                    let rect = Rect::new(bubble.max_x() - 72.0, y + 7.0, 56.0, 28.0);
+                    if let Some(slot) = self.runtime_action_rects.get_mut(runtime_slot)
+                        && Self::rect_is_visible(area, rect)
+                    {
+                        *slot = Some(rect);
+                    }
+                    runtime_slot += 1;
+                    *bubble_h
+                }
+                TranscriptLaidTool::Call {
+                    input_block,
+                    output_block,
+                    bubble_w,
+                    bubble_h,
+                    ..
+                } => {
+                    let bx = area.x() + PAD;
+                    let mut ty = y + 50.0;
+                    for detail in [input_block.as_ref(), output_block.as_ref()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        if detail.collapsible {
+                            let rect = Rect::new(bx + 12.0, ty + detail.height - 30.0, 126.0, 24.0);
+                            if let Some(slot) = self.runtime_action_rects.get_mut(runtime_slot)
+                                && Self::rect_is_visible(area, rect)
+                            {
+                                *slot = Some(rect);
+                            }
+                            runtime_slot += 1;
+                        }
+                        ty += detail.height;
+                    }
+                    let _ = bubble_w;
+                    *bubble_h
+                }
+            };
+            y += height + 10.0;
+        }
+    }
+}
+
+impl Widget for TranscriptControls {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.sync_controls();
+        let size = constraints.max;
+        let area = Rect::from_origin_size(Point::ZERO, size);
+        self.empty_body_rect = Rect::ZERO;
+        self.empty_action_rects.fill(None);
+
+        if let Some(empty) = &self.signature.empty {
+            self.empty_body_rect = match empty {
+                TranscriptEmptyControlState::Standard { .. } => area,
+                TranscriptEmptyControlState::Recovery { .. } => {
+                    TranscriptView::recovery_card_rect(area)
+                }
+            };
+            if let Some(body) = &mut self.empty_body {
+                Self::measure_pod_for_rect(body, ctx, self.empty_body_rect);
+            }
+            let rects = match empty {
+                TranscriptEmptyControlState::Standard { actions, .. } => {
+                    TranscriptView::quick_action_rects(area, actions)
+                        .into_iter()
+                        .map(|(_, rect)| rect)
+                        .collect::<Vec<_>>()
+                }
+                TranscriptEmptyControlState::Recovery {
+                    target, actions: _, ..
+                } => {
+                    let chat = self.shared.chat();
+                    TranscriptView::recovery_action_rects(area, *target, &chat)
+                        .into_iter()
+                        .map(|(_, rect)| rect)
+                        .collect::<Vec<_>>()
+                }
+            };
+            for (slot, rect) in self.empty_action_rects.iter_mut().zip(rects) {
+                *slot = Some(rect);
+            }
+        } else {
+            self.compute_nonempty_rects(ctx, area);
+        }
+
+        for (pod, rect) in self
+            .empty_actions
+            .iter_mut()
+            .zip(self.empty_action_rects.iter().copied())
+            .chain(
+                self.message_actions
+                    .iter_mut()
+                    .zip(self.message_action_rects.iter().copied()),
+            )
+            .chain(
+                self.runtime_actions
+                    .iter_mut()
+                    .zip(self.runtime_action_rects.iter().copied()),
+            )
+        {
+            if let Some(rect) = rect {
+                Self::measure_pod_for_rect(pod, ctx, rect);
+            } else {
+                pod.measure(ctx, Constraints::tight(Size::ZERO));
+            }
+        }
+        size
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let translate = bounds.origin.to_vector();
+        if let Some(body) = &mut self.empty_body {
+            body.arrange(ctx, self.empty_body_rect.translate(translate));
+        }
+        for (pod, rect) in self
+            .empty_actions
+            .iter_mut()
+            .zip(self.empty_action_rects.iter().copied())
+            .chain(
+                self.message_actions
+                    .iter_mut()
+                    .zip(self.message_action_rects.iter().copied()),
+            )
+            .chain(
+                self.runtime_actions
+                    .iter_mut()
+                    .zip(self.runtime_action_rects.iter().copied()),
+            )
+        {
+            pod.arrange(
+                ctx,
+                rect.map(|rect| rect.translate(translate))
+                    .unwrap_or(Rect::ZERO),
+            );
+        }
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        if let Some(body) = &self.empty_body {
+            body.paint(ctx);
+        }
+        for (pod, rect) in self
+            .empty_actions
+            .iter()
+            .zip(self.empty_action_rects.iter())
+            .chain(self.message_actions.iter().zip(&self.message_action_rects))
+            .chain(self.runtime_actions.iter().zip(&self.runtime_action_rects))
+        {
+            if rect.is_some() {
+                pod.paint(ctx);
+            }
+        }
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        if let Some(body) = &self.empty_body {
+            body.semantics(ctx);
+        }
+        for (pod, rect) in self
+            .empty_actions
+            .iter()
+            .zip(self.empty_action_rects.iter())
+            .chain(self.message_actions.iter().zip(&self.message_action_rects))
+            .chain(self.runtime_actions.iter().zip(&self.runtime_action_rects))
+        {
+            if rect.is_some() {
+                pod.semantics(ctx);
+            }
+        }
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        if let Some(body) = &self.empty_body {
+            visitor.visit(body);
+        }
+        for (pod, rect) in self
+            .empty_actions
+            .iter()
+            .zip(self.empty_action_rects.iter())
+            .chain(self.message_actions.iter().zip(&self.message_action_rects))
+            .chain(self.runtime_actions.iter().zip(&self.runtime_action_rects))
+        {
+            if rect.is_some() {
+                visitor.visit(pod);
+            }
+        }
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        if let Some(body) = &mut self.empty_body {
+            visitor.visit(body);
+        }
+        for (pod, rect) in self
+            .empty_actions
+            .iter_mut()
+            .zip(self.empty_action_rects.iter())
+            .chain(
+                self.message_actions
+                    .iter_mut()
+                    .zip(&self.message_action_rects),
+            )
+            .chain(
+                self.runtime_actions
+                    .iter_mut()
+                    .zip(&self.runtime_action_rects),
+            )
+        {
+            if rect.is_some() {
+                visitor.visit(pod);
+            }
+        }
+    }
+}
+
 impl Widget for TranscriptView {
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
         match event {
             Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
-                let runtime_hovered = self.runtime_action_at(pointer.position);
-                let quick_hovered = if runtime_hovered.is_none() {
-                    self.quick_action_at(ctx.bounds(), pointer.position)
-                } else {
-                    None
-                };
-                let recovery_hovered = if quick_hovered.is_none() && runtime_hovered.is_none() {
-                    self.recovery_action_at(ctx.bounds(), pointer.position)
-                } else {
-                    None
-                };
-                let runtime_changed = *self.hovered_runtime_action.borrow() != runtime_hovered;
-                if self.hovered_quick_action.get() != quick_hovered
-                    || self.hovered_recovery_action.get() != recovery_hovered
-                    || runtime_changed
-                {
-                    self.hovered_quick_action.set(quick_hovered);
-                    self.hovered_recovery_action.set(recovery_hovered);
-                    *self.hovered_runtime_action.borrow_mut() = runtime_hovered;
-                    ctx.request_paint();
-                    ctx.request_semantics();
-                }
                 if self.dragging_selection.get()
                     && pointer.buttons.contains(PointerButton::Primary)
                     && let Some(focus) = self.nearest_text_point(pointer.position)
@@ -13880,23 +13975,7 @@ impl Widget for TranscriptView {
                 if pointer.kind == PointerEventKind::Down
                     && pointer.button == Some(PointerButton::Primary) =>
             {
-                if let Some(action) = self.runtime_action_at(pointer.position) {
-                    *self.pressed_runtime_action.borrow_mut() = Some(action);
-                    ctx.request_pointer_capture(pointer.pointer_id);
-                    ctx.request_paint();
-                    ctx.set_handled();
-                } else if let Some(action) = self.quick_action_at(ctx.bounds(), pointer.position) {
-                    self.pressed_quick_action.set(Some(action));
-                    ctx.request_pointer_capture(pointer.pointer_id);
-                    ctx.request_paint();
-                    ctx.set_handled();
-                } else if let Some(action) = self.recovery_action_at(ctx.bounds(), pointer.position)
-                {
-                    self.pressed_recovery_action.set(Some(action));
-                    ctx.request_pointer_capture(pointer.pointer_id);
-                    ctx.request_paint();
-                    ctx.set_handled();
-                } else if let Some(point) = self.text_point_at(pointer.position) {
+                if let Some(point) = self.text_point_at(pointer.position) {
                     // Start a character-granular selection drag on rich text.
                     self.dragging_selection.set(true);
                     self.set_selection(ctx, Some((point, point)));
@@ -13911,38 +13990,6 @@ impl Widget for TranscriptView {
                 if pointer.kind == PointerEventKind::Up
                     && pointer.button == Some(PointerButton::Primary) =>
             {
-                let runtime_pressed = self.pressed_runtime_action.borrow_mut().take();
-                if let Some(pressed) = runtime_pressed {
-                    let released = self.runtime_action_at(pointer.position);
-                    if released.as_ref() == Some(&pressed) {
-                        self.activate_runtime_action(pressed);
-                    }
-                    ctx.release_pointer_capture(pointer.pointer_id);
-                    Self::request_recovery_action_refresh(ctx);
-                    ctx.set_handled();
-                    return;
-                }
-                if let Some(pressed) = self.pressed_quick_action.take() {
-                    let released = self.quick_action_at(ctx.bounds(), pointer.position);
-                    if released == Some(pressed) {
-                        self.activate_quick_action(pressed);
-                    }
-                    ctx.release_pointer_capture(pointer.pointer_id);
-                    Self::request_recovery_action_refresh(ctx);
-                    ctx.set_handled();
-                    return;
-                }
-                let pressed = self.pressed_recovery_action.take();
-                if let Some(pressed) = pressed {
-                    let released = self.recovery_action_at(ctx.bounds(), pointer.position);
-                    if released == Some(pressed) {
-                        self.activate_recovery_action(pressed);
-                    }
-                    ctx.release_pointer_capture(pointer.pointer_id);
-                    Self::request_recovery_action_refresh(ctx);
-                    ctx.set_handled();
-                    return;
-                }
                 if self.dragging_selection.take() {
                     ctx.release_pointer_capture(pointer.pointer_id);
                     ctx.set_handled();
@@ -13970,25 +14017,6 @@ impl Widget for TranscriptView {
             {
                 if pointer.kind == PointerEventKind::Cancel && self.dragging_selection.take() {
                     ctx.release_pointer_capture(pointer.pointer_id);
-                }
-                let had_hover = self.hovered_recovery_action.take().is_some();
-                let had_press = self.pressed_recovery_action.take().is_some();
-                let had_quick_hover = self.hovered_quick_action.take().is_some();
-                let had_quick_press = self.pressed_quick_action.take().is_some();
-                let had_runtime_hover = self.hovered_runtime_action.borrow_mut().take().is_some();
-                let had_runtime_press = self.pressed_runtime_action.borrow_mut().take().is_some();
-                if had_press || had_quick_press || had_runtime_press {
-                    ctx.release_pointer_capture(pointer.pointer_id);
-                }
-                if had_hover
-                    || had_press
-                    || had_quick_hover
-                    || had_quick_press
-                    || had_runtime_hover
-                    || had_runtime_press
-                {
-                    ctx.request_paint();
-                    ctx.request_semantics();
                     ctx.set_handled();
                 }
             }
@@ -14010,7 +14038,7 @@ impl Widget for TranscriptView {
                         chat.maybe_start_newer_transcript_load();
                     }
                     drop(chat);
-                    ctx.request_paint();
+                    Self::request_recovery_action_refresh(ctx);
                 }
             }
             Event::Keyboard(key) if ctx.is_focused() && key.state == KeyState::Pressed => {
@@ -14057,12 +14085,15 @@ impl Widget for TranscriptView {
         }
     }
 
-    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        constraints.max
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let size = constraints.max;
+        self.controls.measure(ctx, Constraints::tight(size));
+        size
     }
 
-    fn arrange(&mut self, _ctx: &mut ArrangeCtx, bounds: Rect) {
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
         self.bounds.set(bounds);
+        self.controls.arrange(ctx, bounds);
     }
 
     fn accepts_focus(&self) -> bool {
@@ -14076,8 +14107,6 @@ impl Widget for TranscriptView {
         let area = ctx.bounds();
         self.bounds.set(area);
         self.viewport_height.set(area.height());
-        self.transcript_recovery_actions.borrow_mut().clear();
-        self.runtime_actions.borrow_mut().clear();
 
         let chat = self.shared.chat();
         if chat.messages.is_empty() {
@@ -14085,7 +14114,7 @@ impl Widget for TranscriptView {
             self.transcript_message_sources.borrow_mut().clear();
             self.transcript_message_semantics.borrow_mut().clear();
             self.selection.set(None);
-            self.paint_empty_state(ctx, &theme, &pal, area, &chat);
+            self.controls.paint(ctx);
             return;
         }
 
@@ -14170,8 +14199,6 @@ impl Widget for TranscriptView {
         // Draw pass: only mutable ctx ops here. Keep a bounded semantic
         // projection beside the visible paint rows so native accessibility
         // receives the same message text and geometry users see.
-        let mut action_rects = Vec::new();
-        let mut runtime_action_rects = Vec::new();
         let mut message_semantics = Vec::new();
         let mut y = area.y() + PAD - scroll;
         if let Some(summary) = timeline_summary.as_deref() {
@@ -14221,7 +14248,6 @@ impl Widget for TranscriptView {
                     y,
                     layout_mode,
                     transcript_message_selection_key(index, message),
-                    &mut action_rects,
                 );
             }
             y += item.bubble_h + message_gap;
@@ -14233,14 +14259,13 @@ impl Widget for TranscriptView {
                 | TranscriptLaidTool::Call { bubble_h, .. } => *bubble_h,
             };
             if y + height >= area.y() && y <= area.y() + area.height() {
-                self.paint_tool_item(ctx, &pal, &theme, area, item, y, &mut runtime_action_rects);
+                self.paint_tool_item(ctx, &pal, &theme, area, item, y);
             }
             y += height + 10.0;
         }
-        *self.transcript_recovery_actions.borrow_mut() = action_rects;
-        *self.runtime_actions.borrow_mut() = runtime_action_rects;
         *self.transcript_message_semantics.borrow_mut() = message_semantics;
         ctx.pop_clip();
+        self.controls.paint(ctx);
 
         // Streaming / typing notice, pinned to the bottom of the transcript.
         if chat.streaming
@@ -14266,16 +14291,9 @@ impl Widget for TranscriptView {
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let (messages_empty, target, streaming) = {
+        let (messages_empty, streaming) = {
             let chat = self.shared.chat();
-            (
-                chat.messages.is_empty(),
-                chat.messages
-                    .is_empty()
-                    .then(|| chat.runtime_recovery_target())
-                    .flatten(),
-                chat.streaming,
-            )
+            (chat.messages.is_empty(), chat.streaming)
         };
         let visible_message_count = self.transcript_message_semantics.borrow().len();
         let mut transcript = SemanticsNode::new(ctx.widget_id(), SemanticsRole::List, ctx.bounds());
@@ -14301,16 +14319,21 @@ impl Widget for TranscriptView {
             ]
         };
         ctx.push(transcript);
-        if target.is_none() {
-            if messages_empty {
-                let (title, hint, context) = {
-                    let chat = self.shared.chat();
+        if messages_empty {
+            // `EmptyState` exposes its copy as one descriptive container. Keep
+            // the individual title, guidance, and context lines discoverable
+            // as text as well, without synthesizing any actionable semantics.
+            let standard_copy = {
+                let chat = self.shared.chat();
+                chat.runtime_recovery_target().is_none().then(|| {
                     (
                         chat.empty_conversation_title(),
                         chat.empty_conversation_hint(),
                         chat.empty_conversation_context(),
                     )
-                };
+                })
+            };
+            if let Some((title, hint, context)) = standard_copy {
                 let (cx, cy) = Self::empty_state_center(ctx.bounds());
                 let text_width = (ctx.bounds().width() - PAD * 4.0).max(120.0).min(560.0);
                 let mut text_nodes = vec![(title, cy + 2.0, 22.0_f32), (hint, cy + 26.0, 18.0)];
@@ -14327,304 +14350,88 @@ impl Widget for TranscriptView {
                     node.name = Some(name);
                     ctx.push(node);
                 }
-                let actions = {
-                    let chat = self.shared.chat();
-                    Self::quick_actions(&chat).to_vec()
-                };
-                for (slot, (action, rect)) in Self::quick_action_rects(ctx.bounds(), &actions)
-                    .into_iter()
-                    .enumerate()
-                {
-                    let mut node = SemanticsNode::new(
-                        Self::quick_action_widget_id(ctx.widget_id(), slot),
-                        SemanticsRole::Button,
-                        rect,
-                    );
-                    node.parent = Some(ctx.widget_id());
-                    node.name = Some(action.label().to_string());
-                    node.description = Some(action.description().to_string());
-                    node.actions = vec![SemanticsAction::Activate];
-                    node.state.hovered = self.hovered_quick_action.get() == Some(action);
-                    ctx.push(node);
-                }
-                return;
             }
-            let notice = {
-                let chat = self.shared.chat();
-                chat.notice.clone()
-            };
-            let semantics = self.transcript_message_semantics.borrow();
-            for message in semantics.iter() {
-                let mut node = SemanticsNode::new(
-                    Self::message_widget_id(ctx.widget_id(), message.message_key),
-                    SemanticsRole::ListItem,
-                    message.bounds,
-                );
-                node.parent = Some(ctx.widget_id());
-                node.name = Some(format!("{}: {}", message.speaker, message.text));
-                node.description = Some(format!(
-                    "Message {} of {}{}",
-                    message.position,
-                    message.total,
-                    if message.busy {
-                        "; response in progress"
-                    } else {
-                        ""
-                    }
-                ));
-                node.value = Some(SemanticsValue::Text(message.text.clone()));
-                node.state.busy = message.busy;
-                ctx.push(node);
-            }
-            drop(semantics);
-            if streaming {
-                let progress_text = notice
-                    .filter(|notice| !notice.trim().is_empty())
-                    .unwrap_or_else(|| "Agent response in progress".to_string());
-                let mut progress = SemanticsNode::new(
-                    Self::progress_widget_id(ctx.widget_id()),
-                    SemanticsRole::BusyIndicator,
-                    Rect::new(
-                        ctx.bounds().x() + PAD,
-                        ctx.bounds().max_y() - 24.0,
-                        (ctx.bounds().width() - PAD * 2.0).max(1.0),
-                        22.0,
-                    ),
-                );
-                progress.parent = Some(ctx.widget_id());
-                progress.name = Some(progress_text.clone());
-                progress.value = Some(SemanticsValue::Text(progress_text));
-                progress.state.busy = true;
-                ctx.push(progress);
-            }
-            let timeline_summary = {
-                let chat = self.shared.chat();
-                chat.timeline.visible_summary(chat.messages.len())
-            };
-            if let Some(summary) = timeline_summary {
-                let rect = Rect::new(
-                    ctx.bounds().x() + PAD,
-                    ctx.bounds().y() + PAD,
-                    (ctx.bounds().width() - PAD * 2.0).max(0.0),
-                    26.0,
-                );
-                let mut node = SemanticsNode::new(
-                    Self::timeline_header_widget_id(ctx.widget_id()),
-                    SemanticsRole::Text,
-                    rect,
-                );
-                node.parent = Some(ctx.widget_id());
-                node.name = Some(summary);
-                ctx.push(node);
-            }
-            for (slot, (action, rect)) in self.runtime_actions.borrow().iter().enumerate() {
-                let mut node = SemanticsNode::new(
-                    Self::runtime_action_widget_id(ctx.widget_id(), slot),
-                    SemanticsRole::Button,
-                    *rect,
-                );
-                node.parent = Some(ctx.widget_id());
-                node.name = Some(runtime_action_label(action).to_string());
-                node.description = Some(match action {
-                    RuntimeTranscriptAction::ToggleToolChain => {
-                        "Show or hide the chain of tool calls".to_string()
-                    }
-                    RuntimeTranscriptAction::ToggleToolDetail(_) => {
-                        "Show or hide long tool input or output".to_string()
-                    }
-                });
-                node.actions = vec![SemanticsAction::Activate];
-                node.state.hovered = self
-                    .hovered_runtime_action
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|hovered| hovered == action);
-                ctx.push(node);
-            }
-            for (slot, (action, rect)) in self
-                .transcript_recovery_actions
-                .borrow()
-                .iter()
-                .copied()
-                .enumerate()
-            {
-                let mut node = SemanticsNode::new(
-                    Self::recovery_action_widget_id(ctx.widget_id(), 100 + slot),
-                    SemanticsRole::Button,
-                    rect,
-                );
-                node.parent = Some(ctx.widget_id());
-                node.name = Some(action.label().to_string());
-                node.description = Some(action.description().to_string());
-                node.actions = vec![SemanticsAction::Activate];
-                node.state.hovered = self.hovered_recovery_action.get() == Some(action);
-                ctx.push(node);
-            }
+            self.controls.semantics(ctx);
             return;
         }
-        let Some(target) = target else { return };
 
-        let chat = self.shared.chat();
-        for (slot, (action, rect)) in Self::recovery_action_rects(ctx.bounds(), target, &chat)
-            .into_iter()
-            .enumerate()
-        {
+        let notice = {
+            let chat = self.shared.chat();
+            chat.notice.clone()
+        };
+        let semantics = self.transcript_message_semantics.borrow();
+        for message in semantics.iter() {
             let mut node = SemanticsNode::new(
-                Self::recovery_action_widget_id(ctx.widget_id(), slot),
-                SemanticsRole::Button,
+                Self::message_widget_id(ctx.widget_id(), message.message_key),
+                SemanticsRole::ListItem,
+                message.bounds,
+            );
+            node.parent = Some(ctx.widget_id());
+            node.name = Some(format!("{}: {}", message.speaker, message.text));
+            node.description = Some(format!(
+                "Message {} of {}{}",
+                message.position,
+                message.total,
+                if message.busy {
+                    "; response in progress"
+                } else {
+                    ""
+                }
+            ));
+            node.value = Some(SemanticsValue::Text(message.text.clone()));
+            node.state.busy = message.busy;
+            ctx.push(node);
+        }
+        drop(semantics);
+        if streaming {
+            let progress_text = notice
+                .filter(|notice| !notice.trim().is_empty())
+                .unwrap_or_else(|| "Agent response in progress".to_string());
+            let mut progress = SemanticsNode::new(
+                Self::progress_widget_id(ctx.widget_id()),
+                SemanticsRole::BusyIndicator,
+                Rect::new(
+                    ctx.bounds().x() + PAD,
+                    ctx.bounds().max_y() - 24.0,
+                    (ctx.bounds().width() - PAD * 2.0).max(1.0),
+                    22.0,
+                ),
+            );
+            progress.parent = Some(ctx.widget_id());
+            progress.name = Some(progress_text.clone());
+            progress.value = Some(SemanticsValue::Text(progress_text));
+            progress.state.busy = true;
+            ctx.push(progress);
+        }
+        let timeline_summary = {
+            let chat = self.shared.chat();
+            chat.timeline.visible_summary(chat.messages.len())
+        };
+        if let Some(summary) = timeline_summary {
+            let rect = Rect::new(
+                ctx.bounds().x() + PAD,
+                ctx.bounds().y() + PAD,
+                (ctx.bounds().width() - PAD * 2.0).max(0.0),
+                26.0,
+            );
+            let mut node = SemanticsNode::new(
+                Self::timeline_header_widget_id(ctx.widget_id()),
+                SemanticsRole::Text,
                 rect,
             );
             node.parent = Some(ctx.widget_id());
-            node.name = Some(action.label().to_string());
-            node.description = Some(action.description().to_string());
-            node.actions = vec![SemanticsAction::Activate];
-            node.state.hovered = self.hovered_recovery_action.get() == Some(action);
+            node.name = Some(summary);
             ctx.push(node);
         }
-    }
-}
-
-impl TranscriptView {
-    fn paint_empty_state(
-        &self,
-        ctx: &mut PaintCtx,
-        theme: &sui::DefaultTheme,
-        pal: &Palette,
-        area: Rect,
-        chat: &ChatState,
-    ) {
-        if let Some(target) = chat.runtime_recovery_target() {
-            self.paint_recovery_empty_state(ctx, theme, pal, area, chat, target);
-            return;
-        }
-
-        let (_, cy) = Self::empty_state_center(area);
-        let center_offset_y = cy - (area.y() + area.height() * 0.5);
-        let title = chat.empty_conversation_title();
-        let hint = chat.empty_conversation_hint();
-        let context = chat.empty_conversation_context();
-        let mut empty_state = EmptyStatePaint::new(&title, &hint)
-            .icon(IconGlyph::Sparkles)
-            .center_offset_y(center_offset_y);
-        if let Some(context) = context.as_deref() {
-            empty_state = empty_state.detail(context);
-        }
-        paint_empty_state(ctx, theme, area, empty_state);
-
-        for (action, rect) in Self::quick_action_rects(area, Self::quick_actions(chat)) {
-            self.paint_quick_action(ctx, theme, pal, action, rect);
-        }
+        self.controls.semantics(ctx);
     }
 
-    fn paint_recovery_empty_state(
-        &self,
-        ctx: &mut PaintCtx,
-        theme: &sui::DefaultTheme,
-        pal: &Palette,
-        area: Rect,
-        chat: &ChatState,
-        target: RuntimeRecoveryTarget,
-    ) {
-        let card = Self::recovery_card_rect(area);
-        let action_top = Self::recovery_action_rects(area, target, chat)
-            .into_iter()
-            .map(|(_, rect)| rect.y())
-            .fold(card.y() + card.height(), f32::min);
-        sui::paint_theme_shadow(ctx, card, [10.0; 4], &theme.shadows.box_shadow.xs);
-        let body = format!(
-            "{}\n{}",
-            chat.recovery_empty_detail(target),
-            chat.recovery_empty_hint(target)
-        );
-        paint_callout(
-            ctx,
-            theme,
-            card,
-            Some(IconGlyph::Alert),
-            Some(chat.recovery_empty_title(target)),
-            &body,
-            CalloutPaint::new(SemanticTone::Warning)
-                .radius(8.0)
-                .icon_size(28.0)
-                .icon_gap(14.0)
-                .padding(Insets {
-                    left: 18.0,
-                    top: 18.0,
-                    right: 18.0,
-                    bottom: 14.0,
-                })
-                .reserved_bottom((card.max_y() - action_top + 4.0).max(0.0)),
-        );
-
-        for (action, rect) in Self::recovery_action_rects(area, target, chat) {
-            let primary = Self::recovery_action_is_primary(chat, target, action);
-            self.paint_recovery_action(ctx, theme, pal, action, rect, primary);
-        }
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.controls);
     }
 
-    fn paint_recovery_action(
-        &self,
-        ctx: &mut PaintCtx,
-        theme: &sui::DefaultTheme,
-        _pal: &Palette,
-        action: RecoveryCardAction,
-        rect: Rect,
-        primary: bool,
-    ) {
-        let hovered = self.hovered_recovery_action.get() == Some(action);
-        let pressed = self.pressed_recovery_action.get() == Some(action);
-        let style = if primary {
-            CommandButtonPaint::filled(SemanticTone::Accent)
-        } else {
-            match action {
-                RecoveryCardAction::OpenConnectionSettings => {
-                    CommandButtonPaint::tonal(SemanticTone::Warning)
-                }
-                RecoveryCardAction::CheckSifs => {
-                    CommandButtonPaint::neutral().icon_tone(SemanticTone::Accent)
-                }
-                RecoveryCardAction::RetryChatList | RecoveryCardAction::OpenProviderSetup => {
-                    CommandButtonPaint::neutral().icon_tone(SemanticTone::Accent)
-                }
-            }
-        }
-        .hovered(hovered)
-        .pressed(pressed);
-        paint_command_button(ctx, theme, rect, action.label(), Some(action.icon()), style);
-    }
-
-    fn paint_quick_action(
-        &self,
-        ctx: &mut PaintCtx,
-        theme: &sui::DefaultTheme,
-        _pal: &Palette,
-        action: ChatQuickAction,
-        rect: Rect,
-    ) {
-        let hovered = self.hovered_quick_action.get() == Some(action);
-        let pressed = self.pressed_quick_action.get() == Some(action);
-        let primary = matches!(
-            action,
-            ChatQuickAction::PlanChange
-                | ChatQuickAction::ManageChannel
-                | ChatQuickAction::NewChannel
-        );
-        let style = if primary {
-            ActionTilePaint::tonal(SemanticTone::Accent)
-        } else {
-            ActionTilePaint::neutral()
-        }
-        .hovered(hovered)
-        .pressed(pressed);
-        paint_action_tile(
-            ctx,
-            theme,
-            rect,
-            action.label(),
-            (rect.height() > 46.0).then_some(action.subtitle()),
-            Some(action.icon()),
-            style,
-        );
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.controls);
     }
 }
 
@@ -14670,8 +14477,7 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                 .alignment(Alignment::Center)
                 .with_child(
                     SizedBox::new().height(SELECTOR_H).with_child(
-                        Label::new("Loading providers...")
-                            .font_size(12.0)
+                        small_label(shared, "Loading providers...")
                             .color_when(move || palette(&s).text_faint),
                     ),
                 );
@@ -14686,8 +14492,7 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                 .alignment(Alignment::Center)
                 .with_child(
                     SizedBox::new().height(SELECTOR_H).with_child(
-                        Label::new("Provider setup required")
-                            .font_size(12.0)
+                        small_label(shared, "Provider setup required")
                             .color_when(move || palette(&s).text_faint),
                     ),
                 );
@@ -14904,7 +14709,9 @@ fn attachment_drawer_chip(
         IconButton::new(IconGlyph::Close, remove_label)
             .size(ATTACHMENT_CHIPS_H)
             .icon_size(12.0)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press(move || {
                 s.chat_mut().remove_attachment(index);
             })
@@ -14915,9 +14722,7 @@ fn attachment_drawer_chip(
             .main_gap(4.0)
             .align_items(Alignment::Center)
             .with_item(
-                Label::new(label)
-                    .font_size(11.0)
-                    .color_when(move || palette(&s).text_muted),
+                small_label(shared, label).color_when(move || palette(&s).text_muted),
                 FlexItem::flex(1.0).min_width(48.0),
             )
             .with_child(remove),
@@ -14929,7 +14734,9 @@ fn attachment_drawer_chip(
         right: 3.0,
         bottom: 0.0,
     })
-    .theme_when(secondary_button_theme(reader))
+    .theme_when(clone_reader(reader))
+    .appearance(SurfaceAppearance::Raised)
+    .tone(SemanticTone::Neutral)
 }
 
 fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
@@ -14951,13 +14758,9 @@ fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     if !controls_visible && shared.chat().attachments.len() > 3 {
         let extra = shared.chat().attachments.len() - 3;
         let s = shared.clone();
-        chips = chips.with_child(
-            SizedBox::new().height(ATTACHMENT_CHIPS_H).with_child(
-                Label::new(format!("+{extra}"))
-                    .font_size(11.0)
-                    .color_when(move || palette(&s).text_faint),
-            ),
-        );
+        chips = chips.with_child(SizedBox::new().height(ATTACHMENT_CHIPS_H).with_child(
+            small_label(shared, format!("+{extra}")).color_when(move || palette(&s).text_faint),
+        ));
     }
 
     if !controls_visible {
@@ -14967,16 +14770,16 @@ fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                 .icon(IconGlyph::File)
                 .min_height(ATTACHMENT_ENTRY_H)
                 .min_width(112.0)
-                .theme_when(secondary_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
                 .on_press(move || {
                     s.chat_mut().toggle_attachment_controls();
                 })
         };
         let empty_summary = {
             let s = shared.clone();
-            Label::new("No files attached")
-                .font_size(11.0)
-                .color_when(move || palette(&s).text_faint)
+            small_label(shared, "No files attached").color_when(move || palette(&s).text_faint)
         };
         let summary = SwitchView::new()
             .selected(if shared.chat().attachments.is_empty() {
@@ -15022,7 +14825,9 @@ fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         IconButton::new(IconGlyph::Close, "Hide attachment field")
             .size(ATTACHMENT_ENTRY_H)
             .icon_size(13.0)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press(move || {
                 s.chat_mut().toggle_attachment_controls();
             })
@@ -15139,7 +14944,9 @@ fn close_popup_button(shared: &Shared, reader: &ThemeReader, label: &'static str
     IconButton::new(IconGlyph::Close, label)
         .size(26.0)
         .icon_size(13.0)
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press_with_ctx(move |ctx| {
             s.chat_mut().set_composer_popup(None);
             request_chat_window_relayout(ctx);
@@ -15433,7 +15240,9 @@ fn composer_context_chip(
         IconButton::new(IconGlyph::Close, remove_label)
             .size(16.0)
             .icon_size(10.0)
-            .theme_when(ghost_icon_button_theme(reader))
+            .theme_when(composer_control_reader(reader))
+            .appearance(sui::ButtonAppearance::Ghost)
+            .tone(SemanticTone::Neutral)
             .on_press_with_ctx(move |ctx| {
                 s.chat_mut().remove_attachment(index);
                 request_chat_window_relayout(ctx);
@@ -15446,11 +15255,7 @@ fn composer_context_chip(
                 .main_gap(5.0)
                 .align_items(Alignment::Center)
                 .with_child(icon)
-                .with_child(
-                    Label::new(label)
-                        .font_size(12.0)
-                        .color_when(move || palette(&s).text_muted),
-                )
+                .with_child(small_label(shared, label).color_when(move || palette(&s).text_muted))
                 .with_child(remove),
         )
         .radius(999.0)
@@ -15460,7 +15265,9 @@ fn composer_context_chip(
             right: 3.0,
             bottom: 0.0,
         })
-        .theme_when(context_chip_theme(reader)),
+        .appearance(SurfaceAppearance::Raised)
+        .tone(SemanticTone::Neutral)
+        .theme_when(clone_reader(reader)),
     )
 }
 
@@ -15485,16 +15292,13 @@ fn composer_queue_chip(
         let theme = shared.theme();
         Label::new(item.kind.label().to_uppercase())
             .style(sui::TextStyle {
-                font_size: 9.0,
-                line_height: 12.0,
                 weight: FontWeight::BOLD,
-                ..theme.body_text_style()
+                ..small_theme_text_style(&theme)
             })
             .color_when(move || palette(&s).accent_text)
     };
     let s = shared.clone();
-    let text = Label::new(compact_line(&item.text, 46))
-        .font_size(11.0)
+    let text = small_label(shared, compact_line(&item.text, 46))
         .color_when(move || palette(&s).accent_text);
     let mut row = Flex::horizontal()
         .main_gap(5.0)
@@ -15512,7 +15316,9 @@ fn composer_queue_chip(
             )
             .size(16.0)
             .icon_size(10.0)
-            .theme_when(ghost_icon_button_theme(reader))
+            .theme_when(composer_control_reader(reader))
+            .appearance(sui::ButtonAppearance::Ghost)
+            .tone(SemanticTone::Neutral)
             .on_press_with_ctx(move |ctx| {
                 s.chat_mut().remove_queued_turn_input(index);
                 request_chat_window_relayout(ctx);
@@ -15529,7 +15335,9 @@ fn composer_queue_chip(
                 right: right_pad,
                 bottom: 0.0,
             })
-            .theme_when(queue_chip_theme(reader)),
+            .appearance(SurfaceAppearance::Soft)
+            .tone(SemanticTone::Accent)
+            .theme_when(clone_reader(reader)),
     )
 }
 
@@ -15603,7 +15411,9 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
         IconButton::new(IconGlyph::Attach, "Attach files")
             .size(COMPOSER_GHOST_BUTTON_SIZE)
             .icon_size(14.0)
-            .theme_when(ghost_icon_button_theme(reader))
+            .theme_when(composer_control_reader(reader))
+            .appearance(sui::ButtonAppearance::Ghost)
+            .tone(SemanticTone::Neutral)
             .on_press_with_ctx(move |ctx| {
                 s.chat_mut()
                     .toggle_composer_popup(ComposerPopup::Attachments);
@@ -15627,7 +15437,9 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
         )
         .size(COMPOSER_GHOST_BUTTON_SIZE)
         .icon_size(14.0)
-        .theme_when(ghost_icon_button_theme(reader))
+        .theme_when(composer_control_reader(reader))
+        .appearance(sui::ButtonAppearance::Ghost)
+        .tone(SemanticTone::Neutral)
         .selected_when({
             let s = s.clone();
             move || s.chat().media_call.active
@@ -15645,7 +15457,9 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
         sui::Button::new(model_button_label(&shared.chat()))
             .icon(IconGlyph::Sparkles)
             .min_height(COMPOSER_GHOST_BUTTON_SIZE)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press_with_ctx(move |ctx| {
                 s.chat_mut().toggle_composer_popup(ComposerPopup::Model);
                 request_chat_window_relayout(ctx);
@@ -15657,7 +15471,9 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
         sui::Button::new(context_overview_summary(&shared.chat()))
             .icon(IconGlyph::History)
             .min_height(COMPOSER_GHOST_BUTTON_SIZE)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press_with_ctx(move |ctx| {
                 s.chat_mut().toggle_composer_popup(ComposerPopup::Context);
                 request_chat_window_relayout(ctx);
@@ -15669,7 +15485,9 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
         sui::Button::new(activity_button_label(&shared.chat()))
             .icon(IconGlyph::History)
             .min_height(COMPOSER_GHOST_BUTTON_SIZE)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press_with_ctx(move |ctx| {
                 s.chat_mut().toggle_activity_panel();
                 request_chat_window_relayout(ctx);
@@ -15677,6 +15495,7 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
     };
 
     let mut row = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
         .gap(COMPOSER_BAR_GAP)
         .align_items(Alignment::Center)
         .with_child(attach)
@@ -15684,11 +15503,8 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
 
     if let Some(hint_text) = hint {
         let s = shared.clone();
-        row = row.with_child(
-            Label::new(hint_text)
-                .font_size(11.0)
-                .color_when(move || palette(&s).accent_text),
-        );
+        row = row
+            .with_child(small_label(shared, hint_text).color_when(move || palette(&s).accent_text));
     }
 
     row = row
@@ -15696,28 +15512,28 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
             model,
             FlexItem::new()
                 .basis(132.0)
-                .min_width(76.0)
+                .min_width(100.0)
                 .min_height(COMPOSER_GHOST_BUTTON_SIZE),
         )
         .with_item(
             context,
             FlexItem::flex(1.0)
-                .min_width(0.0)
+                .basis(260.0)
+                .min_width(160.0)
                 .min_height(COMPOSER_GHOST_BUTTON_SIZE),
         )
         .with_item(
             activity,
             FlexItem::new()
                 .basis(88.0)
-                .min_width(44.0)
+                .min_width(72.0)
                 .min_height(COMPOSER_GHOST_BUTTON_SIZE),
         );
 
     if show_hint {
         let s = shared.clone();
         row = row.with_child(
-            Label::new("Enter sends · Shift+Enter newline")
-                .font_size(11.0)
+            small_label(shared, "Enter sends · Shift+Enter newline")
                 .color_when(move || palette(&s).text_faint),
         );
     }
@@ -15728,7 +15544,9 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
             sui::Button::new("Use answer")
                 .icon(IconGlyph::Redo)
                 .min_height(COMPOSER_GHOST_BUTTON_SIZE)
-                .theme_when(secondary_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
                 .on_press(move || {
                     s.chat_mut().use_latest_answer_as_draft();
                 }),
@@ -15741,7 +15559,9 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
         IconButton::new(IconGlyph::Stop, "Stop generation")
             .size(SEND_BUTTON_SIZE)
             .icon_size(13.0)
-            .theme_when(primary_icon_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Filled)
+            .tone(SemanticTone::Accent)
             .on_press(move || {
                 s.chat_mut().interrupt_turn();
             })
@@ -15750,7 +15570,9 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
         IconButton::new(IconGlyph::ArrowUp, "Send message")
             .size(SEND_BUTTON_SIZE)
             .icon_size(16.0)
-            .theme_when(primary_icon_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Filled)
+            .tone(SemanticTone::Accent)
             .enabled_when({
                 let s = s.clone();
                 move || s.chat().can_send()
@@ -15818,7 +15640,8 @@ fn composer_input_row(
             bottom: 4.0,
         })
         .selection_scope(selection.clone())
-        .theme_when(composer_input_theme(reader));
+        .appearance(FieldAppearance::Bare)
+        .theme_when(clone_reader(reader));
     if provider_ready {
         input = input.on_change({
             let s = s.clone();
@@ -15982,7 +15805,11 @@ fn composer_field(
         .with_child(input_host)
         .with_child(bar_host);
 
-    ComposerFieldFrame::new(shared.clone(), WidgetPod::new(rows))
+    FramedField::new(rows)
+        .name("Message composer")
+        .description("Message, attachments, model controls, and send actions")
+        .fill_width()
+        .theme_when(clone_reader(reader))
 }
 
 fn composer_body(
@@ -16123,7 +15950,9 @@ fn compact_chat_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         IconButton::new(IconGlyph::Chat, "Open conversations and agents")
             .size(34.0)
             .icon_size(16.0)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .selected_when({
                 let s = s.clone();
                 move || s.chat().compact_drawer_open
@@ -16171,7 +16000,9 @@ fn compact_chat_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         IconButton::new(IconGlyph::MoreHorizontal, "Edit current conversation")
             .size(34.0)
             .icon_size(16.0)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .enabled_when({
                 let s = s.clone();
                 move || s.chat().current_session_ref().is_some()
@@ -16191,7 +16022,7 @@ fn compact_chat_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         .main_gap(8.0)
         .align_items(Alignment::Center)
         .with_item(open_drawer, FlexItem::new().no_shrink())
-        .with_item(labels, FlexItem::fill().min_width(80.0))
+        .with_item(labels, FlexItem::fill().min_width(160.0))
         .with_item(edit, FlexItem::new().no_shrink());
     Surface::new(
         SurfaceRole::Titlebar,
@@ -16203,7 +16034,8 @@ fn compact_chat_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
                 bottom: 8.0,
             },
             row,
-        ),
+        )
+        .fill_child(),
     )
     .border(SurfaceBorder::Bottom)
     .fill_width()
@@ -16259,12 +16091,16 @@ fn narrow_pod(shared: &Shared, reader: &ThemeReader, selection: &SelectionScope)
 /// those hosts rebuild and re-measure (a worker-driven change arrives outside any pointer gesture).
 pub struct ChatView {
     shared: Shared,
+    theme_reader: ThemeReader,
+    sessions_scroll_state: ScrollState,
+    selection: SelectionScope,
     wide: WidgetPod,
     narrow: WidgetPod,
     use_wide: Cell<bool>,
     /// Coarse signature of the selection / session / streaming state the inner `RebuildOnChange`
     /// hosts key on; a change forces a full relayout so they rebuild.
     last_sig: Cell<u64>,
+    last_scale_key: Cell<AppTextScale>,
     /// Whether an animation frame is currently requested (so we don't stack duplicate requests).
     pump_alive: Cell<bool>,
     /// Frames since the last state change; bounds the idle tail so we stop requesting frames.
@@ -16289,12 +16125,17 @@ impl ChatView {
         let wide = wide_pod(&shared, &theme_reader, &sessions_scroll_state, &selection);
         let narrow = narrow_pod(&shared, &theme_reader, &selection);
         let last_sig = Cell::new(view_signature(&shared));
+        let last_scale_key = Cell::new(chat_scale_key(&shared));
         Self {
             shared,
+            theme_reader,
+            sessions_scroll_state,
+            selection,
             wide,
             narrow,
             use_wide: Cell::new(true),
             last_sig,
+            last_scale_key,
             pump_alive: Cell::new(false),
             idle_frames: Cell::new(0),
         }
@@ -16314,6 +16155,22 @@ impl ChatView {
         } else {
             &mut self.narrow
         }
+    }
+
+    fn sync_scale(&mut self) -> bool {
+        let current = chat_scale_key(&self.shared);
+        if current == self.last_scale_key.get() {
+            return false;
+        }
+        self.last_scale_key.set(current);
+        self.wide = wide_pod(
+            &self.shared,
+            &self.theme_reader,
+            &self.sessions_scroll_state,
+            &self.selection,
+        );
+        self.narrow = narrow_pod(&self.shared, &self.theme_reader, &self.selection);
+        true
     }
 
     /// Ensure the request-animation-frame pump is running (idempotent).
@@ -16559,6 +16416,7 @@ impl Widget for ChatView {
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.sync_scale();
         let use_wide = constraints.max.width >= WIDE_THRESHOLD;
         if use_wide && !self.use_wide.get() {
             self.shared.chat_mut().compact_drawer_open = false;
@@ -16594,101 +16452,8 @@ impl Widget for ChatView {
     }
 }
 
-/// The Mesh composer field frame (`.sm-composer`): one rounded surface holding
-/// the chip rows, the borderless input and the action bar. Paints the
-/// `--sm-field-bg` fill under a `--sm-border-strong` hairline; while focus is
-/// anywhere inside, the border turns accent and a 3px `--sm-accent-soft` halo
-/// rings the surface (`:focus-within`). Focus can't be observed via callbacks
-/// in sui, so the frame checks the focused widget id against its own subtree —
-/// any focus change repaints every window, which keeps the polled value fresh.
-struct ComposerFieldFrame {
-    shared: Shared,
-    child: WidgetPod,
-}
-
-impl ComposerFieldFrame {
-    fn new(shared: Shared, child: WidgetPod) -> Self {
-        Self { shared, child }
-    }
-
-    fn focus_within(&self, focused: Option<sui::WidgetId>) -> bool {
-        let Some(focused) = focused else {
-            return false;
-        };
-        if self.child.id() == focused {
-            return true;
-        }
-        struct Finder {
-            target: sui::WidgetId,
-            found: bool,
-        }
-        impl WidgetPodVisitor for Finder {
-            fn visit(&mut self, child: &WidgetPod) {
-                if self.found {
-                    return;
-                }
-                if child.id() == self.target {
-                    self.found = true;
-                    return;
-                }
-                child.visit_children(self);
-            }
-        }
-        let mut finder = Finder {
-            target: focused,
-            found: false,
-        };
-        self.child.visit_children(&mut finder);
-        finder.found
-    }
-}
-
-impl Widget for ComposerFieldFrame {
-    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        self.child.measure(ctx, constraints)
-    }
-
-    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        self.child.arrange(ctx, bounds);
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        let pal = palette(&self.shared);
-        let bounds = ctx.bounds();
-        let focused = self.focus_within(ctx.focused_widget_id());
-        if focused {
-            paint_rounded_rect(
-                ctx,
-                bounds.inflate(COMPOSER_FOCUS_RING_W, COMPOSER_FOCUS_RING_W),
-                pal.accent_soft,
-                COMPOSER_FIELD_RADIUS + COMPOSER_FOCUS_RING_W,
-            );
-        }
-        paint_rounded_panel(
-            ctx,
-            bounds,
-            pal.field,
-            if focused {
-                pal.accent
-            } else {
-                pal.border_strong
-            },
-            COMPOSER_FIELD_RADIUS,
-        );
-        self.child.paint(ctx);
-    }
-
-    fn semantics(&self, ctx: &mut SemanticsCtx) {
-        self.child.semantics(ctx);
-    }
-
-    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
-        visitor.visit(&self.child);
-    }
-
-    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
-        visitor.visit(&mut self.child);
-    }
+fn chat_scale_key(shared: &Shared) -> AppTextScale {
+    shared.borrow().text_scale
 }
 
 /// The docked composer panel: an optional popup block above the field surface.
@@ -17001,6 +16766,42 @@ mod tests {
             },
         )));
         assert_eq!(transcript.selection_text().as_deref(), Some("ron"));
+    }
+
+    #[test]
+    fn chat_small_and_code_text_styles_follow_theme_tokens_and_font_stacks() {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let theme = shared.theme();
+        let pal = palette(&shared);
+
+        let small = small_text_style(&shared);
+        assert_eq!(small.font_size, theme.text.sm.size);
+        assert_eq!(small.line_height, theme.text.sm.line_height);
+        assert_eq!(small.font_families, theme.body_text_style().font_families);
+
+        let markdown = TranscriptView::markdown_styles(&pal, &theme, pal.text);
+        assert_eq!(
+            markdown.inline_code.font_families,
+            theme.mono_text_style(pal.text).font_families
+        );
+
+        let document = TranscriptView::code_text_document(
+            &ChatCodeBlock {
+                language: Some("rust".to_string()),
+                text: "let answer = 42;".to_string(),
+                is_diff: false,
+            },
+            false,
+            &pal,
+            &theme,
+        );
+        let style = &document.paragraphs[0].spans[0].style;
+        assert_eq!(style.font_size, theme.text.sm.size);
+        assert_eq!(style.line_height, theme.text.sm.line_height);
+        assert_eq!(
+            style.font_families,
+            theme.mono_text_style(style.color).font_families
+        );
     }
 
     #[test]
@@ -18393,10 +18194,11 @@ mod tests {
         let body = theme.body_text_style();
         let placeholder = theme.placeholder_text_style();
 
-        assert_eq!(body.font_size, theme.text.base.size);
-        assert_eq!(body.line_height, theme.text.base.line_height);
-        assert_eq!(placeholder.font_size, theme.text.base.size);
-        assert_eq!(placeholder.line_height, theme.text.base.line_height);
+        assert_eq!(theme.control_size, Some(ControlSize::Small));
+        assert_eq!(body.font_size, theme.text.sm.size);
+        assert_eq!(body.line_height, theme.text.sm.line_height);
+        assert_eq!(placeholder.font_size, theme.text.sm.size);
+        assert_eq!(placeholder.line_height, theme.text.sm.line_height);
     }
 
     #[test]
@@ -19853,11 +19655,11 @@ mod tests {
             "empty chats use the larger empty-state actions instead of duplicating compact composer presets"
         );
 
-        window
+        let check_cluster = window
             .get_by_role(SemanticsRole::Button)
             .with_name("Check cluster")
-            .with_description("Use background agent to inspect cluster status")
-            .click()?;
+            .with_description("Use background agent to inspect cluster status");
+        check_cluster.click()?;
 
         let chat = shared.chat();
         let check_cluster_prompt = ChatQuickAction::CheckCluster
@@ -19876,6 +19678,20 @@ mod tests {
         let revision_after_quick_action = chat.draft_revision;
         drop(chat);
 
+        check_cluster.press("Enter")?;
+        let revision_after_enter = shared.chat().draft_revision;
+        assert!(
+            revision_after_enter > revision_after_quick_action,
+            "the stock quick-action button should activate from Enter while focused"
+        );
+
+        check_cluster.press(" ")?;
+        let revision_after_space = shared.chat().draft_revision;
+        assert!(
+            revision_after_space > revision_after_enter,
+            "the stock quick-action button should activate from Space while focused"
+        );
+
         // The Mesh composer keeps Send as its one action; clearing is a
         // state-level affordance and must still ride the programmatic
         // composer refresh path.
@@ -19888,7 +19704,7 @@ mod tests {
         );
         assert_eq!(chat.cursor, 0, "clear draft should reset the cursor");
         assert!(
-            chat.draft_revision > revision_after_quick_action,
+            chat.draft_revision > revision_after_space,
             "clear draft should trigger the programmatic composer refresh path"
         );
 
@@ -22921,7 +22737,11 @@ mod tests {
                 node.role == SemanticsRole::Image && node.name.as_deref() == Some("Camera preview")
             })
             .expect("camera preview semantics");
-        assert!(preview.bounds.height() >= 80.0);
+        assert!(
+            preview.bounds.height() >= 80.0,
+            "camera preview should remain useful at narrow widths: {:?}",
+            preview.bounds
+        );
         assert!((1.6..=2.0).contains(&(preview.bounds.width() / preview.bounds.height())));
 
         let named = |name: &str| {
@@ -24571,10 +24391,7 @@ mod tests {
         state.activity.clear();
         state.notice = None;
 
-        assert_eq!(
-            context_overview_summary(&state),
-            "Context waits for provider setup"
-        );
+        assert_eq!(context_overview_summary(&state), "Provider setup needed");
 
         seed_default_provider(&mut state);
         state.info.provider = "openai".to_string();
@@ -24587,7 +24404,7 @@ mod tests {
 
         assert_eq!(
             context_overview_summary(&state),
-            "Context waits for cluster connection"
+            "Cluster connection needed"
         );
     }
 

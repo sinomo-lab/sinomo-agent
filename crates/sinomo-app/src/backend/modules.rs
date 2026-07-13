@@ -11,8 +11,10 @@ use sinomo_runtime::config::{
 };
 use sinomo_runtime::module::{
     MODULE_CLUSTER_CONFIG_KEY, MODULE_NODE_CONFIG_KEY, ModuleRuntimeConfig,
-    ModuleRuntimeConfigEntry, read_native_dylib_module_cache_entries_excluding_cache_keys,
+    ModuleRuntimeConfigEntry, ModuleRuntimeConfigSource, read_declarative_module_loader_states,
+    read_native_dylib_module_cache_entries_excluding_cache_keys,
     read_native_dylib_module_loader_states, read_native_rust_module_runtime_states,
+    resolve_module_runtime_config,
 };
 use sinomo_runtime::network::{ClusterPaths, ObjectRpcRequest};
 use sinomo_runtime::node::NodeId;
@@ -51,6 +53,20 @@ pub struct ModuleConfigModuleSummary {
     pub label: String,
     pub backend: String,
     pub detail: String,
+    pub desired_enabled: Option<bool>,
+    pub effective_enabled: bool,
+    pub effective_source: ModuleRuntimeConfigSource,
+    pub observed: ModuleObservedState,
+    pub observed_detail: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModuleObservedState {
+    Running,
+    Stopped,
+    Installed,
+    NotReported,
+    Unavailable,
 }
 
 impl Backend {
@@ -192,6 +208,7 @@ impl Backend {
         selected_node: Option<&ModuleConfigNode>,
     ) -> Vec<ModuleConfigModuleSummary> {
         let mut modules = BTreeMap::<String, ModuleConfigModuleSummary>::new();
+        let mut observations = BTreeMap::<String, (ModuleObservedState, String)>::new();
         for module_id in cluster_config.module_ids() {
             insert_module_summary(
                 &mut modules,
@@ -214,6 +231,13 @@ impl Backend {
             let mut active_cache_keys = BTreeSet::new();
             for state in states {
                 active_cache_keys.insert(state.cache_key.clone());
+                observations.insert(
+                    state.module_id.to_string(),
+                    (
+                        ModuleObservedState::Running,
+                        format!("Active native library · {}", state.interface_version),
+                    ),
+                );
                 insert_module_summary(
                     &mut modules,
                     &state.module_id.to_string(),
@@ -226,6 +250,14 @@ impl Backend {
                 &active_cache_keys,
             ) {
                 for entry in entries {
+                    observations
+                        .entry(entry.module_id.to_string())
+                        .or_insert_with(|| {
+                            (
+                                ModuleObservedState::Installed,
+                                format!("Installed but not active · {}", entry.interface_version),
+                            )
+                        });
                     insert_module_summary(
                         &mut modules,
                         &entry.module_id.to_string(),
@@ -237,6 +269,17 @@ impl Backend {
         }
         if let Ok(states) = read_native_rust_module_runtime_states(&self.data_dir.root()) {
             for state in states {
+                observations.insert(
+                    state.module_id.to_string(),
+                    (
+                        if state.enabled {
+                            ModuleObservedState::Running
+                        } else {
+                            ModuleObservedState::Stopped
+                        },
+                        format!("{} · {}", state.reason, state.updated_at),
+                    ),
+                );
                 insert_module_summary(
                     &mut modules,
                     &state.module_id.to_string(),
@@ -246,6 +289,30 @@ impl Backend {
                     } else {
                         "Disabled native Rust module"
                     },
+                );
+            }
+        }
+        if let Ok(states) = read_declarative_module_loader_states(&self.data_dir.root()) {
+            for state in states {
+                observations.insert(
+                    state.module_id.to_string(),
+                    (
+                        if state.active {
+                            ModuleObservedState::Running
+                        } else {
+                            ModuleObservedState::Stopped
+                        },
+                        format!(
+                            "Declarative package {} · {}",
+                            state.version, state.installed_at
+                        ),
+                    ),
+                );
+                insert_module_summary(
+                    &mut modules,
+                    &state.module_id.to_string(),
+                    "declarative",
+                    format!("Declarative package · {}", state.version),
                 );
             }
         }
@@ -261,6 +328,36 @@ impl Backend {
             "wasix",
             "WASIX sandbox runtime module",
         );
+
+        let selected_is_local = selected_node.is_some_and(|node| node.summary.local);
+        let empty_node_config = ModuleRuntimeConfig::default();
+        let node_config = selected_node
+            .map(|node| &node.config)
+            .unwrap_or(&empty_node_config);
+        for module in modules.values_mut() {
+            module.desired_enabled = cluster_config
+                .setting(&module.module_id)
+                .map(|setting| setting.enabled);
+            let effective =
+                resolve_module_runtime_config(node_config, cluster_config, &module.module_id);
+            module.effective_enabled = effective.enabled;
+            module.effective_source = effective.source;
+            if selected_is_local {
+                let (state, detail) = observations.remove(&module.module_id).unwrap_or((
+                    ModuleObservedState::NotReported,
+                    "The local loader has not published an observation".to_string(),
+                ));
+                module.observed = state;
+                module.observed_detail = detail;
+            } else {
+                module.observed = ModuleObservedState::Unavailable;
+                module.observed_detail = if selected_node.is_some() {
+                    "This node does not publish loader observations yet".to_string()
+                } else {
+                    "Select a node to inspect loader observations".to_string()
+                };
+            }
+        }
         modules.into_values().collect()
     }
 
@@ -346,6 +443,11 @@ fn insert_module_summary(
             label: module_label(module_id),
             backend: backend.into(),
             detail: detail.into(),
+            desired_enabled: None,
+            effective_enabled: false,
+            effective_source: ModuleRuntimeConfigSource::DisabledDefault,
+            observed: ModuleObservedState::Unavailable,
+            observed_detail: String::new(),
         });
 }
 
@@ -357,16 +459,110 @@ fn parse_node_id(node_id: &str) -> Result<NodeId, String> {
 }
 
 fn module_label(module_id: &str) -> String {
+    match module_id {
+        "module.observe" => return "Observability".to_string(),
+        "module.sandbox.wasix" => return "WASIX Sandbox".to_string(),
+        "module.dfs.cloud-files" => return "Cloud Files".to_string(),
+        "module.remote-management" => return "Remote Management".to_string(),
+        "module.network-iroh" => return "Iroh Networking".to_string(),
+        "module.benchmarks" => return "Benchmarks".to_string(),
+        "module.dfs" => return "Distributed Filesystem".to_string(),
+        "module.network" => return "Networking".to_string(),
+        "module.rollout" => return "Rollout".to_string(),
+        "module.evolution" => return "Evolution".to_string(),
+        _ => {}
+    }
     module_id
         .strip_prefix("module.")
         .unwrap_or(module_id)
-        .chars()
-        .map(|ch| {
-            if matches!(ch, '.' | '-' | '_') {
-                ' '
+        .split(|ch| matches!(ch, '.' | '-' | '_'))
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            if part.eq_ignore_ascii_case("wasix") {
+                "WASIX".to_string()
             } else {
-                ch
+                let mut chars = part.chars();
+                chars
+                    .next()
+                    .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                    .unwrap_or_default()
             }
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_labels_hide_opaque_runtime_ids() {
+        assert_eq!(module_label("module.sandbox.wasix"), "WASIX Sandbox");
+        assert_eq!(module_label("module.dfs.cloud-files"), "Cloud Files");
+        assert_eq!(module_label("module.custom-data_sync"), "Custom Data Sync");
+    }
+
+    #[test]
+    fn catalog_keeps_desired_effective_and_observed_state_separate() {
+        let backend = Backend::local_fallback();
+        let module_id = "module.test-lifecycle";
+        let mut cluster = ModuleRuntimeConfig::default();
+        cluster
+            .set(module_id, ModuleRuntimeConfigEntry::enabled(true))
+            .expect("cluster desired state");
+        let mut node_config = ModuleRuntimeConfig::default();
+        node_config
+            .set(module_id, ModuleRuntimeConfigEntry::enabled(false))
+            .expect("node override");
+        let node = ModuleConfigNode {
+            summary: ModuleConfigNodeSummary {
+                node_id: backend.node.node_id.to_string(),
+                display_name: "Local workstation".to_string(),
+                availability: "online".to_string(),
+                local: true,
+            },
+            config: node_config,
+            error: None,
+        };
+
+        let modules = backend.module_config_catalog(&cluster, Some(&node));
+        let module = modules
+            .iter()
+            .find(|module| module.module_id == module_id)
+            .expect("configured module");
+        assert_eq!(module.label, "Test Lifecycle");
+        assert_eq!(module.desired_enabled, Some(true));
+        assert!(!module.effective_enabled);
+        assert_eq!(module.effective_source, ModuleRuntimeConfigSource::Node);
+        assert_eq!(module.observed, ModuleObservedState::NotReported);
+    }
+
+    #[test]
+    fn remote_observation_is_explicitly_unavailable() {
+        let backend = Backend::local_fallback();
+        let module_id = "module.remote-test";
+        let mut cluster = ModuleRuntimeConfig::default();
+        cluster
+            .set(module_id, ModuleRuntimeConfigEntry::enabled(true))
+            .expect("cluster desired state");
+        let node = ModuleConfigNode {
+            summary: ModuleConfigNodeSummary {
+                node_id: "remote-node".to_string(),
+                display_name: "Studio node".to_string(),
+                availability: "online".to_string(),
+                local: false,
+            },
+            config: ModuleRuntimeConfig::default(),
+            error: None,
+        };
+
+        let modules = backend.module_config_catalog(&cluster, Some(&node));
+        let module = modules
+            .iter()
+            .find(|module| module.module_id == module_id)
+            .expect("configured module");
+        assert_eq!(module.observed, ModuleObservedState::Unavailable);
+        assert!(module.observed_detail.contains("does not publish"));
+    }
 }

@@ -11,8 +11,8 @@
 //! each assembled from stock `FormSection` / `FormRow` / `TabBar` / `Switch` /
 //! `TextInput` / `Select` / `Button` / `ListView` / `ScrollView` widgets. State lives
 //! entirely in [`SettingsState`]; controls bind to it via reactive `*_when` readers and
-//! snapshot-seed-plus-`on_change` writeback. The async provider device-login status is
-//! the one bespoke region — a live-reading [`StatusReflector`] widget.
+//! snapshot-seed-plus-`on_change` writeback. Async provider device-login status is
+//! rebuilt as ordinary `Label` / `Link` composition when its typed state changes.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -29,12 +29,12 @@ use sinomo_cli::app_api::{
     AgentSummary, ProviderSummary, SkillDetail, SkillMutationResult, SkillSummary, agent_summaries,
 };
 use sui::{
-    Alignment, ArrangeCtx, Constraints, DefaultTheme, Event, EventCtx, FieldGroup, FontWeight,
-    FormRow, FormSection, IconGlyph, Label, ListItem, ListView, MeasureCtx, PaintCtx,
-    PointerEventKind, ProgressBar, Rect, ScrollState, ScrollView, Select, SemanticTone,
-    SemanticsCtx, Separator, Size, SizedBox, Spinner, Stack, StatusBadge, Switch, SwitchView,
-    TabBar, TextArea, TextInput, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    WindowEvent,
+    Alignment, ArrangeCtx, Constraints, ControlSize, DefaultTheme, Event, EventCtx, FieldGroup,
+    Flex, FlexItem, FlexWrap, FontWeight, FormRow, FormSection, IconGlyph, Label, ListItem,
+    ListView, MeasureCtx, PaintCtx, PointerEventKind, ProgressBar, Rect, ScrollState, ScrollView,
+    Select, SemanticTone, SemanticsCtx, Separator, Size, SizedBox, Spinner, Stack, StatusBadge,
+    Switch, SwitchView, TabBar, TextArea, TextInput, ThemeTextToken, Widget, WidgetPod,
+    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
 };
 
 use sinomo_runtime::config::{
@@ -44,8 +44,9 @@ use sinomo_runtime::local::SinomoDataDir;
 
 use crate::backend::Backend;
 use crate::backend::agents::{
-    AgentConfigSnapshot, AgentConfigSummary, agent_definition_is_editable, agent_role_label,
-    agent_source_label, built_in_agent_config_snapshot,
+    AgentConfigSnapshot, AgentConfigSummary, AgentReadiness, AgentValidationReport,
+    agent_definition_is_editable, agent_role_label, agent_source_label,
+    built_in_agent_config_snapshot,
 };
 use crate::backend::cluster::{AppClusterInvite, AppClusterStatus, ClusterSnapshot};
 use crate::backend::config::{
@@ -58,12 +59,12 @@ use crate::backend::config::{
     set_provider_reasoning_budget, set_provider_text_verbosity, set_provider_vendor_options,
     set_value, test_provider_connection, text_verbosity_index,
 };
-use crate::backend::modules::ModuleConfigSnapshot;
+use crate::backend::modules::{ModuleConfigSnapshot, ModuleObservedState};
 use crate::rendering::AppRenderMode;
 use crate::state::{Shared, Tab};
-use crate::theme::{AppThemeMode, Palette};
+use crate::theme::{AppTextScale, AppThemeMode, Palette};
 use crate::ui::widgets;
-use sinomo_runtime::module::{ModuleRuntimeConfigSource, resolve_module_runtime_config};
+use sinomo_runtime::module::ModuleRuntimeConfigSource;
 
 /// Budget for each SIFS-backed section (skills, stored agents) of the full settings
 /// snapshot; past this the section reports itself unavailable instead of wedging the
@@ -178,6 +179,9 @@ pub struct SettingsState {
     pub agent_action_error: Option<String>,
     pub agent_action_status: Option<String>,
     pub agent_delete_confirming: Option<String>,
+    pub agent_import_path: String,
+    pub agent_export_path: String,
+    pub agent_validation_report: Option<AgentValidationReport>,
     pub module_snapshot: ModuleConfigSnapshot,
     pub module_selected_node_id: Option<String>,
     pub module_action_error: Option<String>,
@@ -372,6 +376,19 @@ enum SettingsOperation {
     DeleteAgent {
         id: String,
     },
+    ImportAgent {
+        path: PathBuf,
+    },
+    ExportAgent {
+        id: String,
+        output: PathBuf,
+    },
+    ValidateAgent {
+        id: String,
+    },
+    TestAgent {
+        id: String,
+    },
     RefreshModules {
         selected_node_id: Option<String>,
     },
@@ -476,6 +493,10 @@ enum AgentOperationEffect {
     Refreshed,
     Saved(String),
     Deleted(String),
+    Imported(String),
+    Exported(PathBuf),
+    Validated(AgentValidationReport),
+    Tested(AgentValidationReport),
 }
 
 struct ModuleOperationSuccess {
@@ -855,6 +876,9 @@ impl SettingsState {
             agent_action_error: None,
             agent_action_status: None,
             agent_delete_confirming: None,
+            agent_import_path: String::new(),
+            agent_export_path: String::new(),
+            agent_validation_report: None,
             module_snapshot,
             module_selected_node_id,
             module_action_error: None,
@@ -950,6 +974,9 @@ impl SettingsState {
             agent_action_error: None,
             agent_action_status: None,
             agent_delete_confirming: None,
+            agent_import_path: String::new(),
+            agent_export_path: String::new(),
+            agent_validation_report: None,
             module_snapshot: ModuleConfigSnapshot::default(),
             module_selected_node_id: None,
             module_action_error: None,
@@ -1149,6 +1176,9 @@ impl SettingsState {
 
     fn mark_draft_changed(&mut self, domain: SettingsOperationDomain) {
         self.draft_generations.bump(domain);
+        if domain == SettingsOperationDomain::Agents {
+            self.agent_validation_report = None;
+        }
     }
 
     fn set_field_draft(&mut self, domain: SettingsOperationDomain, key: String, value: String) {
@@ -1285,6 +1315,22 @@ impl SettingsState {
             SettingsOperation::DeleteAgent { .. } => {
                 self.agent_action_error = None;
                 self.agent_action_status = Some("Deleting agent…".to_string());
+            }
+            SettingsOperation::ImportAgent { .. } => {
+                self.agent_action_error = None;
+                self.agent_action_status = Some("Importing agent package…".to_string());
+            }
+            SettingsOperation::ExportAgent { .. } => {
+                self.agent_action_error = None;
+                self.agent_action_status = Some("Exporting agent package…".to_string());
+            }
+            SettingsOperation::ValidateAgent { .. } => {
+                self.agent_action_error = None;
+                self.agent_action_status = Some("Validating agent…".to_string());
+            }
+            SettingsOperation::TestAgent { .. } => {
+                self.agent_action_error = None;
+                self.agent_action_status = Some("Testing agent readiness…".to_string());
             }
             SettingsOperation::RefreshModules { .. } => {
                 self.module_action_error = None;
@@ -1493,7 +1539,36 @@ impl SettingsState {
                         AgentOperationEffect::Saved(id) => Some(format!("Saved custom agent {id}")),
                         AgentOperationEffect::Deleted(id) => {
                             self.agent_delete_confirming = None;
+                            self.agent_validation_report = None;
                             Some(format!("Deleted custom agent {id}"))
+                        }
+                        AgentOperationEffect::Imported(id) => {
+                            self.agent_import_path.clear();
+                            self.agent_validation_report = None;
+                            Some(format!("Imported agent package {id}"))
+                        }
+                        AgentOperationEffect::Exported(path) => {
+                            Some(format!("Exported package to {}", path.display()))
+                        }
+                        AgentOperationEffect::Validated(report) => {
+                            let ready = report.is_ready();
+                            let summary = report.summary();
+                            self.agent_validation_report = Some(report);
+                            Some(if ready {
+                                format!("Validation passed · {summary}")
+                            } else {
+                                format!("Validation needs attention · {summary}")
+                            })
+                        }
+                        AgentOperationEffect::Tested(report) => {
+                            let ready = report.is_ready();
+                            let summary = report.summary();
+                            self.agent_validation_report = Some(report);
+                            Some(if ready {
+                                format!("Readiness test passed · {summary}")
+                            } else {
+                                format!("Readiness test needs attention · {summary}")
+                            })
                         }
                     };
                     effects.chat_agents = Some(success.chat_agents);
@@ -1712,6 +1787,18 @@ impl SettingsState {
         self.agent_action_error = None;
         self.agent_action_status = None;
         self.agent_delete_confirming = None;
+    }
+
+    fn set_agent_import_path(&mut self, value: String) {
+        self.agent_import_path = value;
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn set_agent_export_path(&mut self, value: String) {
+        self.agent_export_path = value;
+        self.agent_action_error = None;
+        self.agent_action_status = None;
     }
 
     fn duplicate_selected_agent(&mut self) {
@@ -2572,6 +2659,39 @@ fn execute_settings_operation(
                 AgentOperationEffect::Deleted(id),
             ))
         })()),
+        SettingsOperation::ImportAgent { path } => SettingsOperationPayload::Agents((|| {
+            let id = backend.import_agent_definition(&path)?;
+            Ok(agent_operation_success(
+                backend,
+                Some(&id),
+                AgentOperationEffect::Imported(id.clone()),
+            ))
+        })()),
+        SettingsOperation::ExportAgent { id, output } => SettingsOperationPayload::Agents((|| {
+            let path = backend.export_agent_definition(&id, &output)?;
+            Ok(agent_operation_success(
+                backend,
+                Some(&id),
+                AgentOperationEffect::Exported(path),
+            ))
+        })(
+        )),
+        SettingsOperation::ValidateAgent { id } => SettingsOperationPayload::Agents((|| {
+            let report = backend.validate_agent_definition(&id)?;
+            Ok(agent_operation_success(
+                backend,
+                Some(&id),
+                AgentOperationEffect::Validated(report),
+            ))
+        })()),
+        SettingsOperation::TestAgent { id } => SettingsOperationPayload::Agents((|| {
+            let report = backend.test_agent_definition(&id)?;
+            Ok(agent_operation_success(
+                backend,
+                Some(&id),
+                AgentOperationEffect::Tested(report),
+            ))
+        })()),
         SettingsOperation::RefreshModules { selected_node_id } => {
             SettingsOperationPayload::Modules(Ok(ModuleOperationSuccess {
                 snapshot: backend.module_config_snapshot(selected_node_id.as_deref()),
@@ -3106,7 +3226,10 @@ fn agent_sidebar_preview(snapshot: &AgentConfigSnapshot) -> String {
 }
 
 fn agent_summary_line(agent: &AgentConfigSummary) -> String {
-    let mut parts = vec![agent.role.clone(), agent.source.clone()];
+    let mut parts = vec![
+        agent.role.clone(),
+        format!("{} package {}", agent.source, agent.package_version),
+    ];
     if agent.tool_count == 1 {
         parts.push("1 tool".to_string());
     } else if agent.tool_count > 1 {
@@ -3131,7 +3254,12 @@ fn agent_list_item(agent: &AgentConfigSummary) -> ListItem {
     } else {
         agent.name.clone()
     };
-    ListItem::new(title).detail(agent_summary_line(agent))
+    ListItem::new(title)
+        .detail(agent_summary_line(agent))
+        .trailing(match agent.readiness {
+            AgentReadiness::Ready => "Ready",
+            AgentReadiness::NeedsAttention => "Review",
+        })
 }
 
 fn module_sidebar_preview(snapshot: &ModuleConfigSnapshot) -> String {
@@ -3239,7 +3367,11 @@ pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
     match section {
         SettingsSection::Appearance => {
             let app = shared.borrow();
-            format!("{} · {}", app.theme_mode.label(), app.render_mode.label())
+            format!(
+                "{} · {} text",
+                app.theme_mode.label(),
+                app.text_scale.label()
+            )
         }
         SettingsSection::Connection => {
             if connection_issue_count(shared) > 0 {
@@ -3295,59 +3427,53 @@ fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     move || reader()
 }
 
-fn secondary_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
-    let reader = Rc::clone(reader);
-    move || {
-        let mut theme = reader();
-        theme.palette.accent = theme.palette.control;
-        theme.palette.accent_hover = theme.palette.control_hover;
-        theme.palette.accent_pressed = theme.palette.control_active;
-        theme.palette.accent_border = theme.palette.border;
-        theme.palette.accent_border_hover = theme.palette.border_hover;
-        theme.palette.accent_border_focus = theme.palette.border_focus;
-        theme.palette.accent_text = theme.palette.text;
-        theme
-    }
-}
-
-fn danger_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
-    let reader = Rc::clone(reader);
-    move || {
-        let mut theme = reader();
-        let danger = theme.palette.danger;
-        let contrast = theme.palette.danger_text;
-        theme.palette.accent = danger;
-        theme.palette.accent_hover = theme.palette.danger_hover;
-        theme.palette.accent_pressed = theme.palette.danger_hover;
-        theme.palette.accent_border = danger;
-        theme.palette.accent_border_hover = theme.palette.danger_hover;
-        theme.palette.accent_border_focus = danger;
-        theme.palette.accent_text = contrast;
-        // The focus ring stays the shared Mesh focus color: one ring, everywhere.
-        theme
-    }
-}
-
-/// Resolve the app chrome palette for the current theme (used by the `Label` color readers and the
-/// `StatusReflector` so muted/accent text matches the bespoke chrome).
+/// Resolve the app chrome palette for the current theme.
 fn palette(shared: &Shared) -> Palette {
     Palette::from_theme(&shared.theme(), widgets::theme_is_dark(shared))
 }
 
 /// A muted `Label` whose color tracks the theme.
 fn muted_label(shared: &Shared, text: impl Into<String>) -> Label {
+    let token = shared.theme().text.base;
+    muted_label_with_token(shared, text, token)
+}
+
+fn settings_text_style(shared: &Shared, token: ThemeTextToken) -> sui::TextStyle {
+    sui::TextStyle {
+        font_size: token.size,
+        line_height: token.line_height,
+        ..shared.theme().body_text_style()
+    }
+}
+
+fn settings_label(shared: &Shared, text: impl Into<String>, token: ThemeTextToken) -> Label {
+    Label::new(text).style(settings_text_style(shared, token))
+}
+
+fn muted_label_with_token(
+    shared: &Shared,
+    text: impl Into<String>,
+    token: ThemeTextToken,
+) -> Label {
     let s = shared.clone();
-    Label::new(text).color_when(move || palette(&s).text_muted)
+    settings_label(shared, text, token).color_when(move || palette(&s).text_muted)
+}
+
+fn muted_meta_label(shared: &Shared, text: impl Into<String>) -> Label {
+    let token = shared.theme().text.sm;
+    muted_label_with_token(shared, text, token)
 }
 
 fn primary_label(shared: &Shared, text: impl Into<String>) -> Label {
     let s = shared.clone();
-    Label::new(text).color_when(move || palette(&s).text)
+    let token = shared.theme().text.base;
+    settings_label(shared, text, token).color_when(move || palette(&s).text)
 }
 
 fn positive_label(shared: &Shared, text: impl Into<String>) -> Label {
     let s = shared.clone();
-    Label::new(text).color_when(move || palette(&s).good)
+    let token = shared.theme().text.base;
+    settings_label(shared, text, token).color_when(move || palette(&s).good)
 }
 
 /// A read-only value row: `label` on the left, a muted value `Label` on the right.
@@ -3577,13 +3703,31 @@ fn copyable_text_row(
     label: &str,
     value: impl Into<String>,
 ) -> FormRow {
+    let value = value.into();
     let input = TextInput::new(name)
-        .value(value)
+        .value(value.clone())
         .read_only()
         .theme_when(clone_reader(reader));
-    FormRow::new(label, input)
-        .stacked()
+    let copy_value = value;
+    let copy = sui::Button::new("Copy")
+        .semantic_name(format!("Copy {label}"))
+        .description(format!("Copy the full {label} to the clipboard"))
+        .icon(IconGlyph::Restore)
         .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
+        .on_press_with_ctx(move |ctx| ctx.set_clipboard_text(&copy_value));
+    FormRow::new(
+        label,
+        Flex::horizontal()
+            .wrap(FlexWrap::Wrap)
+            .gap(8.0)
+            .align_items(Alignment::Center)
+            .with_item(input, FlexItem::fill().min_width(220.0))
+            .with_item(copy, FlexItem::new().no_shrink()),
+    )
+    .stacked()
+    .theme_when(clone_reader(reader))
 }
 
 /// A stacked read-only text area for longer generated values.
@@ -3593,15 +3737,36 @@ fn copyable_area_row(
     label: &str,
     value: impl Into<String>,
 ) -> FormRow {
+    let value = value.into();
     let area = SizedBox::new().height(72.0).with_child(
         TextArea::new(name)
-            .value(value)
+            .value(value.clone())
             .read_only()
             .theme_when(clone_reader(reader)),
     );
-    FormRow::new(label, area)
-        .stacked()
+    let copy_value = value;
+    let copy = sui::Button::new("Copy")
+        .semantic_name(format!("Copy {label}"))
+        .description(format!("Copy the full {label} to the clipboard"))
+        .icon(IconGlyph::Restore)
         .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
+        .on_press_with_ctx(move |ctx| ctx.set_clipboard_text(&copy_value));
+    FormRow::new(
+        label,
+        Stack::vertical()
+            .spacing(8.0)
+            .alignment(Alignment::Stretch)
+            .with_child(area)
+            .with_child(
+                Stack::horizontal()
+                    .alignment(Alignment::Start)
+                    .with_child(copy),
+            ),
+    )
+    .stacked()
+    .theme_when(clone_reader(reader))
 }
 
 /// A toggle row: `label` + a `Switch` seeded `on`, calling `on_toggle` when flipped.
@@ -3664,7 +3829,9 @@ where
         .on_change(on_change);
     let save = sui::Button::new("Save")
         .icon(sui::IconGlyph::Check)
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .enabled_when(move || !pending_when())
         .on_press(on_save);
     FormRow::new(
@@ -3797,6 +3964,13 @@ fn mode_to_index(mode: AppThemeMode) -> usize {
     }
 }
 
+fn text_scale_to_index(scale: AppTextScale) -> usize {
+    AppTextScale::ALL
+        .iter()
+        .position(|candidate| *candidate == scale)
+        .unwrap_or_default()
+}
+
 fn index_to_render_mode(i: usize) -> AppRenderMode {
     match i {
         1 => AppRenderMode::ForceSdr,
@@ -3833,7 +4007,10 @@ fn render_mode_hint(mode: AppRenderMode) -> &'static str {
 }
 
 fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let mode_index = mode_to_index(shared.borrow().theme_mode);
+    let (mode_index, text_scale) = {
+        let app = shared.borrow();
+        (mode_to_index(app.theme_mode), app.text_scale)
+    };
     let tab_bar = {
         let s = shared.clone();
         TabBar::new("theme")
@@ -3842,6 +4019,18 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
             .theme_when(clone_reader(reader))
             .on_change(move |i, _| {
                 s.set_theme_mode(index_to_mode(i));
+            })
+    };
+    let text_scale_select = {
+        let s = shared.clone();
+        Select::new("text-scale")
+            .options(AppTextScale::ALL.map(AppTextScale::label))
+            .selected(text_scale_to_index(text_scale))
+            .theme_when(clone_reader(reader))
+            .on_change(move |index, _| {
+                if let Some(scale) = AppTextScale::ALL.get(index).copied() {
+                    s.set_text_scale(scale);
+                }
             })
     };
     let render_select = {
@@ -3866,6 +4055,27 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
     );
     let theme_section = FormSection::new("Appearance", theme_body)
         .description("Choose the app theme used by every tab.")
+        .theme_when(clone_reader(reader));
+
+    let scale_body = FieldGroup::new()
+        .spacing(8.0)
+        .with_child(
+            FormRow::new("Text size", text_scale_select)
+                .inline()
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormRow::new(
+                "Preview",
+                muted_label(shared, format!("{} text", text_scale.label())),
+            )
+            .stacked()
+            .theme_when(clone_reader(reader)),
+        );
+    let scale_section = FormSection::new("Typography", scale_body)
+        .description(
+            "Text size changes typography without inflating interface controls or spacing.",
+        )
         .theme_when(clone_reader(reader));
 
     let current_render_mode = shared.render_mode();
@@ -3898,6 +4108,7 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
         .spacing(12.0)
         .alignment(Alignment::Stretch)
         .with_child(theme_section)
+        .with_child(scale_section)
         .with_child(render_section)
 }
 
@@ -3952,16 +4163,14 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
     let expanded = shared.settings().connection_detail_expanded(tab);
     let status = {
         let s = shared.clone();
-        Label::new("Needs attention")
-            .font_size(12.0)
+        settings_label(shared, "Needs attention", shared.theme().text.sm)
             .color_when(move || palette(&s).warn)
     };
-    let summary = muted_label(shared, connection_issue_summary(&issue)).font_size(12.0);
-    let recovery = muted_label(shared, connection_issue_recovery_hint(&issue)).font_size(12.0);
+    let summary = muted_meta_label(shared, connection_issue_summary(&issue));
+    let recovery = muted_meta_label(shared, connection_issue_recovery_hint(&issue));
     let detail_label = {
         let s = shared.clone();
-        Label::new("Low-level detail")
-            .font_size(11.0)
+        settings_label(shared, "Low-level detail", shared.theme().text.sm)
             .color_when(move || palette(&s).text_faint)
     };
     let detail_field = {
@@ -4003,7 +4212,9 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
         } else {
             sui::IconGlyph::ChevronDown
         })
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press(move || s.settings_mut().toggle_connection_detail(tab))
     };
     let header = Stack::vertical()
@@ -4011,9 +4222,10 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
         .alignment(Alignment::Stretch)
         .with_child(status)
         .with_child(summary);
-    let mut controls = Stack::horizontal()
-        .spacing(8.0)
-        .alignment(Alignment::Start)
+    let mut controls = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(8.0)
+        .align_items(Alignment::Start)
         .with_child(button);
     if let Some(sifs_button) = sifs_button {
         controls = controls.with_child(sifs_button);
@@ -4085,7 +4297,9 @@ fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         } else {
             sui::IconGlyph::ChevronDown
         })
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press(move || s.settings_mut().toggle_node_detail())
     };
 
@@ -4255,7 +4469,9 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                 let s = shared.clone();
                 sui::Button::new("Confirm leave")
                     .icon(sui::IconGlyph::Trash)
-                    .theme_when(danger_button_theme(reader))
+                    .theme_when(clone_reader(reader))
+                    .appearance(sui::ButtonAppearance::Filled)
+                    .tone(SemanticTone::Danger)
                     .enabled_when({
                         let s = s.clone();
                         move || {
@@ -4275,7 +4491,9 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                 let s = shared.clone();
                 sui::Button::new("Cancel")
                     .icon(sui::IconGlyph::Close)
-                    .theme_when(secondary_button_theme(reader))
+                    .theme_when(clone_reader(reader))
+                    .appearance(sui::ButtonAppearance::Tonal)
+                    .tone(SemanticTone::Neutral)
                     .on_press(move || {
                         s.settings_mut().cancel_leave_cluster();
                     })
@@ -4288,9 +4506,10 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                     "This leaves the current cluster and starts a fresh single-node cluster on this device.",
                 ))
                 .with_child(
-                    Stack::horizontal()
-                        .spacing(8.0)
-                        .alignment(Alignment::Start)
+                    Flex::horizontal()
+                        .wrap(FlexWrap::Wrap)
+                        .gap(8.0)
+                        .align_items(Alignment::Start)
                         .with_child(confirm)
                         .with_child(cancel),
                 );
@@ -4304,7 +4523,9 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                 let s = shared.clone();
                 sui::Button::new("Leave cluster")
                     .icon(sui::IconGlyph::Trash)
-                    .theme_when(danger_button_theme(reader))
+                    .theme_when(clone_reader(reader))
+                    .appearance(sui::ButtonAppearance::Filled)
+                    .tone(SemanticTone::Danger)
                     .on_press(move || {
                         s.settings_mut().confirm_leave_cluster();
                     })
@@ -4385,13 +4606,12 @@ fn cluster_join_controls(shared: &Shared, reader: &ThemeReader, clustered: bool)
                 .to_string()
         };
         controls = controls
-            .with_child(muted_label(shared, impact).font_size(11.0))
+            .with_child(muted_meta_label(shared, impact))
             .with_child(
-                muted_label(
+                muted_meta_label(
                     shared,
                     "Recovery: if the target join fails, Sinomo restores the source cluster automatically. After an interrupted migration, restart the daemon and run `sinomo cluster status` before retrying.",
-                )
-                .font_size(11.0),
+                ),
             );
         let confirm = {
             let s = shared.clone();
@@ -4401,7 +4621,9 @@ fn cluster_join_controls(shared: &Shared, reader: &ThemeReader, clustered: bool)
                 "Confirm join"
             })
             .icon(sui::IconGlyph::Check)
-            .theme_when(danger_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Filled)
+            .tone(SemanticTone::Danger)
             .enabled_when({
                 let s = s.clone();
                 move || {
@@ -4427,13 +4649,16 @@ fn cluster_join_controls(shared: &Shared, reader: &ThemeReader, clustered: bool)
             let s = shared.clone();
             sui::Button::new("Cancel")
                 .icon(sui::IconGlyph::Close)
-                .theme_when(secondary_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
                 .on_press(move || s.settings_mut().cancel_join_cluster())
         };
         controls = controls.with_child(
-            Stack::horizontal()
-                .spacing(8.0)
-                .alignment(Alignment::Start)
+            Flex::horizontal()
+                .wrap(FlexWrap::Wrap)
+                .gap(8.0)
+                .align_items(Alignment::Start)
                 .with_child(confirm)
                 .with_child(cancel),
         );
@@ -4488,7 +4713,9 @@ fn cluster_dashboard_button(shared: &Shared, reader: &ThemeReader) -> impl Widge
     let s = shared.clone();
     sui::Button::new("Open Cluster dashboard")
         .icon(sui::IconGlyph::Storage)
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press(move || open_tab(&s, Tab::Cluster))
 }
 
@@ -4507,12 +4734,9 @@ fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             settings.version.clone(),
             settings.mode_label.clone(),
             short_one_line(&settings.status_detail, 96),
-            short(&settings.node_id, 38),
+            settings.node_id.clone(),
             app_surface_summary(&settings.role),
-            settings
-                .cluster_node_id
-                .as_deref()
-                .map(|node_id| short(node_id, 38)),
+            settings.cluster_node_id.clone(),
             settings
                 .cluster_summary
                 .clone()
@@ -4539,10 +4763,20 @@ fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .spacing(6.0)
         .with_child(value_row(shared, reader, "Mode", mode_label))
         .with_child(value_row(shared, reader, "Status", status_detail))
-        .with_child(value_row(shared, reader, "App surface", app_surface_id))
+        .with_child(copyable_text_row(
+            reader,
+            "about-app-surface-id",
+            "App surface ID",
+            app_surface_id,
+        ))
         .with_child(value_row(shared, reader, "Surface role", surface_role));
     if let Some(cluster_node_id) = cluster_node_id {
-        runtime = runtime.with_child(value_row(shared, reader, "Daemon node", cluster_node_id));
+        runtime = runtime.with_child(copyable_text_row(
+            reader,
+            "about-daemon-node-id",
+            "Daemon node ID",
+            cluster_node_id,
+        ));
     }
     runtime = runtime.with_child(value_row(shared, reader, "Cluster", cluster_summary));
     Stack::vertical()
@@ -4684,7 +4918,9 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         let ready_for_chat = form.enabled && form.signed_in;
         let button = sui::Button::new("Use for chat")
             .icon(sui::IconGlyph::Check)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .enabled(ready_for_chat)
             .on_press(move || {
                 queue_settings_operation(
@@ -4810,7 +5046,9 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         } else {
             sui::IconGlyph::ChevronDown
         })
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press(move || {
             s.settings_mut().toggle_provider_detail(&provider, &account);
         })
@@ -4818,9 +5056,10 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
     body = body.with_child(
         FormRow::new(
             "Actions",
-            Stack::horizontal()
-                .spacing(8.0)
-                .alignment(Alignment::Center)
+            Flex::horizontal()
+                .wrap(FlexWrap::Wrap)
+                .gap(8.0)
+                .align_items(Alignment::Center)
                 .with_child(test_control)
                 .with_child(detail_button),
         )
@@ -4856,7 +5095,7 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
             let auth = Stack::vertical()
                 .spacing(6.0)
                 .alignment(Alignment::Stretch)
-                .with_child(StatusReflector::new(shared.clone(), index, reader))
+                .with_child(status_reflector(shared, index, reader))
                 .with_child(button);
             body = body.with_child(
                 FormRow::new("Authentication detail", auth)
@@ -5457,7 +5696,9 @@ fn provider_management_row(
             let s = shared.clone();
             sui::Button::new("Cancel")
                 .icon(sui::IconGlyph::Close)
-                .theme_when(secondary_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
                 .on_press(move || s.settings_mut().cancel_provider_remove())
         };
         let remove = {
@@ -5466,7 +5707,9 @@ fn provider_management_row(
             let account = form.account.clone();
             sui::Button::new("Remove account")
                 .icon(sui::IconGlyph::Trash)
-                .theme_when(danger_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Filled)
+                .tone(SemanticTone::Danger)
                 .enabled_when({
                     let s = s.clone();
                     move || {
@@ -5499,10 +5742,12 @@ fn provider_management_row(
             ))
             .with_child(controls);
         if let Some(error) = action_error {
-            stack = stack.with_child(Label::new(error).font_size(11.0).color_when({
-                let s = shared.clone();
-                move || palette(&s).accent
-            }));
+            stack = stack.with_child(
+                settings_label(shared, error, shared.theme().text.sm).color_when({
+                    let s = shared.clone();
+                    move || palette(&s).accent
+                }),
+            );
         }
         FormRow::new("Management", stack)
             .stacked()
@@ -5512,7 +5757,9 @@ fn provider_management_row(
             let s = shared.clone();
             sui::Button::new("Remove account")
                 .icon(sui::IconGlyph::Trash)
-                .theme_when(danger_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Filled)
+                .tone(SemanticTone::Danger)
                 .on_press(move || s.settings_mut().confirm_provider_remove(index))
         };
         FormRow::new("Management", remove)
@@ -5605,7 +5852,9 @@ fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
             } else {
                 sui::IconGlyph::ChevronDown
             })
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press(move || s.settings_mut().toggle_provider_storage_detail())
         };
         let mut group = FieldGroup::new()
@@ -5789,7 +6038,9 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         let s = shared.clone();
         sui::Button::new("Cancel")
             .icon(sui::IconGlyph::ChevronLeft)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press(move || s.settings_mut().close_provider_add())
     };
     let add_label = if uses_device_login {
@@ -5826,9 +6077,10 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
                 queue_settings_operation(&s, SettingsOperationScope::Providers, operation);
             })
     };
-    let actions = Stack::horizontal()
-        .spacing(8.0)
-        .alignment(Alignment::Center)
+    let actions = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(8.0)
+        .align_items(Alignment::Center)
         .with_child(cancel)
         .with_child(add);
     body = body.with_child(
@@ -5866,26 +6118,18 @@ fn agents_section_key(shared: &Shared) -> String {
         .agent_snapshot
         .agents
         .iter()
-        .map(|agent| {
-            format!(
-                "{}:{}:{}:{}:{}:{}:{:?}",
-                agent.id,
-                agent.name,
-                agent.role,
-                agent.source,
-                agent.editable,
-                agent_summary_line(agent),
-                agent.sandbox_node_id
-            )
-        })
+        .map(|agent| format!("{agent:?}:{}", agent_summary_line(agent)))
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "selected:{:?};error:{:?};status:{:?};delete:{:?};form:{}\n{agents}",
+        "selected:{:?};error:{:?};status:{:?};delete:{:?};import:{};export:{};report:{:?};form:{}\n{agents}",
         settings.agent_selected_id,
         settings.agent_action_error,
         settings.agent_action_status,
         settings.agent_delete_confirming,
+        settings.agent_import_path,
+        settings.agent_export_path,
+        settings.agent_validation_report,
         agent_form_signature(&settings.agent_form)
     )
 }
@@ -5939,7 +6183,9 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         let s = shared.clone();
         sui::Button::new("Duplicate")
             .icon(sui::IconGlyph::Restore)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .enabled_when({
                 let s = s.clone();
                 move || s.settings().agent_snapshot.selected_agent.is_some()
@@ -5950,7 +6196,9 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         let s = shared.clone();
         sui::Button::new("Refresh")
             .icon(sui::IconGlyph::Redo)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press(move || {
                 let selected_id = s.settings().agent_selected_id.clone();
                 queue_settings_operation(
@@ -5983,9 +6231,10 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         .with_child(
             FormRow::new(
                 "Actions",
-                Stack::horizontal()
-                    .spacing(8.0)
-                    .alignment(Alignment::Start)
+                Flex::horizontal()
+                    .wrap(FlexWrap::Wrap)
+                    .gap(8.0)
+                    .align_items(Alignment::Start)
                     .with_child(new_agent)
                     .with_child(duplicate)
                     .with_child(refresh),
@@ -6008,10 +6257,11 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         .with_child(
             FormSection::new("Agents", summary_body)
                 .description(
-                    "Create local custom agents and inspect agents supplied by the runtime.",
+                    "Create, inspect, validate, and move agent packages without leaving Settings.",
                 )
                 .theme_when(clone_reader(reader)),
-        );
+        )
+        .with_child(agent_package_management_section(shared, reader));
 
     let editing_unsaved = shared.settings().agent_form.previous_id.is_none();
     let selected = shared.settings().agent_snapshot.selected_agent.clone();
@@ -6022,7 +6272,176 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
     } else if let Some(definition) = selected {
         stack = stack.with_child(agent_readonly_section(shared, reader, definition));
     }
+    if let Some(report) = shared.settings().agent_validation_report.clone() {
+        stack = stack.with_child(agent_validation_report_section(shared, reader, report));
+    }
     stack
+}
+
+fn agent_package_management_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let (import_path, export_path) = {
+        let settings = shared.settings();
+        (
+            settings.agent_import_path.clone(),
+            settings.agent_export_path.clone(),
+        )
+    };
+    let import_input = {
+        let s = shared.clone();
+        TextInput::new("agent-import-path")
+            .value(import_path)
+            .placeholder("Path to an agent JSON package")
+            .theme_when(clone_reader(reader))
+            .on_change(move |value| s.settings_mut().set_agent_import_path(value))
+    };
+    let import_button = {
+        let s = shared.clone();
+        sui::Button::new("Import package")
+            .icon(IconGlyph::Download)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || {
+                    !s.settings().agent_import_path.trim().is_empty()
+                        && !s.settings().domain_pending(SettingsOperationDomain::Agents)
+                }
+            })
+            .on_press(move || {
+                let path = s.settings().agent_import_path.trim().to_string();
+                if !path.is_empty() {
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::Agents,
+                        SettingsOperation::ImportAgent {
+                            path: PathBuf::from(path),
+                        },
+                    );
+                }
+            })
+    };
+    let export_input = {
+        let s = shared.clone();
+        TextInput::new("agent-export-path")
+            .value(export_path)
+            .placeholder("Output file or directory")
+            .theme_when(clone_reader(reader))
+            .on_change(move |value| s.settings_mut().set_agent_export_path(value))
+    };
+    let export_button = {
+        let s = shared.clone();
+        sui::Button::new("Export selected")
+            .icon(IconGlyph::Storage)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .enabled_when({
+                let s = s.clone();
+                move || {
+                    s.settings().agent_selected_id.is_some()
+                        && !s.settings().agent_export_path.trim().is_empty()
+                        && !s.settings().domain_pending(SettingsOperationDomain::Agents)
+                }
+            })
+            .on_press(move || {
+                let settings = s.settings();
+                let request = settings.agent_selected_id.clone().zip(
+                    (!settings.agent_export_path.trim().is_empty())
+                        .then(|| PathBuf::from(settings.agent_export_path.trim())),
+                );
+                drop(settings);
+                if let Some((id, output)) = request {
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::Agents,
+                        SettingsOperation::ExportAgent { id, output },
+                    );
+                }
+            })
+    };
+    let validate = agent_lifecycle_action_button(shared, reader, false);
+    let test = agent_lifecycle_action_button(shared, reader, true);
+
+    let body = FieldGroup::new()
+        .spacing(8.0)
+        .with_child(
+            FormRow::new(
+                "Import",
+                Stack::vertical()
+                    .spacing(8.0)
+                    .alignment(Alignment::Stretch)
+                    .with_child(import_input)
+                    .with_child(
+                        Stack::horizontal()
+                            .alignment(Alignment::Start)
+                            .with_child(import_button),
+                    ),
+            )
+            .stacked()
+            .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormRow::new(
+                "Export",
+                Stack::vertical()
+                    .spacing(8.0)
+                    .alignment(Alignment::Stretch)
+                    .with_child(export_input)
+                    .with_child(
+                        Stack::horizontal()
+                            .alignment(Alignment::Start)
+                            .with_child(export_button),
+                    ),
+            )
+            .stacked()
+            .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormRow::new(
+                "Checks",
+                Flex::horizontal()
+                    .wrap(FlexWrap::Wrap)
+                    .gap(8.0)
+                    .align_items(Alignment::Start)
+                    .with_child(validate)
+                    .with_child(test),
+            )
+            .inline()
+            .theme_when(clone_reader(reader)),
+        );
+    FormSection::new("Package management", body)
+        .description("Validation checks package structure. Test also verifies configured dependencies without making a model request.")
+        .theme_when(clone_reader(reader))
+}
+
+fn agent_lifecycle_action_button(shared: &Shared, reader: &ThemeReader, test: bool) -> sui::Button {
+    let s = shared.clone();
+    let label = if test { "Test readiness" } else { "Validate" };
+    sui::Button::new(label)
+        .icon(if test {
+            IconGlyph::Redo
+        } else {
+            IconGlyph::Check
+        })
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
+        .enabled_when({
+            let s = s.clone();
+            move || {
+                s.settings().agent_selected_id.is_some()
+                    && !s.settings().domain_pending(SettingsOperationDomain::Agents)
+            }
+        })
+        .on_press(move || {
+            if let Some(id) = s.settings().agent_selected_id.clone() {
+                let operation = if test {
+                    SettingsOperation::TestAgent { id }
+                } else {
+                    SettingsOperation::ValidateAgent { id }
+                };
+                queue_settings_operation(&s, SettingsOperationScope::Agents, operation);
+            }
+        })
 }
 
 fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -6212,6 +6631,17 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             |settings, value| settings.set_agent_deny_tools_text(value),
         ));
 
+    if let Some(summary) = selected_agent_config_summary(shared) {
+        body = body
+            .with_child(agent_readiness_row(shared, reader, summary.readiness))
+            .with_child(value_row(
+                shared,
+                reader,
+                "Package",
+                format!("{} · version {}", summary.source, summary.package_version),
+            ))
+            .with_child(value_row(shared, reader, "Provenance", summary.provenance));
+    }
     body = body.with_child(agent_actions_row(shared, reader));
     let title = if form.previous_id.is_some() {
         format!("Edit {}", short_one_line(&form.id, 48))
@@ -6247,15 +6677,18 @@ fn agent_actions_row(shared: &Shared, reader: &ThemeReader) -> FormRow {
         let s = shared.clone();
         sui::Button::new("Duplicate")
             .icon(sui::IconGlyph::Restore)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press(move || s.settings_mut().duplicate_selected_agent())
     };
     let delete_controls = agent_delete_controls(shared, reader);
     FormRow::new(
         "Actions",
-        Stack::horizontal()
-            .spacing(8.0)
-            .alignment(Alignment::Start)
+        Flex::horizontal()
+            .wrap(FlexWrap::Wrap)
+            .gap(8.0)
+            .align_items(Alignment::Start)
             .with_child(save)
             .with_child(duplicate)
             .with_child(delete_controls),
@@ -6278,7 +6711,9 @@ fn agent_delete_controls(shared: &Shared, reader: &ThemeReader) -> impl Widget +
             let s = shared.clone();
             sui::Button::new("Confirm delete")
                 .icon(sui::IconGlyph::Trash)
-                .theme_when(danger_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Filled)
+                .tone(SemanticTone::Danger)
                 .enabled_when({
                     let s = s.clone();
                     move || !s.settings().domain_pending(SettingsOperationDomain::Agents)
@@ -6301,23 +6736,29 @@ fn agent_delete_controls(shared: &Shared, reader: &ThemeReader) -> impl Widget +
             let s = shared.clone();
             sui::Button::new("Cancel")
                 .icon(sui::IconGlyph::Close)
-                .theme_when(secondary_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
                 .on_press(move || s.settings_mut().cancel_agent_delete())
         };
-        return Stack::horizontal()
-            .spacing(8.0)
-            .alignment(Alignment::Start)
+        return Flex::horizontal()
+            .wrap(FlexWrap::Wrap)
+            .gap(8.0)
+            .align_items(Alignment::Start)
             .with_child(confirm)
             .with_child(cancel);
     }
     let s = shared.clone();
-    Stack::horizontal()
-        .spacing(8.0)
-        .alignment(Alignment::Start)
+    Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(8.0)
+        .align_items(Alignment::Start)
         .with_child(
             sui::Button::new("Delete agent")
                 .icon(sui::IconGlyph::Trash)
-                .theme_when(danger_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Filled)
+                .tone(SemanticTone::Danger)
                 .enabled_when(move || previous_id.is_some())
                 .on_press(move || s.settings_mut().confirm_agent_delete()),
         )
@@ -6337,12 +6778,38 @@ fn agent_readonly_section(
     };
     let mut body = FieldGroup::new()
         .spacing(8.0)
-        .with_child(value_row(shared, reader, "Agent ID", definition.key()))
+        .with_child(agent_readiness_row(
+            shared,
+            reader,
+            selected_agent_config_summary(shared)
+                .map(|summary| summary.readiness)
+                .unwrap_or(AgentReadiness::NeedsAttention),
+        ))
+        .with_child(copyable_text_row(
+            reader,
+            "agent-readonly-id",
+            "Agent ID",
+            definition.key(),
+        ))
+        .with_child(value_row(
+            shared,
+            reader,
+            "Package version",
+            definition.package.version.clone(),
+        ))
         .with_child(value_row(
             shared,
             reader,
             "Source",
             agent_source_label(&definition.package.provenance.source),
+        ))
+        .with_child(value_row(
+            shared,
+            reader,
+            "Provenance",
+            selected_agent_config_summary(shared)
+                .map(|summary| summary.provenance)
+                .unwrap_or_else(|| "Package provenance unavailable".to_string()),
         ))
         .with_child(value_row(
             shared,
@@ -6388,6 +6855,118 @@ fn agent_readonly_section(
     }
     FormSection::new(definition.name.clone(), body)
         .description("This agent is supplied by the runtime. Duplicate it to create an editable custom agent.")
+        .theme_when(clone_reader(reader))
+}
+
+fn selected_agent_config_summary(shared: &Shared) -> Option<AgentConfigSummary> {
+    let settings = shared.settings();
+    let id = settings.agent_selected_id.as_deref()?;
+    settings
+        .agent_snapshot
+        .agents
+        .iter()
+        .find(|agent| agent.id == id)
+        .cloned()
+}
+
+fn agent_readiness_row(
+    shared: &Shared,
+    reader: &ThemeReader,
+    readiness: AgentReadiness,
+) -> FormRow {
+    let (label, detail, tone, icon) = match readiness {
+        AgentReadiness::Ready => (
+            "Ready",
+            "The package passes its structural validation.",
+            SemanticTone::Success,
+            IconGlyph::Check,
+        ),
+        AgentReadiness::NeedsAttention => (
+            "Needs attention",
+            "Run validation to review package problems.",
+            SemanticTone::Warning,
+            IconGlyph::Alert,
+        ),
+    };
+    FormRow::new(
+        "Readiness",
+        Stack::vertical()
+            .spacing(4.0)
+            .alignment(Alignment::Start)
+            .with_child(
+                Stack::horizontal().with_child(
+                    StatusBadge::new(label)
+                        .tone(tone)
+                        .icon(icon)
+                        .theme_when(clone_reader(reader)),
+                ),
+            )
+            .with_child(muted_label(shared, detail)),
+    )
+    .stacked()
+    .theme_when(clone_reader(reader))
+}
+
+fn agent_validation_report_section(
+    shared: &Shared,
+    reader: &ThemeReader,
+    report: AgentValidationReport,
+) -> impl Widget + use<> {
+    let ready = report.is_ready();
+    let title = format!("Validation report · {}", report.agent_id);
+    let summary = report.summary();
+    let mut body = FieldGroup::new().spacing(8.0).with_child(
+        FormRow::new(
+            "Result",
+            Stack::horizontal().with_child(
+                StatusBadge::new(if ready { "Ready" } else { "Needs attention" })
+                    .icon(if ready {
+                        IconGlyph::Check
+                    } else {
+                        IconGlyph::Alert
+                    })
+                    .tone(if ready {
+                        SemanticTone::Success
+                    } else {
+                        SemanticTone::Warning
+                    })
+                    .theme_when(clone_reader(reader)),
+            ),
+        )
+        .inline()
+        .theme_when(clone_reader(reader)),
+    );
+    for check in report.checks {
+        body = body.with_child(
+            FormRow::new(
+                check.name,
+                Stack::vertical()
+                    .spacing(4.0)
+                    .alignment(Alignment::Start)
+                    .with_child(
+                        Stack::horizontal().with_child(
+                            StatusBadge::new(if check.passed { "Passed" } else { "Review" })
+                                .icon(if check.passed {
+                                    IconGlyph::Check
+                                } else {
+                                    IconGlyph::Alert
+                                })
+                                .tone(if check.passed {
+                                    SemanticTone::Success
+                                } else {
+                                    SemanticTone::Warning
+                                })
+                                .theme_when(clone_reader(reader)),
+                        ),
+                    )
+                    .with_child(muted_label(shared, check.detail)),
+            )
+            .stacked()
+            .theme_when(clone_reader(reader)),
+        );
+    }
+    FormSection::new(title, body)
+        .description(summary)
         .theme_when(clone_reader(reader))
 }
 
@@ -6549,8 +7128,16 @@ fn module_section_key(shared: &Shared) -> String {
         .iter()
         .map(|module| {
             format!(
-                "{}:{}:{}:{}",
-                module.module_id, module.label, module.backend, module.detail
+                "{}:{}:{}:{}:{:?}:{:?}:{}:{:?}:{}",
+                module.module_id,
+                module.label,
+                module.backend,
+                module.detail,
+                module.desired_enabled,
+                module.effective_source,
+                module.effective_enabled,
+                module.observed,
+                module.observed_detail
             )
         })
         .collect::<Vec<_>>()
@@ -6636,7 +7223,9 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         let s = shared.clone();
         sui::Button::new("Refresh")
             .icon(sui::IconGlyph::Redo)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press(move || {
                 let selected_node_id = s.settings().module_selected_node_id.clone();
                 queue_settings_operation(
@@ -6663,9 +7252,10 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         .with_child(
             FormRow::new(
                 "Actions",
-                Stack::horizontal()
-                    .spacing(8.0)
-                    .alignment(Alignment::Start)
+                Flex::horizontal()
+                    .wrap(FlexWrap::Wrap)
+                    .gap(8.0)
+                    .align_items(Alignment::Start)
                     .with_child(refresh),
             )
             .inline()
@@ -6733,29 +7323,16 @@ fn module_config_section(
     module: crate::backend::modules::ModuleConfigModuleSummary,
 ) -> impl Widget + use<> {
     let module_id = module.module_id.clone();
-    let (cluster_enabled, effective, selected_node_label) = {
+    let selected_node_label = {
         let settings = shared.settings();
-        let cluster_enabled = settings
-            .module_snapshot
-            .cluster_config
-            .setting(&module_id)
-            .map(|setting| setting.enabled)
-            .unwrap_or(false);
-        let effective = settings.module_snapshot.selected_node.as_ref().map(|node| {
-            resolve_module_runtime_config(
-                &node.config,
-                &settings.module_snapshot.cluster_config,
-                &module_id,
-            )
-        });
-        let selected_node_label = settings
+        settings
             .module_snapshot
             .selected_node
             .as_ref()
             .map(|node| node.summary.display_name.clone())
-            .unwrap_or_else(|| "No node selected".to_string());
-        (cluster_enabled, effective, selected_node_label)
+            .unwrap_or_else(|| "No node selected".to_string())
     };
+    let cluster_enabled = module.desired_enabled.unwrap_or(false);
 
     let cluster_switch = switch_row(reader, "Cluster default", cluster_enabled, {
         let s = shared.clone();
@@ -6822,13 +7399,74 @@ fn module_config_section(
         )
     };
 
-    let mut body = FieldGroup::new()
-        .spacing(8.0)
-        .with_child(value_row(
+    let desired = match module.desired_enabled {
+        Some(true) => module_lifecycle_value(
             shared,
             reader,
-            "Module ID",
-            module_display_id(&module.module_id),
+            "Enabled",
+            SemanticTone::Success,
+            "Cluster desired state",
+        ),
+        Some(false) => module_lifecycle_value(
+            shared,
+            reader,
+            "Disabled",
+            SemanticTone::Neutral,
+            "Cluster desired state",
+        ),
+        None => module_lifecycle_value(
+            shared,
+            reader,
+            "Not configured",
+            SemanticTone::Neutral,
+            "No cluster desired state is set",
+        ),
+    };
+    let effective = module_lifecycle_value(
+        shared,
+        reader,
+        if module.effective_enabled {
+            "Enabled"
+        } else {
+            "Disabled"
+        },
+        if module.effective_enabled {
+            SemanticTone::Success
+        } else {
+            SemanticTone::Neutral
+        },
+        module_effective_source_label(module.effective_source),
+    );
+    let observed = module_lifecycle_value(
+        shared,
+        reader,
+        module_observed_label(module.observed),
+        module_observed_tone(module.observed),
+        module.observed_detail.clone(),
+    );
+
+    let mut body = FieldGroup::new()
+        .spacing(8.0)
+        .with_child(
+            FormRow::new("Desired", desired)
+                .stacked()
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormRow::new(format!("Effective on {selected_node_label}"), effective)
+                .stacked()
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormRow::new(format!("Observed on {selected_node_label}"), observed)
+                .stacked()
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(copyable_text_row(
+            reader,
+            "module-technical-id",
+            "Technical ID",
+            module.module_id.clone(),
         ))
         .with_child(value_row(
             shared,
@@ -6837,15 +7475,23 @@ fn module_config_section(
             format!("{} · {}", module.backend, module.detail),
         ))
         .with_child(cluster_switch)
-        .with_child(node_override)
-        .with_child(value_row(
-            shared,
-            reader,
-            "Effective",
-            effective
-                .map(module_effective_label)
-                .unwrap_or(selected_node_label),
-        ));
+        .with_child(node_override);
+
+    if module_runtime_state_mismatch(&module) {
+        body = body.with_child(
+            FormRow::new(
+                "Reconciliation",
+                Stack::horizontal().with_child(
+                    StatusBadge::new("Pending reconciliation")
+                        .icon(IconGlyph::Alert)
+                        .tone(SemanticTone::Warning)
+                        .theme_when(clone_reader(reader)),
+                ),
+            )
+            .inline()
+            .theme_when(clone_reader(reader)),
+        );
+    }
 
     if let Some(node) = shared.settings().module_snapshot.selected_node.as_ref()
         && let Some(error) = node.error.as_ref()
@@ -6881,17 +7527,62 @@ fn module_cluster_summary(snapshot: &ModuleConfigSnapshot) -> String {
     }
 }
 
-fn module_effective_label(config: sinomo_runtime::module::ResolvedModuleRuntimeConfig) -> String {
-    let state = if config.enabled {
-        "Enabled"
-    } else {
-        "Disabled"
-    };
-    match config.source {
-        ModuleRuntimeConfigSource::Node => format!("{state} from node override"),
-        ModuleRuntimeConfigSource::Cluster => format!("{state} from cluster default"),
-        ModuleRuntimeConfigSource::DisabledDefault => "Disabled by default".to_string(),
+fn module_effective_source_label(source: ModuleRuntimeConfigSource) -> &'static str {
+    match source {
+        ModuleRuntimeConfigSource::Node => "Resolved from this node's override",
+        ModuleRuntimeConfigSource::Cluster => "Resolved from cluster desired state",
+        ModuleRuntimeConfigSource::DisabledDefault => "No desired state; disabled by default",
     }
+}
+
+fn module_observed_label(state: ModuleObservedState) -> &'static str {
+    match state {
+        ModuleObservedState::Running => "Running",
+        ModuleObservedState::Stopped => "Stopped",
+        ModuleObservedState::Installed => "Installed",
+        ModuleObservedState::NotReported => "Not reported",
+        ModuleObservedState::Unavailable => "Unavailable",
+    }
+}
+
+fn module_observed_tone(state: ModuleObservedState) -> SemanticTone {
+    match state {
+        ModuleObservedState::Running => SemanticTone::Success,
+        ModuleObservedState::Stopped => SemanticTone::Neutral,
+        ModuleObservedState::Installed => SemanticTone::Info,
+        ModuleObservedState::NotReported | ModuleObservedState::Unavailable => {
+            SemanticTone::Warning
+        }
+    }
+}
+
+fn module_lifecycle_value(
+    shared: &Shared,
+    reader: &ThemeReader,
+    label: impl Into<String>,
+    tone: SemanticTone,
+    detail: impl Into<String>,
+) -> Stack {
+    Stack::vertical()
+        .spacing(4.0)
+        .alignment(Alignment::Start)
+        .with_child(
+            Stack::horizontal().with_child(
+                StatusBadge::new(label)
+                    .tone(tone)
+                    .theme_when(clone_reader(reader)),
+            ),
+        )
+        .with_child(muted_label(shared, detail))
+}
+
+fn module_runtime_state_mismatch(
+    module: &crate::backend::modules::ModuleConfigModuleSummary,
+) -> bool {
+    matches!(
+        (module.effective_enabled, module.observed),
+        (true, ModuleObservedState::Stopped) | (false, ModuleObservedState::Running)
+    )
 }
 
 fn module_display_id(module_id: &str) -> String {
@@ -7001,7 +7692,9 @@ fn section_skills_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         let s = shared.clone();
         sui::Button::new("Refresh")
             .icon(sui::IconGlyph::Redo)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .enabled_when({
                 let s = s.clone();
                 move || !s.settings().domain_pending(SettingsOperationDomain::Skills)
@@ -7024,9 +7717,10 @@ fn section_skills_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
     summary_body = summary_body.with_child(
         FormRow::new(
             "Actions",
-            Stack::horizontal()
-                .spacing(8.0)
-                .alignment(Alignment::Start)
+            Flex::horizontal()
+                .wrap(FlexWrap::Wrap)
+                .gap(8.0)
+                .align_items(Alignment::Start)
                 .with_child(import)
                 .with_child(refresh),
         )
@@ -7245,7 +7939,9 @@ fn skill_detail_section(
         let s = shared.clone();
         sui::Button::new("Export skill")
             .icon(sui::IconGlyph::Download)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .enabled_when({
                 let s = s.clone();
                 move || !s.settings().domain_pending(SettingsOperationDomain::Skills)
@@ -7292,15 +7988,18 @@ fn skill_detail_section(
         } else {
             sui::IconGlyph::ChevronDown
         })
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press(move || s.settings_mut().toggle_skill_text())
     };
     body = body.with_child(
         FormRow::new(
             "Actions",
-            Stack::horizontal()
-                .spacing(8.0)
-                .alignment(Alignment::Start)
+            Flex::horizontal()
+                .wrap(FlexWrap::Wrap)
+                .gap(8.0)
+                .align_items(Alignment::Start)
                 .with_child(activate)
                 .with_child(export)
                 .with_child(text),
@@ -7413,15 +8112,13 @@ fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widge
     let summary = config_value_summary(&item);
     let summary_label = {
         let s = shared.clone();
-        Label::new(summary)
-            .font_size(12.0)
+        settings_label(shared, summary, shared.theme().text.sm)
             .color_when(move || palette(&s).text_muted)
     };
     let meta_label = {
         let s = shared.clone();
         let metadata = metadata.clone();
-        Label::new(metadata.clone())
-            .font_size(10.5)
+        settings_label(shared, metadata.clone(), shared.theme().text.xs)
             .text_when({
                 let s = s.clone();
                 let row_key = row_key.clone();
@@ -7465,7 +8162,9 @@ fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widge
             } else {
                 sui::IconGlyph::ChevronDown
             })
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press(move || s.settings_mut().toggle_advanced_detail(&key))
     };
     let mut details = Stack::vertical()
@@ -7474,7 +8173,7 @@ fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widge
         .with_child(summary_label)
         .with_child(meta_label);
     if !description.is_empty() {
-        details = details.with_child(muted_label(shared, description).font_size(11.0));
+        details = details.with_child(muted_meta_label(shared, description));
     }
     details = details.with_child(Stack::horizontal().with_child(disclosure));
     if expanded {
@@ -7523,7 +8222,7 @@ fn config_detail_editor(
     let mut stack = Stack::vertical()
         .spacing(5.0)
         .alignment(Alignment::Stretch)
-        .with_child(muted_label(shared, note).font_size(11.0))
+        .with_child(muted_meta_label(shared, note))
         .with_child(SizedBox::new().height(112.0).with_child(editor));
     if editable {
         let save = {
@@ -7531,7 +8230,9 @@ fn config_detail_editor(
             let scope = SettingsOperationScope::ConfigField(draft_key);
             sui::Button::new("Save raw value")
                 .icon(sui::IconGlyph::Check)
-                .theme_when(secondary_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
                 .enabled_when({
                     let s = s.clone();
                     let scope = scope.clone();
@@ -7557,7 +8258,7 @@ fn config_schema_editor(
 ) -> impl Widget + use<> {
     let mut stack = Stack::vertical().spacing(8.0).alignment(Alignment::Stretch);
     if !schema.description.trim().is_empty() {
-        stack = stack.with_child(muted_label(shared, schema.description.clone()).font_size(11.0));
+        stack = stack.with_child(muted_meta_label(shared, schema.description.clone()));
     }
     stack.with_child(PodHost::new(config_schema_value_editor(
         shared,
@@ -7688,10 +8389,12 @@ fn config_schema_map_editor(
     let mut summary_body = Stack::vertical()
         .spacing(4.0)
         .alignment(Alignment::Stretch)
-        .with_child(muted_label(shared, format!("{} entries", entries.len())).font_size(12.0));
+        .with_child(muted_meta_label(
+            shared,
+            format!("{} entries", entries.len()),
+        ));
     if !description.trim().is_empty() {
-        summary_body =
-            summary_body.with_child(muted_label(shared, description.to_string()).font_size(11.0));
+        summary_body = summary_body.with_child(muted_meta_label(shared, description.to_string()));
     }
     group = group.with_child(
         FormRow::new(label, summary_body)
@@ -7827,8 +8530,7 @@ fn config_schema_primitive_row(
                 .alignment(Alignment::Stretch)
                 .with_child(select);
             if !description.trim().is_empty() {
-                body =
-                    body.with_child(muted_label(shared, description.to_string()).font_size(11.0));
+                body = body.with_child(muted_meta_label(shared, description.to_string()));
             }
             WidgetPod::new(
                 FormRow::new(label, body)
@@ -7882,7 +8584,9 @@ fn config_schema_primitive_row(
                 let scope = error_key.clone().map(SettingsOperationScope::ConfigField);
                 sui::Button::new("Save")
                     .icon(sui::IconGlyph::Check)
-                    .theme_when(secondary_button_theme(reader))
+                    .theme_when(clone_reader(reader))
+                    .appearance(sui::ButtonAppearance::Tonal)
+                    .tone(SemanticTone::Neutral)
                     .enabled_when({
                         let s = s.clone();
                         let scope = scope.clone();
@@ -7921,7 +8625,7 @@ fn config_schema_primitive_row(
                 .and_then(|key| shared.settings().field_errors.get(&key).cloned())
                 .unwrap_or_else(|| schema_field_detail(schema, description));
             if !detail.trim().is_empty() {
-                body = body.with_child(muted_label(shared, detail).font_size(11.0));
+                body = body.with_child(muted_meta_label(shared, detail));
             }
             WidgetPod::new(
                 FormRow::new(label, body)
@@ -7994,7 +8698,9 @@ fn config_schema_json_row(
         let scope = error_key.clone().map(SettingsOperationScope::ConfigField);
         sui::Button::new("Save JSON")
             .icon(sui::IconGlyph::Check)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .enabled_when({
                 let s = s.clone();
                 let scope = scope.clone();
@@ -8030,7 +8736,7 @@ fn config_schema_json_row(
         .and_then(|key| shared.settings().field_errors.get(key).cloned())
         .unwrap_or_else(|| schema_field_detail(schema, description));
     if !detail.trim().is_empty() {
-        body = body.with_child(muted_label(shared, detail).font_size(11.0));
+        body = body.with_child(muted_meta_label(shared, detail));
     }
     WidgetPod::new(
         FormRow::new(label, body)
@@ -8491,17 +9197,10 @@ fn section_list_items(shared: &Shared, with_preview: bool) -> Vec<ListItem> {
 fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let heading = {
         let s = shared.clone();
+        let mut style = settings_text_style(shared, shared.theme().text.xs);
+        style.weight = FontWeight::SEMIBOLD;
         Label::new("SETTINGS")
-            .font_size(11.5)
-            .style({
-                let theme = shared.theme();
-                sui::TextStyle {
-                    font_size: 11.5,
-                    line_height: 18.0,
-                    weight: FontWeight::SEMIBOLD,
-                    ..theme.body_text_style()
-                }
-            })
+            .style(style)
             .color_when(move || palette(&s).text_faint)
     };
     let list = {
@@ -8777,86 +9476,91 @@ impl Widget for InsetX {
 }
 
 // ---------------------------------------------------------------------------
-// StatusReflector — live device-login status (custom widget)
+// Live device-login status — composed from stock SUI text/link widgets.
 // ---------------------------------------------------------------------------
 
-/// Renders the device-login status for a provider, live-reading
-/// `shared.settings().device_login` in `paint`. Diffs a status summary on each
-/// `RedrawRequested` to self-invalidate (safety net; the Shell wake handler already requests a
-/// paint on each device-login event). Mirrors the widget-book `WidgetBookSummary` pattern.
-struct StatusReflector {
-    shared: Shared,
-    index: usize,
-    link: WidgetPod,
-    last_seen: RefCell<Option<String>>,
+fn status_reflector(shared: &Shared, index: usize, reader: &ThemeReader) -> impl Widget + use<> {
+    let key_shared = shared.clone();
+    let build_shared = shared.clone();
+    let build_reader = Rc::clone(reader);
+    RebuildOnChange::new(
+        move || device_login_summary(&key_shared, index),
+        move |_| {
+            let theme = build_reader();
+            let pal = palette(&build_shared);
+            let (primary, prompt_url) = device_login_lines(&build_shared, index);
+            let is_error = device_login_is_error(&build_shared, index);
+            let primary_style = sui::TextStyle {
+                font_size: theme.text.sm.size,
+                line_height: theme.text.sm.line_height,
+                weight: FontWeight::MEDIUM,
+                color: if is_error { pal.danger_text } else { pal.text },
+                ..theme.body_text_style()
+            };
+            let mut body = Flex::vertical()
+                .align_items(Alignment::Start)
+                .with_child(sui::Label::new(primary).style(primary_style));
+            if let Some(url) = prompt_url {
+                let link_style = sui::TextStyle {
+                    font_size: theme.text.xs.size,
+                    line_height: theme.text.xs.line_height,
+                    ..theme.text_style(pal.accent_text)
+                };
+                body = body.with_child(
+                    sui::Link::new(url.clone(), url)
+                        .semantic_name("Open login page")
+                        .text_style(link_style)
+                        .theme_when(clone_reader(&build_reader))
+                        .on_open(open_provider_login_url),
+                );
+            }
+            WidgetPod::new(body)
+        },
+    )
 }
 
-impl StatusReflector {
-    fn new(shared: Shared, index: usize, reader: &ThemeReader) -> Self {
-        let label_shared = shared.clone();
-        let url_shared = shared.clone();
-        let link = sui::Link::new("", "")
-            .label_when(move || device_login_prompt_url(&label_shared, index).unwrap_or_default())
-            .url_when(move || device_login_prompt_url(&url_shared, index).unwrap_or_default())
-            .semantic_name("Open login page")
-            .theme_when(clone_reader(reader))
-            .on_open(open_provider_login_url);
-
-        Self {
-            shared,
-            index,
-            link: WidgetPod::new(link),
-            last_seen: RefCell::new(None),
-        }
+fn device_login_summary(shared: &Shared, index: usize) -> String {
+    let settings = shared.settings();
+    let Some(form) = settings.provider_forms.get(index) else {
+        return String::new();
+    };
+    match device_login_status_for(&settings, index) {
+        Some(DeviceLoginStatus::Starting) => "starting".to_string(),
+        Some(DeviceLoginStatus::Prompt {
+            verification_uri,
+            user_code,
+        }) => format!("prompt:{user_code}:{verification_uri}"),
+        Some(DeviceLoginStatus::Done) => "done".to_string(),
+        Some(DeviceLoginStatus::Failed(error)) => format!("failed:{error}"),
+        None if form.signed_in => "signed-in".to_string(),
+        None => "not-signed-in".to_string(),
     }
+}
 
-    /// A short, single-line summary used for change detection.
-    fn summary(&self) -> String {
-        let settings = self.shared.settings();
-        let Some(form) = settings.provider_forms.get(self.index) else {
-            return String::new();
-        };
-        match device_login_status_for(&settings, self.index) {
-            Some(DeviceLoginStatus::Starting) => "starting".to_string(),
-            Some(DeviceLoginStatus::Prompt {
-                verification_uri,
-                user_code,
-            }) => format!("prompt:{user_code}:{verification_uri}"),
-            Some(DeviceLoginStatus::Done) => "done".to_string(),
-            Some(DeviceLoginStatus::Failed(error)) => format!("failed:{error}"),
-            None => {
-                if form.signed_in {
-                    "signed-in".to_string()
-                } else {
-                    "not-signed-in".to_string()
-                }
-            }
-        }
+fn device_login_lines(shared: &Shared, index: usize) -> (String, Option<String>) {
+    let settings = shared.settings();
+    let Some(form) = settings.provider_forms.get(index) else {
+        return (String::new(), None);
+    };
+    match device_login_status_for(&settings, index) {
+        Some(DeviceLoginStatus::Starting) => ("Requesting code…".to_string(), None),
+        Some(DeviceLoginStatus::Prompt {
+            verification_uri,
+            user_code,
+        }) => (format!("Code {user_code}"), Some(verification_uri.clone())),
+        Some(DeviceLoginStatus::Done) => ("Signed in".to_string(), None),
+        Some(DeviceLoginStatus::Failed(error)) => (format!("Failed: {error}"), None),
+        None if form.signed_in => ("Signed in".to_string(), None),
+        None => ("Not signed in".to_string(), None),
     }
+}
 
-    /// The multi-line text to draw: (primary line, optional sub-line).
-    fn lines(&self) -> (String, Option<String>) {
-        let settings = self.shared.settings();
-        let Some(form) = settings.provider_forms.get(self.index) else {
-            return (String::new(), None);
-        };
-        match device_login_status_for(&settings, self.index) {
-            Some(DeviceLoginStatus::Starting) => ("Requesting code…".to_string(), None),
-            Some(DeviceLoginStatus::Prompt {
-                verification_uri,
-                user_code,
-            }) => (format!("Code {user_code}"), Some(verification_uri.clone())),
-            Some(DeviceLoginStatus::Done) => ("Signed in".to_string(), None),
-            Some(DeviceLoginStatus::Failed(error)) => (format!("Failed: {error}"), None),
-            None => {
-                if form.signed_in {
-                    ("Signed in".to_string(), None)
-                } else {
-                    ("Not signed in".to_string(), None)
-                }
-            }
-        }
-    }
+fn device_login_is_error(shared: &Shared, index: usize) -> bool {
+    let settings = shared.settings();
+    matches!(
+        device_login_status_for(&settings, index),
+        Some(DeviceLoginStatus::Failed(_))
+    )
 }
 
 fn device_login_status_for(settings: &SettingsState, index: usize) -> Option<&DeviceLoginStatus> {
@@ -8866,16 +9570,6 @@ fn device_login_status_for(settings: &SettingsState, index: usize) -> Option<&De
         .as_ref()
         .filter(|d| d.provider == form.provider && d.account == form.account)
         .map(|d| &d.status)
-}
-
-fn device_login_prompt_url(shared: &Shared, index: usize) -> Option<String> {
-    let settings = shared.settings();
-    match device_login_status_for(&settings, index)? {
-        DeviceLoginStatus::Prompt {
-            verification_uri, ..
-        } => Some(verification_uri.clone()),
-        _ => None,
-    }
 }
 
 fn open_provider_login_url(url: &str) {
@@ -8932,98 +9626,6 @@ fn open_url_with_system_browser(_url: &str) -> Result<(), String> {
     Err("opening URLs is not supported on this platform".to_string())
 }
 
-const STATUS_LINE_H: f32 = 18.0;
-
-impl Widget for StatusReflector {
-    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        if !matches!(event, Event::Window(WindowEvent::RedrawRequested)) {
-            return;
-        }
-        let summary = self.summary();
-        let mut last = self.last_seen.borrow_mut();
-        if last.as_deref() != Some(summary.as_str()) {
-            *last = Some(summary);
-            ctx.request_measure();
-            ctx.request_arrange();
-            ctx.request_paint();
-            ctx.request_semantics();
-        }
-    }
-
-    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let width = if constraints.max.width.is_finite() {
-            constraints.max.width
-        } else {
-            240.0
-        };
-        let link_size = self.link.measure(
-            ctx,
-            Constraints::new(Size::ZERO, Size::new(width, STATUS_LINE_H)),
-        );
-        let height = STATUS_LINE_H
-            + if link_size.height > 0.0 {
-                link_size.height
-            } else {
-                0.0
-            };
-        constraints.clamp(Size::new(width, height))
-    }
-
-    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        let link_height = self.link.measured_size().height;
-        self.link.arrange(
-            ctx,
-            Rect::new(
-                bounds.x(),
-                bounds.y() + STATUS_LINE_H,
-                bounds.width(),
-                link_height,
-            ),
-        );
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        let theme = self.shared.theme();
-        let pal = palette(&self.shared);
-        let bounds = ctx.bounds();
-        let (primary, _sub) = self.lines();
-
-        let primary_color = match self.lines_is_error() {
-            true => pal.danger_text,
-            false => pal.text,
-        };
-        let primary_style = pal.text_style(&theme, 12.0, FontWeight::MEDIUM, primary_color);
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(bounds.x(), bounds.y(), bounds.width(), STATUS_LINE_H),
-            &primary,
-            primary_style,
-        );
-        self.link.paint(ctx);
-    }
-
-    fn semantics(&self, ctx: &mut SemanticsCtx) {
-        self.link.semantics(ctx);
-    }
-
-    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
-        visitor.visit(&self.link);
-    }
-
-    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
-        visitor.visit(&mut self.link);
-    }
-}
-
-impl StatusReflector {
-    fn lines_is_error(&self) -> bool {
-        let settings = self.shared.settings();
-        device_login_status_for(&settings, self.index)
-            .map(|status| matches!(status, DeviceLoginStatus::Failed(_)))
-            .unwrap_or(false)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Responsive host
 // ---------------------------------------------------------------------------
@@ -9046,13 +9648,14 @@ pub struct SettingsView {
     /// The Connection attention card is built from app-layer Chat/Files health snapshots. Those can
     /// change after startup (Files is loaded lazily), so rebuild the composed pods when they do.
     last_connection_issue_key: RefCell<String>,
+    last_scale_key: Cell<AppTextScale>,
 }
 
 impl SettingsView {
     pub fn new(shared: Shared) -> Self {
         let theme_reader: ThemeReader = {
             let s = shared.clone();
-            Rc::new(move || s.theme())
+            Rc::new(move || settings_control_theme(&s))
         };
         // One shared scroll state so position is consistent across the wide/narrow swap.
         let scroll_state = ScrollState::new();
@@ -9060,6 +9663,7 @@ impl SettingsView {
         let narrow = narrow_pod(&shared, &theme_reader, &scroll_state);
         let last_selected = Cell::new(shared.settings().selected);
         let last_connection_issue_key = RefCell::new(connection_issue_key(&shared));
+        let last_scale_key = Cell::new(settings_scale_key(&shared));
         Self {
             shared,
             theme_reader,
@@ -9070,6 +9674,7 @@ impl SettingsView {
             use_wide: Cell::new(true),
             last_selected,
             last_connection_issue_key,
+            last_scale_key,
         }
     }
 
@@ -9086,6 +9691,16 @@ impl SettingsView {
         }
         *last = current;
         drop(last);
+        self.rebuild_pods();
+        true
+    }
+
+    fn sync_scale(&mut self) -> bool {
+        let current = settings_scale_key(&self.shared);
+        if current == self.last_scale_key.get() {
+            return false;
+        }
+        self.last_scale_key.set(current);
         self.rebuild_pods();
         true
     }
@@ -9131,7 +9746,12 @@ impl Widget for SettingsView {
             let operations_changed = pump_background_operations(&self.shared);
             let current = self.shared.settings().selected;
             let issues_changed = self.sync_connection_issues();
-            if current != self.last_selected.get() || issues_changed || operations_changed {
+            let scale_changed = self.sync_scale();
+            if current != self.last_selected.get()
+                || issues_changed
+                || scale_changed
+                || operations_changed
+            {
                 self.last_selected.set(current);
                 ctx.request_measure();
                 ctx.request_arrange();
@@ -9143,6 +9763,7 @@ impl Widget for SettingsView {
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
         self.sync_connection_issues();
+        self.sync_scale();
         let use_wide = constraints.max.width >= WIDE_THRESHOLD;
         self.use_wide.set(use_wide);
         // A measure pass lays out the currently-active child, so the navigation cache is now
@@ -9176,6 +9797,18 @@ impl Widget for SettingsView {
             visitor.visit(&mut self.narrow);
         }
     }
+}
+
+fn settings_scale_key(shared: &Shared) -> AppTextScale {
+    shared.borrow().text_scale
+}
+
+fn settings_control_theme(shared: &Shared) -> DefaultTheme {
+    let mut theme = shared.theme().with_size(ControlSize::Small);
+    theme.metrics.form_row_label_width = 132.0;
+    theme.metrics.form_row_control_width = 520.0;
+    theme.metrics.form_section_max_width = 860.0;
+    theme
 }
 
 fn short(s: &str, max: usize) -> String {
@@ -10028,6 +10661,78 @@ mod tests {
     }
 
     #[test]
+    fn agent_settings_state_imports_exports_and_reports_readiness() {
+        let backend = Backend::local_fallback();
+        let package_path = backend.data_dir.root().join("settings-agent.json");
+        let export_dir = backend.data_dir.root().join("agent-exports");
+        let definition = AgentDefinition::custom(
+            "settings-package-agent",
+            AgentRole::Background,
+            "Verify lifecycle actions.",
+        );
+        std::fs::write(
+            &package_path,
+            serde_json::to_vec_pretty(&definition).expect("serialize agent package"),
+        )
+        .expect("write agent package");
+        let mut state = SettingsState::new(&backend);
+        state.set_agent_import_path(package_path.display().to_string());
+
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::Agents,
+            SettingsOperation::ImportAgent { path: package_path },
+        );
+        assert_eq!(
+            state.agent_selected_id.as_deref(),
+            Some("settings-package-agent")
+        );
+        assert!(state.agent_import_path.is_empty());
+
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::Agents,
+            SettingsOperation::ValidateAgent {
+                id: "settings-package-agent".to_string(),
+            },
+        );
+        assert!(
+            state
+                .agent_validation_report
+                .as_ref()
+                .is_some_and(AgentValidationReport::is_ready)
+        );
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::Agents,
+            SettingsOperation::TestAgent {
+                id: "settings-package-agent".to_string(),
+            },
+        );
+        assert!(
+            state
+                .agent_validation_report
+                .as_ref()
+                .is_some_and(|report| report.checks.len() >= 5 && report.is_ready())
+        );
+
+        state.set_agent_export_path(export_dir.display().to_string());
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::Agents,
+            SettingsOperation::ExportAgent {
+                id: "settings-package-agent".to_string(),
+                output: export_dir.clone(),
+            },
+        );
+        assert!(export_dir.join("settings-package-agent.json").is_file());
+    }
+
+    #[test]
     fn settings_agents_section_renders_management_controls() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let mut definition =
@@ -10083,6 +10788,176 @@ mod tests {
             .with_name("Refresh")
             .expect()
             .to_be_visible()?;
+        window
+            .get_by_text("Package management")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Import package")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Export selected")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Validate")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Test readiness")
+            .expect()
+            .to_be_visible()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn settings_modules_section_names_and_separates_lifecycle_states() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            let settings = &mut app.ready.as_mut().expect("ready state").settings;
+            settings.open(SettingsSection::Modules);
+            let node_summary = crate::backend::modules::ModuleConfigNodeSummary {
+                node_id: "node-technical-id".to_string(),
+                display_name: "Studio node".to_string(),
+                availability: "online".to_string(),
+                local: true,
+            };
+            settings.module_selected_node_id = Some(node_summary.node_id.clone());
+            settings.module_snapshot = ModuleConfigSnapshot {
+                cluster_config: sinomo_runtime::module::ModuleRuntimeConfig::default(),
+                selected_node: Some(crate::backend::modules::ModuleConfigNode {
+                    summary: node_summary.clone(),
+                    config: sinomo_runtime::module::ModuleRuntimeConfig::default(),
+                    error: None,
+                }),
+                nodes: vec![node_summary],
+                modules: vec![crate::backend::modules::ModuleConfigModuleSummary {
+                    module_id: "module.sandbox.wasix".to_string(),
+                    label: "WASIX Sandbox".to_string(),
+                    backend: "wasix".to_string(),
+                    detail: "WASIX sandbox runtime module".to_string(),
+                    desired_enabled: Some(true),
+                    effective_enabled: false,
+                    effective_source: ModuleRuntimeConfigSource::Node,
+                    observed: ModuleObservedState::Running,
+                    observed_detail: "Runtime process is active".to_string(),
+                }],
+                warnings: Vec::new(),
+            };
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings modules")
+                    .root(view(shared)),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_text("WASIX Sandbox")
+            .expect()
+            .to_be_visible()?;
+        window.get_by_text("Desired").expect().to_be_visible()?;
+        window
+            .get_by_text("Effective on Studio node")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_text("Observed on Studio node")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_text("Pending reconciliation")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_text("Technical ID")
+            .expect()
+            .to_be_visible()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn copyable_identifier_row_copies_the_full_unshortened_value() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let reader: ThemeReader = {
+            let s = shared.clone();
+            Rc::new(move || s.theme())
+        };
+        let full_id = "node-01jz7x9m4k2p8q6r5s3t1v0w9y";
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Copy identifier")
+                    .root(copyable_text_row(
+                        &reader,
+                        "copy-node-id",
+                        "Node ID",
+                        full_id,
+                    )),
+            )
+            .build()?;
+        let clipboard = runtime.clipboard();
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Copy Node ID")
+            .click()?;
+        assert_eq!(clipboard.text().as_deref(), Some(full_id));
+
+        Ok(())
+    }
+
+    #[test]
+    fn appearance_exposes_text_scaling_without_a_global_ui_size() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            app.ready
+                .as_mut()
+                .expect("ready state")
+                .settings
+                .open(SettingsSection::Appearance);
+        }
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Appearance scaling")
+                    .root(view(shared)),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::ComboBox)
+            .with_name("text-scale")
+            .expect()
+            .to_have_value("Standard")?;
+        window
+            .get_by_role(sui::SemanticsRole::ComboBox)
+            .with_name("ui-scale")
+            .expect()
+            .to_have_count(0)?;
+        window.get_by_text("Typography").expect().to_be_visible()?;
 
         Ok(())
     }
@@ -10849,9 +11724,17 @@ mod tests {
                 .count()?
                 >= 1
         );
-        assert!(window.get_by_text("node_about_test").count()? >= 1);
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("about-app-surface-id")
+            .expect()
+            .to_have_value("node_about_test")?;
         assert!(window.get_by_text("voter app surface").count()? >= 1);
-        assert!(window.get_by_text("daemon_node_about_test").count()? >= 1);
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("about-daemon-node-id")
+            .expect()
+            .to_have_value("daemon_node_about_test")?;
         assert!(window.get_by_text("cluster test · voter").count()? >= 1);
 
         Ok(())
@@ -11329,26 +12212,6 @@ mod tests {
 
         let error = open_external_url("codex://login").unwrap_err();
         assert!(error.contains("http"));
-    }
-
-    #[test]
-    fn destructive_and_secondary_button_themes_remap_accent_slots() {
-        let reader: ThemeReader = Rc::new(DefaultTheme::light);
-        let base = reader();
-
-        let danger = danger_button_theme(&reader)();
-        assert_eq!(danger.palette.accent, base.palette.danger);
-        assert_eq!(danger.palette.accent_text, base.palette.danger_text);
-        assert_ne!(danger.palette.accent, base.palette.accent);
-
-        let secondary = secondary_button_theme(&reader)();
-        assert_eq!(secondary.palette.accent, base.palette.control);
-        assert_eq!(secondary.palette.accent_hover, base.palette.control_hover);
-        assert_eq!(
-            secondary.palette.accent_pressed,
-            base.palette.control_active
-        );
-        assert_eq!(secondary.palette.accent_text, base.palette.text);
     }
 
     #[test]

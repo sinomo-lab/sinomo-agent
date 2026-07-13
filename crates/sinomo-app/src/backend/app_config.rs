@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sinomo_runtime::local::SinomoDataDir;
 
 use crate::rendering::AppRenderMode;
-use crate::theme::AppThemeMode;
+use crate::theme::{AppTextScale, AppThemeMode};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppUiConfig {
@@ -18,6 +18,8 @@ pub struct AppUiConfig {
     pub theme: AppThemeMode,
     #[serde(default = "default_render_mode")]
     pub render_mode: AppRenderMode,
+    #[serde(default)]
+    pub text_scale: AppTextScale,
     /// Device selectors are local to the app host because that node owns the
     /// physical microphone, speaker, and camera.
     #[serde(default)]
@@ -29,6 +31,7 @@ impl Default for AppUiConfig {
         Self {
             theme: AppThemeMode::System,
             render_mode: default_render_mode(),
+            text_scale: AppTextScale::default(),
             media: AppMediaPreferences::default(),
         }
     }
@@ -88,6 +91,10 @@ pub fn load_render_mode(data_dir: &SinomoDataDir) -> AppRenderMode {
     load_ui_config(data_dir).render_mode
 }
 
+pub fn load_text_scale(data_dir: &SinomoDataDir) -> AppTextScale {
+    load_ui_config(data_dir).text_scale
+}
+
 pub fn load_media_preferences(data_dir: &SinomoDataDir) -> AppMediaPreferences {
     load_ui_config(data_dir).media
 }
@@ -104,6 +111,12 @@ pub fn save_render_mode(
 ) -> Result<(), String> {
     let mut config = load_ui_config(data_dir);
     config.render_mode = render_mode;
+    save_ui_config(data_dir, &config)
+}
+
+pub fn save_text_scale(data_dir: &SinomoDataDir, text_scale: AppTextScale) -> Result<(), String> {
+    let mut config = load_ui_config(data_dir);
+    config.text_scale = text_scale;
     save_ui_config(data_dir, &config)
 }
 
@@ -167,6 +180,7 @@ mod tests {
 
         assert_eq!(load_ui_config(&data_dir), AppUiConfig::default());
         assert_eq!(load_theme(&data_dir), AppThemeMode::System);
+        assert_eq!(load_text_scale(&data_dir), AppTextScale::Standard);
     }
 
     #[test]
@@ -204,6 +218,17 @@ mod tests {
     }
 
     #[test]
+    fn text_scale_round_trips_local_ui_config() {
+        let data_dir = temp_data_dir("scale-round-trip");
+
+        save_text_scale(&data_dir, AppTextScale::ExtraLarge).expect("save text scale");
+
+        assert_eq!(load_text_scale(&data_dir), AppTextScale::ExtraLarge);
+        let saved = fs::read_to_string(ui_config_file(&data_dir)).expect("read saved config");
+        assert!(saved.contains("\"text_scale\": \"extra_large\""));
+    }
+
+    #[test]
     fn legacy_ui_config_defaults_media_devices_to_system_defaults() {
         let data_dir = temp_data_dir("legacy-media");
         let path = ui_config_file(&data_dir);
@@ -221,6 +246,7 @@ mod tests {
         let loaded = load_ui_config(&data_dir);
 
         assert_eq!(loaded.theme, AppThemeMode::Dark);
+        assert_eq!(loaded.text_scale, AppTextScale::Standard);
         assert_eq!(loaded.media, AppMediaPreferences::default());
     }
 

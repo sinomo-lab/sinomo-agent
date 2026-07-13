@@ -2,13 +2,18 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
 use sui::{
-    ArrangeCtx, Color, Constraints, Event, EventCtx, FontWeight, IconGlyph, KeyState, MeasureCtx,
-    PaintCtx, Path, PathBuilder, Point, PointerButton, PointerEventKind, Rect, SemanticsAction,
-    SemanticsCtx, SemanticsNode, SemanticsRole, Size, StrokeStyle, Widget, WindowEvent, draw_glyph,
+    Alignment, ArrangeCtx, Button, ButtonAppearance, Color, Constraints, DefaultTheme, DetailRow,
+    Dock, EmptyState, Event, EventCtx, Flex, FlexItem, FontWeight, IconGlyph, Insets, KeyState,
+    Label, MeasureCtx, PaintCtx, PanelSection, Path, PathBuilder, Point, PointerButton,
+    PointerEventKind, RebuildOnChange, Rect, ScrollView, SemanticTone, SemanticsAction,
+    SemanticsCtx, SemanticsNode, SemanticsRole, Size, StatusBadge, StrokeStyle, Surface,
+    SurfaceAppearance, SurfaceBorder, SurfaceElevation, TrailingSlotRow, Widget, WidgetPod,
+    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
 };
 
 use crate::backend::Backend;
@@ -24,10 +29,11 @@ const NODE_R: f32 = 22.0;
 const LAN_R: f32 = 18.0;
 const PANEL_W: f32 = 360.0;
 const PANEL_PAD: f32 = 16.0;
-const DETAIL_PANEL_H: f32 = 440.0;
-const DETAIL_BUTTON_H: f32 = 28.0;
-const DETAIL_ROW_LINE_H: f32 = 18.0;
-const DETAIL_ROW_GAP: f32 = 5.0;
+const DETAIL_PANEL_H: f32 = 620.0;
+const DETAIL_BUTTON_H: f32 = 30.0;
+const LEGEND_H: f32 = 32.0;
+const VERTEX_TEXT_TOP_GAP: f32 = 6.0;
+const VERTEX_TEXT_LINE_GAP: f32 = 2.0;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClusterSelection {
@@ -214,15 +220,22 @@ pub fn view(shared: Shared) -> impl Widget {
 
 struct ClusterView {
     shared: Shared,
-    bounds: Rect,
     keyboard_focus: RefCell<Option<ClusterSelection>>,
+    header: WidgetPod,
+    empty: WidgetPod,
+    legend: WidgetPod,
+    detail: WidgetPod,
 }
 
 impl ClusterView {
     fn new(shared: Shared) -> Self {
+        let reader = cluster_theme_reader(&shared);
         Self {
+            header: WidgetPod::new(cluster_header_host(&shared, &reader)),
+            empty: WidgetPod::new(cluster_empty_host(&shared, &reader)),
+            legend: WidgetPod::new(cluster_legend(&reader)),
+            detail: WidgetPod::new(cluster_detail_host(&shared, &reader)),
             shared,
-            bounds: Rect::ZERO,
             keyboard_focus: RefCell::new(None),
         }
     }
@@ -231,14 +244,6 @@ impl ClusterView {
         let theme = self.shared.theme();
         let pal = Palette::from_theme(&theme, widgets::theme_is_dark(&self.shared));
         (theme, pal)
-    }
-
-    fn open_connection_settings(&self) {
-        let mut app = self.shared.borrow_mut();
-        app.active_tab = Tab::Settings;
-        if let Some(ready) = app.ready.as_mut() {
-            ready.settings.open(SettingsSection::Connection);
-        }
     }
 
     fn focused_vertex_index(&self, topology: &Topology) -> Option<usize> {
@@ -314,6 +319,8 @@ impl Widget for ClusterView {
                     _ => false,
                 };
                 if handled {
+                    ctx.request_measure();
+                    ctx.request_arrange();
                     ctx.request_paint();
                     ctx.request_semantics();
                     ctx.set_handled();
@@ -324,85 +331,17 @@ impl Widget for ClusterView {
                     && pointer.button == Some(PointerButton::Primary)
                     && ctx.bounds().contains(pointer.position) =>
             {
-                let (overview_refresh_action, overview_warning_action) = {
-                    let cluster = self.shared.cluster();
-                    (
-                        cluster.selected.is_none(),
-                        cluster.selected.is_none()
-                            && !cluster.refreshing
-                            && cluster_actionable_warning(&cluster.snapshot).is_some(),
-                    )
-                };
-                if overview_refresh_action
-                    && cluster_refresh_action_rect(ctx.bounds()).contains(pointer.position)
-                {
-                    request_refresh(&self.shared);
-                    ctx.request_paint();
-                    ctx.request_semantics();
-                    ctx.set_handled();
-                    return;
-                }
-                if overview_warning_action
-                    && cluster_warning_action_rect(ctx.bounds()).contains(pointer.position)
-                {
-                    self.open_connection_settings();
-                    ctx.request_paint();
-                    ctx.request_semantics();
-                    ctx.set_handled();
-                    return;
-                }
-
-                let (selected, selected_warning_action) = {
-                    let cluster = self.shared.cluster();
-                    let selected = cluster.selected.clone();
-                    let selected_warning_action = selected_node_needs_connection_settings(
-                        &cluster.snapshot,
-                        selected.as_ref(),
-                    );
-                    (selected, selected_warning_action)
-                };
-                if selected.is_some()
-                    && selected_refresh_action_rect(ctx.bounds()).contains(pointer.position)
-                {
-                    request_refresh(&self.shared);
-                    ctx.request_paint();
-                    ctx.request_semantics();
-                    ctx.set_handled();
-                    return;
-                }
-                if selected_warning_action
-                    && selected_warning_action_rect(ctx.bounds()).contains(pointer.position)
-                {
-                    self.open_connection_settings();
-                    ctx.request_paint();
-                    ctx.request_semantics();
-                    ctx.set_handled();
-                    return;
-                }
-
                 let snapshot = self.shared.cluster().snapshot.clone();
                 let topology = build_topology(&snapshot);
-                if overview_detail_toggle_visible(&snapshot, selected.as_ref())
-                    && overview_detail_toggle_rect(ctx.bounds(), overview_warning_action)
-                        .contains(pointer.position)
-                {
-                    let open = self.shared.cluster().diagnostics_open;
-                    self.shared.cluster_mut().diagnostics_open = !open;
-                    ctx.request_paint();
-                    ctx.request_semantics();
-                    ctx.set_handled();
-                    return;
-                }
-                if selected.is_some() && detail_toggle_rect(ctx.bounds()).contains(pointer.position)
-                {
-                    let open = self.shared.cluster().diagnostics_open;
-                    self.shared.cluster_mut().diagnostics_open = !open;
-                    ctx.request_paint();
-                    ctx.request_semantics();
-                    ctx.set_handled();
+                if topology.vertices.is_empty() {
                     return;
                 }
                 let graph = graph_rect(ctx.bounds());
+                if !graph.contains(pointer.position)
+                    || detail_panel_rect(ctx.bounds()).contains(pointer.position)
+                {
+                    return;
+                }
                 let layout = layout_vertices(&topology, graph);
                 let selection = hit_test(&layout, pointer.position);
                 *self.keyboard_focus.borrow_mut() = selection.clone();
@@ -413,6 +352,8 @@ impl Widget for ClusterView {
                 cluster.selected = selection;
                 drop(cluster);
                 ctx.request_focus();
+                ctx.request_measure();
+                ctx.request_arrange();
                 ctx.request_paint();
                 ctx.request_semantics();
                 ctx.set_handled();
@@ -424,12 +365,50 @@ impl Widget for ClusterView {
         }
     }
 
-    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        constraints.max
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let size = constraints.max;
+        let bounds = Rect::new(0.0, 0.0, size.width.max(0.0), size.height.max(0.0));
+        let graph = graph_rect(bounds);
+        let detail = detail_panel_rect(bounds);
+        let legend = legend_rect(bounds);
+        let has_vertices = !self.shared.cluster().snapshot.nodes.is_empty();
+
+        self.header.measure(
+            ctx,
+            Constraints::tight(Size::new(bounds.width(), HEADER_H.min(bounds.height()))),
+        );
+        if has_vertices {
+            self.empty.measure(ctx, Constraints::tight(Size::ZERO));
+            self.legend
+                .measure(ctx, Constraints::tight(rect_size(legend)));
+            self.detail
+                .measure(ctx, Constraints::tight(rect_size(detail)));
+        } else {
+            self.empty
+                .measure(ctx, Constraints::tight(rect_size(graph)));
+            self.legend.measure(ctx, Constraints::tight(Size::ZERO));
+            self.detail.measure(ctx, Constraints::tight(Size::ZERO));
+        }
+        size
     }
 
-    fn arrange(&mut self, _ctx: &mut ArrangeCtx, bounds: Rect) {
-        self.bounds = bounds;
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let header = Rect::new(
+            bounds.x(),
+            bounds.y(),
+            bounds.width(),
+            HEADER_H.min(bounds.height()),
+        );
+        self.header.arrange(ctx, header);
+        if self.shared.cluster().snapshot.nodes.is_empty() {
+            self.empty.arrange(ctx, graph_rect(bounds));
+            self.legend.arrange(ctx, Rect::ZERO);
+            self.detail.arrange(ctx, Rect::ZERO);
+        } else {
+            self.empty.arrange(ctx, Rect::ZERO);
+            self.legend.arrange(ctx, legend_rect(bounds));
+            self.detail.arrange(ctx, detail_panel_rect(bounds));
+        }
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
@@ -439,20 +418,16 @@ impl Widget for ClusterView {
         let bounds = ctx.bounds();
         let graph = graph_rect(bounds);
         let layout = layout_vertices(&topology, graph);
-        let (selected, diagnostics_open, refreshing) = {
+        let selected = {
             let cluster = self.shared.cluster();
-            (
-                cluster.selected.clone(),
-                cluster.diagnostics_open,
-                cluster.refreshing,
-            )
+            cluster.selected.clone()
         };
 
         ctx.fill_bounds(pal.window);
-        paint_header(ctx, &theme, &pal, bounds, &snapshot, &topology, refreshing);
+        self.header.paint(ctx);
 
         if topology.vertices.is_empty() {
-            paint_empty(ctx, &theme, &pal, graph, &snapshot);
+            self.empty.paint(ctx);
             return;
         }
 
@@ -468,18 +443,8 @@ impl Widget for ClusterView {
                 StrokeStyle::new(2.0),
             );
         }
-        paint_legend(ctx, &theme, &pal, bounds);
-        paint_detail_panel(
-            ctx,
-            &theme,
-            &pal,
-            bounds,
-            &snapshot,
-            &topology,
-            selected.as_ref(),
-            diagnostics_open,
-            refreshing,
-        );
+        self.legend.paint(ctx);
+        self.detail.paint(ctx);
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
@@ -527,106 +492,27 @@ impl Widget for ClusterView {
             ctx.push(item);
         }
 
-        let (
-            show_warning_action,
-            show_overview_details,
-            diagnostics_open,
-            selected,
-            selected_warning_action,
-            refreshing,
-        ) = {
-            let cluster = self.shared.cluster();
-            let selected = cluster.selected.clone();
-            (
-                cluster.selected.is_none()
-                    && !cluster.refreshing
-                    && cluster_actionable_warning(&cluster.snapshot).is_some(),
-                overview_detail_toggle_visible(&cluster.snapshot, cluster.selected.as_ref()),
-                cluster.diagnostics_open,
-                selected.clone(),
-                selected_node_needs_connection_settings(&cluster.snapshot, selected.as_ref()),
-                cluster.refreshing,
-            )
-        };
-        if selected.is_some() {
-            let mut action = SemanticsNode::new(
-                cluster_refresh_action_widget_id(ctx.widget_id()),
-                SemanticsRole::Button,
-                selected_refresh_action_rect(ctx.bounds()),
-            );
-            action.parent = Some(ctx.widget_id());
-            action.name = Some(if refreshing {
-                "Refreshing".to_string()
-            } else {
-                "Refresh".to_string()
-            });
-            action.description = Some("Refresh cluster health and topology".to_string());
-            action.actions = vec![SemanticsAction::Activate];
-            action.state.selected = refreshing;
-            ctx.push(action);
-        } else if show_overview_details {
-            let cluster = self.shared.cluster();
-            let mut action = SemanticsNode::new(
-                cluster_refresh_action_widget_id(ctx.widget_id()),
-                SemanticsRole::Button,
-                cluster_refresh_action_rect(ctx.bounds()),
-            );
-            action.parent = Some(ctx.widget_id());
-            action.name = Some(if cluster.refreshing {
-                "Refreshing".to_string()
-            } else {
-                "Refresh".to_string()
-            });
-            action.description = Some("Refresh cluster health and topology".to_string());
-            action.actions = vec![SemanticsAction::Activate];
-            action.state.selected = cluster.refreshing;
-            ctx.push(action);
+        self.header.semantics(ctx);
+        if topology.vertices.is_empty() {
+            self.empty.semantics(ctx);
+        } else {
+            self.legend.semantics(ctx);
+            self.detail.semantics(ctx);
         }
-        if selected_warning_action {
-            let mut action = SemanticsNode::new(
-                cluster_warning_action_widget_id(ctx.widget_id()),
-                SemanticsRole::Button,
-                selected_warning_action_rect(ctx.bounds()),
-            );
-            action.parent = Some(ctx.widget_id());
-            action.name = Some("Connection settings".to_string());
-            action.description =
-                Some("Open connection settings for selected cluster node".to_string());
-            action.actions = vec![SemanticsAction::Activate];
-            ctx.push(action);
-        } else if show_warning_action {
-            let mut action = SemanticsNode::new(
-                cluster_warning_action_widget_id(ctx.widget_id()),
-                SemanticsRole::Button,
-                cluster_warning_action_rect(ctx.bounds()),
-            );
-            action.parent = Some(ctx.widget_id());
-            action.name = Some("Connection settings".to_string());
-            action.description = Some("Open connection settings for cluster warning".to_string());
-            action.actions = vec![SemanticsAction::Activate];
-            ctx.push(action);
-        }
-        if selected.is_some() || show_overview_details {
-            let mut action = SemanticsNode::new(
-                cluster_detail_toggle_widget_id(ctx.widget_id()),
-                SemanticsRole::Button,
-                if selected.is_some() {
-                    detail_toggle_rect(ctx.bounds())
-                } else {
-                    overview_detail_toggle_rect(ctx.bounds(), show_warning_action)
-                },
-            );
-            action.parent = Some(ctx.widget_id());
-            action.name = Some(if diagnostics_open {
-                "Hide diagnostics".to_string()
-            } else {
-                "Show diagnostics".to_string()
-            });
-            action.description =
-                Some("Show technical cluster source and identifier details".to_string());
-            action.actions = vec![SemanticsAction::Activate];
-            ctx.push(action);
-        }
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.header);
+        visitor.visit(&self.empty);
+        visitor.visit(&self.legend);
+        visitor.visit(&self.detail);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.header);
+        visitor.visit(&mut self.empty);
+        visitor.visit(&mut self.legend);
+        visitor.visit(&mut self.detail);
     }
 
     fn accepts_focus(&self) -> bool {
@@ -639,81 +525,192 @@ impl Widget for ClusterView {
     }
 }
 
-fn paint_header(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    bounds: Rect,
-    snapshot: &ClusterSnapshot,
-    topology: &Topology,
-    refreshing: bool,
-) {
-    let title = pal.text_style(theme, 20.0, FontWeight::SEMIBOLD, pal.text);
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(bounds.x() + PAD, bounds.y() + 16.0, 280.0, 28.0),
-        "Cluster",
-        title,
-    );
+type ThemeReader = Rc<dyn Fn() -> DefaultTheme>;
 
-    let subtitle = cluster_header_summary(snapshot, topology);
-    let subtitle = if refreshing {
-        format!("{subtitle} · refreshing")
-    } else {
-        subtitle
-    };
-    let style = pal.text_style(theme, 14.0, FontWeight::NORMAL, pal.text_muted);
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(
-            bounds.x() + PAD,
-            bounds.y() + 44.0,
-            bounds.width() - PAD * 2.0,
-            22.0,
-        ),
-        &subtitle,
-        style,
-    );
-    widgets::hairline_bottom(
-        ctx,
-        Rect::new(bounds.x(), bounds.y(), bounds.width(), HEADER_H),
-        pal.border,
-    );
+fn cluster_theme_reader(shared: &Shared) -> ThemeReader {
+    let shared = shared.clone();
+    Rc::new(move || shared.theme())
 }
 
-fn paint_empty(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    rect: Rect,
-    snapshot: &ClusterSnapshot,
-) {
-    let cx = rect.x() + rect.width() / 2.0;
-    let cy = rect.y() + rect.height() / 2.0;
+fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || reader()
+}
+
+fn cluster_theme_signature(shared: &Shared) -> String {
+    let app = shared.borrow();
+    format!("{:?}:{:?}", app.theme_mode, app.text_scale)
+}
+
+fn cluster_header_signature(shared: &Shared) -> String {
+    let theme = cluster_theme_signature(shared);
+    let cluster = shared.cluster();
+    format!("{theme}|{:?}|{}", cluster.snapshot, cluster.refreshing)
+}
+
+fn cluster_header_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange<String> {
+    let shared = shared.clone();
+    let build_shared = shared.clone();
+    let reader = Rc::clone(reader);
+    RebuildOnChange::new(
+        move || cluster_header_signature(&shared),
+        move |_key| build_cluster_header(&build_shared, &reader),
+    )
+}
+
+fn build_cluster_header(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let (snapshot, refreshing) = {
+        let cluster = shared.cluster();
+        (cluster.snapshot.clone(), cluster.refreshing)
+    };
+    let topology = build_topology(&snapshot);
+    let theme = shared.theme();
+    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
+    let summary = Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .gap(2.0)
+        .with_child(Label::new("Cluster").style(pal.text_style(
+            &theme,
+            theme.text.xl.size,
+            FontWeight::SEMIBOLD,
+            pal.text,
+        )))
+        .with_child(
+            Label::new(cluster_header_summary(&snapshot, &topology)).style(pal.text_style(
+                &theme,
+                theme.text.sm.size,
+                FontWeight::NORMAL,
+                pal.text_muted,
+            )),
+        );
+    let (status, tone) = if refreshing {
+        ("Refreshing".to_string(), SemanticTone::Accent)
+    } else {
+        (
+            cluster_health_summary(&snapshot),
+            cluster_health_tone(&snapshot),
+        )
+    };
+    let row = TrailingSlotRow::new(
+        summary,
+        StatusBadge::new(status)
+            .tone(tone)
+            .theme_when(clone_reader(reader)),
+    )
+    .trailing_width(142.0)
+    .trailing_height(30.0)
+    .gap(12.0);
+    WidgetPod::new(
+        Surface::window(row)
+            .border(SurfaceBorder::Bottom)
+            .padding(Insets {
+                left: PAD,
+                right: PAD,
+                top: 10.0,
+                bottom: 10.0,
+            })
+            .fill()
+            .theme_when(clone_reader(reader)),
+    )
+}
+
+fn cluster_empty_signature(shared: &Shared) -> String {
+    let theme = cluster_theme_signature(shared);
+    let cluster = shared.cluster();
+    format!("{theme}|{:?}|{}", cluster.snapshot, cluster.refreshing)
+}
+
+fn cluster_empty_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange<String> {
+    let shared = shared.clone();
+    let build_shared = shared.clone();
+    let reader = Rc::clone(reader);
+    RebuildOnChange::new(
+        move || cluster_empty_signature(&shared),
+        move |_key| build_cluster_empty(&build_shared, &reader),
+    )
+}
+
+fn build_cluster_empty(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let (snapshot, refreshing) = {
+        let cluster = shared.cluster();
+        (cluster.snapshot.clone(), cluster.refreshing)
+    };
     let title = if snapshot.warnings.is_empty() {
         "No cluster nodes"
     } else {
         "Cluster metadata unavailable"
     };
+    let description = if refreshing {
+        "Refreshing cluster membership and health in the background"
+    } else {
+        "Initialize or join a cluster to populate this view"
+    };
     let detail = snapshot
         .warnings
         .first()
-        .map(String::as_str)
-        .unwrap_or("Initialize or join a cluster to populate this view");
-    widgets::draw_centered(
-        ctx,
-        title,
-        pal.text_style(theme, 18.0, FontWeight::SEMIBOLD, pal.text_muted),
-        cx,
-        cy - 12.0,
-    );
-    widgets::draw_centered(
-        ctx,
-        detail,
-        pal.text_style(theme, 14.0, FontWeight::NORMAL, pal.text_faint),
-        cx,
-        cy + 18.0,
-    );
+        .cloned()
+        .unwrap_or_else(|| "Cluster nodes appear here after discovery completes.".to_string());
+    let refresh_shared = shared.clone();
+    let refresh = Button::new(if refreshing { "Refreshing" } else { "Refresh" })
+        .icon(IconGlyph::Redo)
+        .description("Refresh cluster health and topology")
+        .appearance(ButtonAppearance::Tonal)
+        .tone(SemanticTone::Accent)
+        .enabled(!refreshing)
+        .theme_when(clone_reader(reader))
+        .on_press_with_ctx(move |ctx| {
+            request_refresh(&refresh_shared);
+            ctx.request_measure();
+            ctx.request_arrange();
+            ctx.request_paint();
+        });
+    WidgetPod::new(
+        EmptyState::new(title, description)
+            .name("Cluster empty state")
+            .icon(IconGlyph::Link)
+            .detail(detail)
+            .action(refresh)
+            .action_max_width(160.0)
+            .transparent()
+            .theme_when(clone_reader(reader)),
+    )
+}
+
+fn cluster_legend(reader: &ThemeReader) -> Surface {
+    let row = Flex::horizontal()
+        .align_items(Alignment::Center)
+        .gap(5.0)
+        .with_child(
+            StatusBadge::new("Online")
+                .tone(SemanticTone::Success)
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            StatusBadge::new("Offline")
+                .tone(SemanticTone::Danger)
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            StatusBadge::new("Unknown")
+                .tone(SemanticTone::Neutral)
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            StatusBadge::new("LAN")
+                .tone(SemanticTone::Warning)
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            StatusBadge::new("Public route")
+                .tone(SemanticTone::Info)
+                .theme_when(clone_reader(reader)),
+        );
+    Surface::panel(row)
+        .appearance(SurfaceAppearance::Raised)
+        .elevation(SurfaceElevation::Small)
+        .padding(Insets::all(5.0))
+        .fill()
+        .theme_when(clone_reader(reader))
 }
 
 fn paint_edges(ctx: &mut PaintCtx, pal: &Palette, topology: &Topology, layout: &[LayoutVertex]) {
@@ -791,47 +788,50 @@ fn paint_vertices(
         }
 
         let label_style = pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text);
-        let label_y = vertex.center.y + vertex.radius + 14.0;
+        let detail_style = pal.text_style(theme, 11.0, FontWeight::NORMAL, pal.text_faint);
+        let text_layout = vertex_text_layout(
+            vertex.center,
+            vertex.radius,
+            label_style.line_height,
+            detail_style.line_height,
+        );
         widgets::draw_centered(
             ctx,
             &vertex.vertex.label,
             label_style,
             vertex.center.x,
-            label_y,
+            text_layout.label_center_y,
         );
-        let detail_style = pal.text_style(theme, 11.0, FontWeight::NORMAL, pal.text_faint);
         widgets::draw_centered(
             ctx,
             &vertex.vertex.detail,
             detail_style,
             vertex.center.x,
-            label_y + 15.0,
+            text_layout.detail_center_y,
         );
     }
 }
 
-fn paint_legend(ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette, bounds: Rect) {
-    let x = bounds.x() + PAD;
-    let y = bounds.max_y() - 42.0;
-    let style = pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text_faint);
-    let items = [
-        (pal.good, "online"),
-        (pal.bad, "offline"),
-        (unknown_node_color(pal), "unknown"),
-        (lan_segment_color(pal), "LAN"),
-        (public_node_color(pal), "public route"),
-    ];
-    let mut cursor = x;
-    for (color, label) in items {
-        let label_w = if label == "public route" { 100.0 } else { 72.0 };
-        ctx.fill(Path::circle(Point::new(cursor + 6.0, y + 10.0), 5.0), color);
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(cursor + 16.0, y, label_w, 22.0),
-            label,
-            style.clone(),
-        );
-        cursor += if label == "public route" { 120.0 } else { 92.0 };
+#[derive(Clone, Copy, Debug)]
+struct VertexTextLayout {
+    label_center_y: f32,
+    detail_center_y: f32,
+}
+
+fn vertex_text_layout(
+    center: Point,
+    radius: f32,
+    label_line_height: f32,
+    detail_line_height: f32,
+) -> VertexTextLayout {
+    let label_line_height = label_line_height.max(1.0);
+    let detail_line_height = detail_line_height.max(1.0);
+    let label_top = center.y + radius + VERTEX_TEXT_TOP_GAP;
+    let label_bottom = label_top + label_line_height;
+    let detail_top = label_bottom + VERTEX_TEXT_LINE_GAP;
+    VertexTextLayout {
+        label_center_y: label_top + label_line_height * 0.5,
+        detail_center_y: detail_top + detail_line_height * 0.5,
     }
 }
 
@@ -873,253 +873,265 @@ fn unknown_node_color(pal: &Palette) -> Color {
     pal.text_disabled
 }
 
-enum DetailRowLayout {
-    Hint(Vec<String>),
-    KeyValue { label: String, lines: Vec<String> },
-    Value(Vec<String>),
+fn cluster_detail_signature(shared: &Shared) -> String {
+    let theme = cluster_theme_signature(shared);
+    let cluster = shared.cluster();
+    format!(
+        "{theme}|{:?}|{:?}|{}|{}",
+        cluster.snapshot, cluster.selected, cluster.diagnostics_open, cluster.refreshing
+    )
 }
 
-fn detail_row_layout(
-    ctx: &mut PaintCtx,
-    line: &str,
-    value_w: f32,
-    full_w: f32,
-    value_style: &sui::TextStyle,
-    hint_style: &sui::TextStyle,
-) -> Option<DetailRowLayout> {
-    if line.trim().is_empty() {
-        return None;
-    }
-    if let Some(hint) = line.strip_prefix("hint:") {
-        let lines = wrap_detail_text(ctx, hint.trim(), full_w, hint_style);
-        return Some(DetailRowLayout::Hint(lines));
-    }
-    if let Some((label, value)) = line.split_once(':') {
-        let lines = wrap_detail_text(ctx, value.trim(), value_w, value_style);
-        return Some(DetailRowLayout::KeyValue {
-            label: label.to_string(),
-            lines,
-        });
-    }
-    Some(DetailRowLayout::Value(wrap_detail_text(
-        ctx,
-        line,
-        full_w,
-        value_style,
-    )))
+fn cluster_detail_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange<String> {
+    let shared = shared.clone();
+    let build_shared = shared.clone();
+    let reader = Rc::clone(reader);
+    RebuildOnChange::new(
+        move || cluster_detail_signature(&shared),
+        move |_key| build_cluster_detail(&build_shared, &reader),
+    )
 }
 
-fn wrap_detail_text(
-    ctx: &mut PaintCtx,
-    text: &str,
-    width: f32,
-    style: &sui::TextStyle,
-) -> Vec<String> {
-    let lines = widgets::wrap_lines(text, width, |s| measure_detail_text(ctx, s, style));
-    let mut wrapped = Vec::new();
-    for line in lines {
-        if line.is_empty() || measure_detail_text(ctx, &line, style) <= width {
-            wrapped.push(line);
-        } else {
-            wrapped.extend(break_detail_line(ctx, &line, width, style));
-        }
-    }
-    if wrapped.is_empty() {
-        vec![String::new()]
-    } else {
-        wrapped
-    }
-}
-
-fn measure_detail_text(ctx: &PaintCtx, text: &str, style: &sui::TextStyle) -> f32 {
-    ctx.measure_text(text, style.clone())
-        .map(|m| m.width)
-        .unwrap_or(0.0)
-}
-
-fn break_detail_line(
-    ctx: &mut PaintCtx,
-    text: &str,
-    width: f32,
-    style: &sui::TextStyle,
-) -> Vec<String> {
-    if width <= 0.0 {
-        return vec![text.to_string()];
-    }
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for ch in text.chars() {
-        let mut candidate = current.clone();
-        candidate.push(ch);
-        if !current.is_empty() && measure_detail_text(ctx, &candidate, style) > width {
-            lines.push(current);
-            current = ch.to_string();
-        } else {
-            current = candidate;
-        }
-    }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    lines
-}
-
-fn detail_row_height(row: &DetailRowLayout) -> f32 {
-    let line_count = match row {
-        DetailRowLayout::Hint(lines)
-        | DetailRowLayout::KeyValue { lines, .. }
-        | DetailRowLayout::Value(lines) => lines.len().max(1),
+fn build_cluster_detail(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let (snapshot, selection, diagnostics_open, refreshing) = {
+        let cluster = shared.cluster();
+        (
+            cluster.snapshot.clone(),
+            cluster.selected.clone(),
+            cluster.diagnostics_open,
+            cluster.refreshing,
+        )
     };
-    DETAIL_ROW_LINE_H * line_count as f32
+    let topology = build_topology(&snapshot);
+    let lines = selection
+        .as_ref()
+        .map(|selection| detail_lines(&snapshot, &topology, selection, diagnostics_open))
+        .unwrap_or_else(|| overview_lines(&snapshot, &topology, diagnostics_open, refreshing));
+    let title = lines
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "Cluster overview".to_string());
+    let mut rows = Flex::vertical().align_items(Alignment::Stretch).gap(8.0);
+    for line in lines.iter().skip(1).filter(|line| !line.trim().is_empty()) {
+        let (label, value, max_lines) = if let Some(hint) = line.strip_prefix("hint:") {
+            ("Guidance", hint.trim(), 3)
+        } else if let Some((label, value)) = line.split_once(':') {
+            (
+                label.trim(),
+                value.trim(),
+                if diagnostics_open { 3 } else { 2 },
+            )
+        } else {
+            ("Detail", line.trim(), 2)
+        };
+        rows.push(
+            DetailRow::new(label, value)
+                .max_value_lines(max_lines)
+                .theme_when(clone_reader(reader)),
+        );
+    }
+    let (status, tone) = cluster_detail_status(&snapshot, &topology, selection.as_ref());
+    let details = PanelSection::new(
+        title,
+        ScrollView::vertical(rows)
+            .name("Cluster detail fields")
+            .theme(shared.theme())
+            .viewport_width_hint(true),
+    )
+    .header_action(
+        StatusBadge::new(status)
+            .tone(tone)
+            .theme_when(clone_reader(reader)),
+    )
+    .theme_when(clone_reader(reader));
+
+    let refresh_shared = shared.clone();
+    let refresh = Button::new(if refreshing { "Refreshing" } else { "Refresh" })
+        .icon(IconGlyph::Redo)
+        .description("Refresh cluster health and topology")
+        .appearance(ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
+        .min_height(DETAIL_BUTTON_H)
+        .enabled(!refreshing)
+        .theme_when(clone_reader(reader))
+        .on_press_with_ctx(move |ctx| {
+            request_refresh(&refresh_shared);
+            ctx.request_measure();
+            ctx.request_arrange();
+            ctx.request_paint();
+        });
+    let warning_visible = if selection.is_some() {
+        selected_node_needs_connection_settings(&snapshot, selection.as_ref())
+    } else {
+        !refreshing && cluster_actionable_warning(&snapshot).is_some()
+    };
+    let mut primary_actions = Flex::horizontal()
+        .align_items(Alignment::Stretch)
+        .gap(8.0)
+        .with_item(refresh, FlexItem::fill().min_width(0.0));
+    if warning_visible {
+        let settings_shared = shared.clone();
+        let description = if selection.is_some() {
+            "Open connection settings for selected cluster node"
+        } else {
+            "Open connection settings for cluster warning"
+        };
+        primary_actions.push_item(
+            Button::new("Connection settings")
+                .icon(IconGlyph::Alert)
+                .description(description)
+                .appearance(ButtonAppearance::Filled)
+                .tone(SemanticTone::Accent)
+                .min_height(DETAIL_BUTTON_H)
+                .theme_when(clone_reader(reader))
+                .on_press_with_ctx(move |ctx| {
+                    open_connection_settings(&settings_shared);
+                    ctx.request_measure();
+                    ctx.request_arrange();
+                    ctx.request_paint();
+                }),
+            FlexItem::flex(1.35).min_width(0.0),
+        );
+    }
+
+    let toggle_shared = shared.clone();
+    let mut secondary_actions = Flex::horizontal()
+        .align_items(Alignment::Stretch)
+        .gap(8.0)
+        .with_item(
+            Button::new(if diagnostics_open {
+                "Hide diagnostics"
+            } else {
+                "Show diagnostics"
+            })
+            .icon(if diagnostics_open {
+                IconGlyph::ChevronUp
+            } else {
+                IconGlyph::ChevronDown
+            })
+            .description("Show technical cluster source and identifier details")
+            .appearance(ButtonAppearance::Outline)
+            .tone(SemanticTone::Neutral)
+            .min_height(DETAIL_BUTTON_H)
+            .theme_when(clone_reader(reader))
+            .on_press_with_ctx(move |ctx| {
+                let open = toggle_shared.cluster().diagnostics_open;
+                toggle_shared.cluster_mut().diagnostics_open = !open;
+                ctx.request_measure();
+                ctx.request_arrange();
+                ctx.request_paint();
+                ctx.request_semantics();
+            }),
+            FlexItem::fill().min_width(0.0),
+        );
+    if selection
+        .as_ref()
+        .is_some_and(|selection| selected_copy_details(&snapshot, selection).is_some())
+    {
+        let copy_shared = shared.clone();
+        let copy_selection = selection.clone().expect("selection checked above");
+        let copy_value = selected_copy_details(&snapshot, &copy_selection).unwrap_or_default();
+        secondary_actions.push_item(
+            Button::new("Copy details")
+                .semantic_name("Copy node details")
+                .icon(IconGlyph::Restore)
+                .description(format!(
+                    "Copy the full node ID, address, and endpoints: {copy_value}"
+                ))
+                .appearance(ButtonAppearance::Outline)
+                .tone(SemanticTone::Neutral)
+                .min_height(DETAIL_BUTTON_H)
+                .theme_when(clone_reader(reader))
+                .on_press_with_ctx(move |ctx| {
+                    if let Some(value) =
+                        selected_copy_details(&copy_shared.cluster().snapshot, &copy_selection)
+                    {
+                        ctx.set_clipboard_text(value);
+                    }
+                    ctx.request_semantics();
+                }),
+            FlexItem::fill().min_width(0.0),
+        );
+    }
+
+    let actions = Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .gap(8.0)
+        .with_item(primary_actions, FlexItem::fixed(DETAIL_BUTTON_H))
+        .with_item(secondary_actions, FlexItem::fixed(DETAIL_BUTTON_H));
+    let content = Dock::new(details).bottom(DETAIL_BUTTON_H * 2.0 + 8.0, actions);
+    WidgetPod::new(
+        Surface::panel(content)
+            .name("Cluster inspector")
+            .appearance(SurfaceAppearance::Raised)
+            .elevation(SurfaceElevation::Medium)
+            .padding(Insets::all(PANEL_PAD))
+            .fill()
+            .theme_when(clone_reader(reader)),
+    )
 }
 
-fn paint_detail_panel(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    bounds: Rect,
+fn cluster_detail_status(
     snapshot: &ClusterSnapshot,
     topology: &Topology,
     selection: Option<&ClusterSelection>,
-    diagnostics_open: bool,
-    refreshing: bool,
-) {
-    let panel = detail_panel_rect(bounds);
-    // Floating inspector: Mesh overlay surface with a strong border and the
-    // medium shadow ladder (empty in Void, where the border carries elevation).
-    sui::paint_theme_shadow(ctx, panel, [10.0; 4], &theme.shadows.box_shadow.md);
-    widgets::round_panel(ctx, panel, pal.overlay, pal.border_strong, 10.0);
-
-    let lines = selection
-        .map(|selection| detail_lines(snapshot, topology, selection, diagnostics_open))
-        .unwrap_or_else(|| overview_lines(snapshot, topology, diagnostics_open, refreshing));
-    let show_warning_action =
-        selection.is_none() && !refreshing && cluster_actionable_warning(snapshot).is_some();
-    let show_overview_details = overview_detail_toggle_visible(snapshot, selection);
-    let selected_warning_action = selected_node_needs_connection_settings(snapshot, selection);
-    let title_style = pal.text_style(theme, 14.0, FontWeight::SEMIBOLD, pal.text);
-    let label_style = pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text_muted);
-    let value_style = pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text);
-    let hint_style = pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text_faint);
-    let mut cy = panel.y() + PANEL_PAD;
-    if let Some((title, rest)) = lines.split_first() {
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(
-                panel.x() + PANEL_PAD,
-                cy,
-                panel.width() - PANEL_PAD * 2.0,
-                22.0,
+) -> (String, SemanticTone) {
+    match selection {
+        Some(ClusterSelection::Node(id)) => snapshot
+            .nodes
+            .iter()
+            .find(|node| &node.node_id == id)
+            .map(|node| {
+                (
+                    node.availability.clone(),
+                    availability_tone(&node.availability),
+                )
+            })
+            .unwrap_or_else(|| ("Missing".to_string(), SemanticTone::Danger)),
+        Some(ClusterSelection::LanSegment(id)) => (
+            count_noun(
+                topology
+                    .lan_segments
+                    .get(id)
+                    .map(Vec::len)
+                    .unwrap_or_default(),
+                "member",
+                "members",
             ),
-            title,
-            title_style,
-        );
-        cy += 32.0;
-        let content_bottom = if selection.is_some() {
-            selected_action_row_y(bounds) - 8.0
-        } else if show_warning_action || show_overview_details {
-            overview_action_row_y(bounds) - 8.0
-        } else {
-            panel.max_y() - PANEL_PAD
-        };
-        let label_w = 104.0;
-        let value_x = panel.x() + PANEL_PAD + 108.0;
-        let value_w = (panel.width() - PANEL_PAD * 2.0 - 108.0).max(0.0);
-        let full_w = (panel.width() - PANEL_PAD * 2.0).max(0.0);
-        for line in rest {
-            let Some(row) =
-                detail_row_layout(ctx, line, value_w, full_w, &value_style, &hint_style)
-            else {
-                continue;
-            };
-            let row_h = detail_row_height(&row);
-            if cy + row_h > content_bottom {
-                break;
-            }
-            match row {
-                DetailRowLayout::Hint(lines) => {
-                    for line in lines {
-                        widgets::draw_text_in(
-                            ctx,
-                            Rect::new(panel.x() + PANEL_PAD, cy, full_w, DETAIL_ROW_LINE_H),
-                            &line,
-                            hint_style.clone(),
-                        );
-                        cy += DETAIL_ROW_LINE_H;
-                    }
-                }
-                DetailRowLayout::KeyValue { label, lines } => {
-                    widgets::draw_text_in(
-                        ctx,
-                        Rect::new(panel.x() + PANEL_PAD, cy, label_w, DETAIL_ROW_LINE_H),
-                        &label,
-                        label_style.clone(),
-                    );
-                    for line in lines {
-                        widgets::draw_text_in(
-                            ctx,
-                            Rect::new(value_x, cy, value_w, DETAIL_ROW_LINE_H),
-                            &line,
-                            value_style.clone(),
-                        );
-                        cy += DETAIL_ROW_LINE_H;
-                    }
-                }
-                DetailRowLayout::Value(lines) => {
-                    for line in lines {
-                        widgets::draw_text_in(
-                            ctx,
-                            Rect::new(panel.x() + PANEL_PAD, cy, full_w, DETAIL_ROW_LINE_H),
-                            &line,
-                            value_style.clone(),
-                        );
-                        cy += DETAIL_ROW_LINE_H;
-                    }
-                }
-            }
-            cy += DETAIL_ROW_GAP;
-        }
+            SemanticTone::Info,
+        ),
+        None => (
+            cluster_health_summary(snapshot),
+            cluster_health_tone(snapshot),
+        ),
     }
-    if selection.is_some() {
-        paint_cluster_refresh_action(
-            ctx,
-            theme,
-            pal,
-            selected_refresh_action_rect(bounds),
-            refreshing,
-        );
-        if selected_warning_action {
-            paint_cluster_warning_action(ctx, theme, pal, selected_warning_action_rect(bounds));
-        }
-        paint_detail_toggle(
-            ctx,
-            theme,
-            pal,
-            detail_toggle_rect(bounds),
-            diagnostics_open,
-        );
+}
+
+fn availability_tone(availability: &str) -> SemanticTone {
+    match availability.to_ascii_lowercase().as_str() {
+        "online" | "healthy" => SemanticTone::Success,
+        "offline" | "unavailable" => SemanticTone::Danger,
+        "degraded" | "unknown" => SemanticTone::Warning,
+        _ => SemanticTone::Neutral,
+    }
+}
+
+fn cluster_health_tone(snapshot: &ClusterSnapshot) -> SemanticTone {
+    let counts = availability_counts(snapshot);
+    if counts.offline > 0 {
+        SemanticTone::Danger
+    } else if counts.unknown > 0 || counts.total == 0 {
+        SemanticTone::Warning
     } else {
-        if show_overview_details {
-            paint_cluster_refresh_action(
-                ctx,
-                theme,
-                pal,
-                cluster_refresh_action_rect(bounds),
-                refreshing,
-            );
-        }
-        if show_warning_action {
-            paint_cluster_warning_action(ctx, theme, pal, cluster_warning_action_rect(bounds));
-        }
-        if show_overview_details {
-            paint_detail_toggle(
-                ctx,
-                theme,
-                pal,
-                overview_detail_toggle_rect(bounds, show_warning_action),
-                diagnostics_open,
-            );
-        }
+        SemanticTone::Success
+    }
+}
+
+fn open_connection_settings(shared: &Shared) {
+    let mut app = shared.borrow_mut();
+    app.active_tab = Tab::Settings;
+    if let Some(ready) = app.ready.as_mut() {
+        ready.settings.open(SettingsSection::Connection);
     }
 }
 
@@ -1455,6 +1467,32 @@ fn node_detail_lines(node: &ClusterNodeInfo, diagnostics_open: bool) -> Vec<Stri
     lines
 }
 
+fn selected_copy_details(
+    snapshot: &ClusterSnapshot,
+    selection: &ClusterSelection,
+) -> Option<String> {
+    match selection {
+        ClusterSelection::Node(id) => {
+            let node = snapshot.nodes.iter().find(|node| &node.node_id == id)?;
+            let mut lines = vec![format!("node_id: {}", node.node_id)];
+            if let Some(address) = node
+                .address
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                lines.push(format!("address: {address}"));
+            }
+            lines.extend(
+                node.endpoints
+                    .iter()
+                    .map(|endpoint| format!("{}: {}", endpoint.transport, endpoint.address)),
+            );
+            Some(lines.join("\n"))
+        }
+        ClusterSelection::LanSegment(_) => None,
+    }
+}
+
 fn node_route_summary(node: &ClusterNodeInfo, reachable_endpoints: usize) -> &'static str {
     let availability = node.availability.to_ascii_lowercase();
     if matches!(availability.as_str(), "offline" | "unavailable") {
@@ -1501,13 +1539,6 @@ fn source_summary(source: &str) -> &'static str {
     }
 }
 
-fn overview_detail_toggle_visible(
-    _snapshot: &ClusterSnapshot,
-    selection: Option<&ClusterSelection>,
-) -> bool {
-    selection.is_none()
-}
-
 fn selected_node_needs_connection_settings(
     snapshot: &ClusterSnapshot,
     selection: Option<&ClusterSelection>,
@@ -1537,103 +1568,13 @@ fn node_needs_connection_settings(node: &ClusterNodeInfo) -> bool {
 fn detail_panel_rect(bounds: Rect) -> Rect {
     let panel_w = PANEL_W.min((bounds.width() - PAD * 2.0).max(220.0));
     let y = bounds.y() + HEADER_H + 18.0;
-    let available_h = (bounds.max_y() - y - PAD).max(312.0);
+    let available_h = (bounds.max_y() - y - PAD).max(0.0);
     Rect::new(
         bounds.max_x() - panel_w - PAD,
         y,
         panel_w,
         DETAIL_PANEL_H.min(available_h),
     )
-}
-
-fn detail_toggle_rect(bounds: Rect) -> Rect {
-    let panel = detail_panel_rect(bounds);
-    Rect::new(
-        panel.x() + PANEL_PAD,
-        panel.max_y() - PANEL_PAD - DETAIL_BUTTON_H,
-        144.0,
-        DETAIL_BUTTON_H,
-    )
-}
-
-fn selected_action_row_y(bounds: Rect) -> f32 {
-    detail_toggle_rect(bounds).y() - DETAIL_BUTTON_H - 8.0
-}
-
-fn selected_refresh_action_rect(bounds: Rect) -> Rect {
-    let panel = detail_panel_rect(bounds);
-    Rect::new(
-        panel.x() + PANEL_PAD,
-        selected_action_row_y(bounds),
-        92.0,
-        DETAIL_BUTTON_H,
-    )
-}
-
-fn selected_warning_action_rect(bounds: Rect) -> Rect {
-    let refresh = selected_refresh_action_rect(bounds);
-    Rect::new(
-        refresh.max_x() + 8.0,
-        selected_action_row_y(bounds),
-        132.0,
-        DETAIL_BUTTON_H,
-    )
-}
-
-fn cluster_warning_action_rect(bounds: Rect) -> Rect {
-    let refresh = cluster_refresh_action_rect(bounds);
-    let panel = detail_panel_rect(bounds);
-    let x = refresh.max_x() + 8.0;
-    let right = panel.max_x() - PANEL_PAD;
-    Rect::new(
-        x,
-        overview_action_row_y(bounds),
-        (right - x).min(132.0).max(0.0),
-        DETAIL_BUTTON_H,
-    )
-}
-
-fn cluster_refresh_action_rect(bounds: Rect) -> Rect {
-    let panel = detail_panel_rect(bounds);
-    Rect::new(
-        panel.x() + PANEL_PAD,
-        overview_action_row_y(bounds),
-        92.0,
-        DETAIL_BUTTON_H,
-    )
-}
-
-fn overview_detail_toggle_rect(bounds: Rect, has_warning_action: bool) -> Rect {
-    let panel = detail_panel_rect(bounds);
-    let x = if has_warning_action {
-        cluster_warning_action_rect(bounds).max_x() + 8.0
-    } else {
-        cluster_refresh_action_rect(bounds).max_x() + 8.0
-    };
-    let right = panel.max_x() - PANEL_PAD;
-    Rect::new(
-        x,
-        overview_action_row_y(bounds),
-        (right - x).max(0.0),
-        DETAIL_BUTTON_H,
-    )
-}
-
-fn overview_action_row_y(bounds: Rect) -> f32 {
-    let panel = detail_panel_rect(bounds);
-    panel.max_y() - PANEL_PAD - DETAIL_BUTTON_H
-}
-
-fn cluster_warning_action_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
-    sui::WidgetId::new(parent.get().wrapping_mul(41).wrapping_add(9_301))
-}
-
-fn cluster_refresh_action_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
-    sui::WidgetId::new(parent.get().wrapping_mul(41).wrapping_add(9_303))
-}
-
-fn cluster_detail_toggle_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
-    sui::WidgetId::new(parent.get().wrapping_mul(41).wrapping_add(9_307))
 }
 
 fn cluster_vertex_widget_id(parent: sui::WidgetId, vertex: &GraphVertex) -> sui::WidgetId {
@@ -1656,87 +1597,19 @@ fn cluster_vertex_widget_id(parent: sui::WidgetId, vertex: &GraphVertex) -> sui:
     )
 }
 
-fn paint_detail_toggle(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    rect: Rect,
-    diagnostics_open: bool,
-) {
-    widgets::round_panel(ctx, rect, pal.surface_2, pal.border, 6.0);
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(rect.x() + 10.0, rect.y() + 5.0, rect.width() - 20.0, 18.0),
-        if rect.width() < 112.0 {
-            if diagnostics_open { "Hide" } else { "Details" }
-        } else if diagnostics_open {
-            "Hide diagnostics"
-        } else {
-            "Show diagnostics"
-        },
-        pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text),
-    );
+fn legend_rect(bounds: Rect) -> Rect {
+    let available_w = (bounds.width() - PAD * 2.0).max(0.0);
+    let width = 430.0_f32.min(available_w);
+    Rect::new(
+        bounds.x() + PAD,
+        bounds.max_y() - PAD - LEGEND_H,
+        width,
+        LEGEND_H,
+    )
 }
 
-fn paint_cluster_warning_action(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    rect: Rect,
-) {
-    widgets::round_panel(ctx, rect, pal.accent, pal.accent, 6.0);
-    draw_glyph(
-        ctx,
-        IconGlyph::Alert,
-        Rect::new(rect.x() + 10.0, rect.y() + 7.0, 14.0, 14.0),
-        pal.on_accent,
-    );
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(rect.x() + 30.0, rect.y() + 5.0, rect.width() - 40.0, 18.0),
-        if rect.width() < 150.0 {
-            "Connection"
-        } else {
-            "Connection settings"
-        },
-        pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.on_accent),
-    );
-}
-
-fn paint_cluster_refresh_action(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    rect: Rect,
-    refreshing: bool,
-) {
-    let fill = if refreshing {
-        pal.accent_soft
-    } else {
-        pal.surface_2
-    };
-    let border = if refreshing {
-        pal.accent_border
-    } else {
-        pal.border
-    };
-    widgets::round_panel(ctx, rect, fill, border, 6.0);
-    draw_glyph(
-        ctx,
-        IconGlyph::Redo,
-        Rect::new(rect.x() + 10.0, rect.y() + 7.0, 14.0, 14.0),
-        if refreshing {
-            pal.accent_text
-        } else {
-            pal.text_muted
-        },
-    );
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(rect.x() + 30.0, rect.y() + 5.0, rect.width() - 36.0, 18.0),
-        if refreshing { "Refreshing" } else { "Refresh" },
-        pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text),
-    );
+fn rect_size(rect: Rect) -> Size {
+    Size::new(rect.width().max(0.0), rect.height().max(0.0))
 }
 
 fn graph_rect(bounds: Rect) -> Rect {
@@ -2090,7 +1963,7 @@ mod tests {
     use super::*;
     use crate::backend::Backend;
     use crate::state::AppState;
-    use crate::theme::{AppThemeMode, resolve_theme};
+    use crate::theme::{AppTextScale, AppThemeMode, resolve_theme, resolve_theme_with_preferences};
 
     fn node(id: &str) -> ClusterNodeInfo {
         ClusterNodeInfo {
@@ -2112,6 +1985,29 @@ mod tests {
             public_reachable: false,
             endpoints: Vec::new(),
         }
+    }
+
+    #[test]
+    fn vertex_text_lines_follow_extra_large_theme_metrics_without_overlap() {
+        let theme = resolve_theme_with_preferences(AppThemeMode::Dark, AppTextScale::ExtraLarge);
+        let pal = Palette::from_theme(&theme, true);
+        let label = pal.text_style(&theme, 12.0, FontWeight::MEDIUM, pal.text);
+        let detail = pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_faint);
+        let center = Point::new(120.0, 90.0);
+        let layout = vertex_text_layout(center, NODE_R, label.line_height, detail.line_height);
+        let label_top = layout.label_center_y - label.line_height * 0.5;
+        let label_bottom = layout.label_center_y + label.line_height * 0.5;
+        let detail_top = layout.detail_center_y - detail.line_height * 0.5;
+
+        assert_eq!(label_top, center.y + NODE_R + VERTEX_TEXT_TOP_GAP);
+        assert!(
+            detail_top >= label_bottom + VERTEX_TEXT_LINE_GAP,
+            "resolved label and detail line boxes must stay separated"
+        );
+        assert!(
+            layout.detail_center_y > center.y + NODE_R + 40.0,
+            "large text should expand the authored canvas spacing"
+        );
     }
 
     fn link(a: &str, b: &str, privacy: &str, address: &str) -> ClusterLinkInfo {
@@ -2145,6 +2041,26 @@ mod tests {
             public_ip: true,
             reachable,
         }
+    }
+
+    #[test]
+    fn selected_copy_details_preserves_full_id_address_and_endpoints() {
+        let mut selected = node("node-01jz7x9m4k2p8q6r5s3t1v0w9y");
+        selected.address = Some("https://10.20.30.40:21353/control".to_string());
+        selected.endpoints = vec![endpoint("iroh://full-endpoint-address", true)];
+        let snapshot = ClusterSnapshot {
+            nodes: vec![selected.clone()],
+            ..ClusterSnapshot::default()
+        };
+
+        let copied =
+            selected_copy_details(&snapshot, &ClusterSelection::Node(selected.node_id.clone()))
+                .expect("copyable node details");
+
+        assert!(copied.contains(&selected.node_id));
+        assert!(copied.contains("https://10.20.30.40:21353/control"));
+        assert!(copied.contains("iroh://full-endpoint-address"));
+        assert!(!copied.contains("..."));
     }
 
     #[test]
@@ -2244,6 +2160,14 @@ mod tests {
         assert_eq!(
             shared.cluster().selected,
             Some(ClusterSelection::Node("node-b".to_string()))
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Show diagnostics")
+                .count()?,
+            1,
+            "keyboard selection should rebuild the stock inspector actions"
         );
         Ok(())
     }

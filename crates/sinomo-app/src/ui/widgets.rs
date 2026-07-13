@@ -3,7 +3,7 @@
 use sui::prelude::Padding;
 use sui::{
     Color, Constraints, MeasureCtx, PaintCtx, Path, Point, Rect, SingleChild, Size, TextStyle,
-    Widget,
+    Widget, paint_single_line_aligned_text,
 };
 
 use crate::state::Shared;
@@ -44,21 +44,22 @@ fn is_dark_mode(shared: &Shared) -> bool {
 /// Draw text horizontally centered at `cx`, vertically centered at `cy`.
 pub fn draw_centered(ctx: &mut PaintCtx, text: &str, style: TextStyle, cx: f32, cy: f32) {
     let measurement = ctx.measure_text(text, style.clone()).ok();
-    let (w, h) = measurement
-        .map(|m| (m.width, m.height))
-        .unwrap_or((text.len() as f32 * 8.0, style.line_height));
-    let rect = Rect::new(cx - w / 2.0, cy - h / 2.0, w + 2.0, h + 2.0);
-    ctx.draw_text(rect, text, style);
+    let width = measurement
+        .map(|measurement| measurement.width)
+        .unwrap_or(text.len() as f32 * style.font_size * 0.56);
+    let line_height = style.line_height.max(1.0);
+    let rect = Rect::new(
+        cx - width * 0.5,
+        cy - line_height * 0.5,
+        width + 2.0,
+        line_height,
+    );
+    paint_single_line_aligned_text(ctx, rect, text, &style, line_height, 0.5);
 }
 
 /// Draw left-aligned, vertically-centered text within `row`.
 pub fn draw_text_in(ctx: &mut PaintCtx, row: Rect, text: &str, style: TextStyle) {
-    let h = ctx
-        .measure_text(text, style.clone())
-        .map(|m| m.height)
-        .unwrap_or(style.line_height);
-    let y = row.y() + (row.height() - h) / 2.0;
-    ctx.draw_text(Rect::new(row.x(), y, row.width(), h + 2.0), text, style);
+    paint_single_line_aligned_text(ctx, row, text, &style, style.line_height, 0.0);
 }
 
 /// Fill a rounded rectangle (proper path fill — safe with translucent colors).
