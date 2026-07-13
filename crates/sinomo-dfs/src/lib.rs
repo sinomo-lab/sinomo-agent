@@ -62,6 +62,7 @@ mod posix_model;
 mod posix_object;
 mod posix_path;
 mod protocol;
+mod renewable_lease;
 mod repair;
 mod routes;
 mod service;
@@ -390,6 +391,11 @@ pub use protocol::{
     DfsReadRangeData, DfsReadRequest, DfsReadResponse, DfsReadResult, DfsRepairReplicaCommand,
     DfsRepairReplicaResponse, DfsRoutedMessage, DfsStageBlobCommand, DfsStageBlobResponse,
     DfsStagePatchCommand, DfsWriteCommand, DfsWriteResponse, DfsWriteResult,
+};
+pub use renewable_lease::{
+    DEFAULT_DFS_RENEWABLE_LEASE_RELEASE_TIMEOUT, DfsRenewableExclusiveLease,
+    DfsRenewableLeaseAnchor, DfsRenewableLeaseConfig, DfsRenewableLeaseError,
+    DfsRenewableLeaseStatus,
 };
 pub(crate) use repair::{
     repair_attempt_record_indicates_lost_authority,

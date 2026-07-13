@@ -1,10 +1,11 @@
 use crate::{
     DfsAdvisoryLockCommand, DfsAdvisoryLockOutcome, DfsAdvisoryLockStateRecord, DfsConflictRecord,
     DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataShardConfig, DfsMetadataShardId,
-    DfsMetadataTableSnapshot, DfsNamespaceTransaction, DfsObjectId, DfsObjectMetadata,
-    DfsObjectVersionRecord, DfsPosixDirectorySyncCertificate, DfsPosixDirectorySyncTarget,
-    DfsPosixFileSyncCertificate, DfsPosixFileSyncTarget, DfsReplicaReceiptRecord,
-    DfsReplicationPolicy, DfsVersion, DfsWriteIntentRecord, NetworkedDfsWriteOutcome,
+    DfsMetadataTableSnapshot, DfsNamespaceJobRecord, DfsNamespaceTransaction, DfsObjectId,
+    DfsObjectMetadata, DfsObjectVersionRecord, DfsPosixDirectorySyncCertificate,
+    DfsPosixDirectorySyncTarget, DfsPosixFileSyncCertificate, DfsPosixFileSyncTarget,
+    DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsVersion, DfsWriteIntentRecord,
+    NetworkedDfsWriteOutcome,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
@@ -246,6 +247,22 @@ pub enum DfsNamespaceOperation {
         from: String,
         to: String,
     },
+    RenameSingleNamespaceAtomic {
+        from: String,
+        to: String,
+        expected_shard_id: String,
+        expected_shard_epoch: u64,
+    },
+    RenameDirectoryBounded {
+        from: String,
+        to: String,
+        max_steps: u64,
+    },
+    ResumeNamespaceJobBounded {
+        job_id: String,
+        path: String,
+        max_steps: u64,
+    },
     Hardlink {
         existing_path: String,
         link_path: String,
@@ -380,11 +397,16 @@ impl DfsNamespaceOperation {
             | DfsNamespaceOperation::TouchDirectoryModified { path }
             | DfsNamespaceOperation::ClearDirRecursive { path }
             | DfsNamespaceOperation::SyncPath { path }
-            | DfsNamespaceOperation::LookupPath { path } => vec![path],
+            | DfsNamespaceOperation::LookupPath { path }
+            | DfsNamespaceOperation::ResumeNamespaceJobBounded { path, .. } => vec![path],
             DfsNamespaceOperation::LookupPaths { paths } => {
                 paths.iter().map(String::as_str).collect()
             }
-            DfsNamespaceOperation::Rename { from, to } => vec![from, to],
+            DfsNamespaceOperation::Rename { from, to }
+            | DfsNamespaceOperation::RenameSingleNamespaceAtomic { from, to, .. }
+            | DfsNamespaceOperation::RenameDirectoryBounded { from, to, .. } => {
+                vec![from, to]
+            }
             DfsNamespaceOperation::Hardlink {
                 existing_path,
                 link_path,
@@ -430,6 +452,7 @@ pub struct DfsNamespaceResponse {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsPosixCoordinationResult {
+    NamespaceJob(DfsNamespaceJobRecord),
     AdvisoryLock(DfsAdvisoryLockOutcome),
     /// Capability acknowledgement for a lock-bearing cross-shard adoption.
     /// An older destination that ignores the optional lock aggregate cannot

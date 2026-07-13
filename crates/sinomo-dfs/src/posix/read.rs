@@ -281,6 +281,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
+    /// Reads one bounded range from the authoritative version of `path`, fetching
+    /// it from a healthy replica when the content is not local.
+    pub fn posix_read_file_range_distributed(
+        &mut self,
+        path: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        self.check_cancelled("distributed range read")?;
+        if max_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        let (path, object) = self.distributed_posix_file_content_object(path, true)?;
+        match self
+            .read_object_metadata_range_or_fetch_remote_without_cache(&object, offset, max_bytes)?
+        {
+            NetworkedDfsRangeReadOutcome::Found { data, .. } => {
+                validate_complete_posix_range_content_hash(&object, &data)?;
+                Ok(data.bytes)
+            }
+            NetworkedDfsRangeReadOutcome::PendingReplication { .. }
+            | NetworkedDfsRangeReadOutcome::NotConfirmed { .. }
+            | NetworkedDfsRangeReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
+            NetworkedDfsRangeReadOutcome::Conflicted { conflicts, .. } => {
+                Err(read_conflict_error(path, conflicts))
+            }
+        }
+    }
+
     pub fn posix_read_files_distributed(&mut self, paths: &[String]) -> Vec<Result<Vec<u8>>> {
         if paths.len() <= 1 {
             return paths
@@ -697,6 +726,124 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
+    /// Read one bounded range through a stable opened-object identity.
+    ///
+    /// This is the range counterpart to [`Self::posix_read_file_for_object`]
+    /// used by FUSE file handles. It avoids materializing the complete object
+    /// for each kernel read while retaining rename-safe opened-file semantics.
+    pub fn posix_read_file_range_for_object(
+        &mut self,
+        object_id: &DfsObjectId,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        self.posix_read_file_range_for_object_with_access_update(
+            object_id, offset, max_bytes, false,
+        )
+    }
+
+    /// Read one opened-object range and record access time when this node owns
+    /// the authoritative metadata shard.
+    pub fn posix_read_file_range_for_object_update_access(
+        &mut self,
+        object_id: &DfsObjectId,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        self.posix_read_file_range_for_object_with_access_update(object_id, offset, max_bytes, true)
+    }
+
+    fn posix_read_file_range_for_object_with_access_update(
+        &mut self,
+        object_id: &DfsObjectId,
+        offset: u64,
+        max_bytes: usize,
+        update_access: bool,
+    ) -> Result<Vec<u8>> {
+        if max_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        let object = self
+            .current_read_object_metadata(object_id)
+            .map_err(DfsPosixError::from)?;
+        if object.kind == DfsObjectKind::Tombstone {
+            return Err(DfsPosixError::NotFound { path: object.path });
+        }
+        let path = object.path.clone();
+        let (_, object) = self.posix_file_content_object(path.clone(), object)?;
+        self.posix_read_file_range_for_opened_metadata(
+            path,
+            object,
+            offset,
+            max_bytes,
+            update_access,
+        )
+    }
+
+    /// Read one range for a FUSE-style open handle using a fresh authoritative
+    /// path lookup while fencing against pathname replacement.
+    pub fn posix_read_file_range_for_opened_object(
+        &mut self,
+        path: &str,
+        object_id: &DfsObjectId,
+        offset: u64,
+        max_bytes: usize,
+        update_access: bool,
+    ) -> Result<Vec<u8>> {
+        if max_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        let (path, object) = self.distributed_posix_file_content_object(path, true)?;
+        if object.object_id != *object_id {
+            // Open-unlinked lifetime is not implemented. Fail closed if the
+            // pathname was removed or replaced rather than reading a new file
+            // through the old handle.
+            return Err(DfsPosixError::NotFound { path });
+        }
+        self.posix_read_file_range_for_opened_metadata(
+            path,
+            object,
+            offset,
+            max_bytes,
+            update_access,
+        )
+    }
+
+    fn posix_read_file_range_for_opened_metadata(
+        &mut self,
+        path: String,
+        object: DfsObjectMetadata,
+        offset: u64,
+        max_bytes: usize,
+        update_access: bool,
+    ) -> Result<Vec<u8>> {
+        match self
+            .read_object_metadata_range_or_fetch_remote_without_cache(&object, offset, max_bytes)?
+        {
+            NetworkedDfsRangeReadOutcome::Found { data, .. } => {
+                validate_complete_posix_range_content_hash(&object, &data)?;
+                if update_access && self.is_local_metadata_primary_for_object(&object)? {
+                    let mut current = self
+                        .object_by_id(&object.object_id)?
+                        .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+                    if current.kind == DfsObjectKind::Tombstone {
+                        return Err(DfsPosixError::NotFound { path });
+                    }
+                    current.accessed_at_unix_nanos = now_unix_nanos();
+                    current.version = next_version(&current.version);
+                    self.add_object_metadata(current)?;
+                }
+                Ok(data.bytes)
+            }
+            NetworkedDfsRangeReadOutcome::PendingReplication { .. }
+            | NetworkedDfsRangeReadOutcome::NotConfirmed { .. }
+            | NetworkedDfsRangeReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
+            NetworkedDfsRangeReadOutcome::Conflicted { conflicts, .. } => {
+                Err(read_conflict_error(path, conflicts))
+            }
+        }
+    }
+
     pub(super) fn read_current_object_or_fetch_remote(
         &mut self,
         object_id: &DfsObjectId,
@@ -785,7 +932,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object: &DfsObjectMetadata,
         deadline: Instant,
     ) -> Result<NetworkedDfsReadOutcome> {
-        let mut object = self.current_read_object_metadata_or_path_object(object)?;
+        // `object` came from the authoritative routed namespace lookup.
+        // No-cache reads deliberately reuse it instead of re-resolving through a
+        // non-replica's incomplete local object shard.
+        let mut object = object.clone();
+        self.apply_transient_remote_read_location_prunes(&mut object);
         let initial = self.read_object_metadata_local_if_current_location(&object)?;
         if !matches!(initial, NetworkedDfsReadOutcome::PendingReplication { .. }) {
             return Ok(initial);
@@ -815,7 +966,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     });
                 }
             }
-            object = self.current_read_object_metadata_or_path_object(&object)?;
+            self.apply_transient_remote_read_location_prunes(&mut object);
             let current = self.read_object_metadata_local_if_current_location(&object)?;
             if !matches!(current, NetworkedDfsReadOutcome::PendingReplication { .. }) {
                 return Ok(current);
@@ -882,9 +1033,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_bytes: usize,
         deadline: Instant,
     ) -> Result<NetworkedDfsRangeReadOutcome> {
-        let mut object = self.current_read_object_metadata_or_path_object(object)?;
-        let initial =
-            self.read_object_metadata_local_range_with_state(&object, offset, max_bytes, false)?;
+        // Preserve the same authoritative metadata for the remote range
+        // request; this node may intentionally have no local object shard.
+        let mut object = object.clone();
+        self.apply_transient_remote_read_location_prunes(&mut object);
+        let initial = self.read_authoritative_object_metadata_local_range_or_pending(
+            &object, offset, max_bytes,
+        )?;
         if !matches!(
             initial,
             NetworkedDfsRangeReadOutcome::PendingReplication { .. }
@@ -938,9 +1093,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     _ => {}
                 }
             }
-            object = self.current_read_object_metadata_or_path_object(&object)?;
-            let current = self
-                .read_object_metadata_local_range_with_state(&object, offset, max_bytes, false)?;
+            self.apply_transient_remote_read_location_prunes(&mut object);
+            let current = self.read_authoritative_object_metadata_local_range_or_pending(
+                &object, offset, max_bytes,
+            )?;
             if !matches!(
                 current,
                 NetworkedDfsRangeReadOutcome::PendingReplication { .. }
@@ -988,57 +1144,46 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
-    fn current_read_object_metadata_or_path_object(
+    fn read_authoritative_object_metadata_local_range_or_pending(
         &self,
-        path_object: &DfsObjectMetadata,
-    ) -> Result<DfsObjectMetadata> {
-        let memory_object = self.metadata.object(&path_object.object_id).cloned();
-        let backend_object = if let Some(backend) = self.metadata_backend.as_ref() {
-            backend.get_object(&path_object.object_id)?
-        } else {
-            None
-        };
-        let refreshed = match (memory_object.as_ref(), backend_object.as_ref()) {
-            (Some(memory_object), Some(backend_object)) => {
-                Some(self.resolve_authoritative_object_metadata(
-                    &path_object.object_id,
-                    Some(memory_object),
-                    Some(backend_object),
-                )?)
-            }
-            (Some(memory_object), None) => Some(memory_object.clone()),
-            (None, Some(backend_object)) => Some(backend_object.clone()),
-            (None, None) => None,
-        };
-        let mut object = match refreshed {
-            Some(refreshed)
-                if refreshed.version == path_object.version
-                    && refreshed.content_hash == path_object.content_hash =>
+        object: &DfsObjectMetadata,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<NetworkedDfsRangeReadOutcome> {
+        if !object.current_locations.contains(&self.node_id) && object.content_hash.is_some() {
+            return Ok(NetworkedDfsRangeReadOutcome::PendingReplication {
+                object_id: object.object_id.clone(),
+                version: object.version.clone(),
+                content_hash: object.content_hash.clone(),
+                current_locations: object.current_locations.clone(),
+            });
+        }
+        match self.read_object_metadata_local_range_with_state(object, offset, max_bytes, false) {
+            Ok(outcome) => Ok(outcome),
+            Err(DfsError::UnknownObject { object_id })
+                if object_id == object.object_id && object.content_hash.is_some() =>
             {
-                refreshed
+                // Routed namespace lookup supplied the authoritative object,
+                // but this node intentionally has no local metadata shard for
+                // it. Preserve that authority and proceed to the hinted remote
+                // range request instead of treating local absence as a global
+                // object miss.
+                Ok(NetworkedDfsRangeReadOutcome::PendingReplication {
+                    object_id: object.object_id.clone(),
+                    version: object.version.clone(),
+                    content_hash: object.content_hash.clone(),
+                    current_locations: object.current_locations.clone(),
+                })
             }
-            _ => path_object.clone(),
-        };
-        object = self.object_metadata_with_receipt_locations(object)?;
-        self.apply_transient_remote_read_location_prunes(&mut object);
-        Ok(object)
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn read_object_metadata_local_if_current_location(
         &self,
         object: &DfsObjectMetadata,
     ) -> Result<NetworkedDfsReadOutcome> {
-        let local = self.read_object_metadata_local_content_with_state(object, false)?;
-        if matches!(
-            local,
-            NetworkedDfsReadOutcome::Found { .. } | NetworkedDfsReadOutcome::Conflicted { .. }
-        ) {
-            return Ok(local);
-        }
-        if object.current_locations.contains(&self.node_id) {
-            return Ok(local);
-        }
-        if object.content_hash.is_some() {
+        if !object.current_locations.contains(&self.node_id) && object.content_hash.is_some() {
             return Ok(NetworkedDfsReadOutcome::PendingReplication {
                 object_id: object.object_id.clone(),
                 version: object.version.clone(),
@@ -1046,7 +1191,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 current_locations: object.current_locations.clone(),
             });
         }
-        Ok(NetworkedDfsReadOutcome::NotFound)
+        Ok(self.read_object_metadata_local_content_with_state(object, false)?)
     }
 
     pub fn posix_request_remote_read(&mut self, path: &str) -> Result<Vec<NodeId>> {

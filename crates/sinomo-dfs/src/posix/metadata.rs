@@ -151,6 +151,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })
     }
 
+    /// Resolve every symlink in a POSIX path against authoritative distributed
+    /// metadata. Security boundaries use this before authorizing a path prefix;
+    /// checking the caller-provided spelling alone is insufficient.
+    pub fn posix_resolve_path_distributed(
+        &mut self,
+        path: &str,
+        follow_final: bool,
+    ) -> Result<String> {
+        self.resolve_posix_path_distributed(path, follow_final)
+    }
+
     pub(super) fn resolve_existing_posix_path(
         &self,
         path: &str,

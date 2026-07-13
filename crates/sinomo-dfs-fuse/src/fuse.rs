@@ -1,6 +1,6 @@
 use crate::{
-    DfsFuseError, DfsFuseMountOptions, Result, join_sifs_child, normalize_sifs_root,
-    parent_sifs_path,
+    DfsFuseError, DfsFuseMountHandle, DfsFuseMountOptions, Result, join_sifs_child,
+    normalize_sifs_root, parent_sifs_path, prepare_background_mount_point,
 };
 use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr, ReplyCreate, ReplyData,
@@ -40,6 +40,18 @@ pub fn mount_sifs(mut options: DfsFuseMountOptions) -> Result<()> {
         .map_err(|source| map_mount_error(&mount_point, mount_helper.is_some(), source))
 }
 
+pub fn mount_sifs_background(mut options: DfsFuseMountOptions) -> Result<DfsFuseMountHandle> {
+    options.root_path = normalize_sifs_root(&options.root_path)?;
+    let mount_helper = fuse_mount_helper();
+    let mount_point = prepare_background_mount_point(&options.mount_point)?;
+    options.mount_point = mount_point.clone();
+    let fs = SifsFuseFileSystem::open(options.clone())?;
+    let mount_options = background_fuse_mount_options(&options);
+    let session = fuser::spawn_mount2(fs, &mount_point, &mount_options)
+        .map_err(|source| map_mount_error(&mount_point, mount_helper.is_some(), source))?;
+    Ok(DfsFuseMountHandle::new(mount_point, session))
+}
+
 fn fuse_mount_options(
     options: &DfsFuseMountOptions,
     mount_helper_available: bool,
@@ -59,6 +71,17 @@ fn fuse_mount_options(
     }
     if options.allow_other {
         mount_options.push(MountOption::AllowOther);
+    }
+    mount_options
+}
+
+fn background_fuse_mount_options(options: &DfsFuseMountOptions) -> Vec<MountOption> {
+    let mut mount_options = fuse_mount_options(options, false);
+    if !mount_options.contains(&MountOption::AutoUnmount) {
+        // Background mounts are process resources. fuser retains owner-only
+        // userspace ACL enforcement when it adds the helper's required
+        // allow_other kernel option for AutoUnmount.
+        mount_options.push(MountOption::AutoUnmount);
     }
     mount_options
 }
@@ -885,7 +908,7 @@ impl SifsFuseFileSystem {
         if offset < 0 {
             return Err(libc::EINVAL);
         }
-        let start = usize::try_from(offset).map_err(|_| libc::EINVAL)?;
+        let start = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         let handle_identity = {
             let state = self.lock_state()?;
             state
@@ -894,15 +917,48 @@ impl SifsFuseFileSystem {
                 .map(|handle| (handle.path.clone(), handle.object_id.clone()))
         };
         self.ensure_handle_lock_budget(fh, lock_owner, LOCKED_IO_MIN_LEASE)?;
-        let bytes = {
-            let mut dfs = self.lock_dfs()?;
-            match handle_identity {
-                Some((_, object_id)) => dfs.posix_read_file_for_object(&object_id),
-                None => dfs.posix_read_file_distributed(&self.path_for_ino(ino)?),
+        let handle_identity = match handle_identity {
+            Some((path, object_id)) => {
+                let mut state = self.lock_state()?;
+                let handle = state.handles.get_mut(&fh).ok_or(libc::EBADF)?;
+                let update_access = !handle.access_recorded;
+                handle.access_recorded = true;
+                Some((path, object_id, update_access))
             }
-            .map_err(errno_for_posix_error)?
+            None => None,
         };
-        Ok(slice_bytes(&bytes, start, size as usize))
+        let read_result = {
+            let mut dfs = self.lock_dfs()?;
+            match handle_identity.as_ref() {
+                Some((path, object_id, update_access)) => dfs
+                    .posix_read_file_range_for_opened_object(
+                        path,
+                        object_id,
+                        start,
+                        size as usize,
+                        *update_access,
+                    ),
+                None => dfs.posix_read_file_range_distributed(
+                    &self.path_for_ino(ino)?,
+                    start,
+                    size as usize,
+                ),
+            }
+        };
+        match read_result {
+            Ok(bytes) => Ok(bytes),
+            Err(error) => {
+                if handle_identity.is_some_and(|(_, _, update_access)| update_access)
+                    && let Ok(mut state) = self.lock_state()
+                    && let Some(handle) = state.handles.get_mut(&fh)
+                {
+                    // A failed first read did not observe the file. Permit a
+                    // later successful retry to record atime once.
+                    handle.access_recorded = false;
+                }
+                Err(errno_for_posix_error(error))
+            }
+        }
     }
 
     fn write_handle(
@@ -1835,6 +1891,7 @@ impl FuseState {
                 object_id,
                 writable: flags_has_write_access(flags),
                 sync_mode: HandleSyncMode::from_open_flags(flags),
+                access_recorded: false,
             },
         );
         fh
@@ -1847,6 +1904,7 @@ struct OpenFileHandle {
     object_id: dfs::DfsObjectId,
     writable: bool,
     sync_mode: HandleSyncMode,
+    access_recorded: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2482,14 +2540,6 @@ fn time_or_now_to_nanos(time: TimeOrNow) -> u64 {
     }
 }
 
-fn slice_bytes(bytes: &[u8], start: usize, len: usize) -> Vec<u8> {
-    if start >= bytes.len() {
-        return Vec::new();
-    }
-    let end = start.saturating_add(len).min(bytes.len());
-    bytes[start..end].to_vec()
-}
-
 #[cfg(test)]
 mod errno_tests {
     use super::*;
@@ -2538,6 +2588,15 @@ mod errno_tests {
         let helper_options = fuse_mount_options(&options, true);
         assert!(helper_options.contains(&MountOption::AutoUnmount));
         assert!(helper_options.contains(&MountOption::AllowOther));
+    }
+
+    #[test]
+    fn owner_only_background_mount_uses_helper_auto_unmount() {
+        let options = DfsFuseMountOptions::new("/mnt/sinomo");
+
+        let background_options = background_fuse_mount_options(&options);
+        assert!(background_options.contains(&MountOption::AutoUnmount));
+        assert!(!background_options.contains(&MountOption::AllowOther));
     }
 
     fn test_object_id(name: &str) -> dfs::DfsObjectId {

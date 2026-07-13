@@ -238,6 +238,57 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.posix_rename_directory_bounded_resolved(&from, &to, source, max_steps)
     }
 
+    pub fn posix_rename_directory_bounded_routed(
+        &mut self,
+        from: &str,
+        to: &str,
+        max_steps: usize,
+    ) -> Result<DfsNamespaceJobRecord> {
+        let normalized_from = normalize_posix_path(from)?;
+        let normalized_to = normalize_posix_path(to)?;
+        let from_primary = self.routed_namespace_primary_for_path(&normalized_from)?;
+        let to_primary = self.routed_namespace_primary_for_path(&normalized_to)?;
+        match (from_primary, to_primary) {
+            (None, None) => {
+                self.posix_rename_directory_bounded(&normalized_from, &normalized_to, max_steps)
+            }
+            (Some(from_primary), Some(to_primary)) if from_primary == to_primary => self
+                .route_namespace_job_operation(
+                    from_primary,
+                    DfsNamespaceOperation::RenameDirectoryBounded {
+                        from: normalized_from,
+                        to: normalized_to,
+                        max_steps: u64::try_from(max_steps).unwrap_or(u64::MAX),
+                    },
+                ),
+            _ => Err(DfsPosixError::InvalidPath {
+                path: format!(
+                    "{normalized_from} -> {normalized_to} crosses metadata shard primaries"
+                ),
+            }),
+        }
+    }
+
+    pub fn posix_resume_namespace_job_bounded_routed(
+        &mut self,
+        job_id: &str,
+        routing_path: &str,
+        max_steps: usize,
+    ) -> Result<DfsNamespaceJobRecord> {
+        let routing_path = normalize_posix_path(routing_path)?;
+        match self.routed_namespace_primary_for_path(&routing_path)? {
+            Some(primary) => self.route_namespace_job_operation(
+                primary,
+                DfsNamespaceOperation::ResumeNamespaceJobBounded {
+                    job_id: job_id.to_string(),
+                    path: routing_path,
+                    max_steps: u64::try_from(max_steps).unwrap_or(u64::MAX),
+                },
+            ),
+            None => self.posix_resume_namespace_job_bounded(job_id, max_steps),
+        }
+    }
+
     fn clear_dir_recursive_job_for_path(&self, path: &str) -> Result<DfsNamespaceJobRecord> {
         let directory = self
             .lookup_sifs_path(path)?

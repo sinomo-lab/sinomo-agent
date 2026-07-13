@@ -15,6 +15,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation: &DfsNamespaceOperation,
     ) -> posix_model::Result<Option<DfsPosixCoordinationResult>> {
         match operation {
+            DfsNamespaceOperation::RenameDirectoryBounded {
+                from,
+                to,
+                max_steps,
+            } => self
+                .posix_rename_directory_bounded(from, to, usize_from_bounded_steps(*max_steps))
+                .map(DfsPosixCoordinationResult::NamespaceJob)
+                .map(Some),
+            DfsNamespaceOperation::ResumeNamespaceJobBounded {
+                job_id, max_steps, ..
+            } => self
+                .posix_resume_namespace_job_bounded(job_id, usize_from_bounded_steps(*max_steps))
+                .map(DfsPosixCoordinationResult::NamespaceJob)
+                .map(Some),
             DfsNamespaceOperation::AdvisoryLock {
                 path,
                 object_id,
@@ -116,4 +130,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .map(|()| None),
         }
     }
+}
+
+fn usize_from_bounded_steps(max_steps: u64) -> usize {
+    usize::try_from(max_steps).unwrap_or(usize::MAX)
 }

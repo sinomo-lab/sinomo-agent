@@ -15983,6 +15983,134 @@ fn remote_read_content_mismatch_prunes_stale_location() {
     std::fs::remove_dir_all(root).ok();
 }
 
+fn assert_malformed_remote_range_rejected(
+    name: &str,
+    mutate: impl FnOnce(&mut DfsReadRangeData),
+    expected_reason: &str,
+) {
+    let root = temp_root(name);
+    let reader = NodeId::from_legacy_named(&format!("{name}_reader")).expect("reader node");
+    let source = NodeId::from_legacy_named(&format!("{name}_source")).expect("source node");
+    let object_id = DfsObjectId::from_legacy_named(&format!("{name}_object")).expect("object");
+    let version = DfsVersion::from_legacy_named(&format!("{name}_version")).expect("version");
+    let bytes = b"authoritative ranged response bytes".to_vec();
+    let content_hash = content_hash(&bytes);
+    let offset = 3_u64;
+    let max_bytes = 7_usize;
+    let request_id = format!("{name}_request");
+    let mut dfs = networked_sifs_with_backend(&root, reader);
+    let mut object = file_metadata(source.clone());
+    object.object_id = object_id.clone();
+    object.version = version.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![source.clone()];
+    object.content_hash = Some(content_hash.clone());
+    object.content_size_bytes = Some(bytes.len() as u64);
+    dfs.add_object_metadata(object).expect("object metadata");
+    dfs.pending_reads.insert(
+        request_id.clone(),
+        PendingNetworkedRead {
+            object_id: object_id.clone(),
+            version: version.clone(),
+            content_hash: Some(content_hash.clone()),
+            content_size_bytes: Some(bytes.len() as u64),
+            range_offset: Some(offset),
+            range_max_bytes: Some(max_bytes),
+            target_node_id: source.clone(),
+            next_retry_at: Instant::now() + DFS_REMOTE_READ_RETRY_DELAY,
+            cache_response: false,
+        },
+    );
+    let start = offset as usize;
+    let mut data = DfsReadRangeData {
+        object_id: object_id.clone(),
+        version,
+        content_hash: Some(content_hash),
+        offset,
+        total_size_bytes: bytes.len() as u64,
+        bytes: bytes[start..start + max_bytes].to_vec(),
+    };
+    mutate(&mut data);
+
+    let event = dfs
+        .handle_networked_read_response(
+            source.clone(),
+            DfsReadResponse {
+                request_id: request_id.clone(),
+                object_id: object_id.clone(),
+                result: DfsReadResult::RangeFound(data),
+            },
+        )
+        .expect("malformed range response handled");
+
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::RemoteReadCompleted {
+            request_id: completed_request_id,
+            result: DfsReadResult::Rejected { reason },
+            ..
+        } if completed_request_id == request_id && reason.contains(expected_reason)
+    ));
+    assert!(!dfs.pending_reads.contains_key(&request_id));
+    assert!(
+        !dfs.current_read_object_metadata(&object_id)
+            .expect("current metadata")
+            .current_locations
+            .contains(&source),
+        "source returning malformed range metadata must be pruned"
+    );
+}
+
+#[test]
+fn remote_range_rejects_wrong_version() {
+    assert_malformed_remote_range_rejected(
+        "range_wrong_version",
+        |data| {
+            data.version =
+                DfsVersion::from_legacy_named("range_wrong_version_other").expect("version")
+        },
+        "expected version",
+    );
+}
+
+#[test]
+fn remote_range_rejects_wrong_offset() {
+    assert_malformed_remote_range_rejected(
+        "range_wrong_offset",
+        |data| data.offset += 1,
+        "offset mismatch",
+    );
+}
+
+#[test]
+fn remote_range_rejects_short_length() {
+    assert_malformed_remote_range_rejected(
+        "range_short_length",
+        |data| {
+            data.bytes.pop();
+        },
+        "length mismatch",
+    );
+}
+
+#[test]
+fn remote_range_rejects_wrong_total_size() {
+    assert_malformed_remote_range_rejected(
+        "range_wrong_total",
+        |data| data.total_size_bytes += 1,
+        "does not match object metadata",
+    );
+}
+
+#[test]
+fn remote_range_rejects_wrong_content_hash() {
+    assert_malformed_remote_range_rejected(
+        "range_wrong_hash",
+        |data| data.content_hash = Some("blake3:wrong-range-hash".to_string()),
+        "expected content hash",
+    );
+}
+
 #[test]
 fn complete_remote_range_content_mismatch_prunes_stale_location() {
     let root = temp_root("remote-range-read-mismatch-prunes-location");
@@ -22731,6 +22859,86 @@ fn sifs_posix_read_updates_atime_without_changing_mtime() {
 }
 
 #[test]
+fn sifs_opened_object_ranges_allow_one_atime_update_for_many_chunks() {
+    let root = temp_root("sifs-opened-range-atime");
+    let node_id = NodeId::from_legacy_named("node_sifs_opened_range_atime").expect("node");
+    let file_path = "/services/sandbox/instances/sandbox_range_atime/work/file.txt";
+    let bytes = b"content split across several FUSE reads";
+
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_range_atime/work")
+        .expect("mkdir");
+    let written = dfs
+        .posix_write_file(
+            file_path,
+            bytes,
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("write");
+    dfs.posix_set_times(file_path, Some(12_345), Some(67_890))
+        .expect("old times");
+    let before = dfs.posix_stat(file_path).expect("before stat");
+
+    assert_eq!(
+        dfs.posix_read_file_range_for_object(&written.object_id, 0, 7)
+            .expect("first no-atime range"),
+        &bytes[..7]
+    );
+    let after_no_atime = dfs.posix_stat(file_path).expect("no-atime stat");
+    assert_eq!(after_no_atime.version, before.version);
+    assert_eq!(after_no_atime.accessed_at_unix_nanos, 12_345);
+
+    assert_eq!(
+        dfs.posix_read_file_range_for_object_update_access(&written.object_id, 7, 9)
+            .expect("first handle range updates atime"),
+        &bytes[7..16]
+    );
+    let after_access = dfs.posix_stat(file_path).expect("updated atime stat");
+    assert_ne!(after_access.version, before.version);
+    assert!(after_access.accessed_at_unix_nanos > 12_345);
+    assert_eq!(after_access.modified_at_unix_nanos, 67_890);
+
+    assert_eq!(
+        dfs.posix_read_file_range_for_object(&written.object_id, 16, 8)
+            .expect("subsequent no-atime range"),
+        &bytes[16..24]
+    );
+    let after_next_chunk = dfs.posix_stat(file_path).expect("next chunk stat");
+    assert_eq!(
+        after_next_chunk.version, after_access.version,
+        "subsequent chunks must not append authoritative atime metadata"
+    );
+
+    let renamed_path = "/services/sandbox/instances/sandbox_range_atime/work/file-renamed.txt";
+    dfs.posix_rename(file_path, renamed_path)
+        .expect("rename opened file");
+    assert_eq!(
+        dfs.posix_read_file_range_for_opened_object(renamed_path, &written.object_id, 5, 6, false,)
+            .expect("renamed opened-object range"),
+        &bytes[5..11]
+    );
+
+    let local_node_id = dfs.node_id().clone();
+    dfs.posix_write_file(
+        file_path,
+        b"replacement",
+        DfsWriteOptions::replicated_eventual(vec![local_node_id]),
+    )
+    .expect("pathname replacement");
+    assert!(matches!(
+        dfs.posix_read_file_range_for_opened_object(file_path, &written.object_id, 0, 4, false,),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert_eq!(
+        dfs.posix_read_file_range_for_opened_object(renamed_path, &written.object_id, 0, 4, false,)
+            .expect("old handle keeps renamed identity"),
+        &bytes[..4]
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn sifs_posix_list_updates_directory_atime_without_changing_mtime() {
     let root = temp_root("sifs-posix-list-atime");
     let node_id = NodeId::from_legacy_named("node_sifs_list_atime").expect("node");
@@ -23396,6 +23604,73 @@ fn sifs_posix_cluster_node(
             .expect("cluster node metadata backend"),
     )
     .expect("cluster node metadata backend attach")
+}
+
+#[test]
+fn atomic_namespace_rename_rejects_shard_epoch_change_before_commit() {
+    let root = temp_root("atomic-namespace-rename-shard-change");
+    let node_id = NodeId::from_legacy_named("node_atomic_namespace_primary").expect("primary node");
+    let network = InProcessNetwork::new();
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    let shard = |epoch| DfsMetadataShardConfig {
+        file_system_id: sifs_file_system_id(),
+        shard_id: "root".to_string(),
+        primary_node_id: node_id.clone(),
+        replica_node_ids: Vec::new(),
+        epoch,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                node_id.clone(),
+            )))
+            .expect("filesystem config");
+        control
+            .put_metadata_shard(&shard(1))
+            .expect("initial shard config");
+    });
+    let mut service =
+        sifs_posix_cluster_node(&network, &shared_kv, &root, "primary", node_id.clone());
+    service
+        .bootstrap_distributed_sifs()
+        .expect("bootstrap SIFS");
+    service
+        .posix_mkdir_all("/services/sandbox/instances")
+        .expect("instance namespace");
+    service
+        .posix_symlink(
+            "/services/sandbox/generations/one",
+            "/services/sandbox/instances/.swap",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("staged link");
+
+    shared_kv.with_client(|kv| {
+        DfsControlPlaneStore::new(kv)
+            .put_metadata_shard(&shard(2))
+            .expect("advance shard epoch");
+    });
+
+    let error = service
+        .posix_rename_single_namespace_atomic_local(
+            "/services/sandbox/instances/.swap",
+            "/services/sandbox/instances/one",
+            Some(("root", 1)),
+        )
+        .expect_err("stale atomic authority must fail closed");
+    assert!(matches!(error, DfsPosixError::InvalidPath { .. }));
+    assert!(
+        service
+            .posix_lstat_distributed("/services/sandbox/instances/.swap")
+            .is_ok()
+    );
+    assert!(matches!(
+        service.posix_lstat_distributed("/services/sandbox/instances/one"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
 }
 
 fn sifs_posix_cluster(name: &str) -> SifsPosixCluster {
@@ -27725,6 +28000,68 @@ fn sifs_cluster_posix_routed_namespace_ops_have_read_your_write_semantics() {
 }
 
 #[test]
+fn sifs_cluster_routes_bounded_directory_rename_and_resume_receipts() {
+    let cluster = sifs_posix_cluster("sifs-cluster-bounded-rename");
+    let SifsPosixCluster {
+        root,
+        primary,
+        writer_node,
+        mut writer,
+        ..
+    } = cluster;
+    let stop_primary = Arc::new(AtomicBool::new(false));
+    let primary_stop = Arc::clone(&stop_primary);
+    let primary_thread = std::thread::spawn(move || {
+        let mut primary = primary;
+        while !primary_stop.load(Ordering::SeqCst) {
+            primary.process_incoming().expect("primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        primary
+    });
+
+    let from = "/users/bounded-old";
+    let to = "/users/bounded-new";
+    writer
+        .posix_mkdir_all(&format!("{from}/nested"))
+        .expect("routed source tree");
+    for index in 0..4 {
+        writer
+            .posix_write_file(
+                &format!("{from}/nested/{index}.txt"),
+                index.to_string().as_bytes(),
+                DfsWriteOptions::replicated_eventual(vec![writer_node.clone()]),
+            )
+            .expect("routed source file");
+    }
+    let mut job = writer
+        .posix_rename_directory_bounded_routed(from, to, 1)
+        .expect("first routed bounded batch");
+    while job.status == DfsNamespaceJobStatus::Running {
+        job = writer
+            .posix_resume_namespace_job_bounded_routed(&job.job_id, from, 1)
+            .expect("next routed bounded batch");
+    }
+    assert_eq!(job.status, DfsNamespaceJobStatus::Completed);
+    assert!(matches!(
+        writer.posix_stat(from),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    for index in 0..4 {
+        assert_eq!(
+            writer
+                .posix_read_file(&format!("{to}/nested/{index}.txt"))
+                .expect("renamed file"),
+            index.to_string().as_bytes()
+        );
+    }
+
+    stop_primary.store(true, Ordering::SeqCst);
+    let _primary = primary_thread.join().expect("primary thread");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn sifs_cluster_posix_routed_namespace_ops_converge_across_replicas() {
     // Namespace mutations issued from different replicas serialize through
     // the shard primary, and every node converges to one identical namespace.
@@ -31378,6 +31715,18 @@ fn sifs_non_replica_prefix_read_reuses_authoritative_metadata_for_remote_range()
     assert!(
         observer.posix_read_file(path).is_err(),
         "an uncached prefix read must not materialize the full remote object locally"
+    );
+
+    let opened = observer
+        .posix_stat_distributed(path)
+        .expect("outsider authoritative open metadata");
+    let opened_range = observer
+        .posix_read_file_range_for_opened_object(path, &opened.object_id, 17, 31, true)
+        .expect("outsider opened-object remote range read");
+    assert_eq!(opened_range, bytes[17..48]);
+    assert!(
+        observer.posix_read_file(path).is_err(),
+        "an opened-object range read must not materialize the full remote object locally"
     );
 
     let complete = observer

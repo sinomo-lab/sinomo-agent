@@ -102,6 +102,11 @@ pub(crate) fn dfs_namespace_operation_trace_label(
         DfsNamespaceOperation::Rmdir { .. } => "rmdir",
         DfsNamespaceOperation::Unlink { .. } => "unlink",
         DfsNamespaceOperation::Rename { .. } => "rename",
+        DfsNamespaceOperation::RenameSingleNamespaceAtomic { .. } => {
+            "rename-single-namespace-atomic"
+        }
+        DfsNamespaceOperation::RenameDirectoryBounded { .. } => "rename-directory-bounded",
+        DfsNamespaceOperation::ResumeNamespaceJobBounded { .. } => "resume-namespace-job-bounded",
         DfsNamespaceOperation::Hardlink { .. } => "hardlink",
         DfsNamespaceOperation::SetMode { .. } => "set-mode",
         DfsNamespaceOperation::SetOwner { .. } => "set-owner",
