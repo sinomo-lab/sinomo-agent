@@ -297,7 +297,7 @@ fn tab_label(tab: Tab, compact: bool) -> &'static str {
             Tab::Evolution => "Evolve",
             Tab::Cluster => Tab::Cluster.title(),
             Tab::Files => Tab::Files.title(),
-            Tab::Settings => Tab::Settings.title(),
+            Tab::Settings => "Prefs",
         }
     } else {
         tab.title()
@@ -1842,7 +1842,10 @@ fn draw_loading_spinner(ctx: &mut PaintCtx, pal: &Palette, cx: f32, cy: f32, siz
 }
 
 fn compact_chrome(width: f32) -> bool {
-    width < COMPACT_CHROME_WIDTH
+    // Treat the breakpoint itself as compact. Window managers and test surfaces commonly land on
+    // the exact logical width, and keeping the desktop chrome there leaves no room for enlarged
+    // text beside the health affordance.
+    width <= COMPACT_CHROME_WIDTH
 }
 
 fn tab_strip_x(bounds_x: f32, compact: bool) -> f32 {
@@ -1874,10 +1877,10 @@ fn status_pill_arrange_rect(bounds: Rect, compact: bool) -> Rect {
     }
 }
 
-/// Approximate width reserved for the "Sinomo" wordmark (kept simple; the tab strip measures its
-/// own natural width to the right of it).
+/// Width reserved for the "Sinomo" wordmark. This includes enough room for the supported 130%
+/// text scale so the brand never wraps into a second title-bar line.
 fn brand_word_width() -> f32 {
-    58.0
+    84.0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2275,7 +2278,12 @@ mod tests {
         let root = window.root();
         app.run_until_idle()?;
 
-        root.dispatch_event(Event::Window(WindowEvent::Resized(Size::new(520.0, 720.0))))?;
+        // Exercise the exact breakpoint: this is a common snapped/window-test width and must not
+        // fall back to the wider title-bar treatment.
+        root.dispatch_event(Event::Window(WindowEvent::Resized(Size::new(
+            COMPACT_CHROME_WIDTH,
+            720.0,
+        ))))?;
         app.run_until_idle()?;
 
         let snapshot = window.snapshot()?;
@@ -2304,7 +2312,7 @@ mod tests {
             tab_bar.bounds
         );
         assert!(
-            tab_bar.bounds.max_x() <= 520.0 + 0.5,
+            tab_bar.bounds.max_x() <= COMPACT_CHROME_WIDTH + 0.5,
             "tab bar should use the remaining title-bar width without running under right chrome: {:?}",
             tab_bar.bounds
         );

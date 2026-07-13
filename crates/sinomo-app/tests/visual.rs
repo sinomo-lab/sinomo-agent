@@ -499,6 +499,95 @@ fn capture_settings_responsive() {
     }
 }
 
+#[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
+fn capture_contextual_size_matrix() {
+    use sinomo_app::theme::AppTextScale;
+    use sinomo_app::ui::settings::SettingsSection;
+    use sui::{Event, Size, WindowEvent};
+
+    let dir = shots_dir();
+    std::fs::create_dir_all(&dir).expect("create shots dir");
+    let capture = |name: &str, window: &sui_testing::TestWindow| {
+        let shot = window.capture_screenshot().expect("capture screenshot");
+        let path = dir.join(format!("sinomo-app-{name}.png"));
+        shot.write_png(&path).expect("write png");
+        println!(
+            "wrote {} ({}x{})",
+            path.display(),
+            shot.width(),
+            shot.height()
+        );
+    };
+
+    let shared = boot(Tab::Settings);
+    {
+        let mut state = shared.borrow_mut();
+        state.text_scale = AppTextScale::Standard;
+    }
+    shared.settings_mut().selected = Some(SettingsSection::Appearance);
+    let runtime = build_runtime(shared.clone()).expect("build runtime");
+    let app = TestApp::from_runtime(runtime).expect("headless test app");
+    let window = app.main_window().expect("main window");
+    let root = window.root();
+    app.run_until_idle().expect("settle contextual wide layout");
+    app.advance_time(0.5)
+        .expect("settle contextual wide entrance animations");
+    app.run_until_idle()
+        .expect("finish contextual wide animation frame");
+    capture("contextual-sizes-settings-wide", &window);
+
+    root.dispatch_event(Event::Window(WindowEvent::Resized(Size::new(620.0, 820.0))))
+        .expect("resize scaled settings");
+    app.run_until_idle()
+        .expect("settle contextual narrow layout");
+    app.advance_time(0.5)
+        .expect("settle contextual narrow entrance animations");
+    app.run_until_idle()
+        .expect("finish contextual narrow animation frame");
+    capture("contextual-sizes-settings-narrow", &window);
+
+    shared.borrow_mut().active_tab = Tab::Evolution;
+    root.dispatch_event(Event::Window(WindowEvent::Resized(Size::new(
+        1280.0, 720.0,
+    ))))
+    .expect("resize scaled Evolution");
+    root.dispatch_event(Event::Window(WindowEvent::RedrawRequested))
+        .expect("show scaled Evolution");
+    app.run_until_idle().expect("settle large Evolution layout");
+    app.advance_time(0.5)
+        .expect("settle large Evolution entrance animations");
+    app.run_until_idle()
+        .expect("finish large Evolution animation frame");
+    capture("contextual-sizes-evolution", &window);
+
+    shared.borrow_mut().active_tab = Tab::Sinomo;
+    root.dispatch_event(Event::Window(WindowEvent::RedrawRequested))
+        .expect("show scaled Chat");
+    app.run_until_idle().expect("settle contextual Chat layout");
+    capture("contextual-sizes-chat-wide", &window);
+    root.dispatch_event(Event::Window(WindowEvent::Resized(Size::new(600.0, 820.0))))
+        .expect("resize Chat below its compact breakpoint");
+    app.run_until_idle().expect("settle compact Chat");
+    capture("contextual-sizes-chat-narrow", &window);
+
+    shared.borrow_mut().active_tab = Tab::Files;
+    root.dispatch_event(Event::Window(WindowEvent::Resized(Size::new(
+        1280.0, 720.0,
+    ))))
+    .expect("resize scaled Files");
+    root.dispatch_event(Event::Window(WindowEvent::RedrawRequested))
+        .expect("show scaled Files");
+    app.run_until_idle().expect("settle large Files layout");
+    capture("contextual-sizes-files", &window);
+
+    shared.borrow_mut().active_tab = Tab::Cluster;
+    root.dispatch_event(Event::Window(WindowEvent::RedrawRequested))
+        .expect("show scaled Cluster");
+    app.run_until_idle().expect("settle large Cluster layout");
+    capture("contextual-sizes-cluster", &window);
+}
+
 /// Deterministic responsive captures for the rebuilt (composed) Settings tab: wide master/detail
 /// in dark + light, and the narrow drill-down menu + detail. Sets `selected` directly rather than
 /// relying on click coordinates so the captures stay stable as the composed layout evolves.

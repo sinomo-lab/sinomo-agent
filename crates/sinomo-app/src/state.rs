@@ -19,7 +19,7 @@ use sinomo_runtime::{api::DaemonStatus, local::SinomoDataDir};
 
 use crate::backend::{Backend, Connection, app_config, probe_runtime_connection};
 use crate::rendering::{AppRenderMode, resolve_render_options};
-use crate::theme::{AppThemeMode, resolve_theme};
+use crate::theme::{AppTextScale, AppThemeMode, resolve_theme_with_preferences};
 use crate::ui::chat::ChatState;
 use crate::ui::cluster::ClusterState;
 use crate::ui::evolution::EvolutionState;
@@ -296,6 +296,7 @@ impl ReadyState {
 pub struct AppState {
     pub active_tab: Tab,
     pub theme_mode: AppThemeMode,
+    pub text_scale: AppTextScale,
     pub render_mode: AppRenderMode,
     pub data_dir: Arc<SinomoDataDir>,
     /// Renderer-device bridge for app-owned custom GPU textures. Multimedia
@@ -326,10 +327,12 @@ impl AppState {
     pub fn connecting() -> Self {
         let data_dir = Arc::new(app_config::default_data_dir());
         let theme_mode = app_config::load_theme(&data_dir);
+        let text_scale = app_config::load_text_scale(&data_dir);
         let render_mode = app_config::load_render_mode(&data_dir);
         Self {
             active_tab: Tab::Sinomo,
             theme_mode,
+            text_scale,
             render_mode,
             data_dir,
             external_texture_registry: sui::WgpuExternalTextureRegistry::new(),
@@ -348,11 +351,13 @@ impl AppState {
     pub fn ready(backend: Backend) -> Self {
         let data_dir = backend.data_dir.clone();
         let theme_mode = app_config::load_theme(&data_dir);
+        let text_scale = app_config::load_text_scale(&data_dir);
         let render_mode = app_config::load_render_mode(&data_dir);
         let connection_health = ConnectionHealth::from_backend(&backend);
         Self {
             active_tab: Tab::Sinomo,
             theme_mode,
+            text_scale,
             render_mode,
             data_dir,
             external_texture_registry: sui::WgpuExternalTextureRegistry::new(),
@@ -368,7 +373,7 @@ impl AppState {
 
     /// The resolved widget theme for the current mode.
     pub fn theme(&self) -> DefaultTheme {
-        resolve_theme(self.theme_mode)
+        resolve_theme_with_preferences(self.theme_mode, self.text_scale)
     }
 
     pub fn render_options(&self) -> WindowRenderOptions {
@@ -550,10 +555,12 @@ impl Shared {
                 ConnectEvent::Connected(ready) => {
                     let data_dir = ready.backend.data_dir.clone();
                     let theme_mode = app_config::load_theme(&data_dir);
+                    let text_scale = app_config::load_text_scale(&data_dir);
                     let render_mode = app_config::load_render_mode(&data_dir);
                     let connection_health = ConnectionHealth::from_backend(&ready.backend);
                     let mut state = self.0.borrow_mut();
                     state.theme_mode = theme_mode;
+                    state.text_scale = text_scale;
                     state.render_mode = render_mode;
                     state.data_dir = data_dir;
                     state.status = ready.backend.mode_label();
@@ -845,6 +852,20 @@ impl Shared {
         };
         if let Err(error) = app_config::save_render_mode(&data_dir, mode) {
             tracing::warn!(%error, "failed to persist app render preference");
+        }
+    }
+
+    pub fn set_text_scale(&self, scale: AppTextScale) {
+        let data_dir = {
+            let mut state = self.0.borrow_mut();
+            if state.text_scale == scale {
+                return;
+            }
+            state.text_scale = scale;
+            state.data_dir.clone()
+        };
+        if let Err(error) = app_config::save_text_scale(&data_dir, scale) {
+            tracing::warn!(%error, "failed to persist app text-scale preference");
         }
     }
 }

@@ -29,12 +29,12 @@ use sinomo_cli::app_api::{
     AgentSummary, ProviderSummary, SkillDetail, SkillMutationResult, SkillSummary, agent_summaries,
 };
 use sui::{
-    Alignment, ArrangeCtx, Constraints, DefaultTheme, Event, EventCtx, FieldGroup, FontWeight,
-    FormRow, FormSection, IconGlyph, Label, ListItem, ListView, MeasureCtx, PaintCtx,
-    PointerEventKind, ProgressBar, Rect, ScrollState, ScrollView, Select, SemanticTone,
-    SemanticsCtx, Separator, Size, SizedBox, Spinner, Stack, StatusBadge, Switch, SwitchView,
-    TabBar, TextArea, TextInput, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    WindowEvent,
+    Alignment, ArrangeCtx, Constraints, ControlSize, DefaultTheme, Event, EventCtx, FieldGroup,
+    Flex, FlexItem, FlexWrap, FontWeight, FormRow, FormSection, IconGlyph, Label, ListItem,
+    ListView, MeasureCtx, PaintCtx, PointerEventKind, ProgressBar, Rect, ScrollState, ScrollView,
+    Select, SemanticTone, SemanticsCtx, Separator, Size, SizedBox, Spinner, Stack, StatusBadge,
+    Switch, SwitchView, TabBar, TextArea, TextInput, Widget, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, WindowEvent,
 };
 
 use sinomo_runtime::config::{
@@ -62,7 +62,7 @@ use crate::backend::config::{
 use crate::backend::modules::{ModuleConfigSnapshot, ModuleObservedState};
 use crate::rendering::AppRenderMode;
 use crate::state::{Shared, Tab};
-use crate::theme::{AppThemeMode, Palette};
+use crate::theme::{AppTextScale, AppThemeMode, Palette};
 use crate::ui::widgets;
 use sinomo_runtime::module::ModuleRuntimeConfigSource;
 
@@ -3367,7 +3367,11 @@ pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
     match section {
         SettingsSection::Appearance => {
             let app = shared.borrow();
-            format!("{} · {}", app.theme_mode.label(), app.render_mode.label())
+            format!(
+                "{} · {} text",
+                app.theme_mode.label(),
+                app.text_scale.label()
+            )
         }
         SettingsSection::Connection => {
             if connection_issue_count(shared) > 0 {
@@ -3466,6 +3470,14 @@ fn palette(shared: &Shared) -> Palette {
 fn muted_label(shared: &Shared, text: impl Into<String>) -> Label {
     let s = shared.clone();
     Label::new(text).color_when(move || palette(&s).text_muted)
+}
+
+fn settings_meta_size(shared: &Shared) -> f32 {
+    shared.theme().text.sm.size
+}
+
+fn settings_micro_size(shared: &Shared) -> f32 {
+    shared.theme().text.xs.size
 }
 
 fn primary_label(shared: &Shared, text: impl Into<String>) -> Label {
@@ -3705,13 +3717,29 @@ fn copyable_text_row(
     label: &str,
     value: impl Into<String>,
 ) -> FormRow {
+    let value = value.into();
     let input = TextInput::new(name)
-        .value(value)
+        .value(value.clone())
         .read_only()
         .theme_when(clone_reader(reader));
-    FormRow::new(label, input)
-        .stacked()
-        .theme_when(clone_reader(reader))
+    let copy_value = value;
+    let copy = sui::Button::new("Copy")
+        .semantic_name(format!("Copy {label}"))
+        .description(format!("Copy the full {label} to the clipboard"))
+        .icon(IconGlyph::Restore)
+        .theme_when(secondary_button_theme(reader))
+        .on_press_with_ctx(move |ctx| ctx.set_clipboard_text(&copy_value));
+    FormRow::new(
+        label,
+        Flex::horizontal()
+            .wrap(FlexWrap::Wrap)
+            .gap(8.0)
+            .align_items(Alignment::Center)
+            .with_item(input, FlexItem::fill().min_width(220.0))
+            .with_item(copy, FlexItem::new().no_shrink()),
+    )
+    .stacked()
+    .theme_when(clone_reader(reader))
 }
 
 /// A stacked read-only text area for longer generated values.
@@ -3721,15 +3749,34 @@ fn copyable_area_row(
     label: &str,
     value: impl Into<String>,
 ) -> FormRow {
+    let value = value.into();
     let area = SizedBox::new().height(72.0).with_child(
         TextArea::new(name)
-            .value(value)
+            .value(value.clone())
             .read_only()
             .theme_when(clone_reader(reader)),
     );
-    FormRow::new(label, area)
-        .stacked()
-        .theme_when(clone_reader(reader))
+    let copy_value = value;
+    let copy = sui::Button::new("Copy")
+        .semantic_name(format!("Copy {label}"))
+        .description(format!("Copy the full {label} to the clipboard"))
+        .icon(IconGlyph::Restore)
+        .theme_when(secondary_button_theme(reader))
+        .on_press_with_ctx(move |ctx| ctx.set_clipboard_text(&copy_value));
+    FormRow::new(
+        label,
+        Stack::vertical()
+            .spacing(8.0)
+            .alignment(Alignment::Stretch)
+            .with_child(area)
+            .with_child(
+                Stack::horizontal()
+                    .alignment(Alignment::Start)
+                    .with_child(copy),
+            ),
+    )
+    .stacked()
+    .theme_when(clone_reader(reader))
 }
 
 /// A toggle row: `label` + a `Switch` seeded `on`, calling `on_toggle` when flipped.
@@ -3925,6 +3972,13 @@ fn mode_to_index(mode: AppThemeMode) -> usize {
     }
 }
 
+fn text_scale_to_index(scale: AppTextScale) -> usize {
+    AppTextScale::ALL
+        .iter()
+        .position(|candidate| *candidate == scale)
+        .unwrap_or_default()
+}
+
 fn index_to_render_mode(i: usize) -> AppRenderMode {
     match i {
         1 => AppRenderMode::ForceSdr,
@@ -3961,7 +4015,10 @@ fn render_mode_hint(mode: AppRenderMode) -> &'static str {
 }
 
 fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let mode_index = mode_to_index(shared.borrow().theme_mode);
+    let (mode_index, text_scale) = {
+        let app = shared.borrow();
+        (mode_to_index(app.theme_mode), app.text_scale)
+    };
     let tab_bar = {
         let s = shared.clone();
         TabBar::new("theme")
@@ -3970,6 +4027,18 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
             .theme_when(clone_reader(reader))
             .on_change(move |i, _| {
                 s.set_theme_mode(index_to_mode(i));
+            })
+    };
+    let text_scale_select = {
+        let s = shared.clone();
+        Select::new("text-scale")
+            .options(AppTextScale::ALL.map(AppTextScale::label))
+            .selected(text_scale_to_index(text_scale))
+            .theme_when(clone_reader(reader))
+            .on_change(move |index, _| {
+                if let Some(scale) = AppTextScale::ALL.get(index).copied() {
+                    s.set_text_scale(scale);
+                }
             })
     };
     let render_select = {
@@ -3994,6 +4063,27 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
     );
     let theme_section = FormSection::new("Appearance", theme_body)
         .description("Choose the app theme used by every tab.")
+        .theme_when(clone_reader(reader));
+
+    let scale_body = FieldGroup::new()
+        .spacing(8.0)
+        .with_child(
+            FormRow::new("Text size", text_scale_select)
+                .inline()
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormRow::new(
+                "Preview",
+                muted_label(shared, format!("{} text", text_scale.label())),
+            )
+            .stacked()
+            .theme_when(clone_reader(reader)),
+        );
+    let scale_section = FormSection::new("Typography", scale_body)
+        .description(
+            "Text size changes typography without inflating interface controls or spacing.",
+        )
         .theme_when(clone_reader(reader));
 
     let current_render_mode = shared.render_mode();
@@ -4026,6 +4116,7 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
         .spacing(12.0)
         .alignment(Alignment::Stretch)
         .with_child(theme_section)
+        .with_child(scale_section)
         .with_child(render_section)
 }
 
@@ -4081,15 +4172,17 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
     let status = {
         let s = shared.clone();
         Label::new("Needs attention")
-            .font_size(12.0)
+            .font_size(settings_meta_size(shared))
             .color_when(move || palette(&s).warn)
     };
-    let summary = muted_label(shared, connection_issue_summary(&issue)).font_size(12.0);
-    let recovery = muted_label(shared, connection_issue_recovery_hint(&issue)).font_size(12.0);
+    let summary =
+        muted_label(shared, connection_issue_summary(&issue)).font_size(settings_meta_size(shared));
+    let recovery = muted_label(shared, connection_issue_recovery_hint(&issue))
+        .font_size(settings_meta_size(shared));
     let detail_label = {
         let s = shared.clone();
         Label::new("Low-level detail")
-            .font_size(11.0)
+            .font_size(settings_meta_size(shared))
             .color_when(move || palette(&s).text_faint)
     };
     let detail_field = {
@@ -4139,9 +4232,10 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
         .alignment(Alignment::Stretch)
         .with_child(status)
         .with_child(summary);
-    let mut controls = Stack::horizontal()
-        .spacing(8.0)
-        .alignment(Alignment::Start)
+    let mut controls = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(8.0)
+        .align_items(Alignment::Start)
         .with_child(button);
     if let Some(sifs_button) = sifs_button {
         controls = controls.with_child(sifs_button);
@@ -4416,9 +4510,10 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                     "This leaves the current cluster and starts a fresh single-node cluster on this device.",
                 ))
                 .with_child(
-                    Stack::horizontal()
-                        .spacing(8.0)
-                        .alignment(Alignment::Start)
+                    Flex::horizontal()
+                        .wrap(FlexWrap::Wrap)
+                        .gap(8.0)
+                        .align_items(Alignment::Start)
                         .with_child(confirm)
                         .with_child(cancel),
                 );
@@ -4513,13 +4608,13 @@ fn cluster_join_controls(shared: &Shared, reader: &ThemeReader, clustered: bool)
                 .to_string()
         };
         controls = controls
-            .with_child(muted_label(shared, impact).font_size(11.0))
+            .with_child(muted_label(shared, impact).font_size(settings_meta_size(shared)))
             .with_child(
                 muted_label(
                     shared,
                     "Recovery: if the target join fails, Sinomo restores the source cluster automatically. After an interrupted migration, restart the daemon and run `sinomo cluster status` before retrying.",
                 )
-                .font_size(11.0),
+                .font_size(settings_meta_size(shared)),
             );
         let confirm = {
             let s = shared.clone();
@@ -4559,9 +4654,10 @@ fn cluster_join_controls(shared: &Shared, reader: &ThemeReader, clustered: bool)
                 .on_press(move || s.settings_mut().cancel_join_cluster())
         };
         controls = controls.with_child(
-            Stack::horizontal()
-                .spacing(8.0)
-                .alignment(Alignment::Start)
+            Flex::horizontal()
+                .wrap(FlexWrap::Wrap)
+                .gap(8.0)
+                .align_items(Alignment::Start)
                 .with_child(confirm)
                 .with_child(cancel),
         );
@@ -4635,12 +4731,9 @@ fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             settings.version.clone(),
             settings.mode_label.clone(),
             short_one_line(&settings.status_detail, 96),
-            short(&settings.node_id, 38),
+            settings.node_id.clone(),
             app_surface_summary(&settings.role),
-            settings
-                .cluster_node_id
-                .as_deref()
-                .map(|node_id| short(node_id, 38)),
+            settings.cluster_node_id.clone(),
             settings
                 .cluster_summary
                 .clone()
@@ -4667,10 +4760,20 @@ fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .spacing(6.0)
         .with_child(value_row(shared, reader, "Mode", mode_label))
         .with_child(value_row(shared, reader, "Status", status_detail))
-        .with_child(value_row(shared, reader, "App surface", app_surface_id))
+        .with_child(copyable_text_row(
+            reader,
+            "about-app-surface-id",
+            "App surface ID",
+            app_surface_id,
+        ))
         .with_child(value_row(shared, reader, "Surface role", surface_role));
     if let Some(cluster_node_id) = cluster_node_id {
-        runtime = runtime.with_child(value_row(shared, reader, "Daemon node", cluster_node_id));
+        runtime = runtime.with_child(copyable_text_row(
+            reader,
+            "about-daemon-node-id",
+            "Daemon node ID",
+            cluster_node_id,
+        ));
     }
     runtime = runtime.with_child(value_row(shared, reader, "Cluster", cluster_summary));
     Stack::vertical()
@@ -4938,9 +5041,10 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
     body = body.with_child(
         FormRow::new(
             "Actions",
-            Stack::horizontal()
-                .spacing(8.0)
-                .alignment(Alignment::Center)
+            Flex::horizontal()
+                .wrap(FlexWrap::Wrap)
+                .gap(8.0)
+                .align_items(Alignment::Center)
                 .with_child(test_control)
                 .with_child(detail_button),
         )
@@ -5619,10 +5723,14 @@ fn provider_management_row(
             ))
             .with_child(controls);
         if let Some(error) = action_error {
-            stack = stack.with_child(Label::new(error).font_size(11.0).color_when({
-                let s = shared.clone();
-                move || palette(&s).accent
-            }));
+            stack = stack.with_child(
+                Label::new(error)
+                    .font_size(settings_meta_size(shared))
+                    .color_when({
+                        let s = shared.clone();
+                        move || palette(&s).accent
+                    }),
+            );
         }
         FormRow::new("Management", stack)
             .stacked()
@@ -5946,9 +6054,10 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
                 queue_settings_operation(&s, SettingsOperationScope::Providers, operation);
             })
     };
-    let actions = Stack::horizontal()
-        .spacing(8.0)
-        .alignment(Alignment::Center)
+    let actions = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(8.0)
+        .align_items(Alignment::Center)
         .with_child(cancel)
         .with_child(add);
     body = body.with_child(
@@ -6095,9 +6204,10 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         .with_child(
             FormRow::new(
                 "Actions",
-                Stack::horizontal()
-                    .spacing(8.0)
-                    .alignment(Alignment::Start)
+                Flex::horizontal()
+                    .wrap(FlexWrap::Wrap)
+                    .gap(8.0)
+                    .align_items(Alignment::Start)
                     .with_child(new_agent)
                     .with_child(duplicate)
                     .with_child(refresh),
@@ -6259,9 +6369,10 @@ fn agent_package_management_section(shared: &Shared, reader: &ThemeReader) -> im
         .with_child(
             FormRow::new(
                 "Checks",
-                Stack::horizontal()
-                    .spacing(8.0)
-                    .alignment(Alignment::Start)
+                Flex::horizontal()
+                    .wrap(FlexWrap::Wrap)
+                    .gap(8.0)
+                    .align_items(Alignment::Start)
                     .with_child(validate)
                     .with_child(test),
             )
@@ -6541,9 +6652,10 @@ fn agent_actions_row(shared: &Shared, reader: &ThemeReader) -> FormRow {
     let delete_controls = agent_delete_controls(shared, reader);
     FormRow::new(
         "Actions",
-        Stack::horizontal()
-            .spacing(8.0)
-            .alignment(Alignment::Start)
+        Flex::horizontal()
+            .wrap(FlexWrap::Wrap)
+            .gap(8.0)
+            .align_items(Alignment::Start)
             .with_child(save)
             .with_child(duplicate)
             .with_child(delete_controls),
@@ -6592,16 +6704,18 @@ fn agent_delete_controls(shared: &Shared, reader: &ThemeReader) -> impl Widget +
                 .theme_when(secondary_button_theme(reader))
                 .on_press(move || s.settings_mut().cancel_agent_delete())
         };
-        return Stack::horizontal()
-            .spacing(8.0)
-            .alignment(Alignment::Start)
+        return Flex::horizontal()
+            .wrap(FlexWrap::Wrap)
+            .gap(8.0)
+            .align_items(Alignment::Start)
             .with_child(confirm)
             .with_child(cancel);
     }
     let s = shared.clone();
-    Stack::horizontal()
-        .spacing(8.0)
-        .alignment(Alignment::Start)
+    Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(8.0)
+        .align_items(Alignment::Start)
         .with_child(
             sui::Button::new("Delete agent")
                 .icon(sui::IconGlyph::Trash)
@@ -6632,7 +6746,12 @@ fn agent_readonly_section(
                 .map(|summary| summary.readiness)
                 .unwrap_or(AgentReadiness::NeedsAttention),
         ))
-        .with_child(value_row(shared, reader, "Agent ID", definition.key()))
+        .with_child(copyable_text_row(
+            reader,
+            "agent-readonly-id",
+            "Agent ID",
+            definition.key(),
+        ))
         .with_child(value_row(
             shared,
             reader,
@@ -7092,9 +7211,10 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         .with_child(
             FormRow::new(
                 "Actions",
-                Stack::horizontal()
-                    .spacing(8.0)
-                    .alignment(Alignment::Start)
+                Flex::horizontal()
+                    .wrap(FlexWrap::Wrap)
+                    .gap(8.0)
+                    .align_items(Alignment::Start)
                     .with_child(refresh),
             )
             .inline()
@@ -7301,11 +7421,11 @@ fn module_config_section(
                 .stacked()
                 .theme_when(clone_reader(reader)),
         )
-        .with_child(value_row(
-            shared,
+        .with_child(copyable_text_row(
             reader,
+            "module-technical-id",
             "Technical ID",
-            module_display_id(&module.module_id),
+            module.module_id.clone(),
         ))
         .with_child(value_row(
             shared,
@@ -7554,9 +7674,10 @@ fn section_skills_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
     summary_body = summary_body.with_child(
         FormRow::new(
             "Actions",
-            Stack::horizontal()
-                .spacing(8.0)
-                .alignment(Alignment::Start)
+            Flex::horizontal()
+                .wrap(FlexWrap::Wrap)
+                .gap(8.0)
+                .align_items(Alignment::Start)
                 .with_child(import)
                 .with_child(refresh),
         )
@@ -7828,9 +7949,10 @@ fn skill_detail_section(
     body = body.with_child(
         FormRow::new(
             "Actions",
-            Stack::horizontal()
-                .spacing(8.0)
-                .alignment(Alignment::Start)
+            Flex::horizontal()
+                .wrap(FlexWrap::Wrap)
+                .gap(8.0)
+                .align_items(Alignment::Start)
                 .with_child(activate)
                 .with_child(export)
                 .with_child(text),
@@ -7944,14 +8066,14 @@ fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widge
     let summary_label = {
         let s = shared.clone();
         Label::new(summary)
-            .font_size(12.0)
+            .font_size(settings_meta_size(shared))
             .color_when(move || palette(&s).text_muted)
     };
     let meta_label = {
         let s = shared.clone();
         let metadata = metadata.clone();
         Label::new(metadata.clone())
-            .font_size(10.5)
+            .font_size(settings_micro_size(shared))
             .text_when({
                 let s = s.clone();
                 let row_key = row_key.clone();
@@ -8004,7 +8126,8 @@ fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widge
         .with_child(summary_label)
         .with_child(meta_label);
     if !description.is_empty() {
-        details = details.with_child(muted_label(shared, description).font_size(11.0));
+        details = details
+            .with_child(muted_label(shared, description).font_size(settings_meta_size(shared)));
     }
     details = details.with_child(Stack::horizontal().with_child(disclosure));
     if expanded {
@@ -8053,7 +8176,7 @@ fn config_detail_editor(
     let mut stack = Stack::vertical()
         .spacing(5.0)
         .alignment(Alignment::Stretch)
-        .with_child(muted_label(shared, note).font_size(11.0))
+        .with_child(muted_label(shared, note).font_size(settings_meta_size(shared)))
         .with_child(SizedBox::new().height(112.0).with_child(editor));
     if editable {
         let save = {
@@ -8087,7 +8210,9 @@ fn config_schema_editor(
 ) -> impl Widget + use<> {
     let mut stack = Stack::vertical().spacing(8.0).alignment(Alignment::Stretch);
     if !schema.description.trim().is_empty() {
-        stack = stack.with_child(muted_label(shared, schema.description.clone()).font_size(11.0));
+        stack = stack.with_child(
+            muted_label(shared, schema.description.clone()).font_size(settings_meta_size(shared)),
+        );
     }
     stack.with_child(PodHost::new(config_schema_value_editor(
         shared,
@@ -8218,10 +8343,14 @@ fn config_schema_map_editor(
     let mut summary_body = Stack::vertical()
         .spacing(4.0)
         .alignment(Alignment::Stretch)
-        .with_child(muted_label(shared, format!("{} entries", entries.len())).font_size(12.0));
+        .with_child(
+            muted_label(shared, format!("{} entries", entries.len()))
+                .font_size(settings_meta_size(shared)),
+        );
     if !description.trim().is_empty() {
-        summary_body =
-            summary_body.with_child(muted_label(shared, description.to_string()).font_size(11.0));
+        summary_body = summary_body.with_child(
+            muted_label(shared, description.to_string()).font_size(settings_meta_size(shared)),
+        );
     }
     group = group.with_child(
         FormRow::new(label, summary_body)
@@ -8357,8 +8486,10 @@ fn config_schema_primitive_row(
                 .alignment(Alignment::Stretch)
                 .with_child(select);
             if !description.trim().is_empty() {
-                body =
-                    body.with_child(muted_label(shared, description.to_string()).font_size(11.0));
+                body = body.with_child(
+                    muted_label(shared, description.to_string())
+                        .font_size(settings_meta_size(shared)),
+                );
             }
             WidgetPod::new(
                 FormRow::new(label, body)
@@ -8451,7 +8582,8 @@ fn config_schema_primitive_row(
                 .and_then(|key| shared.settings().field_errors.get(&key).cloned())
                 .unwrap_or_else(|| schema_field_detail(schema, description));
             if !detail.trim().is_empty() {
-                body = body.with_child(muted_label(shared, detail).font_size(11.0));
+                body = body
+                    .with_child(muted_label(shared, detail).font_size(settings_meta_size(shared)));
             }
             WidgetPod::new(
                 FormRow::new(label, body)
@@ -8560,7 +8692,7 @@ fn config_schema_json_row(
         .and_then(|key| shared.settings().field_errors.get(key).cloned())
         .unwrap_or_else(|| schema_field_detail(schema, description));
     if !detail.trim().is_empty() {
-        body = body.with_child(muted_label(shared, detail).font_size(11.0));
+        body = body.with_child(muted_label(shared, detail).font_size(settings_meta_size(shared)));
     }
     WidgetPod::new(
         FormRow::new(label, body)
@@ -9022,12 +9154,12 @@ fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let heading = {
         let s = shared.clone();
         Label::new("SETTINGS")
-            .font_size(11.5)
+            .font_size(settings_micro_size(shared))
             .style({
                 let theme = shared.theme();
                 sui::TextStyle {
-                    font_size: 11.5,
-                    line_height: 18.0,
+                    font_size: settings_micro_size(shared),
+                    line_height: theme.text.xs.line_height,
                     weight: FontWeight::SEMIBOLD,
                     ..theme.body_text_style()
                 }
@@ -9462,8 +9594,6 @@ fn open_url_with_system_browser(_url: &str) -> Result<(), String> {
     Err("opening URLs is not supported on this platform".to_string())
 }
 
-const STATUS_LINE_H: f32 = 18.0;
-
 impl Widget for StatusReflector {
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
         if !matches!(event, Event::Window(WindowEvent::RedrawRequested)) {
@@ -9481,6 +9611,7 @@ impl Widget for StatusReflector {
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let line_height = self.shared.theme().text.sm.line_height;
         let width = if constraints.max.width.is_finite() {
             constraints.max.width
         } else {
@@ -9488,9 +9619,9 @@ impl Widget for StatusReflector {
         };
         let link_size = self.link.measure(
             ctx,
-            Constraints::new(Size::ZERO, Size::new(width, STATUS_LINE_H)),
+            Constraints::new(Size::ZERO, Size::new(width, line_height)),
         );
-        let height = STATUS_LINE_H
+        let height = line_height
             + if link_size.height > 0.0 {
                 link_size.height
             } else {
@@ -9500,12 +9631,13 @@ impl Widget for StatusReflector {
     }
 
     fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let line_height = self.shared.theme().text.sm.line_height;
         let link_height = self.link.measured_size().height;
         self.link.arrange(
             ctx,
             Rect::new(
                 bounds.x(),
-                bounds.y() + STATUS_LINE_H,
+                bounds.y() + line_height,
                 bounds.width(),
                 link_height,
             ),
@@ -9525,7 +9657,12 @@ impl Widget for StatusReflector {
         let primary_style = pal.text_style(&theme, 12.0, FontWeight::MEDIUM, primary_color);
         widgets::draw_text_in(
             ctx,
-            Rect::new(bounds.x(), bounds.y(), bounds.width(), STATUS_LINE_H),
+            Rect::new(
+                bounds.x(),
+                bounds.y(),
+                bounds.width(),
+                theme.text.sm.line_height,
+            ),
             &primary,
             primary_style,
         );
@@ -9576,13 +9713,14 @@ pub struct SettingsView {
     /// The Connection attention card is built from app-layer Chat/Files health snapshots. Those can
     /// change after startup (Files is loaded lazily), so rebuild the composed pods when they do.
     last_connection_issue_key: RefCell<String>,
+    last_scale_key: Cell<AppTextScale>,
 }
 
 impl SettingsView {
     pub fn new(shared: Shared) -> Self {
         let theme_reader: ThemeReader = {
             let s = shared.clone();
-            Rc::new(move || s.theme())
+            Rc::new(move || settings_control_theme(&s))
         };
         // One shared scroll state so position is consistent across the wide/narrow swap.
         let scroll_state = ScrollState::new();
@@ -9590,6 +9728,7 @@ impl SettingsView {
         let narrow = narrow_pod(&shared, &theme_reader, &scroll_state);
         let last_selected = Cell::new(shared.settings().selected);
         let last_connection_issue_key = RefCell::new(connection_issue_key(&shared));
+        let last_scale_key = Cell::new(settings_scale_key(&shared));
         Self {
             shared,
             theme_reader,
@@ -9600,6 +9739,7 @@ impl SettingsView {
             use_wide: Cell::new(true),
             last_selected,
             last_connection_issue_key,
+            last_scale_key,
         }
     }
 
@@ -9616,6 +9756,16 @@ impl SettingsView {
         }
         *last = current;
         drop(last);
+        self.rebuild_pods();
+        true
+    }
+
+    fn sync_scale(&mut self) -> bool {
+        let current = settings_scale_key(&self.shared);
+        if current == self.last_scale_key.get() {
+            return false;
+        }
+        self.last_scale_key.set(current);
         self.rebuild_pods();
         true
     }
@@ -9661,7 +9811,12 @@ impl Widget for SettingsView {
             let operations_changed = pump_background_operations(&self.shared);
             let current = self.shared.settings().selected;
             let issues_changed = self.sync_connection_issues();
-            if current != self.last_selected.get() || issues_changed || operations_changed {
+            let scale_changed = self.sync_scale();
+            if current != self.last_selected.get()
+                || issues_changed
+                || scale_changed
+                || operations_changed
+            {
                 self.last_selected.set(current);
                 ctx.request_measure();
                 ctx.request_arrange();
@@ -9673,6 +9828,7 @@ impl Widget for SettingsView {
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
         self.sync_connection_issues();
+        self.sync_scale();
         let use_wide = constraints.max.width >= WIDE_THRESHOLD;
         self.use_wide.set(use_wide);
         // A measure pass lays out the currently-active child, so the navigation cache is now
@@ -9706,6 +9862,18 @@ impl Widget for SettingsView {
             visitor.visit(&mut self.narrow);
         }
     }
+}
+
+fn settings_scale_key(shared: &Shared) -> AppTextScale {
+    shared.borrow().text_scale
+}
+
+fn settings_control_theme(shared: &Shared) -> DefaultTheme {
+    let mut theme = shared.theme().with_size(ControlSize::Small);
+    theme.metrics.form_row_label_width = 132.0;
+    theme.metrics.form_row_control_width = 520.0;
+    theme.metrics.form_section_max_width = 860.0;
+    theme
 }
 
 fn short(s: &str, max: usize) -> String {
@@ -10788,6 +10956,78 @@ mod tests {
     }
 
     #[test]
+    fn copyable_identifier_row_copies_the_full_unshortened_value() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let reader: ThemeReader = {
+            let s = shared.clone();
+            Rc::new(move || s.theme())
+        };
+        let full_id = "node-01jz7x9m4k2p8q6r5s3t1v0w9y";
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Copy identifier")
+                    .root(copyable_text_row(
+                        &reader,
+                        "copy-node-id",
+                        "Node ID",
+                        full_id,
+                    )),
+            )
+            .build()?;
+        let clipboard = runtime.clipboard();
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Copy Node ID")
+            .click()?;
+        assert_eq!(clipboard.text().as_deref(), Some(full_id));
+
+        Ok(())
+    }
+
+    #[test]
+    fn appearance_exposes_text_scaling_without_a_global_ui_size() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            app.ready
+                .as_mut()
+                .expect("ready state")
+                .settings
+                .open(SettingsSection::Appearance);
+        }
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Appearance scaling")
+                    .root(view(shared)),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::ComboBox)
+            .with_name("text-scale")
+            .expect()
+            .to_have_value("Standard")?;
+        window
+            .get_by_role(sui::SemanticsRole::ComboBox)
+            .with_name("ui-scale")
+            .expect()
+            .to_have_count(0)?;
+        window.get_by_text("Typography").expect().to_be_visible()?;
+
+        Ok(())
+    }
+
+    #[test]
     fn provider_model_edit_reports_saved_status_and_persists() {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend.clone()));
@@ -11542,9 +11782,17 @@ mod tests {
                 .count()?
                 >= 1
         );
-        assert!(window.get_by_text("node_about_test").count()? >= 1);
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("about-app-surface-id")
+            .expect()
+            .to_have_value("node_about_test")?;
         assert!(window.get_by_text("voter app surface").count()? >= 1);
-        assert!(window.get_by_text("daemon_node_about_test").count()? >= 1);
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("about-daemon-node-id")
+            .expect()
+            .to_have_value("daemon_node_about_test")?;
         assert!(window.get_by_text("cluster test · voter").count()? >= 1);
 
         Ok(())

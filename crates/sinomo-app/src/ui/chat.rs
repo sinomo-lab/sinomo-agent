@@ -48,10 +48,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sui::{
     ActionTilePaint, Alignment, ArrangeCtx, CalloutPaint, CodePanelPaint, CodeTextLine,
-    CodeTextPaint, CodeTextSpan, Color, CommandButtonPaint, Constraints, ContextMenu, CustomEvent,
-    DefaultTheme, DisclosureButtonPaint, Dock, EmptyStatePaint, Event, EventCtx, FixedPaneSplit,
-    Flex, FlexItem, FlexWrap, FontWeight, Icon, IconButton, IconButtonPaint, IconGlyph,
-    ImageHandle, ImageSource, Insets, KeyState, Label, ListItem, ListView, MeasureCtx,
+    CodeTextPaint, CodeTextSpan, Color, CommandButtonPaint, Constraints, ContextMenu, ControlSize,
+    CustomEvent, DefaultTheme, DisclosureButtonPaint, Dock, EmptyStatePaint, Event, EventCtx,
+    FixedPaneSplit, Flex, FlexItem, FlexWrap, FontWeight, Icon, IconButton, IconButtonPaint,
+    IconGlyph, ImageHandle, ImageSource, Insets, KeyState, Label, ListItem, ListView, MeasureCtx,
     MeasuredBottomDock, MenuItem, PaintCtx, Path, Point, PointerButton, PointerEventKind,
     RebuildOnChange, RebuildOnConstraints, Rect, RegisteredImage, RichTextSourceMap, ScrollBar,
     ScrollDelta, ScrollState, ScrollView, SectionLabel, SectionPanelPaint, SegmentedControl,
@@ -90,7 +90,7 @@ use crate::backend::chat_engine::{
 };
 use crate::backend::sifs::SifsDaemonAccess;
 use crate::state::{Shared, Tab};
-use crate::theme::Palette;
+use crate::theme::{AppTextScale, Palette};
 use crate::ui::chat_render::{
     self, ChatCodeBlock, ChatMarkdownRender, ChatMarkdownStyles, ChatRichRenderBlock,
 };
@@ -107,14 +107,15 @@ use crate::ui::widgets;
 const WIDE_THRESHOLD: f32 = 620.0;
 const SIDEBAR_W: f32 = 250.0;
 const COMPACT_HEADER_H: f32 = 54.0;
-// Expanded media content is 341px tall at its fixed row sizes. Keep a small
-// buffer for theme rounding without taking an extra transcript row.
+// Small media instruments preserve the useful 16:9 preview without consuming transcript space.
 const MEDIA_CALL_H: f32 = 352.0;
 const MEDIA_CALL_COMPACT_H: f32 = 46.0;
 const CHAT_MEDIA_DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(65);
 #[cfg(not(test))]
 static CHAT_MEDIA_CAMERA_OPEN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 const PAD: f32 = 16.0;
+// Agent and conversation rows carry two short lines, so they sit one step above a one-line Small
+// data row while remaining denser than a standard content row.
 const SIDEBAR_ROW_H: f32 = 36.0;
 const SIDEBAR_ROW_EDIT_W: f32 = 26.0;
 const SIDEBAR_ROW_EDIT_H: f32 = 24.0;
@@ -136,9 +137,9 @@ const COMPOSER_CHIP_ROW_PAD_TOP: f32 = 8.0;
 const COMPOSER_BAR_PAD_X: f32 = 8.0;
 const COMPOSER_BAR_PAD_Y: f32 = 6.0;
 const COMPOSER_BAR_GAP: f32 = 4.0;
-/// Quiet bar controls are compact; Send is the one primary action and reads larger.
+/// Quiet bar controls use the Small size; Send remains a Medium primary action.
 const COMPOSER_GHOST_BUTTON_SIZE: f32 = 28.0;
-const SEND_BUTTON_SIZE: f32 = 36.0;
+const SEND_BUTTON_SIZE: f32 = 32.0;
 const COMPOSER_INPUT_MIN_LINES: usize = 2;
 /// The docked composer input grows to 160px, then scrolls (Mesh layout spec).
 const COMPOSER_INPUT_MAX_H: f32 = 160.0;
@@ -6169,14 +6170,14 @@ fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     move || reader()
 }
 
+fn small_control_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || reader().with_size(ControlSize::Small)
+}
+
 fn composer_control_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     let reader = Rc::clone(reader);
-    move || {
-        let mut theme = reader();
-        theme.typography.body_font_size = theme.text.base.size;
-        theme.typography.body_line_height = theme.text.base.line_height;
-        theme
-    }
+    move || reader().with_size(ControlSize::Small)
 }
 
 /// The composer's borderless `TextArea`: the field frame paints the composer's
@@ -6205,7 +6206,7 @@ fn composer_input_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'st
 fn ghost_icon_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     let reader = Rc::clone(reader);
     move || {
-        let mut theme = reader();
+        let mut theme = reader().with_size(ControlSize::Small);
         theme.palette.control = Color::TRANSPARENT;
         theme.palette.border = Color::TRANSPARENT;
         theme.palette.border_hover = Color::TRANSPARENT;
@@ -7586,8 +7587,8 @@ fn context_overview_summary(chat: &ChatState) -> String {
 
     if let Some(target) = chat.runtime_recovery_target() {
         return match target {
-            RuntimeRecoveryTarget::Providers => "Context waits for provider setup".to_string(),
-            RuntimeRecoveryTarget::Connection => "Context waits for cluster connection".to_string(),
+            RuntimeRecoveryTarget::Providers => "Provider setup needed".to_string(),
+            RuntimeRecoveryTarget::Connection => "Cluster connection needed".to_string(),
         };
     }
 
@@ -8107,8 +8108,8 @@ fn heading(shared: &Shared, text: &str) -> Label {
         .style({
             let theme = shared.theme();
             sui::TextStyle {
-                font_size: 11.0,
-                line_height: 18.0,
+                font_size: ui_meta_size(shared),
+                line_height: shared.theme().text.sm.line_height,
                 weight: FontWeight::SEMIBOLD,
                 ..theme.body_text_style()
             }
@@ -8135,13 +8136,17 @@ fn muted_label(shared: &Shared, text: impl Into<String>) -> Label {
     Label::new(text).color_when(move || palette(&s).text_muted)
 }
 
+fn ui_meta_size(shared: &Shared) -> f32 {
+    shared.theme().text.sm.size
+}
+
 fn dialog_section_label(shared: &Shared, text: impl Into<String>) -> Label {
     let s = shared.clone();
     let theme = shared.theme();
     Label::new(text)
         .style(sui::TextStyle {
-            font_size: 12.0,
-            line_height: 18.0,
+            font_size: ui_meta_size(shared),
+            line_height: shared.theme().text.sm.line_height,
             weight: FontWeight::SEMIBOLD,
             ..theme.body_text_style()
         })
@@ -8263,6 +8268,7 @@ fn session_kind_filter_count(sessions: &[SessionRef], kind_filter: SessionKindFi
         .count()
 }
 
+#[cfg(test)]
 fn session_kind_filter_count_label(
     sessions: &[SessionRef],
     kind_filter: SessionKindFilter,
@@ -8429,7 +8435,7 @@ fn agents_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     ListView::new("chat-agents")
         .items(items)
         .row_height(SIDEBAR_ROW_H)
-        .theme_when(clone_reader(reader))
+        .theme_when(small_control_reader(reader))
         .selected_when({
             let s = s.clone();
             move || {
@@ -8509,7 +8515,7 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             }
         })
         .row_height(SIDEBAR_ROW_H)
-        .theme_when(clone_reader(reader))
+        .theme_when(small_control_reader(reader))
         .on_change(move |index, _label| {
             let mut chat = s.chat_mut();
             if chat.session_list_loading && chat.sessions.is_empty() {
@@ -8528,12 +8534,16 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 }
 
 fn session_create_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let small_reader: ThemeReader = {
+        let reader = Rc::clone(reader);
+        Rc::new(move || reader().with_size(ControlSize::Small))
+    };
     let new_chat = {
         let s = shared.clone();
         sui::Button::new("New chat")
             .icon(IconGlyph::Chat)
-            .min_height(32.0)
-            .theme_when(clone_reader(reader))
+            .min_height(28.0)
+            .theme_when(clone_reader(&small_reader))
             .on_press(move || {
                 s.chat_mut().new_session();
             })
@@ -8542,8 +8552,8 @@ fn session_create_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget 
         let s = shared.clone();
         sui::Button::new("New channel")
             .icon(IconGlyph::Add)
-            .min_height(32.0)
-            .theme_when(secondary_button_theme(reader))
+            .min_height(28.0)
+            .theme_when(secondary_button_theme(&small_reader))
             .on_press_with_ctx(move |ctx| {
                 let waker = { s.borrow().waker.clone() };
                 s.chat_mut().new_channel(waker);
@@ -8575,7 +8585,7 @@ fn session_filter_input(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         .value(value)
         .placeholder("Search conversations")
         .leading_icon(IconGlyph::Search)
-        .theme_when(clone_reader(reader))
+        .theme_when(small_control_reader(reader))
         .on_change(move |value| {
             s.chat_mut().set_session_filter(value);
         })
@@ -8665,15 +8675,9 @@ fn session_kind_filter_control(shared: &Shared, reader: &ThemeReader) -> impl Wi
             .iter()
             .copied()
             .map(|filter| {
-                let label = format!(
-                    "{} {}",
-                    filter.label(),
-                    session_kind_filter_count_label(
-                        &chat.sessions,
-                        filter,
-                        chat.session_list_loading
-                    )
-                );
+                // Counts remain in the semantic description and the active section heading. Keep
+                // the three visible segments short enough to survive large text in the sidebar.
+                let label = filter.label().to_string();
                 let description = if chat.session_list_loading && chat.sessions.is_empty() {
                     "Loading conversations".to_string()
                 } else {
@@ -9089,7 +9093,7 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
             FlexItem::flex(1.35).min_width(112.0),
         );
     let summary = TrailingSlotRow::new(
-        dialog_section_label(shared, "History diagnostics").font_size(11.0),
+        dialog_section_label(shared, "History diagnostics").font_size(ui_meta_size(shared)),
         Flex::horizontal()
             .align_items(Alignment::Center)
             .spacer()
@@ -9110,7 +9114,7 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
                     shared,
                     "Chat and channel history stays in SIFS. You can keep chatting while it syncs.",
                 )
-                .font_size(10.5),
+                .font_size(ui_meta_size(shared)),
             )
             .with_child(SizedBox::new().height(28.0).with_child(actions))
             .with_child(SizedBox::new().height(28.0).with_child(connection));
@@ -9307,7 +9311,7 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                 shared,
                 "Untitled channel. Rename it so it is easy to recognize in the sidebar.",
             )
-            .font_size(11.0),
+            .font_size(ui_meta_size(shared)),
         );
     }
     if let Some(error) = rename_error {
@@ -9316,7 +9320,7 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                 shared,
                 format!("Rename failed: {error}. Edit the title or retry Save."),
             )
-            .font_size(11.0),
+            .font_size(ui_meta_size(shared)),
         );
     }
     body = body
@@ -9690,7 +9694,9 @@ fn channel_agent_row(
         .align_items(Alignment::Center)
         .with_item(icon, FlexItem::new().no_shrink())
         .with_item(
-            Label::new(label).font_size(12.5).color_when(text_color),
+            Label::new(label)
+                .font_size(ui_meta_size(shared))
+                .color_when(text_color),
             FlexItem::new().grow(1.0).min_width(0.0),
         );
     let row = TrailingSlotRow::new(body, action)
@@ -10327,12 +10333,11 @@ fn media_call_compact_body(
     signature: &MediaCallPanelSignature,
 ) -> impl Widget + use<> {
     let details = media_call_details_button(shared, reader, signature.details_open);
-    // The compact panel has 36px after vertical padding. A status-badge title
-    // plus a second 15px summary line cannot fit without clipping, and the
-    // provider/model already remains in the panel's accessibility summary.
+    // Keep the compact panel to one reflow-safe title row; provider/model detail remains in the
+    // panel's accessibility summary.
     let row = TrailingSlotRow::new(media_call_title_line(shared, reader), details)
         .trailing_width(100.0)
-        .trailing_height(26.0)
+        .trailing_height(30.0)
         .gap(10.0);
     WidgetPadding::symmetric(PAD, 5.0, row).fill_child()
 }
@@ -10347,7 +10352,7 @@ fn media_call_expanded_body(
         media_call_details_button(shared, reader, signature.details_open),
     )
     .trailing_width(78.0)
-    .trailing_height(26.0)
+    .trailing_height(30.0)
     .gap(10.0);
 
     let tiles = Flex::horizontal()
@@ -10355,39 +10360,39 @@ fn media_call_expanded_body(
         .align_items(Alignment::Stretch)
         .with_item(
             media_call_video_tile(shared, reader, signature, MediaCallTile::Remote),
-            FlexItem::flex(1.0).min_width(84.0).min_height(140.0),
+            FlexItem::flex(1.0).min_width(84.0).min_height(145.0),
         )
         .with_item(
             media_call_video_tile(shared, reader, signature, MediaCallTile::Local),
-            FlexItem::fixed(168.0).min_height(140.0),
+            FlexItem::fixed(168.0).min_height(145.0),
         );
 
     let body = Stack::vertical()
         .spacing(3.0)
         .alignment(Alignment::Stretch)
-        .with_child(SizedBox::new().height(26.0).with_child(header))
-        .with_child(SizedBox::new().height(140.0).with_child(tiles))
+        .with_child(SizedBox::new().height(30.0).with_child(header))
+        .with_child(SizedBox::new().height(145.0).with_child(tiles))
         .with_child(
             SizedBox::new()
-                .height(26.0)
+                .height(30.0)
                 .with_child(media_setup_access_row(shared, reader)),
         )
         .with_child(
             SizedBox::new()
-                .height(42.0)
+                .height(34.0)
                 .with_child(media_setup_device_selectors(shared, reader, signature)),
         )
         .with_child(
             SizedBox::new()
-                .height(26.0)
+                .height(30.0)
                 .with_child(media_setup_test_row(shared, reader)),
         )
         .with_child(
             SizedBox::new()
-                .height(22.0)
+                .height(24.0)
                 .with_child(media_setup_recovery_row(shared, reader)),
         );
-    let body = Dock::new(body).bottom(30.0, media_call_controls_row(shared, reader, signature));
+    let body = Dock::new(body).bottom(34.0, media_call_controls_row(shared, reader, signature));
 
     WidgetPadding::symmetric(PAD, 7.0, body).fill_child()
 }
@@ -10410,8 +10415,8 @@ fn media_call_title_line(shared: &Shared, reader: &ThemeReader) -> impl Widget +
         )
         .with_child(
             Label::new("Media call")
-                .font_size(12.0)
-                .line_height(16.0)
+                .font_size(ui_meta_size(shared))
+                .line_height(shared.theme().text.sm.line_height)
                 .color_when({
                     let s = shared.clone();
                     move || palette(&s).text
@@ -10539,7 +10544,7 @@ fn media_call_video_tile(
         )
         .with_child(
             SizedBox::new()
-                .height(84.0)
+                .height(82.0)
                 .with_child(MediaCameraPreviewWidget::new(shared.clone())),
         );
     let icon_shared = shared.clone();
@@ -10563,8 +10568,8 @@ fn media_call_video_tile(
                 }))
                 .with_child(
                     Label::new(title)
-                        .font_size(10.5)
-                        .line_height(14.0)
+                        .font_size(ui_meta_size(shared))
+                        .line_height(shared.theme().text.sm.line_height)
                         .color_when(move || palette(&title_shared).text),
                 ),
         )
@@ -10907,13 +10912,15 @@ where
     C: FnMut(usize, String) + 'static,
 {
     let label_reader = Rc::clone(reader);
+    let meta_size = reader().text.sm.size;
+    let meta_line_height = reader().text.sm.line_height;
     Stack::vertical()
         .spacing(2.0)
         .alignment(Alignment::Stretch)
         .with_child(
             Label::new(label)
-                .font_size(9.5)
-                .line_height(12.0)
+                .font_size(meta_size)
+                .line_height(meta_line_height)
                 .color_when(move || label_reader().palette.text_muted),
         )
         .with_child(
@@ -11016,8 +11023,8 @@ fn media_setup_recovery_row(shared: &Shared, reader: &ThemeReader) -> impl Widge
     let label = Label::dynamic("Saved on this node.", move || {
         media_setup_recovery_label(&text_shared.chat()).to_string()
     })
-    .font_size(9.5)
-    .line_height(12.0)
+    .font_size(ui_meta_size(shared))
+    .line_height(shared.theme().text.sm.line_height)
     .color_when(move || palette(&color_shared).text_faint);
     let settings_shared = shared.clone();
     let enabled_shared = shared.clone();
@@ -11426,7 +11433,7 @@ fn activity_status_card(
             .with_child(header)
             .with_child(
                 Label::new(compact_line(&status, 84))
-                    .font_size(12.0)
+                    .font_size(ui_meta_size(shared))
                     .color_when({
                         let s = s.clone();
                         move || palette(&s).text
@@ -11462,8 +11469,8 @@ fn activity_detail_card(
             )
             .with_child(
                 Label::new(compact_line(&entry.detail, 120))
-                    .font_size(11.0)
-                    .line_height(15.0)
+                    .font_size(ui_meta_size(shared))
+                    .line_height(shared.theme().text.sm.line_height)
                     .color_when(move || palette(&s).text_muted),
             ),
     )
@@ -11490,14 +11497,14 @@ fn activity_item_card(
 ) -> impl Widget + use<> {
     let s = shared.clone();
     let title_label = Label::new(compact_line(&title, 46))
-        .font_size(12.0)
+        .font_size(ui_meta_size(shared))
         .color_when({
             let s = s.clone();
             move || palette(&s).text
         });
     let detail_label = Label::new(compact_line(&detail, 64))
-        .font_size(10.5)
-        .line_height(14.0)
+        .font_size(ui_meta_size(shared))
+        .line_height(shared.theme().text.sm.line_height)
         .color_when(move || palette(&s).text_muted);
     let text = Stack::vertical()
         .spacing(1.0)
@@ -12555,7 +12562,12 @@ impl TranscriptView {
         Self::plain_rich_render(text, styles.body)
     }
 
-    fn code_text_document(code: &ChatCodeBlock, dark: bool, pal: &Palette) -> TextDocument {
+    fn code_text_document(
+        code: &ChatCodeBlock,
+        dark: bool,
+        pal: &Palette,
+        theme: &sui::DefaultTheme,
+    ) -> TextDocument {
         let highlighted = chat_render::highlight_code(code.language.as_deref(), &code.text, dark);
         let source_lines = code.text.split('\n').collect::<Vec<_>>();
         let mut paragraphs = highlighted
@@ -12573,8 +12585,8 @@ impl TranscriptView {
                     .map(|span| {
                         let color = span.rgb.map(color_from_rgb).unwrap_or(fallback);
                         let mut style = TextStyle::new(color);
-                        style.font_size = 12.0;
-                        style.line_height = 17.0;
+                        style.font_size = theme.text.sm.size;
+                        style.line_height = theme.text.sm.line_height;
                         TextSpan::new(&span.text, style)
                     })
                     .collect::<Vec<_>>();
@@ -12589,8 +12601,8 @@ impl TranscriptView {
             .collect::<Vec<_>>();
         if paragraphs.is_empty() {
             let mut style = TextStyle::new(pal.text);
-            style.font_size = 12.0;
-            style.line_height = 17.0;
+            style.font_size = theme.text.sm.size;
+            style.line_height = theme.text.sm.line_height;
             paragraphs.push(TextParagraph::new("", style));
         }
         TextDocument { paragraphs }
@@ -12637,7 +12649,7 @@ impl TranscriptView {
                     code,
                     display_range,
                 } => {
-                    let document = Self::code_text_document(&code, pal.dark, pal);
+                    let document = Self::code_text_document(&code, pal.dark, pal, theme);
                     let layout = ctx
                         .layout_text_document(
                             TextLayoutRequest::new(document)
@@ -13280,8 +13292,8 @@ impl TranscriptView {
             &painted_lines,
             CodeTextPaint::new()
                 .color(pal.text)
-                .font_size(12.0)
-                .line_height(17.0)
+                .font_size(theme.text.sm.size)
+                .line_height(theme.text.sm.line_height)
                 .x_padding(2.0),
         );
     }
@@ -14326,7 +14338,7 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                 .with_child(
                     SizedBox::new().height(SELECTOR_H).with_child(
                         Label::new("Loading providers...")
-                            .font_size(12.0)
+                            .font_size(ui_meta_size(shared))
                             .color_when(move || palette(&s).text_faint),
                     ),
                 );
@@ -14342,7 +14354,7 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                 .with_child(
                     SizedBox::new().height(SELECTOR_H).with_child(
                         Label::new("Provider setup required")
-                            .font_size(12.0)
+                            .font_size(ui_meta_size(shared))
                             .color_when(move || palette(&s).text_faint),
                     ),
                 );
@@ -14571,7 +14583,7 @@ fn attachment_drawer_chip(
             .align_items(Alignment::Center)
             .with_item(
                 Label::new(label)
-                    .font_size(11.0)
+                    .font_size(ui_meta_size(shared))
                     .color_when(move || palette(&s).text_muted),
                 FlexItem::flex(1.0).min_width(48.0),
             )
@@ -14609,7 +14621,7 @@ fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         chips = chips.with_child(
             SizedBox::new().height(ATTACHMENT_CHIPS_H).with_child(
                 Label::new(format!("+{extra}"))
-                    .font_size(11.0)
+                    .font_size(ui_meta_size(shared))
                     .color_when(move || palette(&s).text_faint),
             ),
         );
@@ -14630,7 +14642,7 @@ fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         let empty_summary = {
             let s = shared.clone();
             Label::new("No files attached")
-                .font_size(11.0)
+                .font_size(ui_meta_size(shared))
                 .color_when(move || palette(&s).text_faint)
         };
         let summary = SwitchView::new()
@@ -15103,7 +15115,7 @@ fn composer_context_chip(
                 .with_child(icon)
                 .with_child(
                     Label::new(label)
-                        .font_size(12.0)
+                        .font_size(ui_meta_size(shared))
                         .color_when(move || palette(&s).text_muted),
                 )
                 .with_child(remove),
@@ -15140,8 +15152,8 @@ fn composer_queue_chip(
         let theme = shared.theme();
         Label::new(item.kind.label().to_uppercase())
             .style(sui::TextStyle {
-                font_size: 9.0,
-                line_height: 12.0,
+                font_size: ui_meta_size(shared),
+                line_height: shared.theme().text.sm.line_height,
                 weight: FontWeight::BOLD,
                 ..theme.body_text_style()
             })
@@ -15149,7 +15161,7 @@ fn composer_queue_chip(
     };
     let s = shared.clone();
     let text = Label::new(compact_line(&item.text, 46))
-        .font_size(11.0)
+        .font_size(ui_meta_size(shared))
         .color_when(move || palette(&s).accent_text);
     let mut row = Flex::horizontal()
         .main_gap(5.0)
@@ -15332,6 +15344,7 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
     };
 
     let mut row = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
         .gap(COMPOSER_BAR_GAP)
         .align_items(Alignment::Center)
         .with_child(attach)
@@ -15341,7 +15354,7 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
         let s = shared.clone();
         row = row.with_child(
             Label::new(hint_text)
-                .font_size(11.0)
+                .font_size(ui_meta_size(shared))
                 .color_when(move || palette(&s).accent_text),
         );
     }
@@ -15351,20 +15364,21 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
             model,
             FlexItem::new()
                 .basis(132.0)
-                .min_width(76.0)
+                .min_width(100.0)
                 .min_height(COMPOSER_GHOST_BUTTON_SIZE),
         )
         .with_item(
             context,
             FlexItem::flex(1.0)
-                .min_width(0.0)
+                .basis(260.0)
+                .min_width(160.0)
                 .min_height(COMPOSER_GHOST_BUTTON_SIZE),
         )
         .with_item(
             activity,
             FlexItem::new()
                 .basis(88.0)
-                .min_width(44.0)
+                .min_width(72.0)
                 .min_height(COMPOSER_GHOST_BUTTON_SIZE),
         );
 
@@ -15372,7 +15386,7 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
         let s = shared.clone();
         row = row.with_child(
             Label::new("Enter sends · Shift+Enter newline")
-                .font_size(11.0)
+                .font_size(ui_meta_size(shared))
                 .color_when(move || palette(&s).text_faint),
         );
     }
@@ -15846,7 +15860,7 @@ fn compact_chat_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         .main_gap(8.0)
         .align_items(Alignment::Center)
         .with_item(open_drawer, FlexItem::new().no_shrink())
-        .with_item(labels, FlexItem::fill().min_width(80.0))
+        .with_item(labels, FlexItem::fill().min_width(160.0))
         .with_item(edit, FlexItem::new().no_shrink());
     Surface::new(
         SurfaceRole::Titlebar,
@@ -15858,7 +15872,8 @@ fn compact_chat_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
                 bottom: 8.0,
             },
             row,
-        ),
+        )
+        .fill_child(),
     )
     .border(SurfaceBorder::Bottom)
     .fill_width()
@@ -15914,12 +15929,16 @@ fn narrow_pod(shared: &Shared, reader: &ThemeReader, selection: &SelectionScope)
 /// those hosts rebuild and re-measure (a worker-driven change arrives outside any pointer gesture).
 pub struct ChatView {
     shared: Shared,
+    theme_reader: ThemeReader,
+    sessions_scroll_state: ScrollState,
+    selection: SelectionScope,
     wide: WidgetPod,
     narrow: WidgetPod,
     use_wide: Cell<bool>,
     /// Coarse signature of the selection / session / streaming state the inner `RebuildOnChange`
     /// hosts key on; a change forces a full relayout so they rebuild.
     last_sig: Cell<u64>,
+    last_scale_key: Cell<AppTextScale>,
     /// Whether an animation frame is currently requested (so we don't stack duplicate requests).
     pump_alive: Cell<bool>,
     /// Frames since the last state change; bounds the idle tail so we stop requesting frames.
@@ -15944,12 +15963,17 @@ impl ChatView {
         let wide = wide_pod(&shared, &theme_reader, &sessions_scroll_state, &selection);
         let narrow = narrow_pod(&shared, &theme_reader, &selection);
         let last_sig = Cell::new(view_signature(&shared));
+        let last_scale_key = Cell::new(chat_scale_key(&shared));
         Self {
             shared,
+            theme_reader,
+            sessions_scroll_state,
+            selection,
             wide,
             narrow,
             use_wide: Cell::new(true),
             last_sig,
+            last_scale_key,
             pump_alive: Cell::new(false),
             idle_frames: Cell::new(0),
         }
@@ -15969,6 +15993,22 @@ impl ChatView {
         } else {
             &mut self.narrow
         }
+    }
+
+    fn sync_scale(&mut self) -> bool {
+        let current = chat_scale_key(&self.shared);
+        if current == self.last_scale_key.get() {
+            return false;
+        }
+        self.last_scale_key.set(current);
+        self.wide = wide_pod(
+            &self.shared,
+            &self.theme_reader,
+            &self.sessions_scroll_state,
+            &self.selection,
+        );
+        self.narrow = narrow_pod(&self.shared, &self.theme_reader, &self.selection);
+        true
     }
 
     /// Ensure the request-animation-frame pump is running (idempotent).
@@ -16214,6 +16254,7 @@ impl Widget for ChatView {
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.sync_scale();
         let use_wide = constraints.max.width >= WIDE_THRESHOLD;
         if use_wide && !self.use_wide.get() {
             self.shared.chat_mut().compact_drawer_open = false;
@@ -16247,6 +16288,10 @@ impl Widget for ChatView {
             visitor.visit(&mut self.narrow);
         }
     }
+}
+
+fn chat_scale_key(shared: &Shared) -> AppTextScale {
+    shared.borrow().text_scale
 }
 
 /// The Mesh composer field frame (`.sm-composer`): one rounded surface holding
@@ -22236,7 +22281,11 @@ mod tests {
                 node.role == SemanticsRole::Image && node.name.as_deref() == Some("Camera preview")
             })
             .expect("camera preview semantics");
-        assert!(preview.bounds.height() >= 80.0);
+        assert!(
+            preview.bounds.height() >= 80.0,
+            "camera preview should remain useful at narrow widths: {:?}",
+            preview.bounds
+        );
         assert!((1.6..=2.0).contains(&(preview.bounds.width() / preview.bounds.height())));
 
         let named = |name: &str| {
@@ -23887,10 +23936,7 @@ mod tests {
         state.activity.clear();
         state.notice = None;
 
-        assert_eq!(
-            context_overview_summary(&state),
-            "Context waits for provider setup"
-        );
+        assert_eq!(context_overview_summary(&state), "Provider setup needed");
 
         seed_default_provider(&mut state);
         state.info.provider = "openai".to_string();
@@ -23903,7 +23949,7 @@ mod tests {
 
         assert_eq!(
             context_overview_summary(&state),
-            "Context waits for cluster connection"
+            "Cluster connection needed"
         );
     }
 

@@ -379,6 +379,16 @@ impl Widget for ClusterView {
                     ctx.set_handled();
                     return;
                 }
+                if let Some(selection) = selected.as_ref()
+                    && selected_copy_details_rect(ctx.bounds()).contains(pointer.position)
+                    && let Some(value) =
+                        selected_copy_details(&self.shared.cluster().snapshot, selection)
+                {
+                    ctx.set_clipboard_text(value);
+                    ctx.request_semantics();
+                    ctx.set_handled();
+                    return;
+                }
 
                 let snapshot = self.shared.cluster().snapshot.clone();
                 let topology = build_topology(&snapshot);
@@ -624,6 +634,22 @@ impl Widget for ClusterView {
             });
             action.description =
                 Some("Show technical cluster source and identifier details".to_string());
+            action.actions = vec![SemanticsAction::Activate];
+            ctx.push(action);
+        }
+        if let Some(selection) = selected.as_ref()
+            && let Some(value) = selected_copy_details(&snapshot, selection)
+        {
+            let mut action = SemanticsNode::new(
+                cluster_copy_details_widget_id(ctx.widget_id()),
+                SemanticsRole::Button,
+                selected_copy_details_rect(ctx.bounds()),
+            );
+            action.parent = Some(ctx.widget_id());
+            action.name = Some("Copy node details".to_string());
+            action.description = Some(format!(
+                "Copy the full node ID, address, and endpoints: {value}"
+            ));
             action.actions = vec![SemanticsAction::Activate];
             ctx.push(action);
         }
@@ -1098,6 +1124,9 @@ fn paint_detail_panel(
             detail_toggle_rect(bounds),
             diagnostics_open,
         );
+        if selection.is_some_and(|selection| selected_copy_details(snapshot, selection).is_some()) {
+            paint_copy_details_action(ctx, theme, pal, selected_copy_details_rect(bounds));
+        }
     } else {
         if show_overview_details {
             paint_cluster_refresh_action(
@@ -1455,6 +1484,32 @@ fn node_detail_lines(node: &ClusterNodeInfo, diagnostics_open: bool) -> Vec<Stri
     lines
 }
 
+fn selected_copy_details(
+    snapshot: &ClusterSnapshot,
+    selection: &ClusterSelection,
+) -> Option<String> {
+    match selection {
+        ClusterSelection::Node(id) => {
+            let node = snapshot.nodes.iter().find(|node| &node.node_id == id)?;
+            let mut lines = vec![format!("node_id: {}", node.node_id)];
+            if let Some(address) = node
+                .address
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                lines.push(format!("address: {address}"));
+            }
+            lines.extend(
+                node.endpoints
+                    .iter()
+                    .map(|endpoint| format!("{}: {}", endpoint.transport, endpoint.address)),
+            );
+            Some(lines.join("\n"))
+        }
+        ClusterSelection::LanSegment(_) => None,
+    }
+}
+
 fn node_route_summary(node: &ClusterNodeInfo, reachable_endpoints: usize) -> &'static str {
     let availability = node.availability.to_ascii_lowercase();
     if matches!(availability.as_str(), "offline" | "unavailable") {
@@ -1556,6 +1611,17 @@ fn detail_toggle_rect(bounds: Rect) -> Rect {
     )
 }
 
+fn selected_copy_details_rect(bounds: Rect) -> Rect {
+    let details = detail_toggle_rect(bounds);
+    let panel = detail_panel_rect(bounds);
+    Rect::new(
+        details.max_x() + 8.0,
+        details.y(),
+        (panel.max_x() - PANEL_PAD - details.max_x() - 8.0).max(0.0),
+        DETAIL_BUTTON_H,
+    )
+}
+
 fn selected_action_row_y(bounds: Rect) -> f32 {
     detail_toggle_rect(bounds).y() - DETAIL_BUTTON_H - 8.0
 }
@@ -1628,6 +1694,10 @@ fn cluster_warning_action_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
     sui::WidgetId::new(parent.get().wrapping_mul(41).wrapping_add(9_301))
 }
 
+fn cluster_copy_details_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
+    sui::WidgetId::new(parent.get().wrapping_mul(41).wrapping_add(9_303))
+}
+
 fn cluster_refresh_action_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
     sui::WidgetId::new(parent.get().wrapping_mul(41).wrapping_add(9_303))
 }
@@ -1674,6 +1744,27 @@ fn paint_detail_toggle(
         } else {
             "Show diagnostics"
         },
+        pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text),
+    );
+}
+
+fn paint_copy_details_action(
+    ctx: &mut PaintCtx,
+    theme: &sui::DefaultTheme,
+    pal: &Palette,
+    rect: Rect,
+) {
+    widgets::round_panel(ctx, rect, pal.surface_2, pal.border, 6.0);
+    draw_glyph(
+        ctx,
+        IconGlyph::Restore,
+        Rect::new(rect.x() + 9.0, rect.y() + 7.0, 14.0, 14.0),
+        pal.text_muted,
+    );
+    widgets::draw_text_in(
+        ctx,
+        Rect::new(rect.x() + 28.0, rect.y() + 5.0, rect.width() - 34.0, 18.0),
+        "Copy details",
         pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text),
     );
 }
@@ -2145,6 +2236,26 @@ mod tests {
             public_ip: true,
             reachable,
         }
+    }
+
+    #[test]
+    fn selected_copy_details_preserves_full_id_address_and_endpoints() {
+        let mut selected = node("node-01jz7x9m4k2p8q6r5s3t1v0w9y");
+        selected.address = Some("https://10.20.30.40:21353/control".to_string());
+        selected.endpoints = vec![endpoint("iroh://full-endpoint-address", true)];
+        let snapshot = ClusterSnapshot {
+            nodes: vec![selected.clone()],
+            ..ClusterSnapshot::default()
+        };
+
+        let copied =
+            selected_copy_details(&snapshot, &ClusterSelection::Node(selected.node_id.clone()))
+                .expect("copyable node details");
+
+        assert!(copied.contains(&selected.node_id));
+        assert!(copied.contains("https://10.20.30.40:21353/control"));
+        assert!(copied.contains("iroh://full-endpoint-address"));
+        assert!(!copied.contains("..."));
     }
 
     #[test]

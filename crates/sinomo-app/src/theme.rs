@@ -7,7 +7,7 @@
 //! role tokens; [`Palette`] re-exports them under the app's names and adds the
 //! product-identity tokens (agent hues, mesh decoration tints, glows).
 
-use sui::{Color, DefaultTheme, FontWeight, TextStyle, ThemeShadow};
+use sui::{Color, ControlSize, DefaultTheme, FontWeight, TextStyle, ThemeShadow};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -50,9 +50,45 @@ impl AppThemeMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppTextScale {
+    #[default]
+    Standard,
+    Large,
+    ExtraLarge,
+}
+
+impl AppTextScale {
+    pub const ALL: [Self; 3] = [Self::Standard, Self::Large, Self::ExtraLarge];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "Standard",
+            Self::Large => "Large",
+            Self::ExtraLarge => "Extra large",
+        }
+    }
+
+    pub fn factor(self) -> f32 {
+        match self {
+            Self::Standard => 1.0,
+            Self::Large => 1.15,
+            Self::ExtraLarge => 1.3,
+        }
+    }
+}
+
 /// Resolve the concrete widget theme for a mode.
 pub fn resolve_theme(mode: AppThemeMode) -> DefaultTheme {
-    match mode {
+    resolve_theme_with_preferences(mode, AppTextScale::default())
+}
+
+pub fn resolve_theme_with_preferences(
+    mode: AppThemeMode,
+    text_scale: AppTextScale,
+) -> DefaultTheme {
+    let mut theme = match mode {
         AppThemeMode::Light => DefaultTheme::light(),
         AppThemeMode::Void => DefaultTheme::void(),
         AppThemeMode::Dark | AppThemeMode::System => {
@@ -63,6 +99,52 @@ pub fn resolve_theme(mode: AppThemeMode) -> DefaultTheme {
             }
         }
     }
+    // Medium is the standard interface size. Smaller and larger metrics are contextual component
+    // choices, not an application-wide user preference.
+    .with_size(ControlSize::Medium);
+
+    let factor = text_scale.factor();
+    // The product baseline deliberately starts one step above SUI's compact
+    // toolkit defaults. Tiny metadata remains subordinate without dropping
+    // below 12px at the standard scale.
+    let sizes = [
+        (12.0, 17.0),
+        (13.0, 18.0),
+        (15.0, 22.0),
+        (17.0, 25.0),
+        (19.0, 27.0),
+        (21.0, 29.0),
+        (25.0, 33.0),
+        (31.0, 39.0),
+        (37.0, 45.0),
+        (49.0, 55.0),
+        (61.0, 67.0),
+        (73.0, 79.0),
+        (97.0, 103.0),
+    ];
+    let token = |(size, line_height): (f32, f32)| sui::ThemeTextToken {
+        size: size * factor,
+        line_height: line_height * factor,
+    };
+    theme.text.xs = token(sizes[0]);
+    theme.text.sm = token(sizes[1]);
+    theme.text.base = token(sizes[2]);
+    theme.text.lg = token(sizes[3]);
+    theme.text.xl = token(sizes[4]);
+    theme.text._2xl = token(sizes[5]);
+    theme.text._3xl = token(sizes[6]);
+    theme.text._4xl = token(sizes[7]);
+    theme.text._5xl = token(sizes[8]);
+    theme.text._6xl = token(sizes[9]);
+    theme.text._7xl = token(sizes[10]);
+    theme.text._8xl = token(sizes[11]);
+    theme.text._9xl = token(sizes[12]);
+    theme.sync_derived_fields();
+
+    theme.metrics.form_row_label_width = 136.0;
+    theme.metrics.form_row_control_width = 520.0;
+    theme.metrics.form_section_max_width = 860.0;
+    theme
 }
 
 /// The six agent identity hues (`--sm-agent-1…6`), shared across themes and
@@ -289,6 +371,8 @@ impl Palette {
         weight: FontWeight,
         color: Color,
     ) -> TextStyle {
+        let scale = theme.text.base.size / 15.0;
+        let size = (size * scale).max(theme.text.xs.size);
         TextStyle {
             font_size: size,
             line_height: (size * 1.4286).round(),
@@ -372,5 +456,26 @@ mod tests {
         // Light does not glow on paper.
         assert!(light_pal.glow_accent.first.is_none());
         assert!(!light_pal.dark);
+    }
+
+    #[test]
+    fn app_typography_has_a_readable_floor_and_independent_scaling() {
+        let standard = resolve_theme_with_preferences(AppThemeMode::Dark, AppTextScale::Standard);
+        let large_text = resolve_theme_with_preferences(AppThemeMode::Dark, AppTextScale::Large);
+
+        assert_eq!(standard.text.xs.size, 12.0);
+        assert_eq!(standard.text.base.size, 15.0);
+        assert!(large_text.text.base.size > standard.text.base.size);
+        assert_eq!(large_text.metrics.min_height, standard.metrics.min_height);
+        assert_eq!(standard.metrics.min_height, 32.0);
+        assert!(standard.metrics.form_section_max_width >= 860.0);
+
+        let palette = Palette::from_theme(&standard, true);
+        assert!(
+            palette
+                .text_style(&standard, 9.0, FontWeight::NORMAL, palette.text)
+                .font_size
+                >= standard.text.xs.size
+        );
     }
 }

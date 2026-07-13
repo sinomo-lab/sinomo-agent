@@ -8,11 +8,11 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 use sui::{
-    ArrangeCtx, Button, Color, Constraints, DefaultTheme, Event, EventCtx, FontWeight, IconGlyph,
-    KeyState, MeasureCtx, PaintCtx, Path, PointerButton, PointerEventKind, Rect, ScrollDelta,
-    Select, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Size,
-    StrokeStyle, TextInput, Widget, WidgetId, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    WindowEvent,
+    ArrangeCtx, Button, Color, Constraints, ControlSize, DefaultTheme, Event, EventCtx, FontWeight,
+    IconGlyph, KeyState, MeasureCtx, PaintCtx, Path, PointerButton, PointerEventKind, Rect,
+    ScrollDelta, Select, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole,
+    SemanticsValue, Size, StrokeStyle, TextInput, Widget, WidgetId, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, WindowEvent,
 };
 
 use crate::backend::Backend;
@@ -29,17 +29,16 @@ use sinomo_runtime::local::SinomoDataDir;
 const HEADER_H: f32 = 78.0;
 const PAD: f32 = 20.0;
 const GAP: f32 = 14.0;
-const START_WIDE_H: f32 = 124.0;
-const START_NARROW_COLLAPSED_H: f32 = 206.0;
-const START_NARROW_EXPANDED_H: f32 = 270.0;
+const START_WIDE_HEADER_H: f32 = 42.0;
+const START_NARROW_HEADER_H: f32 = 60.0;
 const START_BREAKPOINT: f32 = 760.0;
-const CONTROL_LABEL_H: f32 = 14.0;
+const CONTROL_LABEL_H: f32 = 18.0;
 const CONTROL_LABEL_GAP: f32 = 4.0;
-/// Form controls ride the Mesh large control height (`--sm-ctl-h-lg`).
-const CONTROL_H: f32 = 34.0;
+/// Evolution's start form is a dense configuration surface, so its fields use Small.
+const CONTROL_H: f32 = 28.0;
 const CONTROL_GAP: f32 = 8.0;
 const STARTER_ACTION_COUNT: usize = 3;
-const STARTER_ACTION_H: f32 = 30.0;
+const STARTER_ACTION_H: f32 = 28.0;
 const STARTER_ACTION_GAP: f32 = 8.0;
 const START_OPTIONS_W: f32 = 112.0;
 const START_BUTTON_W: f32 = 112.0;
@@ -53,7 +52,7 @@ const QUEUE_SCROLLBAR_W: f32 = 3.0;
 const SECTION_GAP: f32 = 16.0;
 const DECISION_SECTION_H: f32 = 146.0;
 const NARROW_ACTION_BAR_H: f32 = 72.0;
-/// Decision actions use the Mesh control height (`--sm-ctl-h`).
+/// Sticky queue decisions remain Small so the review surface keeps priority.
 const DECISION_BUTTON_H: f32 = 28.0;
 const READINESS_DETAIL_BUTTON_W: f32 = 136.0;
 const OBJECTIVE_PLACEHOLDER: &str = "Describe the improvement or task";
@@ -721,6 +720,11 @@ fn theme_reader(shared: &Shared) -> ThemeReader {
     Rc::new(move || shared.theme())
 }
 
+fn small_theme_reader(shared: &Shared) -> ThemeReader {
+    let shared = shared.clone();
+    Rc::new(move || shared.theme().with_size(ControlSize::Small))
+}
+
 fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     let reader = Rc::clone(reader);
     move || reader()
@@ -1125,7 +1129,7 @@ struct StartControls {
 
 impl StartControls {
     fn new(shared: Shared) -> Self {
-        let reader = theme_reader(&shared);
+        let reader = small_theme_reader(&shared);
 
         let objective = {
             let s = shared.clone();
@@ -2165,16 +2169,12 @@ fn readiness_detail_toggle_visible(
 
 fn start_height_for(width: f32, advanced_open: bool) -> f32 {
     let controls_w = (width - PAD * 2.0).max(0.0);
-    let starter_extra = starter_actions_height_for(controls_w) + CONTROL_GAP;
-    if controls_w >= START_BREAKPOINT && advanced_open {
-        START_WIDE_H + starter_extra + control_block_height() + CONTROL_GAP
-    } else if controls_w >= START_BREAKPOINT {
-        START_WIDE_H + starter_extra
-    } else if advanced_open {
-        START_NARROW_EXPANDED_H + starter_extra
+    let header_h = if controls_w >= START_BREAKPOINT {
+        START_WIDE_HEADER_H
     } else {
-        START_NARROW_COLLAPSED_H + starter_extra
-    }
+        START_NARROW_HEADER_H
+    };
+    header_h + start_controls_height_for(controls_w, advanced_open) + PAD
 }
 
 fn start_controls_height_for(width: f32, advanced_open: bool) -> f32 {
@@ -2207,7 +2207,7 @@ fn paint_header(
     let title = pal.text_style(theme, 20.0, FontWeight::SEMIBOLD, pal.text);
     widgets::draw_text_in(
         ctx,
-        Rect::new(rect.x() + PAD, rect.y() + 12.0, 260.0, 28.0),
+        Rect::new(rect.x() + PAD, rect.y() + 7.0, 260.0, 30.0),
         "Evolution",
         title,
     );
@@ -2218,7 +2218,7 @@ fn paint_header(
         ctx,
         Rect::new(
             rect.x() + PAD,
-            rect.y() + 43.0,
+            rect.y() + 40.0,
             (rect.width() - PAD * 2.0).max(0.0),
             22.0,
         ),
@@ -2424,7 +2424,7 @@ fn paint_queue(
         ctx,
         Rect::new(
             rect.x() + PAD,
-            rect.y() + 8.0,
+            rect.y() + 7.0,
             rect.width() - PAD * 2.0,
             20.0,
         ),
@@ -2439,7 +2439,7 @@ fn paint_queue(
             rect.width() - PAD * 2.0,
             18.0,
         ),
-        "Observed through promoted lifecycle",
+        "Observed to promoted",
         pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text_faint),
     );
 
@@ -2474,16 +2474,17 @@ fn paint_queue(
         let row = queue_row_rect(rect, index, scroll_y);
         let selected_here = selected == Some(index);
         if selected_here {
-            // Mesh selected row: accent wash plus a 2px accent rail.
-            ctx.fill_rect(row.inflate(-1.0, -1.0), pal.accent_soft);
-            ctx.fill_rect(Rect::new(row.x(), row.y(), 2.0, row.height()), pal.accent);
+            // Match SUI data rows: a persistent inset selection wash. Keyboard focus remains a
+            // separate ring so selection and navigation focus never collapse into one state.
+            ctx.fill_rect(row.inflate(-1.0, -1.0), pal.selected);
         }
         paint_queue_row(ctx, theme, pal, row, job, selected_here);
         if list_focused && focused == Some(index) {
+            let outset = theme.metrics.focus_ring_outset;
             ctx.stroke(
-                Path::rounded_rect(row.inflate(-3.0, -3.0), 5.0),
-                pal.accent,
-                StrokeStyle::new(1.5),
+                Path::rounded_rect(row.inflate(outset, outset), 5.0),
+                pal.focus,
+                StrokeStyle::new(theme.metrics.focus_ring_width),
             );
         }
         widgets::hairline_bottom(ctx, row, pal.border_subtle);
@@ -2775,8 +2776,8 @@ fn paint_detail_empty(
     start_ready: bool,
     starting: bool,
 ) {
-    let panel_w = rect.width().min(420.0);
-    let panel_h = 154.0;
+    let panel_w = rect.width().min(500.0);
+    let panel_h = 164.0;
     let panel = Rect::new(
         rect.x() + (rect.width() - panel_w) / 2.0,
         rect.y() + (rect.height() - panel_h) / 2.0,
@@ -2789,14 +2790,14 @@ fn paint_detail_empty(
         "No evolution job selected",
         pal.text_style(theme, 18.0, FontWeight::SEMIBOLD, pal.text_muted),
         panel.x() + panel.width() / 2.0,
-        panel.y() + 32.0,
+        panel.y() + 31.0,
     );
     widgets::draw_centered(
         ctx,
         empty_detail_subtitle(start_ready, starting),
         pal.text_style(theme, 14.0, FontWeight::NORMAL, pal.text_faint),
         panel.x() + panel.width() / 2.0,
-        panel.y() + 58.0,
+        panel.y() + 59.0,
     );
     paint_rows(
         ctx,
@@ -2804,9 +2805,9 @@ fn paint_detail_empty(
         pal,
         Rect::new(
             panel.x() + 14.0,
-            panel.y() + 80.0,
+            panel.y() + 82.0,
             panel.width() - 28.0,
-            60.0,
+            66.0,
         ),
         &empty_detail_rows(start_ready, starting),
     );
@@ -3004,20 +3005,30 @@ fn paint_rows(
     widgets::round_panel(ctx, rect, pal.panel, pal.border, 10.0);
     let mut y = rect.y() + 9.0;
     for (index, (label, value)) in rows.iter().take(4).enumerate() {
-        let row = Rect::new(rect.x() + 12.0, y, rect.width() - 24.0, 22.0);
+        let row = Rect::new(rect.x() + 12.0, y, rect.width() - 24.0, 24.0);
+        let label_width = 128.0_f32.min(row.width() * 0.42);
         widgets::draw_text_in(
             ctx,
-            Rect::new(row.x(), row.y(), 122.0, row.height()),
+            Rect::new(row.x(), row.y(), label_width, row.height()),
             label,
             pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text_muted),
         );
         widgets::draw_text_in(
             ctx,
-            Rect::new(row.x() + 126.0, row.y(), row.width() - 126.0, row.height()),
-            &compact(value, ((row.width() - 126.0) / 7.0).max(18.0) as usize),
+            Rect::new(
+                row.x() + label_width + 4.0,
+                row.y(),
+                row.width() - label_width - 4.0,
+                row.height(),
+            ),
+            &compact(
+                value,
+                ((row.width() - label_width - 4.0) / (theme.text.sm.size * 0.55)).max(12.0)
+                    as usize,
+            ),
             pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text),
         );
-        y += 24.0;
+        y += 26.0;
         if index < rows.len() - 1 {
             ctx.fill_rect(
                 Rect::new(rect.x() + 12.0, y - 1.0, rect.width() - 24.0, 1.0),

@@ -30,21 +30,21 @@ use std::time::Duration;
 
 use sui::{
     Alignment, ArrangeCtx, Background, Breadcrumb, BreadcrumbItem, CheckboxIndicatorState, Color,
-    CommandButtonPaint, Constraints, DefaultTheme, Dock, EmptyState, Event, EventCtx,
-    FixedPaneSplit, Flex, FlexItem, FontWeight, HairlineEdge, IconButton, IconGlyph, Insets, Label,
-    LeadingLabelCellPaint, ListItem, ListView, MeasureCtx, PaintCtx, PlacementBadgePaint, Point,
-    PointerButton, PointerEventKind, RebuildOnChange, Rect, ScrollState, ScrollView, SectionLabel,
-    SectionLabelPaint, SectionPanelPaint, SegmentedControl, SegmentedControlItem, SemanticRegion,
-    SemanticTone, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, Separator, Size,
-    SizedBox, Stack, StackHostOptions, StatusBadge, StatusBar, StatusBarSegment, Surface,
-    SwitchView, TextBlockPaint, TextCellPaint, Tooltip, TooltipPlacement, TrailingSlotRow,
-    VirtualTable, VirtualTableColumn, VirtualTableRowActivationKind, VirtualTableRowContext,
-    VirtualTableSortDirection, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    WindowEvent, containers::Padding as WidgetPadding, detail_row_height_for_value,
-    paint_checkbox_indicator, paint_command_button, paint_detail_row_at, paint_hairline,
-    paint_leading_label_cell, paint_placement_badge, paint_placement_badge_with,
-    paint_section_label, paint_section_panel, paint_status_badge, paint_text_block,
-    paint_text_cell,
+    CommandButtonPaint, Constraints, ControlSize, DefaultTheme, Dock, EmptyState, Event, EventCtx,
+    FixedPaneSplit, Flex, FlexItem, FlexWrap, FontWeight, HairlineEdge, IconButton, IconGlyph,
+    Insets, Label, LeadingLabelCellPaint, ListItem, ListView, MeasureCtx, PaintCtx,
+    PlacementBadgePaint, Point, PointerButton, PointerEventKind, RebuildOnChange, Rect,
+    ScrollState, ScrollView, SectionLabel, SectionLabelPaint, SectionPanelPaint, SegmentedControl,
+    SegmentedControlItem, SemanticRegion, SemanticTone, SemanticsAction, SemanticsCtx,
+    SemanticsNode, SemanticsRole, Separator, Size, SizedBox, Stack, StackHostOptions, StatusBadge,
+    StatusBar, StatusBarSegment, Surface, SwitchView, TextBlockPaint, TextCellPaint, Tooltip,
+    TooltipPlacement, TrailingSlotRow, VirtualTable, VirtualTableColumn,
+    VirtualTableRowActivationKind, VirtualTableRowContext, VirtualTableSortDirection, Widget,
+    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
+    containers::Padding as WidgetPadding, detail_row_height_for_value, paint_checkbox_indicator,
+    paint_command_button, paint_detail_row_at, paint_hairline, paint_leading_label_cell,
+    paint_placement_badge, paint_placement_badge_with, paint_section_label, paint_section_panel,
+    paint_status_badge, paint_text_block, paint_text_cell,
 };
 
 use sinomo_cli::app_api::{
@@ -6089,8 +6089,8 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             FlexItem::new().no_shrink(),
         )
         .with_item(
-            SizedBox::new().width(108.0).with_child(source),
-            FlexItem::fixed(108.0),
+            SizedBox::new().width(120.0).with_child(source),
+            FlexItem::fixed(120.0),
         )
         .with_item(breadcrumb, FlexItem::fill().min_width(160.0))
         .with_item(
@@ -6270,7 +6270,7 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
             Some(
                 sui::Button::new("Connection settings")
                     .icon(IconGlyph::Alert)
-                    .min_width(160.0)
+                    .min_width(190.0)
                     .theme_when(secondary_button_theme(reader))
                     .on_press(move || open_settings_section(&s, SettingsSection::Connection)),
             )
@@ -6282,7 +6282,7 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
             Some(
                 sui::Button::new("Browse local files")
                     .icon(IconGlyph::Folder)
-                    .min_width(156.0)
+                    .min_width(180.0)
                     .theme_when(secondary_button_theme(reader))
                     .on_press(move || {
                         let waker = { s.borrow().waker.clone() };
@@ -6292,14 +6292,15 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
         } else {
             None
         };
-        let mut primary_actions = Stack::horizontal()
-            .spacing(8.0)
-            .alignment(Alignment::Center)
+        let mut primary_actions = Flex::horizontal()
+            .wrap(FlexWrap::Wrap)
+            .gap(8.0)
+            .align_items(Alignment::Center)
             .with_child(retry);
         if let Some(settings) = settings {
             primary_actions = primary_actions.with_child(settings);
         }
-        let mut action_height = 32.0;
+        let mut action_height = 72.0;
         let mut actions = Stack::vertical()
             .spacing(8.0)
             .alignment(Alignment::Center)
@@ -6307,11 +6308,11 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
         if let Some(browse_local) = browse_local {
             actions = actions.with_child(
                 SizedBox::new()
-                    .width(180.0)
-                    .height(30.0)
+                    .width(200.0)
+                    .height(32.0)
                     .with_child(browse_local),
             );
-            action_height = 70.0;
+            action_height = 112.0;
         }
         let body = centered_note(
             reader,
@@ -6328,7 +6329,7 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
             let s = shared.clone();
             sui::Button::new("Create file")
                 .icon(IconGlyph::File)
-                .min_width(116.0)
+                .min_width(130.0)
                 .theme_when(clone_reader(reader))
                 .on_press_with_ctx(move |ctx| {
                     s.files_mut()
@@ -6340,7 +6341,7 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
             let s = shared.clone();
             sui::Button::new("Create folder")
                 .icon(IconGlyph::Folder)
-                .min_width(132.0)
+                .min_width(150.0)
                 .theme_when(clone_reader(reader))
                 .on_press_with_ctx(move |ctx| {
                     s.files_mut()
@@ -6348,9 +6349,10 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
                     request_files_overlay_rebuild(ctx);
                 })
         };
-        let actions = Stack::horizontal()
-            .spacing(8.0)
-            .alignment(Alignment::Center)
+        let actions = Flex::horizontal()
+            .wrap(FlexWrap::Wrap)
+            .gap(8.0)
+            .align_items(Alignment::Center)
             .with_child(create_file)
             .with_child(create_folder);
         let body = centered_note(
@@ -6359,7 +6361,8 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
             "Empty directory",
             "Nothing here yet.",
         )
-        .action(actions);
+        .action(actions)
+        .action_height(72.0);
         return placeholder_with_task_strip(shared, reader, body, has_tasks);
     }
 
@@ -8334,6 +8337,7 @@ fn open_cluster_tab(shared: &Shared) {
 enum InspectorAction {
     OpenFolder,
     Copy,
+    CopyIdentifiers,
     CopyToSifs,
     CopyToLocal,
     Move,
@@ -8354,6 +8358,7 @@ impl InspectorAction {
         match self {
             Self::OpenFolder => "Open folder",
             Self::Copy => "Copy",
+            Self::CopyIdentifiers => "Copy IDs",
             Self::CopyToSifs => "Copy to SIFS",
             Self::CopyToLocal => "Download",
             Self::Move => "Move",
@@ -8373,7 +8378,7 @@ impl InspectorAction {
     fn glyph(self) -> IconGlyph {
         match self {
             Self::OpenFolder => IconGlyph::Folder,
-            Self::Copy => IconGlyph::Restore,
+            Self::Copy | Self::CopyIdentifiers => IconGlyph::Restore,
             Self::CopyToSifs => IconGlyph::Storage,
             Self::CopyToLocal => IconGlyph::Download,
             Self::Move => IconGlyph::ChevronRight,
@@ -8399,6 +8404,7 @@ impl InspectorAction {
             Self::Rename => Some(FileActionPromptKind::Rename),
             Self::Delete => Some(FileActionPromptKind::Delete),
             Self::OpenFolder
+            | Self::CopyIdentifiers
             | Self::RefreshPlacement
             | Self::RepairReplicas
             | Self::MakeMetadataPrimary
@@ -8421,6 +8427,7 @@ impl InspectorAction {
             Self::PinContent => format!("Pin content {}", entry.name),
             Self::UnpinContent => format!("Unpin content {}", entry.name),
             Self::ConnectionSettings => "Connection settings".to_string(),
+            Self::CopyIdentifiers => format!("Copy full identifiers for {}", entry.name),
             Self::CopyToSifs => format!("Copy to SIFS {}", entry.name),
             Self::CopyToLocal => format!("Download {}", entry.name),
             Self::Copy | Self::Move | Self::Rename | Self::Delete => {
@@ -8454,6 +8461,7 @@ fn inspector_actions(files: &FilesState, entry: &SifsEntry) -> Vec<InspectorActi
         actions.push(InspectorAction::RefreshPlacement);
         if !metadata_needs_connection && !files.details_loading {
             if let Some(details) = files.selected_details.as_ref() {
+                actions.push(InspectorAction::CopyIdentifiers);
                 actions.push(InspectorAction::RepairReplicas);
                 if sifs_can_make_metadata_primary(details) {
                     actions.push(InspectorAction::MakeMetadataPrimary);
@@ -8474,6 +8482,22 @@ fn inspector_actions(files: &FilesState, entry: &SifsEntry) -> Vec<InspectorActi
         }
     }
     actions
+}
+
+fn sifs_identifiers_for_clipboard(details: &SifsObjectDetails) -> String {
+    let mut lines = vec![
+        format!("file_system_id: {}", details.file_system_id),
+        format!("object_id: {}", details.object_id),
+        format!("version: {}", details.version),
+    ];
+    if let Some(hash) = details
+        .content_hash
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(format!("content_hash: {hash}"));
+    }
+    lines.join("\n")
 }
 
 fn sifs_loading_rows(
@@ -8606,6 +8630,7 @@ fn inspector_action_button_widget_id(
     let salt = match action {
         InspectorAction::OpenFolder => 7_497,
         InspectorAction::Copy => 7_511,
+        InspectorAction::CopyIdentifiers => 7_513,
         InspectorAction::CopyToSifs => 7_515,
         InspectorAction::CopyToLocal => 7_519,
         InspectorAction::Move => 7_523,
@@ -8743,6 +8768,18 @@ impl Widget for InspectorView {
                     InspectorAction::ConnectionSettings => {
                         open_settings_section(&self.shared, SettingsSection::Connection);
                         ctx.request_measure();
+                    }
+                    InspectorAction::CopyIdentifiers => {
+                        let value = {
+                            let files = self.shared.files();
+                            files
+                                .selected_details
+                                .as_ref()
+                                .map(sifs_identifiers_for_clipboard)
+                        };
+                        if let Some(value) = value {
+                            ctx.set_clipboard_text(value);
+                        }
                     }
                     InspectorAction::Copy
                     | InspectorAction::CopyToSifs
@@ -9478,6 +9515,12 @@ impl Widget for InspectorView {
                         format!("Download SIFS {} to a local path", entry.path)
                     }
                     InspectorAction::Copy => format!("Copy {}", entry.path),
+                    InspectorAction::CopyIdentifiers => {
+                        format!(
+                            "Copy the full SIFS object, version, and hash IDs for {}",
+                            entry.path
+                        )
+                    }
                     InspectorAction::Move => format!("Move {}", entry.path),
                     InspectorAction::Rename => format!("Rename {}", entry.path),
                     InspectorAction::Delete => format!("Delete {}", entry.path),
@@ -9729,9 +9772,10 @@ impl InspectorView {
             InspectorAction::CopyToSifs | InspectorAction::CopyToLocal => {
                 CommandButtonPaint::tonal(SemanticTone::Accent)
             }
-            InspectorAction::Copy | InspectorAction::Move | InspectorAction::Rename => {
-                CommandButtonPaint::neutral()
-            }
+            InspectorAction::Copy
+            | InspectorAction::CopyIdentifiers
+            | InspectorAction::Move
+            | InspectorAction::Rename => CommandButtonPaint::neutral(),
         };
         paint_command_button(
             ctx,
@@ -10070,7 +10114,7 @@ where
     F: FnMut(&mut EventCtx) + 'static,
 {
     sui::Button::new(label)
-        .min_height(34.0)
+        .min_height(32.0)
         .theme_when(clone_reader(reader))
         .enabled_when(enabled)
         .on_press_with_ctx(on_press)
@@ -10510,9 +10554,10 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                 request_files_overlay_rebuild(ctx);
             })
     };
-    let actions = Stack::horizontal()
-        .spacing(8.0)
-        .alignment(Alignment::End)
+    let actions = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(8.0)
+        .align_items(Alignment::End)
         .with_child(submit)
         .with_child(cancel);
 
@@ -10829,7 +10874,7 @@ impl Widget for FilesView {
 pub fn view(shared: Shared) -> impl Widget {
     let reader: ThemeReader = {
         let s = shared.clone();
-        Rc::new(move || s.theme())
+        Rc::new(move || s.theme().with_size(ControlSize::Small))
     };
     FilesDialogHost::new(FilesView::new(shared.clone()), shared, reader)
 }
@@ -10877,6 +10922,23 @@ mod tests {
             metadata_shard: None,
             health: None,
         }
+    }
+
+    #[test]
+    fn sifs_identifier_copy_keeps_full_unshortened_values() {
+        let mut details = test_sifs_details(Vec::new());
+        details.file_system_id = "sifs-01-full-file-system-id".to_string();
+        details.object_id = "object-01-full-content-addressed-id".to_string();
+        details.version = "version-01-full-version-id".to_string();
+        details.content_hash = Some("sha256:full-content-hash".to_string());
+
+        let copied = sifs_identifiers_for_clipboard(&details);
+
+        assert!(copied.contains(&details.file_system_id));
+        assert!(copied.contains(&details.object_id));
+        assert!(copied.contains(&details.version));
+        assert!(copied.contains(details.content_hash.as_deref().expect("content hash")));
+        assert!(!copied.contains("..."));
     }
 
     fn degraded_sifs_health() -> SifsHealthSummary {
