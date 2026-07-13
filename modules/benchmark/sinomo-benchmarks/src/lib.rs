@@ -188,6 +188,7 @@ pub fn benchmark_module_catalog() -> BenchmarkModuleCatalog {
             minestudio_plan(),
             minestudio_vision_action_loop_plan(),
             minestudio_live_duplex_loop_plan(),
+            sifs_fuse_benchmark_plan(),
         ],
     }
 }
@@ -214,6 +215,7 @@ pub fn benchmarks_module_descriptor() -> NativeModuleDescriptor {
             "benchmark.agent.skill.plan".to_string(),
             "benchmark.swebench.plan".to_string(),
             "benchmark.minestudio.plan".to_string(),
+            "benchmark.sifs-fuse.plan".to_string(),
             "benchmark.terminalbench.plan".to_string(),
         ],
         surfaces: NativeModuleSurfaces {
@@ -402,6 +404,29 @@ pub fn agent_memory_quality_plan() -> BenchmarkHarnessPlan {
             "The checked-in scenarios cover information extraction, multi-session reasoning, knowledge updates, temporal reasoning, scope-boundary abstention, and procedural workflow recall.".to_string(),
             "The axes are inspired by LongMemEval, LoCoMo, BEAM, MemoryAgentBench, MemoryArena, LongMemEval-V2, and RAGAS retrieval metrics.".to_string(),
             "Default plan/fixture modes are deterministic; --mode run calls the configured Sinomo agent and scores marker use, citations, forbidden leakage, source coverage, and cache churn.".to_string(),
+        ],
+    }
+}
+
+pub fn sifs_fuse_benchmark_plan() -> BenchmarkHarnessPlan {
+    BenchmarkHarnessPlan {
+        name: "sifs-fuse".to_string(),
+        setup_commands: vec![
+            "cargo test -p sinomo-benchmarks --features sifs-fuse-bench --bin sinomo-sifs-fuse-bench"
+                .to_string(),
+            "cargo build --release -p sinomo-benchmarks --features sifs-fuse-bench --bin sinomo-sifs-fuse-bench"
+                .to_string(),
+        ],
+        run_command: "target/release/sinomo-sifs-fuse-bench --root \"$SINOMO_SIFS_FUSE_BENCH_ROOT\" --suite full --require-fuse --json-out benchmark-results/sifs-fuse/report.json"
+            .to_string(),
+        required_tools: vec![AgentToolKind::RunShellCommand],
+        notes: vec![
+            "This is an opt-in Unix integration and performance harness for the kernel FUSE mount over a live SIFS cluster, not a normal Rust unit test."
+                .to_string(),
+            "SINOMO_SIFS_FUSE_BENCH_ROOT must identify an existing caller-writable SIFS subtree; every run uses a unique child and removes it on exit."
+                .to_string(),
+            "Correctness failures produce a non-zero exit; performance thresholds are opt-in so unconfigured runs report measurements without imposing host-specific gates."
+                .to_string(),
         ],
     }
 }
@@ -1502,6 +1527,11 @@ mod tests {
                 .capabilities
                 .contains(&"benchmark.agent.skill.plan".to_string())
         );
+        assert!(
+            descriptor
+                .capabilities
+                .contains(&"benchmark.sifs-fuse.plan".to_string())
+        );
         assert!(descriptor.surfaces.object_rpc_routes.iter().any(|route| {
             route.route == SINOMO_BENCHMARKS_CANCEL_PROBE_ROUTE
                 && route.category == SINOMO_BENCHMARKS_RPC_CATEGORY
@@ -1560,11 +1590,36 @@ mod tests {
                 .iter()
                 .any(|plan| plan.name == "minestudio-live-duplex-loop")
         );
+        assert!(catalog.plans.iter().any(|plan| plan.name == "sifs-fuse"));
         assert!(
             catalog
                 .plans
                 .iter()
                 .all(|plan| !plan.run_command.contains("crates/sinomo-benchmarks"))
+        );
+    }
+
+    #[test]
+    fn sifs_fuse_plan_is_opt_in_and_reproducible() {
+        let plan = sifs_fuse_benchmark_plan();
+
+        assert_eq!(plan.name, "sifs-fuse");
+        assert_eq!(plan.setup_commands.len(), 2);
+        assert!(plan.setup_commands[0].contains("cargo test"));
+        assert!(plan.setup_commands[1].contains("--release"));
+        assert!(plan.setup_commands[1].contains("--features sifs-fuse-bench"));
+        assert!(plan.run_command.contains("$SINOMO_SIFS_FUSE_BENCH_ROOT"));
+        assert!(plan.run_command.contains("--suite full"));
+        assert!(plan.run_command.contains("--require-fuse"));
+        assert!(
+            plan.run_command
+                .contains("benchmark-results/sifs-fuse/report.json")
+        );
+        assert_eq!(plan.required_tools, vec![AgentToolKind::RunShellCommand]);
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.contains("performance thresholds are opt-in"))
         );
     }
 

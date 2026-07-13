@@ -8151,9 +8151,12 @@ dependencies = [
 name = "sinomo-benchmarks"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "libc",
  "serde",
  "serde_json",
  "sinomo-agent",
+ "sinomo-dfs-fuse",
  "sinomo-lm",
  "sinomo-pytorch",
  "sinomo-runtime",

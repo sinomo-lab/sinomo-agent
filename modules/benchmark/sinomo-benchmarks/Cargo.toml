@@ -6,7 +6,7 @@ authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-include = ["**/*.rs", "Cargo.toml", "agent/**", "harbor/**", "mcu/**", "minestudio/**", "swebench/**"]
+include = ["**/*.rs", "build.rs", "Cargo.toml", "agent/**", "harbor/**", "mcu/**", "minestudio/**", "sifs/**", "swebench/**"]
 
 [package.metadata.sinomo]
 ring = "application"
@@ -21,15 +21,24 @@ default = false
 [features]
 default = []
 env-bench = []
+sifs-fuse-bench = ["dep:blake3", "dep:libc", "dep:sinomo-dfs-fuse"]
 
 [lib]
 crate-type = ["rlib", "cdylib"]
 
+[[bin]]
+name = "sinomo-sifs-fuse-bench"
+path = "src/bin/sinomo-sifs-fuse-bench.rs"
+required-features = ["sifs-fuse-bench"]
+
 [dependencies]
+blake3 = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 sinomo-agent = { path = "../../../crates/sinomo-agent" }
+sinomo-dfs-fuse = { path = "../../../crates/sinomo-dfs-fuse", features = ["fuse"], optional = true }
 sinomo-lm = { path = "../../../crates/sinomo-lm" }
 sinomo-pytorch = { path = "../../../crates/sinomo-pytorch" }
 sinomo-runtime = { path = "../../../crates/sinomo-runtime" }
