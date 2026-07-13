@@ -8681,7 +8681,9 @@ fn workspace_selector(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
     let apply_shared = shared.clone();
     let apply = sui::Button::new("Use")
         .min_height(30.0)
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .enabled_when({
             let shared = shared.clone();
             move || !shared.chat().workspace_path_input.trim().is_empty()
