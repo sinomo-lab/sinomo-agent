@@ -306,7 +306,7 @@ fn fetch_daemon_health_rows(
 fn fetch_cluster_health_rows(address: &str) -> Result<Vec<ClusterHealthRow>, String> {
     DaemonApiClient::at_address(address)
         .with_timeout(CLUSTER_REFRESH_RPC_TIMEOUT)
-        .cluster_health()
+        .cluster_health_with_peer_views()
         .map_err(|error| error.to_string())
 }
 
