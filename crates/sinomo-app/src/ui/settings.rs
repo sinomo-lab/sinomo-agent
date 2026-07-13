@@ -44,8 +44,9 @@ use sinomo_runtime::local::SinomoDataDir;
 
 use crate::backend::Backend;
 use crate::backend::agents::{
-    AgentConfigSnapshot, AgentConfigSummary, agent_definition_is_editable, agent_role_label,
-    agent_source_label, built_in_agent_config_snapshot,
+    AgentConfigSnapshot, AgentConfigSummary, AgentReadiness, AgentValidationReport,
+    agent_definition_is_editable, agent_role_label, agent_source_label,
+    built_in_agent_config_snapshot,
 };
 use crate::backend::cluster::{AppClusterInvite, AppClusterStatus, ClusterSnapshot};
 use crate::backend::config::{
@@ -58,12 +59,12 @@ use crate::backend::config::{
     set_provider_reasoning_budget, set_provider_text_verbosity, set_provider_vendor_options,
     set_value, test_provider_connection, text_verbosity_index,
 };
-use crate::backend::modules::ModuleConfigSnapshot;
+use crate::backend::modules::{ModuleConfigSnapshot, ModuleObservedState};
 use crate::rendering::AppRenderMode;
 use crate::state::{Shared, Tab};
 use crate::theme::{AppThemeMode, Palette};
 use crate::ui::widgets;
-use sinomo_runtime::module::{ModuleRuntimeConfigSource, resolve_module_runtime_config};
+use sinomo_runtime::module::ModuleRuntimeConfigSource;
 
 /// Budget for each SIFS-backed section (skills, stored agents) of the full settings
 /// snapshot; past this the section reports itself unavailable instead of wedging the
@@ -178,6 +179,9 @@ pub struct SettingsState {
     pub agent_action_error: Option<String>,
     pub agent_action_status: Option<String>,
     pub agent_delete_confirming: Option<String>,
+    pub agent_import_path: String,
+    pub agent_export_path: String,
+    pub agent_validation_report: Option<AgentValidationReport>,
     pub module_snapshot: ModuleConfigSnapshot,
     pub module_selected_node_id: Option<String>,
     pub module_action_error: Option<String>,
@@ -372,6 +376,19 @@ enum SettingsOperation {
     DeleteAgent {
         id: String,
     },
+    ImportAgent {
+        path: PathBuf,
+    },
+    ExportAgent {
+        id: String,
+        output: PathBuf,
+    },
+    ValidateAgent {
+        id: String,
+    },
+    TestAgent {
+        id: String,
+    },
     RefreshModules {
         selected_node_id: Option<String>,
     },
@@ -476,6 +493,10 @@ enum AgentOperationEffect {
     Refreshed,
     Saved(String),
     Deleted(String),
+    Imported(String),
+    Exported(PathBuf),
+    Validated(AgentValidationReport),
+    Tested(AgentValidationReport),
 }
 
 struct ModuleOperationSuccess {
@@ -855,6 +876,9 @@ impl SettingsState {
             agent_action_error: None,
             agent_action_status: None,
             agent_delete_confirming: None,
+            agent_import_path: String::new(),
+            agent_export_path: String::new(),
+            agent_validation_report: None,
             module_snapshot,
             module_selected_node_id,
             module_action_error: None,
@@ -950,6 +974,9 @@ impl SettingsState {
             agent_action_error: None,
             agent_action_status: None,
             agent_delete_confirming: None,
+            agent_import_path: String::new(),
+            agent_export_path: String::new(),
+            agent_validation_report: None,
             module_snapshot: ModuleConfigSnapshot::default(),
             module_selected_node_id: None,
             module_action_error: None,
@@ -1149,6 +1176,9 @@ impl SettingsState {
 
     fn mark_draft_changed(&mut self, domain: SettingsOperationDomain) {
         self.draft_generations.bump(domain);
+        if domain == SettingsOperationDomain::Agents {
+            self.agent_validation_report = None;
+        }
     }
 
     fn set_field_draft(&mut self, domain: SettingsOperationDomain, key: String, value: String) {
@@ -1285,6 +1315,22 @@ impl SettingsState {
             SettingsOperation::DeleteAgent { .. } => {
                 self.agent_action_error = None;
                 self.agent_action_status = Some("Deleting agent…".to_string());
+            }
+            SettingsOperation::ImportAgent { .. } => {
+                self.agent_action_error = None;
+                self.agent_action_status = Some("Importing agent package…".to_string());
+            }
+            SettingsOperation::ExportAgent { .. } => {
+                self.agent_action_error = None;
+                self.agent_action_status = Some("Exporting agent package…".to_string());
+            }
+            SettingsOperation::ValidateAgent { .. } => {
+                self.agent_action_error = None;
+                self.agent_action_status = Some("Validating agent…".to_string());
+            }
+            SettingsOperation::TestAgent { .. } => {
+                self.agent_action_error = None;
+                self.agent_action_status = Some("Testing agent readiness…".to_string());
             }
             SettingsOperation::RefreshModules { .. } => {
                 self.module_action_error = None;
@@ -1493,7 +1539,36 @@ impl SettingsState {
                         AgentOperationEffect::Saved(id) => Some(format!("Saved custom agent {id}")),
                         AgentOperationEffect::Deleted(id) => {
                             self.agent_delete_confirming = None;
+                            self.agent_validation_report = None;
                             Some(format!("Deleted custom agent {id}"))
+                        }
+                        AgentOperationEffect::Imported(id) => {
+                            self.agent_import_path.clear();
+                            self.agent_validation_report = None;
+                            Some(format!("Imported agent package {id}"))
+                        }
+                        AgentOperationEffect::Exported(path) => {
+                            Some(format!("Exported package to {}", path.display()))
+                        }
+                        AgentOperationEffect::Validated(report) => {
+                            let ready = report.is_ready();
+                            let summary = report.summary();
+                            self.agent_validation_report = Some(report);
+                            Some(if ready {
+                                format!("Validation passed · {summary}")
+                            } else {
+                                format!("Validation needs attention · {summary}")
+                            })
+                        }
+                        AgentOperationEffect::Tested(report) => {
+                            let ready = report.is_ready();
+                            let summary = report.summary();
+                            self.agent_validation_report = Some(report);
+                            Some(if ready {
+                                format!("Readiness test passed · {summary}")
+                            } else {
+                                format!("Readiness test needs attention · {summary}")
+                            })
                         }
                     };
                     effects.chat_agents = Some(success.chat_agents);
@@ -1712,6 +1787,18 @@ impl SettingsState {
         self.agent_action_error = None;
         self.agent_action_status = None;
         self.agent_delete_confirming = None;
+    }
+
+    fn set_agent_import_path(&mut self, value: String) {
+        self.agent_import_path = value;
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn set_agent_export_path(&mut self, value: String) {
+        self.agent_export_path = value;
+        self.agent_action_error = None;
+        self.agent_action_status = None;
     }
 
     fn duplicate_selected_agent(&mut self) {
@@ -2572,6 +2659,39 @@ fn execute_settings_operation(
                 AgentOperationEffect::Deleted(id),
             ))
         })()),
+        SettingsOperation::ImportAgent { path } => SettingsOperationPayload::Agents((|| {
+            let id = backend.import_agent_definition(&path)?;
+            Ok(agent_operation_success(
+                backend,
+                Some(&id),
+                AgentOperationEffect::Imported(id.clone()),
+            ))
+        })()),
+        SettingsOperation::ExportAgent { id, output } => SettingsOperationPayload::Agents((|| {
+            let path = backend.export_agent_definition(&id, &output)?;
+            Ok(agent_operation_success(
+                backend,
+                Some(&id),
+                AgentOperationEffect::Exported(path),
+            ))
+        })(
+        )),
+        SettingsOperation::ValidateAgent { id } => SettingsOperationPayload::Agents((|| {
+            let report = backend.validate_agent_definition(&id)?;
+            Ok(agent_operation_success(
+                backend,
+                Some(&id),
+                AgentOperationEffect::Validated(report),
+            ))
+        })()),
+        SettingsOperation::TestAgent { id } => SettingsOperationPayload::Agents((|| {
+            let report = backend.test_agent_definition(&id)?;
+            Ok(agent_operation_success(
+                backend,
+                Some(&id),
+                AgentOperationEffect::Tested(report),
+            ))
+        })()),
         SettingsOperation::RefreshModules { selected_node_id } => {
             SettingsOperationPayload::Modules(Ok(ModuleOperationSuccess {
                 snapshot: backend.module_config_snapshot(selected_node_id.as_deref()),
@@ -3106,7 +3226,10 @@ fn agent_sidebar_preview(snapshot: &AgentConfigSnapshot) -> String {
 }
 
 fn agent_summary_line(agent: &AgentConfigSummary) -> String {
-    let mut parts = vec![agent.role.clone(), agent.source.clone()];
+    let mut parts = vec![
+        agent.role.clone(),
+        format!("{} package {}", agent.source, agent.package_version),
+    ];
     if agent.tool_count == 1 {
         parts.push("1 tool".to_string());
     } else if agent.tool_count > 1 {
@@ -3131,7 +3254,12 @@ fn agent_list_item(agent: &AgentConfigSummary) -> ListItem {
     } else {
         agent.name.clone()
     };
-    ListItem::new(title).detail(agent_summary_line(agent))
+    ListItem::new(title)
+        .detail(agent_summary_line(agent))
+        .trailing(match agent.readiness {
+            AgentReadiness::Ready => "Ready",
+            AgentReadiness::NeedsAttention => "Review",
+        })
 }
 
 fn module_sidebar_preview(snapshot: &ModuleConfigSnapshot) -> String {
@@ -5858,26 +5986,18 @@ fn agents_section_key(shared: &Shared) -> String {
         .agent_snapshot
         .agents
         .iter()
-        .map(|agent| {
-            format!(
-                "{}:{}:{}:{}:{}:{}:{:?}",
-                agent.id,
-                agent.name,
-                agent.role,
-                agent.source,
-                agent.editable,
-                agent_summary_line(agent),
-                agent.sandbox_node_id
-            )
-        })
+        .map(|agent| format!("{agent:?}:{}", agent_summary_line(agent)))
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "selected:{:?};error:{:?};status:{:?};delete:{:?};form:{}\n{agents}",
+        "selected:{:?};error:{:?};status:{:?};delete:{:?};import:{};export:{};report:{:?};form:{}\n{agents}",
         settings.agent_selected_id,
         settings.agent_action_error,
         settings.agent_action_status,
         settings.agent_delete_confirming,
+        settings.agent_import_path,
+        settings.agent_export_path,
+        settings.agent_validation_report,
         agent_form_signature(&settings.agent_form)
     )
 }
@@ -6000,10 +6120,11 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         .with_child(
             FormSection::new("Agents", summary_body)
                 .description(
-                    "Create local custom agents and inspect agents supplied by the runtime.",
+                    "Create, inspect, validate, and move agent packages without leaving Settings.",
                 )
                 .theme_when(clone_reader(reader)),
-        );
+        )
+        .with_child(agent_package_management_section(shared, reader));
 
     let editing_unsaved = shared.settings().agent_form.previous_id.is_none();
     let selected = shared.settings().agent_snapshot.selected_agent.clone();
@@ -6014,7 +6135,171 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
     } else if let Some(definition) = selected {
         stack = stack.with_child(agent_readonly_section(shared, reader, definition));
     }
+    if let Some(report) = shared.settings().agent_validation_report.clone() {
+        stack = stack.with_child(agent_validation_report_section(shared, reader, report));
+    }
     stack
+}
+
+fn agent_package_management_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let (import_path, export_path) = {
+        let settings = shared.settings();
+        (
+            settings.agent_import_path.clone(),
+            settings.agent_export_path.clone(),
+        )
+    };
+    let import_input = {
+        let s = shared.clone();
+        TextInput::new("agent-import-path")
+            .value(import_path)
+            .placeholder("Path to an agent JSON package")
+            .theme_when(clone_reader(reader))
+            .on_change(move |value| s.settings_mut().set_agent_import_path(value))
+    };
+    let import_button = {
+        let s = shared.clone();
+        sui::Button::new("Import package")
+            .icon(IconGlyph::Download)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || {
+                    !s.settings().agent_import_path.trim().is_empty()
+                        && !s.settings().domain_pending(SettingsOperationDomain::Agents)
+                }
+            })
+            .on_press(move || {
+                let path = s.settings().agent_import_path.trim().to_string();
+                if !path.is_empty() {
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::Agents,
+                        SettingsOperation::ImportAgent {
+                            path: PathBuf::from(path),
+                        },
+                    );
+                }
+            })
+    };
+    let export_input = {
+        let s = shared.clone();
+        TextInput::new("agent-export-path")
+            .value(export_path)
+            .placeholder("Output file or directory")
+            .theme_when(clone_reader(reader))
+            .on_change(move |value| s.settings_mut().set_agent_export_path(value))
+    };
+    let export_button = {
+        let s = shared.clone();
+        sui::Button::new("Export selected")
+            .icon(IconGlyph::Storage)
+            .theme_when(secondary_button_theme(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || {
+                    s.settings().agent_selected_id.is_some()
+                        && !s.settings().agent_export_path.trim().is_empty()
+                        && !s.settings().domain_pending(SettingsOperationDomain::Agents)
+                }
+            })
+            .on_press(move || {
+                let settings = s.settings();
+                let request = settings.agent_selected_id.clone().zip(
+                    (!settings.agent_export_path.trim().is_empty())
+                        .then(|| PathBuf::from(settings.agent_export_path.trim())),
+                );
+                drop(settings);
+                if let Some((id, output)) = request {
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::Agents,
+                        SettingsOperation::ExportAgent { id, output },
+                    );
+                }
+            })
+    };
+    let validate = agent_lifecycle_action_button(shared, reader, false);
+    let test = agent_lifecycle_action_button(shared, reader, true);
+
+    let body = FieldGroup::new()
+        .spacing(8.0)
+        .with_child(
+            FormRow::new(
+                "Import",
+                Stack::vertical()
+                    .spacing(8.0)
+                    .alignment(Alignment::Stretch)
+                    .with_child(import_input)
+                    .with_child(
+                        Stack::horizontal()
+                            .alignment(Alignment::Start)
+                            .with_child(import_button),
+                    ),
+            )
+            .stacked()
+            .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormRow::new(
+                "Export",
+                Stack::vertical()
+                    .spacing(8.0)
+                    .alignment(Alignment::Stretch)
+                    .with_child(export_input)
+                    .with_child(
+                        Stack::horizontal()
+                            .alignment(Alignment::Start)
+                            .with_child(export_button),
+                    ),
+            )
+            .stacked()
+            .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormRow::new(
+                "Checks",
+                Stack::horizontal()
+                    .spacing(8.0)
+                    .alignment(Alignment::Start)
+                    .with_child(validate)
+                    .with_child(test),
+            )
+            .inline()
+            .theme_when(clone_reader(reader)),
+        );
+    FormSection::new("Package management", body)
+        .description("Validation checks package structure. Test also verifies configured dependencies without making a model request.")
+        .theme_when(clone_reader(reader))
+}
+
+fn agent_lifecycle_action_button(shared: &Shared, reader: &ThemeReader, test: bool) -> sui::Button {
+    let s = shared.clone();
+    let label = if test { "Test readiness" } else { "Validate" };
+    sui::Button::new(label)
+        .icon(if test {
+            IconGlyph::Redo
+        } else {
+            IconGlyph::Check
+        })
+        .theme_when(secondary_button_theme(reader))
+        .enabled_when({
+            let s = s.clone();
+            move || {
+                s.settings().agent_selected_id.is_some()
+                    && !s.settings().domain_pending(SettingsOperationDomain::Agents)
+            }
+        })
+        .on_press(move || {
+            if let Some(id) = s.settings().agent_selected_id.clone() {
+                let operation = if test {
+                    SettingsOperation::TestAgent { id }
+                } else {
+                    SettingsOperation::ValidateAgent { id }
+                };
+                queue_settings_operation(&s, SettingsOperationScope::Agents, operation);
+            }
+        })
 }
 
 fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -6204,6 +6489,17 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             |settings, value| settings.set_agent_deny_tools_text(value),
         ));
 
+    if let Some(summary) = selected_agent_config_summary(shared) {
+        body = body
+            .with_child(agent_readiness_row(shared, reader, summary.readiness))
+            .with_child(value_row(
+                shared,
+                reader,
+                "Package",
+                format!("{} · version {}", summary.source, summary.package_version),
+            ))
+            .with_child(value_row(shared, reader, "Provenance", summary.provenance));
+    }
     body = body.with_child(agent_actions_row(shared, reader));
     let title = if form.previous_id.is_some() {
         format!("Edit {}", short_one_line(&form.id, 48))
@@ -6329,12 +6625,33 @@ fn agent_readonly_section(
     };
     let mut body = FieldGroup::new()
         .spacing(8.0)
+        .with_child(agent_readiness_row(
+            shared,
+            reader,
+            selected_agent_config_summary(shared)
+                .map(|summary| summary.readiness)
+                .unwrap_or(AgentReadiness::NeedsAttention),
+        ))
         .with_child(value_row(shared, reader, "Agent ID", definition.key()))
+        .with_child(value_row(
+            shared,
+            reader,
+            "Package version",
+            definition.package.version.clone(),
+        ))
         .with_child(value_row(
             shared,
             reader,
             "Source",
             agent_source_label(&definition.package.provenance.source),
+        ))
+        .with_child(value_row(
+            shared,
+            reader,
+            "Provenance",
+            selected_agent_config_summary(shared)
+                .map(|summary| summary.provenance)
+                .unwrap_or_else(|| "Package provenance unavailable".to_string()),
         ))
         .with_child(value_row(
             shared,
@@ -6380,6 +6697,118 @@ fn agent_readonly_section(
     }
     FormSection::new(definition.name.clone(), body)
         .description("This agent is supplied by the runtime. Duplicate it to create an editable custom agent.")
+        .theme_when(clone_reader(reader))
+}
+
+fn selected_agent_config_summary(shared: &Shared) -> Option<AgentConfigSummary> {
+    let settings = shared.settings();
+    let id = settings.agent_selected_id.as_deref()?;
+    settings
+        .agent_snapshot
+        .agents
+        .iter()
+        .find(|agent| agent.id == id)
+        .cloned()
+}
+
+fn agent_readiness_row(
+    shared: &Shared,
+    reader: &ThemeReader,
+    readiness: AgentReadiness,
+) -> FormRow {
+    let (label, detail, tone, icon) = match readiness {
+        AgentReadiness::Ready => (
+            "Ready",
+            "The package passes its structural validation.",
+            SemanticTone::Success,
+            IconGlyph::Check,
+        ),
+        AgentReadiness::NeedsAttention => (
+            "Needs attention",
+            "Run validation to review package problems.",
+            SemanticTone::Warning,
+            IconGlyph::Alert,
+        ),
+    };
+    FormRow::new(
+        "Readiness",
+        Stack::vertical()
+            .spacing(4.0)
+            .alignment(Alignment::Start)
+            .with_child(
+                Stack::horizontal().with_child(
+                    StatusBadge::new(label)
+                        .tone(tone)
+                        .icon(icon)
+                        .theme_when(clone_reader(reader)),
+                ),
+            )
+            .with_child(muted_label(shared, detail)),
+    )
+    .stacked()
+    .theme_when(clone_reader(reader))
+}
+
+fn agent_validation_report_section(
+    shared: &Shared,
+    reader: &ThemeReader,
+    report: AgentValidationReport,
+) -> impl Widget + use<> {
+    let ready = report.is_ready();
+    let title = format!("Validation report · {}", report.agent_id);
+    let summary = report.summary();
+    let mut body = FieldGroup::new().spacing(8.0).with_child(
+        FormRow::new(
+            "Result",
+            Stack::horizontal().with_child(
+                StatusBadge::new(if ready { "Ready" } else { "Needs attention" })
+                    .icon(if ready {
+                        IconGlyph::Check
+                    } else {
+                        IconGlyph::Alert
+                    })
+                    .tone(if ready {
+                        SemanticTone::Success
+                    } else {
+                        SemanticTone::Warning
+                    })
+                    .theme_when(clone_reader(reader)),
+            ),
+        )
+        .inline()
+        .theme_when(clone_reader(reader)),
+    );
+    for check in report.checks {
+        body = body.with_child(
+            FormRow::new(
+                check.name,
+                Stack::vertical()
+                    .spacing(4.0)
+                    .alignment(Alignment::Start)
+                    .with_child(
+                        Stack::horizontal().with_child(
+                            StatusBadge::new(if check.passed { "Passed" } else { "Review" })
+                                .icon(if check.passed {
+                                    IconGlyph::Check
+                                } else {
+                                    IconGlyph::Alert
+                                })
+                                .tone(if check.passed {
+                                    SemanticTone::Success
+                                } else {
+                                    SemanticTone::Warning
+                                })
+                                .theme_when(clone_reader(reader)),
+                        ),
+                    )
+                    .with_child(muted_label(shared, check.detail)),
+            )
+            .stacked()
+            .theme_when(clone_reader(reader)),
+        );
+    }
+    FormSection::new(title, body)
+        .description(summary)
         .theme_when(clone_reader(reader))
 }
 
@@ -6541,8 +6970,16 @@ fn module_section_key(shared: &Shared) -> String {
         .iter()
         .map(|module| {
             format!(
-                "{}:{}:{}:{}",
-                module.module_id, module.label, module.backend, module.detail
+                "{}:{}:{}:{}:{:?}:{:?}:{}:{:?}:{}",
+                module.module_id,
+                module.label,
+                module.backend,
+                module.detail,
+                module.desired_enabled,
+                module.effective_source,
+                module.effective_enabled,
+                module.observed,
+                module.observed_detail
             )
         })
         .collect::<Vec<_>>()
@@ -6725,29 +7162,16 @@ fn module_config_section(
     module: crate::backend::modules::ModuleConfigModuleSummary,
 ) -> impl Widget + use<> {
     let module_id = module.module_id.clone();
-    let (cluster_enabled, effective, selected_node_label) = {
+    let selected_node_label = {
         let settings = shared.settings();
-        let cluster_enabled = settings
-            .module_snapshot
-            .cluster_config
-            .setting(&module_id)
-            .map(|setting| setting.enabled)
-            .unwrap_or(false);
-        let effective = settings.module_snapshot.selected_node.as_ref().map(|node| {
-            resolve_module_runtime_config(
-                &node.config,
-                &settings.module_snapshot.cluster_config,
-                &module_id,
-            )
-        });
-        let selected_node_label = settings
+        settings
             .module_snapshot
             .selected_node
             .as_ref()
             .map(|node| node.summary.display_name.clone())
-            .unwrap_or_else(|| "No node selected".to_string());
-        (cluster_enabled, effective, selected_node_label)
+            .unwrap_or_else(|| "No node selected".to_string())
     };
+    let cluster_enabled = module.desired_enabled.unwrap_or(false);
 
     let cluster_switch = switch_row(reader, "Cluster default", cluster_enabled, {
         let s = shared.clone();
@@ -6814,12 +7238,73 @@ fn module_config_section(
         )
     };
 
+    let desired = match module.desired_enabled {
+        Some(true) => module_lifecycle_value(
+            shared,
+            reader,
+            "Enabled",
+            SemanticTone::Success,
+            "Cluster desired state",
+        ),
+        Some(false) => module_lifecycle_value(
+            shared,
+            reader,
+            "Disabled",
+            SemanticTone::Neutral,
+            "Cluster desired state",
+        ),
+        None => module_lifecycle_value(
+            shared,
+            reader,
+            "Not configured",
+            SemanticTone::Neutral,
+            "No cluster desired state is set",
+        ),
+    };
+    let effective = module_lifecycle_value(
+        shared,
+        reader,
+        if module.effective_enabled {
+            "Enabled"
+        } else {
+            "Disabled"
+        },
+        if module.effective_enabled {
+            SemanticTone::Success
+        } else {
+            SemanticTone::Neutral
+        },
+        module_effective_source_label(module.effective_source),
+    );
+    let observed = module_lifecycle_value(
+        shared,
+        reader,
+        module_observed_label(module.observed),
+        module_observed_tone(module.observed),
+        module.observed_detail.clone(),
+    );
+
     let mut body = FieldGroup::new()
         .spacing(8.0)
+        .with_child(
+            FormRow::new("Desired", desired)
+                .stacked()
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormRow::new(format!("Effective on {selected_node_label}"), effective)
+                .stacked()
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormRow::new(format!("Observed on {selected_node_label}"), observed)
+                .stacked()
+                .theme_when(clone_reader(reader)),
+        )
         .with_child(value_row(
             shared,
             reader,
-            "Module ID",
+            "Technical ID",
             module_display_id(&module.module_id),
         ))
         .with_child(value_row(
@@ -6829,15 +7314,23 @@ fn module_config_section(
             format!("{} · {}", module.backend, module.detail),
         ))
         .with_child(cluster_switch)
-        .with_child(node_override)
-        .with_child(value_row(
-            shared,
-            reader,
-            "Effective",
-            effective
-                .map(module_effective_label)
-                .unwrap_or(selected_node_label),
-        ));
+        .with_child(node_override);
+
+    if module_runtime_state_mismatch(&module) {
+        body = body.with_child(
+            FormRow::new(
+                "Reconciliation",
+                Stack::horizontal().with_child(
+                    StatusBadge::new("Pending reconciliation")
+                        .icon(IconGlyph::Alert)
+                        .tone(SemanticTone::Warning)
+                        .theme_when(clone_reader(reader)),
+                ),
+            )
+            .inline()
+            .theme_when(clone_reader(reader)),
+        );
+    }
 
     if let Some(node) = shared.settings().module_snapshot.selected_node.as_ref()
         && let Some(error) = node.error.as_ref()
@@ -6873,17 +7366,62 @@ fn module_cluster_summary(snapshot: &ModuleConfigSnapshot) -> String {
     }
 }
 
-fn module_effective_label(config: sinomo_runtime::module::ResolvedModuleRuntimeConfig) -> String {
-    let state = if config.enabled {
-        "Enabled"
-    } else {
-        "Disabled"
-    };
-    match config.source {
-        ModuleRuntimeConfigSource::Node => format!("{state} from node override"),
-        ModuleRuntimeConfigSource::Cluster => format!("{state} from cluster default"),
-        ModuleRuntimeConfigSource::DisabledDefault => "Disabled by default".to_string(),
+fn module_effective_source_label(source: ModuleRuntimeConfigSource) -> &'static str {
+    match source {
+        ModuleRuntimeConfigSource::Node => "Resolved from this node's override",
+        ModuleRuntimeConfigSource::Cluster => "Resolved from cluster desired state",
+        ModuleRuntimeConfigSource::DisabledDefault => "No desired state; disabled by default",
     }
+}
+
+fn module_observed_label(state: ModuleObservedState) -> &'static str {
+    match state {
+        ModuleObservedState::Running => "Running",
+        ModuleObservedState::Stopped => "Stopped",
+        ModuleObservedState::Installed => "Installed",
+        ModuleObservedState::NotReported => "Not reported",
+        ModuleObservedState::Unavailable => "Unavailable",
+    }
+}
+
+fn module_observed_tone(state: ModuleObservedState) -> SemanticTone {
+    match state {
+        ModuleObservedState::Running => SemanticTone::Success,
+        ModuleObservedState::Stopped => SemanticTone::Neutral,
+        ModuleObservedState::Installed => SemanticTone::Info,
+        ModuleObservedState::NotReported | ModuleObservedState::Unavailable => {
+            SemanticTone::Warning
+        }
+    }
+}
+
+fn module_lifecycle_value(
+    shared: &Shared,
+    reader: &ThemeReader,
+    label: impl Into<String>,
+    tone: SemanticTone,
+    detail: impl Into<String>,
+) -> Stack {
+    Stack::vertical()
+        .spacing(4.0)
+        .alignment(Alignment::Start)
+        .with_child(
+            Stack::horizontal().with_child(
+                StatusBadge::new(label)
+                    .tone(tone)
+                    .theme_when(clone_reader(reader)),
+            ),
+        )
+        .with_child(muted_label(shared, detail))
+}
+
+fn module_runtime_state_mismatch(
+    module: &crate::backend::modules::ModuleConfigModuleSummary,
+) -> bool {
+    matches!(
+        (module.effective_enabled, module.observed),
+        (true, ModuleObservedState::Stopped) | (false, ModuleObservedState::Running)
+    )
 }
 
 fn module_display_id(module_id: &str) -> String {
@@ -10020,6 +10558,78 @@ mod tests {
     }
 
     #[test]
+    fn agent_settings_state_imports_exports_and_reports_readiness() {
+        let backend = Backend::local_fallback();
+        let package_path = backend.data_dir.root().join("settings-agent.json");
+        let export_dir = backend.data_dir.root().join("agent-exports");
+        let definition = AgentDefinition::custom(
+            "settings-package-agent",
+            AgentRole::Background,
+            "Verify lifecycle actions.",
+        );
+        std::fs::write(
+            &package_path,
+            serde_json::to_vec_pretty(&definition).expect("serialize agent package"),
+        )
+        .expect("write agent package");
+        let mut state = SettingsState::new(&backend);
+        state.set_agent_import_path(package_path.display().to_string());
+
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::Agents,
+            SettingsOperation::ImportAgent { path: package_path },
+        );
+        assert_eq!(
+            state.agent_selected_id.as_deref(),
+            Some("settings-package-agent")
+        );
+        assert!(state.agent_import_path.is_empty());
+
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::Agents,
+            SettingsOperation::ValidateAgent {
+                id: "settings-package-agent".to_string(),
+            },
+        );
+        assert!(
+            state
+                .agent_validation_report
+                .as_ref()
+                .is_some_and(AgentValidationReport::is_ready)
+        );
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::Agents,
+            SettingsOperation::TestAgent {
+                id: "settings-package-agent".to_string(),
+            },
+        );
+        assert!(
+            state
+                .agent_validation_report
+                .as_ref()
+                .is_some_and(|report| report.checks.len() >= 5 && report.is_ready())
+        );
+
+        state.set_agent_export_path(export_dir.display().to_string());
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::Agents,
+            SettingsOperation::ExportAgent {
+                id: "settings-package-agent".to_string(),
+                output: export_dir.clone(),
+            },
+        );
+        assert!(export_dir.join("settings-package-agent.json").is_file());
+    }
+
+    #[test]
     fn settings_agents_section_renders_management_controls() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let mut definition =
@@ -10073,6 +10683,104 @@ mod tests {
         window
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Refresh")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_text("Package management")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Import package")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Export selected")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Validate")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Test readiness")
+            .expect()
+            .to_be_visible()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn settings_modules_section_names_and_separates_lifecycle_states() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            let settings = &mut app.ready.as_mut().expect("ready state").settings;
+            settings.open(SettingsSection::Modules);
+            let node_summary = crate::backend::modules::ModuleConfigNodeSummary {
+                node_id: "node-technical-id".to_string(),
+                display_name: "Studio node".to_string(),
+                availability: "online".to_string(),
+                local: true,
+            };
+            settings.module_selected_node_id = Some(node_summary.node_id.clone());
+            settings.module_snapshot = ModuleConfigSnapshot {
+                cluster_config: sinomo_runtime::module::ModuleRuntimeConfig::default(),
+                selected_node: Some(crate::backend::modules::ModuleConfigNode {
+                    summary: node_summary.clone(),
+                    config: sinomo_runtime::module::ModuleRuntimeConfig::default(),
+                    error: None,
+                }),
+                nodes: vec![node_summary],
+                modules: vec![crate::backend::modules::ModuleConfigModuleSummary {
+                    module_id: "module.sandbox.wasix".to_string(),
+                    label: "WASIX Sandbox".to_string(),
+                    backend: "wasix".to_string(),
+                    detail: "WASIX sandbox runtime module".to_string(),
+                    desired_enabled: Some(true),
+                    effective_enabled: false,
+                    effective_source: ModuleRuntimeConfigSource::Node,
+                    observed: ModuleObservedState::Running,
+                    observed_detail: "Runtime process is active".to_string(),
+                }],
+                warnings: Vec::new(),
+            };
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings modules")
+                    .root(view(shared)),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_text("WASIX Sandbox")
+            .expect()
+            .to_be_visible()?;
+        window.get_by_text("Desired").expect().to_be_visible()?;
+        window
+            .get_by_text("Effective on Studio node")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_text("Observed on Studio node")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_text("Pending reconciliation")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_text("Technical ID")
             .expect()
             .to_be_visible()?;
 
