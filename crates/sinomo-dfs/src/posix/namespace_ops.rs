@@ -127,9 +127,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if self.sifs_dir_has_children(&path)? {
             return Err(DfsPosixError::DirectoryNotEmpty { path });
         }
-        object.kind = DfsObjectKind::Tombstone;
-        object.version = next_version(&object.version);
-        object.current_locations = vec![self.node_id.clone()];
+        object = self.tombstone_path_object(object);
         self.apply_namespace_transaction(DfsNamespaceTransaction {
             transaction_id: namespace_transaction_id_for_path("rmdir", &object.object_id, &path),
             file_system_id: object.file_system_id.clone(),
@@ -490,11 +488,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.stat_object(&old_path_tombstone)
     }
 
-    fn tombstone_path_object(&self, object: DfsObjectMetadata) -> DfsObjectMetadata {
+    pub(super) fn tombstone_path_object(&self, object: DfsObjectMetadata) -> DfsObjectMetadata {
         self.tombstone_path_object_at(object, String::new())
     }
 
-    fn tombstone_path_object_at(
+    pub(super) fn tombstone_path_object_at(
         &self,
         mut object: DfsObjectMetadata,
         path: String,
@@ -504,6 +502,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         object.kind = DfsObjectKind::Tombstone;
         object.version = next_version(&object.version);
+        object.changed_at_unix_nanos =
+            now_unix_nanos().max(object.changed_at_unix_nanos.saturating_add(1));
         object.content_hash = None;
         object.content_size_bytes = None;
         object.link_target_object_id = None;

@@ -349,6 +349,31 @@ impl DfsMetadataTables {
             })
     }
 
+    /// Return true when a compacted tombstone proves that replaying `object`
+    /// during namespace-transaction recovery would restore stale state.
+    ///
+    /// An exact compacted tombstone is already fully materialized. A newer
+    /// tombstone may also fence an older transaction, but only when the object
+    /// and its namespace identity match; path reuse by another object must not
+    /// suppress recovery.
+    pub(crate) fn compacted_tombstone_fences_namespace_recovery(
+        &self,
+        object: &DfsObjectMetadata,
+    ) -> bool {
+        if self.compacted_tombstone_matches(object) {
+            return true;
+        }
+        self.compacted_tombstones
+            .get(&object.object_id)
+            .is_some_and(|stored| {
+                stored.kind == DfsObjectKind::Tombstone
+                    && stored.file_system_id == object.file_system_id
+                    && normalize_path(&stored.path) == normalize_path(&object.path)
+                    && (stored.changed_at_unix_nanos, &stored.version)
+                        > (object.changed_at_unix_nanos, &object.version)
+            })
+    }
+
     fn put_hardlink_index(
         &mut self,
         target_object_id: DfsObjectId,

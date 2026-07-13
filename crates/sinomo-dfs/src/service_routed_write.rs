@@ -9,6 +9,7 @@
 use std::time::Instant;
 
 use sinomo_core::DfsWriteRequest;
+use sinomo_core::events::EventId;
 use sinomo_core::node::NodeId;
 
 use crate::metadata_pages::walk_metadata_pages;
@@ -22,6 +23,27 @@ fn routed_write_command_content_size_bytes(command: &DfsDistributedWriteCommand)
     }
 }
 
+fn routed_exclusive_create_event_id(command: &DfsDistributedWriteCommand) -> Option<EventId> {
+    if !command.exclusive_create {
+        return None;
+    }
+    let object = command.object_metadata.as_ref()?;
+    let identity = format!(
+        "{}\0{}\0{}\0{:?}\0{}\0{}\0{}",
+        command.request_id,
+        command.request.object_id,
+        object.path,
+        object.kind,
+        object.mode,
+        object.uid,
+        object.gid,
+    );
+    Some(EventId::derived(
+        "sinomo-dfs.routed-exclusive-create.v1",
+        identity.as_bytes(),
+    ))
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn replayed_routed_write_outcome_if_known(
         &mut self,
@@ -30,6 +52,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<Option<NetworkedDfsWriteOutcome>, DfsError> {
         if requester_node_id != &command.request.requesting_node_id {
             return Ok(None);
+        }
+        if let Some(expected_event_id) = routed_exclusive_create_event_id(command) {
+            let exact_create_is_still_visible =
+                match self.current_read_object_metadata(&command.request.object_id) {
+                    Ok(object) => {
+                        object.kind != DfsObjectKind::Tombstone
+                            && object.version == command.request.target_version
+                            && object.last_modified_by_event_id.as_ref() == Some(&expected_event_id)
+                    }
+                    Err(DfsError::UnknownObject { .. }) => false,
+                    Err(error) => return Err(error),
+                };
+            if !exact_create_is_still_visible {
+                return Ok(None);
+            }
         }
         let expected_content_hash = routed_write_command_content_hash(command);
         let Some(expected_content_size_bytes) = routed_write_command_content_size_bytes(command)
@@ -174,6 +211,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let request_id = command.request_id.clone();
         let object_id = command.request.object_id.clone();
+        let file_system_id = command.request.file_system_id.clone();
+        let target_version = command.request.target_version.clone();
+        let foreground_replica_repair = command.foreground_replica_repair;
         let metadata_journal_after_sequence = command.metadata_journal_after_sequence;
         let routed_object_path = command
             .object_metadata
@@ -184,6 +224,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_payload_bytes = command.bytes.len();
         let trace_manifest_only = command.content_hash.is_some();
         let mut created_object_path = None;
+        let mut injected_transient_metadata = false;
         let apply_started = Instant::now();
         let result = if requester_node_id != command.request.requesting_node_id {
             DfsDistributedWriteResult::Rejected {
@@ -199,35 +240,49 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsDistributedWriteResult::Outcome { outcome }
         } else {
             self.rebase_routed_path_write_if_current(&mut command)?;
-            let write_foreground_replica_repair = command.foreground_replica_repair
+            let write_foreground_replica_repair = foreground_replica_repair
                 && !self
                     .transport
                     .can_return_committed_foreground_response_before_replica_repair();
-            match self
-                .ensure_routed_write_object_metadata(
-                    &command.request,
-                    command.object_metadata.as_ref(),
-                )
-                .and_then(|created| {
-                    if created && touch_parent_on_create {
-                        created_object_path = routed_object_path;
-                    }
-                    if let Some(content_hash) = command.content_hash {
-                        let content_size_bytes =
-                            command.content_size_bytes.ok_or_else(|| DfsError::Distributed {
+            let manifest = match command.content_hash.clone() {
+                Some(content_hash) => {
+                    let content_size_bytes =
+                        command
+                            .content_size_bytes
+                            .ok_or_else(|| DfsError::Distributed {
                                 message: format!(
                                     "routed reader-backed write for {} missing content size",
                                     command.request.object_id
                                 ),
-                            })?;
-                        if !command.bytes.is_empty() {
-                            return Err(DfsError::Distributed {
-                                message: format!(
-                                    "routed reader-backed write for {} must not include inline bytes",
-                                    command.request.object_id
-                                ),
                             });
-                        }
+                    if !command.bytes.is_empty() {
+                        Err(DfsError::Distributed {
+                            message: format!(
+                                "routed reader-backed write for {} must not include inline bytes",
+                                command.request.object_id
+                            ),
+                        })
+                    } else {
+                        content_size_bytes.map(|size| Some((content_hash, size)))
+                    }
+                }
+                None => Ok(None),
+            };
+            match manifest.and_then(|manifest| {
+                let exclusive_create_event_id = routed_exclusive_create_event_id(&command);
+                self
+                .ensure_routed_write_object_metadata(
+                    &command.request,
+                    command.object_metadata.as_ref(),
+                    command.exclusive_create,
+                    exclusive_create_event_id,
+                )
+                .and_then(|created| {
+                    injected_transient_metadata = created;
+                    if created && touch_parent_on_create {
+                        created_object_path = routed_object_path;
+                    }
+                    if let Some((content_hash, content_size_bytes)) = manifest {
                         self.write_distributed_eventual_from_remote_manifest_with_base_and_parent_touch(
                             command.request,
                             command.expected_base_version,
@@ -236,6 +291,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             command.desired_replica_nodes,
                             command.policy,
                             created_object_path.is_some(),
+                            command.exclusive_create,
                             write_foreground_replica_repair,
                         )
                     } else {
@@ -246,12 +302,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             command.desired_replica_nodes,
                             command.policy,
                             created_object_path.is_some(),
+                            command.exclusive_create,
                             write_foreground_replica_repair,
                             false,
                             true,
                         )
                     }
-                }) {
+                })
+            }) {
                 Ok(outcome) => {
                     let response_outcome = match &outcome {
                         NetworkedDfsWriteOutcome::Pending { intent_id, .. } => {
@@ -262,7 +320,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 &object_id,
                                 metadata_journal_after_sequence,
                                 created_object_path.clone(),
-                                command.foreground_replica_repair,
+                                foreground_replica_repair,
                             );
                             outcome.clone()
                         }
@@ -270,7 +328,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             intent_id,
                             repair_jobs,
                             ..
-                        } if command.foreground_replica_repair && !repair_jobs.is_empty() => {
+                        } if foreground_replica_repair && !repair_jobs.is_empty() => {
                             self.track_pending_remote_write_response(
                                 intent_id,
                                 &requester_node_id,
@@ -278,7 +336,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 &object_id,
                                 metadata_journal_after_sequence,
                                 None,
-                                command.foreground_replica_repair,
+                                foreground_replica_repair,
                             );
                             NetworkedDfsWriteOutcome::Pending {
                                 intent_id: intent_id.clone(),
@@ -300,6 +358,62 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                 }
                 Err(error) => {
+                    let failed_intent = self
+                        .coordinator
+                        .intent_for_target(
+                            &file_system_id,
+                            &object_id,
+                            &target_version,
+                        )
+                        .cloned();
+                    let committed = failed_intent.as_ref().is_some_and(|intent| {
+                        matches!(intent.state, DfsWriteIntentState::Committed)
+                    });
+                    let mut cleanup_error = None;
+                    if injected_transient_metadata && !committed {
+                        let mut cleanup_completed = true;
+                        if let Some(intent) = failed_intent {
+                            let content_hash = self
+                                .pending_writes
+                                .get(&intent.intent_id)
+                                .map(|pending| pending.content_hash.clone());
+                            let aborted = if matches!(
+                                intent.state,
+                                DfsWriteIntentState::AwaitingReceipts
+                            ) {
+                                match self.coordinator.abort_intent(&intent.intent_id) {
+                                    Ok(aborted) => Some(aborted),
+                                    Err(source) => {
+                                        cleanup_error = Some(source.to_string());
+                                        cleanup_completed = false;
+                                        None
+                                    }
+                                }
+                            } else {
+                                Some(intent.clone())
+                            };
+                            if let Some(aborted) = aborted {
+                                if let Err(source) =
+                                    self.put_metadata_intent(&aborted, content_hash.as_deref())
+                                {
+                                    cleanup_error = Some(source.to_string());
+                                    cleanup_completed = false;
+                                } else {
+                                    self.pending_writes.remove(&intent.intent_id);
+                                }
+                            }
+                        }
+                        if cleanup_completed {
+                            self.remove_transient_object_metadata(&object_id);
+                        }
+                    }
+                    if let Some(cleanup_error) = cleanup_error {
+                        return Err(DfsError::Distributed {
+                            message: format!(
+                                "{error}; failed to durably abort rejected routed create: {cleanup_error}; metadata authority is quarantining the create"
+                            ),
+                        });
+                    }
                     let current_primary_node_id =
                         distributed_write_rejection_current_primary(&error);
                     DfsDistributedWriteResult::Rejected {
@@ -315,7 +429,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &object_id,
             &result,
             metadata_journal_after_sequence,
-            if command.foreground_replica_repair {
+            if foreground_replica_repair {
                 DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT
             } else {
                 DFS_ROUTED_WRITE_RESPONSE_JOURNAL_BATCH_LIMIT
@@ -576,41 +690,46 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         primary_node_id,
                         result: response.result,
                     });
-                } else if self.send_dfs_message_if_routable(
-                    &current_primary_node_id,
-                    DfsNetworkMessage::DistributedWriteRequest(command.clone()),
-                )? {
+                } else {
+                    let message = if command.exclusive_create {
+                        DfsNetworkMessage::ExclusiveCreateRequest(command.clone())
+                    } else {
+                        DfsNetworkMessage::DistributedWriteRequest(command.clone())
+                    };
+                    if self.send_dfs_message_if_routable(&current_primary_node_id, message)? {
+                        if let Some(pending) =
+                            self.pending_routed_writes.get_mut(&response.request_id)
+                        {
+                            pending.primary_node_id = current_primary_node_id.clone();
+                            pending.command = command;
+                            pending.authority_redirects_remaining = redirects_remaining - 1;
+                            pending.remote_intent_id = None;
+                            pending.durable_receipts = 0;
+                            pending.required_receipts = 1;
+                            pending.result = None;
+                        }
+                        return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
+                            request_id: response.request_id,
+                            source_node_id: primary_node_id,
+                            reason: format!(
+                                "distributed write authority moved to {current_primary_node_id}; retrying"
+                            ),
+                        });
+                    }
                     if let Some(pending) = self.pending_routed_writes.get_mut(&response.request_id)
                     {
-                        pending.primary_node_id = current_primary_node_id.clone();
-                        pending.command = command;
-                        pending.authority_redirects_remaining = redirects_remaining - 1;
-                        pending.remote_intent_id = None;
-                        pending.durable_receipts = 0;
-                        pending.required_receipts = 1;
-                        pending.result = None;
+                        pending.result = Some(Err(DfsError::Network {
+                            message: format!(
+                                "redirected metadata primary {current_primary_node_id} is not routable for distributed write"
+                            ),
+                        }));
+                        return Ok(NetworkedDfsServiceEvent::RemoteWriteCompleted {
+                            request_id: response.request_id,
+                            object_id: response.object_id,
+                            primary_node_id,
+                            result: response.result,
+                        });
                     }
-                    return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
-                        request_id: response.request_id,
-                        source_node_id: primary_node_id,
-                        reason: format!(
-                            "distributed write authority moved to {current_primary_node_id}; retrying"
-                        ),
-                    });
-                } else if let Some(pending) =
-                    self.pending_routed_writes.get_mut(&response.request_id)
-                {
-                    pending.result = Some(Err(DfsError::Network {
-                        message: format!(
-                            "redirected metadata primary {current_primary_node_id} is not routable for distributed write"
-                        ),
-                    }));
-                    return Ok(NetworkedDfsServiceEvent::RemoteWriteCompleted {
-                        request_id: response.request_id,
-                        object_id: response.object_id,
-                        primary_node_id,
-                        result: response.result,
-                    });
                 }
             }
         }
@@ -833,8 +952,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         request: &DfsWriteRequest,
         object_metadata: Option<&DfsObjectMetadata>,
+        exclusive_create: bool,
+        exclusive_create_event_id: Option<EventId>,
     ) -> Result<bool, DfsError> {
         match self.current_object_for_write(&request.object_id) {
+            Ok(current) if exclusive_create && current.kind != DfsObjectKind::Tombstone => {
+                return Err(DfsError::AlreadyExists { path: current.path });
+            }
             Ok(_) => return Ok(false),
             Err(DfsError::UnknownObject { .. }) => {}
             Err(error) => return Err(error),
@@ -881,19 +1005,65 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 epoch: shard.epoch,
             });
         }
-        if object.content_hash.is_none() {
-            self.ensure_routed_create_parent_current(object)?;
+        if exclusive_create {
+            let path_key = crate::posix_path::normalized_posix_path_key(&object.path)
+                .unwrap_or_else(|| object.path.clone());
+            let metadata_key = crate::namespace::metadata_path(&path_key);
+            let memory_object = self
+                .metadata
+                .object_by_normalized_posix_path(&object.file_system_id, &path_key)
+                .cloned();
+            let backend_object = self
+                .metadata_backend
+                .as_ref()
+                .map(|backend| backend.get_object_by_path(&object.file_system_id, &metadata_key))
+                .transpose()?
+                .flatten();
+            let current = match (memory_object.as_ref(), backend_object.as_ref()) {
+                (Some(memory_object), Some(backend_object)) => {
+                    Some(self.resolve_authoritative_object_metadata(
+                        &backend_object.object_id,
+                        Some(memory_object),
+                        Some(backend_object),
+                    )?)
+                }
+                (_, Some(backend_object)) => Some(backend_object.clone()),
+                (Some(memory_object), None) => Some(memory_object.clone()),
+                (None, None) => None,
+            };
+            if let Some(current) = current
+                && current.kind != DfsObjectKind::Tombstone
+            {
+                return Err(DfsError::AlreadyExists { path: current.path });
+            }
         }
-        self.add_transient_object_metadata(object.clone())?;
+        let mut object = object.clone();
+        if object.content_hash.is_none() {
+            let parent = self.ensure_routed_create_parent_current(&object)?;
+            let attrs = DfsPosixCreateAttrs::new(object.mode, object.uid, object.gid);
+            let attrs = parent.map_or(attrs, |parent| {
+                crate::posix_object::inherit_posix_create_attrs(
+                    attrs,
+                    object.kind == DfsObjectKind::Directory,
+                    parent.mode,
+                    parent.gid,
+                )
+            });
+            crate::posix_object::apply_posix_create_attrs(&mut object, attrs);
+        }
+        if exclusive_create {
+            object.last_modified_by_event_id = exclusive_create_event_id;
+        }
+        self.add_transient_object_metadata(object)?;
         Ok(true)
     }
 
     fn ensure_routed_create_parent_current(
         &self,
         object: &DfsObjectMetadata,
-    ) -> Result<(), DfsError> {
+    ) -> Result<Option<DfsObjectMetadata>, DfsError> {
         let Some(parent_path) = crate::posix_path::parent_posix_path(&object.path) else {
-            return Ok(());
+            return Ok(None);
         };
         let parent_key = crate::posix_path::normalized_posix_path_key(&parent_path)
             .unwrap_or_else(|| parent_path.clone());
@@ -930,7 +1100,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             (None, None) => None,
         };
         match parent {
-            Some(parent) if parent.kind == DfsObjectKind::Directory => Ok(()),
+            Some(parent) if parent.kind == DfsObjectKind::Directory => Ok(Some(parent)),
             Some(parent) if parent.kind == DfsObjectKind::Tombstone => Err(DfsError::Distributed {
                 message: format!("parent directory does not exist: {parent_path}"),
             }),

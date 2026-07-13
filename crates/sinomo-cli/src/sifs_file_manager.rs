@@ -14,8 +14,8 @@ use sinomo_runtime::dfs::{
     DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
     DfsMetadataShardConfig, DfsNodeAdvertisement, DfsNodeTransport, DfsObjectKind,
     DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError, DfsPeerTransportFuture,
-    DfsPinAddRequest, DfsPinMode, DfsPosixError, DfsStat, DfsWriteOptions, LocalContentStore,
-    NetworkedDfsService, cluster_dfs_peer_node_ids, content_services_prefix,
+    DfsPinAddRequest, DfsPinMode, DfsPosixCreateAttrs, DfsPosixError, DfsStat, DfsWriteOptions,
+    LocalContentStore, NetworkedDfsService, cluster_dfs_peer_node_ids, content_services_prefix,
     default_dfs_metadata_root, default_dfs_metadata_shards_root, default_dfs_pin_root,
     fallback_dfs_node_id, metadata_shards_prefix, open_local_sharded_metadata_backend,
     open_root_local_metadata_backend, publish_cluster_dfs_metadata_journal_with_peer_transport,
@@ -915,6 +915,54 @@ impl SifsFileManagerBackend {
         drop(service);
         self.publish_metadata_after_mutation()?;
         Ok(())
+    }
+
+    /// Provision a private POSIX directory through the authoritative DFS
+    /// service rather than through a FUSE mount whose parent may not be
+    /// writable by the local kernel identity. Existing directories are only
+    /// accepted when their ownership and mode already match; roaming devices
+    /// must never silently steal one another's session home.
+    pub(crate) fn ensure_posix_directory_with_attrs(
+        &self,
+        path: &str,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+    ) -> Result<DfsStat, String> {
+        let path = normalize_sifs_path(path)?;
+        let mode = mode & 0o7777;
+        let mut service = self.lock_service()?;
+        self.refresh_service_peer_targets(&mut service);
+        let existing = match service.posix_lstat_distributed(&path) {
+            Ok(stat) => Some(stat),
+            Err(DfsPosixError::NotFound { .. } | DfsPosixError::MissingParent { .. }) => None,
+            Err(error) => return Err(format!("cannot inspect SIFS directory {path}: {error}")),
+        };
+        if let Some(stat) = existing {
+            validate_posix_directory_attrs(&path, &stat, uid, gid, mode)?;
+            return Ok(stat);
+        }
+
+        let parent = sifs_parent_path(&path).ok_or_else(|| {
+            format!("cannot provision POSIX attributes on the SIFS root directory {path}")
+        })?;
+        service
+            .posix_mkdir_all(&parent)
+            .map_err(|error| format!("cannot create SIFS directory parent {parent}: {error}"))?;
+        let attrs = DfsPosixCreateAttrs::new(mode, uid, gid);
+        let stat = match service.posix_mkdir_with_create_attrs(&path, attrs) {
+            Ok(stat) => stat,
+            Err(DfsPosixError::AlreadyExists { .. }) => service
+                .posix_lstat_distributed(&path)
+                .map_err(|error| format!("cannot inspect raced SIFS directory {path}: {error}"))?,
+            Err(error) => {
+                return Err(format!("cannot create SIFS directory {path}: {error}"));
+            }
+        };
+        drop(service);
+        self.publish_metadata_after_mutation()?;
+        validate_posix_directory_attrs(&path, &stat, uid, gid, mode)?;
+        Ok(stat)
     }
 
     pub(crate) fn create_dir_all_deferred_local_replay_until(
@@ -2036,6 +2084,40 @@ fn sifs_operation_remaining(
         .ok_or_else(|| format!("SIFS operation deadline expired during {operation}"))
 }
 
+fn validate_posix_directory_attrs(
+    path: &str,
+    stat: &DfsStat,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+) -> Result<(), String> {
+    if stat.kind != DfsObjectKind::Directory {
+        return Err(format!(
+            "SIFS path {path} is {:?}, not a directory",
+            stat.kind
+        ));
+    }
+    if stat.uid != uid || stat.gid != gid || stat.mode != mode {
+        return Err(format!(
+            "SIFS directory {path} has owner {}:{} mode {:04o}, expected {uid}:{gid} mode {:04o}",
+            stat.uid, stat.gid, stat.mode, mode
+        ));
+    }
+    Ok(())
+}
+
+fn sifs_parent_path(path: &str) -> Option<String> {
+    let (parent, name) = path.rsplit_once('/')?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(if parent.is_empty() {
+        "/".to_string()
+    } else {
+        parent.to_string()
+    })
+}
+
 fn sifs_entry_kind(kind: &DfsObjectKind) -> FileManagerEntryKind {
     match kind {
         DfsObjectKind::Directory => FileManagerEntryKind::Directory,
@@ -2359,6 +2441,65 @@ mod tests {
         manager.delete_selected("DELETE").expect("delete file");
         manager.go_parent().expect("parent");
         manager.delete_selected("DELETE").expect("delete dir");
+    }
+
+    #[test]
+    fn private_posix_directory_bootstrap_is_idempotent_and_never_steals_owner() {
+        let root = temp_sifs_data_dir("private-posix-directory");
+        let data_dir = SinomoDataDir::new(&root);
+        let backend = SifsFileManagerBackend::open(&data_dir).expect("backend");
+        let path = "/sinomo/agents/test-session/home";
+
+        let created = backend
+            .ensure_posix_directory_with_attrs(path, 1001, 1002, 0o700)
+            .expect("create private directory");
+        assert_eq!(created.kind, DfsObjectKind::Directory);
+        assert_eq!(
+            (created.uid, created.gid, created.mode),
+            (1001, 1002, 0o700)
+        );
+        let reopened = backend
+            .ensure_posix_directory_with_attrs(path, 1001, 1002, 0o700)
+            .expect("reopen private directory");
+        assert_eq!(
+            (reopened.uid, reopened.gid, reopened.mode),
+            (1001, 1002, 0o700)
+        );
+
+        let mismatch = backend
+            .ensure_posix_directory_with_attrs(path, 2001, 2002, 0o700)
+            .expect_err("existing owner must not be replaced");
+        assert!(mismatch.contains("has owner 1001:1002"), "{mismatch}");
+        let unchanged = backend.dfs_stat(path).expect("unchanged private directory");
+        assert_eq!((unchanged.uid, unchanged.gid), (1001, 1002));
+
+        let file_path = "/sinomo/agents/not-a-directory";
+        backend.write_file(file_path, b"file").expect("create file");
+        let wrong_kind = backend
+            .ensure_posix_directory_with_attrs(file_path, 1001, 1002, 0o700)
+            .expect_err("file must not be accepted as a directory");
+        assert!(wrong_kind.contains("not a directory"), "{wrong_kind}");
+
+        let target_path = "/sinomo/agents/symlink-target-home";
+        backend
+            .ensure_posix_directory_with_attrs(target_path, 1001, 1002, 0o700)
+            .expect("create matching symlink target");
+        let link_path = "/sinomo/agents/symlink-home";
+        {
+            let mut service = backend.lock_service().expect("lock service");
+            let node_id = service.node_id().clone();
+            service
+                .posix_symlink(
+                    target_path,
+                    link_path,
+                    DfsWriteOptions::replicated_eventual(vec![node_id]),
+                )
+                .expect("create home symlink");
+        }
+        let symlink_error = backend
+            .ensure_posix_directory_with_attrs(link_path, 1001, 1002, 0o700)
+            .expect_err("a symlink leaf must never be accepted as a private home");
+        assert!(symlink_error.contains("not a directory"), "{symlink_error}");
     }
 
     #[test]

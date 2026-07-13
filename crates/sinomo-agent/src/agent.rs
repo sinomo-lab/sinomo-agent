@@ -113,10 +113,21 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentSession {
     pub session_id: SessionId,
     pub role: AgentRole,
+    /// Monotonic logical revision of private/model execution state. This lets
+    /// device-local and roaming snapshots distinguish queue/control updates
+    /// that do not append a transcript item.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub state_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_definition_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_binding: Option<WorkspaceRef>,
     pub transcript: AgentTranscript,
@@ -137,6 +148,8 @@ impl AgentSession {
         Self {
             session_id,
             role,
+            state_revision: 0,
+            agent_definition_key: None,
             workspace_binding: None,
             transcript: AgentTranscript::new(),
             raw_transcript: AgentTranscript::new(),
@@ -145,6 +158,11 @@ impl AgentSession {
             follow_up_queue: Vec::new(),
             abort: None,
         }
+    }
+
+    pub fn with_agent_definition_key(mut self, key: impl Into<String>) -> Self {
+        self.agent_definition_key = Some(key.into());
+        self
     }
 
     pub fn append_run(&mut self, run: &AgentRun) {
@@ -160,6 +178,11 @@ impl AgentSession {
         {
             self.projection = Some(projection);
         }
+        self.advance_state_revision();
+    }
+
+    pub fn advance_state_revision(&mut self) {
+        self.state_revision = self.state_revision.saturating_add(1);
     }
 
     pub fn is_aborted(&self) -> bool {
@@ -5715,8 +5738,16 @@ impl AgentRuntimeStorage {
 
 struct AgentSessionRuntimeState {
     control: AgentSessionControlPlane,
+    /// Queue items captured by the active worker. They remain in the durable
+    /// live session until successful turn completion so a crash replays rather
+    /// than silently loses them.
+    in_flight_input_ids: BTreeSet<TaskId>,
     runtime_events: Vec<AgentRuntimeEvent>,
     completed_turns: Vec<AgentOpOutcome>,
+    /// Authoritative worker-liveness marker. A joiner temporarily owns and
+    /// removes the `JoinHandle`, so handle presence alone cannot fence a new
+    /// turn while the previous worker is still exiting.
+    turn_worker_running: bool,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -5750,8 +5781,10 @@ where
             agent,
             state: Arc::new(Mutex::new(AgentSessionRuntimeState {
                 control: AgentSessionControlPlane::new(session),
+                in_flight_input_ids: BTreeSet::new(),
                 runtime_events: Vec::new(),
                 completed_turns: Vec::new(),
+                turn_worker_running: false,
                 worker: None,
             })),
         }
@@ -5762,6 +5795,22 @@ where
             return self.submit_turn_op(op);
         }
         let mut state = self.lock_state()?;
+        if matches!(&op.action, AgentOpAction::Compact { .. })
+            && (state.control.active_turn.is_some() || state.turn_worker_running)
+        {
+            return Err(AgentError::Runtime {
+                detail: "cannot compact an agent session while a turn is active".to_string(),
+            });
+        }
+        if let AgentOpAction::RemoveQueuedInput { input_id } = &op.action
+            && state.in_flight_input_ids.contains(input_id)
+        {
+            return Err(AgentError::Runtime {
+                detail: format!(
+                    "queued input {input_id} is already in flight and cannot be removed"
+                ),
+            });
+        }
         let result = state.control.submit_op(self.agent.as_ref(), op)?;
         state.append_control_runtime_events(&result.events);
         Ok(result)
@@ -5792,21 +5841,13 @@ where
     pub fn replace_session(&self, session: AgentSession) -> Result<(), AgentError> {
         self.reap_finished_worker()?;
         let mut state = self.lock_state()?;
-        if state.control.active_turn.is_some() {
+        if state.control.active_turn.is_some() || state.turn_worker_running {
             return Err(AgentError::Runtime {
                 detail: "cannot replace agent session while a turn is active".to_string(),
             });
         }
-        if state
-            .worker
-            .as_ref()
-            .is_some_and(|worker| !worker.is_finished())
-        {
-            return Err(AgentError::Runtime {
-                detail: "cannot replace agent session while a worker is active".to_string(),
-            });
-        }
         state.control = AgentSessionControlPlane::new(session);
+        state.in_flight_input_ids.clear();
         state.runtime_events.clear();
         state.completed_turns.clear();
         Ok(())
@@ -5876,14 +5917,14 @@ where
             },
         )];
 
-        if state.control.active_turn.is_some() {
+        if state.control.active_turn.is_some() || state.turn_worker_running {
             events.push(agent_session_event(
                 &op_id,
                 &state.control.session.session_id,
                 AgentEventPayload::OperationRejected {
                     sequence,
                     action,
-                    reason: "session already has an active turn".to_string(),
+                    reason: "session already has an active turn worker".to_string(),
                 },
             ));
             state.control.events.extend(events.iter().cloned());
@@ -5919,8 +5960,18 @@ where
             events.push(event);
         }
         let session_for_turn = state.control.session.clone();
-        state.control.session.steering_queue.clear();
-        state.control.session.follow_up_queue.clear();
+        let base_state_revision = session_for_turn.state_revision;
+        state.in_flight_input_ids = session_for_turn
+            .steering_queue
+            .iter()
+            .map(|input| input.steering_id.clone())
+            .chain(
+                session_for_turn
+                    .follow_up_queue
+                    .iter()
+                    .map(|input| input.follow_up_id.clone()),
+            )
+            .collect();
         state.control.events.extend(events.iter().cloned());
         state.append_control_runtime_events(&events);
         state.push_runtime_event(AgentRuntimeEventPayload::WorkerStarted {
@@ -5936,15 +5987,18 @@ where
             outcome: None,
             snapshot: state.control.snapshot(),
         };
+        state.turn_worker_running = true;
 
         let worker_state = Arc::clone(&self.state);
         let progress_state = Arc::clone(&self.state);
         let model_progress_state = Arc::clone(&self.state);
         let worker_agent = Arc::clone(&self.agent);
         let worker_op_id = op_id.clone();
+        let persist_worker_op_id = worker_op_id.clone();
         let progress_op_id = op_id.clone();
         let model_progress_op_id = op_id.clone();
         let worker_action = action;
+        let persist_worker_action = worker_action.clone();
         let worker_task = task;
         let worker_started = std::time::Instant::now();
         let progress_sink = AgentToolProgressSink::new(move |event| {
@@ -5967,16 +6021,25 @@ where
         });
         let worker = thread::spawn(move || {
             let mut completed_session = session_for_turn;
-            let outcome = worker_agent.handle_op_with_cancellation_and_progress(
-                &mut completed_session,
-                op,
-                cancellation_token,
-                progress_sink,
-                model_progress_sink,
-            );
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker_agent.handle_op_with_cancellation_and_progress_and_persistence(
+                    &mut completed_session,
+                    op,
+                    cancellation_token,
+                    progress_sink,
+                    model_progress_sink,
+                    false,
+                )
+            }))
+            .unwrap_or_else(|_| {
+                Err(AgentError::Runtime {
+                    detail: "agent session runtime worker panicked".to_string(),
+                })
+            });
             let mut state = worker_state
                 .lock()
                 .expect("agent session runtime lock poisoned");
+            let persist_completed_session = outcome.is_ok();
             state.finish_turn(AgentSessionRuntimeTurnCompletion {
                 sequence,
                 op_id: worker_op_id,
@@ -5985,8 +6048,19 @@ where
                 timeout_ms,
                 started: worker_started,
                 completed_session,
+                base_state_revision,
                 outcome,
             });
+            if persist_completed_session
+                && let Err(error) = worker_agent.save_session(&state.control.session)
+            {
+                state.push_runtime_event(AgentRuntimeEventPayload::WorkerFailed {
+                    sequence,
+                    op_id: persist_worker_op_id,
+                    action: persist_worker_action,
+                    detail: format!("persist merged completed agent session failed: {error}"),
+                });
+            }
         });
         state.worker = Some(worker);
         Ok(result)
@@ -6028,6 +6102,7 @@ struct AgentSessionRuntimeTurnCompletion {
     timeout_ms: Option<u64>,
     started: std::time::Instant,
     completed_session: AgentSession,
+    base_state_revision: u64,
     outcome: Result<AgentOpOutcome, AgentError>,
 }
 
@@ -6070,12 +6145,18 @@ impl AgentSessionRuntimeState {
     }
 
     fn finish_turn(&mut self, completion: AgentSessionRuntimeTurnCompletion) {
+        self.turn_worker_running = false;
         self.control.active_turn = None;
         self.control.active_turn_cancellation = None;
         let mut events = Vec::new();
         match completion.outcome {
             Ok(outcome) => {
-                self.replace_session_preserving_live_inputs(completion.completed_session);
+                let in_flight_input_ids = std::mem::take(&mut self.in_flight_input_ids);
+                self.replace_session_preserving_live_inputs(
+                    completion.completed_session,
+                    completion.base_state_revision,
+                    &in_flight_input_ids,
+                );
                 events.extend(outcome.events.iter().cloned());
                 let stop_reason = outcome
                     .run
@@ -6110,6 +6191,7 @@ impl AgentSessionRuntimeState {
                 });
             }
             Err(error) => {
+                self.in_flight_input_ids.clear();
                 let detail = error.to_string();
                 events.push(agent_session_event(
                     &completion.op_id,
@@ -6143,15 +6225,33 @@ impl AgentSessionRuntimeState {
         self.append_control_runtime_events(&events);
     }
 
-    fn replace_session_preserving_live_inputs(&mut self, mut completed_session: AgentSession) {
+    fn replace_session_preserving_live_inputs(
+        &mut self,
+        mut completed_session: AgentSession,
+        base_state_revision: u64,
+        in_flight_input_ids: &BTreeSet<TaskId>,
+    ) {
         let live_session = &mut self.control.session;
-        let queued_steering = std::mem::take(&mut live_session.steering_queue);
-        let queued_follow_ups = std::mem::take(&mut live_session.follow_up_queue);
+        let live_state_revision = live_session.state_revision;
+        let queued_steering = std::mem::take(&mut live_session.steering_queue)
+            .into_iter()
+            .filter(|input| !in_flight_input_ids.contains(&input.steering_id))
+            .collect();
+        let queued_follow_ups = std::mem::take(&mut live_session.follow_up_queue)
+            .into_iter()
+            .filter(|input| !in_flight_input_ids.contains(&input.follow_up_id))
+            .collect();
         let live_abort = live_session.abort.clone();
         completed_session.steering_queue = queued_steering;
         completed_session.follow_up_queue = queued_follow_ups;
         if live_abort.is_some() {
             completed_session.abort = live_abort;
+        }
+        if live_state_revision > base_state_revision {
+            completed_session.state_revision = completed_session
+                .state_revision
+                .max(live_state_revision)
+                .saturating_add(1);
         }
         self.control.session = completed_session;
     }
@@ -7756,6 +7856,25 @@ impl<M: InteractionModel> Agent<M> {
         progress_sink: AgentToolProgressSink,
         model_progress_sink: AgentModelProgressSink,
     ) -> Result<AgentOpOutcome, AgentError> {
+        self.handle_op_with_cancellation_and_progress_and_persistence(
+            session,
+            op,
+            cancellation_token,
+            progress_sink,
+            model_progress_sink,
+            true,
+        )
+    }
+
+    fn handle_op_with_cancellation_and_progress_and_persistence(
+        &self,
+        session: &mut AgentSession,
+        op: AgentOp,
+        cancellation_token: AgentCancellationToken,
+        progress_sink: AgentToolProgressSink,
+        model_progress_sink: AgentModelProgressSink,
+        persist_completed_turn: bool,
+    ) -> Result<AgentOpOutcome, AgentError> {
         let op_id = op.op_id;
         let session_id = session.session_id.clone();
         let mut events = Vec::new();
@@ -7776,13 +7895,15 @@ impl<M: InteractionModel> Agent<M> {
                         run_context: self.config.run_context.clone(),
                     },
                 ));
-                let completed_run = self.start_turn_with_cancellation_and_progress(
-                    session,
-                    &input,
-                    cancellation_token.clone(),
-                    progress_sink.clone(),
-                    model_progress_sink.clone(),
-                )?;
+                let completed_run = self
+                    .start_turn_with_cancellation_and_progress_and_persistence(
+                        session,
+                        &input,
+                        cancellation_token.clone(),
+                        progress_sink.clone(),
+                        model_progress_sink.clone(),
+                        persist_completed_turn,
+                    )?;
                 events.push(turn_completed_agent_event(
                     &op_id,
                     &session_id,
@@ -7804,13 +7925,15 @@ impl<M: InteractionModel> Agent<M> {
                         run_context: self.config.run_context.clone(),
                     },
                 ));
-                let completed_run = self.continue_turn_with_cancellation_and_progress(
-                    session,
-                    &input,
-                    cancellation_token.clone(),
-                    progress_sink.clone(),
-                    model_progress_sink.clone(),
-                )?;
+                let completed_run = self
+                    .start_turn_with_cancellation_and_progress_and_persistence(
+                        session,
+                        &input,
+                        cancellation_token.clone(),
+                        progress_sink.clone(),
+                        model_progress_sink.clone(),
+                        persist_completed_turn,
+                    )?;
                 events.push(turn_completed_agent_event(
                     &op_id,
                     &session_id,
@@ -7996,6 +8119,25 @@ impl<M: InteractionModel> Agent<M> {
         progress_sink: AgentToolProgressSink,
         model_progress_sink: AgentModelProgressSink,
     ) -> Result<AgentRun, AgentError> {
+        self.start_turn_with_cancellation_and_progress_and_persistence(
+            session,
+            input,
+            cancellation_token,
+            progress_sink,
+            model_progress_sink,
+            true,
+        )
+    }
+
+    fn start_turn_with_cancellation_and_progress_and_persistence(
+        &self,
+        session: &mut AgentSession,
+        input: &AgentLoopInput,
+        cancellation_token: AgentCancellationToken,
+        progress_sink: AgentToolProgressSink,
+        model_progress_sink: AgentModelProgressSink,
+        persist_completed_turn: bool,
+    ) -> Result<AgentRun, AgentError> {
         if session.is_aborted() {
             return Ok(AgentRun {
                 final_decision: AgentLoopDecision::silent(),
@@ -8064,7 +8206,9 @@ impl<M: InteractionModel> Agent<M> {
             },
         )?;
         self.record_completed_turn_memories(input, &run);
-        self.save_session(session)?;
+        if persist_completed_turn {
+            self.save_session(session)?;
+        }
         Ok(run)
     }
 
@@ -8109,6 +8253,7 @@ impl<M: InteractionModel> Agent<M> {
     ) -> Result<AgentSteeringMessage, AgentError> {
         let steering = AgentSteeringMessage::new(message);
         session.steering_queue.push(steering.clone());
+        session.advance_state_revision();
         self.session_store_record(
             &session.session_id,
             AgentSessionStoreRecordKind::SteeringQueued {
@@ -8126,6 +8271,7 @@ impl<M: InteractionModel> Agent<M> {
     ) -> Result<AgentFollowUpMessage, AgentError> {
         let follow_up = AgentFollowUpMessage::new(message);
         session.follow_up_queue.push(follow_up.clone());
+        session.advance_state_revision();
         self.session_store_record(
             &session.session_id,
             AgentSessionStoreRecordKind::FollowUpQueued {
@@ -8150,6 +8296,7 @@ impl<M: InteractionModel> Agent<M> {
             .position(|queued| queued.steering_id == *input_id)
         {
             let steering = session.steering_queue.remove(index);
+            session.advance_state_revision();
             self.session_store_record(
                 &session.session_id,
                 AgentSessionStoreRecordKind::SteeringRemoved {
@@ -8165,6 +8312,7 @@ impl<M: InteractionModel> Agent<M> {
             .position(|queued| queued.follow_up_id == *input_id)
         {
             let follow_up = session.follow_up_queue.remove(index);
+            session.advance_state_revision();
             self.session_store_record(
                 &session.session_id,
                 AgentSessionStoreRecordKind::FollowUpRemoved {
@@ -8212,6 +8360,7 @@ impl<M: InteractionModel> Agent<M> {
             compaction_item.clone(),
             summary.retained_tail_count,
         );
+        session.advance_state_revision();
         self.session_store_items(&session.session_id, &[compaction_item])?;
         self.session_store_projection(&session.session_id, &summary.projection)?;
         self.session_store_record(
@@ -8269,6 +8418,7 @@ impl<M: InteractionModel> Agent<M> {
     ) -> Result<AgentAbortRecord, AgentError> {
         let abort = AgentAbortRecord::new(reason);
         session.abort = Some(abort.clone());
+        session.advance_state_revision();
         self.session_store_record(
             &session.session_id,
             AgentSessionStoreRecordKind::Aborted {
@@ -10995,6 +11145,61 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
             })
+        }
+    }
+
+    struct BlockingModel {
+        started: std::sync::mpsc::Sender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl InteractionModel for BlockingModel {
+        fn complete(
+            &self,
+            request: &LanguageModelRequest,
+        ) -> Result<LanguageModelResponse, LanguageModelError> {
+            self.started.send(()).map_err(|source| {
+                LanguageModelError::ProviderInvocationFailed {
+                    provider: request.provider.clone(),
+                    model: request.model.clone(),
+                    detail: source.to_string(),
+                }
+            })?;
+            self.release
+                .lock()
+                .expect("release lock")
+                .recv()
+                .map_err(|source| LanguageModelError::ProviderInvocationFailed {
+                    provider: request.provider.clone(),
+                    model: request.model.clone(),
+                    detail: source.to_string(),
+                })?;
+            Ok(LanguageModelResponse {
+                provider: request.provider.clone(),
+                model: request.model.clone(),
+                content: r#"{
+                    "response_mode": "answer",
+                    "text": "completed after steering",
+                    "tool_calls": [],
+                    "background_handoff": null,
+                    "next_state": "listening"
+                }"#
+                .to_string(),
+                items: Vec::new(),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    struct PanickingModel;
+
+    impl InteractionModel for PanickingModel {
+        fn complete(
+            &self,
+            _request: &LanguageModelRequest,
+        ) -> Result<LanguageModelResponse, LanguageModelError> {
+            panic!("intentional agent worker panic")
         }
     }
 
@@ -18814,6 +19019,231 @@ old
                     if final_decision.text == "Persisted runtime answer."
             )
         }));
+    }
+
+    #[test]
+    fn runtime_merge_advances_revision_for_inputs_queued_during_a_turn() {
+        let session_id = SessionId::generate();
+        let mut base = AgentSession::new(session_id, AgentRole::Main);
+        base.state_revision = 4;
+        let mut live = base.clone();
+        live.steering_queue
+            .push(AgentSteeringMessage::new("arrived during turn"));
+        live.state_revision = 5;
+        let mut completed = base;
+        completed.transcript.push(AgentItem::AssistantText {
+            item_id: TaskId::generate(),
+            step_index: 0,
+            content: "completed turn".to_string(),
+        });
+        completed.raw_transcript = completed.transcript.clone();
+        completed.state_revision = 5;
+        let mut state = AgentSessionRuntimeState {
+            control: AgentSessionControlPlane::new(live),
+            in_flight_input_ids: BTreeSet::new(),
+            runtime_events: Vec::new(),
+            completed_turns: Vec::new(),
+            turn_worker_running: false,
+            worker: None,
+        };
+
+        state.replace_session_preserving_live_inputs(completed, 4, &BTreeSet::new());
+
+        assert_eq!(state.control.session.state_revision, 6);
+        assert_eq!(state.control.session.steering_queue.len(), 1);
+        assert_eq!(
+            state.control.session.steering_queue[0].message,
+            "arrived during turn"
+        );
+        assert_eq!(state.control.session.transcript.items.len(), 1);
+    }
+
+    #[test]
+    fn runtime_persists_inputs_queued_during_a_completed_turn() {
+        let data_root = sinomo_testdir::TestDir::new("sinomo-agent-runtime-mid-turn-input");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let input = agent_input("block while steering arrives");
+        let session_id = input.session.session_id.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let agent = Agent::new(
+            BlockingModel {
+                started: started_tx,
+                release: Mutex::new(release_rx),
+            },
+            "fake",
+            "fake",
+        );
+        let mut initial_session = AgentSession::new(session_id.clone(), AgentRole::Main);
+        initial_session
+            .steering_queue
+            .push(AgentSteeringMessage::new("consume this in the active turn"));
+        initial_session.advance_state_revision();
+        let runtime = AgentSessionRuntime::with_data_dir_storage(agent, initial_session, &data_dir);
+
+        assert!(
+            runtime
+                .submit_op(AgentOp::start_turn(input))
+                .expect("submit turn")
+                .accepted
+        );
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("model started");
+        assert!(
+            runtime
+                .submit_op(AgentOp::steer("preserve this steering"))
+                .expect("steer during turn")
+                .accepted
+        );
+        let during_turn = AgentRuntimeStorage::from_data_dir(&data_dir)
+            .load_session(&session_id)
+            .expect("load in-flight session")
+            .expect("in-flight session persisted by steering");
+        assert_eq!(
+            during_turn.steering_queue.len(),
+            2,
+            "the consumed baseline remains durable until turn commit"
+        );
+        release_tx.send(()).expect("release model");
+        runtime.join_active_turn().expect("join turn");
+
+        let merged = runtime.session_snapshot().expect("merged session");
+        assert_eq!(merged.state_revision, 3);
+        assert_eq!(merged.steering_queue.len(), 1);
+        assert_eq!(merged.steering_queue[0].message, "preserve this steering");
+        let persisted = AgentRuntimeStorage::from_data_dir(&data_dir)
+            .load_session(&session_id)
+            .expect("load persisted session")
+            .expect("persisted session");
+        assert_eq!(persisted, merged);
+    }
+
+    #[test]
+    fn runtime_rejects_a_new_turn_until_a_cancelled_worker_exits() {
+        let first_input = agent_input("block until the cancelled worker is released");
+        let session_id = first_input.session.session_id.clone();
+        let second_input = agent_input("do not start while the first worker is exiting");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let agent = Agent::new(
+            BlockingModel {
+                started: started_tx,
+                release: Mutex::new(release_rx),
+            },
+            "fake",
+            "fake",
+        );
+        let runtime =
+            AgentSessionRuntime::new(agent, AgentSession::new(session_id, AgentRole::Main));
+
+        assert!(
+            runtime
+                .submit_op(AgentOp::start_turn(first_input))
+                .expect("submit first turn")
+                .accepted
+        );
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("first worker started");
+        assert!(
+            runtime
+                .interrupt_active_turn("cancel without releasing the model")
+                .expect("request cancellation")
+                .accepted
+        );
+        let join_runtime = runtime.clone();
+        let joiner = thread::spawn(move || join_runtime.join_active_turn());
+        for _ in 0..100 {
+            let joiner_owns_handle = runtime
+                .state
+                .lock()
+                .expect("runtime state")
+                .worker
+                .is_none();
+            if joiner_owns_handle {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        {
+            let state = runtime.state.lock().expect("runtime state");
+            assert!(
+                state.worker.is_none(),
+                "joiner should own the worker handle"
+            );
+            assert!(
+                state.turn_worker_running,
+                "worker liveness must outlast handle ownership"
+            );
+        }
+
+        let rejected = runtime
+            .submit_op(AgentOp::start_turn(second_input))
+            .expect("reject overlapping turn");
+        assert!(!rejected.accepted);
+        assert!(rejected.events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                AgentEventPayload::OperationRejected { reason, .. }
+                    if reason == "session already has an active turn worker"
+            )
+        }));
+
+        release_tx.send(()).expect("release first worker");
+        joiner
+            .join()
+            .expect("join joiner thread")
+            .expect("join first worker");
+    }
+
+    #[test]
+    fn runtime_worker_panic_is_terminalized_without_fencing_the_session() {
+        let input = agent_input("panic in the model worker");
+        let session_id = input.session.session_id.clone();
+        let mut session = AgentSession::new(session_id.clone(), AgentRole::Main);
+        session
+            .steering_queue
+            .push(AgentSteeringMessage::new("retain after worker panic"));
+        session.advance_state_revision();
+        let runtime = AgentSessionRuntime::new(Agent::new(PanickingModel, "fake", "fake"), session);
+
+        assert!(
+            runtime
+                .submit_op(AgentOp::start_turn(input))
+                .expect("submit panicking turn")
+                .accepted
+        );
+        runtime
+            .join_active_turn()
+            .expect("panic is converted into a worker failure");
+
+        let snapshot = runtime.session_snapshot().expect("session snapshot");
+        assert_eq!(snapshot.steering_queue.len(), 1);
+        assert_eq!(
+            snapshot.steering_queue[0].message,
+            "retain after worker panic"
+        );
+        assert!(runtime.active_turn().expect("active turn").is_none());
+        assert!(
+            runtime
+                .runtime_events_since(AgentRuntimeEventCursor {
+                    offset: 0,
+                    last_event_id: None,
+                })
+                .expect("runtime events")
+                .events
+                .iter()
+                .any(|event| matches!(
+                    &event.payload,
+                    AgentRuntimeEventPayload::WorkerFailed { detail, .. }
+                        if detail == "agent runtime failed: agent session runtime worker panicked"
+                ))
+        );
+
+        runtime
+            .replace_session(AgentSession::new(session_id, AgentRole::Main))
+            .expect("worker panic must not fence session replacement");
     }
 
     #[test]

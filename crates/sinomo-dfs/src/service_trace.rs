@@ -72,6 +72,7 @@ pub(crate) fn dfs_network_message_trace_label(message: &DfsNetworkMessage) -> &'
         DfsNetworkMessage::WriteRequest(_) => "write-request",
         DfsNetworkMessage::WriteResponse(_) => "write-response",
         DfsNetworkMessage::DistributedWriteRequest(_) => "distributed-write-request",
+        DfsNetworkMessage::ExclusiveCreateRequest(_) => "exclusive-create-request",
         DfsNetworkMessage::DistributedWriteResponse(_) => "distributed-write-response",
         DfsNetworkMessage::NamespaceRequest(_) => "namespace-request",
         DfsNetworkMessage::NamespaceResponse(_) => "namespace-response",
@@ -98,6 +99,7 @@ pub(crate) fn dfs_namespace_operation_trace_label(
 ) -> &'static str {
     match operation {
         DfsNamespaceOperation::Mkdir { .. } => "mkdir",
+        DfsNamespaceOperation::MkdirWithAttrs { .. } => "mkdir-with-attrs",
         DfsNamespaceOperation::MkdirAll { .. } => "mkdir-all",
         DfsNamespaceOperation::Rmdir { .. } => "rmdir",
         DfsNamespaceOperation::Unlink { .. } => "unlink",
@@ -110,6 +112,7 @@ pub(crate) fn dfs_namespace_operation_trace_label(
         DfsNamespaceOperation::Hardlink { .. } => "hardlink",
         DfsNamespaceOperation::SetMode { .. } => "set-mode",
         DfsNamespaceOperation::SetOwner { .. } => "set-owner",
+        DfsNamespaceOperation::SetSymlinkOwner { .. } => "set-symlink-owner",
         DfsNamespaceOperation::SetTimes { .. } => "set-times",
         DfsNamespaceOperation::TouchDirectoryModified { .. } => "touch-directory-modified",
         DfsNamespaceOperation::ClearDirRecursive { .. } => "clear-dir-recursive",

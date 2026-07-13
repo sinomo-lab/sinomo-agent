@@ -53,6 +53,7 @@ impl From<DfsError> for DfsPosixError {
     fn from(error: DfsError) -> Self {
         match error {
             DfsError::DirectoryNotEmpty { path } => DfsPosixError::DirectoryNotEmpty { path },
+            DfsError::AlreadyExists { path } => DfsPosixError::AlreadyExists { path },
             error => DfsPosixError::Dfs(error),
         }
     }
@@ -136,6 +137,40 @@ pub struct DfsWriteOptions {
     pub replica_candidates: Vec<NodeId>,
     pub wait_for_commit: bool,
     pub foreground_replica_repair: bool,
+}
+
+/// POSIX attributes installed as part of creating a namespace object.
+///
+/// These attributes travel with the initial metadata object so a file,
+/// directory, or symlink is never visible with a temporary default owner or
+/// mode before a follow-up chmod/chown reaches the metadata authority.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsPosixCreateAttrs {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl DfsPosixCreateAttrs {
+    pub const fn new(mode: u32, uid: u32, gid: u32) -> Self {
+        Self {
+            mode: mode & 0o7777,
+            uid,
+            gid,
+        }
+    }
+
+    pub const fn file_default() -> Self {
+        Self::new(0o644, 0, 0)
+    }
+
+    pub const fn directory_default() -> Self {
+        Self::new(0o755, 0, 0)
+    }
+
+    pub const fn symlink_default() -> Self {
+        Self::new(0o777, 0, 0)
+    }
 }
 
 /// Durability barrier requested through the POSIX DFS surface.

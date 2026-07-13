@@ -533,23 +533,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     )?;
                     return Ok(true);
                 }
-                let mut alias_tombstone = alias.clone();
-                alias_tombstone.path = hidden_alias_tombstone_path(&alias.object_id);
-                alias_tombstone.kind = DfsObjectKind::Tombstone;
-                alias_tombstone.version = next_version(&alias.version);
-                alias_tombstone.content_hash = None;
-                alias_tombstone.content_size_bytes = None;
-                alias_tombstone.link_target_object_id = None;
-                alias_tombstone.current_locations = vec![self.node_id.clone()];
+                let alias_tombstone = self.tombstone_path_object_at(
+                    alias.clone(),
+                    hidden_alias_tombstone_path(&alias.object_id),
+                );
 
                 let mut old_path_tombstone = object.clone();
                 old_path_tombstone.object_id = DfsObjectId::generate();
-                old_path_tombstone.kind = DfsObjectKind::Tombstone;
-                old_path_tombstone.version = next_version(&object.version);
-                old_path_tombstone.content_hash = None;
-                old_path_tombstone.content_size_bytes = None;
-                old_path_tombstone.link_target_object_id = None;
-                old_path_tombstone.current_locations = vec![self.node_id.clone()];
+                let old_path_tombstone = self.tombstone_path_object(old_path_tombstone);
 
                 let mut promoted = object.clone();
                 promoted.path = alias.path.clone();
@@ -569,28 +560,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 })?;
                 continue;
             }
-            let tombstone = DfsObjectMetadata {
-                object_id: DfsObjectId::generate(),
-                file_system_id: object.file_system_id.clone(),
-                path: object.path.clone(),
-                kind: DfsObjectKind::Tombstone,
-                owner_node_id: self.node_id.clone(),
-                current_locations: vec![self.node_id.clone()],
-                content_hash: None,
-                content_size_bytes: None,
-                link_target_object_id: None,
-                mode: 0,
-                uid: 0,
-                gid: 0,
-                accessed_at_unix_nanos: 0,
-                modified_at_unix_nanos: 0,
-                created_at_unix_nanos: 0,
-                changed_at_unix_nanos: 0,
-                version: next_version(&object.version),
-                policy: object.policy.clone(),
-                created_by_event_id: object.created_by_event_id.clone(),
-                last_modified_by_event_id: object.last_modified_by_event_id.clone(),
-            };
+            let mut tombstone = object;
+            tombstone.object_id = DfsObjectId::generate();
+            tombstone.owner_node_id = self.node_id.clone();
+            let tombstone = self.tombstone_path_object(tombstone);
             self.add_object_metadata(tombstone)?;
             return Ok(true);
         }
@@ -899,7 +872,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
 
         let mut transaction_objects = Vec::new();
-        if let Some(mut destination) = self.lookup_sifs_path(target_root)?
+        if let Some(destination) = self.lookup_sifs_path(target_root)?
             && destination.kind != DfsObjectKind::Tombstone
             && destination.object_id != source.object_id
         {
@@ -913,24 +886,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     path: target_root.to_string(),
                 });
             }
-            destination.kind = DfsObjectKind::Tombstone;
-            destination.version = next_version(&destination.version);
-            destination.content_hash = None;
-            destination.content_size_bytes = None;
-            destination.link_target_object_id = None;
-            destination.current_locations = vec![self.node_id.clone()];
-            transaction_objects.push(destination);
+            transaction_objects.push(self.tombstone_path_object(destination));
         }
 
         let mut old_path_tombstone = source.clone();
         old_path_tombstone.object_id = DfsObjectId::generate();
-        old_path_tombstone.path = source_root.to_string();
-        old_path_tombstone.kind = DfsObjectKind::Tombstone;
-        old_path_tombstone.version = next_version(&source.version);
-        old_path_tombstone.content_hash = None;
-        old_path_tombstone.content_size_bytes = None;
-        old_path_tombstone.link_target_object_id = None;
-        old_path_tombstone.current_locations = vec![self.node_id.clone()];
+        let old_path_tombstone =
+            self.tombstone_path_object_at(old_path_tombstone, source_root.to_string());
 
         source.path = target_root.to_string();
         source.changed_at_unix_nanos = now_unix_nanos();

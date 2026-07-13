@@ -43,7 +43,8 @@ pub(crate) fn split_dfs_message_request_body(
             let digest = content_hash(&bytes);
             (bytes, digest)
         }
-        DfsNetworkMessage::DistributedWriteRequest(command) => {
+        DfsNetworkMessage::DistributedWriteRequest(command)
+        | DfsNetworkMessage::ExclusiveCreateRequest(command) => {
             let bytes = std::mem::take(&mut command.bytes);
             // These bytes are still an inline DFS write semantically; only
             // their wire transport is streamed as an RPC attachment. Keep the
@@ -102,7 +103,8 @@ pub(crate) fn attach_dfs_message_request_body(
     validate_body(&head.body, &bytes, "DFS request")?;
     match &mut head.command.routed_message.message {
         DfsNetworkMessage::WriteRequest(command) => command.bytes = bytes,
-        DfsNetworkMessage::DistributedWriteRequest(command) => {
+        DfsNetworkMessage::DistributedWriteRequest(command)
+        | DfsNetworkMessage::ExclusiveCreateRequest(command) => {
             command.content_hash = None;
             command.content_size_bytes = None;
             command.bytes = bytes;
@@ -392,6 +394,7 @@ mod tests {
                     object_metadata: None,
                     touch_parent_on_create: true,
                     foreground_replica_repair: true,
+                    exclusive_create: false,
                 }),
             },
         };

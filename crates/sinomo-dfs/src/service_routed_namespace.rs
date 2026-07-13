@@ -223,7 +223,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNamespaceOperation::SyncPath { path } => {
                 return self.synced_namespace_objects_for_sync_path(file_system_id, path);
             }
-            DfsNamespaceOperation::LookupPath { path } | DfsNamespaceOperation::Mkdir { path } => {
+            DfsNamespaceOperation::LookupPath { path }
+            | DfsNamespaceOperation::Mkdir { path }
+            | DfsNamespaceOperation::MkdirWithAttrs { path, .. } => {
                 posix_path::normalized_posix_path_key(path)
                     .into_iter()
                     .collect()

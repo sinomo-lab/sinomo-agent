@@ -5712,6 +5712,7 @@ fn agent_run_parser_accepts_provider_model_account_and_prompt() {
         AgentRunOptions {
             prompt: "check the cluster".to_string(),
             agent: "coding-agent".to_string(),
+            agent_explicit: true,
             provider: "codex".to_string(),
             model: "gpt-5.2-codex".to_string(),
             account: Some("work".to_string()),
@@ -5724,6 +5725,7 @@ fn agent_run_parser_accepts_provider_model_account_and_prompt() {
     let defaults =
         super::parse_agent_run_options(&["hello".to_string()]).expect("default agent run");
     assert_eq!(defaults.agent, "main-agent");
+    assert!(!defaults.agent_explicit);
     assert!(defaults.session_id.is_none());
     assert!(!defaults.compact_after);
     assert!(!defaults.json);
@@ -5740,11 +5742,13 @@ fn agent_run_session_loader_creates_then_resumes_a_durable_snapshot() {
         &store,
         session_id.clone(),
         sinomo_agent::AgentRole::Main,
+        "main-agent",
         None,
     )
     .expect("create durable session");
     assert!(!resumed);
     assert_eq!(created.session_id, session_id);
+    assert_eq!(created.agent_definition_key.as_deref(), Some("main-agent"));
     assert!(
         sinomo_agent::AgentSessionStore::load_session(&store, &session_id)
             .expect("load created snapshot")
@@ -5759,6 +5763,7 @@ fn agent_run_session_loader_creates_then_resumes_a_durable_snapshot() {
         &store,
         session_id.clone(),
         sinomo_agent::AgentRole::Deliberation,
+        "main-agent",
         None,
     )
     .expect("resume durable session");
@@ -5766,8 +5771,24 @@ fn agent_run_session_loader_creates_then_resumes_a_durable_snapshot() {
     assert!(resumed);
     assert_eq!(loaded.session_id, session_id);
     assert_eq!(loaded.role, sinomo_agent::AgentRole::Deliberation);
+    assert_eq!(loaded.agent_definition_key.as_deref(), Some("main-agent"));
     assert_eq!(loaded.steering_queue.len(), 1);
     assert_eq!(loaded.steering_queue[0].message, "persisted input");
+
+    let mismatch = super::load_or_create_agent_run_session(
+        &store,
+        session_id,
+        sinomo_agent::AgentRole::Deliberation,
+        "coding-agent",
+        None,
+    )
+    .expect_err("a durable session cannot change agent identity");
+    assert!(matches!(
+        mismatch,
+        CliError::Parse { detail }
+            if detail.contains("belongs to `main-agent`")
+                && detail.contains("cannot be resumed as `coding-agent`")
+    ));
 }
 
 #[test]
@@ -5791,6 +5812,7 @@ fn coding_agent_session_resume_is_bound_to_its_original_workspace() {
         &store,
         session_id.clone(),
         sinomo_agent::AgentRole::Deliberation,
+        "coding-agent",
         Some(&original_binding),
     )
     .expect("create workspace-bound session");
@@ -5801,6 +5823,7 @@ fn coding_agent_session_resume_is_bound_to_its_original_workspace() {
         &store,
         session_id.clone(),
         sinomo_agent::AgentRole::Deliberation,
+        "coding-agent",
         Some(&original_binding),
     )
     .expect("resume from original workspace");
@@ -5811,6 +5834,7 @@ fn coding_agent_session_resume_is_bound_to_its_original_workspace() {
         &store,
         session_id.clone(),
         sinomo_agent::AgentRole::Deliberation,
+        "coding-agent",
         Some(&other_binding),
     )
     .expect_err("cross-workspace resume must be rejected");
@@ -5860,6 +5884,7 @@ fn coding_agent_refuses_unbound_legacy_session_with_durable_history() {
         &store,
         session_id,
         sinomo_agent::AgentRole::Deliberation,
+        "coding-agent",
         Some(&binding),
     )
     .expect_err("unbound legacy history must not gain mutation authority");
@@ -5891,6 +5916,7 @@ fn coding_agent_refuses_an_unbound_empty_preexisting_session() {
         &store,
         session_id,
         sinomo_agent::AgentRole::Deliberation,
+        "coding-agent",
         Some(&binding),
     )
     .expect_err("an empty snapshot is not proof that no earlier turn or tool call ran");
@@ -15015,7 +15041,7 @@ fn coding_agent_rejects_unsafe_mutating_workspace_roots() {
 fn coding_agent_rejects_plain_directory_that_looks_like_the_live_sifs_mount() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-fake-sifs-workspace");
     let data_dir = SinomoDataDir::new(root.join("data"));
-    let lookalike = data_dir.root().join("mounts/sifs/projects/selected");
+    let lookalike = super::simple_sandbox_sifs_mount_point(&data_dir).join("projects/selected");
     fs::create_dir_all(&lookalike).expect("create plain lookalike directory");
 
     let error = super::agent_tool_registry_for_workspace(
@@ -15030,6 +15056,91 @@ fn coding_agent_rejects_plain_directory_that_looks_like_the_live_sifs_mount() {
     .expect("an ordinary directory under mounts/sifs is still Sinomo internal state");
 
     assert!(error.to_string().contains("unsafe workspace root"));
+}
+
+#[cfg(all(unix, feature = "dfs-fuse"))]
+#[test]
+fn coding_local_workspace_survives_optional_sifs_mount_failure() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-optional-sifs-mount");
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(
+                ClusterId::from_legacy_named("agent_optional_sifs_mount").expect("cluster"),
+            ),
+            node_id: Some(
+                NodeId::from_legacy_named("node_agent_optional_sifs_mount").expect("node"),
+            ),
+            name: "agent optional SIFS mount".to_string(),
+        },
+        &ClusterPaths::new(&data_dir),
+    )
+    .expect("cluster init");
+
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace).expect("local workspace");
+    let mount_point = super::simple_sandbox_sifs_mount_point(&data_dir);
+    fs::create_dir_all(mount_point.parent().expect("mount parent")).expect("mount parent");
+    fs::write(&mount_point, b"force deterministic FUSE mount failure").expect("mount-point file");
+
+    let session = InteractionSession::new(
+        SessionId::generate(),
+        NodeId::from_legacy_named("node_agent_optional_sifs_session").expect("session node"),
+        InteractionSurface::new("test", InteractionSurfaceKind::CommandLine),
+    );
+    let registry = super::agent_tool_registry_for_workspace(
+        &data_dir,
+        &workspace,
+        &sinomo_agent::AgentDefinition::coding(),
+        Some(&session.session_id),
+        None,
+        true,
+    )
+    .expect("local coding registry must tolerate optional SIFS mount failure");
+    assert!(registry.contains("write_file"));
+    assert!(registry.contains("run_command"));
+    let write = registry.execute(
+        &session,
+        0,
+        0,
+        &sinomo_agent::AgentToolCall {
+            call_id: None,
+            tool: "write_file".to_string(),
+            input: serde_json::json!({ "path": "available.txt", "content": "available\n" }),
+            r#async: false,
+            summary: "verify local workspace availability".to_string(),
+        },
+    );
+    assert_eq!(write.status, sinomo_agent::AgentToolStatus::Succeeded);
+    assert_eq!(
+        fs::read_to_string(workspace.join("available.txt")).expect("written local file"),
+        "available\n"
+    );
+
+    let sifs_workspace = mount_point.join("projects/selected");
+    let error = super::agent_tool_registry_for_workspace(
+        &data_dir,
+        &sifs_workspace,
+        &sinomo_agent::AgentDefinition::coding(),
+        Some(&SessionId::generate()),
+        None,
+        true,
+    )
+    .err()
+    .expect("a SIFS workspace must still require its live mount");
+    assert!(error.to_string().contains("mount live SIFS"));
+}
+
+#[test]
+fn simple_sandbox_sifs_mount_points_are_isolated_by_process() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-process-sifs-mounts");
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    let first = super::simple_sandbox_sifs_mount_point_for_process(&data_dir, 111);
+    let second = super::simple_sandbox_sifs_mount_point_for_process(&data_dir, 222);
+
+    assert_ne!(first, second);
+    assert_eq!(first, data_dir.root().join("mounts/sifs/by-process/111"));
+    assert_eq!(second, data_dir.root().join("mounts/sifs/by-process/222"));
 }
 
 #[test]

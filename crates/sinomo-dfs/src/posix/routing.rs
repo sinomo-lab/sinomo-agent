@@ -610,6 +610,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         match operation {
             DfsNamespaceOperation::Mkdir { path } => self.posix_mkdir_local(path).map(drop),
+            DfsNamespaceOperation::MkdirWithAttrs { path, attrs } => self
+                .posix_mkdir_local_with_create_attrs(path, *attrs)
+                .map(drop),
             DfsNamespaceOperation::MkdirAll { path } => self.posix_mkdir_all_local(path),
             DfsNamespaceOperation::Rmdir { path } => self.posix_rmdir_local(path).map(drop),
             DfsNamespaceOperation::Unlink { path } => self.posix_unlink_local(path).map(drop),
@@ -640,6 +643,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNamespaceOperation::SetOwner { path, uid, gid } => {
                 self.posix_set_owner_local(path, *uid, *gid).map(drop)
             }
+            DfsNamespaceOperation::SetSymlinkOwner { path, uid, gid } => self
+                .posix_set_symlink_owner_local(path, *uid, *gid)
+                .map(drop),
             DfsNamespaceOperation::SetTimes {
                 path,
                 accessed_at_unix_nanos,
@@ -953,11 +959,13 @@ fn validate_advisory_lock_migration_receipt(
 fn namespace_operation_routing_path(operation: &DfsNamespaceOperation) -> Option<&str> {
     match operation {
         DfsNamespaceOperation::Mkdir { path }
+        | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
         | DfsNamespaceOperation::MkdirAll { path }
         | DfsNamespaceOperation::Rmdir { path }
         | DfsNamespaceOperation::Unlink { path }
         | DfsNamespaceOperation::SetMode { path, .. }
         | DfsNamespaceOperation::SetOwner { path, .. }
+        | DfsNamespaceOperation::SetSymlinkOwner { path, .. }
         | DfsNamespaceOperation::SetTimes { path, .. }
         | DfsNamespaceOperation::TouchDirectoryModified { path }
         | DfsNamespaceOperation::ClearDirRecursive { path }

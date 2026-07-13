@@ -1691,6 +1691,7 @@ mod tests {
                 object_metadata: None,
                 touch_parent_on_create: true,
                 foreground_replica_repair: false,
+                exclusive_create: false,
             }),
         }
     }
@@ -2424,6 +2425,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 fn served_message_foreground_write_request_id(message: &DfsNetworkMessage) -> Option<String> {
     match message {
         DfsNetworkMessage::DistributedWriteRequest(command)
+        | DfsNetworkMessage::ExclusiveCreateRequest(command)
             if command.foreground_replica_repair =>
         {
             Some(command.request_id.clone())

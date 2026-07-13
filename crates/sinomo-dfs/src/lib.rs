@@ -374,7 +374,7 @@ pub use operator::{
 pub use posix::sync::{DfsPosixDirectorySyncCertificate, DfsPosixFileSyncCertificate};
 pub use posix_model::{
     DfsDirEntry, DfsDirEntryPage, DfsNamespaceJobFailure, DfsNamespaceJobMaintenanceReport,
-    DfsPosixDirectorySyncTarget, DfsPosixError, DfsPosixFilePrefixRead,
+    DfsPosixCreateAttrs, DfsPosixDirectorySyncTarget, DfsPosixError, DfsPosixFilePrefixRead,
     DfsPosixFileRangeReadStream, DfsPosixFileReadStream, DfsPosixFileSyncEvidence,
     DfsPosixFileSyncTarget, DfsPosixSyncKind, DfsStat, DfsWriteOptions,
 };

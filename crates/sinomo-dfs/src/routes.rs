@@ -206,7 +206,8 @@ fn dfs_message_route_for_network_message(message: &DfsNetworkMessage) -> &'stati
         DfsNetworkMessage::BulkReadResponse(_) => DFS_DATA_BULK_READ_RESPONSE_ROUTE,
         DfsNetworkMessage::WriteRequest(_) => DFS_DATA_WRITE_ROUTE,
         DfsNetworkMessage::WriteResponse(_) => DFS_DATA_WRITE_RESPONSE_ROUTE,
-        DfsNetworkMessage::DistributedWriteRequest(_) => DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
+        DfsNetworkMessage::DistributedWriteRequest(_)
+        | DfsNetworkMessage::ExclusiveCreateRequest(_) => DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
         DfsNetworkMessage::DistributedWriteResponse(_) => DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE,
         DfsNetworkMessage::NamespaceRequest(_) => DFS_DATA_NAMESPACE_ROUTE,
         DfsNetworkMessage::NamespaceResponse(_) => DFS_DATA_NAMESPACE_RESPONSE_ROUTE,
@@ -251,6 +252,7 @@ fn dfs_network_message_uses_full_response_budget(message: &DfsNetworkMessage) ->
             | DfsNetworkMessage::WriteRequest(_)
             | DfsNetworkMessage::WriteResponse(_)
             | DfsNetworkMessage::DistributedWriteRequest(_)
+            | DfsNetworkMessage::ExclusiveCreateRequest(_)
             | DfsNetworkMessage::DistributedWriteResponse(_)
             | DfsNetworkMessage::NamespaceRequest(_)
             | DfsNetworkMessage::NamespaceResponse(_)
@@ -303,7 +305,8 @@ pub(crate) fn dfs_network_message_allows_write_repair_progress(
     message: &DfsNetworkMessage,
 ) -> bool {
     match message {
-        DfsNetworkMessage::DistributedWriteRequest(command) => command.foreground_replica_repair,
+        DfsNetworkMessage::DistributedWriteRequest(command)
+        | DfsNetworkMessage::ExclusiveCreateRequest(command) => command.foreground_replica_repair,
         _ => false,
     }
 }
@@ -391,12 +394,15 @@ pub fn dfs_message_rpc_request(
         request = request.with_full_response_budget();
     }
     if dfs_network_message_response_retry_safe(&command.routed_message.message) {
-        // Distributed writes carry a stable request identity and their outcome
+        // Ordinary distributed writes carry a stable request identity and their outcome
         // is durably reconciled at the metadata primary. Repair writes are
         // content-addressed and replay-identifiable; completed duplicate
         // requests take idempotent durable fast paths. If a transport loses
         // only the response, sinomo-network may therefore safely redispatch
-        // these commands instead of surfacing an ambiguous timeout.
+        // these commands instead of surfacing an ambiguous timeout. Exclusive
+        // creates are intentionally excluded until their success response is
+        // durably replayable: redispatching one after commit would turn success
+        // into AlreadyExists.
         request = request.with_response_retry_safe();
     }
     if let Some(traceparent) = crate::current_dfs_traceparent() {

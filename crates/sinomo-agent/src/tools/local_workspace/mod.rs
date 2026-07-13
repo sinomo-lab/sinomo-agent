@@ -27,12 +27,13 @@ use sinomo_runtime::sandbox::{
     LocalSandboxInstanceLayout, LocalSandboxInstanceStore, LocalSandboxToolchainStore,
     SandboxCancellationToken, SandboxCommandExecutionError, SandboxId,
     SandboxInstanceLifecycleStatus, SandboxInstanceManifest, SandboxInstancePortability,
-    SandboxLocalExecutionLease, SandboxMount, SandboxMountMode, SandboxPath, SandboxPolicy,
-    SandboxRuntimeBinding, SandboxStoreError, SandboxToolchainId, SandboxTrackedProcess,
-    SandboxTrackedProcessStatus, SandboxWasiError,
-    recover_sandbox_local_execution_journal_with_lease, sandbox_execution_placement_for_node,
-    try_acquire_sandbox_local_execution_lease,
+    SandboxLocalExecutionLease, SandboxPath, SandboxPolicy, SandboxRuntimeBinding,
+    SandboxStoreError, SandboxToolchainId, SandboxTrackedProcess, SandboxTrackedProcessStatus,
+    SandboxWasiError, recover_sandbox_local_execution_journal_with_lease,
+    sandbox_execution_placement_for_node, try_acquire_sandbox_local_execution_lease,
 };
+#[cfg(test)]
+use sinomo_runtime::sandbox::{SandboxMount, SandboxMountMode};
 use sinomo_runtime::sandbox_simple::{SandboxSimpleNativeCommandRunner, SandboxSimpleNativeConfig};
 use std::collections::BTreeMap;
 use std::env;
@@ -709,6 +710,19 @@ fn execute_simple_sandbox_command(
             ));
         }
     };
+    // A live DFS-backed HOME is an optional projection. If it becomes
+    // unavailable after registry setup (ownership drift, disconnected mount,
+    // or another device using an incompatible numeric UID), preserve generic
+    // shell execution with the inherited host HOME instead of rejecting the
+    // command before it starts.
+    let mut effective_config = config.clone();
+    if let Some(home) = agent_home_live_host_path(&effective_config)
+        && (fs::create_dir_all(&home).is_err()
+            || !fs::metadata(&home).is_ok_and(|metadata| metadata.is_dir()))
+    {
+        effective_config = effective_config.without_agent_home_sifs_path();
+    }
+    let config = &effective_config;
     let prepared = prepare_sandbox_command(program, args, &cwd)?;
     let sandbox_cwd = sandbox_path_for_host_path(&cwd)?;
     let sandbox_id = agent_sandbox_id(config, &root);
@@ -1213,7 +1227,7 @@ fn prepare_agent_sandbox_manifest(
         )
     })?;
     let now = time::OffsetDateTime::now_utc();
-    let (mut manifest, layout) = match store.load(sandbox_id) {
+    let (mut manifest, _layout) = match store.load(sandbox_id) {
         Ok(loaded) => loaded,
         Err(SandboxStoreError::NotFound { .. }) => match local_execution_lease {
             Some(lease) => store
@@ -1273,7 +1287,11 @@ fn prepare_agent_sandbox_manifest(
         path_prefixes,
         agent_home_host_path.as_deref(),
     );
-    manifest.mounts = agent_home_mounts(config, &layout)?;
+    // HOME already names the live FUSE path and simple-native executes against
+    // the host namespace. Declaring a second projection is redundant and would
+    // make optional DFS HOME depend on bubblewrap merely to bind the same path
+    // elsewhere in the sandbox instance layout.
+    manifest.mounts.clear();
     // Bound the native process itself, not only the later tool-result preview.
     // This prevents an unbounded producer from buffering until process exit.
     manifest.limits.max_output_bytes = config.max_command_output_bytes as u64;
@@ -1457,24 +1475,6 @@ fn sandbox_store_failure(
             }),
         )
     }
-}
-
-fn agent_home_mounts(
-    config: &LocalWorkspaceAgentConfig,
-    layout: &LocalSandboxInstanceLayout,
-) -> Result<Vec<SandboxMount>, AgentToolResult> {
-    let Some(source_sifs_path) = &config.agent_home_sifs_path else {
-        return Ok(Vec::new());
-    };
-    Ok(vec![SandboxMount {
-        source_sifs_path: normalize_agent_home_sifs_path(source_sifs_path.clone()),
-        // Keep the generic host filesystem visible as-is. Projecting over
-        // `/home` hid unrelated host paths and could make PATH-resolved host
-        // tools disappear. The instance-owned home is a stable, non-shadowing
-        // guest target; HOME still points directly at the same live FUSE tree.
-        mount_path: sandbox_path_for_host_path(&layout.home)?,
-        mode: SandboxMountMode::ReadWrite,
-    }])
 }
 
 fn agent_sandbox_policy() -> SandboxPolicy {
@@ -2436,7 +2436,7 @@ mod tests {
     }
 
     #[test]
-    fn simple_sandbox_manifest_mounts_agent_home_without_shadowing_host_home() {
+    fn simple_sandbox_manifest_uses_live_agent_home_without_redundant_projection() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-sandbox-home");
         let runtime_root = root.join("sandbox-runtime");
         let workspace = root.join("workspace");
@@ -2472,16 +2472,7 @@ mod tests {
         .expect("manifest");
         let (manifest, _layout) = store.load(&sandbox_id).expect("load manifest");
 
-        assert_eq!(manifest.mounts.len(), 1);
-        assert_eq!(
-            manifest.mounts[0].source_sifs_path,
-            "/sinomo/agents/test-agent/home"
-        );
-        assert_eq!(
-            manifest.mounts[0].mount_path.as_str(),
-            layout.home.display().to_string()
-        );
-        assert_eq!(manifest.mounts[0].mode, SandboxMountMode::ReadWrite);
+        assert!(manifest.mounts.is_empty());
         assert!(layout.home.exists());
         let home_host_path = agent_home_live_host_path(&config).expect("live agent home host path");
         assert!(home_host_path.exists());
@@ -2630,6 +2621,42 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("usable")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_live_agent_home_does_not_veto_generic_shell() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-unavailable-live-home");
+        let workspace = root.join("workspace");
+        let mount_root = root.join("mount");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&mount_root).expect("mount root");
+        fs::write(mount_root.join("sinomo"), b"blocks directory traversal").expect("blocking file");
+        let session = test_session("unavailable-live-home");
+        let config = LocalWorkspaceAgentConfig::new(&workspace)
+            .with_sandbox_sifs_mount_root(&mount_root)
+            .with_agent_home_sifs_path("/sinomo/agents/test/home")
+            .allowing_shell_commands(true);
+        let registry = AgentToolRegistry::local_workspace_with_config(config);
+
+        let outcome = registry.execute(
+            &session,
+            0,
+            0,
+            &AgentToolCall {
+                call_id: None,
+                tool: "run_command".to_string(),
+                input: serde_json::json!({
+                    "command": "printf usable-without-dfs-home",
+                    "timeout_ms": 5_000,
+                }),
+                r#async: false,
+                summary: "verify optional DFS home failure".to_string(),
+            },
+        );
+
+        assert_eq!(outcome.status, AgentToolStatus::Succeeded, "{outcome:#?}");
+        assert_eq!(outcome.output["stdout"], "usable-without-dfs-home");
     }
 
     #[test]

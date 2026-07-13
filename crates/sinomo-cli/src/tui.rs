@@ -1084,6 +1084,41 @@ trait TuiAgentRuntimeControl: InteractionEventHandler {
         definition: AgentDefinition,
     ) -> Result<TuiAgentRuntimeInfo, CliError>;
 
+    fn switch_tui_agent_for_session(
+        &mut self,
+        data_dir: &SinomoDataDir,
+        session: &InteractionSession,
+        daemon_connected: bool,
+        definition: AgentDefinition,
+    ) -> Result<TuiAgentRuntimeInfo, CliError> {
+        let _ = session;
+        self.switch_tui_agent(data_dir, daemon_connected, definition)
+    }
+
+    fn prepare_tui_agent(
+        &mut self,
+        data_dir: &SinomoDataDir,
+        daemon_connected: bool,
+        definition: AgentDefinition,
+    ) -> Result<TuiAgentRuntimeInfo, CliError> {
+        self.switch_tui_agent(data_dir, daemon_connected, definition)
+    }
+
+    fn load_tui_agent_session(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<Option<AgentSession>, CliError> {
+        Ok(None)
+    }
+
+    fn persist_tui_agent_session(
+        &mut self,
+        _data_dir: &SinomoDataDir,
+        _session: &InteractionSession,
+    ) -> Result<(), CliError> {
+        Ok(())
+    }
+
     fn configure_tui_tool_runtime(
         &mut self,
         _data_dir: &SinomoDataDir,
@@ -1096,7 +1131,9 @@ trait TuiAgentRuntimeControl: InteractionEventHandler {
 
     fn restore_tui_agent_session(
         &mut self,
+        _data_dir: &SinomoDataDir,
         _session: &InteractionSession,
+        _persisted: Option<AgentSession>,
         _transcript: sinomo_agent::AgentTranscript,
     ) -> Result<(), CliError> {
         Ok(())
@@ -3080,10 +3117,13 @@ fn apply_tui_slash_command<H: TuiAgentRuntimeControl>(
                 .ok_or_else(|| CliError::Parse {
                     detail: format!("unknown agent `{agent_id}`"),
                 })?;
-            let info =
-                runtime
-                    .handler
-                    .switch_tui_agent(data_dir, state.daemon_connected, definition)?;
+            let session = runtime.session().clone();
+            let info = runtime.handler.switch_tui_agent_for_session(
+                data_dir,
+                &session,
+                state.daemon_connected,
+                definition,
+            )?;
             state.update_runtime_info(info.clone());
             Ok(vec![InteractionOutput::Line(format!(
                 "agent switched: {}",
@@ -3251,15 +3291,40 @@ fn resume_tui_session<H: TuiAgentRuntimeControl>(
     }
 
     session_store.save_state(runtime.session(), state)?;
+    let current_session = runtime.session().clone();
+    runtime
+        .handler
+        .persist_tui_agent_session(data_dir, &current_session)?;
     let record = session_store.load_session(&session_id)?;
+    let mut persisted_agent_session = runtime.handler.load_tui_agent_session(&session_id)?;
     let mut outputs = Vec::new();
+    let resume_agent_key = match persisted_agent_session
+        .as_ref()
+        .and_then(|session| session.agent_definition_key.as_deref())
+        .filter(|key| !key.trim().is_empty())
+    {
+        Some(key) => key.to_string(),
+        None => {
+            let source = if persisted_agent_session.is_some() {
+                "canonical session has no agent definition"
+            } else {
+                "canonical session is unavailable"
+            };
+            outputs.push(InteractionOutput::Line(format!(
+                "legacy session restore: {source}; using TUI agent metadata `{}`",
+                record.runtime_info.agent
+            )));
+            record.runtime_info.agent.clone()
+        }
+    };
     let restored_info = restore_tui_session_runtime_info(
         &mut runtime.handler,
         data_dir,
         state.daemon_connected,
         &record.runtime_info,
+        &resume_agent_key,
         &mut outputs,
-    );
+    )?;
     runtime.replace_store_and_session(
         JsonlEventStore::new(session_store.events_path_for_session(&session_id)),
         record.session.clone(),
@@ -3274,8 +3339,18 @@ fn resume_tui_session<H: TuiAgentRuntimeControl>(
         ),
         None => (Vec::new(), None, TuiTokenUsage::default()),
     };
+    if let Some(persisted) = persisted_agent_session.as_mut()
+        && persisted
+            .agent_definition_key
+            .as_deref()
+            .is_none_or(|key| key.trim().is_empty())
+    {
+        persisted.agent_definition_key = Some(resume_agent_key);
+    }
     runtime.handler.restore_tui_agent_session(
+        data_dir,
         &record.session,
+        persisted_agent_session,
         agent_transcript_from_tui_messages(&messages),
     )?;
     state.replace_session(
@@ -3323,8 +3398,9 @@ fn restore_tui_session_runtime_info<H: TuiAgentRuntimeControl>(
     data_dir: &SinomoDataDir,
     daemon_connected: bool,
     info: &TuiAgentRuntimeInfo,
+    agent_key: &str,
     outputs: &mut Vec<InteractionOutput>,
-) -> TuiAgentRuntimeInfo {
+) -> Result<TuiAgentRuntimeInfo, CliError> {
     let provider =
         normalize_tui_model_provider(&info.provider).unwrap_or_else(|_| info.provider.clone());
     let selection = TuiModelSelection {
@@ -3335,7 +3411,7 @@ fn restore_tui_session_runtime_info<H: TuiAgentRuntimeControl>(
             .clone()
             .unwrap_or_else(|| sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string()),
     };
-    let restored = match handler.switch_tui_model(data_dir, selection, daemon_connected) {
+    let _restored = match handler.switch_tui_model(data_dir, selection, daemon_connected) {
         Ok(info) => info,
         Err(error) => {
             outputs.push(InteractionOutput::Line(format!(
@@ -3344,20 +3420,21 @@ fn restore_tui_session_runtime_info<H: TuiAgentRuntimeControl>(
             handler.tui_agent_runtime_info()
         }
     };
-    if let Ok(catalog) = load_tui_agent_catalog(data_dir)
-        && let Some(definition) = catalog.get(&info.agent).cloned()
-    {
-        return match handler.switch_tui_agent(data_dir, daemon_connected, definition) {
-            Ok(info) => info,
-            Err(error) => {
-                outputs.push(InteractionOutput::Line(format!(
-                    "agent restore failed: {error}"
-                )));
-                restored
-            }
-        };
-    }
-    restored
+    let catalog = load_tui_agent_catalog(data_dir)?;
+    let definition = catalog
+        .get(agent_key)
+        .cloned()
+        .ok_or_else(|| CliError::Parse {
+            detail: format!(
+                "canonical agent session references unknown agent definition `{agent_key}`"
+            ),
+        })?;
+    let prepared = handler
+        .prepare_tui_agent(data_dir, daemon_connected, definition)
+        .map_err(|error| CliError::Parse {
+            detail: format!("prepare agent `{agent_key}` for session restore failed: {error}"),
+        })?;
+    Ok(prepared)
 }
 
 fn tui_agent_status_outputs(info: &TuiAgentRuntimeInfo) -> Vec<InteractionOutput> {
@@ -5061,7 +5138,8 @@ mod tui_tests {
         .with_runtime_storage(AgentRuntimeStorage::from_data_dir(&data_dir));
         let mut runtime =
             InteractionRuntime::new(InMemoryEventStore::new(), handler, session.clone());
-        let mut durable_session = AgentSession::new(session.session_id.clone(), AgentRole::Main);
+        let mut durable_session = AgentSession::new(session.session_id.clone(), AgentRole::Main)
+            .with_agent_definition_key("main-agent");
         let first_visible = sinomo_agent::AgentItem::UserMessage {
             item_id: TaskId::generate(),
             step_index: 0,
@@ -6222,6 +6300,231 @@ mod tui_tests {
         assert_eq!(info.agent, "ops-agent");
         assert_eq!(handler.tui_agent_runtime_info().agent, "ops-agent");
     }
+
+    #[test]
+    fn tui_agent_switch_persists_identity_and_generic_workspace_immediately() {
+        let root = temp_file_browser_root("durable-agent-switch");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let workspace = root.join("plain-workspace");
+        fs::create_dir_all(&workspace).expect("create generic workspace");
+        let workspace = fs::canonicalize(workspace).expect("canonical generic workspace");
+        let mut handler = RuntimeMainAgentInteractionHandler::from_runtime_config(
+            &data_dir,
+            ModelRuntimeConfig::default(),
+        )
+        .expect("handler");
+        handler.workspace_root = workspace.clone();
+        let session = InteractionSession::new(
+            SessionId::generate(),
+            NodeId::from_legacy_named("node_tui_durable_switch").expect("node"),
+            InteractionSurface::new(
+                "surface.tui-durable-switch",
+                InteractionSurfaceKind::CommandLine,
+            ),
+        );
+
+        let info = handler
+            .switch_tui_agent_for_session(&data_dir, &session, false, AgentDefinition::coding())
+            .expect("switch coding agent");
+
+        assert_eq!(info.agent, "coding-agent");
+        let persisted = FileAgentSessionStore::for_data_dir(&data_dir)
+            .load_session(&session.session_id)
+            .expect("load canonical session")
+            .expect("canonical session");
+        assert_eq!(
+            persisted.agent_definition_key.as_deref(),
+            Some("coding-agent")
+        );
+        assert_eq!(
+            persisted
+                .workspace_binding
+                .as_ref()
+                .and_then(|binding| binding.local_root.as_deref()),
+            Some(workspace.as_path())
+        );
+        assert_eq!(
+            handler
+                .agent_session_snapshot()
+                .expect("live snapshot")
+                .expect("live session"),
+            persisted
+        );
+    }
+
+    #[test]
+    fn tui_agent_switch_rolls_back_definition_when_runtime_selection_fails() {
+        let root = temp_file_browser_root("agent-switch-rollback");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let mut handler = RuntimeMainAgentInteractionHandler::from_runtime_config(
+            &data_dir,
+            ModelRuntimeConfig::default(),
+        )
+        .expect("handler");
+        let session = InteractionSession::new(
+            SessionId::generate(),
+            NodeId::from_legacy_named("node_tui_switch_rollback").expect("node"),
+            InteractionSurface::new(
+                "surface.tui-switch-rollback",
+                InteractionSurfaceKind::CommandLine,
+            ),
+        );
+        handler
+            .replace_agent_session(&session, sinomo_agent::AgentTranscript::new())
+            .expect("attach main session");
+        let runtime_config_path =
+            write_model_runtime_config_for_node(&data_dir, &ModelRuntimeConfig::default())
+                .expect("write valid runtime config");
+        fs::write(&runtime_config_path, b"{not valid json")
+            .expect("corrupt runtime config after handler creation");
+
+        handler
+            .switch_tui_agent(&data_dir, false, AgentDefinition::coding())
+            .expect_err("malformed runtime config must reject switch");
+
+        assert_eq!(handler.tui_agent_runtime_info().agent, "main-agent");
+        assert_eq!(
+            handler
+                .agent_session_snapshot()
+                .expect("live snapshot")
+                .expect("live session")
+                .agent_definition_key
+                .as_deref(),
+            Some("main-agent")
+        );
+    }
+
+    #[test]
+    fn tui_resume_prefers_canonical_agent_identity_over_stale_ui_metadata() {
+        let root = temp_file_browser_root("canonical-agent-resume");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let workspace = root.join("canonical-workspace");
+        fs::create_dir_all(&workspace).expect("create canonical workspace");
+        let workspace = fs::canonicalize(workspace).expect("canonical workspace");
+        let session_store = TuiSessionStore::for_data_dir(&data_dir);
+        let target_session = InteractionSession::new(
+            SessionId::generate(),
+            NodeId::from_legacy_named("node_tui_canonical_resume").expect("node"),
+            InteractionSurface::new(
+                "surface.tui-canonical-resume",
+                InteractionSurfaceKind::CommandLine,
+            ),
+        );
+        let mut target_state = TuiState::new(&target_session, None, TuiAgentRuntimeInfo::default());
+        target_state.push_message(TuiMessageKind::User, "resume this coding session");
+        session_store
+            .save_state(&target_session, &target_state)
+            .expect("save stale TUI metadata");
+        let mut canonical =
+            AgentSession::new(target_session.session_id.clone(), AgentRole::Deliberation)
+                .with_agent_definition_key("coding-agent");
+        canonical.workspace_binding = Some(WorkspaceRef::local_path(workspace.clone()));
+        FileAgentSessionStore::for_data_dir(&data_dir)
+            .save_session(&canonical)
+            .expect("save canonical coding session");
+
+        let handler = RuntimeMainAgentInteractionHandler::from_runtime_config(
+            &data_dir,
+            ModelRuntimeConfig::default(),
+        )
+        .expect("handler");
+        let mut runtime =
+            new_tui_interaction_runtime(handler, None, &session_store).expect("runtime");
+        let mut state = TuiState::new(
+            runtime.session(),
+            None,
+            runtime.handler.tui_agent_runtime_info(),
+        );
+
+        resume_tui_session(
+            &mut runtime,
+            &mut state,
+            &session_store,
+            &data_dir,
+            None,
+            target_session.session_id.clone(),
+        )
+        .expect("resume canonical coding session");
+
+        assert_eq!(state.runtime_info.agent, "coding-agent");
+        let resumed = runtime
+            .handler
+            .agent_session_snapshot()
+            .expect("live snapshot")
+            .expect("live session");
+        assert_eq!(
+            resumed.agent_definition_key.as_deref(),
+            Some("coding-agent")
+        );
+        assert_eq!(resumed.workspace_binding, canonical.workspace_binding);
+    }
+
+    #[test]
+    fn tui_resume_migrates_legacy_agent_identity_from_ui_metadata() {
+        let root = temp_file_browser_root("legacy-agent-resume");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let session_store = TuiSessionStore::for_data_dir(&data_dir);
+        let target_session = InteractionSession::new(
+            SessionId::generate(),
+            NodeId::from_legacy_named("node_tui_legacy_resume").expect("node"),
+            InteractionSurface::new(
+                "surface.tui-legacy-resume",
+                InteractionSurfaceKind::CommandLine,
+            ),
+        );
+        let coding_info = TuiAgentRuntimeInfo {
+            agent: "coding-agent".to_string(),
+            ..TuiAgentRuntimeInfo::default()
+        };
+        let mut target_state = TuiState::new(&target_session, None, coding_info);
+        target_state.push_message(TuiMessageKind::User, "resume legacy session");
+        session_store
+            .save_state(&target_session, &target_state)
+            .expect("save legacy TUI metadata");
+        FileAgentSessionStore::for_data_dir(&data_dir)
+            .save_session(&AgentSession::new(
+                target_session.session_id.clone(),
+                AgentRole::Deliberation,
+            ))
+            .expect("save legacy canonical session");
+
+        let handler = RuntimeMainAgentInteractionHandler::from_runtime_config(
+            &data_dir,
+            ModelRuntimeConfig::default(),
+        )
+        .expect("handler");
+        let mut runtime =
+            new_tui_interaction_runtime(handler, None, &session_store).expect("runtime");
+        let mut state = TuiState::new(
+            runtime.session(),
+            None,
+            runtime.handler.tui_agent_runtime_info(),
+        );
+
+        let outputs = resume_tui_session(
+            &mut runtime,
+            &mut state,
+            &session_store,
+            &data_dir,
+            None,
+            target_session.session_id.clone(),
+        )
+        .expect("resume legacy session");
+
+        assert!(outputs.iter().any(|output| matches!(
+            output,
+            InteractionOutput::Line(line) if line.contains("legacy session restore")
+        )));
+        let migrated = FileAgentSessionStore::for_data_dir(&data_dir)
+            .load_session(&target_session.session_id)
+            .expect("load migrated session")
+            .expect("migrated session");
+        assert_eq!(
+            migrated.agent_definition_key.as_deref(),
+            Some("coding-agent")
+        );
+        assert_eq!(state.runtime_info.agent, "coding-agent");
+    }
 }
 
 pub trait InteractionEventHandler {
@@ -6704,8 +7007,6 @@ where
     }
 
     fn build_runtime(&self, model: M, session: AgentSession) -> AgentSessionRuntime<M> {
-        let mut session = session;
-        session.role = self.agent_definition.role.clone();
         let config = sinomo_agent::AgentConfig::new(self.provider.clone(), self.model_name.clone())
             .with_agent_definition(self.agent_definition.clone())
             .with_workspace_root(self.workspace_root.clone())
@@ -6730,7 +7031,8 @@ where
             let agent_session = AgentSession::new(
                 session.session_id.clone(),
                 self.agent_definition.role.clone(),
-            );
+            )
+            .with_agent_definition_key(self.agent_definition.key());
             let runtime = self.build_runtime(model, agent_session);
             self.register_runtime_control(&runtime)?;
             self.runtime = Some(RuntimeMainAgentSlot::Ready(runtime));
@@ -6779,39 +7081,62 @@ where
         model_name: String,
         account: Option<String>,
         options: LanguageModelProviderOptions,
+        rebind_agent_identity: bool,
     ) -> Result<TuiAgentRuntimeInfo, CliError> {
-        let previous = self.runtime.take();
-        let mut previous_session_id = None;
-        let preserved_session = match previous {
+        let previous_runtime = self.runtime.take();
+        let preserved_session = match previous_runtime.as_ref() {
             Some(RuntimeMainAgentSlot::Ready(runtime)) => {
-                if runtime.active_turn()?.is_some() {
-                    let _ =
-                        runtime.interrupt_active_turn("model switched while turn was active")?;
-                    runtime.join_active_turn()?;
+                let snapshot = (|| {
+                    if runtime.active_turn()?.is_some() {
+                        let _ = runtime
+                            .interrupt_active_turn("model switched while turn was active")?;
+                        runtime.join_active_turn()?;
+                    }
+                    runtime.session_snapshot().map_err(CliError::from)
+                })();
+                match snapshot {
+                    Ok(session) => Some(session),
+                    Err(error) => {
+                        self.runtime = previous_runtime;
+                        return Err(error);
+                    }
                 }
-                let session = runtime.session_snapshot()?;
-                previous_session_id = Some(session.session_id.clone());
-                Some(session)
             }
             Some(RuntimeMainAgentSlot::Pending(_)) | None => None,
         };
-        if let Some(session_id) = previous_session_id {
-            self.unregister_runtime_control_session(&session_id)?;
-        }
 
-        self.provider = provider;
-        self.model_name = model_name;
-        self.account = account;
-        self.reasoning_effort = options.reasoning_effort;
-        self.reasoning_budget_tokens = options.reasoning_budget_tokens;
-        self.runtime = Some(match preserved_session {
-            Some(session) => {
+        let previous_provider = std::mem::replace(&mut self.provider, provider);
+        let previous_model_name = std::mem::replace(&mut self.model_name, model_name);
+        let previous_account = std::mem::replace(&mut self.account, account);
+        let previous_reasoning_effort =
+            std::mem::replace(&mut self.reasoning_effort, options.reasoning_effort);
+        let previous_reasoning_budget_tokens = std::mem::replace(
+            &mut self.reasoning_budget_tokens,
+            options.reasoning_budget_tokens,
+        );
+        let next_runtime = match preserved_session {
+            Some(mut session) => {
+                if rebind_agent_identity {
+                    // Only an explicit user agent switch may change the
+                    // identity of the currently attached live session.
+                    session.role = self.agent_definition.role.clone();
+                    session.agent_definition_key = Some(self.agent_definition.key().to_string());
+                }
                 let runtime = self.build_runtime(model, session);
-                self.register_runtime_control(&runtime)?;
+                if let Err(error) = self.register_runtime_control(&runtime) {
+                    self.provider = previous_provider;
+                    self.model_name = previous_model_name;
+                    self.account = previous_account;
+                    self.reasoning_effort = previous_reasoning_effort;
+                    self.reasoning_budget_tokens = previous_reasoning_budget_tokens;
+                    self.runtime = previous_runtime;
+                    return Err(error);
+                }
                 RuntimeMainAgentSlot::Ready(runtime)
             }
             None => RuntimeMainAgentSlot::Pending(model),
-        });
+        };
+        self.runtime = Some(next_runtime);
         self.runtime_cursor = AgentRuntimeEventCursor {
             offset: 0,
             last_event_id: None,
@@ -6819,7 +7144,10 @@ where
         Ok(self.runtime_info())
     }
 
-    fn set_agent_definition(&mut self, definition: AgentDefinition) -> Result<(), CliError> {
+    fn validate_agent_definition(
+        &self,
+        definition: AgentDefinition,
+    ) -> Result<AgentDefinition, CliError> {
         let mut definition = definition;
         if definition.id.is_empty() {
             definition.id = definition.name.clone();
@@ -6827,6 +7155,12 @@ where
         definition.validate().map_err(|source| CliError::Parse {
             detail: source.to_string(),
         })?;
+        Ok(definition)
+    }
+
+    #[cfg(test)]
+    fn set_agent_definition(&mut self, definition: AgentDefinition) -> Result<(), CliError> {
+        let definition = self.validate_agent_definition(definition)?;
         self.agent_definition = definition;
         Ok(())
     }
@@ -6840,6 +7174,7 @@ where
             interaction_session.session_id.clone(),
             self.agent_definition.role.clone(),
         );
+        agent_session.agent_definition_key = Some(self.agent_definition.key().to_string());
         agent_session.transcript = transcript.clone();
         agent_session.raw_transcript = transcript;
         let (previous_session_id, cursor, runtime_handle) = {
@@ -6864,6 +7199,23 @@ where
         mut agent_session: AgentSession,
     ) -> Result<(), CliError> {
         agent_session.session_id = interaction_session.session_id.clone();
+        let persisted_key = agent_session.agent_definition_key.as_deref().ok_or_else(|| {
+            CliError::Parse {
+                detail: format!(
+                    "legacy agent session `{}` has no persisted agent definition; select its agent explicitly before restoring it",
+                    agent_session.session_id
+                ),
+            }
+        })?;
+        if persisted_key != self.agent_definition.key() {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "agent session `{}` belongs to `{persisted_key}` and cannot be restored as `{}`",
+                    agent_session.session_id,
+                    self.agent_definition.key()
+                ),
+            });
+        }
         agent_session.role = self.agent_definition.role.clone();
         let (previous_session_id, cursor, runtime_handle) = {
             let runtime = self.ensure_runtime(interaction_session)?;
@@ -6896,6 +7248,35 @@ where
             .load_session(session_id)
             .map_err(|source| CliError::Parse {
                 detail: format!("load persisted agent session `{session_id}`: {source}"),
+            })
+    }
+
+    fn persist_attached_agent_session(
+        &self,
+        data_dir: &SinomoDataDir,
+        expected_session_id: &SessionId,
+    ) -> Result<(), CliError> {
+        let session = self
+            .agent_session_snapshot()?
+            .ok_or_else(|| CliError::Parse {
+                detail: format!(
+                    "agent runtime has no canonical session `{expected_session_id}` to persist"
+                ),
+            })?;
+        if &session.session_id != expected_session_id {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "agent runtime session `{}` does not match persistence request for `{expected_session_id}`",
+                    session.session_id
+                ),
+            });
+        }
+        FileAgentSessionStore::for_data_dir(data_dir)
+            .save_session(&session)
+            .map_err(|source| CliError::Parse {
+                detail: format!(
+                    "persist canonical agent session `{expected_session_id}`: {source}"
+                ),
             })
     }
 
@@ -6994,11 +7375,164 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         self
     }
 
+    fn switch_agent_definition(
+        &mut self,
+        data_dir: &SinomoDataDir,
+        definition: AgentDefinition,
+        daemon_connected: bool,
+        rebind_agent_identity: bool,
+    ) -> Result<TuiAgentRuntimeInfo, CliError> {
+        let definition = self.validate_agent_definition(definition)?;
+        let previous_definition = std::mem::replace(&mut self.agent_definition, definition);
+        let selection = TuiModelSelection {
+            provider: self.provider.clone(),
+            model: self.model_name.clone(),
+            account: self
+                .account
+                .clone()
+                .unwrap_or_else(|| sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string()),
+        };
+        match self.switch_to_selection_with_agent_rebind(
+            data_dir,
+            selection,
+            daemon_connected,
+            rebind_agent_identity,
+        ) {
+            Ok(info) => Ok(info),
+            Err(error) => {
+                self.agent_definition = previous_definition;
+                Err(error)
+            }
+        }
+    }
+
+    fn switch_agent_definition_for_session(
+        &mut self,
+        data_dir: &SinomoDataDir,
+        interaction_session: &InteractionSession,
+        definition: AgentDefinition,
+        daemon_connected: bool,
+    ) -> Result<TuiAgentRuntimeInfo, CliError> {
+        let definition = self.validate_agent_definition(definition)?;
+        self.ensure_runtime(interaction_session)?;
+        let previous_session = self
+            .agent_session_snapshot()?
+            .ok_or_else(|| CliError::Parse {
+                detail: format!(
+                    "agent runtime has no canonical session `{}` to switch",
+                    interaction_session.session_id
+                ),
+            })?;
+        if previous_session.session_id != interaction_session.session_id {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "agent runtime session `{}` does not match agent switch request for `{}`",
+                    previous_session.session_id, interaction_session.session_id
+                ),
+            });
+        }
+
+        let mut candidate = previous_session.clone();
+        candidate.role = definition.role.clone();
+        candidate.agent_definition_key = Some(definition.key().to_string());
+        if agent_definition_has_coding_authority(&definition)
+            && candidate.workspace_binding.is_none()
+        {
+            let metadata =
+                std::fs::metadata(&self.workspace_root).map_err(|source| CliError::Io {
+                    path: self.workspace_root.display().to_string(),
+                    detail: format!("workspace directory is unavailable: {source}"),
+                })?;
+            if !metadata.is_dir() {
+                return Err(CliError::Parse {
+                    detail: format!(
+                        "workspace path is not a directory: {}",
+                        self.workspace_root.display()
+                    ),
+                });
+            }
+            candidate.workspace_binding = Some(
+                coding_agent_workspace_binding(data_dir, &self.workspace_root)?
+                    .binding()
+                    .clone(),
+            );
+        }
+
+        let store = FileAgentSessionStore::for_data_dir(data_dir);
+        if let Err(source) = store.save_session(&candidate) {
+            let rollback = store.save_session(&previous_session).err();
+            return Err(CliError::Parse {
+                detail: match rollback {
+                    Some(rollback) => format!(
+                        "persist agent switch for session `{}` failed: {source}; restoring the previous canonical session also failed: {rollback}",
+                        interaction_session.session_id
+                    ),
+                    None => format!(
+                        "persist agent switch for session `{}` failed: {source}",
+                        interaction_session.session_id
+                    ),
+                },
+            });
+        }
+        if let Some(runtime) = self.ready_runtime()
+            && let Err(error) = runtime.replace_session(candidate)
+        {
+            let rollback = store.save_session(&previous_session).err();
+            return Err(CliError::Parse {
+                detail: match rollback {
+                    Some(rollback) => format!(
+                        "attach agent switch for session `{}` failed: {error}; restoring the previous canonical session also failed: {rollback}",
+                        interaction_session.session_id
+                    ),
+                    None => format!(
+                        "attach agent switch for session `{}` failed: {error}",
+                        interaction_session.session_id
+                    ),
+                },
+            });
+        }
+
+        match self.switch_agent_definition(data_dir, definition, daemon_connected, true) {
+            Ok(info) => Ok(info),
+            Err(error) => {
+                let mut rollback_errors = Vec::new();
+                if let Some(runtime) = self.ready_runtime()
+                    && let Err(rollback) = runtime.replace_session(previous_session.clone())
+                {
+                    rollback_errors.push(format!("restore live session: {rollback}"));
+                }
+                if let Err(rollback) = store.save_session(&previous_session) {
+                    rollback_errors.push(format!("restore canonical session: {rollback}"));
+                }
+                if rollback_errors.is_empty() {
+                    Err(error)
+                } else {
+                    Err(CliError::Parse {
+                        detail: format!(
+                            "agent switch failed: {error}; rollback failed: {}",
+                            rollback_errors.join("; ")
+                        ),
+                    })
+                }
+            }
+        }
+    }
+
     fn switch_to_selection(
         &mut self,
         data_dir: &SinomoDataDir,
         selection: TuiModelSelection,
         daemon_connected: bool,
+    ) -> Result<TuiAgentRuntimeInfo, CliError> {
+        self.switch_to_selection_with_agent_rebind(data_dir, selection, daemon_connected, false)
+    }
+
+    fn switch_to_selection_with_agent_rebind(
+        &mut self,
+        data_dir: &SinomoDataDir,
+        selection: TuiModelSelection,
+        daemon_connected: bool,
+        rebind_agent_identity: bool,
     ) -> Result<TuiAgentRuntimeInfo, CliError> {
         with_tui_model_config_mode(daemon_connected, || {
             let (runtime_config, _) = load_model_runtime_config_for_node(data_dir)?;
@@ -7016,6 +7550,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
                         info.model,
                         info.account,
                         LanguageModelProviderOptions::default(),
+                        rebind_agent_identity,
                     )
                 }
                 MINICPM_PROVIDER_ID => {
@@ -7037,6 +7572,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
                         model_name,
                         None,
                         LanguageModelProviderOptions::default(),
+                        rebind_agent_identity,
                     )
                 }
                 provider => {
@@ -7058,6 +7594,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
                         selection.model,
                         Some(selection.account),
                         options,
+                        rebind_agent_identity,
                     )
                 }
             }
@@ -7123,7 +7660,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
             });
         }
 
-        let requested_binding = requested_workspace_root
+        let requested_workspace = requested_workspace_root
             .map(|root| {
                 let metadata = std::fs::metadata(root).map_err(|source| CliError::Io {
                     path: root.display().to_string(),
@@ -7141,22 +7678,27 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
                 }
             })
             .transpose()?;
+        let requested_binding = requested_workspace
+            .as_ref()
+            .map(|workspace| workspace.binding());
 
-        if let (Some(existing), Some(requested)) = (
-            session.workspace_binding.as_ref(),
-            requested_binding.as_ref(),
-        ) {
+        if let (Some(existing), Some(requested)) =
+            (session.workspace_binding.as_ref(), requested_binding)
+        {
             validate_agent_session_workspace_binding(session_id, existing, requested)?;
         }
         if session.workspace_binding.is_none() {
-            session.workspace_binding = requested_binding;
+            session.workspace_binding = requested_binding.cloned();
         }
 
-        let selected_root = session
+        let selected_workspace = session
             .workspace_binding
             .as_ref()
             .map(|binding| workspace_binding_root_for_data_dir(data_dir, session_id, binding))
             .transpose()?;
+        let selected_root = selected_workspace
+            .as_ref()
+            .map(|workspace| workspace.root().to_path_buf());
         if agent_definition_has_coding_authority(&self.agent_definition) && selected_root.is_none()
         {
             return Err(CliError::Parse {
@@ -7192,6 +7734,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
             sandbox_node_id,
             agent_definition_has_coding_authority(&self.agent_definition),
         )?;
+        self.persist_attached_agent_session(data_dir, session_id)?;
         Ok(selected_root)
     }
 }
@@ -7257,6 +7800,19 @@ pub(crate) fn app_switch_agent(
     daemon_connected: bool,
 ) -> Result<AppRuntimeInfo, CliError> {
     let info = handler.switch_tui_agent(data_dir, daemon_connected, definition)?;
+    Ok((&info).into())
+}
+
+/// Load an agent definition for an immediately following durable-session
+/// restore without changing the identity of the session currently attached to
+/// the handler.
+pub(crate) fn app_prepare_agent(
+    handler: &mut RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>,
+    data_dir: &SinomoDataDir,
+    definition: AgentDefinition,
+    daemon_connected: bool,
+) -> Result<AppRuntimeInfo, CliError> {
+    let info = handler.switch_agent_definition(data_dir, definition, daemon_connected, false)?;
     Ok((&info).into())
 }
 
@@ -7361,6 +7917,11 @@ fn tui_grants_workspace_mutation_only_to_the_builtin_coding_agent() {
             .and_then(|binding| binding.local_root.as_deref()),
         Some(workspace.as_path())
     );
+    let persisted = FileAgentSessionStore::for_data_dir(&data_dir)
+        .load_session(&session.session_id)
+        .expect("load configured workspace session")
+        .expect("configured workspace session");
+    assert_eq!(persisted.workspace_binding, snapshot.workspace_binding);
 
     handler
         .set_agent_definition(AgentDefinition::main())
@@ -7423,7 +7984,8 @@ fn tui_resume_uses_the_session_workspace_binding() {
     let mut agent_session = AgentSession::new(
         interaction_session.session_id.clone(),
         AgentRole::Deliberation,
-    );
+    )
+    .with_agent_definition_key("coding-agent");
     agent_session.workspace_binding = Some(WorkspaceRef::local_path(original_workspace.clone()));
     handler
         .replace_full_agent_session(&interaction_session, agent_session)
@@ -7483,16 +8045,42 @@ impl TuiAgentRuntimeControl for RuntimeMainAgentInteractionHandler<DefaultMainAg
         daemon_connected: bool,
         definition: AgentDefinition,
     ) -> Result<TuiAgentRuntimeInfo, CliError> {
-        self.set_agent_definition(definition)?;
-        let selection = TuiModelSelection {
-            provider: self.provider.clone(),
-            model: self.model_name.clone(),
-            account: self
-                .account
-                .clone()
-                .unwrap_or_else(|| sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string()),
-        };
-        self.switch_to_selection(data_dir, selection, daemon_connected)
+        self.switch_agent_definition(data_dir, definition, daemon_connected, true)
+    }
+
+    fn switch_tui_agent_for_session(
+        &mut self,
+        data_dir: &SinomoDataDir,
+        session: &InteractionSession,
+        daemon_connected: bool,
+        definition: AgentDefinition,
+    ) -> Result<TuiAgentRuntimeInfo, CliError> {
+        self.switch_agent_definition_for_session(data_dir, session, definition, daemon_connected)
+    }
+
+    fn prepare_tui_agent(
+        &mut self,
+        data_dir: &SinomoDataDir,
+        daemon_connected: bool,
+        definition: AgentDefinition,
+    ) -> Result<TuiAgentRuntimeInfo, CliError> {
+        self.switch_agent_definition(data_dir, definition, daemon_connected, false)
+    }
+
+    fn load_tui_agent_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<AgentSession>, CliError> {
+        self.load_persisted_agent_session(session_id)
+    }
+
+    fn persist_tui_agent_session(
+        &mut self,
+        data_dir: &SinomoDataDir,
+        session: &InteractionSession,
+    ) -> Result<(), CliError> {
+        self.ensure_runtime(session)?;
+        self.persist_attached_agent_session(data_dir, &session.session_id)
     }
 
     fn configure_tui_tool_runtime(
@@ -7512,13 +8100,16 @@ impl TuiAgentRuntimeControl for RuntimeMainAgentInteractionHandler<DefaultMainAg
 
     fn restore_tui_agent_session(
         &mut self,
+        data_dir: &SinomoDataDir,
         session: &InteractionSession,
+        persisted: Option<AgentSession>,
         transcript: sinomo_agent::AgentTranscript,
     ) -> Result<(), CliError> {
-        match self.load_persisted_agent_session(&session.session_id)? {
+        match persisted {
             Some(persisted) => self.replace_full_agent_session(session, persisted),
             None => self.replace_agent_session(session, transcript),
-        }
+        }?;
+        self.persist_attached_agent_session(data_dir, &session.session_id)
     }
 }
 

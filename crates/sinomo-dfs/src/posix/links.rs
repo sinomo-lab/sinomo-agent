@@ -6,8 +6,10 @@
 
 use super::now_unix_nanos;
 use crate::namespace::{initial_version, next_version, object_id_for_path};
-use crate::posix_model::{DfsPosixError, DfsStat, DfsWriteOptions, Result};
-use crate::posix_object::{new_posix_metadata_object, recreated_posix_metadata_object};
+use crate::posix_model::{DfsPosixCreateAttrs, DfsPosixError, DfsStat, DfsWriteOptions, Result};
+use crate::posix_object::{
+    apply_posix_create_attrs, new_posix_metadata_object, recreated_posix_metadata_object,
+};
 use crate::posix_path::{
     normalize_posix_path, normalize_posix_path_with_trailing_directory,
     validate_posix_symlink_target,
@@ -24,6 +26,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         target: &str,
         link_path: &str,
         options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
+        self.posix_symlink_with_create_attrs(
+            target,
+            link_path,
+            options,
+            DfsPosixCreateAttrs::symlink_default(),
+        )
+    }
+
+    pub fn posix_symlink_with_create_attrs(
+        &mut self,
+        target: &str,
+        link_path: &str,
+        options: DfsWriteOptions,
+        attrs: DfsPosixCreateAttrs,
     ) -> Result<DfsStat> {
         validate_posix_symlink_target(target)?;
         let (link_path, requires_directory) =
@@ -42,24 +59,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Err(DfsPosixError::AlreadyExists { path: link_path });
             }
             Some(_) => {
-                let object = recreated_posix_metadata_object(
+                let mut object = recreated_posix_metadata_object(
                     &self.node_id,
                     &link_path,
                     DfsObjectKind::Symlink,
                 );
+                let attrs = self.posix_create_attrs_for_object_authority(&object, attrs, false)?;
+                apply_posix_create_attrs(&mut object, attrs);
                 self.add_transient_object_metadata(object.clone())?;
                 object
             }
             None => {
-                let object =
+                let mut object =
                     new_posix_metadata_object(&self.node_id, &link_path, DfsObjectKind::Symlink);
+                let attrs = self.posix_create_attrs_for_object_authority(&object, attrs, false)?;
+                apply_posix_create_attrs(&mut object, attrs);
                 self.add_transient_object_metadata(object.clone())?;
                 object
             }
         };
         let target_version = next_version(&object.version);
         let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
-        let outcome = self.write_distributed_eventual_with_candidates_and_repair_mode(
+        let outcome = self.write_distributed_eventual_with_candidates_and_parent_touch(
             DfsWriteRequest {
                 file_system_id: object.file_system_id.clone(),
                 object_id: object.object_id.clone(),
@@ -91,11 +112,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         match outcome {
             NetworkedDfsWriteOutcome::Committed { .. } => {
-                // Same as posix_write_file: the shard primary journals the
-                // parent-mtime update for routed symlink creates.
-                if self.is_local_metadata_primary_for_object(&object)? {
-                    self.touch_parent_directory_modified(&link_path)?;
-                }
                 let object =
                     self.lookup_sifs_path(&link_path)?
                         .ok_or_else(|| DfsPosixError::NotFound {

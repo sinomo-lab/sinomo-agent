@@ -2,10 +2,10 @@ use crate::{
     DfsAdvisoryLockCommand, DfsAdvisoryLockOutcome, DfsAdvisoryLockStateRecord, DfsConflictRecord,
     DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataShardConfig, DfsMetadataShardId,
     DfsMetadataTableSnapshot, DfsNamespaceJobRecord, DfsNamespaceTransaction, DfsObjectId,
-    DfsObjectMetadata, DfsObjectVersionRecord, DfsPosixDirectorySyncCertificate,
-    DfsPosixDirectorySyncTarget, DfsPosixFileSyncCertificate, DfsPosixFileSyncTarget,
-    DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsVersion, DfsWriteIntentRecord,
-    NetworkedDfsWriteOutcome,
+    DfsObjectMetadata, DfsObjectVersionRecord, DfsPosixCreateAttrs,
+    DfsPosixDirectorySyncCertificate, DfsPosixDirectorySyncTarget, DfsPosixFileSyncCertificate,
+    DfsPosixFileSyncTarget, DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsVersion,
+    DfsWriteIntentRecord, NetworkedDfsWriteOutcome,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
@@ -161,6 +161,10 @@ pub struct DfsDistributedWriteCommand {
     pub touch_parent_on_create: bool,
     #[serde(default = "default_true")]
     pub foreground_replica_repair: bool,
+    /// Reject the write at the metadata authority if the path already names a
+    /// current object. Used by POSIX O_EXCL/mknod and symlink creation.
+    #[serde(default)]
+    pub exclusive_create: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -234,6 +238,10 @@ pub enum DfsNamespaceOperation {
     Mkdir {
         path: String,
     },
+    MkdirWithAttrs {
+        path: String,
+        attrs: DfsPosixCreateAttrs,
+    },
     MkdirAll {
         path: String,
     },
@@ -272,6 +280,11 @@ pub enum DfsNamespaceOperation {
         mode: u32,
     },
     SetOwner {
+        path: String,
+        uid: u32,
+        gid: u32,
+    },
+    SetSymlinkOwner {
         path: String,
         uid: u32,
         gid: u32,
@@ -388,11 +401,13 @@ impl DfsNamespaceOperation {
     pub fn involved_paths(&self) -> Vec<&str> {
         match self {
             DfsNamespaceOperation::Mkdir { path }
+            | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
             | DfsNamespaceOperation::MkdirAll { path }
             | DfsNamespaceOperation::Rmdir { path }
             | DfsNamespaceOperation::Unlink { path }
             | DfsNamespaceOperation::SetMode { path, .. }
             | DfsNamespaceOperation::SetOwner { path, .. }
+            | DfsNamespaceOperation::SetSymlinkOwner { path, .. }
             | DfsNamespaceOperation::SetTimes { path, .. }
             | DfsNamespaceOperation::TouchDirectoryModified { path }
             | DfsNamespaceOperation::ClearDirRecursive { path }
@@ -787,6 +802,10 @@ pub enum DfsNetworkMessage {
     WriteRequest(DfsWriteCommand),
     WriteResponse(DfsWriteResponse),
     DistributedWriteRequest(DfsDistributedWriteCommand),
+    /// Exclusive namespace creation. Kept as a distinct message variant so
+    /// older peers reject it instead of ignoring an additive flag and
+    /// accidentally executing it as an overwrite-capable write.
+    ExclusiveCreateRequest(DfsDistributedWriteCommand),
     DistributedWriteResponse(DfsDistributedWriteResponse),
     NamespaceRequest(DfsNamespaceCommand),
     NamespaceResponse(DfsNamespaceResponse),

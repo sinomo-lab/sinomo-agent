@@ -6,6 +6,7 @@
 
 use std::io::Read;
 
+use sinomo_core::events::EventId;
 use sinomo_core::network::NetworkError;
 use sinomo_core::node::NodeId;
 
@@ -620,7 +621,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(crate) fn next_request_id(&mut self) -> String {
-        let request_id = format!("dfs_net_req_{}", self.next_request_id);
+        // The sequence is useful in traces, while the event suffix makes the
+        // operation identity unique across daemon/service restarts. Exclusive
+        // create replay safety must never alias a fresh request after a local
+        // counter reset.
+        let request_id = format!(
+            "dfs_net_req_{}_{}",
+            self.next_request_id,
+            EventId::generate()
+        );
         self.next_request_id += 1;
         request_id
     }

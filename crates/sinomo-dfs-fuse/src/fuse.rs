@@ -7,13 +7,16 @@ use fuser::{
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
     TimeOrNow,
 };
-use sinomo_runtime::dfs::{self, DfsError, DfsObjectKind, DfsPosixError, DfsWriteOptions};
+use sinomo_runtime::dfs::{
+    self, DfsError, DfsObjectKind, DfsPosixCreateAttrs, DfsPosixError, DfsWriteOptions,
+};
 use sinomo_runtime::local::SinomoDataDir;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 use std::thread;
@@ -27,6 +30,7 @@ const FUSE_LOCK_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const FUSE_LOCK_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const LOCKED_IO_MIN_LEASE: Duration = Duration::from_secs(60);
 const MAX_ACTIVE_LOCK_KEYS_PER_MOUNT: usize = 2;
+const FUSE_CREATE_RACE_RETRY_ROUNDS: usize = 4;
 static NEXT_MOUNT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 type SifsService = dfs::MountedSifsService;
 
@@ -43,6 +47,7 @@ pub fn mount_sifs(mut options: DfsFuseMountOptions) -> Result<()> {
 pub fn mount_sifs_background(mut options: DfsFuseMountOptions) -> Result<DfsFuseMountHandle> {
     options.root_path = normalize_sifs_root(&options.root_path)?;
     let mount_helper = fuse_mount_helper();
+    recover_disconnected_mount_point(&options.mount_point, mount_helper.as_deref())?;
     let mount_point = prepare_background_mount_point(&options.mount_point)?;
     options.mount_point = mount_point.clone();
     let fs = SifsFuseFileSystem::open(options.clone())?;
@@ -50,6 +55,50 @@ pub fn mount_sifs_background(mut options: DfsFuseMountOptions) -> Result<DfsFuse
     let session = fuser::spawn_mount2(fs, &mount_point, &mount_options)
         .map_err(|source| map_mount_error(&mount_point, mount_helper.is_some(), source))?;
     Ok(DfsFuseMountHandle::new(mount_point, session))
+}
+
+fn recover_disconnected_mount_point(path: &Path, mount_helper: Option<&Path>) -> Result<()> {
+    let Err(source) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    if !is_disconnected_mount_error(&source) {
+        return Ok(());
+    }
+    let Some(mount_helper) = mount_helper else {
+        return Err(DfsFuseError::Mount {
+            mount_point: path.display().to_string(),
+            detail: format!(
+                "stale disconnected FUSE mount requires `fusermount3` or `fusermount` cleanup: {source}"
+            ),
+        });
+    };
+    let status = Command::new(mount_helper)
+        .arg("-u")
+        .arg("-z")
+        .arg(path)
+        .status()
+        .map_err(|cleanup_error| DfsFuseError::Mount {
+            mount_point: path.display().to_string(),
+            detail: format!(
+                "failed to start stale FUSE mount cleanup with {}: {cleanup_error}",
+                mount_helper.display()
+            ),
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(DfsFuseError::Mount {
+            mount_point: path.display().to_string(),
+            detail: format!(
+                "stale FUSE mount cleanup with {} exited with {status}",
+                mount_helper.display()
+            ),
+        })
+    }
+}
+
+fn is_disconnected_mount_error(source: &io::Error) -> bool {
+    source.raw_os_error() == Some(libc::ENOTCONN)
 }
 
 fn fuse_mount_options(
@@ -1151,14 +1200,15 @@ impl Filesystem for SifsFuseFileSystem {
             result = result.and_then(|_| {
                 self.ensure_writable()?;
                 let current = self.stat_path(&path, false)?;
-                self.lock_dfs()?
-                    .posix_set_owner(
-                        &path,
-                        uid.unwrap_or(current.uid),
-                        gid.unwrap_or(current.gid),
-                    )
-                    .map(|_| ())
-                    .map_err(errno_for_posix_error)
+                let uid = uid.unwrap_or(current.uid);
+                let gid = gid.unwrap_or(current.gid);
+                let mut dfs = self.lock_dfs()?;
+                let updated = if current.kind == DfsObjectKind::Symlink {
+                    dfs.posix_set_symlink_owner(&path, uid, gid)
+                } else {
+                    dfs.posix_set_owner(&path, uid, gid)
+                };
+                updated.map(|_| ()).map_err(errno_for_posix_error)
             });
         }
         if atime.is_some() || mtime.is_some() {
@@ -1199,11 +1249,11 @@ impl Filesystem for SifsFuseFileSystem {
 
     fn mknod(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         mode: u32,
-        _umask: u32,
+        umask: u32,
         _rdev: u32,
         reply: ReplyEntry,
     ) {
@@ -1219,15 +1269,9 @@ impl Filesystem for SifsFuseFileSystem {
             Err(errno) => return reply.error(errno),
         };
         let result = self.lock_dfs().and_then(|mut dfs| {
-            let mut stat = dfs
-                .posix_write_file(&path, &[], self.write_options())
-                .map_err(errno_for_posix_error)?;
-            if mode & 0o7777 != 0o644 {
-                stat = dfs
-                    .posix_set_mode(&path, mode)
-                    .map_err(errno_for_posix_error)?;
-            }
-            Ok(stat)
+            let attrs = DfsPosixCreateAttrs::new(created_mode(mode, umask), req.uid(), req.gid());
+            dfs.posix_create_file_with_attrs(&path, self.write_options(), attrs)
+                .map_err(errno_for_posix_error)
         });
         match result {
             Ok(stat) => self.reply_entry_for_path(reply, path, stat),
@@ -1237,11 +1281,11 @@ impl Filesystem for SifsFuseFileSystem {
 
     fn mkdir(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         mode: u32,
-        _umask: u32,
+        umask: u32,
         reply: ReplyEntry,
     ) {
         if let Err(errno) = self.ensure_writable() {
@@ -1252,13 +1296,9 @@ impl Filesystem for SifsFuseFileSystem {
             Err(errno) => return reply.error(errno),
         };
         let result = self.lock_dfs().and_then(|mut dfs| {
-            let mut stat = dfs.posix_mkdir(&path).map_err(errno_for_posix_error)?;
-            if mode & 0o7777 != 0o755 {
-                stat = dfs
-                    .posix_set_mode(&path, mode)
-                    .map_err(errno_for_posix_error)?;
-            }
-            Ok(stat)
+            let attrs = DfsPosixCreateAttrs::new(created_mode(mode, umask), req.uid(), req.gid());
+            dfs.posix_mkdir_with_create_attrs(&path, attrs)
+                .map_err(errno_for_posix_error)
         });
         match result {
             Ok(stat) => self.reply_entry_for_path(reply, path, stat),
@@ -1312,7 +1352,7 @@ impl Filesystem for SifsFuseFileSystem {
 
     fn symlink(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         link: &std::path::Path,
@@ -1329,7 +1369,8 @@ impl Filesystem for SifsFuseFileSystem {
             Err(errno) => return reply.error(errno),
         };
         let result = self.lock_dfs().and_then(|mut dfs| {
-            dfs.posix_symlink(target, &path, self.write_options())
+            let attrs = DfsPosixCreateAttrs::new(0o777, req.uid(), req.gid());
+            dfs.posix_symlink_with_create_attrs(target, &path, self.write_options(), attrs)
                 .map_err(errno_for_posix_error)
         });
         match result {
@@ -1429,11 +1470,11 @@ impl Filesystem for SifsFuseFileSystem {
 
     fn create(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         mode: u32,
-        _umask: u32,
+        umask: u32,
         flags: i32,
         reply: ReplyCreate,
     ) {
@@ -1445,15 +1486,8 @@ impl Filesystem for SifsFuseFileSystem {
             Err(errno) => return reply.error(errno),
         };
         let result = self.lock_dfs().and_then(|mut dfs| {
-            let mut stat = dfs
-                .posix_write_file(&path, &[], self.write_options())
-                .map_err(errno_for_posix_error)?;
-            if mode & 0o7777 != 0o644 {
-                stat = dfs
-                    .posix_set_mode(&path, mode)
-                    .map_err(errno_for_posix_error)?;
-            }
-            Ok(stat)
+            let attrs = DfsPosixCreateAttrs::new(created_mode(mode, umask), req.uid(), req.gid());
+            create_file_for_fuse(&mut dfs, &path, self.write_options(), attrs, flags)
         });
         match result {
             Ok(stat) => match self.lock_state() {
@@ -2519,6 +2553,87 @@ fn errno_for_posix_error(error: DfsPosixError) -> libc::c_int {
     }
 }
 
+fn created_mode(mode: u32, umask: u32) -> u32 {
+    (mode & 0o7777) & !(umask & 0o777)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExistingFileCreateAction {
+    Reject,
+    ReturnExisting,
+    Truncate,
+}
+
+fn existing_file_create_action(flags: i32) -> ExistingFileCreateAction {
+    if flags & libc::O_EXCL != 0 {
+        ExistingFileCreateAction::Reject
+    } else if flags & libc::O_TRUNC != 0 {
+        ExistingFileCreateAction::Truncate
+    } else {
+        ExistingFileCreateAction::ReturnExisting
+    }
+}
+
+fn create_file_for_fuse(
+    dfs: &mut SifsService,
+    path: &str,
+    options: DfsWriteOptions,
+    attrs: DfsPosixCreateAttrs,
+    flags: i32,
+) -> std::result::Result<dfs::DfsStat, libc::c_int> {
+    if existing_file_create_action(flags) == ExistingFileCreateAction::Reject {
+        return dfs
+            .posix_create_file_with_attrs(path, options, attrs)
+            .map_err(errno_for_posix_error);
+    }
+
+    let mut create_needed = true;
+    for _ in 0..=FUSE_CREATE_RACE_RETRY_ROUNDS {
+        if create_needed {
+            match dfs.posix_create_file_following_symlink_with_attrs(path, options.clone(), attrs) {
+                Ok(created) => return Ok(created),
+                Err(DfsPosixError::AlreadyExists { .. }) => create_needed = false,
+                Err(error) => return Err(errno_for_posix_error(error)),
+            }
+        }
+        match dfs.posix_stat_distributed(path) {
+            Ok(existing) => {
+                if existing.kind == DfsObjectKind::Directory {
+                    return Err(libc::EISDIR);
+                }
+                if existing.kind != DfsObjectKind::File {
+                    return Err(libc::EINVAL);
+                }
+                if existing_file_create_action(flags) == ExistingFileCreateAction::Truncate {
+                    // The create attrs are ignored while this inode still
+                    // exists, but become the initial attrs if an unlink wins
+                    // just before the truncating write recreates the path.
+                    return dfs
+                        .posix_write_file_with_create_attrs(path, &[], options.clone(), attrs)
+                        .map_err(errno_for_posix_error);
+                }
+                match dfs.posix_stat_distributed(path) {
+                    Ok(confirmed) if confirmed.object_id == existing.object_id => {
+                        return Ok(confirmed);
+                    }
+                    Ok(_) => continue,
+                    Err(DfsPosixError::NotFound { .. }) => {
+                        create_needed = true;
+                        continue;
+                    }
+                    Err(error) => return Err(errno_for_posix_error(error)),
+                }
+            }
+            Err(DfsPosixError::NotFound { .. }) => {
+                create_needed = true;
+                continue;
+            }
+            Err(error) => return Err(errno_for_posix_error(error)),
+        }
+    }
+    Err(libc::EAGAIN)
+}
+
 fn flags_has_write_access(flags: i32) -> bool {
     matches!(flags & libc::O_ACCMODE, libc::O_WRONLY | libc::O_RDWR)
 }
@@ -2565,6 +2680,20 @@ mod errno_tests {
     }
 
     #[test]
+    fn stale_mount_recovery_only_classifies_enotconn() {
+        assert!(is_disconnected_mount_error(&io::Error::from_raw_os_error(
+            libc::ENOTCONN
+        )));
+        assert!(!is_disconnected_mount_error(&io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
+        assert!(!is_disconnected_mount_error(&io::Error::new(
+            io::ErrorKind::NotFound,
+            "missing"
+        )));
+    }
+
+    #[test]
     fn owner_only_foreground_mount_omits_auto_unmount_and_allow_other() {
         let options = DfsFuseMountOptions::new("/mnt/sinomo");
 
@@ -2598,6 +2727,34 @@ mod errno_tests {
         let background_options = background_fuse_mount_options(&options, true);
         assert!(!background_options.contains(&MountOption::AutoUnmount));
         assert!(!background_options.contains(&MountOption::AllowOther));
+    }
+
+    #[test]
+    fn created_entry_mode_applies_the_request_umask() {
+        assert_eq!(created_mode(libc::S_IFREG | 0o666, 0o022), 0o644);
+        assert_eq!(created_mode(libc::S_IFDIR | 0o777, 0o027), 0o750);
+        assert_eq!(created_mode(0o700, 0), 0o700);
+        assert_eq!(created_mode(0o6777, 0o7000), 0o6777);
+    }
+
+    #[test]
+    fn create_flags_preserve_existing_files_unless_exclusive_or_truncating() {
+        assert_eq!(
+            existing_file_create_action(libc::O_CREAT),
+            ExistingFileCreateAction::ReturnExisting
+        );
+        assert_eq!(
+            existing_file_create_action(libc::O_CREAT | libc::O_TRUNC),
+            ExistingFileCreateAction::Truncate
+        );
+        assert_eq!(
+            existing_file_create_action(libc::O_CREAT | libc::O_EXCL),
+            ExistingFileCreateAction::Reject
+        );
+        assert_eq!(
+            existing_file_create_action(libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC),
+            ExistingFileCreateAction::Reject
+        );
     }
 
     fn test_object_id(name: &str) -> dfs::DfsObjectId {

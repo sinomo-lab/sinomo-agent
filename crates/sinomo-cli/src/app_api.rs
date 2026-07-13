@@ -1916,6 +1916,25 @@ fn select_resumable_agent_session(
             local.session_id
         ));
     }
+    let reconciled_agent_key = match (
+        local.agent_definition_key.as_deref(),
+        roaming.agent_definition_key.as_deref(),
+    ) {
+        (Some(local_key), Some(roaming_key)) if local_key != roaming_key => {
+            return Err(format!(
+                "local and roaming agent sessions disagree on agent definition for {}",
+                local.session_id
+            ));
+        }
+        (Some(key), _) | (_, Some(key)) => Some(key.to_string()),
+        (None, None) => None,
+    };
+    if local.workspace_binding != roaming.workspace_binding {
+        return Err(format!(
+            "local and roaming agent sessions disagree on workspace binding for {}",
+            local.session_id
+        ));
+    }
     if local == roaming {
         return Ok(Some(roaming));
     }
@@ -1933,35 +1952,61 @@ fn select_resumable_agent_session(
         .collect::<BTreeSet<_>>();
     let local_contains_roaming = local_items.is_superset(&roaming_items);
     let roaming_contains_local = roaming_items.is_superset(&local_items);
-    match (local_contains_roaming, roaming_contains_local) {
+    let private_control_matches = local.steering_queue == roaming.steering_queue
+        && local.follow_up_queue == roaming.follow_up_queue
+        && local.abort == roaming.abort;
+    let mut selected = match (local_contains_roaming, roaming_contains_local) {
         // A node-local append may exist if the SIFS publication failed after
         // the local durable save. Never discard that strictly newer evidence.
-        (true, false) => Ok(Some(local)),
+        (true, false) if private_control_matches => local,
         // Normal multi-device resume: a successful remote publication has
         // advanced beyond this device's stale local snapshot.
-        (false, true) => Ok(Some(roaming)),
+        (false, true) if private_control_matches => roaming,
+        (true, false) | (false, true) => {
+            return Err(format!(
+                "local and roaming agent sessions {} have concurrent transcript and private control-state changes",
+                local.session_id
+            ));
+        }
         (true, true) => {
-            let local_projection_at = local
-                .projection
-                .as_ref()
-                .map(|projection| projection.created_at);
-            let roaming_projection_at = roaming
-                .projection
-                .as_ref()
-                .map(|projection| projection.created_at);
-            if local_projection_at > roaming_projection_at {
-                Ok(Some(local))
-            } else {
-                // With equal append-only evidence and projection age, the
-                // immutable SIFS head is canonical for queues/control state.
-                Ok(Some(roaming))
+            match local.state_revision.cmp(&roaming.state_revision) {
+                std::cmp::Ordering::Greater => local,
+                std::cmp::Ordering::Less => roaming,
+                std::cmp::Ordering::Equal if local.state_revision > 0 => {
+                    return Err(format!(
+                        "local and roaming agent sessions {} have divergent state at revision {}",
+                        local.session_id, local.state_revision
+                    ));
+                }
+                std::cmp::Ordering::Equal => {
+                    // Legacy snapshots predate logical revisions. Preserve the
+                    // old projection-age fallback only for those records; all
+                    // newly mutated sessions use the revision above.
+                    let local_projection_at = local
+                        .projection
+                        .as_ref()
+                        .map(|projection| projection.created_at);
+                    let roaming_projection_at = roaming
+                        .projection
+                        .as_ref()
+                        .map(|projection| projection.created_at);
+                    if local_projection_at > roaming_projection_at {
+                        local
+                    } else {
+                        roaming
+                    }
+                }
             }
         }
-        (false, false) => Err(format!(
-            "local and roaming agent sessions {} have divergent raw transcripts",
-            local.session_id
-        )),
-    }
+        (false, false) => {
+            return Err(format!(
+                "local and roaming agent sessions {} have divergent raw transcripts",
+                local.session_id
+            ));
+        }
+    };
+    selected.agent_definition_key = reconciled_agent_key;
+    Ok(Some(selected))
 }
 
 fn app_agent_item_id(item: &AgentItem) -> TaskId {
@@ -2129,98 +2174,220 @@ impl AgentChat {
                 }
             };
         let channel_before_resume = channel.clone();
-        let align_primary_session = should_align_primary_participant(&channel);
-        let participant_id = ensure_primary_participant(&mut channel, &info, align_primary_session);
-        if !self.tool_runtime_explicit_override {
-            self.tool_runtime = channel
-                .participant(&participant_id)
-                .map(|participant| {
-                    chat_tool_runtime_from_agent_runtime_definition(&participant.tool_runtime)
-                })
-                .filter(|tool_runtime| !tool_runtime.is_default())
-                .unwrap_or_else(|| default_tool_runtime_for_agent(&self.data_dir, &info.agent));
-        }
-        if !loaded_existing_channel {
-            let tool_runtime = self.tool_runtime.clone();
-            set_participant_tool_runtime(&mut channel, &participant_id, &tool_runtime);
-        }
         self.runtime
             .replace_store_and_session(InMemoryEventStore::new(), session.clone());
         let local_session = self
             .runtime
             .handler()
             .load_persisted_agent_session(&session.session_id)?;
-        let participant = channel
-            .participant(&participant_id)
+        // An existing channel already has durable membership. Consult that
+        // selection and the persisted session identity before the handler's
+        // process-local default can add or re-enable a participant.
+        let participant_id = resume_primary_participant_id(
+            &mut channel,
+            &info,
+            loaded_existing_channel,
+            local_session.as_ref(),
+        );
+        let mut participant = participant_id
+            .as_ref()
+            .and_then(|participant_id| channel.participant(participant_id))
             .cloned()
-            .ok_or_else(|| CliError::Parse {
-                detail: format!(
-                    "primary participant {participant_id} disappeared while resuming channel {}",
-                    channel.channel_id
-                ),
-            })?;
-        let roaming_session = self
-            .session_checkpoint_store
-            .load_latest(&channel, &participant)
-            .map_err(|detail| CliError::Parse {
-                detail: format!("load roaming agent session checkpoint failed: {detail}"),
-            })?;
+            .unwrap_or_else(|| outer_channel_runtime_participant(&channel, &info));
+        let durable_participant_before_resume = participant_id
+            .as_ref()
+            .and_then(|participant_id| channel_before_resume.participant(participant_id))
+            .cloned();
+        let participant_agent_key = participant.agent_key.clone();
+        if !self.tool_runtime_explicit_override {
+            let participant_tool_runtime =
+                chat_tool_runtime_from_agent_runtime_definition(&participant.tool_runtime);
+            self.tool_runtime = if participant_tool_runtime.is_default() {
+                default_tool_runtime_for_agent(&self.data_dir, &participant_agent_key)
+            } else {
+                participant_tool_runtime
+            };
+        }
+        if !loaded_existing_channel && let Some(participant_id) = participant_id.as_ref() {
+            let tool_runtime = self.tool_runtime.clone();
+            set_participant_tool_runtime(&mut channel, participant_id, &tool_runtime);
+            participant = channel
+                .participant(participant_id)
+                .cloned()
+                .ok_or_else(|| CliError::Parse {
+                    detail: format!(
+                        "primary participant {participant_id} disappeared while resuming channel {}",
+                        channel.channel_id
+                    ),
+                })?;
+        }
+        let roaming_session = if participant_id.is_some() {
+            self.session_checkpoint_store
+                .load_latest(&channel, &participant)
+                .map_err(|detail| CliError::Parse {
+                    detail: format!("load roaming agent session checkpoint failed: {detail}"),
+                })?
+        } else {
+            None
+        };
         let persisted_session = select_resumable_agent_session(local_session, roaming_session)
             .map_err(|detail| CliError::Parse {
                 detail: format!("select canonical agent session failed: {detail}"),
             })?;
+        let previous_agent_key = self.runtime_info().agent;
         match persisted_session {
             Some(mut persisted) => {
+                let persisted_agent_key = match persisted.agent_definition_key.clone() {
+                    Some(key) => key,
+                    None if durable_participant_before_resume.as_ref().is_some_and(
+                        |durable_participant| {
+                            durable_participant.agent_session_id == persisted.session_id
+                        },
+                    ) =>
+                    {
+                        participant.agent_key.clone()
+                    }
+                    None => {
+                        return Err(CliError::Parse {
+                            detail: format!(
+                                "legacy agent session `{}` has no persisted agent definition and no durable channel participant proves its identity; select the agent explicitly before resuming",
+                                persisted.session_id
+                            ),
+                        });
+                    }
+                };
+                let definition = resolve_agent(&self.data_dir, &persisted_agent_key).ok_or_else(
+                    || CliError::Parse {
+                        detail: format!(
+                            "agent session `{}` references unknown agent definition `{persisted_agent_key}`",
+                            persisted.session_id
+                        ),
+                    },
+                )?;
+                if let Some(durable_participant) = durable_participant_before_resume
+                    .as_ref()
+                    .filter(|durable_participant| {
+                        durable_participant.agent_session_id == persisted.session_id
+                    })
+                    && durable_participant.agent_key != persisted_agent_key
+                {
+                    return Err(CliError::Parse {
+                        detail: format!(
+                            "agent session `{}` belongs to `{persisted_agent_key}`, but its durable channel participant belongs to `{}`",
+                            persisted.session_id, durable_participant.agent_key
+                        ),
+                    });
+                }
+                if durable_participant_before_resume.is_none() {
+                    if let Some(participant_id) = participant_id.as_ref() {
+                        if let Some(channel_participant) = channel.participant_mut(participant_id) {
+                            channel_participant.agent_key = persisted_agent_key.clone();
+                            channel_participant.agent_name = definition.name.clone();
+                            participant = channel_participant.clone();
+                        }
+                    } else {
+                        participant.agent_key = persisted_agent_key.clone();
+                        participant.agent_name = definition.name.clone();
+                    }
+                    if !self.tool_runtime_explicit_override {
+                        self.tool_runtime =
+                            ChatToolRuntimeSelection::from_agent_definition(&definition);
+                    }
+                }
+                persisted.agent_definition_key = Some(persisted_agent_key);
                 if !self.tool_runtime_explicit_override {
-                    self.tool_runtime.workspace_root = persisted
-                        .workspace_binding
-                        .as_ref()
-                        .map(|binding| {
-                            crate::workspace_binding_root_for_data_dir(
-                                &self.data_dir,
-                                &persisted.session_id,
-                                binding,
-                            )
-                        })
-                        .transpose()?;
+                    // Resolve the durable binding while configuring the tool
+                    // registry below so a live SIFS mount guard is retained
+                    // before its process-local path is exposed to the app.
+                    self.tool_runtime.workspace_root = None;
                 }
                 let channel_view = channel.clone();
-                if let Some(participant) = channel.participant_mut(&participant_id) {
-                    sync_participant_session(&channel_view, participant, &mut persisted);
+                if let Some(participant_id) = participant_id.as_ref() {
+                    let channel_id = channel.channel_id.clone();
+                    let channel_participant =
+                        channel
+                            .participant_mut(participant_id)
+                            .ok_or_else(|| CliError::Parse {
+                                detail: format!(
+                                    "primary participant {participant_id} disappeared while reconciling channel {}",
+                                    channel_id
+                                ),
+                            })?;
+                    sync_participant_session(&channel_view, channel_participant, &mut persisted);
+                    participant = channel_participant.clone();
+                } else {
+                    sync_participant_session(&channel_view, &mut participant, &mut persisted);
                 }
                 FileAgentSessionStore::for_data_dir(&self.data_dir)
                     .save_session(&persisted)
                     .map_err(|source| CliError::Parse {
                         detail: format!("persist reconciled chat session failed: {source}"),
                     })?;
-                let participant = channel
-                    .participant(&participant_id)
-                    .ok_or_else(|| CliError::Parse {
-                        detail: format!(
-                            "primary participant {participant_id} disappeared while checkpointing channel {}",
-                            channel.channel_id
-                        ),
-                    })?;
-                self.session_checkpoint_store
-                    .publish(&channel, participant, &persisted)
-                    .map_err(|detail| CliError::Parse {
-                        detail: format!(
-                            "publish reconciled agent session checkpoint failed: {detail}"
-                        ),
-                    })?;
-                self.runtime
+                if participant_id.is_some() {
+                    self.session_checkpoint_store
+                        .publish(&channel, &participant, &persisted)
+                        .map_err(|detail| CliError::Parse {
+                            detail: format!(
+                                "publish reconciled agent session checkpoint failed: {detail}"
+                            ),
+                        })?;
+                }
+                tui::app_prepare_agent(
+                    self.runtime.handler_mut(),
+                    &self.data_dir,
+                    definition,
+                    self.daemon_connected,
+                )?;
+                if let Err(error) = self
+                    .runtime
                     .handler_mut()
-                    .replace_full_agent_session(&session, persisted)?;
+                    .replace_full_agent_session(&session, persisted)
+                {
+                    if let Some(previous) = resolve_agent(&self.data_dir, &previous_agent_key) {
+                        let _ = tui::app_prepare_agent(
+                            self.runtime.handler_mut(),
+                            &self.data_dir,
+                            previous,
+                            self.daemon_connected,
+                        );
+                    }
+                    return Err(error);
+                }
             }
-            None => self.runtime.handler_mut().replace_agent_session(
-                &session,
-                agent_transcript_from_channel(&channel, history),
-            )?,
+            None => {
+                let definition =
+                    resolve_agent(&self.data_dir, &participant.agent_key).ok_or_else(|| {
+                        CliError::Parse {
+                            detail: format!(
+                                "chat participant references unknown agent definition `{}`",
+                                participant.agent_key
+                            ),
+                        }
+                    })?;
+                tui::app_prepare_agent(
+                    self.runtime.handler_mut(),
+                    &self.data_dir,
+                    definition,
+                    self.daemon_connected,
+                )?;
+                if let Err(error) = self.runtime.handler_mut().replace_agent_session(
+                    &session,
+                    agent_transcript_from_channel(&channel, history),
+                ) {
+                    if let Some(previous) = resolve_agent(&self.data_dir, &previous_agent_key) {
+                        let _ = tui::app_prepare_agent(
+                            self.runtime.handler_mut(),
+                            &self.data_dir,
+                            previous,
+                            self.daemon_connected,
+                        );
+                    }
+                    return Err(error);
+                }
+            }
         }
         self.channel = channel;
-        if self.tool_runtime_explicit_override {
-            self.configure_tool_runtime_for_session(&session.session_id)?;
-        }
+        self.configure_tool_runtime_for_session(&session.session_id)?;
         if loaded_existing_channel && self.channel != channel_before_resume {
             self.save_channel()?;
         }
@@ -2289,11 +2456,20 @@ impl AgentChat {
         self.tool_runtime = selection;
         self.tool_runtime_explicit_override = true;
         let info = self.runtime_info();
-        let participant_id = ensure_primary_participant(&mut self.channel, &info, true);
-        let tool_runtime = self.tool_runtime.clone();
-        set_participant_tool_runtime(&mut self.channel, &participant_id, &tool_runtime);
-        self.save_channel()?;
-        self.persist_primary_session_checkpoint()?;
+        let participant_id = if self.channel.channel_kind == AgentChannelKind::Channel {
+            selected_enabled_participant_id(&self.channel, &info, &session_id)
+        } else {
+            Some(ensure_primary_participant(&mut self.channel, &info, true))
+        };
+        if let Some(participant_id) = participant_id.as_ref() {
+            let tool_runtime = self.tool_runtime.clone();
+            set_participant_tool_runtime(&mut self.channel, participant_id, &tool_runtime);
+        }
+        // A group channel's outer runtime is not necessarily a member runtime.
+        // Persist its local workspace binding, but publish a roaming member
+        // checkpoint only when the session has an exact durable member identity.
+        // Empty/all-disabled groups deliberately leave membership untouched.
+        self.persist_current_session_checkpoint(participant_id.is_some())?;
         Ok(self.tool_runtime())
     }
 
@@ -2344,7 +2520,7 @@ impl AgentChat {
             })
             .map_err(agent_control_cli_error)?;
         let status = chat_control_status(result);
-        self.persist_primary_session_checkpoint()?;
+        self.persist_current_session_checkpoint(false)?;
         Ok(status)
     }
 
@@ -2359,7 +2535,7 @@ impl AgentChat {
             })
             .map_err(agent_control_cli_error)?;
         let status = chat_control_status(result);
-        self.persist_primary_session_checkpoint()?;
+        self.persist_current_session_checkpoint(false)?;
         Ok(status)
     }
 
@@ -2375,7 +2551,7 @@ impl AgentChat {
             })
             .map_err(agent_control_cli_error)?;
         let status = chat_control_status(result);
-        self.persist_primary_session_checkpoint()?;
+        self.persist_current_session_checkpoint(false)?;
         Ok(status)
     }
 
@@ -2390,7 +2566,7 @@ impl AgentChat {
             })
             .map_err(agent_control_cli_error)?;
         let status = chat_control_status(result);
-        self.persist_primary_session_checkpoint()?;
+        self.persist_current_session_checkpoint(false)?;
         Ok(status)
     }
 
@@ -2600,6 +2776,8 @@ impl AgentChat {
         let data_dir = self.data_dir.clone();
         let daemon_connected = self.daemon_connected;
         let previous_agent = self.runtime_info().agent;
+        let previous_interaction_session = self.runtime.session().clone();
+        let previous_agent_session = self.runtime.handler().agent_session_snapshot()?;
         let channel = self.channel.clone();
         let session_store = FileAgentSessionStore::for_data_dir(&data_dir);
         let mut participant_sessions = Vec::new();
@@ -2667,14 +2845,35 @@ impl AgentChat {
         );
         self.channel = channel_runtime.channel().clone();
         drop(channel_runtime);
+        self.runtime.replace_store_and_session(
+            InMemoryEventStore::new(),
+            previous_interaction_session.clone(),
+        );
         if let Some(definition) = resolve_agent(&data_dir, &previous_agent) {
-            let _ = tui::app_switch_agent(
+            tui::app_prepare_agent(
                 self.runtime.handler_mut(),
                 &data_dir,
                 definition,
                 daemon_connected,
-            );
+            )?;
+        } else {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "cannot restore previous agent definition `{previous_agent}` after channel turn"
+                ),
+            });
         }
+        match previous_agent_session {
+            Some(previous_agent_session) => self.runtime.handler_mut().replace_full_agent_session(
+                &previous_interaction_session,
+                previous_agent_session,
+            )?,
+            None => self.runtime.handler_mut().replace_agent_session(
+                &previous_interaction_session,
+                sinomo_agent::AgentTranscript::new(),
+            )?,
+        }
+        self.configure_tool_runtime_for_session(&previous_interaction_session.session_id)?;
         result.map(|_| ()).map_err(|source| CliError::Parse {
             detail: format!("channel turn failed: {source}"),
         })
@@ -2757,13 +2956,23 @@ impl AgentChat {
             resolve_agent(&self.data_dir, agent_key).ok_or_else(|| CliError::Parse {
                 detail: format!("unknown agent `{agent_key}`"),
             })?;
-        let info = tui::app_switch_agent(
-            self.runtime.handler_mut(),
-            &self.data_dir,
-            definition.clone(),
-            self.daemon_connected,
-        )?;
-        let info: ChatRuntimeInfo = info.into();
+        let info = if self.channel.channel_kind == AgentChannelKind::Channel {
+            // Adding/enabling a channel participant must not pair the outer
+            // handler's existing session with a different definition. Each
+            // participant turn prepares its own definition immediately before
+            // restoring that participant's durable session.
+            let mut info = self.runtime_info();
+            info.agent = definition.key().to_string();
+            info
+        } else {
+            let info = tui::app_switch_agent(
+                self.runtime.handler_mut(),
+                &self.data_dir,
+                definition.clone(),
+                self.daemon_connected,
+            )?;
+            ChatRuntimeInfo::from(info)
+        };
         if self.channel.channel_kind == AgentChannelKind::Channel {
             let participant_id = ensure_primary_participant(&mut self.channel, &info, false);
             let tool_runtime = ChatToolRuntimeSelection::from_agent_definition(&definition);
@@ -2781,7 +2990,13 @@ impl AgentChat {
             let tool_runtime = self.tool_runtime.clone();
             set_participant_tool_runtime(&mut self.channel, &participant_id, &tool_runtime);
         }
-        self.save_channel()?;
+        if self.channel.channel_kind == AgentChannelKind::Channel {
+            self.save_channel()?;
+        } else if self.runtime.handler().agent_session_snapshot()?.is_some() {
+            self.persist_primary_session_checkpoint()?;
+        } else {
+            self.save_channel()?;
+        }
         Ok(info)
     }
 
@@ -2823,6 +3038,13 @@ impl AgentChat {
     }
 
     fn persist_primary_session_checkpoint(&self) -> Result<(), CliError> {
+        self.persist_current_session_checkpoint(true)
+    }
+
+    fn persist_current_session_checkpoint(
+        &self,
+        persist_channel_metadata: bool,
+    ) -> Result<(), CliError> {
         let session = self
             .runtime
             .handler()
@@ -2833,23 +3055,70 @@ impl AgentChat {
                     self.channel.channel_id
                 ),
             })?;
-        let participant = self.primary_participant().ok_or_else(|| CliError::Parse {
-            detail: format!(
-                "channel {} has no enabled participant for session checkpoint",
-                self.channel.channel_id
-            ),
-        })?;
-        self.save_channel()?;
+        let participant = if self.channel.channel_kind == AgentChannelKind::Channel {
+            session
+                .agent_definition_key
+                .as_deref()
+                .filter(|key| !key.trim().is_empty())
+                .and_then(|session_agent_key| {
+                    self.channel.participants.iter().find(|participant| {
+                        participant.enabled
+                            && participant.agent_key == session_agent_key
+                            && participant.agent_session_id == session.session_id
+                    })
+                })
+        } else {
+            let participant = self.primary_participant().ok_or_else(|| CliError::Parse {
+                detail: format!(
+                    "channel {} has no enabled participant for session checkpoint",
+                    self.channel.channel_id
+                ),
+            })?;
+            let session_agent_key = session
+                .agent_definition_key
+                .as_deref()
+                .filter(|key| !key.trim().is_empty())
+                .ok_or_else(|| CliError::Parse {
+                    detail: format!(
+                        "canonical agent session {} has no agent definition for participant {}",
+                        session.session_id, participant.participant_id
+                    ),
+                })?;
+            if session_agent_key != participant.agent_key {
+                return Err(CliError::Parse {
+                    detail: format!(
+                        "canonical agent session {} belongs to `{session_agent_key}`, but primary participant {} belongs to `{}`",
+                        session.session_id, participant.participant_id, participant.agent_key
+                    ),
+                });
+            }
+            if session.session_id != participant.agent_session_id {
+                return Err(CliError::Parse {
+                    detail: format!(
+                        "canonical agent session {} does not match primary participant {} session {}",
+                        session.session_id,
+                        participant.participant_id,
+                        participant.agent_session_id
+                    ),
+                });
+            }
+            Some(participant)
+        };
+        if persist_channel_metadata {
+            self.save_channel()?;
+        }
         FileAgentSessionStore::for_data_dir(&self.data_dir)
             .save_session(&session)
             .map_err(|source| CliError::Parse {
                 detail: format!("persist canonical chat session failed: {source}"),
             })?;
-        self.session_checkpoint_store
-            .publish(&self.channel, participant, &session)
-            .map_err(|detail| CliError::Parse {
-                detail: format!("publish roaming agent session checkpoint failed: {detail}"),
-            })?;
+        if let Some(participant) = participant {
+            self.session_checkpoint_store
+                .publish(&self.channel, participant, &session)
+                .map_err(|detail| CliError::Parse {
+                    detail: format!("publish roaming agent session checkpoint failed: {detail}"),
+                })?;
+        }
         Ok(())
     }
 
@@ -2937,7 +3206,27 @@ impl AgentChannelTurnExecutor for AppAgentChannelExecutor<'_> {
                 participant.agent_key
             ))
         })?;
-        tui::app_switch_agent(
+        if session.session_id != participant.agent_session_id {
+            return Err(AgentChannelExecutorError::new(format!(
+                "channel participant `{}` expects session `{}`, but received session `{}`",
+                participant.participant_id, participant.agent_session_id, session.session_id
+            )));
+        }
+        match session.agent_definition_key.as_deref() {
+            Some(key) if key != participant.agent_key => {
+                return Err(AgentChannelExecutorError::new(format!(
+                    "channel participant `{}` belongs to `{}`, but session `{}` belongs to `{key}`",
+                    participant.participant_id, participant.agent_key, session.session_id
+                )));
+            }
+            None => {
+                // The durable participant/session association is explicit
+                // channel identity evidence for a legacy checkpoint.
+                session.agent_definition_key = Some(participant.agent_key.clone());
+            }
+            Some(_) => {}
+        }
+        tui::app_prepare_agent(
             self.runtime.handler_mut(),
             self.data_dir,
             definition,
@@ -3607,6 +3896,105 @@ fn ensure_primary_participant(
         }
     }
     participant_id
+}
+
+fn selected_enabled_participant_id(
+    channel: &AgentChannel,
+    info: &ChatRuntimeInfo,
+    runtime_session_id: &SessionId,
+) -> Option<TaskId> {
+    let enabled = || {
+        channel
+            .participants
+            .iter()
+            .filter(|participant| participant.enabled)
+    };
+    enabled()
+        .find(|participant| {
+            participant.agent_key == info.agent
+                && participant.agent_session_id == *runtime_session_id
+        })
+        .or_else(|| enabled().find(|participant| participant.agent_key == info.agent))
+        .or_else(|| enabled().min_by_key(|participant| participant.order))
+        .map(|participant| participant.participant_id.clone())
+}
+
+fn resume_primary_participant_id(
+    channel: &mut AgentChannel,
+    info: &ChatRuntimeInfo,
+    loaded_existing_channel: bool,
+    local_session: Option<&AgentSession>,
+) -> Option<TaskId> {
+    if loaded_existing_channel {
+        let exact_local = local_session
+            .and_then(|session| {
+                session
+                    .agent_definition_key
+                    .as_deref()
+                    .map(|agent_key| (agent_key, &session.session_id))
+            })
+            .and_then(|(agent_key, session_id)| {
+                channel
+                    .participants
+                    .iter()
+                    .filter(|participant| participant.enabled)
+                    .find(|participant| {
+                        participant.agent_key == agent_key
+                            && participant.agent_session_id == *session_id
+                    })
+            });
+        let durable_primary = channel
+            .participants
+            .iter()
+            .filter(|participant| participant.enabled)
+            .min_by_key(|participant| participant.order);
+        if channel.channel_kind == AgentChannelKind::Channel {
+            let durable_outer_identity = channel
+                .participants
+                .iter()
+                .filter(|participant| participant.enabled)
+                .find(|participant| participant.agent_key == info.agent);
+            return exact_local
+                .or(durable_outer_identity)
+                .or(durable_primary)
+                .map(|participant| participant.participant_id.clone());
+        }
+        if let Some(participant) = exact_local.or(durable_primary) {
+            return Some(participant.participant_id.clone());
+        }
+    }
+    let align_primary_session = should_align_primary_participant(channel);
+    Some(ensure_primary_participant(
+        channel,
+        info,
+        align_primary_session,
+    ))
+}
+
+/// Runtime-only identity used to open an existing group channel that currently
+/// has no enabled participants. It is deliberately not inserted into channel
+/// membership or used for roaming participant checkpoints.
+fn outer_channel_runtime_participant(
+    channel: &AgentChannel,
+    info: &ChatRuntimeInfo,
+) -> AgentChannelParticipant {
+    let agent_key = if info.agent.trim().is_empty() {
+        "main-agent".to_string()
+    } else {
+        info.agent.clone()
+    };
+    AgentChannelParticipant {
+        participant_id: TaskId::generate(),
+        agent_key: agent_key.clone(),
+        agent_name: agent_key,
+        agent_session_id: channel.channel_id.clone(),
+        enabled: true,
+        order: 0,
+        tool_runtime: sinomo_agent::AgentToolRuntimeDefinition::default(),
+        observed_through_sequence: 0,
+        message_reconciliation_version: sinomo_agent::AGENT_CHANNEL_MESSAGE_RECONCILIATION_VERSION,
+        observed_message_ids: Vec::new(),
+    }
 }
 
 fn set_participant_tool_runtime(
@@ -6481,6 +6869,115 @@ mod tests {
     }
 
     #[test]
+    fn roaming_session_reconciliation_rejects_identity_and_workspace_drift() {
+        let session_id = SessionId::generate();
+        let local = AgentSession::new(session_id.clone(), AgentRole::Deliberation)
+            .with_agent_definition_key("coding-agent");
+        let mut roaming = local.clone();
+        roaming.agent_definition_key = Some("main-agent".to_string());
+        let identity_error = select_resumable_agent_session(Some(local.clone()), Some(roaming))
+            .expect_err("agent identity drift must be rejected");
+        assert!(identity_error.contains("disagree on agent definition"));
+
+        let mut local = local;
+        local.workspace_binding = Some(sinomo_agent::WorkspaceRef::local_path("/workspace/a"));
+        let mut roaming = local.clone();
+        roaming.workspace_binding = Some(sinomo_agent::WorkspaceRef::local_path("/workspace/b"));
+        let workspace_error = select_resumable_agent_session(Some(local), Some(roaming))
+            .expect_err("workspace drift must be rejected");
+        assert!(workspace_error.contains("disagree on workspace binding"));
+    }
+
+    #[test]
+    fn primary_checkpoint_rejects_participant_agent_identity_drift() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-checkpoint-agent-drift");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let mut chat = AgentChat::new(data_dir, false).expect("chat runtime");
+        let participant = chat
+            .channel
+            .participants
+            .iter_mut()
+            .find(|participant| participant.enabled)
+            .expect("enabled primary participant");
+        participant.agent_key = "coding-agent".to_string();
+
+        let error = chat
+            .persist_primary_session_checkpoint()
+            .expect_err("mismatched participant must not be checkpointed");
+
+        assert!(
+            error.to_string().contains("belongs to `main-agent`")
+                && error.to_string().contains("belongs to `coding-agent`"),
+            "checkpoint error should explain both identities: {error}"
+        );
+    }
+
+    #[test]
+    fn roaming_session_reconciliation_uses_state_revision_for_control_queues() {
+        let session_id = SessionId::generate();
+        let mut roaming = AgentSession::new(session_id, AgentRole::Deliberation)
+            .with_agent_definition_key("main-agent");
+        roaming.state_revision = 1;
+        let mut local = roaming.clone();
+        local
+            .steering_queue
+            .push(sinomo_agent::AgentSteeringMessage::new(
+                "local-only steering",
+            ));
+        local.state_revision = 2;
+
+        let selected = select_resumable_agent_session(Some(local.clone()), Some(roaming.clone()))
+            .expect("select locally newer control state")
+            .expect("session");
+        assert_eq!(selected.steering_queue, local.steering_queue);
+
+        roaming
+            .follow_up_queue
+            .push(sinomo_agent::AgentFollowUpMessage::new("roaming follow-up"));
+        roaming.state_revision = 3;
+        let selected = select_resumable_agent_session(Some(local), Some(roaming.clone()))
+            .expect("select roaming newer control state")
+            .expect("session");
+        assert_eq!(selected.follow_up_queue, roaming.follow_up_queue);
+
+        let mut divergent = roaming.clone();
+        divergent
+            .steering_queue
+            .push(sinomo_agent::AgentSteeringMessage::new(
+                "concurrent steering",
+            ));
+        let error = select_resumable_agent_session(Some(roaming), Some(divergent))
+            .expect_err("same revision with different private state must conflict");
+        assert!(error.contains("divergent state at revision 3"), "{error}");
+
+        let session_id = SessionId::generate();
+        let mut transcript_branch = AgentSession::new(session_id, AgentRole::Deliberation)
+            .with_agent_definition_key("main-agent");
+        transcript_branch.state_revision = 2;
+        transcript_branch
+            .raw_transcript
+            .push(AgentItem::UserMessage {
+                item_id: TaskId::generate(),
+                step_index: 0,
+                content: "offline transcript append".to_string(),
+                event_id: None,
+            });
+        transcript_branch.transcript = transcript_branch.raw_transcript.clone();
+        let mut control_branch = AgentSession::new(
+            transcript_branch.session_id.clone(),
+            AgentRole::Deliberation,
+        )
+        .with_agent_definition_key("main-agent");
+        control_branch.state_revision = 2;
+        control_branch
+            .follow_up_queue
+            .push(sinomo_agent::AgentFollowUpMessage::new("offline follow-up"));
+        let error = select_resumable_agent_session(Some(transcript_branch), Some(control_branch))
+            .expect_err("concurrent transcript and control branches must conflict");
+        assert!(error.contains("concurrent transcript and private control-state"));
+    }
+
+    #[test]
     fn app_chat_resume_explicit_channel_preserves_participant_session_id() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-resume");
         let data_dir = SinomoDataDir::new(&root);
@@ -6522,6 +7019,278 @@ mod tests {
     }
 
     #[test]
+    fn app_chat_resume_group_channel_does_not_add_or_reenable_process_default() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-membership-resume");
+        let data_dir = SinomoDataDir::new(&root);
+        let definition =
+            AgentDefinition::custom("worker-agent", AgentRole::Main, "Work with the team.");
+        let definition_store = sinomo_agent::AgentDefinitionSifsStore::open(Some(data_dir.root()))
+            .expect("open agent definition store");
+        sinomo_agent::AgentDefinitionStore::save_definition(&definition_store, &definition)
+            .expect("save worker definition");
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+
+        for (default_disabled, include_worker, expected_outer_agent) in [
+            (false, true, "worker-agent"),
+            (true, true, "worker-agent"),
+            (false, false, "main-agent"),
+            (true, false, "main-agent"),
+        ] {
+            let channel_id = SessionId::generate();
+            let mut channel = AgentChannel::new_channel(channel_id.clone(), "Durable team");
+            channel.ensure_user(AgentChannelUser::app_local());
+            if default_disabled {
+                let default_id = channel.ensure_participant("main-agent", "main-agent");
+                assert!(channel.disable_participant(&default_id));
+            }
+            if include_worker {
+                channel.ensure_participant("worker-agent", "Worker agent");
+            }
+            let durable_participants = channel.participants.clone();
+            store.save_channel(&channel).expect("save durable channel");
+
+            let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+            assert_eq!(chat.runtime_info().agent, "main-agent");
+            chat.resume_session(&channel_id.to_string(), &[])
+                .expect("resume durable group channel");
+
+            assert_eq!(chat.runtime_info().agent, expected_outer_agent);
+            assert_eq!(
+                chat.channel.participants, durable_participants,
+                "resume must select an enabled durable participant without changing membership"
+            );
+            assert_eq!(
+                store
+                    .load_channel(&channel_id)
+                    .expect("reload durable channel")
+                    .expect("durable channel")
+                    .participants,
+                durable_participants,
+                "resume must not persist a process-default participant or enablement change"
+            );
+        }
+    }
+
+    #[test]
+    fn app_chat_group_tool_runtime_update_preserves_membership_and_session_identity() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-tool-runtime-identity");
+        let data_dir = SinomoDataDir::new(&root);
+        let definition =
+            AgentDefinition::custom("worker-agent", AgentRole::Main, "Work with the team.");
+        let definition_store = sinomo_agent::AgentDefinitionSifsStore::open(Some(data_dir.root()))
+            .expect("open agent definition store");
+        sinomo_agent::AgentDefinitionStore::save_definition(&definition_store, &definition)
+            .expect("save worker definition");
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let channel_id = SessionId::generate();
+        let mut channel = AgentChannel::new_channel(channel_id.clone(), "Durable team");
+        channel.ensure_user(AgentChannelUser::app_local());
+        let default_id = channel.ensure_participant("main-agent", "main-agent");
+        assert!(channel.disable_participant(&default_id));
+        let worker_id = channel.ensure_participant("worker-agent", "Worker agent");
+        let durable_participants = channel.participants.clone();
+        let worker_session_id = channel
+            .participant(&worker_id)
+            .expect("worker participant")
+            .agent_session_id
+            .clone();
+        assert_ne!(worker_session_id, channel_id);
+        store.save_channel(&channel).expect("save durable channel");
+
+        let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        chat.resume_session(&channel_id.to_string(), &[])
+            .expect("resume durable group channel");
+        chat.set_tool_runtime_node(Some("updated-node".to_string()))
+            .expect("update selected participant tool runtime");
+
+        assert_eq!(chat.channel.participants.len(), durable_participants.len());
+        for durable in &durable_participants {
+            let updated = chat
+                .channel
+                .participant(&durable.participant_id)
+                .expect("durable participant remains present");
+            assert_eq!(updated.agent_key, durable.agent_key);
+            assert_eq!(updated.agent_name, durable.agent_name);
+            assert_eq!(updated.agent_session_id, durable.agent_session_id);
+            assert_eq!(updated.enabled, durable.enabled);
+            assert_eq!(updated.order, durable.order);
+        }
+        assert_eq!(
+            chat.channel
+                .participant(&worker_id)
+                .expect("worker participant")
+                .tool_runtime
+                .sandbox_node_id
+                .as_deref(),
+            Some("updated-node")
+        );
+        assert_eq!(
+            chat.channel
+                .participant(&default_id)
+                .expect("disabled default participant")
+                .tool_runtime
+                .sandbox_node_id,
+            durable_participants
+                .iter()
+                .find(|participant| participant.participant_id == default_id)
+                .expect("durable disabled participant")
+                .tool_runtime
+                .sandbox_node_id
+        );
+
+        let saved = store
+            .load_channel(&channel_id)
+            .expect("reload durable channel")
+            .expect("durable channel");
+        let saved_worker = saved.participant(&worker_id).expect("saved worker");
+        assert_eq!(saved_worker.agent_session_id, worker_session_id);
+        assert_eq!(
+            saved_worker.tool_runtime.sandbox_node_id.as_deref(),
+            Some("updated-node")
+        );
+        assert!(
+            !saved
+                .participant(&default_id)
+                .expect("saved default")
+                .enabled
+        );
+    }
+
+    #[test]
+    fn app_chat_group_tool_runtime_update_preserves_empty_and_all_disabled_membership() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-tool-runtime-empty");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+
+        for all_disabled in [false, true] {
+            let channel_id = SessionId::generate();
+            let mut channel = AgentChannel::new_channel(channel_id.clone(), "Quiet team");
+            channel.ensure_user(AgentChannelUser::app_local());
+            if all_disabled {
+                let participant_id = channel.ensure_participant("main-agent", "main-agent");
+                assert!(channel.disable_participant(&participant_id));
+            }
+            let durable_participants = channel.participants.clone();
+            store.save_channel(&channel).expect("save durable channel");
+
+            let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+            chat.resume_session(&channel_id.to_string(), &[])
+                .expect("resume quiet group channel");
+            chat.set_tool_runtime_node(Some("outer-node".to_string()))
+                .expect("update outer runtime without a member");
+
+            assert_eq!(chat.channel.participants, durable_participants);
+            assert_eq!(
+                store
+                    .load_channel(&channel_id)
+                    .expect("reload durable channel")
+                    .expect("durable channel")
+                    .participants,
+                durable_participants,
+                "tool runtime selection must not create or re-enable group membership"
+            );
+            let outer_session = chat
+                .runtime
+                .handler()
+                .agent_session_snapshot()
+                .expect("outer session snapshot")
+                .expect("outer session");
+            assert!(
+                FileAgentSessionStore::for_data_dir(&data_dir)
+                    .load_session(&outer_session.session_id)
+                    .expect("load persisted outer session")
+                    .is_some(),
+                "the runtime-only outer session should still persist locally"
+            );
+        }
+    }
+
+    #[test]
+    fn app_chat_group_controls_skip_non_member_roaming_checkpoint() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-control-checkpoint");
+        let data_dir = SinomoDataDir::new(&root);
+        let definition =
+            AgentDefinition::custom("worker-agent", AgentRole::Main, "Work with the team.");
+        let definition_store = sinomo_agent::AgentDefinitionSifsStore::open(Some(data_dir.root()))
+            .expect("open agent definition store");
+        sinomo_agent::AgentDefinitionStore::save_definition(&definition_store, &definition)
+            .expect("save worker definition");
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let channel_id = SessionId::generate();
+        let mut channel = AgentChannel::new_channel(channel_id.clone(), "Durable team");
+        channel.ensure_user(AgentChannelUser::app_local());
+        let worker_id = channel.ensure_participant("worker-agent", "Worker agent");
+        let durable_participants = channel.participants.clone();
+        store.save_channel(&channel).expect("save durable channel");
+
+        let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        chat.resume_session(&channel_id.to_string(), &[])
+            .expect("resume durable group channel");
+        let steering = chat.steer("focus on correctness").expect("queue steering");
+        let steering_id = steering
+            .queued_input
+            .expect("steering queue item")
+            .input_id
+            .parse::<TaskId>()
+            .expect("steering id");
+        chat.follow_up("run the focused checks")
+            .expect("queue follow-up");
+        chat.remove_queued_input(steering_id)
+            .expect("remove steering");
+        chat.interrupt("operator requested stop")
+            .expect("request interrupt");
+
+        assert_eq!(chat.channel.participants, durable_participants);
+        let outer_session = FileAgentSessionStore::for_data_dir(&data_dir)
+            .load_session(&channel_id)
+            .expect("load outer session")
+            .expect("persisted outer session");
+        assert!(outer_session.steering_queue.is_empty());
+        assert_eq!(outer_session.follow_up_queue.len(), 1);
+        let worker = chat.channel.participant(&worker_id).expect("worker");
+        assert!(
+            chat.session_checkpoint_store
+                .load_latest(&chat.channel, worker)
+                .expect("load worker checkpoint")
+                .is_none(),
+            "outer channel control state must not be published as the worker checkpoint"
+        );
+    }
+
+    #[test]
+    fn app_chat_group_controls_publish_exact_member_checkpoint() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-control-member");
+        let data_dir = SinomoDataDir::new(&root);
+        let mut chat = AgentChat::new(data_dir, false).expect("chat runtime");
+        chat.channel.channel_kind = AgentChannelKind::Channel;
+        let participant = chat
+            .primary_participant()
+            .expect("primary participant")
+            .clone();
+        assert_eq!(
+            participant.agent_session_id,
+            chat.runtime.session().session_id,
+            "fresh chat identity should be exact before promoting it to a group"
+        );
+        chat.save_channel().expect("save promoted group channel");
+
+        chat.steer("preserve the exact member checkpoint")
+            .expect("queue steering");
+
+        let checkpoint = chat
+            .session_checkpoint_store
+            .load_latest(&chat.channel, &participant)
+            .expect("load participant checkpoint")
+            .expect("exact participant checkpoint");
+        assert_eq!(checkpoint.session_id, participant.agent_session_id);
+        assert_eq!(
+            checkpoint.agent_definition_key.as_deref(),
+            Some(participant.agent_key.as_str())
+        );
+        assert_eq!(checkpoint.steering_queue.len(), 1);
+    }
+
+    #[test]
     fn app_chat_resume_restores_canonical_projection_and_raw_history() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-canonical-resume");
         let data_dir = SinomoDataDir::new(&root);
@@ -6539,7 +7308,8 @@ mod tests {
             .expect("append visible message");
         channel_store.save_channel(&channel).expect("save channel");
 
-        let mut persisted = AgentSession::new(session_id.clone(), AgentRole::Main);
+        let mut persisted = AgentSession::new(session_id.clone(), AgentRole::Main)
+            .with_agent_definition_key("main-agent");
         let raw_item_id = TaskId::generate();
         persisted.raw_transcript.push(AgentItem::UserMessage {
             item_id: raw_item_id.clone(),
@@ -6625,6 +7395,94 @@ mod tests {
     }
 
     #[test]
+    fn app_chat_resume_restores_exact_coding_agent_and_workspace() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-coding-resume");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("create coding workspace");
+        let workspace = fs::canonicalize(workspace).expect("canonical coding workspace");
+        let session_id = SessionId::generate();
+
+        let channel_store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let mut channel = AgentChannel::new(session_id.clone(), "Coding chat");
+        channel.ensure_user(AgentChannelUser::app_local());
+        let participant_id = channel.ensure_participant("coding-agent", "Coding agent");
+        channel
+            .participant_mut(&participant_id)
+            .expect("coding participant")
+            .agent_session_id = session_id.clone();
+        channel_store.save_channel(&channel).expect("save channel");
+
+        let mut persisted = AgentSession::new(session_id.clone(), AgentRole::Deliberation)
+            .with_agent_definition_key("coding-agent");
+        persisted.workspace_binding =
+            Some(sinomo_agent::WorkspaceRef::local_path(workspace.clone()));
+        FileAgentSessionStore::for_data_dir(&data_dir)
+            .save_session(&persisted)
+            .expect("save coding session");
+
+        let mut chat = AgentChat::new(data_dir, false).expect("chat runtime");
+        chat.resume_session(&session_id.to_string(), &[])
+            .expect("resume coding session");
+
+        assert_eq!(chat.runtime_info().agent, "coding-agent");
+        assert_eq!(
+            chat.tool_runtime().workspace_root.as_ref(),
+            Some(&workspace)
+        );
+        let resumed = chat
+            .runtime
+            .handler()
+            .agent_session_snapshot()
+            .expect("runtime snapshot")
+            .expect("runtime attached");
+        assert_eq!(
+            resumed.agent_definition_key.as_deref(),
+            Some("coding-agent")
+        );
+        assert_eq!(resumed.workspace_binding, persisted.workspace_binding);
+    }
+
+    #[test]
+    fn app_chat_reopens_the_enabled_agent_after_a_direct_switch() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-switched-agent-resume");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let workspace = root.join("plain-workspace");
+        fs::create_dir_all(&workspace).expect("create generic workspace");
+        let workspace = fs::canonicalize(workspace).expect("canonical generic workspace");
+        let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        let session_id = chat.session_id();
+
+        chat.set_agent("coding-agent")
+            .expect("switch direct chat to coding agent");
+        chat.set_tool_runtime(ChatToolRuntimeSelection {
+            workspace_root: Some(workspace.clone()),
+            ..ChatToolRuntimeSelection::default()
+        })
+        .expect("bind generic workspace before using coding tools");
+        assert_eq!(chat.runtime_info().agent, "coding-agent");
+        drop(chat);
+
+        let mut reopened = AgentChat::new(data_dir, false).expect("reopen chat runtime");
+        reopened
+            .resume_session(&session_id, &[])
+            .expect("resume switched direct chat");
+        assert_eq!(reopened.runtime_info().agent, "coding-agent");
+        assert_eq!(
+            reopened.tool_runtime().workspace_root.as_deref(),
+            Some(workspace.as_path()),
+            "direct-agent resume must retain the selected generic workspace"
+        );
+        let enabled = reopened
+            .channel
+            .enabled_participants_in_order()
+            .into_iter()
+            .map(|participant| participant.agent_key.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(enabled, vec!["coding-agent".to_string()]);
+    }
+
+    #[test]
     fn app_chat_roams_latest_canonical_session_checkpoint_across_data_dirs() {
         let root_a = sinomo_testdir::TestDir::new("sinomo-app-chat-roaming-session-a");
         let root_b = sinomo_testdir::TestDir::new("sinomo-app-chat-roaming-session-b");
@@ -6653,7 +7511,8 @@ mod tests {
             .expect("save shared channel");
         drop(shared_channel_store);
 
-        let mut seeded = AgentSession::new(channel_id.clone(), AgentRole::Main);
+        let mut seeded = AgentSession::new(channel_id.clone(), AgentRole::Main)
+            .with_agent_definition_key("main-agent");
         let raw_item_id = TaskId::generate();
         seeded.raw_transcript.push(AgentItem::UserMessage {
             item_id: raw_item_id.clone(),
@@ -6877,8 +7736,8 @@ mod tests {
     #[test]
     fn portable_sifs_workspace_binding_remaps_across_device_mounts() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-portable-sifs-workspace");
-        let mount_a = root.join("device-a/data/mounts/sifs");
-        let mount_b = root.join("device-b/data/mounts/sifs");
+        let mount_a = root.join("device-a/data/mounts/sifs/by-process/111");
+        let mount_b = root.join("device-b/data/mounts/sifs/by-process/222");
         let workspace_a = mount_a.join("teams/shared-workspace");
         let workspace_b = mount_b.join("teams/shared-workspace");
         fs::create_dir_all(&workspace_a).expect("create device A workspace");
@@ -6906,6 +7765,7 @@ mod tests {
             &store,
             session_id.clone(),
             AgentRole::Deliberation,
+            "coding-agent",
             Some(&binding_a),
         )
         .expect("persist device A logical binding");
@@ -6915,6 +7775,7 @@ mod tests {
             &store,
             session_id.clone(),
             AgentRole::Deliberation,
+            "coding-agent",
             Some(&binding_b),
         )
         .expect("resume same logical workspace from device B prefix");
@@ -6967,7 +7828,26 @@ mod tests {
         let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
         chat.resume_session(&channel_id.to_string(), &[])
             .expect("resume channel");
+        let outer_agent = chat.runtime_info().agent;
+        let outer_session_key = chat
+            .runtime
+            .handler()
+            .agent_session_snapshot()
+            .expect("outer session snapshot")
+            .expect("outer session")
+            .agent_definition_key;
         chat.set_agent("worker-agent").expect("set channel agent");
+        assert_eq!(chat.runtime_info().agent, outer_agent);
+        assert_eq!(
+            chat.runtime
+                .handler()
+                .agent_session_snapshot()
+                .expect("outer session snapshot after participant add")
+                .expect("outer session after participant add")
+                .agent_definition_key,
+            outer_session_key,
+            "adding a group participant must not rebind the outer session"
+        );
 
         let saved = SifsAgentChannelStore::open(&data_dir)
             .expect("reopen channel store")

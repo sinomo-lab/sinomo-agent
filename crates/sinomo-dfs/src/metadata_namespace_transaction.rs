@@ -127,6 +127,7 @@ pub(crate) fn plan_namespace_transaction_recovery_table_ops(
     let mut scratch = tables.clone();
     let mut table_ops = Vec::new();
     let mut transaction_authoritative_object_ids = BTreeSet::new();
+    let mut compacted_tombstone_fenced_object_ids = BTreeSet::new();
     let transaction_object_ids = transaction
         .objects
         .iter()
@@ -143,6 +144,7 @@ pub(crate) fn plan_namespace_transaction_recovery_table_ops(
             object,
             &transaction_object_ids,
             &mut transaction_authoritative_object_ids,
+            &mut compacted_tombstone_fenced_object_ids,
         );
     }
     for object in transaction
@@ -156,10 +158,14 @@ pub(crate) fn plan_namespace_transaction_recovery_table_ops(
             object,
             &transaction_object_ids,
             &mut transaction_authoritative_object_ids,
+            &mut compacted_tombstone_fenced_object_ids,
         );
     }
     for version in &transaction.versions {
         let version = normalized_version_record(version);
+        if compacted_tombstone_fenced_object_ids.contains(&version.object_id) {
+            continue;
+        }
         // A present version record may have been enriched by later receipt or
         // repair activity. Namespace recovery fills partial writes; it must
         // never roll an existing same-key record back to the historical
@@ -176,6 +182,9 @@ pub(crate) fn plan_namespace_transaction_recovery_table_ops(
         }
     }
     for state in &transaction.advisory_lock_states {
+        if compacted_tombstone_fenced_object_ids.contains(&state.object_id) {
+            continue;
+        }
         let existing = scratch.advisory_lock_states.get(&state.object_id);
         let should_recover = match existing {
             None => true,
@@ -214,6 +223,7 @@ pub(crate) fn namespace_transaction_recovery_is_complete(
         .map(|object| object.object_id.clone())
         .collect::<BTreeSet<_>>();
     let mut transaction_authoritative_object_ids = BTreeSet::new();
+    let mut compacted_tombstone_fenced_object_ids = BTreeSet::new();
 
     for object in transaction
         .objects
@@ -225,6 +235,7 @@ pub(crate) fn namespace_transaction_recovery_is_complete(
             object,
             &transaction_object_ids,
             &mut transaction_authoritative_object_ids,
+            &mut compacted_tombstone_fenced_object_ids,
         ) {
             return false;
         }
@@ -239,6 +250,7 @@ pub(crate) fn namespace_transaction_recovery_is_complete(
             object,
             &transaction_object_ids,
             &mut transaction_authoritative_object_ids,
+            &mut compacted_tombstone_fenced_object_ids,
         ) {
             return false;
         }
@@ -246,14 +258,18 @@ pub(crate) fn namespace_transaction_recovery_is_complete(
 
     if transaction.versions.iter().any(|version| {
         let version = normalized_version_record(version);
-        !tables
-            .versions
-            .contains_key(&(version.object_id, version.version))
+        !compacted_tombstone_fenced_object_ids.contains(&version.object_id)
+            && !tables
+                .versions
+                .contains_key(&(version.object_id, version.version))
     }) {
         return false;
     }
 
     transaction.advisory_lock_states.iter().all(|state| {
+        if compacted_tombstone_fenced_object_ids.contains(&state.object_id) {
+            return true;
+        }
         match tables.advisory_lock_states.get(&state.object_id) {
             None => false,
             Some(existing) if existing == state => true,
@@ -270,8 +286,10 @@ fn namespace_transaction_object_recovery_is_complete(
     transaction_object: &DfsObjectMetadata,
     transaction_object_ids: &BTreeSet<DfsObjectId>,
     transaction_authoritative_object_ids: &mut BTreeSet<DfsObjectId>,
+    compacted_tombstone_fenced_object_ids: &mut BTreeSet<DfsObjectId>,
 ) -> bool {
-    if tables.compacted_tombstone_matches(transaction_object) {
+    if tables.compacted_tombstone_fences_namespace_recovery(transaction_object) {
+        compacted_tombstone_fenced_object_ids.insert(transaction_object.object_id.clone());
         return true;
     }
     let current = tables.objects.get(&transaction_object.object_id);
@@ -406,8 +424,10 @@ fn plan_object_index_recovery_ops(
     transaction_object: &DfsObjectMetadata,
     transaction_object_ids: &BTreeSet<DfsObjectId>,
     transaction_authoritative_object_ids: &mut BTreeSet<DfsObjectId>,
+    compacted_tombstone_fenced_object_ids: &mut BTreeSet<DfsObjectId>,
 ) {
-    if scratch.compacted_tombstone_matches(transaction_object) {
+    if scratch.compacted_tombstone_fences_namespace_recovery(transaction_object) {
+        compacted_tombstone_fenced_object_ids.insert(transaction_object.object_id.clone());
         return;
     }
     let current = scratch.objects.get(&transaction_object.object_id).cloned();
@@ -621,6 +641,124 @@ mod tests {
             "a missing object index must fall back to scratch-table recovery planning"
         );
         assert!(!plan_namespace_transaction_recovery_table_ops(&tables, &transaction).is_empty());
+    }
+
+    #[test]
+    fn newer_compacted_tombstone_fences_historical_live_transaction_recovery() {
+        let mut historical_live = object(
+            object_id("obj_namespace_compacted_fence"),
+            "/docs/compacted-fence.md",
+            DfsObjectKind::File,
+        );
+        historical_live.changed_at_unix_nanos = 20;
+        historical_live.version = version("version_namespace_compacted_live");
+        let historical_version = version_record(&historical_live);
+        let historical_lock = DfsAdvisoryLockStateRecord::empty(
+            historical_live.file_system_id.clone(),
+            historical_live.object_id.clone(),
+            7,
+        );
+        let transaction = DfsNamespaceTransaction {
+            transaction_id: "txn_namespace_compacted_fence".to_string(),
+            file_system_id: historical_live.file_system_id.clone(),
+            objects: vec![historical_live.clone()],
+            versions: vec![historical_version],
+            advisory_lock_states: vec![historical_lock],
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+
+        let mut compacted_tombstone = historical_live.clone();
+        compacted_tombstone.kind = DfsObjectKind::Tombstone;
+        compacted_tombstone.changed_at_unix_nanos = 30;
+        compacted_tombstone.version = version("version_namespace_compacted_tombstone");
+        let mut tables = DfsMetadataTables::default();
+        tables.apply(DfsMetadataTableOp::PutCompactedTombstone {
+            object: compacted_tombstone.clone(),
+        });
+
+        assert!(namespace_transaction_recovery_is_complete(
+            &tables,
+            &transaction
+        ));
+        assert!(
+            plan_namespace_transaction_recovery_table_ops(&tables, &transaction).is_empty(),
+            "recovery must not resurrect an object family superseded by a compacted tombstone"
+        );
+        assert_eq!(
+            tables
+                .compacted_tombstones
+                .get(&compacted_tombstone.object_id),
+            Some(&compacted_tombstone)
+        );
+        assert!(!tables.objects.contains_key(&historical_live.object_id));
+        assert!(tables.versions.is_empty());
+        assert!(tables.advisory_lock_states.is_empty());
+    }
+
+    #[test]
+    fn only_newer_same_namespace_compacted_tombstone_fences_live_recovery() {
+        let mut historical_live = object(
+            object_id("obj_namespace_compacted_non_fence"),
+            "/docs/compacted-non-fence.md",
+            DfsObjectKind::File,
+        );
+        historical_live.changed_at_unix_nanos = 30;
+        historical_live.version = version("version_namespace_compacted_current");
+        let transaction = DfsNamespaceTransaction {
+            transaction_id: "txn_namespace_compacted_non_fence".to_string(),
+            file_system_id: historical_live.file_system_id.clone(),
+            objects: vec![historical_live.clone()],
+            versions: Vec::new(),
+            advisory_lock_states: Vec::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+
+        let mut older = historical_live.clone();
+        older.kind = DfsObjectKind::Tombstone;
+        older.changed_at_unix_nanos = 20;
+        older.version = version("version_namespace_compacted_older");
+        let mut same_generation = historical_live.clone();
+        same_generation.kind = DfsObjectKind::Tombstone;
+        let mut different_path = historical_live.clone();
+        different_path.kind = DfsObjectKind::Tombstone;
+        different_path.path = "/archive/compacted-non-fence.md".to_string();
+        different_path.changed_at_unix_nanos = 40;
+        different_path.version = version("version_namespace_compacted_different_path");
+        let mut different_file_system = historical_live.clone();
+        different_file_system.kind = DfsObjectKind::Tombstone;
+        different_file_system.file_system_id =
+            DfsFileSystemId::from_legacy_named("fs_namespace_txn_other")
+                .expect("valid filesystem id");
+        different_file_system.changed_at_unix_nanos = 40;
+        different_file_system.version =
+            version("version_namespace_compacted_different_file_system");
+
+        for (label, compacted_tombstone) in [
+            ("older", older),
+            ("same generation", same_generation),
+            ("different path", different_path),
+            ("different filesystem", different_file_system),
+        ] {
+            let mut tables = DfsMetadataTables::default();
+            tables.apply(DfsMetadataTableOp::PutCompactedTombstone {
+                object: compacted_tombstone,
+            });
+
+            assert!(
+                !namespace_transaction_recovery_is_complete(&tables, &transaction),
+                "a {label} compacted tombstone must not suppress live-object recovery"
+            );
+            assert!(
+                plan_namespace_transaction_recovery_table_ops(&tables, &transaction)
+                    .iter()
+                    .any(|op| matches!(
+                        op,
+                        DfsMetadataTableOp::PutObject { object }
+                            if object == &historical_live
+                    )),
+                "a {label} compacted tombstone must be replaced by the authoritative live object"
+            );
+        }
     }
 
     #[test]

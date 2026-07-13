@@ -980,6 +980,7 @@ pub fn sync_participant_session(
     }
 
     let mut next_step = session.transcript.items.len();
+    let mut session_changed = false;
     for message in &channel.transcript {
         participant.observed_through_sequence =
             participant.observed_through_sequence.max(message.sequence);
@@ -994,6 +995,7 @@ pub fn sync_participant_session(
             channel_message_agent_item(message, participant, next_step, channel.channel_kind);
         session.transcript.push(item.clone());
         session.raw_transcript.push(item);
+        session_changed = true;
         observed_message_ids.insert(message.message_id.clone());
         next_step = next_step.saturating_add(1);
     }
@@ -1006,6 +1008,9 @@ pub fn sync_participant_session(
         .filter(|message| observed_message_ids.contains(&message.message_id))
         .map(|message| message.message_id.clone())
         .collect();
+    if session_changed {
+        session.advance_state_revision();
+    }
 }
 
 /// Stable identity for the session item projected from one visible channel message.

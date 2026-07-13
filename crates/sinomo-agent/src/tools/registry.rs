@@ -15,6 +15,10 @@ const AGENT_TOOL_GATEWAY_WAIT_POLL_MS: u64 = 50;
 #[derive(Clone, Default)]
 pub struct AgentToolRegistry {
     tools: Arc<RwLock<Vec<Arc<dyn AgentTool>>>>,
+    /// Runtime resources whose lifetime must cover every tool registered in
+    /// this registry (for example, a live filesystem mount). Resources are not
+    /// tools and therefore never appear in model-visible descriptors.
+    resources: Arc<RwLock<Vec<Arc<dyn Send + Sync>>>>,
     generation: Arc<AtomicU64>,
 }
 
@@ -89,6 +93,18 @@ impl AgentToolRegistry {
         None
     }
 
+    /// Keep a shared runtime resource alive for as long as this registry (or
+    /// any of its clones) remains configured.
+    pub fn retain_resource<T>(&self, resource: Arc<T>)
+    where
+        T: Send + Sync + 'static,
+    {
+        self.resources
+            .write()
+            .expect("agent tool registry resource lock poisoned")
+            .push(resource);
+    }
+
     pub fn remove(&self, tool_name: &str) -> Option<AgentToolDescriptor> {
         let mut tools = self
             .tools
@@ -103,10 +119,16 @@ impl AgentToolRegistry {
     }
 
     pub fn clear(&self) {
-        self.tools
+        let mut tools = self
+            .tools
             .write()
-            .expect("agent tool registry lock poisoned")
-            .clear();
+            .expect("agent tool registry lock poisoned");
+        let mut resources = self
+            .resources
+            .write()
+            .expect("agent tool registry resource lock poisoned");
+        tools.clear();
+        resources.clear();
         self.bump_generation();
     }
 
@@ -195,13 +217,24 @@ impl AgentToolRegistry {
                 cancelled_before_tool_execution_result(call),
             );
         }
-        let tool = self
+        // Acquire both snapshots under the same lock order as `clear`. A
+        // reconfiguration can remove a tool while it is running, but must not
+        // tear down the filesystem/session resources that invocation uses.
+        let tools = self
             .tools
             .read()
-            .expect("agent tool registry lock poisoned")
+            .expect("agent tool registry lock poisoned");
+        let resources = self
+            .resources
+            .read()
+            .expect("agent tool registry resource lock poisoned");
+        let tool = tools
             .iter()
             .find(|tool| tool.descriptor().spec.name == call.tool)
             .cloned();
+        let _resources = resources.clone();
+        drop(resources);
+        drop(tools);
         let result = tool
             .map(|tool| {
                 tool.execute(AgentToolRequest {
@@ -521,6 +554,94 @@ mod tests {
             NodeId::from_legacy_named("agent_gateway_cancel_node").expect("node"),
             InteractionSurface::new("agent.gateway.test", InteractionSurfaceKind::CommandLine),
         )
+    }
+
+    #[test]
+    fn retained_runtime_resource_follows_registry_lifetime() {
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let registry = AgentToolRegistry::new();
+        registry.retain_resource(Arc::new(DropProbe(Arc::clone(&dropped))));
+        let clone = registry.clone();
+        drop(registry);
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        clone.clear();
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn clearing_registry_keeps_resources_alive_for_running_tool() {
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        struct BlockingTool {
+            started: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl AgentTool for BlockingTool {
+            fn descriptor(&self) -> AgentToolDescriptor {
+                AgentToolDescriptor::new(AgentToolSpec::new(
+                    AgentToolKind::ModuleObjectRpc,
+                    "blocking_probe",
+                    "test runtime-resource lifetime",
+                    false,
+                ))
+            }
+
+            fn execute(&self, _request: AgentToolRequest<'_>) -> AgentToolResult {
+                self.started.send(()).expect("signal started");
+                self.release
+                    .lock()
+                    .expect("release lock")
+                    .recv()
+                    .expect("release tool");
+                AgentToolResult::succeeded("finished", serde_json::json!({}))
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let registry = AgentToolRegistry::new();
+        registry.retain_resource(Arc::new(DropProbe(Arc::clone(&dropped))));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        registry.register(BlockingTool {
+            started: started_tx,
+            release: Mutex::new(release_rx),
+        });
+        let executing_registry = registry.clone();
+        let execution = std::thread::spawn(move || {
+            executing_registry.execute(
+                &test_session(),
+                0,
+                0,
+                &AgentToolCall {
+                    call_id: None,
+                    tool: "blocking_probe".to_string(),
+                    input: serde_json::json!({}),
+                    r#async: false,
+                    summary: "block".to_string(),
+                },
+            )
+        });
+        started_rx.recv().expect("tool started");
+
+        registry.clear();
+        assert!(!dropped.load(Ordering::SeqCst));
+        release_tx.send(()).expect("release tool");
+        execution.join().expect("tool join");
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[test]

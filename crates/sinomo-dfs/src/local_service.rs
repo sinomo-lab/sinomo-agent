@@ -226,6 +226,7 @@ impl<T: DfsMessageTransport> LocalOwnedDfsService<T> {
                 | DfsNetworkMessage::FetchBlob(_)
                 | DfsNetworkMessage::FetchBlobResponse(_)
                 | DfsNetworkMessage::DistributedWriteRequest(_)
+                | DfsNetworkMessage::ExclusiveCreateRequest(_)
                 | DfsNetworkMessage::DistributedWriteResponse(_)
                 | DfsNetworkMessage::NamespaceRequest(_)
                 | DfsNetworkMessage::NamespaceResponse(_)

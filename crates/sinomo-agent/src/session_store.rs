@@ -794,6 +794,15 @@ impl AgentSessionStore for FileAgentSessionStore {
                 schema_version: snapshot.schema_version,
             });
         }
+        if &snapshot.session.session_id != session_id {
+            return Err(AgentSessionStoreError::Deserialization {
+                path: path.display().to_string(),
+                detail: format!(
+                    "snapshot session id `{}` does not match requested session id `{session_id}`",
+                    snapshot.session.session_id
+                ),
+            });
+        }
         Ok(Some(snapshot.session))
     }
 
@@ -909,6 +918,37 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::Duration;
+
+    #[test]
+    fn file_session_store_rejects_snapshot_under_the_wrong_session_path() {
+        let data_root = sinomo_testdir::TestDir::new("sinomo-agent-session-id-mismatch");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let store = FileAgentSessionStore::for_data_dir(&data_dir);
+        let stored_id = SessionId::from_legacy_named("sess_stored_identity").expect("session");
+        let requested_id =
+            SessionId::from_legacy_named("sess_requested_identity").expect("session");
+        store
+            .save_session(&AgentSession::new(stored_id.clone(), AgentRole::Main))
+            .expect("save source snapshot");
+        let stored_path = store.paths.session_snapshot_path_for_session(&stored_id);
+        let requested_path = store.paths.session_snapshot_path_for_session(&requested_id);
+        fs::create_dir_all(
+            requested_path
+                .parent()
+                .expect("requested session directory"),
+        )
+        .expect("create requested session directory");
+        fs::copy(stored_path, requested_path).expect("place snapshot under wrong session path");
+
+        let error = store
+            .load_session(&requested_id)
+            .expect_err("mismatched embedded session id must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match requested session id")
+        );
+    }
 
     #[test]
     fn file_session_store_live_streams_appended_records_for_matching_session() {
