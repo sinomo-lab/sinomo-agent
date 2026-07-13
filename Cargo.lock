@@ -8277,7 +8277,6 @@ dependencies = [
  "sinomo-registry",
  "sinomo-rollout",
  "sinomo-sandbox",
- "sinomo-sandbox-wasix-host",
  "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
@@ -8380,6 +8379,7 @@ name = "sinomo-events"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "fs2",
  "serde",
  "serde_json",
  "sinomo-base",
@@ -8717,7 +8717,9 @@ name = "sinomo-sandbox"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "fs2",
  "getrandom 0.4.3",
+ "libc",
  "serde",
  "serde_json",
  "sinomo-cli-registry",
@@ -8762,11 +8764,11 @@ name = "sinomo-sandbox-wasix-host"
 version = "0.1.0"
 dependencies = [
  "sinomo-core",
- "sinomo-dfs",
  "sinomo-module",
  "sinomo-module-api",
  "sinomo-sandbox",
  "sinomo-sandbox-wasix-api",
+ "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
  "wat",

@@ -191,6 +191,20 @@ impl LocalSandboxBackend {
             None => Ok(self),
         }
     }
+
+    fn settle_local_execution(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<SandboxLocalExecutionLease, SandboxBackendError> {
+        let lease = try_acquire_sandbox_local_execution_lease(&self.store, sandbox_id)?;
+        recover_sandbox_local_execution_journal_with_lease(
+            &self.store,
+            &lease,
+            sandbox_id,
+            OffsetDateTime::now_utc(),
+        )?;
+        Ok(lease)
+    }
 }
 
 /// Error for routes the local (daemonless) backend cannot serve — mediated HTTP and
@@ -207,9 +221,13 @@ impl SandboxBackend for LocalSandboxBackend {
         request: SandboxCreateInstanceRequest,
     ) -> Result<SandboxCreateInstanceResponse, SandboxBackendError> {
         let sandbox_id = request.sandbox_id.unwrap_or_else(SandboxId::generate);
-        let (mut manifest, _layout) =
-            self.store
-                .create(sandbox_id, request.toolchain_id, OffsetDateTime::now_utc())?;
+        let lease = try_acquire_sandbox_local_execution_lease(&self.store, &sandbox_id)?;
+        let (mut manifest, _layout) = self.store.create_under_local_execution_lease(
+            &lease,
+            sandbox_id,
+            request.toolchain_id,
+            OffsetDateTime::now_utc(),
+        )?;
         manifest.temp_policy = request.temp_policy;
         if let Some(memory_mb) = request.memory_mb {
             manifest.limits.memory_mb = memory_mb;
@@ -241,6 +259,7 @@ impl SandboxBackend for LocalSandboxBackend {
         &mut self,
         request: SandboxStatusRequest,
     ) -> Result<SandboxStatusResponse, SandboxBackendError> {
+        let _lease = self.settle_local_execution(&request.sandbox_id)?;
         let (manifest, _layout) = self.store.load(&request.sandbox_id)?;
         Ok(SandboxStatusResponse { manifest })
     }
@@ -249,6 +268,7 @@ impl SandboxBackend for LocalSandboxBackend {
         &mut self,
         request: SandboxUpdateInstanceRequest,
     ) -> Result<SandboxUpdateInstanceResponse, SandboxBackendError> {
+        let _lease = self.settle_local_execution(&request.sandbox_id)?;
         let (mut manifest, layout) = self.store.load(&request.sandbox_id)?;
         for key in request.env_set.keys().chain(request.env_unset.iter()) {
             if !sandbox_env_name_is_valid(key) {
@@ -275,6 +295,9 @@ impl SandboxBackend for LocalSandboxBackend {
             manifest.env.remove(&key);
         }
         manifest.env.extend(request.env_set);
+        manifest
+            .advance_generation()
+            .map_err(SandboxStoreError::from)?;
         manifest.updated_at = OffsetDateTime::now_utc();
         self.store.save_manifest(&manifest)?;
         Ok(SandboxUpdateInstanceResponse { manifest })
@@ -284,6 +307,7 @@ impl SandboxBackend for LocalSandboxBackend {
         &mut self,
         request: SandboxCheckpointRequest,
     ) -> Result<SandboxCheckpointResponse, SandboxBackendError> {
+        let _lease = self.settle_local_execution(&request.sandbox_id)?;
         let checkpoint = self
             .store
             .create_checkpoint(&request.sandbox_id, OffsetDateTime::now_utc())?;
@@ -294,6 +318,7 @@ impl SandboxBackend for LocalSandboxBackend {
         &mut self,
         request: SandboxResumeRequest,
     ) -> Result<SandboxResumeResponse, SandboxBackendError> {
+        let _lease = self.settle_local_execution(&request.sandbox_id)?;
         let (manifest, _layout) = self.store.resume_checkpoint(
             &request.sandbox_id,
             &request.checkpoint_id,
@@ -306,6 +331,7 @@ impl SandboxBackend for LocalSandboxBackend {
         &mut self,
         request: SandboxRebootRequest,
     ) -> Result<SandboxRebootResponse, SandboxBackendError> {
+        let _lease = self.settle_local_execution(&request.sandbox_id)?;
         let (manifest, _layout, cleared_tmp) = self
             .store
             .reboot_session(&request.sandbox_id, OffsetDateTime::now_utc())?;
@@ -319,7 +345,9 @@ impl SandboxBackend for LocalSandboxBackend {
         &mut self,
         request: SandboxDestroyRequest,
     ) -> Result<SandboxDestroyResponse, SandboxBackendError> {
-        self.store.destroy(&request.sandbox_id)?;
+        let _lease = self.settle_local_execution(&request.sandbox_id)?;
+        self.store
+            .destroy_under_local_execution_lease(&_lease, &request.sandbox_id)?;
         Ok(SandboxDestroyResponse {
             sandbox_id: request.sandbox_id,
         })
@@ -329,6 +357,7 @@ impl SandboxBackend for LocalSandboxBackend {
         &mut self,
         request: SandboxListRequest,
     ) -> Result<SandboxListResponse, SandboxBackendError> {
+        let _lease = self.settle_local_execution(&request.sandbox_id)?;
         let (_manifest, layout) = self.store.load(&request.sandbox_id)?;
         let fs = LocalSandboxFileSystem::new(layout);
         let entries = fs.list(&request.path)?;
@@ -339,6 +368,7 @@ impl SandboxBackend for LocalSandboxBackend {
         &mut self,
         request: SandboxReadRequest,
     ) -> Result<SandboxReadResponse, SandboxBackendError> {
+        let _lease = self.settle_local_execution(&request.sandbox_id)?;
         let (_manifest, layout) = self.store.load(&request.sandbox_id)?;
         let fs = LocalSandboxFileSystem::new(layout);
         let bytes = fs.read(&request.path, request.range)?;
@@ -349,7 +379,8 @@ impl SandboxBackend for LocalSandboxBackend {
         &mut self,
         request: SandboxWriteRequest,
     ) -> Result<SandboxWriteResponse, SandboxBackendError> {
-        let (manifest, layout) = self.store.load(&request.sandbox_id)?;
+        let _lease = self.settle_local_execution(&request.sandbox_id)?;
+        let (mut manifest, layout) = self.store.load(&request.sandbox_id)?;
         let mut fs = LocalSandboxFileSystem::new(layout);
         validate_sandbox_write_resource_limits(
             &fs,
@@ -358,6 +389,11 @@ impl SandboxBackend for LocalSandboxBackend {
             &manifest.limits,
         )?;
         fs.write(&request.path, &request.bytes)?;
+        manifest
+            .advance_generation()
+            .map_err(SandboxStoreError::from)?;
+        manifest.updated_at = OffsetDateTime::now_utc();
+        self.store.save_manifest(&manifest)?;
         let bytes_written = request.bytes.len() as u64;
         Ok(SandboxWriteResponse {
             path: request.path,
@@ -476,6 +512,34 @@ mod tests {
     use super::{LocalSandboxBackend, SandboxBackend};
     use crate::internal::*;
 
+    fn seed_guest_active_local_journal(
+        store: &LocalSandboxInstanceStore,
+        sandbox_id: &SandboxId,
+        path: &SandboxPath,
+        partial_bytes: &[u8],
+    ) -> SandboxLocalExecutionLease {
+        let (manifest, layout) = store.load(sandbox_id).expect("load sandbox");
+        let lease = try_acquire_sandbox_local_execution_lease(store, sandbox_id)
+            .expect("acquire execution lease");
+        let mut journal = begin_sandbox_local_execution_journal(
+            store,
+            &lease,
+            &manifest,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("begin local journal");
+        activate_sandbox_local_execution_journal(
+            store,
+            &lease,
+            &mut journal,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("activate local journal");
+        let mut fs = LocalSandboxFileSystem::new(layout);
+        fs.write(path, partial_bytes).expect("write partial effect");
+        lease
+    }
+
     /// Full daemonless round trip: create a sandbox on the local filesystem store, write a
     /// file, read it back, see it in a directory listing, then destroy the instance — all
     /// with no cluster and no daemon.
@@ -545,5 +609,237 @@ mod tests {
             backend.status(SandboxStatusRequest { sandbox_id }).is_err(),
             "status should fail after destroy"
         );
+    }
+
+    #[test]
+    fn local_backend_settles_guest_active_marker_before_read_write_and_status() {
+        let root = sinomo_testdir::TestDir::new("sinomo-local-backend-journal-fence");
+        let store = LocalSandboxInstanceStore::new(root.join("runtime"));
+        let mut backend = LocalSandboxBackend::with_store(store.clone());
+        let created = backend
+            .create(SandboxCreateInstanceRequest {
+                sandbox_id: None,
+                toolchain_id: SandboxToolchainId::from_legacy_named("txn_toolchain")
+                    .expect("toolchain"),
+                temp_policy: SandboxTempPolicy::RetainAcrossSessions,
+                memory_mb: None,
+                wall_time_ms: None,
+                max_input_bytes: None,
+                max_output_bytes: None,
+                max_workspace_bytes: None,
+                max_written_bytes_per_command: None,
+                max_file_count: None,
+                mounts: Vec::new(),
+            })
+            .expect("create sandbox");
+        let sandbox_id = created.manifest.sandbox_id;
+        let path = SandboxPath::new("/work/state.txt").expect("path");
+        backend
+            .write(SandboxWriteRequest {
+                sandbox_id: sandbox_id.clone(),
+                path: path.clone(),
+                bytes: b"baseline".to_vec(),
+            })
+            .expect("write baseline");
+
+        seed_guest_active_local_journal(&store, &sandbox_id, &path, b"partial-read");
+        assert_eq!(
+            backend
+                .read(SandboxReadRequest {
+                    sandbox_id: sandbox_id.clone(),
+                    path: path.clone(),
+                    range: None,
+                })
+                .expect("read settles journal")
+                .bytes,
+            b"partial-read"
+        );
+
+        seed_guest_active_local_journal(&store, &sandbox_id, &path, b"partial-write");
+        backend
+            .write(SandboxWriteRequest {
+                sandbox_id: sandbox_id.clone(),
+                path: path.clone(),
+                bytes: b"committed-write".to_vec(),
+            })
+            .expect("write settles journal first");
+
+        seed_guest_active_local_journal(&store, &sandbox_id, &path, b"partial-status");
+        backend
+            .status(SandboxStatusRequest {
+                sandbox_id: sandbox_id.clone(),
+            })
+            .expect("status settles journal");
+        assert_eq!(
+            backend
+                .read(SandboxReadRequest {
+                    sandbox_id,
+                    path,
+                    range: None,
+                })
+                .expect("read committed state")
+                .bytes,
+            b"partial-status"
+        );
+    }
+
+    #[test]
+    fn local_backend_surfaces_busy_without_rolling_back_a_live_guest() {
+        let root = sinomo_testdir::TestDir::new("sinomo-local-backend-live-journal");
+        let store = LocalSandboxInstanceStore::new(root.join("runtime"));
+        let mut backend = LocalSandboxBackend::with_store(store.clone());
+        let created = backend
+            .create(SandboxCreateInstanceRequest {
+                sandbox_id: None,
+                toolchain_id: SandboxToolchainId::from_legacy_named("live_txn_toolchain")
+                    .expect("toolchain"),
+                temp_policy: SandboxTempPolicy::RetainAcrossSessions,
+                memory_mb: None,
+                wall_time_ms: None,
+                max_input_bytes: None,
+                max_output_bytes: None,
+                max_workspace_bytes: None,
+                max_written_bytes_per_command: None,
+                max_file_count: None,
+                mounts: Vec::new(),
+            })
+            .expect("create sandbox");
+        let sandbox_id = created.manifest.sandbox_id;
+        let path = SandboxPath::new("/work/live.txt").expect("path");
+        backend
+            .write(SandboxWriteRequest {
+                sandbox_id: sandbox_id.clone(),
+                path: path.clone(),
+                bytes: b"baseline".to_vec(),
+            })
+            .expect("write baseline");
+
+        let live_lease =
+            seed_guest_active_local_journal(&store, &sandbox_id, &path, b"live-effect");
+        for error in [
+            backend
+                .status(SandboxStatusRequest {
+                    sandbox_id: sandbox_id.clone(),
+                })
+                .expect_err("status must not recover a live guest"),
+            backend
+                .read(SandboxReadRequest {
+                    sandbox_id: sandbox_id.clone(),
+                    path: path.clone(),
+                    range: None,
+                })
+                .expect_err("read must not recover a live guest"),
+        ] {
+            assert!(
+                error.to_string().contains("active local execution owner"),
+                "unexpected busy error: {error}"
+            );
+        }
+        let raw_fs = LocalSandboxFileSystem::new(store.layout(&sandbox_id));
+        assert_eq!(
+            raw_fs.read(&path, None).expect("read live state directly"),
+            b"live-effect",
+            "observer must not roll back a live owner"
+        );
+
+        drop(live_lease);
+        backend
+            .status(SandboxStatusRequest {
+                sandbox_id: sandbox_id.clone(),
+            })
+            .expect("status recovers after owner disappears");
+        assert_eq!(
+            backend
+                .read(SandboxReadRequest {
+                    sandbox_id,
+                    path,
+                    range: None,
+                })
+                .expect("read preserved guest state")
+                .bytes,
+            b"live-effect"
+        );
+    }
+
+    #[test]
+    fn persistent_lock_anchor_fences_destroy_and_explicit_id_recreate() {
+        let root = sinomo_testdir::TestDir::new("sinomo-local-backend-destroy-recreate-lock");
+        let store = LocalSandboxInstanceStore::new(root.join("runtime"));
+        let mut first_backend = LocalSandboxBackend::with_store(store.clone());
+        let mut second_backend = LocalSandboxBackend::with_store(store.clone());
+        let sandbox_id = SandboxId::from_legacy_named("destroy_recreate_lock").expect("sandbox");
+        first_backend
+            .create(SandboxCreateInstanceRequest {
+                sandbox_id: Some(sandbox_id.clone()),
+                toolchain_id: SandboxToolchainId::from_legacy_named("lock_toolchain")
+                    .expect("toolchain"),
+                temp_policy: SandboxTempPolicy::RetainAcrossSessions,
+                memory_mb: None,
+                wall_time_ms: None,
+                max_input_bytes: None,
+                max_output_bytes: None,
+                max_workspace_bytes: None,
+                max_written_bytes_per_command: None,
+                max_file_count: None,
+                mounts: Vec::new(),
+            })
+            .expect("create sandbox");
+        let live_lease =
+            try_acquire_sandbox_local_execution_lease(&store, &sandbox_id).expect("live lease");
+
+        let destroy_error = second_backend
+            .destroy(SandboxDestroyRequest {
+                sandbox_id: sandbox_id.clone(),
+            })
+            .expect_err("destroy must be fenced by the persistent anchor");
+        assert!(
+            destroy_error
+                .to_string()
+                .contains("active local execution owner")
+        );
+        let create_error = second_backend
+            .create(SandboxCreateInstanceRequest {
+                sandbox_id: Some(sandbox_id.clone()),
+                toolchain_id: SandboxToolchainId::from_legacy_named("lock_toolchain")
+                    .expect("toolchain"),
+                temp_policy: SandboxTempPolicy::RetainAcrossSessions,
+                memory_mb: None,
+                wall_time_ms: None,
+                max_input_bytes: None,
+                max_output_bytes: None,
+                max_workspace_bytes: None,
+                max_written_bytes_per_command: None,
+                max_file_count: None,
+                mounts: Vec::new(),
+            })
+            .expect_err("explicit-ID create must contend before inspecting the instance");
+        assert!(
+            create_error
+                .to_string()
+                .contains("active local execution owner")
+        );
+
+        drop(live_lease);
+        first_backend
+            .destroy(SandboxDestroyRequest {
+                sandbox_id: sandbox_id.clone(),
+            })
+            .expect("destroy after owner release");
+        second_backend
+            .create(SandboxCreateInstanceRequest {
+                sandbox_id: Some(sandbox_id.clone()),
+                toolchain_id: SandboxToolchainId::from_legacy_named("lock_toolchain")
+                    .expect("toolchain"),
+                temp_policy: SandboxTempPolicy::RetainAcrossSessions,
+                memory_mb: None,
+                wall_time_ms: None,
+                max_input_bytes: None,
+                max_output_bytes: None,
+                max_workspace_bytes: None,
+                max_written_bytes_per_command: None,
+                max_file_count: None,
+                mounts: Vec::new(),
+            })
+            .expect("recreate after owner release");
     }
 }

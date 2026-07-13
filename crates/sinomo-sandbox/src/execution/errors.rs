@@ -4,7 +4,9 @@ pub fn sandbox_command_record_status_for_wasi_error(
     error: &SandboxWasiError,
 ) -> SandboxCommandRecordStatus {
     match error {
-        SandboxWasiError::Cancelled => SandboxCommandRecordStatus::Cancelled,
+        SandboxWasiError::Cancelled | SandboxWasiError::CancelledCleanupFailed { .. } => {
+            SandboxCommandRecordStatus::Cancelled
+        }
         SandboxWasiError::TimedOut { .. }
         | SandboxWasiError::InputLimitExceeded { .. }
         | SandboxWasiError::MemoryLimitExceeded { .. }
@@ -41,6 +43,8 @@ pub enum SandboxWasiError {
     TimedOut { timeout_ms: u64 },
     #[error("sandbox WASI command was cancelled")]
     Cancelled,
+    #[error("sandbox WASI command was cancelled; durable local cleanup failed: {detail}")]
+    CancelledCleanupFailed { detail: String },
     #[error("sandbox WASI command exceeded memory limit of {limit} bytes")]
     MemoryLimitExceeded { limit: usize },
     #[error("sandbox WASI command exceeded input limit of {limit} bytes")]

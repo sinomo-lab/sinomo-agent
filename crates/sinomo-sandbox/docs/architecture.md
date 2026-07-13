@@ -65,7 +65,9 @@ The runtime sees a virtual Unix tree. Typical mounts include:
 
 ## Virtual Filesystem Boundary
 
-All sandbox filesystem operations should go through the virtual filesystem layer. The local host-backed filesystem is a development backend and staging implementation detail. Runtime code should not assume host paths are available or stable, because production state is expected to be SIFS-backed.
+WASIX sandbox filesystem operations go through the virtual filesystem layer. The local
+host-backed filesystem remains a development backend and must not be used as an implicit
+copy of production SIFS state.
 
 SIFS-backed WASIX execution mounts the sandbox workspace and declared SIFS mounts as virtual preopens backed directly by `SandboxFileSystem`; it must not copy SIFS state into host directories for the actual command run. Toolchain artifacts are provided through read-only virtual preopens built from the SIFS toolchain objects.
 
@@ -88,7 +90,18 @@ WASIX is the production SIFS backend. It is required for policy-visible clustere
 
 Docker/Podman is a local backend for development and compatibility workloads. It runs commands from a configured image with network disabled by default, a read-only image root, dropped Linux capabilities, and writable sandbox mounts for the standard sandbox directories. Container mode treats the requested command name as an executable inside the image; it does not use WASIX module artifacts from the sandbox toolchain store.
 
-Simple-native is a Linux-first local backend for desktop workflows that should run host binaries at native speed. It exposes the host filesystem layout as-is and uses Landlock to allow reads from common system paths and writes only to the sandbox instance directories plus explicitly configured extra paths. This backend is for preventing accidental access to unapproved resources, not for containing hostile code. It does not provide SIFS-backed cluster execution, guest path virtualization, or WASIX toolchain provenance checks.
+Simple-native is a host-command backend for workflows that need arbitrary native tools. A
+command is still admitted through the sandbox manifest, cluster policy, resource limits,
+lease, cancellation, and audit paths, but the admitted process sees the host filesystem and
+normal host command semantics. Simple-native is a permission-boundary hint, not a security
+sandbox intended to contain hostile code or prevent deliberate escape.
+
+On Linux, simple-native can project policy-approved SIFS paths from an already-mounted live
+DFS/FUSE root into the command's filesystem. The mount namespace is used only to express
+those guest paths; it deliberately keeps the host root visible and writable. There is no
+command-time copy-in or copy-back. Native programs therefore use the same POSIX filesystem
+objects as every other cluster client, and remote changes become visible according to the DFS
+filesystem's normal consistency rules.
 
 Container mode can be selected explicitly:
 
@@ -117,13 +130,22 @@ Simple-native can also be selected for local CLI execution through:
 SINOMO_SANDBOX_BACKEND=simple-native
 ```
 
-Simple-native path allowlists can be extended for local development with:
+Simple-native host-path hints can be extended when a caller needs to describe additional
+paths:
 
 ```text
 SINOMO_SANDBOX_SIMPLE_READ_PATHS=/path/one:/path/two
 SINOMO_SANDBOX_SIMPLE_WRITE_PATHS=/path/out
 SINOMO_SANDBOX_SIMPLE_EXECUTE_PATHS=/opt/tool/bin
 ```
+
+A live SIFS/FUSE root for declared mounts can be supplied with:
+
+```text
+SINOMO_SANDBOX_SIMPLE_HOST_SIFS_ROOT=/path/to/live/sifs/mount
+```
+
+This is a mount source, never a synchronization or staging directory.
 
 WASIX runtime code is split under `src/runtime/`:
 
@@ -145,6 +167,18 @@ The sandbox is intended to support normal POSIX-style coding workflows. That req
 - futex, mutex, condition variable, and TLS behavior.
 
 The implementation currently supports part of this surface. The status doc tracks the exact remaining gaps.
+
+## Synchronization And Checkpoints
+
+SIFS synchronization is continuous and independent of command or checkpoint state. WASIX
+uses the SIFS VFS directly, while simple-native uses live DFS/FUSE mount projections. A
+successful write is visible through that filesystem immediately; writes completed before a
+failure, timeout, or cancellation are not rolled back merely because the command failed.
+
+Checkpoints are explicit lifecycle artifacts for tracking and restoring work. They do not
+commit, flush, synchronize, or publish a command, and command execution must never create,
+resume, or discard one implicitly. Import/export helpers may copy trees only when explicitly
+invoked as lifecycle or migration operations; they are not an execution transport.
 
 ## Policy And Audit
 
@@ -172,7 +206,8 @@ Command records and events capture lifecycle, output chunks, final status, resou
 - `src/model.rs` defines IDs, manifests, mounts, resource limits, command records, and shared data structures.
 - `src/runtime/` contains runtime adapters and capability reporting.
 - `src/filesystem/` contains local and SIFS virtual filesystem backends plus path and usage helpers.
-- `src/store/` contains instance stores, command-record persistence, and workspace sync helpers.
+- `src/store/` contains instance stores, command-record persistence, explicit checkpoints,
+  and opt-in import/export helpers.
 - `src/execution/` contains local and SIFS staged command execution plus structured process-plan execution.
 - `src/toolchain/` contains local/SIFS toolchain stores, manifests, hash verification, package import helpers, and built-in package specs.
 - `src/policy/`, `src/events/`, and `src/http/` own policy validation, event lowering, and mediated HTTP behavior.

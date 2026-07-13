@@ -7,6 +7,7 @@ pub type SandboxToolchainId = Id;
 pub type SandboxNetworkRequestId = Id;
 
 pub const SIFS_SANDBOX_ROOT: &str = "/services/sandbox";
+pub const SIFS_SANDBOX_SHARED_ROOT: &str = "/services/sandbox-shared";
 pub const SANDBOX_POLICY_CONFIG_KEY: &str = "sandbox.policy";
 pub const SANDBOX_POLICY_CONFIG_KV_KEY: &str = "/config/sandbox/policy";
 pub const SANDBOX_STORAGE_MODULE: &str = "sinomo-sandbox";

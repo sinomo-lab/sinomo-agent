@@ -212,7 +212,6 @@ impl LocalStagedSandboxCommandRunner {
             });
         }
 
-        let rollback_checkpoint = store.create_checkpoint(sandbox_id, OffsetDateTime::now_utc())?;
         let pipe_pairs = (0..plan.steps.len() - 1)
             .map(|_| virtual_fs::Pipe::channel())
             .collect::<Vec<_>>();
@@ -293,23 +292,11 @@ impl LocalStagedSandboxCommandRunner {
         }
 
         if let Some(error) = panic_error {
-            store.resume_checkpoint(
-                sandbox_id,
-                &rollback_checkpoint.checkpoint_id,
-                OffsetDateTime::now_utc(),
-            )?;
-            let _ = store.delete_checkpoint(sandbox_id, &rollback_checkpoint.checkpoint_id);
             return Err(error.into());
         }
 
         if let Some(failed_index) = step_runs.iter().position(|step| step.result.is_err()) {
             let failed_step = step_runs.remove(failed_index);
-            store.resume_checkpoint(
-                sandbox_id,
-                &rollback_checkpoint.checkpoint_id,
-                OffsetDateTime::now_utc(),
-            )?;
-            let _ = store.delete_checkpoint(sandbox_id, &rollback_checkpoint.checkpoint_id);
             let Err(error) = failed_step.result else {
                 unreachable!("failed step selected by is_err");
             };
@@ -344,10 +331,9 @@ impl LocalStagedSandboxCommandRunner {
         for step in &step_runs {
             let limits = prepared_limit_for_step(toolchain, &manifest, &step.command_name)?;
             if let Err(error) = validate_workspace_usage(&workspace_usage, &limits) {
-                return rollback_wasix_process_plan_for_resource_error(
+                return record_wasix_process_plan_resource_error(
                     store,
                     sandbox_id,
-                    &rollback_checkpoint,
                     &layout,
                     &manifest,
                     step,
@@ -358,10 +344,9 @@ impl LocalStagedSandboxCommandRunner {
                 );
             }
             if let Err(error) = validate_written_bytes(written_bytes, &limits) {
-                return rollback_wasix_process_plan_for_resource_error(
+                return record_wasix_process_plan_resource_error(
                     store,
                     sandbox_id,
-                    &rollback_checkpoint,
                     &layout,
                     &manifest,
                     step,
@@ -373,7 +358,6 @@ impl LocalStagedSandboxCommandRunner {
             }
         }
 
-        let _ = store.delete_checkpoint(sandbox_id, &rollback_checkpoint.checkpoint_id);
         let mut step_outcomes = Vec::with_capacity(step_runs.len());
         let completed_at = OffsetDateTime::now_utc();
         let mut sandbox_fs = LocalSandboxFileSystem::new(layout);
@@ -617,22 +601,15 @@ fn sandbox_path_tail_under_mount(path: &SandboxPath, mount_path: &SandboxPath) -
 
 #[cfg(feature = "wasix-runtime")]
 #[allow(clippy::too_many_arguments)]
-fn rollback_wasix_process_plan_for_resource_error(
+fn record_wasix_process_plan_resource_error(
     store: &LocalSandboxInstanceStore,
     sandbox_id: &SandboxId,
-    rollback_checkpoint: &SandboxCheckpoint,
     layout: &LocalSandboxInstanceLayout,
     manifest: &SandboxInstanceManifest,
     step: &WasixProcessPlanStepRun,
     outcome: &SandboxLocalCommandOutcome,
     error: SandboxFsError,
 ) -> Result<Option<SandboxProcessPlanOutcome>, SandboxCommandExecutionError> {
-    store.resume_checkpoint(
-        sandbox_id,
-        &rollback_checkpoint.checkpoint_id,
-        OffsetDateTime::now_utc(),
-    )?;
-    let _ = store.delete_checkpoint(sandbox_id, &rollback_checkpoint.checkpoint_id);
     let completed_at = OffsetDateTime::now_utc();
     let mut sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
     persist_command_record(

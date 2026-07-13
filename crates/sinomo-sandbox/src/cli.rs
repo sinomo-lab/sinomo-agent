@@ -7719,7 +7719,11 @@ fn print_sandbox_command_record_summary(record: &crate::SandboxCommandRecord) {
         println!("exit status: {}", response.exit_status);
         println!("stdout: {}", response.stdout_ref);
         println!("stderr: {}", response.stderr_ref);
-        println!("written bytes: {}", response.resource_usage.written_bytes);
+        if response.resource_usage.written_bytes == crate::SANDBOX_RESOURCE_USAGE_UNAVAILABLE {
+            println!("written bytes: unavailable (host writes are not fully observable)");
+        } else {
+            println!("written bytes: {}", response.resource_usage.written_bytes);
+        }
         if !response.changed_paths.is_empty() {
             println!("changed paths:");
             for path in &response.changed_paths {

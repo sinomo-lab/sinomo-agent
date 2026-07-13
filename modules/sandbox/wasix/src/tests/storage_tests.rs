@@ -2,6 +2,249 @@ use super::*;
 use std::sync::{Arc, Mutex};
 
 #[test]
+fn sifs_create_publishes_complete_generation_behind_stable_symlink_and_external_fence() {
+    let runtime_root = unique_test_dir("sinomo-sandbox-generation-layout");
+    let network = InProcessNetwork::new();
+    let node_id = NodeId::from_legacy_named("node_generation_layout").expect("node");
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(node_id),
+        LocalContentStore::new(runtime_root.join("content")).expect("content"),
+    );
+    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let sandbox_id = SandboxId::from_legacy_named("sandbox_generation_layout").expect("sandbox");
+    let mut store = SifsSandboxInstanceStore::new(dfs);
+    let candidate = SandboxInstanceManifest::new(
+        sandbox_id.clone(),
+        SandboxToolchainId::from_legacy_named("toolchain_busybox").expect("toolchain"),
+        OffsetDateTime::now_utc(),
+    )
+    .expect("candidate");
+    let pending = store
+        .create_manifest(&candidate)
+        .expect("create transaction");
+    let transaction_id = pending
+        .pending_reconciliation
+        .as_ref()
+        .expect("create fence")
+        .transaction_id
+        .clone();
+    let stable = sandbox_instance_root(&sandbox_id);
+    assert_eq!(
+        store
+            .dfs
+            .posix_lstat_distributed(&stable)
+            .expect("stable link")
+            .kind,
+        sinomo_dfs::DfsObjectKind::Symlink
+    );
+    let target = store
+        .dfs
+        .posix_readlink_distributed(&stable)
+        .expect("generation target");
+    for name in ["root", "home", "tmp", "work", "var", "logs", "artifacts"] {
+        assert_eq!(
+            store
+                .dfs
+                .posix_stat_distributed(&format!("{target}/{name}"))
+                .expect("complete generation directory")
+                .kind,
+            sinomo_dfs::DfsObjectKind::Directory
+        );
+    }
+    assert!(matches!(
+        store.load(&sandbox_id),
+        Err(SandboxStoreError::ReconciliationPending { .. })
+    ));
+    store
+        .clear_reconciliation_transaction(&sandbox_id, &transaction_id, OffsetDateTime::now_utc())
+        .expect("clear after durable audit");
+    assert_eq!(
+        store.load(&sandbox_id).expect("load").workspace_root,
+        stable
+    );
+    fs::remove_dir_all(runtime_root).ok();
+}
+
+#[test]
+fn destroy_finalization_stops_on_lease_loss_and_cannot_walk_a_recreated_control_root() {
+    let runtime_root = unique_test_dir("sinomo-sandbox-destroy-finalize-fence");
+    let network = InProcessNetwork::new();
+    let node_id = NodeId::from_legacy_named("node_destroy_finalize_fence").expect("node");
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(node_id.clone()),
+        LocalContentStore::new(runtime_root.join("content")).expect("content"),
+    );
+    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let sandbox_id =
+        SandboxId::from_legacy_named("sandbox_destroy_finalize_fence").expect("sandbox");
+    let toolchain = SandboxToolchainId::from_legacy_named("toolchain_busybox").expect("toolchain");
+    let mut store = SifsSandboxInstanceStore::new(dfs);
+    store
+        .create(
+            sandbox_id.clone(),
+            toolchain.clone(),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .expect("create");
+    let checkpoint_tree = format!("{}/checkpoints/deep/a/b", sandbox_control_root(&sandbox_id));
+    store
+        .dfs
+        .posix_mkdir_all(&checkpoint_tree)
+        .expect("checkpoint tree");
+    store
+        .dfs
+        .posix_write_file(
+            &format!("{checkpoint_tree}/state"),
+            b"checkpoint",
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("checkpoint state");
+
+    let destroying = store
+        .prepare_destroy(&sandbox_id, OffsetDateTime::now_utc())
+        .expect("prepare destroy");
+    let destroy_txn = destroying
+        .pending_reconciliation
+        .as_ref()
+        .expect("destroy transaction")
+        .transaction_id
+        .clone();
+    store
+        .apply_destroy(&sandbox_id, &destroy_txn)
+        .expect("remove incarnation generation");
+    let mut checkpoints = 0usize;
+    let interrupted = store.finalize_destroy_with_checkpoints(&sandbox_id, &destroy_txn, || {
+        checkpoints += 1;
+        if checkpoints == 3 {
+            return Err(SandboxStoreError::Io {
+                path: sandbox_control_root(&sandbox_id),
+                detail: "test lease lost".to_string(),
+            });
+        }
+        Ok(())
+    });
+    assert!(interrupted.is_err(), "lease loss must stop finalization");
+    assert!(matches!(
+        store.load(&sandbox_id),
+        Err(SandboxStoreError::ReconciliationPending { .. })
+    ));
+
+    store
+        .finalize_destroy(&sandbox_id, &destroy_txn)
+        .expect("new lease resumes exact destroy");
+    let recreated = store
+        .create(sandbox_id.clone(), toolchain, OffsetDateTime::now_utc())
+        .expect("same id can be recreated after finalization");
+    assert!(matches!(
+        store.finalize_destroy(&sandbox_id, &destroy_txn),
+        Err(SandboxStoreError::ReconciliationPending { .. })
+    ));
+    assert!(
+        store
+            .dfs
+            .posix_lstat_distributed(&sandbox_instance_root(&sandbox_id))
+            .is_ok()
+    );
+    assert!(recreated.pending_reconciliation.is_some());
+    fs::remove_dir_all(runtime_root).ok();
+}
+
+#[test]
+fn legacy_directory_migration_preserves_checkpoint_resume_and_stable_refs() {
+    let runtime_root = unique_test_dir("sinomo-sandbox-legacy-layout");
+    let network = InProcessNetwork::new();
+    let node_id = NodeId::from_legacy_named("node_legacy_layout").expect("node");
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(node_id.clone()),
+        LocalContentStore::new(runtime_root.join("content")).expect("content"),
+    );
+    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let sandbox_id = SandboxId::from_legacy_named("sandbox_legacy_layout").expect("sandbox");
+    let checkpoint_id = SandboxCheckpointId::from_legacy_named("legacy_checkpoint").expect("cp");
+    let stable = sandbox_instance_root(&sandbox_id);
+    let mut legacy = SandboxInstanceManifest::new(
+        sandbox_id.clone(),
+        SandboxToolchainId::from_legacy_named("toolchain_busybox").expect("toolchain"),
+        OffsetDateTime::UNIX_EPOCH,
+    )
+    .expect("legacy manifest");
+    legacy.incarnation_id = None;
+    let options = DfsWriteOptions::replicated_eventual(vec![node_id]);
+    for name in ["root", "home", "tmp/0", "work", "var", "logs", "artifacts"] {
+        dfs.posix_mkdir_all(&format!("{stable}/{name}"))
+            .expect("legacy directory");
+    }
+    dfs.posix_write_file(
+        &format!("{stable}/work/value.txt"),
+        b"newer",
+        options.clone(),
+    )
+    .expect("legacy workspace");
+    let checkpoint_root = format!("{stable}/checkpoints/{checkpoint_id}");
+    for name in ["root", "home", "tmp/0", "work", "var", "logs", "artifacts"] {
+        dfs.posix_mkdir_all(&format!("{checkpoint_root}/{name}"))
+            .expect("checkpoint directory");
+    }
+    dfs.posix_write_file(
+        &format!("{checkpoint_root}/work/value.txt"),
+        b"checkpoint",
+        options.clone(),
+    )
+    .expect("checkpoint data");
+    let manifest_bytes = encode_sandbox_instance_manifest(&legacy).expect("manifest bytes");
+    dfs.posix_write_file(
+        &format!("{stable}/manifest.sobj"),
+        &manifest_bytes,
+        options.clone(),
+    )
+    .expect("legacy manifest");
+    dfs.posix_write_file(
+        &format!("{checkpoint_root}/manifest.sobj"),
+        &manifest_bytes,
+        options,
+    )
+    .expect("checkpoint manifest");
+
+    let mut store = SifsSandboxInstanceStore::new(dfs);
+    assert!(matches!(
+        store.load(&sandbox_id),
+        Err(SandboxStoreError::LegacyLayout { .. })
+    ));
+    let migrated = store
+        .migrate_legacy_instance(&sandbox_id, OffsetDateTime::now_utc())
+        .expect("migrate legacy layout");
+    let migration_txn = migrated
+        .pending_reconciliation
+        .as_ref()
+        .expect("migration fence")
+        .transaction_id
+        .clone();
+    store
+        .clear_reconciliation_transaction(&sandbox_id, &migration_txn, OffsetDateTime::now_utc())
+        .expect("clear migration fence");
+    let resumed = store
+        .resume_checkpoint(&sandbox_id, &checkpoint_id, OffsetDateTime::now_utc())
+        .expect("resume migrated checkpoint");
+    let resume_txn = resumed
+        .pending_reconciliation
+        .as_ref()
+        .expect("resume fence")
+        .transaction_id
+        .clone();
+    store
+        .clear_reconciliation_transaction(&sandbox_id, &resume_txn, OffsetDateTime::now_utc())
+        .expect("clear resume fence");
+    assert_eq!(
+        store
+            .dfs
+            .posix_read_file_distributed(&format!("{stable}/work/value.txt"))
+            .expect("stable resumed file"),
+        b"checkpoint"
+    );
+    fs::remove_dir_all(runtime_root).ok();
+}
+
+#[test]
 fn command_outputs_persist_through_local_sandbox_filesystem() {
     let (_manifest, layout, runtime_root) = create_test_instance("sandbox_command_outputs_local");
     let mut sandbox_fs = LocalSandboxFileSystem::new(layout);
@@ -315,12 +558,13 @@ fn command_record_events_fetch_remote_sifs_log_content() {
     let mut reader_fs = SifsSandboxFileSystem::new(reader_dfs, &manifest);
     let mut event_store = sinomo_core::events::InMemoryEventStore::new();
 
+    let stop_owner = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let owner_worker = {
         let owner_dfs = Arc::clone(&owner_dfs);
+        let stop_owner = Arc::clone(&stop_owner);
         std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let mut served = 0usize;
-            loop {
+            while !stop_owner.load(std::sync::atomic::Ordering::SeqCst) {
                 let events = owner_dfs
                     .lock()
                     .expect("owner dfs lock")
@@ -335,23 +579,22 @@ fn command_record_events_fetch_remote_sifs_log_content() {
                         )
                     })
                     .count();
-                if served >= 2 {
-                    return served;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "owner did not receive remote log read requests"
-                );
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
+            served
         })
     };
 
     let receipts =
-        append_sandbox_command_record_events(&mut reader_fs, reader.clone(), &mut event_store)
-            .expect("append events");
+        append_sandbox_command_record_events(&mut reader_fs, reader.clone(), &mut event_store);
+    stop_owner.store(true, std::sync::atomic::Ordering::SeqCst);
+    let served = owner_worker.join().expect("owner worker");
+    let receipts = receipts.expect("append events");
 
-    assert_eq!(owner_worker.join().expect("owner worker"), 2);
+    assert!(
+        served >= 2,
+        "expected remote log content reads, got {served}"
+    );
     assert_eq!(receipts.len(), 3);
     let events = event_store
         .replay(sinomo_core::events::ReplayQuery::by_kind_prefix(
@@ -536,35 +779,38 @@ fn sandbox_workspace_sync_fetches_remote_sifs_source_content() {
         create_test_instance("sandbox_sync_sifs_remote_to_local_staged");
     let mut local_fs = LocalSandboxFileSystem::new(local_layout);
 
+    let stop_owner = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let owner_worker = {
         let owner_dfs = Arc::clone(&owner_dfs);
+        let stop_owner = Arc::clone(&stop_owner);
         std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
+            let mut served = 0_usize;
+            while !stop_owner.load(std::sync::atomic::Ordering::SeqCst) {
                 let events = owner_dfs
                     .lock()
                     .expect("owner dfs lock")
                     .process_incoming()
                     .expect("owner serves remote sync read");
-                if events.iter().any(|event| {
-                    matches!(
-                        event,
-                        sinomo_dfs::NetworkedDfsServiceEvent::RemoteReadServed { .. }
-                    )
-                }) {
-                    return;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "owner did not receive remote sync read request"
-                );
+                served += events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            sinomo_dfs::NetworkedDfsServiceEvent::RemoteReadServed { .. }
+                        )
+                    })
+                    .count();
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
+            served
         })
     };
 
-    sync_sandbox_workspace_roots(&mut reader_fs, &mut local_fs).expect("sync");
-    owner_worker.join().expect("owner worker");
+    let sync = sync_sandbox_workspace_roots(&mut reader_fs, &mut local_fs);
+    stop_owner.store(true, std::sync::atomic::Ordering::SeqCst);
+    let served = owner_worker.join().expect("owner worker");
+    sync.expect("sync");
+    assert!(served >= 1, "expected remote workspace reads, got {served}");
     assert_eq!(
         local_fs
             .read(&SandboxPath::new("/work/src/main.rs").expect("file"), None)

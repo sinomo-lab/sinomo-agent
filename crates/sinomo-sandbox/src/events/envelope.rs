@@ -1,5 +1,15 @@
 use crate::internal::*;
 
+fn sandbox_command_event_id(
+    sandbox_id: &SandboxId,
+    command_id: &SandboxCommandId,
+    phase: &str,
+    detail: &str,
+) -> EventId {
+    let identity = format!("{sandbox_id}\0{command_id}\0{phase}\0{detail}");
+    EventId::derived("sinomo.sandbox.command-event.v1", identity.as_bytes())
+}
+
 pub fn sandbox_command_record_event(
     node_id: NodeId,
     record: &SandboxCommandRecord,
@@ -28,7 +38,7 @@ pub fn sandbox_command_record_event(
         };
 
     EventEnvelope::new(
-        EventId::generate(),
+        sandbox_command_event_id(&record.sandbox_id, &record.command_id, "terminal", ""),
         record.completed_at.unwrap_or_else(OffsetDateTime::now_utc),
         node_id,
         Source::new("sandbox.runtime").expect("valid source"),
@@ -77,7 +87,7 @@ pub fn sandbox_command_started_event(
     started_at: OffsetDateTime,
 ) -> EventEnvelope {
     EventEnvelope::new(
-        EventId::generate(),
+        sandbox_command_event_id(&manifest.sandbox_id, command_id, "started", ""),
         started_at,
         node_id,
         Source::new("sandbox.runtime").expect("valid source"),
@@ -108,7 +118,7 @@ pub fn sandbox_command_started_event_from_record(
     record: &SandboxCommandRecord,
 ) -> EventEnvelope {
     EventEnvelope::new(
-        EventId::generate(),
+        sandbox_command_event_id(&record.sandbox_id, &record.command_id, "started", ""),
         record.started_at,
         node_id,
         Source::new("sandbox.runtime").expect("valid source"),
@@ -136,8 +146,17 @@ pub fn sandbox_command_started_event_from_record(
 }
 
 pub fn sandbox_command_output_event(node_id: NodeId, chunk: &SandboxOutputChunk) -> EventEnvelope {
+    let stream = match chunk.stream {
+        SandboxOutputStream::Stdout => "stdout",
+        SandboxOutputStream::Stderr => "stderr",
+    };
     EventEnvelope::new(
-        EventId::generate(),
+        sandbox_command_event_id(
+            &chunk.sandbox_id,
+            &chunk.command_id,
+            "output",
+            &format!("{stream}:{}", chunk.offset),
+        ),
         OffsetDateTime::now_utc(),
         node_id,
         Source::new("sandbox.runtime").expect("valid source"),
@@ -195,8 +214,10 @@ fn sandbox_instance_lifecycle_event(
     if let (Some(payload), Some(extra)) = (payload.as_object_mut(), extra_payload.as_object()) {
         payload.extend(extra.clone());
     }
+    let event_id = sandbox_authoritative_mutation_event_id(manifest, kind, "")
+        .unwrap_or_else(EventId::generate);
     EventEnvelope::new(
-        EventId::generate(),
+        event_id,
         OffsetDateTime::now_utc(),
         node_id,
         Source::new("sandbox.instance").expect("valid source"),
@@ -210,6 +231,24 @@ fn sandbox_instance_lifecycle_event(
         ),
     )
     .with_payload(payload)
+}
+
+fn sandbox_authoritative_mutation_event_id(
+    manifest: &SandboxInstanceManifest,
+    kind: &str,
+    discriminator: &str,
+) -> Option<EventId> {
+    let pending = manifest.pending_reconciliation.as_ref()?;
+    let operation = serde_json::to_string(&pending.operation).ok()?;
+    Some(EventId::derived(
+        "sinomo.sandbox.authoritative-mutation-event.v2",
+        format!(
+            "{}:{}:{}:{operation}:{kind}:{discriminator}",
+            manifest.sandbox_id,
+            manifest.effective_incarnation_id(),
+            pending.transaction_id
+        ),
+    ))
 }
 
 pub fn sandbox_instance_created_event(
@@ -273,6 +312,18 @@ pub fn sandbox_instance_rebooted_event(
     )
 }
 
+pub fn sandbox_instance_migrated_event(
+    node_id: NodeId,
+    manifest: &SandboxInstanceManifest,
+) -> EventEnvelope {
+    sandbox_instance_lifecycle_event(
+        node_id,
+        "sandbox.instance.migrated",
+        manifest,
+        serde_json::json!({ "layout": "stable-symlink-generation" }),
+    )
+}
+
 pub fn sandbox_instance_checkpointed_event(
     node_id: NodeId,
     manifest: &SandboxInstanceManifest,
@@ -315,13 +366,44 @@ pub fn sandbox_instance_destroyed_event(
     }))
 }
 
+pub fn sandbox_instance_destroyed_transaction_event(
+    node_id: NodeId,
+    manifest: &SandboxInstanceManifest,
+) -> EventEnvelope {
+    EventEnvelope::new(
+        sandbox_authoritative_mutation_event_id(manifest, "sandbox.instance.destroyed", "")
+            .unwrap_or_else(EventId::generate),
+        OffsetDateTime::now_utc(),
+        node_id,
+        Source::new("sandbox.instance").expect("valid source"),
+        EventKind::new("sandbox.instance.destroyed").expect("valid event kind"),
+        Salience::new(0.72).expect("valid salience"),
+        Confidence::new(0.98).expect("valid confidence"),
+        RoutingMetadata::new(
+            RoutingScope::TrustedNetwork,
+            LatencyClass::Background,
+            PrivacyClass::Derived,
+        ),
+    )
+    .with_payload(serde_json::json!({
+        "sandbox_id": manifest.sandbox_id.to_string(),
+        "workspace_root": manifest.workspace_root,
+        "incarnation_id": manifest.effective_incarnation_id().to_string(),
+    }))
+}
+
 pub fn sandbox_mount_added_event(
     node_id: NodeId,
     manifest: &SandboxInstanceManifest,
     mount: &SandboxMount,
 ) -> EventEnvelope {
     EventEnvelope::new(
-        EventId::generate(),
+        sandbox_authoritative_mutation_event_id(
+            manifest,
+            "sandbox.mount.added",
+            mount.mount_path.as_str(),
+        )
+        .unwrap_or_else(EventId::generate),
         OffsetDateTime::now_utc(),
         node_id,
         Source::new("sandbox.mount").expect("valid source"),
@@ -378,7 +460,12 @@ pub fn sandbox_toolchain_pinned_event(
     manifest: &SandboxInstanceManifest,
 ) -> EventEnvelope {
     EventEnvelope::new(
-        EventId::generate(),
+        sandbox_authoritative_mutation_event_id(
+            manifest,
+            "sandbox.toolchain.pinned",
+            manifest.toolchain_id.as_str(),
+        )
+        .unwrap_or_else(EventId::generate),
         OffsetDateTime::now_utc(),
         node_id,
         Source::new("sandbox.toolchain").expect("valid source"),
@@ -605,4 +692,53 @@ pub fn sandbox_http_exchange_event(
         "response_bytes": record.response_bytes,
         "redacted_headers": record.redacted_headers.clone(),
     }))
+}
+
+#[cfg(test)]
+mod command_event_id_tests {
+    use super::*;
+
+    fn command_record() -> SandboxCommandRecord {
+        SandboxCommandRecord {
+            sandbox_id: SandboxId::from_legacy_named("event_id_sandbox").expect("sandbox"),
+            command_id: SandboxCommandId::from_legacy_named("event_id_command").expect("command"),
+            status: SandboxCommandRecordStatus::Cancelled,
+            workspace_root: "/services/sandbox/instances/event".to_string(),
+            toolchain_id: SandboxToolchainId::from_legacy_named("event_id_toolchain")
+                .expect("toolchain"),
+            argv: vec!["sh".to_string()],
+            cwd: SandboxPath::new("/work").expect("cwd"),
+            env: BTreeMap::new(),
+            started_at: OffsetDateTime::UNIX_EPOCH,
+            completed_at: Some(OffsetDateTime::UNIX_EPOCH),
+            response: None,
+            error: Some("cancelled".to_string()),
+        }
+    }
+
+    #[test]
+    fn command_event_ids_are_stable_across_reconciliation_replay() {
+        let record = command_record();
+        let node = NodeId::from_legacy_named("event_id_node").expect("node");
+        let first_started = sandbox_command_started_event_from_record(node.clone(), &record);
+        let second_started = sandbox_command_started_event_from_record(node.clone(), &record);
+        assert_eq!(first_started.event_id, second_started.event_id);
+
+        let first_terminal = sandbox_command_record_event(node.clone(), &record);
+        let second_terminal = sandbox_command_record_event(node.clone(), &record);
+        assert_eq!(first_terminal.event_id, second_terminal.event_id);
+
+        let chunk = SandboxOutputChunk {
+            sandbox_id: record.sandbox_id.clone(),
+            command_id: record.command_id.clone(),
+            stream: SandboxOutputStream::Stdout,
+            offset: 0,
+            bytes: b"output".to_vec(),
+        };
+        let first_output = sandbox_command_output_event(node.clone(), &chunk);
+        let second_output = sandbox_command_output_event(node, &chunk);
+        assert_eq!(first_output.event_id, second_output.event_id);
+        assert_ne!(first_started.event_id, first_terminal.event_id);
+        assert_ne!(first_started.event_id, first_output.event_id);
+    }
 }

@@ -351,11 +351,10 @@ impl SifsStagedSandboxCommandRunner {
 
         let mut command_history_id = None;
         if let Err(error) = &command {
-            restore_sandbox_filesystem_with_roots(
-                &mut *sifs_fs_guard,
-                &before_snapshot,
-                &snapshot_roots,
-            )?;
+            // Execution is already operating on the authoritative SIFS
+            // workspace.  A failed guest does not imply a filesystem rollback:
+            // writes completed before the failure remain visible through DFS and
+            // FUSE just like writes from any other POSIX process.
             let command_id = SandboxCommandId::generate();
             command_history_id = Some(command_id.clone());
             persist_command_record(
@@ -385,11 +384,6 @@ impl SifsStagedSandboxCommandRunner {
             if let Err(error) = validate_workspace_usage(&after_snapshot.usage(), &limits)
                 .and_then(|_| validate_written_bytes(written_bytes, &limits))
             {
-                restore_sandbox_filesystem_with_roots(
-                    &mut *sifs_fs_guard,
-                    &before_snapshot,
-                    &snapshot_roots,
-                )?;
                 let mut response = outcome.response.clone();
                 response.changed_paths = changed_paths;
                 response.resource_usage.written_bytes = written_bytes;
@@ -695,7 +689,6 @@ pub(super) enum SandboxFilesystemSnapshotEntry {
     },
     File {
         metadata: SandboxMetadata,
-        bytes: Vec<u8>,
     },
     Symlink {
         metadata: SandboxMetadata,
@@ -708,9 +701,9 @@ impl SandboxFilesystemSnapshot {
         let mut usage = SandboxWorkspaceUsage::default();
         for entry in self.entries.values() {
             match entry {
-                SandboxFilesystemSnapshotEntry::File { bytes, .. } => {
+                SandboxFilesystemSnapshotEntry::File { metadata } => {
                     usage.file_count = usage.file_count.saturating_add(1);
-                    usage.total_bytes = usage.total_bytes.saturating_add(bytes.len() as u64);
+                    usage.total_bytes = usage.total_bytes.saturating_add(metadata.len);
                 }
                 SandboxFilesystemSnapshotEntry::Symlink { target, .. } => {
                     usage.file_count = usage.file_count.saturating_add(1);
@@ -745,9 +738,24 @@ impl SandboxFilesystemSnapshot {
         let mut written = 0u64;
         for (path, entry) in &self.entries {
             match entry {
-                SandboxFilesystemSnapshotEntry::File { bytes, .. } => {
-                    if before.entries.get(path) != Some(entry) {
-                        written = written.saturating_add(bytes.len() as u64);
+                SandboxFilesystemSnapshotEntry::File { metadata } => {
+                    let content_changed = match before.entries.get(path) {
+                        Some(SandboxFilesystemSnapshotEntry::File { metadata: previous }) => {
+                            match (&previous.content_hash, &metadata.content_hash) {
+                                (Some(previous), Some(current)) => previous != current,
+                                _ => {
+                                    previous.len != metadata.len
+                                        || previous.modified_at_unix_nanos
+                                            != metadata.modified_at_unix_nanos
+                                        || previous.changed_at_unix_nanos
+                                            != metadata.changed_at_unix_nanos
+                                }
+                            }
+                        }
+                        _ => true,
+                    };
+                    if content_changed {
+                        written = written.saturating_add(metadata.len);
                     }
                 }
                 SandboxFilesystemSnapshotEntry::Symlink { target, .. } => {
@@ -804,157 +812,8 @@ fn collect_sandbox_filesystem_snapshot<F: SandboxFileSystem>(
     } else {
         snapshot.entries.insert(
             path.clone(),
-            SandboxFilesystemSnapshotEntry::File {
-                metadata,
-                bytes: filesystem.read_unchecked_mut(path, None)?,
-            },
+            SandboxFilesystemSnapshotEntry::File { metadata },
         );
-    }
-    Ok(())
-}
-
-pub(super) fn restore_sandbox_filesystem_with_roots<F: SandboxFileSystem>(
-    filesystem: &mut F,
-    snapshot: &SandboxFilesystemSnapshot,
-    roots: &[SandboxPath],
-) -> Result<(), SandboxFsError> {
-    let current = snapshot_sandbox_filesystem_with_roots(filesystem, roots)?;
-    let mut removed_paths = current
-        .entries
-        .iter()
-        .filter_map(|(path, current_entry)| {
-            let snapshot_entry = snapshot.entries.get(path);
-            let keep_directory = matches!(
-                current_entry,
-                SandboxFilesystemSnapshotEntry::Directory { .. }
-            ) && matches!(
-                snapshot_entry,
-                Some(SandboxFilesystemSnapshotEntry::Directory { .. })
-            );
-            (!keep_directory && snapshot_entry != Some(current_entry)).then(|| path.clone())
-        })
-        .collect::<Vec<_>>();
-    removed_paths.sort_by(|left, right| {
-        right
-            .as_str()
-            .matches('/')
-            .count()
-            .cmp(&left.as_str().matches('/').count())
-            .then_with(|| right.cmp(left))
-    });
-    for path in removed_paths {
-        match current.entries.get(&path) {
-            Some(SandboxFilesystemSnapshotEntry::Directory { .. }) => {
-                match filesystem.remove_dir(&path) {
-                    Ok(()) | Err(SandboxFsError::NotFound { .. }) => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            _ => match filesystem.unlink(&path) {
-                Ok(()) | Err(SandboxFsError::NotFound { .. }) => {}
-                Err(error) => return Err(error),
-            },
-        }
-    }
-
-    let mut desired_entries = snapshot.entries.iter().collect::<Vec<_>>();
-    desired_entries.sort_by(|(left, _), (right, _)| {
-        left.as_str()
-            .matches('/')
-            .count()
-            .cmp(&right.as_str().matches('/').count())
-            .then_with(|| left.cmp(right))
-    });
-    for (path, entry) in desired_entries {
-        if let SandboxFilesystemSnapshotEntry::Directory { .. } = entry {
-            filesystem.create_dir_all(path)?;
-        }
-    }
-
-    let mut desired_entries = snapshot.entries.iter().collect::<Vec<_>>();
-    desired_entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-    for (path, entry) in desired_entries {
-        match entry {
-            SandboxFilesystemSnapshotEntry::Directory { .. } => {}
-            SandboxFilesystemSnapshotEntry::File { bytes, .. } => {
-                filesystem.write(path, bytes)?;
-            }
-            SandboxFilesystemSnapshotEntry::Symlink { target, .. } => {
-                if let Some(parent) = snapshot_parent_path(path)? {
-                    filesystem.create_dir_all(&parent)?;
-                }
-                filesystem.symlink(target, path)?;
-            }
-        }
-    }
-    let mut hardlink_groups = BTreeMap::<String, Vec<SandboxPath>>::new();
-    for (path, entry) in &snapshot.entries {
-        let metadata = match entry {
-            SandboxFilesystemSnapshotEntry::Directory { .. } => continue,
-            SandboxFilesystemSnapshotEntry::File { metadata, .. }
-            | SandboxFilesystemSnapshotEntry::Symlink { metadata, .. } => metadata,
-        };
-        if let Some(key) = snapshot_hardlink_key(metadata) {
-            hardlink_groups.entry(key).or_default().push(path.clone());
-        }
-    }
-    for paths in hardlink_groups.values_mut() {
-        paths.sort();
-        let Some(representative) = paths.last().cloned() else {
-            continue;
-        };
-        for path in paths.iter().filter(|path| **path != representative) {
-            match filesystem.unlink(path) {
-                Ok(()) | Err(SandboxFsError::NotFound { .. }) => {}
-                Err(error) => return Err(error),
-            }
-            filesystem.hard_link(&representative, path)?;
-        }
-    }
-    for (path, entry) in &snapshot.entries {
-        match entry {
-            SandboxFilesystemSnapshotEntry::Directory { metadata }
-            | SandboxFilesystemSnapshotEntry::File { metadata, .. } => {
-                restore_sandbox_metadata(filesystem, path, metadata, false)?;
-            }
-            SandboxFilesystemSnapshotEntry::Symlink { metadata, .. } => {
-                restore_sandbox_metadata(filesystem, path, metadata, true)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn snapshot_hardlink_key(metadata: &SandboxMetadata) -> Option<String> {
-    if metadata.link_count <= 1 {
-        return None;
-    }
-    metadata
-        .object_identity
-        .clone()
-        .or_else(|| (metadata.inode != 0).then(|| format!("inode:{}", metadata.inode)))
-}
-
-fn restore_sandbox_metadata<F: SandboxFileSystem>(
-    filesystem: &mut F,
-    path: &SandboxPath,
-    metadata: &SandboxMetadata,
-    symlink: bool,
-) -> Result<(), SandboxFsError> {
-    if !symlink {
-        filesystem.set_mode(path, metadata.mode)?;
-        filesystem.set_owner(path, metadata.uid, metadata.gid)?;
-        filesystem.set_times(
-            path,
-            Some(metadata.accessed_at_unix_nanos),
-            Some(metadata.modified_at_unix_nanos),
-        )?;
-    } else {
-        filesystem.set_symlink_times(
-            path,
-            Some(metadata.accessed_at_unix_nanos),
-            Some(metadata.modified_at_unix_nanos),
-        )?;
     }
     Ok(())
 }
@@ -996,20 +855,6 @@ pub(super) fn sifs_manifest_mount_needs_wasix_system_preopen(path: &SandboxPath)
         .any(|parent| path.as_str().starts_with(&format!("{parent}/")))
 }
 
-fn snapshot_parent_path(path: &SandboxPath) -> Result<Option<SandboxPath>, SandboxFsError> {
-    let value = path.as_str();
-    if value == "/" {
-        return Ok(None);
-    }
-    let Some((parent, _name)) = value.rsplit_once('/') else {
-        return Ok(None);
-    };
-    if parent.is_empty() {
-        return Ok(Some(SandboxPath::new("/")?));
-    }
-    Ok(Some(SandboxPath::new(parent)?))
-}
-
 pub(super) fn sandbox_command_record_status_for_execution_error(
     error: &SandboxCommandExecutionError,
 ) -> SandboxCommandRecordStatus {
@@ -1035,7 +880,7 @@ mod tests {
     }
 
     #[test]
-    fn sifs_snapshot_fetches_remote_file_and_symlink_content() {
+    fn sifs_snapshot_uses_file_metadata_and_fetches_remote_symlink_target() {
         let runtime_root = unique_test_dir("sinomo-sandbox-sifs-snapshot-remote-content");
         let network = InProcessNetwork::new();
         let owner = NodeId::from_legacy_named("node_sifs_snapshot_owner").expect("owner");
@@ -1111,7 +956,7 @@ mod tests {
                             )
                         })
                         .count();
-                    if served >= 2 {
+                    if served >= 1 {
                         return served;
                     }
                     assert!(
@@ -1133,7 +978,8 @@ mod tests {
         let link = SandboxPath::new("/work/link.txt").expect("link");
         assert!(matches!(
             snapshot.entries.get(&target),
-            Some(SandboxFilesystemSnapshotEntry::File { bytes, .. }) if bytes == b"target"
+            Some(SandboxFilesystemSnapshotEntry::File { metadata })
+                if metadata.len == b"target".len() as u64 && metadata.content_hash.is_some()
         ));
         assert!(matches!(
             snapshot.entries.get(&link),

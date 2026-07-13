@@ -23,8 +23,8 @@ pub(crate) use sinomo_core::{
     RoutingMetadata, RoutingScope, Salience, Source,
 };
 pub(crate) use sinomo_dfs::{
-    DfsMessageTransport, DfsObjectId, DfsObjectKind, DfsPosixError, DfsWriteOptions,
-    NetworkedDfsService,
+    DfsMessageTransport, DfsNamespaceJobStatus, DfsObjectId, DfsObjectKind, DfsPosixError,
+    DfsWriteOptions, NetworkedDfsService,
 };
 pub(crate) use sinomo_module::ArtifactId;
 pub(crate) use std::collections::{BTreeMap, BTreeSet};

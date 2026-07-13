@@ -286,7 +286,6 @@ impl LocalStagedSandboxCommandRunner {
         sandbox_fs.validate_resource_limits(&limits)?;
         validate_sandbox_working_directory(&sandbox_fs, &effective_cwd)?;
         let before = sandbox_fs.snapshot()?;
-        let rollback_checkpoint = store.create_checkpoint(sandbox_id, OffsetDateTime::now_utc())?;
         let started_at = OffsetDateTime::now_utc();
 
         let mut wasi_options = local_staged_sandbox_wasi_options_with_limits_and_preopens(
@@ -348,12 +347,6 @@ impl LocalStagedSandboxCommandRunner {
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
-                store.resume_checkpoint(
-                    sandbox_id,
-                    &rollback_checkpoint.checkpoint_id,
-                    OffsetDateTime::now_utc(),
-                )?;
-                let _ = store.delete_checkpoint(sandbox_id, &rollback_checkpoint.checkpoint_id);
                 let command_id = SandboxCommandId::generate();
                 let completed_at = OffsetDateTime::now_utc();
                 let mut sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
@@ -381,12 +374,6 @@ impl LocalStagedSandboxCommandRunner {
 
         let after = sandbox_fs.snapshot()?;
         if let Err(error) = validate_workspace_usage(&after.workspace_usage(), &limits) {
-            store.resume_checkpoint(
-                sandbox_id,
-                &rollback_checkpoint.checkpoint_id,
-                OffsetDateTime::now_utc(),
-            )?;
-            let _ = store.delete_checkpoint(sandbox_id, &rollback_checkpoint.checkpoint_id);
             let completed_at = OffsetDateTime::now_utc();
             let mut sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
             persist_command_record(
@@ -417,12 +404,6 @@ impl LocalStagedSandboxCommandRunner {
 
         let written_bytes = after.written_bytes_since(&before);
         if let Err(error) = validate_written_bytes(written_bytes, &limits) {
-            store.resume_checkpoint(
-                sandbox_id,
-                &rollback_checkpoint.checkpoint_id,
-                OffsetDateTime::now_utc(),
-            )?;
-            let _ = store.delete_checkpoint(sandbox_id, &rollback_checkpoint.checkpoint_id);
             let mut response = outcome.response.clone();
             response.resource_usage.written_bytes = written_bytes;
             let completed_at = OffsetDateTime::now_utc();
@@ -453,7 +434,6 @@ impl LocalStagedSandboxCommandRunner {
             return Err(error.into());
         }
 
-        let _ = store.delete_checkpoint(sandbox_id, &rollback_checkpoint.checkpoint_id);
         outcome.response.changed_paths = sandbox_fs.changed_paths_since(&before)?;
         outcome.response.resource_usage.written_bytes = written_bytes;
         let completed_at = OffsetDateTime::now_utc();

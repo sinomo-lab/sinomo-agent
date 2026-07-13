@@ -246,6 +246,7 @@ impl<F: SandboxFileSystem + Send + 'static> virtual_fs::FileOpener for WasixSand
             gid: 0,
             inode: 0,
             object_identity: None,
+            content_hash: None,
             accessed_at_unix_nanos: 1_000_000_000,
             modified_at_unix_nanos: 1_000_000_000,
             created_at_unix_nanos: 1_000_000_000,

@@ -1372,7 +1372,7 @@ fn local_staged_runner_verifies_toolchain_fidelity_cases() {
 }
 
 #[test]
-fn local_staged_runner_keeps_failed_quota_write_from_persisting() {
+fn local_staged_runner_preserves_write_before_quota_failure() {
     let (mut manifest, layout, runtime_root) = create_test_instance("sandbox_staged_runner_quota");
     let store = LocalSandboxInstanceStore::new(&runtime_root);
     manifest.limits.max_written_bytes_per_command = 3;
@@ -1391,11 +1391,11 @@ fn local_staged_runner_keeps_failed_quota_write_from_persisting() {
 
     assert_ne!(outcome.response.exit_status, 0);
     let fs = LocalSandboxFileSystem::new(layout);
-    assert!(matches!(
+    assert_eq!(
         fs.read(&SandboxPath::new("/work/out.txt").expect("out"), None)
-            .expect_err("failed write should not persist"),
-        SandboxFsError::NotFound { .. }
-    ));
+            .expect("completed write remains visible"),
+        b"created"
+    );
     assert!(
         fs.list(&SandboxPath::new("/logs").expect("logs"))
             .expect("logs")
@@ -1693,7 +1693,7 @@ fn local_staged_wasix_toolchain_command_searches_pinned_bin_for_child() {
 }
 
 #[test]
-fn sifs_staged_runner_runs_locally_and_syncs_back_to_sifs() {
+fn sifs_staged_runner_executes_directly_on_sifs_and_persists_records() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-staged-runner-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-staged-runner-local");
     let network = InProcessNetwork::new();
@@ -2684,18 +2684,18 @@ fn sifs_staged_wasix_write_through_hardlink_updates_shared_sifs_object() {
 
 #[test]
 #[cfg(feature = "wasix-runtime")]
-fn sifs_staged_wasix_resource_rollback_preserves_hardlinks() {
-    let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rollback-hardlink-sifs");
-    let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rollback-hardlink-local");
+fn sifs_staged_wasix_resource_failure_preserves_live_hardlink_write() {
+    let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-resource-hardlink-sifs");
+    let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-resource-hardlink-local");
     let network = InProcessNetwork::new();
-    let node_id = NodeId::from_legacy_named("node_sifs_wasix_rollback_hardlink").expect("node");
+    let node_id = NodeId::from_legacy_named("node_sifs_wasix_resource_hardlink").expect("node");
     let mut dfs = NetworkedDfsService::new(
         network.add_node(node_id),
         LocalContentStore::new(sifs_root.join("content")).expect("content"),
     );
     dfs.bootstrap_distributed_sifs().expect("bootstrap");
     let sandbox_id =
-        SandboxId::from_legacy_named("sandbox_sifs_wasix_rollback_hardlink").expect("sandbox");
+        SandboxId::from_legacy_named("sandbox_sifs_wasix_resource_hardlink").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
     let mut manifest = sifs_store
         .create(
@@ -2750,8 +2750,8 @@ fn sifs_staged_wasix_resource_rollback_preserves_hardlinks() {
     let record =
         load_command_record(&mut sifs_fs, &manifest.command_history[0]).expect("resource record");
     assert_eq!(record.status, SandboxCommandRecordStatus::ResourceExhausted);
-    assert_eq!(sifs_fs.read(&original, None).expect("original"), b"initial");
-    assert_eq!(sifs_fs.read(&alias, None).expect("alias"), b"initial");
+    assert_eq!(sifs_fs.read(&original, None).expect("original"), b"created");
+    assert_eq!(sifs_fs.read(&alias, None).expect("alias"), b"created");
     let original_stat = sifs_fs.stat(&original).expect("original stat");
     let alias_stat = sifs_fs.stat(&alias).expect("alias stat");
     assert_eq!(original_stat.inode, alias_stat.inode);
@@ -2764,18 +2764,18 @@ fn sifs_staged_wasix_resource_rollback_preserves_hardlinks() {
 
 #[test]
 #[cfg(feature = "wasix-runtime")]
-fn sifs_staged_wasix_resource_rollback_removes_created_directories() {
-    let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rollback-dir-sifs");
-    let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rollback-dir-local");
+fn sifs_staged_wasix_resource_failure_preserves_created_directories() {
+    let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-resource-dir-sifs");
+    let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-resource-dir-local");
     let network = InProcessNetwork::new();
-    let node_id = NodeId::from_legacy_named("node_sifs_wasix_rollback_dir").expect("node");
+    let node_id = NodeId::from_legacy_named("node_sifs_wasix_resource_dir").expect("node");
     let mut dfs = NetworkedDfsService::new(
         network.add_node(node_id),
         LocalContentStore::new(sifs_root.join("content")).expect("content"),
     );
     dfs.bootstrap_distributed_sifs().expect("bootstrap");
     let sandbox_id =
-        SandboxId::from_legacy_named("sandbox_sifs_wasix_rollback_dir").expect("sandbox");
+        SandboxId::from_legacy_named("sandbox_sifs_wasix_resource_dir").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
     let mut manifest = sifs_store
         .create(
@@ -2819,10 +2819,21 @@ fn sifs_staged_wasix_resource_rollback_removes_created_directories() {
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
     let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    assert!(matches!(
-        sifs_fs.stat(&SandboxPath::new("/work/generated").expect("generated")),
-        Err(SandboxFsError::NotFound { .. })
-    ));
+    assert!(
+        sifs_fs
+            .stat(&SandboxPath::new("/work/generated").expect("generated"))
+            .expect("generated directory remains visible")
+            .is_dir
+    );
+    assert_eq!(
+        sifs_fs
+            .read(
+                &SandboxPath::new("/work/generated/out.txt").expect("generated file"),
+                None,
+            )
+            .expect("completed write remains visible"),
+        b"created"
+    );
     assert_eq!(manifest.command_history.len(), 1);
     let record =
         load_command_record(&mut sifs_fs, &manifest.command_history[0]).expect("resource record");
@@ -2834,18 +2845,18 @@ fn sifs_staged_wasix_resource_rollback_removes_created_directories() {
 
 #[test]
 #[cfg(feature = "wasix-runtime")]
-fn sifs_staged_wasix_resource_rollback_restores_file_replaced_by_directory() {
-    let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rollback-type-sifs");
-    let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rollback-type-local");
+fn sifs_staged_wasix_resource_failure_preserves_replaced_directory() {
+    let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-resource-type-sifs");
+    let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-resource-type-local");
     let network = InProcessNetwork::new();
-    let node_id = NodeId::from_legacy_named("node_sifs_wasix_rollback_type").expect("node");
+    let node_id = NodeId::from_legacy_named("node_sifs_wasix_resource_type").expect("node");
     let mut dfs = NetworkedDfsService::new(
         network.add_node(node_id),
         LocalContentStore::new(sifs_root.join("content")).expect("content"),
     );
     dfs.bootstrap_distributed_sifs().expect("bootstrap");
     let sandbox_id =
-        SandboxId::from_legacy_named("sandbox_sifs_wasix_rollback_type").expect("sandbox");
+        SandboxId::from_legacy_named("sandbox_sifs_wasix_resource_type").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
     let mut manifest = sifs_store
         .create(
@@ -2894,16 +2905,12 @@ fn sifs_staged_wasix_resource_rollback_restores_file_replaced_by_directory() {
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
     let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let restored_metadata = sifs_fs.stat(&replaced_path).expect("restored path");
-    assert!(!restored_metadata.is_dir);
+    let replaced_metadata = sifs_fs.stat(&replaced_path).expect("replaced path remains");
+    assert!(replaced_metadata.is_dir);
     assert_eq!(
-        sifs_fs.read(&replaced_path, None).expect("restored bytes"),
-        b"initial"
+        sifs_fs.read(&child_path, None).expect("replacement child"),
+        b"created"
     );
-    assert!(matches!(
-        sifs_fs.stat(&child_path),
-        Err(SandboxFsError::NotFound { .. }) | Err(SandboxFsError::NotDirectory { .. })
-    ));
     assert_eq!(manifest.command_history.len(), 1);
     let record =
         load_command_record(&mut sifs_fs, &manifest.command_history[0]).expect("resource record");
@@ -11639,7 +11646,7 @@ fn sifs_staged_runner_command_progress_resumes_from_replica_node() {
 }
 
 #[test]
-fn sifs_staged_runner_stages_rw_mounts_and_syncs_back_to_sifs() {
+fn sifs_staged_runner_writes_live_read_write_sifs_mounts() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-staged-mount-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-staged-mount-local");
     let network = InProcessNetwork::new();
@@ -11708,7 +11715,7 @@ fn sifs_staged_runner_stages_rw_mounts_and_syncs_back_to_sifs() {
 }
 
 #[test]
-fn sifs_staged_runner_rolls_back_rw_mount_write_on_resource_failure() {
+fn sifs_staged_runner_preserves_rw_mount_write_on_resource_failure() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-staged-mount-quota-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-staged-mount-quota-local");
     let network = InProcessNetwork::new();
@@ -11759,19 +11766,20 @@ fn sifs_staged_runner_rolls_back_rw_mount_write_on_resource_failure() {
             SandboxFsError::QuotaExceeded { .. }
         ))
     ));
-    assert!(matches!(
+    assert_eq!(
         outcome
             .dfs
-            .posix_stat("/services/sandbox/shared/target/out.txt"),
-        Err(DfsPosixError::NotFound { .. }) | Err(DfsPosixError::MissingParent { .. })
-    ));
+            .posix_read_file("/services/sandbox/shared/target/out.txt")
+            .expect("completed mount write remains visible"),
+        b"created"
+    );
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
 }
 
 #[test]
-fn sifs_staged_runner_replicates_rw_mount_writeback_to_candidate_node() {
+fn sifs_staged_runner_replicates_live_rw_mount_write_to_candidate_node() {
     let runtime_root = unique_test_dir("sinomo-sandbox-sifs-staged-mount-replica");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-staged-mount-replica-local");
     let network = InProcessNetwork::new();
@@ -11847,7 +11855,7 @@ fn sifs_staged_runner_replicates_rw_mount_writeback_to_candidate_node() {
 
     replica_dfs
         .process_incoming()
-        .expect("replica receives mount writeback");
+        .expect("replica receives live mount write");
     let replica_backend =
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
             .expect("replica metadata reload");

@@ -214,6 +214,7 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
             gid: 0,
             inode: sifs_inode_for_object(&format!("mount-ancestor:{path}"), 0),
             object_identity: None,
+            content_hash: None,
             accessed_at_unix_nanos: 1_000_000_000,
             modified_at_unix_nanos: 1_000_000_000,
             created_at_unix_nanos: 1_000_000_000,
@@ -274,6 +275,7 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
             gid: stat.gid,
             inode: sifs_inode_for_object(stat.object_id.as_str(), stat.created_at_unix_nanos),
             object_identity: Some(stat.object_id.as_str().to_string()),
+            content_hash: stat.content_hash,
             accessed_at_unix_nanos: stat.accessed_at_unix_nanos,
             modified_at_unix_nanos: stat.modified_at_unix_nanos,
             created_at_unix_nanos: stat.created_at_unix_nanos,
@@ -315,6 +317,19 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
     ) -> Result<Vec<u8>, SandboxFsError> {
         self.process_incoming_dfs_messages(path)?;
         let sifs_path = self.sifs_path(resolved);
+        if !update_access
+            && let Some(range) = range.as_ref()
+            && let Some(end) = range.end
+        {
+            let max_bytes = usize::try_from(end.saturating_sub(range.start)).unwrap_or(usize::MAX);
+            if max_bytes == 0 {
+                return Ok(Vec::new());
+            }
+            return self
+                .dfs
+                .posix_read_file_range_distributed(&sifs_path, range.start, max_bytes)
+                .map_err(|error| sandbox_fs_error_from_dfs(path, error));
+        }
         let bytes = self
             .read_sifs_path(&sifs_path, update_access)
             .map_err(|error| sandbox_fs_error_from_dfs(path, error))?;
@@ -793,6 +808,7 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
                         gid: 0,
                         inode: sifs_inode_for_object(&format!("mount-ancestor:{child_path}"), 0),
                         object_identity: None,
+                        content_hash: None,
                         accessed_at_unix_nanos: 1_000_000_000,
                         modified_at_unix_nanos: 1_000_000_000,
                         created_at_unix_nanos: 1_000_000_000,

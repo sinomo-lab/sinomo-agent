@@ -1,11 +1,14 @@
 use crate::internal::*;
+use sinomo_core::storage::durable_file::{DurableAtomicFileOptions, write_file_atomic};
 
 mod local;
+mod local_execution;
 mod records;
 mod sifs;
 mod sync;
 
 pub use local::*;
+pub use local_execution::*;
 pub use records::*;
 pub use sifs::*;
 pub use sync::*;
@@ -21,17 +24,16 @@ fn write_manifest(
         })?;
     }
     let bytes = encode_instance_manifest(manifest, &path.display().to_string())?;
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("manifest.sobj");
-    let temp_path = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
-    fs::write(&temp_path, bytes).map_err(|source| SandboxStoreError::Io {
-        path: temp_path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    fs::rename(&temp_path, path).map_err(|source| SandboxStoreError::Io {
+    write_file_atomic(
+        path,
+        &bytes,
+        DurableAtomicFileOptions::new(file_name, "sandbox-manifest").sync_all(),
+    )
+    .map_err(|source| SandboxStoreError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
     })
@@ -47,6 +49,14 @@ fn encode_instance_manifest(
             path: path.to_string(),
             detail: source.to_string(),
         })
+}
+
+/// Encode the canonical SOBJ representation used by local, SIFS, checkpoint,
+/// and legacy-migration manifests.
+pub fn encode_sandbox_instance_manifest(
+    manifest: &SandboxInstanceManifest,
+) -> Result<Vec<u8>, SandboxStoreError> {
+    encode_instance_manifest(manifest, "sandbox manifest")
 }
 
 fn decode_instance_manifest(
@@ -65,6 +75,12 @@ fn decode_instance_manifest(
 struct StoredSandboxInstanceManifest {
     sandbox_id: String,
     workspace_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    incarnation_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_reconciliation: Option<SandboxAuthoritativeReconciliationFence>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    generation: u64,
     toolchain_id: String,
     cwd: String,
     env: Vec<StoredEnvPair>,
@@ -316,6 +332,9 @@ impl TryFrom<&SandboxInstanceManifest> for StoredSandboxInstanceManifest {
         Ok(Self {
             sandbox_id: manifest.sandbox_id.to_string(),
             workspace_root: manifest.workspace_root.clone(),
+            incarnation_id: manifest.incarnation_id.clone(),
+            pending_reconciliation: manifest.pending_reconciliation.clone(),
+            generation: manifest.generation,
             toolchain_id: manifest.toolchain_id.to_string(),
             cwd: manifest.cwd.to_string(),
             env: manifest
@@ -365,6 +384,9 @@ impl TryFrom<StoredSandboxInstanceManifest> for SandboxInstanceManifest {
                 }
             })?,
             workspace_root: stored.workspace_root,
+            incarnation_id: stored.incarnation_id,
+            pending_reconciliation: stored.pending_reconciliation,
+            generation: stored.generation,
             toolchain_id: SandboxToolchainId::new(stored.toolchain_id).map_err(|source| {
                 SandboxStoreError::Object {
                     path: "manifest.sobj".to_string(),
@@ -432,6 +454,19 @@ pub enum SandboxStoreError {
     AlreadyExists { sandbox_id: SandboxId },
     #[error("sandbox instance not found: {sandbox_id}")]
     NotFound { sandbox_id: SandboxId },
+    #[error(
+        "sandbox {sandbox_id} is quarantined behind authoritative reconciliation transaction {transaction_id}"
+    )]
+    ReconciliationPending {
+        sandbox_id: SandboxId,
+        transaction_id: Id,
+    },
+    #[error("sandbox {sandbox_id} has an active local execution owner")]
+    LocalExecutionBusy { sandbox_id: SandboxId },
+    #[error(
+        "sandbox {sandbox_id} uses the legacy directory instance layout at {path}; migrate it under the lifecycle lease before use"
+    )]
+    LegacyLayout { sandbox_id: SandboxId, path: String },
     #[error("sandbox checkpoint not found: {sandbox_id}:{checkpoint_id}")]
     CheckpointNotFound {
         sandbox_id: SandboxId,
@@ -439,6 +474,8 @@ pub enum SandboxStoreError {
     },
     #[error("sandbox path error: {0}")]
     Path(#[from] SandboxPathError),
+    #[error(transparent)]
+    Generation(#[from] SandboxManifestGenerationError),
     #[error("sandbox store object error at {path}: {detail}")]
     Object { path: String, detail: String },
     #[error("sandbox store I/O error at {path}: {detail}")]
