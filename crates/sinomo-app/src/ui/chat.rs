@@ -38,10 +38,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -75,8 +75,9 @@ use sinomo_agent::{
 use sinomo_cli::app_api::{
     AgentChannelMessagePage, AgentChannelMessageReconciliation, AgentChannelTimelineOverview,
     AgentChannelTimelineSegment, AgentChatSifsStorage, AgentSummary, ChatAttachmentInput,
-    ChatContextSnapshot, ChatHistoryMessage, ChatProcessSnapshot, ChatQueuedTurnInput,
-    ChatQueuedTurnInputKind, ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection,
+    ChatAttachmentSource, ChatContextSnapshot, ChatHistoryMessage, ChatLocalAttachmentProvenance,
+    ChatProcessSnapshot, ChatQueuedTurnInput, ChatQueuedTurnInputKind,
+    ChatSifsAttachmentProvenance, ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection,
     ChatUsageSnapshot, ProviderSummary, SifsAgentChannelStore, agent_summaries,
     agent_summaries_with_error, built_in_agent_summaries, reasoning_efforts,
 };
@@ -87,6 +88,9 @@ use crate::backend::chat_engine::{
     ChatCommand, ChatEvent, ChatEventWake, ChatHandle, ChatRole, RuntimeInfo,
 };
 use crate::backend::sifs::SifsDaemonAccess;
+use crate::native_picker::{
+    NativePickerKind, NativePickerLane, NativePickerOutcome, NativePickerResult,
+};
 use crate::state::{Shared, Tab};
 use crate::theme::{AppTextScale, Palette};
 use crate::ui::chat_render::{
@@ -999,9 +1003,87 @@ enum ChannelAgentsStoreStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingChatAttachment {
-    path: PathBuf,
+    source: ChatAttachmentSource,
     file_name: String,
     size_bytes: u64,
+}
+
+impl PendingChatAttachment {
+    fn input(&self) -> ChatAttachmentInput {
+        ChatAttachmentInput {
+            file_name: self.file_name.clone(),
+            source: self.source.clone(),
+        }
+    }
+
+    fn has_source(&self, source: &ChatAttachmentSource) -> bool {
+        match (&self.source, source) {
+            (ChatAttachmentSource::LocalPath(left), ChatAttachmentSource::LocalPath(right)) => {
+                left == right
+            }
+            (
+                ChatAttachmentSource::LocalSnapshot {
+                    provenance: left, ..
+                },
+                ChatAttachmentSource::LocalSnapshot {
+                    provenance: right, ..
+                },
+            ) => left.source_path() == right.source_path(),
+            (
+                ChatAttachmentSource::SifsSnapshot {
+                    provenance: left, ..
+                },
+                ChatAttachmentSource::SifsSnapshot {
+                    provenance: right, ..
+                },
+            ) => left.path == right.path,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingAttachmentPicker {
+    request_id: u64,
+    session_id: String,
+    draft_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalAttachmentIngress {
+    NativePicker,
+    ManualPath,
+    OsDrop,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingLocalAttachmentValidation {
+    request_id: u64,
+    session_id: String,
+    draft_generation: u64,
+    ingress: LocalAttachmentIngress,
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LocalAttachmentValidationOutcome {
+    Ready {
+        path: PathBuf,
+        file_name: String,
+        size_bytes: u64,
+    },
+    Failed {
+        path: PathBuf,
+        detail: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalAttachmentValidationResult {
+    request_id: u64,
+    session_id: String,
+    draft_generation: u64,
+    outcomes: Vec<LocalAttachmentValidationOutcome>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1248,8 +1330,18 @@ pub struct ChatState {
     pub input: String,
     pub cursor: usize,
     draft_revision: u64,
+    attachment_draft_generation: u64,
     attachment_path_input: String,
+    attachment_manual_path_open: bool,
     attachment_controls_open: bool,
+    attachment_picker: NativePickerLane,
+    pending_attachment_picker: Option<PendingAttachmentPicker>,
+    next_attachment_validation_request_id: u64,
+    pending_attachment_validations: Vec<PendingLocalAttachmentValidation>,
+    attachment_validation_tx: Sender<LocalAttachmentValidationResult>,
+    attachment_validation_rx: Receiver<LocalAttachmentValidationResult>,
+    attachment_picker_error: Option<String>,
+    attachment_drop_hovered: bool,
     attachments: Vec<PendingChatAttachment>,
     /// Steering/follow-up messages queued into the active turn from this
     /// composer and not yet consumed by the runtime (pending chips).
@@ -1464,6 +1556,7 @@ impl ChatState {
         } else {
             list_conversations_with_error(&backend.data_dir, None)
         };
+        let (attachment_validation_tx, attachment_validation_rx) = mpsc::channel();
 
         let mut state = Self {
             data_dir: backend.data_dir.clone(),
@@ -1480,8 +1573,18 @@ impl ChatState {
             input: String::new(),
             cursor: 0,
             draft_revision: 0,
+            attachment_draft_generation: 0,
             attachment_path_input: String::new(),
+            attachment_manual_path_open: false,
             attachment_controls_open: false,
+            attachment_picker: NativePickerLane::new(),
+            pending_attachment_picker: None,
+            next_attachment_validation_request_id: 0,
+            pending_attachment_validations: Vec::new(),
+            attachment_validation_tx,
+            attachment_validation_rx,
+            attachment_picker_error: None,
+            attachment_drop_hovered: false,
             attachments: Vec::new(),
             queued_turn_inputs: Vec::new(),
             streaming: false,
@@ -1917,6 +2020,7 @@ impl ChatState {
     }
 
     pub fn pump_worker_events(&mut self) -> bool {
+        let attachment_picker_changed = self.pump_attachment_lanes();
         let rename_changed = self.pump_session_rename();
         let channel_config_changed = self.pump_channel_config();
         let events = self.handle.drain();
@@ -1924,7 +2028,7 @@ impl ChatState {
         for event in events {
             self.apply_event(event);
         }
-        changed || rename_changed || channel_config_changed
+        changed || rename_changed || channel_config_changed || attachment_picker_changed
     }
 
     fn apply_session_list_result(&mut self, result: SessionListWorkerResult) {
@@ -2386,7 +2490,9 @@ impl ChatState {
         {
             let had_path = !self.attachment_path_input.trim().is_empty();
             self.attachment_path_input.clear();
+            self.attachment_manual_path_open = false;
             self.attachment_controls_open = false;
+            self.attachment_picker_error = None;
             if had_path {
                 self.draft_revision = self.draft_revision.wrapping_add(1);
             }
@@ -2736,8 +2842,11 @@ impl ChatState {
         self.messages.clear();
         self.input.clear();
         self.cursor = 0;
+        self.advance_attachment_draft_generation();
         self.attachment_path_input.clear();
+        self.attachment_manual_path_open = false;
         self.attachment_controls_open = false;
+        self.attachments.clear();
         self.streaming = false;
         self.queued_turn_inputs.clear();
         self.notice = preserved_notice;
@@ -3425,6 +3534,10 @@ impl ChatState {
             return;
         };
         self.compact_drawer_open = false;
+        // A native picker belongs to the visible chat/draft that opened it. The text and any
+        // already-queued attachments intentionally remain available while navigating stored
+        // chats, but a late OS-dialog result must not leak into the newly visible chat.
+        self.advance_attachment_draft_generation();
         self.session_id = session.id.clone();
         self.messages = vec![transcript_loading_message(&session)];
         self.timeline = ConversationTimelineState::default();
@@ -4565,6 +4678,10 @@ impl ChatState {
     fn submit(&mut self) {
         let text = self.input.trim().to_string();
         let attachments = self.attachment_inputs();
+        if self.attachment_operation_pending() {
+            self.notice = Some("wait for selected files to finish attaching".to_string());
+            return;
+        }
         if text.is_empty() && attachments.is_empty() {
             return;
         }
@@ -4600,7 +4717,9 @@ impl ChatState {
             self.messages.push(ChatMessage::user(text));
             self.input.clear();
             self.cursor = 0;
+            self.advance_attachment_draft_generation();
             self.attachment_path_input.clear();
+            self.attachment_manual_path_open = false;
             self.attachment_controls_open = false;
             if self.composer_popup == Some(ComposerPopup::Attachments) {
                 self.composer_popup = None;
@@ -4633,7 +4752,9 @@ impl ChatState {
         self.control.active_turn = true;
         self.input.clear();
         self.cursor = 0;
+        self.advance_attachment_draft_generation();
         self.attachment_path_input.clear();
+        self.attachment_manual_path_open = false;
         self.attachment_controls_open = false;
         if self.composer_popup == Some(ComposerPopup::Attachments) {
             self.composer_popup = None;
@@ -4725,6 +4846,7 @@ impl ChatState {
         (!self.input.trim().is_empty() || !self.attachments.is_empty())
             && !self.providers.is_empty()
             && !self.initial_transcript_load_pending()
+            && !self.attachment_operation_pending()
     }
 
     fn latest_reusable_answer(&self) -> Option<&str> {
@@ -4743,6 +4865,7 @@ impl ChatState {
             && self.input.trim().is_empty()
             && self.attachments.is_empty()
             && self.attachment_path_input.trim().is_empty()
+            && !self.attachment_operation_pending()
             && self.latest_reusable_answer().is_some()
     }
 
@@ -4752,7 +4875,9 @@ impl ChatState {
         };
         self.input = answer;
         self.cursor = self.input.len();
+        self.advance_attachment_draft_generation();
         self.attachment_path_input.clear();
+        self.attachment_manual_path_open = false;
         self.attachment_controls_open = false;
         self.attachments.clear();
         self.draft_revision = self.draft_revision.wrapping_add(1);
@@ -4974,12 +5099,15 @@ impl ChatState {
         if self.input.is_empty()
             && self.attachments.is_empty()
             && self.attachment_path_input.is_empty()
+            && !self.attachment_operation_pending()
         {
             return;
         }
         self.input.clear();
         self.cursor = 0;
+        self.advance_attachment_draft_generation();
         self.attachment_path_input.clear();
+        self.attachment_manual_path_open = false;
         self.attachment_controls_open = false;
         if self.composer_popup == Some(ComposerPopup::Attachments) {
             self.composer_popup = None;
@@ -4988,20 +5116,234 @@ impl ChatState {
         self.draft_revision = self.draft_revision.wrapping_add(1);
     }
 
-    fn toggle_attachment_controls(&mut self) {
-        if self.attachment_controls_open {
-            self.set_composer_popup(None);
-        } else {
-            self.set_composer_popup(Some(ComposerPopup::Attachments));
-        }
-    }
-
     fn attachment_controls_visible(&self) -> bool {
         self.attachment_controls_open
     }
 
+    fn attachment_picker_pending(&self) -> bool {
+        self.pending_attachment_picker.is_some()
+    }
+
+    fn attachment_picker_lane_pending(&self) -> bool {
+        self.attachment_picker.is_pending()
+    }
+
+    fn attachment_operation_pending(&self) -> bool {
+        self.attachment_picker_pending() || !self.pending_attachment_validations.is_empty()
+    }
+
+    fn advance_attachment_draft_generation(&mut self) {
+        self.attachment_draft_generation = self.attachment_draft_generation.wrapping_add(1);
+        self.pending_attachment_picker = None;
+        self.pending_attachment_validations.clear();
+        self.attachment_picker_error = None;
+        self.attachment_drop_hovered = false;
+    }
+
+    fn request_attachment_picker(&mut self) {
+        self.attachment_picker_error = None;
+        let session_id = self.session_id.clone();
+        let draft_generation = self.attachment_draft_generation;
+        match self.attachment_picker.request(
+            NativePickerKind::MultipleFiles,
+            "Choose files to attach",
+            draft_generation,
+            self.ui_waker.clone(),
+        ) {
+            Ok(request_id) => {
+                self.pending_attachment_picker = Some(PendingAttachmentPicker {
+                    request_id,
+                    session_id,
+                    draft_generation,
+                });
+            }
+            Err(error) => {
+                self.attachment_picker_error = Some(error);
+            }
+        }
+        self.draft_revision = self.draft_revision.wrapping_add(1);
+    }
+
+    /// Drain native-picker and path-validation completions without blocking the UI thread.
+    /// Shell may call this after an external wake; `pump_worker_events` also calls it so Chat owns
+    /// the lane when it is visible.
+    pub(crate) fn pump_attachment_lanes(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(result) = self.attachment_picker.poll() {
+            self.apply_attachment_picker_result(result);
+            changed = true;
+        }
+        loop {
+            match self.attachment_validation_rx.try_recv() {
+                Ok(result) => {
+                    self.apply_attachment_validation_result(result);
+                    changed = true;
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+        changed
+    }
+
+    fn apply_attachment_picker_result(&mut self, result: NativePickerResult) {
+        let Some(pending) = self.pending_attachment_picker.take() else {
+            // The visible session or draft was reset while the OS dialog was open.
+            return;
+        };
+        if pending.request_id != result.request_id
+            || pending.session_id != self.session_id
+            || pending.draft_generation != self.attachment_draft_generation
+            || result.context_generation != self.attachment_draft_generation
+        {
+            return;
+        }
+
+        match result.outcome {
+            NativePickerOutcome::Selected(paths) => {
+                if let Err(error) = self.request_local_attachment_validation(
+                    paths,
+                    LocalAttachmentIngress::NativePicker,
+                ) {
+                    self.attachment_picker_error = Some(error);
+                }
+            }
+            NativePickerOutcome::Cancelled => {
+                self.attachment_picker_error = None;
+            }
+            NativePickerOutcome::Failed(error) => {
+                self.attachment_picker_error = Some(error);
+            }
+        }
+        self.draft_revision = self.draft_revision.wrapping_add(1);
+    }
+
+    fn apply_attachment_validation_result(&mut self, result: LocalAttachmentValidationResult) {
+        let Some(index) = self
+            .pending_attachment_validations
+            .iter()
+            .position(|pending| pending.request_id == result.request_id)
+        else {
+            // The session/draft was reset while the validation worker was in flight.
+            return;
+        };
+        let pending = self.pending_attachment_validations.remove(index);
+        if pending.session_id != self.session_id
+            || pending.session_id != result.session_id
+            || pending.draft_generation != self.attachment_draft_generation
+            || pending.draft_generation != result.draft_generation
+        {
+            return;
+        }
+
+        let mut errors = Vec::new();
+        for outcome in result.outcomes {
+            match outcome {
+                LocalAttachmentValidationOutcome::Ready {
+                    path,
+                    file_name,
+                    size_bytes,
+                } => {
+                    let source = ChatAttachmentSource::LocalPath(path);
+                    if !self
+                        .attachments
+                        .iter()
+                        .any(|attachment| attachment.has_source(&source))
+                    {
+                        self.attachments.push(PendingChatAttachment {
+                            source,
+                            file_name,
+                            size_bytes,
+                        });
+                    }
+                }
+                LocalAttachmentValidationOutcome::Failed { path, detail } => {
+                    errors.push(format!("{}: {detail}", path.display()));
+                }
+            }
+        }
+        self.attachment_picker_error = if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join(" "))
+        };
+        self.draft_revision = self.draft_revision.wrapping_add(1);
+    }
+
+    fn request_local_attachment_validation(
+        &mut self,
+        paths: Vec<PathBuf>,
+        ingress: LocalAttachmentIngress,
+    ) -> Result<u64, String> {
+        let mut paths: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|path| !path.as_os_str().is_empty())
+            .collect();
+        paths.dedup();
+        if paths.is_empty() {
+            let detail = "choose at least one file to attach".to_string();
+            self.attachment_picker_error = Some(detail.clone());
+            return Err(detail);
+        }
+
+        self.next_attachment_validation_request_id = self
+            .next_attachment_validation_request_id
+            .wrapping_add(1)
+            .max(1);
+        let request_id = self.next_attachment_validation_request_id;
+        let session_id = self.session_id.clone();
+        let draft_generation = self.attachment_draft_generation;
+        let worker_paths = paths.clone();
+        let worker_session_id = session_id.clone();
+        let sender = self.attachment_validation_tx.clone();
+        let waker = self.ui_waker.clone();
+        let spawn = thread::Builder::new()
+            .name(format!("sinomo-chat-attachment-{request_id}"))
+            .spawn(move || {
+                let outcomes = worker_paths
+                    .into_iter()
+                    .map(validate_local_attachment_path)
+                    .collect();
+                let _ = sender.send(LocalAttachmentValidationResult {
+                    request_id,
+                    session_id: worker_session_id,
+                    draft_generation,
+                    outcomes,
+                });
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            });
+        if let Err(error) = spawn {
+            let detail = format!("could not inspect the selected files: {error}");
+            self.attachment_picker_error = Some(detail.clone());
+            return Err(detail);
+        }
+
+        self.pending_attachment_validations
+            .push(PendingLocalAttachmentValidation {
+                request_id,
+                session_id,
+                draft_generation,
+                ingress,
+                paths,
+            });
+        self.attachment_picker_error = None;
+        self.draft_revision = self.draft_revision.wrapping_add(1);
+        Ok(request_id)
+    }
+
+    fn toggle_manual_attachment_path(&mut self) {
+        self.attachment_manual_path_open = !self.attachment_manual_path_open;
+        if !self.attachment_manual_path_open {
+            self.attachment_path_input.clear();
+        }
+        self.attachment_picker_error = None;
+        self.draft_revision = self.draft_revision.wrapping_add(1);
+    }
+
     fn set_attachment_path_input(&mut self, value: String) {
         self.attachment_path_input = value;
+        self.attachment_picker_error = None;
     }
 
     fn add_attachment_from_path_input(&mut self) {
@@ -5009,43 +5351,198 @@ impl ChatState {
         match self.queue_attachment_path(&value) {
             Ok(()) => {
                 self.attachment_path_input.clear();
-                self.draft_revision = self.draft_revision.wrapping_add(1);
             }
             Err(error) => {
-                self.notice = Some(error);
+                self.attachment_picker_error = Some(error);
             }
         }
     }
 
     fn queue_attachment_path(&mut self, value: &str) -> Result<(), String> {
         let normalized = normalize_attachment_path(value)
-            .ok_or_else(|| "paste a file path before attaching".to_string())?;
-        let path = PathBuf::from(normalized);
-        let metadata =
-            std::fs::metadata(&path).map_err(|error| format!("attachment unavailable: {error}"))?;
-        if !metadata.is_file() {
-            return Err("attachment must be a file".to_string());
+            .ok_or_else(|| "enter a file path before attaching".to_string())?;
+        self.queue_local_attachment_path(PathBuf::from(normalized))
+    }
+
+    /// Queue a host file for background validation. This does no filesystem I/O on the caller's
+    /// thread, so native-picker, pasted-path, and OS-drop entry points share the same safe lane.
+    ///
+    /// The path remains the source until the chat worker accepts the turn, preserving the existing
+    /// local-file behavior while giving shell integration one typed entry point.
+    pub(crate) fn queue_local_attachment_path(
+        &mut self,
+        path: impl Into<PathBuf>,
+    ) -> Result<(), String> {
+        self.request_local_attachment_validation(
+            vec![path.into()],
+            LocalAttachmentIngress::ManualPath,
+        )
+        .map(|_| ())
+    }
+
+    /// Queue files received from SUI's root drag/drop event and open the attachment surface.
+    pub(crate) fn queue_dropped_local_attachment_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+    ) -> Result<(), String> {
+        self.attachment_drop_hovered = false;
+        self.open_attachment_surface();
+        self.request_local_attachment_validation(paths, LocalAttachmentIngress::OsDrop)
+            .map(|_| ())
+    }
+
+    pub(crate) fn queue_dropped_local_attachment_path(
+        &mut self,
+        path: PathBuf,
+    ) -> Result<(), String> {
+        self.queue_dropped_local_attachment_paths(vec![path])
+    }
+
+    /// Reveal the attachment panel while a host-file drag is over the window.
+    pub(crate) fn begin_external_attachment_hover(&mut self) {
+        if self.attachment_drop_hovered {
+            return;
         }
-        let path = std::fs::canonicalize(&path).unwrap_or(path);
-        if self
-            .attachments
-            .iter()
-            .any(|attachment| attachment.path == path)
-        {
-            return Ok(());
+        self.attachment_drop_hovered = true;
+        self.open_attachment_surface();
+        self.draft_revision = self.draft_revision.wrapping_add(1);
+    }
+
+    /// Clear the transient drag target when the pointer leaves or the host cancels the drag.
+    pub(crate) fn cancel_external_attachment_hover(&mut self) {
+        if self.attachment_drop_hovered {
+            self.attachment_drop_hovered = false;
+            self.draft_revision = self.draft_revision.wrapping_add(1);
         }
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "attachment".to_string());
-        self.attachments.push(PendingChatAttachment {
-            path,
+    }
+
+    pub(crate) fn open_attachment_surface(&mut self) {
+        self.set_composer_popup(Some(ComposerPopup::Attachments));
+    }
+
+    /// Queue the exact local bytes already displayed by Files. Unlike picker/drop paths, this
+    /// snapshot is never reopened after the user chooses "Attach to current chat".
+    #[cfg(test)]
+    pub(crate) fn queue_local_attachment_snapshot(
+        &mut self,
+        file_name: impl Into<String>,
+        source_path: impl Into<String>,
+        bytes: impl Into<Arc<[u8]>>,
+    ) -> Result<(), String> {
+        self.queue_local_attachment_snapshot_with_provenance(
             file_name,
-            size_bytes: metadata.len(),
-        });
+            ChatLocalAttachmentProvenance::new(source_path),
+            bytes,
+        )
+    }
+
+    pub(crate) fn queue_local_attachment_snapshot_with_provenance(
+        &mut self,
+        file_name: impl Into<String>,
+        provenance: ChatLocalAttachmentProvenance,
+        bytes: impl Into<Arc<[u8]>>,
+    ) -> Result<(), String> {
+        if provenance.source_path().trim().is_empty() {
+            let detail = "local attachment source is missing".to_string();
+            self.attachment_picker_error = Some(detail.clone());
+            return Err(detail);
+        }
+        let bytes = bytes.into();
+        let file_name = file_name.into();
+        let file_name = if file_name.trim().is_empty() {
+            FsPath::new(provenance.source_path())
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or("attachment")
+                .to_string()
+        } else {
+            file_name.trim().to_string()
+        };
+        let source = ChatAttachmentSource::LocalSnapshot {
+            provenance,
+            bytes: bytes.clone(),
+        };
+        let pending = PendingChatAttachment {
+            source: source.clone(),
+            file_name,
+            size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        };
+        if let Some(existing) = self
+            .attachments
+            .iter_mut()
+            .find(|attachment| attachment.has_source(&source))
+        {
+            *existing = pending;
+        } else {
+            self.attachments.push(pending);
+        }
+        self.open_attachment_surface();
+        self.attachment_picker_error = None;
+        self.draft_revision = self.draft_revision.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Queue an immutable SIFS viewer snapshot without staging it through a local temporary file.
+    /// The SIFS path is retained as provenance when the chat worker stores the attachment.
+    #[cfg(test)]
+    pub(crate) fn queue_sifs_attachment_snapshot(
+        &mut self,
+        file_name: impl Into<String>,
+        sifs_path: impl Into<String>,
+        bytes: impl Into<Arc<[u8]>>,
+    ) -> Result<(), String> {
+        self.queue_sifs_attachment_snapshot_with_provenance(
+            file_name,
+            ChatSifsAttachmentProvenance::new(sifs_path),
+            bytes,
+        )
+    }
+
+    pub(crate) fn queue_sifs_attachment_snapshot_with_provenance(
+        &mut self,
+        file_name: impl Into<String>,
+        provenance: ChatSifsAttachmentProvenance,
+        bytes: impl Into<Arc<[u8]>>,
+    ) -> Result<(), String> {
+        if provenance.path.trim().is_empty() {
+            let detail = "SIFS attachment path is missing".to_string();
+            self.attachment_picker_error = Some(detail.clone());
+            return Err(detail);
+        }
+        let bytes = bytes.into();
+        let file_name = file_name.into();
+        let file_name = if file_name.trim().is_empty() {
+            FsPath::new(&provenance.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or("attachment")
+                .to_string()
+        } else {
+            file_name.trim().to_string()
+        };
+        let source = ChatAttachmentSource::SifsSnapshot {
+            provenance,
+            bytes: bytes.clone(),
+        };
+        let pending = PendingChatAttachment {
+            source: source.clone(),
+            file_name,
+            size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        };
+        if let Some(existing) = self
+            .attachments
+            .iter_mut()
+            .find(|attachment| attachment.has_source(&source))
+        {
+            *existing = pending;
+        } else {
+            self.attachments.push(pending);
+        }
+        self.open_attachment_surface();
+        self.attachment_picker_error = None;
+        self.draft_revision = self.draft_revision.wrapping_add(1);
         Ok(())
     }
 
@@ -5060,9 +5557,7 @@ impl ChatState {
     fn attachment_inputs(&self) -> Vec<ChatAttachmentInput> {
         self.attachments
             .iter()
-            .map(|attachment| ChatAttachmentInput {
-                path: attachment.path.clone(),
-            })
+            .map(PendingChatAttachment::input)
             .collect()
     }
 
@@ -5082,7 +5577,7 @@ impl ChatState {
         self.input = prompt.to_string();
         self.cursor = self.input.len();
         if action.opens_attachment_controls() {
-            self.attachment_controls_open = true;
+            self.open_attachment_surface();
         }
         self.draft_revision = self.draft_revision.wrapping_add(1);
     }
@@ -6332,6 +6827,37 @@ fn normalize_attachment_path(value: &str) -> Option<String> {
         None
     } else {
         Some(path)
+    }
+}
+
+fn validate_local_attachment_path(path: PathBuf) -> LocalAttachmentValidationOutcome {
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return LocalAttachmentValidationOutcome::Failed {
+                path,
+                detail: format!("attachment unavailable: {error}"),
+            };
+        }
+    };
+    if !metadata.is_file() {
+        return LocalAttachmentValidationOutcome::Failed {
+            path,
+            detail: "attachment must be a file".to_string(),
+        };
+    }
+    let path = std::fs::canonicalize(&path).unwrap_or(path);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "attachment".to_string());
+    LocalAttachmentValidationOutcome::Ready {
+        path,
+        file_name,
+        size_bytes: metadata.len(),
     }
 }
 
@@ -14685,12 +15211,19 @@ fn open_provider_setup(shared: &Shared) {
     }
 }
 
-fn attachment_signature(shared: &Shared) -> (u64, usize, bool) {
+fn attachment_signature(
+    shared: &Shared,
+) -> (u64, usize, bool, bool, bool, bool, bool, Option<String>) {
     let chat = shared.chat();
     (
         chat.draft_revision,
         chat.attachments.len(),
         chat.attachment_controls_visible(),
+        chat.attachment_manual_path_open,
+        chat.attachment_operation_pending(),
+        chat.attachment_picker_lane_pending(),
+        chat.attachment_drop_hovered,
+        chat.attachment_picker_error.clone(),
     )
 }
 
@@ -14742,135 +15275,183 @@ fn attachment_drawer_chip(
 }
 
 fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    let controls_visible = shared.chat().attachment_controls_visible();
-    let chip_limit = if controls_visible { usize::MAX } else { 3 };
     let mut chips = Flex::horizontal()
         .wrap(FlexWrap::Wrap)
         .gap(6.0)
         .align_items(Alignment::Center);
-    for (index, attachment) in shared
-        .chat()
-        .attachments
-        .iter()
-        .take(chip_limit)
-        .enumerate()
-    {
+    for (index, attachment) in shared.chat().attachments.iter().enumerate() {
         chips = chips.with_child(attachment_drawer_chip(shared, reader, index, attachment));
     }
-    if !controls_visible && shared.chat().attachments.len() > 3 {
-        let extra = shared.chat().attachments.len() - 3;
-        let s = shared.clone();
-        chips = chips.with_child(SizedBox::new().height(ATTACHMENT_CHIPS_H).with_child(
-            small_label(shared, format!("+{extra}")).color_when(move || palette(&s).text_faint),
-        ));
-    }
 
-    if !controls_visible {
-        let attach = {
-            let s = shared.clone();
-            sui::Button::new("Attach file")
-                .icon(IconGlyph::File)
-                .min_height(ATTACHMENT_ENTRY_H)
-                .min_width(112.0)
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Tonal)
-                .tone(SemanticTone::Neutral)
-                .on_press(move || {
-                    s.chat_mut().toggle_attachment_controls();
-                })
-        };
-        let empty_summary = {
-            let s = shared.clone();
-            small_label(shared, "No files attached").color_when(move || palette(&s).text_faint)
-        };
-        let summary = SwitchView::new()
-            .selected(if shared.chat().attachments.is_empty() {
-                0
-            } else {
-                1
-            })
-            .with_child(empty_summary)
-            .with_child(chips);
-        let entry = TrailingSlotRow::new(
-            summary,
-            Flex::horizontal()
-                .align_items(Alignment::Center)
-                .spacer()
-                .with_child(attach),
+    let picker_pending = shared.chat().attachment_picker_pending();
+    let picker_lane_pending = shared.chat().attachment_picker_lane_pending();
+    let choose = {
+        let s = shared.clone();
+        sui::Button::new(if picker_pending {
+            "Choosing files…"
+        } else if picker_lane_pending {
+            "Close previous picker…"
+        } else {
+            "Choose files"
+        })
+        .icon(IconGlyph::Attach)
+        .min_height(ATTACHMENT_ENTRY_H)
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Filled)
+        .tone(SemanticTone::Accent)
+        .enabled_when({
+            let s = s.clone();
+            move || !s.chat().attachment_picker_lane_pending()
+        })
+        .on_press_with_ctx(move |ctx| {
+            s.chat_mut().request_attachment_picker();
+            request_chat_window_relayout(ctx);
+        })
+    };
+    let manual_path_open = shared.chat().attachment_manual_path_open;
+    let manual = {
+        let s = shared.clone();
+        sui::Button::new(if manual_path_open {
+            "Hide path entry"
+        } else {
+            "Enter path manually"
+        })
+        .icon(IconGlyph::File)
+        .min_height(ATTACHMENT_ENTRY_H)
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
+        .on_press_with_ctx(move |ctx| {
+            s.chat_mut().toggle_manual_attachment_path();
+            request_chat_window_relayout(ctx);
+        })
+    };
+    let actions = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(8.0)
+        .align_items(Alignment::Center)
+        .with_child(choose)
+        .with_child(manual);
+
+    let hint = {
+        let s = shared.clone();
+        small_label(
+            shared,
+            "Choose one or more files with the system picker. Manual paths are a fallback.",
         )
-        .trailing_width(120.0)
-        .trailing_height(ATTACHMENT_ENTRY_H)
-        .gap(8.0);
-        return WidgetPod::new(
-            Stack::vertical()
-                .spacing(4.0)
-                .alignment(Alignment::Stretch)
-                .with_child(SizedBox::new().height(ATTACHMENT_ENTRY_H).with_child(entry))
-                .with_child(SizedBox::new().height(ATTACHMENT_CHIPS_H)),
+        .color_when(move || palette(&s).text_muted)
+    };
+    let mut body = Stack::vertical()
+        .spacing(8.0)
+        .alignment(Alignment::Stretch)
+        .with_child(actions)
+        .with_child(hint);
+
+    if shared.chat().attachment_drop_hovered {
+        body = body.with_child(
+            Stack::horizontal().with_child(
+                StatusBadge::new("Drop files to attach")
+                    .icon(IconGlyph::Attach)
+                    .tone(SemanticTone::Info)
+                    .theme_when(clone_reader(reader)),
+            ),
         );
     }
 
-    let path_input = {
+    let pending_validations = shared.chat().pending_attachment_validations.clone();
+    if !pending_validations.is_empty() {
+        let mut pending_chips = Flex::horizontal()
+            .wrap(FlexWrap::Wrap)
+            .gap(6.0)
+            .align_items(Alignment::Center);
+        for pending in pending_validations {
+            let ingress = match pending.ingress {
+                LocalAttachmentIngress::NativePicker => "Checking",
+                LocalAttachmentIngress::ManualPath => "Checking path",
+                LocalAttachmentIngress::OsDrop => "Checking drop",
+            };
+            for path in pending.paths {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or("file");
+                pending_chips = pending_chips.with_child(
+                    StatusBadge::new(format!("{ingress} {}…", compact_line(name, 24)))
+                        .icon(IconGlyph::File)
+                        .tone(SemanticTone::Info)
+                        .theme_when(clone_reader(reader)),
+                );
+            }
+        }
+        body = body.with_child(pending_chips);
+    }
+
+    if manual_path_open {
+        let path_input = {
+            let s = shared.clone();
+            TextInput::new("chat-attachment-path")
+                .value(shared.chat().attachment_path_input.clone())
+                .placeholder("Enter a file path")
+                .leading_icon(IconGlyph::File)
+                .theme_when(composer_control_reader(reader))
+                .on_change(move |value| {
+                    s.chat_mut().set_attachment_path_input(value);
+                })
+        };
+        let add = {
+            let s = shared.clone();
+            sui::Button::new("Add path")
+                .icon(IconGlyph::Add)
+                .min_height(ATTACHMENT_ENTRY_H)
+                .min_width(96.0)
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
+                .enabled_when({
+                    let s = s.clone();
+                    move || !s.chat().attachment_path_input.trim().is_empty()
+                })
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().add_attachment_from_path_input();
+                    request_chat_window_relayout(ctx);
+                })
+        };
+        body = body.with_child(
+            Flex::horizontal()
+                .wrap(FlexWrap::Wrap)
+                .gap(8.0)
+                .align_items(Alignment::Center)
+                .with_item(path_input, FlexItem::flex(1.0).min_width(180.0))
+                .with_child(add),
+        );
+    }
+
+    if let Some(error) = shared.chat().attachment_picker_error.clone() {
         let s = shared.clone();
-        TextInput::new("chat-attachment-path")
-            .value(shared.chat().attachment_path_input.clone())
-            .placeholder("Paste file path")
-            .leading_icon(IconGlyph::File)
-            .theme_when(composer_control_reader(reader))
-            .on_change(move |value| {
-                s.chat_mut().set_attachment_path_input(value);
-            })
-    };
+        body = body.with_child(
+            Flex::horizontal()
+                .wrap(FlexWrap::Wrap)
+                .gap(8.0)
+                .align_items(Alignment::Center)
+                .with_child(
+                    StatusBadge::new("Couldn’t attach")
+                        .icon(IconGlyph::Alert)
+                        .tone(SemanticTone::Danger)
+                        .theme_when(clone_reader(reader)),
+                )
+                .with_item(
+                    small_label(shared, error).color_when(move || palette(&s).danger_text),
+                    FlexItem::flex(1.0).min_width(140.0),
+                ),
+        );
+    }
 
-    let hide = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::Close, "Hide attachment field")
-            .size(ATTACHMENT_ENTRY_H)
-            .icon_size(13.0)
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Tonal)
-            .tone(SemanticTone::Neutral)
-            .on_press(move || {
-                s.chat_mut().toggle_attachment_controls();
-            })
-    };
+    if !shared.chat().attachments.is_empty() {
+        body = body.with_child(chips);
+    }
 
-    let add = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::Add, "Attach file")
-            .size(ATTACHMENT_ENTRY_H)
-            .icon_size(15.0)
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || !s.chat().attachment_path_input.trim().is_empty()
-            })
-            .on_press(move || {
-                s.chat_mut().add_attachment_from_path_input();
-            })
-    };
-
-    let action_width = ATTACHMENT_ENTRY_H * 2.0 + 6.0;
-    let entry = TrailingSlotRow::new(
-        path_input,
-        Flex::horizontal()
-            .main_gap(6.0)
-            .align_items(Alignment::Center)
-            .spacer()
-            .with_child(hide)
-            .with_child(add),
-    )
-    .trailing_width(action_width)
-    .trailing_height(ATTACHMENT_ENTRY_H)
-    .gap(8.0);
-
-    WidgetPod::new(
-        Stack::vertical()
-            .spacing(4.0)
-            .alignment(Alignment::Stretch)
-            .with_child(SizedBox::new().height(ATTACHMENT_ENTRY_H).with_child(entry))
-            .with_child(chips),
-    )
+    WidgetPod::new(body)
 }
 
 fn model_button_label(chat: &ChatState) -> String {
@@ -15106,7 +15687,11 @@ fn composer_attachments_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPo
             "Attachments",
             "Close attachments",
         ))
-        .with_child(controls);
+        .with_child(
+            SizedBox::new()
+                .height(COMPOSER_POPUP_H - 34.0)
+                .with_child(ScrollView::vertical(controls).viewport_width_hint(true)),
+        );
     WidgetPod::new(
         Surface::new(
             SurfaceRole::Titlebar,
@@ -16285,6 +16870,12 @@ fn view_signature(shared: &Shared) -> u64 {
     chat.draft_revision.hash(&mut h);
     chat.attachments.len().hash(&mut h);
     chat.attachment_path_input.is_empty().hash(&mut h);
+    chat.attachment_manual_path_open.hash(&mut h);
+    chat.attachment_operation_pending().hash(&mut h);
+    chat.attachment_picker_lane_pending().hash(&mut h);
+    chat.pending_attachment_validations.len().hash(&mut h);
+    chat.attachment_drop_hovered.hash(&mut h);
+    chat.attachment_picker_error.hash(&mut h);
     chat.queued_turn_inputs.len().hash(&mut h);
     for queued in &chat.queued_turn_inputs {
         (queued.kind == QueuedTurnKind::Steer).hash(&mut h);
@@ -16888,7 +17479,7 @@ mod tests {
 
     fn pending_attachment(file_name: &str, size_bytes: u64) -> PendingChatAttachment {
         PendingChatAttachment {
-            path: PathBuf::from(format!("C:\\tmp\\{file_name}")),
+            source: ChatAttachmentSource::LocalPath(PathBuf::from(format!("C:\\tmp\\{file_name}"))),
             file_name: file_name.to_string(),
             size_bytes,
         }
@@ -24477,6 +25068,13 @@ mod tests {
         state
             .queue_attachment_path(&format!("\"{}\"", attachment.path.display()))
             .expect("queue attachment");
+        assert!(
+            state.attachment_operation_pending(),
+            "path validation stays off the UI thread"
+        );
+        wait_for(&mut state, Duration::from_secs(2), |state| {
+            !state.attachment_operation_pending()
+        });
         assert_eq!(state.attachments.len(), 1);
         assert_eq!(state.attachments[0].file_name, "report.txt");
         assert!(!state.can_send(), "provider setup is still required");
@@ -24508,6 +25106,9 @@ mod tests {
         state
             .queue_attachment_path(attachment.path.to_str().expect("utf8 path"))
             .expect("queue attachment");
+        wait_for(&mut state, Duration::from_secs(2), |state| {
+            !state.attachment_operation_pending()
+        });
 
         state.submit();
 
@@ -24519,21 +25120,233 @@ mod tests {
     }
 
     #[test]
-    fn attachment_drawer_hides_unqueued_path_input() {
+    fn manual_attachment_path_is_explicit_fallback_and_clears_when_hidden() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
 
         assert!(!state.attachment_controls_visible());
-        state.toggle_attachment_controls();
+        state.open_attachment_surface();
         assert!(state.attachment_controls_visible());
+        assert!(!state.attachment_manual_path_open);
+        state.toggle_manual_attachment_path();
+        assert!(state.attachment_manual_path_open);
         state.set_attachment_path_input("C:\\tmp\\draft.txt".to_string());
 
-        state.toggle_attachment_controls();
-        assert!(!state.attachment_controls_visible());
+        state.toggle_manual_attachment_path();
+        assert!(!state.attachment_manual_path_open);
         assert!(
             state.attachment_path_input.is_empty(),
-            "closing the drawer must not leave a hidden unsent path draft"
+            "hiding the fallback must not leave an invisible unsent path draft"
         );
+    }
+
+    #[test]
+    fn native_picker_attachment_selection_uses_background_validation_lane() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let first = temp_attachment_file("picker-first", "first.txt", b"first");
+        let second = temp_attachment_file("picker-second", "second.rs", b"second");
+        state.session_id = "visible-chat".to_string();
+        state.pending_attachment_picker = Some(PendingAttachmentPicker {
+            request_id: 41,
+            session_id: state.session_id.clone(),
+            draft_generation: state.attachment_draft_generation,
+        });
+
+        state.apply_attachment_picker_result(NativePickerResult {
+            request_id: 41,
+            context_generation: state.attachment_draft_generation,
+            outcome: NativePickerOutcome::Selected(vec![first.path.clone(), second.path.clone()]),
+        });
+
+        assert!(state.attachments.is_empty());
+        assert_eq!(state.pending_attachment_validations.len(), 1);
+        wait_for(&mut state, Duration::from_secs(2), |state| {
+            !state.attachment_operation_pending()
+        });
+        assert_eq!(state.attachments.len(), 2);
+        assert_eq!(state.attachments[0].file_name, "first.txt");
+        assert_eq!(state.attachments[1].file_name, "second.rs");
+        assert!(state.attachment_picker_error.is_none());
+    }
+
+    #[test]
+    fn attachment_validation_failure_is_recoverable_and_blocks_early_send() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        state.set_draft("Review this file".to_string());
+        let missing = std::env::temp_dir().join(format!(
+            "sinomo-missing-attachment-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+
+        state
+            .queue_local_attachment_path(missing)
+            .expect("queue background validation");
+        assert!(!state.can_send(), "pending attachment disables send");
+        state.submit();
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("wait for selected files to finish attaching")
+        );
+
+        wait_for(&mut state, Duration::from_secs(2), |state| {
+            !state.attachment_operation_pending()
+        });
+        assert!(state.attachments.is_empty());
+        assert!(
+            state
+                .attachment_picker_error
+                .as_deref()
+                .is_some_and(|error| error.contains("attachment unavailable"))
+        );
+        assert!(
+            state.can_send(),
+            "the text draft can be sent after recovering from the failed attachment"
+        );
+    }
+
+    #[test]
+    fn late_native_attachment_picker_result_is_rejected_after_visible_session_changes() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.session_id = "first-chat".to_string();
+        state.pending_attachment_picker = Some(PendingAttachmentPicker {
+            request_id: 7,
+            session_id: state.session_id.clone(),
+            draft_generation: state.attachment_draft_generation,
+        });
+        state.session_id = "second-chat".to_string();
+
+        state.apply_attachment_picker_result(NativePickerResult {
+            request_id: 7,
+            context_generation: state.attachment_draft_generation,
+            outcome: NativePickerOutcome::Selected(vec![PathBuf::from("stale.txt")]),
+        });
+
+        assert!(state.pending_attachment_validations.is_empty());
+        assert!(state.attachments.is_empty());
+    }
+
+    #[test]
+    fn resetting_attachment_draft_rejects_late_local_validation_result() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.session_id = "old-chat".to_string();
+        let old_generation = state.attachment_draft_generation;
+        state
+            .pending_attachment_validations
+            .push(PendingLocalAttachmentValidation {
+                request_id: 9,
+                session_id: state.session_id.clone(),
+                draft_generation: old_generation,
+                ingress: LocalAttachmentIngress::OsDrop,
+                paths: vec![PathBuf::from("stale.txt")],
+            });
+
+        state.reset_visible_session("new-chat".to_string());
+        state.apply_attachment_validation_result(LocalAttachmentValidationResult {
+            request_id: 9,
+            session_id: "old-chat".to_string(),
+            draft_generation: old_generation,
+            outcomes: vec![LocalAttachmentValidationOutcome::Ready {
+                path: PathBuf::from("stale.txt"),
+                file_name: "stale.txt".to_string(),
+                size_bytes: 5,
+            }],
+        });
+
+        assert!(state.pending_attachment_validations.is_empty());
+        assert!(state.attachments.is_empty());
+    }
+
+    #[test]
+    fn sifs_attachment_snapshot_is_queued_in_memory_with_path_provenance() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state
+            .queue_sifs_attachment_snapshot(
+                "main.rs",
+                "/workspace/src/main.rs",
+                b"fn main() {}".to_vec(),
+            )
+            .expect("queue SIFS snapshot");
+
+        let inputs = state.attachment_inputs();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].file_name, "main.rs");
+        match &inputs[0].source {
+            ChatAttachmentSource::SifsSnapshot { provenance, bytes } => {
+                assert_eq!(provenance.path, "/workspace/src/main.rs");
+                assert_eq!(bytes.as_ref(), b"fn main() {}");
+            }
+            source => panic!("expected SIFS snapshot, got {source:?}"),
+        }
+
+        state
+            .queue_sifs_attachment_snapshot_with_provenance(
+                "main.rs",
+                ChatSifsAttachmentProvenance {
+                    path: "/workspace/src/main.rs".to_string(),
+                    object_id: Some("object-main".to_string()),
+                    version: Some("version-2".to_string()),
+                    content_hash: Some("sha256:new".to_string()),
+                    policy: Some("editable".to_string()),
+                    unsaved_editor_buffer: true,
+                },
+                b"fn main() { println!(\"new\"); }".to_vec(),
+            )
+            .expect("replace SIFS snapshot");
+        assert_eq!(state.attachments.len(), 1, "same SIFS path is refreshed");
+        match &state.attachment_inputs()[0].source {
+            ChatAttachmentSource::SifsSnapshot { provenance, bytes } => {
+                assert!(bytes.as_ref().windows(3).any(|window| window == b"new"));
+                assert_eq!(provenance.object_id.as_deref(), Some("object-main"));
+                assert_eq!(provenance.version.as_deref(), Some("version-2"));
+                assert!(provenance.unsaved_editor_buffer);
+            }
+            source => panic!("expected SIFS snapshot, got {source:?}"),
+        }
+    }
+
+    #[test]
+    fn local_attachment_viewer_snapshot_keeps_exact_displayed_bytes() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state
+            .queue_local_attachment_snapshot(
+                "notes.txt",
+                "C:\\workspace\\notes.txt",
+                b"viewer snapshot".to_vec(),
+            )
+            .expect("queue local viewer snapshot");
+
+        match &state.attachment_inputs()[0].source {
+            ChatAttachmentSource::LocalSnapshot { provenance, bytes } => {
+                assert_eq!(provenance.original_path, "C:\\workspace\\notes.txt");
+                assert_eq!(provenance.canonical_path, None);
+                assert_eq!(bytes.as_ref(), b"viewer snapshot");
+            }
+            source => panic!("expected local snapshot, got {source:?}"),
+        }
+    }
+
+    #[test]
+    fn external_drag_opens_and_clears_attachment_drop_target() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+
+        state.begin_external_attachment_hover();
+        assert!(state.attachment_drop_hovered);
+        assert_eq!(state.composer_popup(), Some(ComposerPopup::Attachments));
+
+        state.cancel_external_attachment_hover();
+        assert!(!state.attachment_drop_hovered);
     }
 
     fn test_window<W: Widget + 'static>(
@@ -24846,10 +25659,12 @@ mod tests {
     fn rendered_attachment_controls_are_collapsed_until_opened() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
+        let narrow_error = "C:\\very\\deep\\workspace\\that\\does\\not\\fit\\on\\one\\line\\missing-file.rs: attachment unavailable; choose another file";
         {
             let mut chat = shared.chat_mut();
             seed_default_provider(&mut chat);
             chat.models_loading = false;
+            chat.attachment_picker_error = Some(narrow_error.to_string());
         }
 
         let runtime = sui::Application::new()
@@ -24861,18 +25676,24 @@ mod tests {
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
+        window
+            .root()
+            .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                420.0, 720.0,
+            ))))?;
+        window.run_until_idle()?;
 
         assert!(!shared.chat().attachment_controls_visible());
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("Hide attachment field")
+                .with_name("Choose files")
                 .count()?,
             0
         );
 
-        // The bar's attach button opens the attachments popup with the path
-        // entry visible.
+        // The bar opens the attachment popup with the native picker as the primary path. Manual
+        // entry stays explicit and collapsed until requested.
         window
             .get_by_role(SemanticsRole::Button)
             .with_name("Attach files")
@@ -24881,23 +25702,63 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("Hide attachment field")
+                .with_name("Choose files")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Enter path manually")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Add path")
+                .count()?,
+            0,
+            "manual path entry must not be the primary interaction"
+        );
+        let snapshot = window.snapshot()?;
+        let viewport = Rect::new(0.0, 0.0, 420.0, 720.0);
+        for (name, bounds) in [
+            (
+                "Couldn’t attach",
+                named_node_bounds(&snapshot, SemanticsRole::Text, "Couldn’t attach"),
+            ),
+            (
+                narrow_error,
+                named_node_bounds(&snapshot, SemanticsRole::Text, narrow_error),
+            ),
+        ] {
+            assert!(
+                bounds.width() > 0.0
+                    && bounds.max_x() <= viewport.max_x() + 0.5
+                    && bounds.max_y() <= viewport.max_y() + 0.5,
+                "narrow attachment error {name:?} should remain readable inside {viewport:?}, got {bounds:?}"
+            );
+        }
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Enter path manually")
+            .click()?;
+        assert!(shared.chat().attachment_manual_path_open);
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Add path")
                 .count()?,
             1
         );
 
         window
             .get_by_role(SemanticsRole::Button)
-            .with_name("Hide attachment field")
+            .with_name("Close attachments")
             .click()?;
         assert!(!shared.chat().attachment_controls_visible());
-        assert_eq!(
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("Hide attachment field")
-                .count()?,
-            0
-        );
 
         Ok(())
     }
@@ -25344,6 +26205,7 @@ mod tests {
             state.pump_session_rename();
             state.pump_channel_config();
             state.pump_delete();
+            state.pump_attachment_lanes();
             if predicate(state) {
                 return;
             }

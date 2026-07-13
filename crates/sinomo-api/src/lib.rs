@@ -50,6 +50,8 @@ pub const DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE: &str =
 pub const DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE: &str = "/daemon/dfs/browser/read-file-prefix";
 pub const DAEMON_DFS_BROWSER_READ_FILES_ROUTE: &str = "/daemon/dfs/browser/read-files";
 pub const DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE: &str = "/daemon/dfs/browser/write-file";
+pub const DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE: &str =
+    "/daemon/dfs/browser/replace-file-if-version";
 pub const DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE: &str = "/daemon/dfs/browser/create-dir-all";
 pub const DAEMON_DFS_BROWSER_RENAME_ROUTE: &str = "/daemon/dfs/browser/rename";
 pub const DAEMON_DFS_BROWSER_DELETE_ROUTE: &str = "/daemon/dfs/browser/delete";
@@ -68,6 +70,7 @@ pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
     DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
+    DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE,
     DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
     DAEMON_DFS_BROWSER_RENAME_ROUTE,
     DAEMON_DFS_BROWSER_DELETE_ROUTE,
@@ -346,6 +349,62 @@ pub struct DaemonDfsBrowserWriteFileRequest {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonDfsBrowserWriteFileResponse;
 
+/// Fail-closed compare-and-swap replacement request.
+///
+/// This has a dedicated route so an older daemon cannot silently ignore the
+/// precondition and fall back to an unconditional write during a rolling
+/// upgrade.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserReplaceFileIfVersionRequest {
+    pub path: String,
+    pub bytes: Vec<u8>,
+    pub expected_object_id: String,
+    pub expected_version: String,
+}
+
+/// The exact visible version committed by a conditional replacement.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserWriteReceipt {
+    pub object_id: String,
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+}
+
+/// Typed operational result for a conditional replacement. Transport and
+/// daemon-internal failures remain RPC errors; expected filesystem outcomes do
+/// not get flattened into service-error strings.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub enum DaemonDfsBrowserReplaceFileIfVersionOutcome {
+    Committed {
+        receipt: DaemonDfsBrowserWriteReceipt,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        maintenance_warning: Option<String>,
+    },
+    Conflict {
+        detail: String,
+    },
+    NotFound {
+        detail: String,
+    },
+    Rejected {
+        detail: String,
+    },
+}
+
+impl DaemonDfsBrowserReplaceFileIfVersionOutcome {
+    pub fn is_committed(&self) -> bool {
+        matches!(self, Self::Committed { .. })
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserReplaceFileIfVersionResponse {
+    pub outcome: DaemonDfsBrowserReplaceFileIfVersionOutcome,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonDfsBrowserCreateDirAllRequest {
     pub path: String,
@@ -442,3 +501,80 @@ pub struct DaemonLocalConnectivityReloadRequest;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonLocalConnectivityReloadResponse;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conditional_replace_has_a_dedicated_fail_closed_route() {
+        assert_ne!(
+            DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE,
+            DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE
+        );
+        assert!(
+            DAEMON_DFS_BROWSER_ROUTES.contains(&DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE)
+        );
+
+        let write = serde_json::to_value(DaemonDfsBrowserWriteFileRequest {
+            path: "/notes.txt".to_string(),
+            bytes: b"plain write".to_vec(),
+        })
+        .expect("serialize plain write");
+        assert_eq!(write.as_object().map(|fields| fields.len()), Some(2));
+        assert!(write.get("expected_object_id").is_none());
+        assert!(write.get("expected_version").is_none());
+    }
+
+    #[test]
+    fn conditional_replace_outcomes_preserve_receipt_and_error_kinds() {
+        let committed = DaemonDfsBrowserReplaceFileIfVersionResponse {
+            outcome: DaemonDfsBrowserReplaceFileIfVersionOutcome::Committed {
+                receipt: DaemonDfsBrowserWriteReceipt {
+                    object_id: "object-1".to_string(),
+                    version: "version-2".to_string(),
+                    content_hash: Some("hash-2".to_string()),
+                    size_bytes: Some(7),
+                },
+                maintenance_warning: Some("maintenance queued".to_string()),
+            },
+        };
+        let encoded = serde_json::to_vec(&committed).expect("encode committed outcome");
+        let decoded: DaemonDfsBrowserReplaceFileIfVersionResponse =
+            serde_json::from_slice(&encoded).expect("decode committed outcome");
+        assert_eq!(decoded, committed);
+        assert!(decoded.outcome.is_committed());
+
+        for outcome in [
+            DaemonDfsBrowserReplaceFileIfVersionOutcome::Conflict {
+                detail: "stale base".to_string(),
+            },
+            DaemonDfsBrowserReplaceFileIfVersionOutcome::NotFound {
+                detail: "removed".to_string(),
+            },
+            DaemonDfsBrowserReplaceFileIfVersionOutcome::Rejected {
+                detail: "not writable".to_string(),
+            },
+        ] {
+            let encoded = serde_json::to_vec(&outcome).expect("encode typed outcome");
+            let decoded: DaemonDfsBrowserReplaceFileIfVersionOutcome =
+                serde_json::from_slice(&encoded).expect("decode typed outcome");
+            assert_eq!(decoded, outcome);
+            assert!(!decoded.is_committed());
+        }
+    }
+
+    #[test]
+    fn daemon_api_error_preserves_possibly_applied_delivery_state() {
+        let error = DaemonApiError::from(sinomo_core::network::NetworkError::timeout(
+            "conditional replace response",
+            sinomo_core::network::NetworkTimeoutPhase::FirstByte,
+            std::time::Duration::from_secs(1),
+            sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+        ));
+        assert_eq!(
+            error.delivery_state(),
+            Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied)
+        );
+    }
+}

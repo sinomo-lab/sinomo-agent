@@ -1481,6 +1481,7 @@ mod tests {
             policy: DfsReplicationPolicy::new(1, 1).expect("replication policy"),
             object_metadata: Some(object),
             touch_parent_on_create: false,
+            exclusive_create: false,
             foreground_replica_repair: false,
         });
         DfsRoutedMessage {
