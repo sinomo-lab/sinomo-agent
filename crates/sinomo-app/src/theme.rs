@@ -104,9 +104,8 @@ pub fn resolve_theme_with_preferences(
     .with_size(ControlSize::Medium);
 
     let factor = text_scale.factor();
-    // The product baseline deliberately starts one step above SUI's compact
-    // toolkit defaults. Tiny metadata remains subordinate without dropping
-    // below 12px at the standard scale.
+    // Keep the application on SUI's shared type ramp. Scaling changes the
+    // whole ramp while control size remains a local layout choice.
     let sizes = [
         (12.0, 17.0),
         (13.0, 18.0),
@@ -361,9 +360,11 @@ impl Palette {
         }
     }
 
-    /// A text style with explicit size/weight/color, inheriting font metrics.
-    /// Line height rides the Mesh UI grid (`--sm-leading` ≈ 1.43: 20px at the
-    /// 14px body).
+    /// Resolve legacy authored sizes onto the shared SUI typography ramp.
+    ///
+    /// Custom visualization code still describes the intended hierarchy with a
+    /// nominal size, but the rendered style always uses an exact theme token so
+    /// it shares the same line grid and user text scaling as composed widgets.
     pub fn text_style(
         &self,
         theme: &DefaultTheme,
@@ -371,11 +372,26 @@ impl Palette {
         weight: FontWeight,
         color: Color,
     ) -> TextStyle {
-        let scale = theme.text.base.size / 15.0;
-        let size = (size * scale).max(theme.text.xs.size);
+        let token = if size <= 12.0 {
+            theme.text.xs
+        } else if size <= 14.0 {
+            theme.text.sm
+        } else if size <= 16.0 {
+            theme.text.base
+        } else if size <= 18.0 {
+            theme.text.lg
+        } else if size <= 20.0 {
+            theme.text.xl
+        } else if size <= 23.0 {
+            theme.text._2xl
+        } else if size <= 28.0 {
+            theme.text._3xl
+        } else {
+            theme.text._4xl
+        };
         TextStyle {
-            font_size: size,
-            line_height: (size * 1.4286).round(),
+            font_size: token.size,
+            line_height: token.line_height,
             weight,
             color,
             ..theme.body_text_style()

@@ -314,7 +314,30 @@ fn capture_evolution_seeded() {
         };
         evolution.selected = Some(0);
     }
-    capture(shared, "evolution-seeded");
+    capture(shared.clone(), "evolution-seeded");
+
+    // Keep a compact capture alongside the desktop one so the sticky decision
+    // bar and the wrapped start controls are covered by the same seeded state.
+    let runtime = build_runtime(shared).expect("build narrow evolution runtime");
+    let app = TestApp::from_runtime(runtime).expect("headless narrow evolution app");
+    let window = app.main_window().expect("narrow evolution window");
+    app.run_until_idle().expect("settle wide evolution layout");
+    window
+        .root()
+        .dispatch_event(sui::Event::Window(sui::WindowEvent::Resized(
+            sui::Size::new(720.0, 820.0),
+        )))
+        .expect("resize seeded evolution narrow");
+    app.run_until_idle()
+        .expect("settle narrow evolution layout");
+    let screenshot = window
+        .capture_screenshot()
+        .expect("capture narrow evolution screenshot");
+    let path = dir.join("sinomo-app-evolution-seeded-narrow.png");
+    screenshot
+        .write_png(&path)
+        .expect("write narrow evolution png");
+    println!("wrote {}", path.display());
 }
 
 #[test]
@@ -1506,6 +1529,55 @@ fn capture_shell_chrome() {
             .expect("crop title bar");
         write(&bar, "shell-titlebar-light");
     }
+}
+
+/// Captures the composed health-and-recovery popover with an actionable issue. This specifically
+/// guards the stock `Popover` + `ScrollView` composition against intrinsic-height regressions.
+#[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
+fn capture_health_center() {
+    let dir = target_shots_dir();
+    std::fs::create_dir_all(&dir).expect("create shots dir");
+
+    // Open the health trigger through its stable popover semantics. Startup may surface an
+    // additional backend issue, so the visible issue count is intentionally not hard-coded.
+    let (shared, _cleanup) = boot_with_visual_data_dir(Tab::Files, "health-center");
+    {
+        let mut files = shared.files_mut();
+        files.loaded = true;
+        files.loading = false;
+        files.error = Some("device authorization was denied".to_string());
+    }
+    let runtime = build_runtime(shared).expect("build runtime");
+    let app = TestApp::from_runtime(runtime).expect("headless test app");
+    let window = app.main_window().expect("main window");
+    app.run_until_idle().expect("settle health center trigger");
+    window
+        .get_by_role(sui::SemanticsRole::Popover)
+        .with_name("Health and recovery")
+        .get_by_role(sui::SemanticsRole::Button)
+        .click()
+        .expect("open health center");
+    app.run_until_idle().expect("settle health center popover");
+    app.advance_time(0.5)
+        .expect("settle health center entrance animation");
+    app.run_until_idle()
+        .expect("finish health center animation frame");
+    window
+        .root()
+        .dispatch_event(sui::Event::Window(sui::WindowEvent::RedrawRequested))
+        .expect("repaint settled health center");
+    app.run_until_idle().expect("finish health center repaint");
+
+    let shot = window.capture_screenshot().expect("capture health center");
+    let path = dir.join("sinomo-app-health-center.png");
+    shot.write_png(&path).expect("write health center png");
+    println!(
+        "wrote {} ({}x{})",
+        path.display(),
+        shot.width(),
+        shot.height()
+    );
 }
 
 /// Deterministic captures for the rebuilt (composed) Chat tab: the empty state in dark + light, a

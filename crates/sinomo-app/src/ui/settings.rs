@@ -11,8 +11,8 @@
 //! each assembled from stock `FormSection` / `FormRow` / `TabBar` / `Switch` /
 //! `TextInput` / `Select` / `Button` / `ListView` / `ScrollView` widgets. State lives
 //! entirely in [`SettingsState`]; controls bind to it via reactive `*_when` readers and
-//! snapshot-seed-plus-`on_change` writeback. The async provider device-login status is
-//! the one bespoke region — a live-reading [`StatusReflector`] widget.
+//! snapshot-seed-plus-`on_change` writeback. Async provider device-login status is
+//! rebuilt as ordinary `Label` / `Link` composition when its typed state changes.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -33,8 +33,8 @@ use sui::{
     Flex, FlexItem, FlexWrap, FontWeight, FormRow, FormSection, IconGlyph, Label, ListItem,
     ListView, MeasureCtx, PaintCtx, PointerEventKind, ProgressBar, Rect, ScrollState, ScrollView,
     Select, SemanticTone, SemanticsCtx, Separator, Size, SizedBox, Spinner, Stack, StatusBadge,
-    Switch, SwitchView, TabBar, TextArea, TextInput, Widget, WidgetPod, WidgetPodMutVisitor,
-    WidgetPodVisitor, WindowEvent,
+    Switch, SwitchView, TabBar, TextArea, TextInput, ThemeTextToken, Widget, WidgetPod,
+    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
 };
 
 use sinomo_runtime::config::{
@@ -3427,67 +3427,53 @@ fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     move || reader()
 }
 
-fn secondary_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
-    let reader = Rc::clone(reader);
-    move || {
-        let mut theme = reader();
-        theme.palette.accent = theme.palette.control;
-        theme.palette.accent_hover = theme.palette.control_hover;
-        theme.palette.accent_pressed = theme.palette.control_active;
-        theme.palette.accent_border = theme.palette.border;
-        theme.palette.accent_border_hover = theme.palette.border_hover;
-        theme.palette.accent_border_focus = theme.palette.border_focus;
-        theme.palette.accent_text = theme.palette.text;
-        theme
-    }
-}
-
-fn danger_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
-    let reader = Rc::clone(reader);
-    move || {
-        let mut theme = reader();
-        let danger = theme.palette.danger;
-        let contrast = theme.palette.danger_text;
-        theme.palette.accent = danger;
-        theme.palette.accent_hover = theme.palette.danger_hover;
-        theme.palette.accent_pressed = theme.palette.danger_hover;
-        theme.palette.accent_border = danger;
-        theme.palette.accent_border_hover = theme.palette.danger_hover;
-        theme.palette.accent_border_focus = danger;
-        theme.palette.accent_text = contrast;
-        // The focus ring stays the shared Mesh focus color: one ring, everywhere.
-        theme
-    }
-}
-
-/// Resolve the app chrome palette for the current theme (used by the `Label` color readers and the
-/// `StatusReflector` so muted/accent text matches the bespoke chrome).
+/// Resolve the app chrome palette for the current theme.
 fn palette(shared: &Shared) -> Palette {
     Palette::from_theme(&shared.theme(), widgets::theme_is_dark(shared))
 }
 
 /// A muted `Label` whose color tracks the theme.
 fn muted_label(shared: &Shared, text: impl Into<String>) -> Label {
+    let token = shared.theme().text.base;
+    muted_label_with_token(shared, text, token)
+}
+
+fn settings_text_style(shared: &Shared, token: ThemeTextToken) -> sui::TextStyle {
+    sui::TextStyle {
+        font_size: token.size,
+        line_height: token.line_height,
+        ..shared.theme().body_text_style()
+    }
+}
+
+fn settings_label(shared: &Shared, text: impl Into<String>, token: ThemeTextToken) -> Label {
+    Label::new(text).style(settings_text_style(shared, token))
+}
+
+fn muted_label_with_token(
+    shared: &Shared,
+    text: impl Into<String>,
+    token: ThemeTextToken,
+) -> Label {
     let s = shared.clone();
-    Label::new(text).color_when(move || palette(&s).text_muted)
+    settings_label(shared, text, token).color_when(move || palette(&s).text_muted)
 }
 
-fn settings_meta_size(shared: &Shared) -> f32 {
-    shared.theme().text.sm.size
-}
-
-fn settings_micro_size(shared: &Shared) -> f32 {
-    shared.theme().text.xs.size
+fn muted_meta_label(shared: &Shared, text: impl Into<String>) -> Label {
+    let token = shared.theme().text.sm;
+    muted_label_with_token(shared, text, token)
 }
 
 fn primary_label(shared: &Shared, text: impl Into<String>) -> Label {
     let s = shared.clone();
-    Label::new(text).color_when(move || palette(&s).text)
+    let token = shared.theme().text.base;
+    settings_label(shared, text, token).color_when(move || palette(&s).text)
 }
 
 fn positive_label(shared: &Shared, text: impl Into<String>) -> Label {
     let s = shared.clone();
-    Label::new(text).color_when(move || palette(&s).good)
+    let token = shared.theme().text.base;
+    settings_label(shared, text, token).color_when(move || palette(&s).good)
 }
 
 /// A read-only value row: `label` on the left, a muted value `Label` on the right.
@@ -3727,7 +3713,9 @@ fn copyable_text_row(
         .semantic_name(format!("Copy {label}"))
         .description(format!("Copy the full {label} to the clipboard"))
         .icon(IconGlyph::Restore)
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press_with_ctx(move |ctx| ctx.set_clipboard_text(&copy_value));
     FormRow::new(
         label,
@@ -3761,7 +3749,9 @@ fn copyable_area_row(
         .semantic_name(format!("Copy {label}"))
         .description(format!("Copy the full {label} to the clipboard"))
         .icon(IconGlyph::Restore)
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press_with_ctx(move |ctx| ctx.set_clipboard_text(&copy_value));
     FormRow::new(
         label,
@@ -3839,7 +3829,9 @@ where
         .on_change(on_change);
     let save = sui::Button::new("Save")
         .icon(sui::IconGlyph::Check)
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .enabled_when(move || !pending_when())
         .on_press(on_save);
     FormRow::new(
@@ -4171,18 +4163,14 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
     let expanded = shared.settings().connection_detail_expanded(tab);
     let status = {
         let s = shared.clone();
-        Label::new("Needs attention")
-            .font_size(settings_meta_size(shared))
+        settings_label(shared, "Needs attention", shared.theme().text.sm)
             .color_when(move || palette(&s).warn)
     };
-    let summary =
-        muted_label(shared, connection_issue_summary(&issue)).font_size(settings_meta_size(shared));
-    let recovery = muted_label(shared, connection_issue_recovery_hint(&issue))
-        .font_size(settings_meta_size(shared));
+    let summary = muted_meta_label(shared, connection_issue_summary(&issue));
+    let recovery = muted_meta_label(shared, connection_issue_recovery_hint(&issue));
     let detail_label = {
         let s = shared.clone();
-        Label::new("Low-level detail")
-            .font_size(settings_meta_size(shared))
+        settings_label(shared, "Low-level detail", shared.theme().text.sm)
             .color_when(move || palette(&s).text_faint)
     };
     let detail_field = {
@@ -4224,7 +4212,9 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
         } else {
             sui::IconGlyph::ChevronDown
         })
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press(move || s.settings_mut().toggle_connection_detail(tab))
     };
     let header = Stack::vertical()
@@ -4307,7 +4297,9 @@ fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         } else {
             sui::IconGlyph::ChevronDown
         })
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press(move || s.settings_mut().toggle_node_detail())
     };
 
@@ -4477,7 +4469,9 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                 let s = shared.clone();
                 sui::Button::new("Confirm leave")
                     .icon(sui::IconGlyph::Trash)
-                    .theme_when(danger_button_theme(reader))
+                    .theme_when(clone_reader(reader))
+                    .appearance(sui::ButtonAppearance::Filled)
+                    .tone(SemanticTone::Danger)
                     .enabled_when({
                         let s = s.clone();
                         move || {
@@ -4497,7 +4491,9 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                 let s = shared.clone();
                 sui::Button::new("Cancel")
                     .icon(sui::IconGlyph::Close)
-                    .theme_when(secondary_button_theme(reader))
+                    .theme_when(clone_reader(reader))
+                    .appearance(sui::ButtonAppearance::Tonal)
+                    .tone(SemanticTone::Neutral)
                     .on_press(move || {
                         s.settings_mut().cancel_leave_cluster();
                     })
@@ -4527,7 +4523,9 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                 let s = shared.clone();
                 sui::Button::new("Leave cluster")
                     .icon(sui::IconGlyph::Trash)
-                    .theme_when(danger_button_theme(reader))
+                    .theme_when(clone_reader(reader))
+                    .appearance(sui::ButtonAppearance::Filled)
+                    .tone(SemanticTone::Danger)
                     .on_press(move || {
                         s.settings_mut().confirm_leave_cluster();
                     })
@@ -4608,13 +4606,12 @@ fn cluster_join_controls(shared: &Shared, reader: &ThemeReader, clustered: bool)
                 .to_string()
         };
         controls = controls
-            .with_child(muted_label(shared, impact).font_size(settings_meta_size(shared)))
+            .with_child(muted_meta_label(shared, impact))
             .with_child(
-                muted_label(
+                muted_meta_label(
                     shared,
                     "Recovery: if the target join fails, Sinomo restores the source cluster automatically. After an interrupted migration, restart the daemon and run `sinomo cluster status` before retrying.",
-                )
-                .font_size(settings_meta_size(shared)),
+                ),
             );
         let confirm = {
             let s = shared.clone();
@@ -4624,7 +4621,9 @@ fn cluster_join_controls(shared: &Shared, reader: &ThemeReader, clustered: bool)
                 "Confirm join"
             })
             .icon(sui::IconGlyph::Check)
-            .theme_when(danger_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Filled)
+            .tone(SemanticTone::Danger)
             .enabled_when({
                 let s = s.clone();
                 move || {
@@ -4650,7 +4649,9 @@ fn cluster_join_controls(shared: &Shared, reader: &ThemeReader, clustered: bool)
             let s = shared.clone();
             sui::Button::new("Cancel")
                 .icon(sui::IconGlyph::Close)
-                .theme_when(secondary_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
                 .on_press(move || s.settings_mut().cancel_join_cluster())
         };
         controls = controls.with_child(
@@ -4712,7 +4713,9 @@ fn cluster_dashboard_button(shared: &Shared, reader: &ThemeReader) -> impl Widge
     let s = shared.clone();
     sui::Button::new("Open Cluster dashboard")
         .icon(sui::IconGlyph::Storage)
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press(move || open_tab(&s, Tab::Cluster))
 }
 
@@ -4915,7 +4918,9 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         let ready_for_chat = form.enabled && form.signed_in;
         let button = sui::Button::new("Use for chat")
             .icon(sui::IconGlyph::Check)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .enabled(ready_for_chat)
             .on_press(move || {
                 queue_settings_operation(
@@ -5033,7 +5038,9 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         } else {
             sui::IconGlyph::ChevronDown
         })
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press(move || {
             s.settings_mut().toggle_provider_detail(&provider, &account);
         })
@@ -5080,7 +5087,7 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
             let auth = Stack::vertical()
                 .spacing(6.0)
                 .alignment(Alignment::Stretch)
-                .with_child(StatusReflector::new(shared.clone(), index, reader))
+                .with_child(status_reflector(shared, index, reader))
                 .with_child(button);
             body = body.with_child(
                 FormRow::new("Authentication detail", auth)
@@ -5681,7 +5688,9 @@ fn provider_management_row(
             let s = shared.clone();
             sui::Button::new("Cancel")
                 .icon(sui::IconGlyph::Close)
-                .theme_when(secondary_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
                 .on_press(move || s.settings_mut().cancel_provider_remove())
         };
         let remove = {
@@ -5690,7 +5699,9 @@ fn provider_management_row(
             let account = form.account.clone();
             sui::Button::new("Remove account")
                 .icon(sui::IconGlyph::Trash)
-                .theme_when(danger_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Filled)
+                .tone(SemanticTone::Danger)
                 .enabled_when({
                     let s = s.clone();
                     move || {
@@ -5724,12 +5735,10 @@ fn provider_management_row(
             .with_child(controls);
         if let Some(error) = action_error {
             stack = stack.with_child(
-                Label::new(error)
-                    .font_size(settings_meta_size(shared))
-                    .color_when({
-                        let s = shared.clone();
-                        move || palette(&s).accent
-                    }),
+                settings_label(shared, error, shared.theme().text.sm).color_when({
+                    let s = shared.clone();
+                    move || palette(&s).accent
+                }),
             );
         }
         FormRow::new("Management", stack)
@@ -5740,7 +5749,9 @@ fn provider_management_row(
             let s = shared.clone();
             sui::Button::new("Remove account")
                 .icon(sui::IconGlyph::Trash)
-                .theme_when(danger_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Filled)
+                .tone(SemanticTone::Danger)
                 .on_press(move || s.settings_mut().confirm_provider_remove(index))
         };
         FormRow::new("Management", remove)
@@ -5833,7 +5844,9 @@ fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
             } else {
                 sui::IconGlyph::ChevronDown
             })
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press(move || s.settings_mut().toggle_provider_storage_detail())
         };
         let mut group = FieldGroup::new()
@@ -6017,7 +6030,9 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         let s = shared.clone();
         sui::Button::new("Cancel")
             .icon(sui::IconGlyph::ChevronLeft)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press(move || s.settings_mut().close_provider_add())
     };
     let add_label = if uses_device_login {
@@ -6160,7 +6175,9 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         let s = shared.clone();
         sui::Button::new("Duplicate")
             .icon(sui::IconGlyph::Restore)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .enabled_when({
                 let s = s.clone();
                 move || s.settings().agent_snapshot.selected_agent.is_some()
@@ -6171,7 +6188,9 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         let s = shared.clone();
         sui::Button::new("Refresh")
             .icon(sui::IconGlyph::Redo)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press(move || {
                 let selected_id = s.settings().agent_selected_id.clone();
                 queue_settings_operation(
@@ -6304,7 +6323,9 @@ fn agent_package_management_section(shared: &Shared, reader: &ThemeReader) -> im
         let s = shared.clone();
         sui::Button::new("Export selected")
             .icon(IconGlyph::Storage)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .enabled_when({
                 let s = s.clone();
                 move || {
@@ -6393,7 +6414,9 @@ fn agent_lifecycle_action_button(shared: &Shared, reader: &ThemeReader, test: bo
         } else {
             IconGlyph::Check
         })
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .enabled_when({
             let s = s.clone();
             move || {
@@ -6646,7 +6669,9 @@ fn agent_actions_row(shared: &Shared, reader: &ThemeReader) -> FormRow {
         let s = shared.clone();
         sui::Button::new("Duplicate")
             .icon(sui::IconGlyph::Restore)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press(move || s.settings_mut().duplicate_selected_agent())
     };
     let delete_controls = agent_delete_controls(shared, reader);
@@ -6678,7 +6703,9 @@ fn agent_delete_controls(shared: &Shared, reader: &ThemeReader) -> impl Widget +
             let s = shared.clone();
             sui::Button::new("Confirm delete")
                 .icon(sui::IconGlyph::Trash)
-                .theme_when(danger_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Filled)
+                .tone(SemanticTone::Danger)
                 .enabled_when({
                     let s = s.clone();
                     move || !s.settings().domain_pending(SettingsOperationDomain::Agents)
@@ -6701,7 +6728,9 @@ fn agent_delete_controls(shared: &Shared, reader: &ThemeReader) -> impl Widget +
             let s = shared.clone();
             sui::Button::new("Cancel")
                 .icon(sui::IconGlyph::Close)
-                .theme_when(secondary_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
                 .on_press(move || s.settings_mut().cancel_agent_delete())
         };
         return Flex::horizontal()
@@ -6719,7 +6748,9 @@ fn agent_delete_controls(shared: &Shared, reader: &ThemeReader) -> impl Widget +
         .with_child(
             sui::Button::new("Delete agent")
                 .icon(sui::IconGlyph::Trash)
-                .theme_when(danger_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Filled)
+                .tone(SemanticTone::Danger)
                 .enabled_when(move || previous_id.is_some())
                 .on_press(move || s.settings_mut().confirm_agent_delete()),
         )
@@ -7184,7 +7215,9 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         let s = shared.clone();
         sui::Button::new("Refresh")
             .icon(sui::IconGlyph::Redo)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press(move || {
                 let selected_node_id = s.settings().module_selected_node_id.clone();
                 queue_settings_operation(
@@ -7651,7 +7684,9 @@ fn section_skills_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         let s = shared.clone();
         sui::Button::new("Refresh")
             .icon(sui::IconGlyph::Redo)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .enabled_when({
                 let s = s.clone();
                 move || !s.settings().domain_pending(SettingsOperationDomain::Skills)
@@ -7896,7 +7931,9 @@ fn skill_detail_section(
         let s = shared.clone();
         sui::Button::new("Export skill")
             .icon(sui::IconGlyph::Download)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .enabled_when({
                 let s = s.clone();
                 move || !s.settings().domain_pending(SettingsOperationDomain::Skills)
@@ -7943,7 +7980,9 @@ fn skill_detail_section(
         } else {
             sui::IconGlyph::ChevronDown
         })
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press(move || s.settings_mut().toggle_skill_text())
     };
     body = body.with_child(
@@ -8065,15 +8104,13 @@ fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widge
     let summary = config_value_summary(&item);
     let summary_label = {
         let s = shared.clone();
-        Label::new(summary)
-            .font_size(settings_meta_size(shared))
+        settings_label(shared, summary, shared.theme().text.sm)
             .color_when(move || palette(&s).text_muted)
     };
     let meta_label = {
         let s = shared.clone();
         let metadata = metadata.clone();
-        Label::new(metadata.clone())
-            .font_size(settings_micro_size(shared))
+        settings_label(shared, metadata.clone(), shared.theme().text.xs)
             .text_when({
                 let s = s.clone();
                 let row_key = row_key.clone();
@@ -8117,7 +8154,9 @@ fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widge
             } else {
                 sui::IconGlyph::ChevronDown
             })
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press(move || s.settings_mut().toggle_advanced_detail(&key))
     };
     let mut details = Stack::vertical()
@@ -8126,8 +8165,7 @@ fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widge
         .with_child(summary_label)
         .with_child(meta_label);
     if !description.is_empty() {
-        details = details
-            .with_child(muted_label(shared, description).font_size(settings_meta_size(shared)));
+        details = details.with_child(muted_meta_label(shared, description));
     }
     details = details.with_child(Stack::horizontal().with_child(disclosure));
     if expanded {
@@ -8176,7 +8214,7 @@ fn config_detail_editor(
     let mut stack = Stack::vertical()
         .spacing(5.0)
         .alignment(Alignment::Stretch)
-        .with_child(muted_label(shared, note).font_size(settings_meta_size(shared)))
+        .with_child(muted_meta_label(shared, note))
         .with_child(SizedBox::new().height(112.0).with_child(editor));
     if editable {
         let save = {
@@ -8184,7 +8222,9 @@ fn config_detail_editor(
             let scope = SettingsOperationScope::ConfigField(draft_key);
             sui::Button::new("Save raw value")
                 .icon(sui::IconGlyph::Check)
-                .theme_when(secondary_button_theme(reader))
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
                 .enabled_when({
                     let s = s.clone();
                     let scope = scope.clone();
@@ -8210,9 +8250,7 @@ fn config_schema_editor(
 ) -> impl Widget + use<> {
     let mut stack = Stack::vertical().spacing(8.0).alignment(Alignment::Stretch);
     if !schema.description.trim().is_empty() {
-        stack = stack.with_child(
-            muted_label(shared, schema.description.clone()).font_size(settings_meta_size(shared)),
-        );
+        stack = stack.with_child(muted_meta_label(shared, schema.description.clone()));
     }
     stack.with_child(PodHost::new(config_schema_value_editor(
         shared,
@@ -8343,14 +8381,12 @@ fn config_schema_map_editor(
     let mut summary_body = Stack::vertical()
         .spacing(4.0)
         .alignment(Alignment::Stretch)
-        .with_child(
-            muted_label(shared, format!("{} entries", entries.len()))
-                .font_size(settings_meta_size(shared)),
-        );
+        .with_child(muted_meta_label(
+            shared,
+            format!("{} entries", entries.len()),
+        ));
     if !description.trim().is_empty() {
-        summary_body = summary_body.with_child(
-            muted_label(shared, description.to_string()).font_size(settings_meta_size(shared)),
-        );
+        summary_body = summary_body.with_child(muted_meta_label(shared, description.to_string()));
     }
     group = group.with_child(
         FormRow::new(label, summary_body)
@@ -8486,10 +8522,7 @@ fn config_schema_primitive_row(
                 .alignment(Alignment::Stretch)
                 .with_child(select);
             if !description.trim().is_empty() {
-                body = body.with_child(
-                    muted_label(shared, description.to_string())
-                        .font_size(settings_meta_size(shared)),
-                );
+                body = body.with_child(muted_meta_label(shared, description.to_string()));
             }
             WidgetPod::new(
                 FormRow::new(label, body)
@@ -8543,7 +8576,9 @@ fn config_schema_primitive_row(
                 let scope = error_key.clone().map(SettingsOperationScope::ConfigField);
                 sui::Button::new("Save")
                     .icon(sui::IconGlyph::Check)
-                    .theme_when(secondary_button_theme(reader))
+                    .theme_when(clone_reader(reader))
+                    .appearance(sui::ButtonAppearance::Tonal)
+                    .tone(SemanticTone::Neutral)
                     .enabled_when({
                         let s = s.clone();
                         let scope = scope.clone();
@@ -8582,8 +8617,7 @@ fn config_schema_primitive_row(
                 .and_then(|key| shared.settings().field_errors.get(&key).cloned())
                 .unwrap_or_else(|| schema_field_detail(schema, description));
             if !detail.trim().is_empty() {
-                body = body
-                    .with_child(muted_label(shared, detail).font_size(settings_meta_size(shared)));
+                body = body.with_child(muted_meta_label(shared, detail));
             }
             WidgetPod::new(
                 FormRow::new(label, body)
@@ -8656,7 +8690,9 @@ fn config_schema_json_row(
         let scope = error_key.clone().map(SettingsOperationScope::ConfigField);
         sui::Button::new("Save JSON")
             .icon(sui::IconGlyph::Check)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .enabled_when({
                 let s = s.clone();
                 let scope = scope.clone();
@@ -8692,7 +8728,7 @@ fn config_schema_json_row(
         .and_then(|key| shared.settings().field_errors.get(key).cloned())
         .unwrap_or_else(|| schema_field_detail(schema, description));
     if !detail.trim().is_empty() {
-        body = body.with_child(muted_label(shared, detail).font_size(settings_meta_size(shared)));
+        body = body.with_child(muted_meta_label(shared, detail));
     }
     WidgetPod::new(
         FormRow::new(label, body)
@@ -9153,17 +9189,10 @@ fn section_list_items(shared: &Shared, with_preview: bool) -> Vec<ListItem> {
 fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let heading = {
         let s = shared.clone();
+        let mut style = settings_text_style(shared, shared.theme().text.xs);
+        style.weight = FontWeight::SEMIBOLD;
         Label::new("SETTINGS")
-            .font_size(settings_micro_size(shared))
-            .style({
-                let theme = shared.theme();
-                sui::TextStyle {
-                    font_size: settings_micro_size(shared),
-                    line_height: theme.text.xs.line_height,
-                    weight: FontWeight::SEMIBOLD,
-                    ..theme.body_text_style()
-                }
-            })
+            .style(style)
             .color_when(move || palette(&s).text_faint)
     };
     let list = {
@@ -9439,86 +9468,91 @@ impl Widget for InsetX {
 }
 
 // ---------------------------------------------------------------------------
-// StatusReflector — live device-login status (custom widget)
+// Live device-login status — composed from stock SUI text/link widgets.
 // ---------------------------------------------------------------------------
 
-/// Renders the device-login status for a provider, live-reading
-/// `shared.settings().device_login` in `paint`. Diffs a status summary on each
-/// `RedrawRequested` to self-invalidate (safety net; the Shell wake handler already requests a
-/// paint on each device-login event). Mirrors the widget-book `WidgetBookSummary` pattern.
-struct StatusReflector {
-    shared: Shared,
-    index: usize,
-    link: WidgetPod,
-    last_seen: RefCell<Option<String>>,
+fn status_reflector(shared: &Shared, index: usize, reader: &ThemeReader) -> impl Widget + use<> {
+    let key_shared = shared.clone();
+    let build_shared = shared.clone();
+    let build_reader = Rc::clone(reader);
+    RebuildOnChange::new(
+        move || device_login_summary(&key_shared, index),
+        move |_| {
+            let theme = build_reader();
+            let pal = palette(&build_shared);
+            let (primary, prompt_url) = device_login_lines(&build_shared, index);
+            let is_error = device_login_is_error(&build_shared, index);
+            let primary_style = sui::TextStyle {
+                font_size: theme.text.sm.size,
+                line_height: theme.text.sm.line_height,
+                weight: FontWeight::MEDIUM,
+                color: if is_error { pal.danger_text } else { pal.text },
+                ..theme.body_text_style()
+            };
+            let mut body = Flex::vertical()
+                .align_items(Alignment::Start)
+                .with_child(sui::Label::new(primary).style(primary_style));
+            if let Some(url) = prompt_url {
+                let link_style = sui::TextStyle {
+                    font_size: theme.text.xs.size,
+                    line_height: theme.text.xs.line_height,
+                    ..theme.text_style(pal.accent_text)
+                };
+                body = body.with_child(
+                    sui::Link::new(url.clone(), url)
+                        .semantic_name("Open login page")
+                        .text_style(link_style)
+                        .theme_when(clone_reader(&build_reader))
+                        .on_open(open_provider_login_url),
+                );
+            }
+            WidgetPod::new(body)
+        },
+    )
 }
 
-impl StatusReflector {
-    fn new(shared: Shared, index: usize, reader: &ThemeReader) -> Self {
-        let label_shared = shared.clone();
-        let url_shared = shared.clone();
-        let link = sui::Link::new("", "")
-            .label_when(move || device_login_prompt_url(&label_shared, index).unwrap_or_default())
-            .url_when(move || device_login_prompt_url(&url_shared, index).unwrap_or_default())
-            .semantic_name("Open login page")
-            .theme_when(clone_reader(reader))
-            .on_open(open_provider_login_url);
-
-        Self {
-            shared,
-            index,
-            link: WidgetPod::new(link),
-            last_seen: RefCell::new(None),
-        }
+fn device_login_summary(shared: &Shared, index: usize) -> String {
+    let settings = shared.settings();
+    let Some(form) = settings.provider_forms.get(index) else {
+        return String::new();
+    };
+    match device_login_status_for(&settings, index) {
+        Some(DeviceLoginStatus::Starting) => "starting".to_string(),
+        Some(DeviceLoginStatus::Prompt {
+            verification_uri,
+            user_code,
+        }) => format!("prompt:{user_code}:{verification_uri}"),
+        Some(DeviceLoginStatus::Done) => "done".to_string(),
+        Some(DeviceLoginStatus::Failed(error)) => format!("failed:{error}"),
+        None if form.signed_in => "signed-in".to_string(),
+        None => "not-signed-in".to_string(),
     }
+}
 
-    /// A short, single-line summary used for change detection.
-    fn summary(&self) -> String {
-        let settings = self.shared.settings();
-        let Some(form) = settings.provider_forms.get(self.index) else {
-            return String::new();
-        };
-        match device_login_status_for(&settings, self.index) {
-            Some(DeviceLoginStatus::Starting) => "starting".to_string(),
-            Some(DeviceLoginStatus::Prompt {
-                verification_uri,
-                user_code,
-            }) => format!("prompt:{user_code}:{verification_uri}"),
-            Some(DeviceLoginStatus::Done) => "done".to_string(),
-            Some(DeviceLoginStatus::Failed(error)) => format!("failed:{error}"),
-            None => {
-                if form.signed_in {
-                    "signed-in".to_string()
-                } else {
-                    "not-signed-in".to_string()
-                }
-            }
-        }
+fn device_login_lines(shared: &Shared, index: usize) -> (String, Option<String>) {
+    let settings = shared.settings();
+    let Some(form) = settings.provider_forms.get(index) else {
+        return (String::new(), None);
+    };
+    match device_login_status_for(&settings, index) {
+        Some(DeviceLoginStatus::Starting) => ("Requesting code…".to_string(), None),
+        Some(DeviceLoginStatus::Prompt {
+            verification_uri,
+            user_code,
+        }) => (format!("Code {user_code}"), Some(verification_uri.clone())),
+        Some(DeviceLoginStatus::Done) => ("Signed in".to_string(), None),
+        Some(DeviceLoginStatus::Failed(error)) => (format!("Failed: {error}"), None),
+        None if form.signed_in => ("Signed in".to_string(), None),
+        None => ("Not signed in".to_string(), None),
     }
+}
 
-    /// The multi-line text to draw: (primary line, optional sub-line).
-    fn lines(&self) -> (String, Option<String>) {
-        let settings = self.shared.settings();
-        let Some(form) = settings.provider_forms.get(self.index) else {
-            return (String::new(), None);
-        };
-        match device_login_status_for(&settings, self.index) {
-            Some(DeviceLoginStatus::Starting) => ("Requesting code…".to_string(), None),
-            Some(DeviceLoginStatus::Prompt {
-                verification_uri,
-                user_code,
-            }) => (format!("Code {user_code}"), Some(verification_uri.clone())),
-            Some(DeviceLoginStatus::Done) => ("Signed in".to_string(), None),
-            Some(DeviceLoginStatus::Failed(error)) => (format!("Failed: {error}"), None),
-            None => {
-                if form.signed_in {
-                    ("Signed in".to_string(), None)
-                } else {
-                    ("Not signed in".to_string(), None)
-                }
-            }
-        }
-    }
+fn device_login_is_error(shared: &Shared, index: usize) -> bool {
+    let settings = shared.settings();
+    matches!(
+        device_login_status_for(&settings, index),
+        Some(DeviceLoginStatus::Failed(_))
+    )
 }
 
 fn device_login_status_for(settings: &SettingsState, index: usize) -> Option<&DeviceLoginStatus> {
@@ -9528,16 +9562,6 @@ fn device_login_status_for(settings: &SettingsState, index: usize) -> Option<&De
         .as_ref()
         .filter(|d| d.provider == form.provider && d.account == form.account)
         .map(|d| &d.status)
-}
-
-fn device_login_prompt_url(shared: &Shared, index: usize) -> Option<String> {
-    let settings = shared.settings();
-    match device_login_status_for(&settings, index)? {
-        DeviceLoginStatus::Prompt {
-            verification_uri, ..
-        } => Some(verification_uri.clone()),
-        _ => None,
-    }
 }
 
 fn open_provider_login_url(url: &str) {
@@ -9592,103 +9616,6 @@ fn open_url_with_system_browser(url: &str) -> Result<(), String> {
 #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
 fn open_url_with_system_browser(_url: &str) -> Result<(), String> {
     Err("opening URLs is not supported on this platform".to_string())
-}
-
-impl Widget for StatusReflector {
-    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        if !matches!(event, Event::Window(WindowEvent::RedrawRequested)) {
-            return;
-        }
-        let summary = self.summary();
-        let mut last = self.last_seen.borrow_mut();
-        if last.as_deref() != Some(summary.as_str()) {
-            *last = Some(summary);
-            ctx.request_measure();
-            ctx.request_arrange();
-            ctx.request_paint();
-            ctx.request_semantics();
-        }
-    }
-
-    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let line_height = self.shared.theme().text.sm.line_height;
-        let width = if constraints.max.width.is_finite() {
-            constraints.max.width
-        } else {
-            240.0
-        };
-        let link_size = self.link.measure(
-            ctx,
-            Constraints::new(Size::ZERO, Size::new(width, line_height)),
-        );
-        let height = line_height
-            + if link_size.height > 0.0 {
-                link_size.height
-            } else {
-                0.0
-            };
-        constraints.clamp(Size::new(width, height))
-    }
-
-    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        let line_height = self.shared.theme().text.sm.line_height;
-        let link_height = self.link.measured_size().height;
-        self.link.arrange(
-            ctx,
-            Rect::new(
-                bounds.x(),
-                bounds.y() + line_height,
-                bounds.width(),
-                link_height,
-            ),
-        );
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        let theme = self.shared.theme();
-        let pal = palette(&self.shared);
-        let bounds = ctx.bounds();
-        let (primary, _sub) = self.lines();
-
-        let primary_color = match self.lines_is_error() {
-            true => pal.danger_text,
-            false => pal.text,
-        };
-        let primary_style = pal.text_style(&theme, 12.0, FontWeight::MEDIUM, primary_color);
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(
-                bounds.x(),
-                bounds.y(),
-                bounds.width(),
-                theme.text.sm.line_height,
-            ),
-            &primary,
-            primary_style,
-        );
-        self.link.paint(ctx);
-    }
-
-    fn semantics(&self, ctx: &mut SemanticsCtx) {
-        self.link.semantics(ctx);
-    }
-
-    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
-        visitor.visit(&self.link);
-    }
-
-    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
-        visitor.visit(&mut self.link);
-    }
-}
-
-impl StatusReflector {
-    fn lines_is_error(&self) -> bool {
-        let settings = self.shared.settings();
-        device_login_status_for(&settings, self.index)
-            .map(|status| matches!(status, DeviceLoginStatus::Failed(_)))
-            .unwrap_or(false)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -12270,26 +12197,6 @@ mod tests {
 
         let error = open_external_url("codex://login").unwrap_err();
         assert!(error.contains("http"));
-    }
-
-    #[test]
-    fn destructive_and_secondary_button_themes_remap_accent_slots() {
-        let reader: ThemeReader = Rc::new(DefaultTheme::light);
-        let base = reader();
-
-        let danger = danger_button_theme(&reader)();
-        assert_eq!(danger.palette.accent, base.palette.danger);
-        assert_eq!(danger.palette.accent_text, base.palette.danger_text);
-        assert_ne!(danger.palette.accent, base.palette.accent);
-
-        let secondary = secondary_button_theme(&reader)();
-        assert_eq!(secondary.palette.accent, base.palette.control);
-        assert_eq!(secondary.palette.accent_hover, base.palette.control_hover);
-        assert_eq!(
-            secondary.palette.accent_pressed,
-            base.palette.control_active
-        );
-        assert_eq!(secondary.palette.accent_text, base.palette.text);
     }
 
     #[test]

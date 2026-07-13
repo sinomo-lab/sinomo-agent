@@ -6,8 +6,8 @@
 //! Like the Settings tab, this is a fully *composed* `sui-widgets` tree: [`view`]
 //! returns a responsive host ([`FilesView`]) over pre-built pods (wide split with
 //! the inspector, narrow list-only), each assembled from stock `Breadcrumb` /
-//! `IconButton` / `VirtualTable` / `ScrollView` / `Separator` / `PanelSection` /
-//! `PropertyRow` / `Label` widgets. State lives entirely in [`FilesState`]; the
+//! `IconButton` / `VirtualTable` / `ScrollView` / `SideSheet` / `PanelSection` /
+//! `DetailRow` / `StatusBadge` widgets. State lives entirely in [`FilesState`]; the
 //! interactive app lists SIFS on a background worker so tab layout never blocks
 //! on DFS metadata or network work.
 //!
@@ -17,7 +17,7 @@
 //! requested through the worker/daemon boundary instead of doing heavy listing
 //! work on the UI path.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
@@ -29,22 +29,20 @@ use std::thread;
 use std::time::Duration;
 
 use sui::{
-    Alignment, ArrangeCtx, Background, Breadcrumb, BreadcrumbItem, CheckboxIndicatorState, Color,
-    CommandButtonPaint, Constraints, ControlSize, DefaultTheme, Dock, EmptyState, Event, EventCtx,
-    FixedPaneSplit, Flex, FlexItem, FlexWrap, FontWeight, HairlineEdge, IconButton, IconGlyph,
-    Insets, Label, LeadingLabelCellPaint, ListItem, ListView, MeasureCtx, PaintCtx,
-    PlacementBadgePaint, Point, PointerButton, PointerEventKind, RebuildOnChange, Rect,
-    ScrollState, ScrollView, SectionLabel, SectionLabelPaint, SectionPanelPaint, SegmentedControl,
-    SegmentedControlItem, SemanticRegion, SemanticTone, SemanticsAction, SemanticsCtx,
-    SemanticsNode, SemanticsRole, Separator, Size, SizedBox, Stack, StackHostOptions, StatusBadge,
-    StatusBar, StatusBarSegment, Surface, SwitchView, TextBlockPaint, TextCellPaint, Tooltip,
+    Alignment, ArrangeCtx, Background, Breadcrumb, BreadcrumbItem, ButtonAppearance,
+    CheckboxIndicatorState, Color, Constraints, ControlSize, DefaultTheme, DetailRow, Dock,
+    EmptyState, Event, EventCtx, FixedPaneSplit, Flex, FlexItem, FlexWrap, FontWeight, IconButton,
+    IconGlyph, Insets, Label, LeadingLabelCellPaint, ListItem, ListView, MeasureCtx, PaintCtx,
+    PanelSection, PlacementBadge, PlacementBadgePaint, PointerEventKind, RebuildOnChange, Rect,
+    RichText, ScrollState, ScrollView, SectionLabel, SegmentedControl, SegmentedControlItem,
+    SemanticRegion, SemanticTone, SemanticsCtx, SemanticsRole, Separator, SideSheet,
+    SideSheetPlacement, Size, SizedBox, Stack, StackHostOptions, StatusBadge, StatusBar,
+    StatusBarSegment, Surface, SurfaceBorder, SurfaceRole, SwitchView, TextCellPaint, Tooltip,
     TooltipPlacement, TrailingSlotRow, VirtualTable, VirtualTableColumn,
     VirtualTableRowActivationKind, VirtualTableRowContext, VirtualTableSortDirection, Widget,
     WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
-    containers::Padding as WidgetPadding, detail_row_height_for_value, paint_checkbox_indicator,
-    paint_command_button, paint_detail_row_at, paint_hairline, paint_leading_label_cell,
-    paint_placement_badge, paint_placement_badge_with, paint_section_label, paint_section_panel,
-    paint_status_badge, paint_text_block, paint_text_cell,
+    containers::Padding as WidgetPadding, paint_checkbox_indicator, paint_leading_label_cell,
+    paint_placement_badge_with, paint_text_cell,
 };
 
 use sinomo_cli::app_api::{
@@ -4631,25 +4629,9 @@ fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     move || reader()
 }
 
-/// Resolve the app chrome palette for the current theme (used by the `Label` color readers and the
-/// `InspectorView` so muted/accent text matches the bespoke chrome).
+/// Resolve the app chrome palette for file rows and preview-specific paint helpers.
 fn palette(shared: &Shared) -> Palette {
     Palette::from_theme(&shared.theme(), widgets::theme_is_dark(shared))
-}
-
-fn secondary_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
-    let reader = Rc::clone(reader);
-    move || {
-        let mut theme = reader();
-        theme.palette.accent = theme.palette.control;
-        theme.palette.accent_hover = theme.palette.control_hover;
-        theme.palette.accent_pressed = theme.palette.control_active;
-        theme.palette.accent_border = theme.palette.border;
-        theme.palette.accent_border_hover = theme.palette.border_hover;
-        theme.palette.accent_border_focus = theme.palette.border_focus;
-        theme.palette.accent_text = theme.palette.text;
-        theme
-    }
 }
 
 fn toolbar_tooltip<W>(text: impl Into<String>, child: W, reader: &ThemeReader) -> Tooltip
@@ -6271,7 +6253,9 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
                 sui::Button::new("Connection settings")
                     .icon(IconGlyph::Alert)
                     .min_width(190.0)
-                    .theme_when(secondary_button_theme(reader))
+                    .theme_when(clone_reader(reader))
+                    .appearance(sui::ButtonAppearance::Tonal)
+                    .tone(SemanticTone::Neutral)
                     .on_press(move || open_settings_section(&s, SettingsSection::Connection)),
             )
         } else {
@@ -6283,7 +6267,9 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
                 sui::Button::new("Browse local files")
                     .icon(IconGlyph::Folder)
                     .min_width(180.0)
-                    .theme_when(secondary_button_theme(reader))
+                    .theme_when(clone_reader(reader))
+                    .appearance(sui::ButtonAppearance::Tonal)
+                    .tone(SemanticTone::Neutral)
                     .on_press(move || {
                         let waker = { s.borrow().waker.clone() };
                         s.files_mut().switch_source(FilesSourceKind::Local, waker);
@@ -7539,7 +7525,9 @@ fn task_strip_clear_button(shared: &Shared, reader: &ThemeReader) -> sui::Button
         .min_width(108.0)
         .min_height(22.0)
         .padding(task_strip_button_padding())
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press_with_ctx(move |ctx| {
             s.files_mut().clear_finished_tasks();
             ctx.request_measure();
@@ -7562,7 +7550,9 @@ fn task_strip_cancel_button(
         .min_width(58.0)
         .min_height(22.0)
         .padding(task_strip_button_padding())
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press_with_ctx(move |ctx| {
             s.files_mut().cancel_task(task_id);
             ctx.request_paint();
@@ -7584,7 +7574,9 @@ fn task_strip_recovery_button(
         .min_width(92.0)
         .min_height(22.0)
         .padding(task_strip_button_padding())
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press_with_ctx(move |ctx| {
             open_settings_section(&s, SettingsSection::Connection);
             ctx.request_measure();
@@ -7782,7 +7774,9 @@ fn inspector_task_clear_button(shared: &Shared, reader: &ThemeReader) -> sui::Bu
         .min_width(108.0)
         .min_height(22.0)
         .padding(task_strip_button_padding())
-        .theme_when(secondary_button_theme(reader))
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
         .on_press_with_ctx(move |ctx| {
             s.files_mut().clear_finished_tasks();
             ctx.request_measure();
@@ -7927,343 +7921,6 @@ fn task_progress_tone(task: &FilesTask) -> SemanticTone {
         FilesTaskState::Completed | FilesTaskState::Cancelled => SemanticTone::Success,
         FilesTaskState::Failed => SemanticTone::Warning,
     }
-}
-
-// ---------------------------------------------------------------------------
-// Inspector details — a live-reading custom widget (selection changes without a path change).
-// ---------------------------------------------------------------------------
-
-/// Renders the SIFS inspector for the *currently selected* entry, live-reading
-/// `shared.files()` in `paint`. Diffs a summary on each `RedrawRequested` to self-invalidate so a
-/// virtual-table selection refreshes the inspector without rebuilding the list. Mirrors the
-/// Settings `StatusReflector` pattern.
-///
-/// The task queue above it is composed from SUI controls. This painter is kept for the dense
-/// selection-specific metadata body because its shape changes with source, metadata loading,
-/// preview state, and disclosure.
-struct InspectorView {
-    shared: Shared,
-    last_seen: RefCell<Option<String>>,
-}
-
-impl InspectorView {
-    fn new(shared: Shared) -> Self {
-        Self {
-            shared,
-            last_seen: RefCell::new(None),
-        }
-    }
-
-    /// A short, single-line summary used for change detection.
-    fn summary(&self) -> String {
-        let files = self.shared.files();
-        if files.loading {
-            return format!(
-                "loading|{:?}|{}|{}",
-                files.source, files.path, files.inspector_details_open
-            );
-        }
-        if let Some(error) = &files.error {
-            return format!(
-                "error|{:?}|{}|{}|{}",
-                files.source, files.path, error, files.inspector_details_open
-            );
-        }
-        match files.selected_entry() {
-            Some(entry) => format!(
-                "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
-                files.source,
-                entry.path,
-                entry.is_dir,
-                entry.is_link,
-                files.clustered,
-                files.details_loading,
-                files.details_error.as_deref().unwrap_or(""),
-                files.preview_loading,
-                files.preview_error.as_deref().unwrap_or(""),
-                files.inspector_details_open,
-                sifs_details_signature(files.selected_details.as_ref()),
-                local_details_signature(files.selected_local_details.as_ref()),
-                files_preview_signature(files.selected_preview.as_ref())
-            ),
-            None => format!(
-                "unselected|{:?}|{}|{}|{}|{}|{}",
-                files.source,
-                files.path,
-                files.clustered,
-                files.entries.len(),
-                files.inspector_details_open,
-                unselected_inspector_health_summary(&files).unwrap_or_default()
-            ),
-        }
-    }
-
-    fn measured_content_height(&self, _ctx: &mut MeasureCtx, width: f32) -> f32 {
-        let w = (width - INSPECTOR_PAD * 2.0).max(0.0);
-        let files = self.shared.files();
-        let mut y = inspector_state_panel_y();
-
-        let finish = |end_y: f32| (end_y + INSPECTOR_BOTTOM_PAD).max(inspector_min_content_h());
-
-        if files.loading {
-            let rows = sifs_loading_rows(
-                &files.path,
-                files.inspector_details_open,
-                files.list_slow_after_secs,
-            );
-            let panel_h = Self::state_panel_height(w, &rows);
-            return finish(y + panel_h);
-        }
-
-        if let Some(error) = &files.error {
-            let rows = sifs_unavailable_rows(error, files.inspector_details_open);
-            let panel_h = Self::state_panel_height(w, &rows);
-            return finish(y + panel_h);
-        }
-
-        let Some(entry) = files.selected_entry() else {
-            let rows = unselected_inspector_rows(&files);
-            let panel_h = Self::state_panel_height(w, &rows);
-            let actions = unselected_inspector_actions(&files);
-            let actions_h = if actions.is_empty() {
-                0.0
-            } else {
-                10.0 + inspector_actions_height(actions.len())
-            };
-            return finish(y + panel_h + actions_h);
-        };
-
-        y += 26.0;
-        y += 34.0;
-
-        let actions = inspector_actions(&files, entry);
-        if !actions.is_empty() {
-            let action_start = inspector_state_panel_y() + 26.0 + 30.0;
-            y = (action_start + inspector_actions_height(actions.len())).max(y) + 12.0;
-        }
-
-        y += Self::info_row_height(w, &entry.path);
-
-        if files.source == FilesSourceKind::Local {
-            y += 10.0 + 24.0;
-            y += 26.0;
-            y += 10.0 + Self::info_row_height(w, "Host filesystem");
-
-            let local = files.selected_local_details.as_ref();
-            if let Some(local) = local {
-                y += 4.0
-                    + Self::info_row_height(
-                        w,
-                        if local.readonly {
-                            "read-only"
-                        } else {
-                            "writable"
-                        },
-                    );
-                if let Some(canonical) = &local.canonical_path
-                    && canonical != &local.path
-                {
-                    y += 4.0 + Self::info_row_height(w, canonical);
-                }
-            } else if let Some(error) = &files.details_error {
-                y += 4.0 + Self::info_row_height(w, error);
-            } else if files.details_loading {
-                y += 4.0 + Self::info_row_height(w, "Reading metadata");
-            }
-
-            if files.inspector_details_open {
-                y += 14.0 + 22.0;
-                if let Some(local) = local {
-                    y += Self::info_row_height(w, &local.kind);
-                    y += 4.0
-                        + Self::info_row_height(w, &local_time_label(local.accessed_at_unix_nanos));
-                    y += 4.0
-                        + Self::info_row_height(w, &local_time_label(local.modified_at_unix_nanos));
-                    y += 4.0
-                        + Self::info_row_height(w, &local_time_label(local.created_at_unix_nanos));
-                }
-            }
-
-            if !entry.is_dir {
-                let preview_error = files
-                    .preview_error
-                    .as_deref()
-                    .map(|error| file_preview_error_display(files.source, error));
-                y += 10.0
-                    + Self::preview_section_height(
-                        w,
-                        files.preview_loading,
-                        preview_error.as_deref(),
-                        files.selected_preview.as_ref(),
-                    );
-            }
-
-            return finish(y);
-        }
-
-        y += 10.0 + 24.0;
-        y += 36.0;
-        y += 26.0;
-
-        let details = files.selected_details.as_ref();
-        let placement = sifs_replication_summary(details, files.clustered);
-        y += 10.0 + Self::info_row_height(w, &placement);
-        let pins = sifs_pin_summary(details);
-        y += 4.0 + Self::info_row_height(w, &pins);
-        let next_step = sifs_inspector_next_step(
-            details,
-            files.clustered,
-            files.details_loading,
-            files.details_error.as_deref(),
-        );
-        y += 4.0 + Self::info_row_height(w, &next_step);
-
-        if files.inspector_details_open {
-            y += 14.0 + 22.0;
-            if let Some(error) = &files.details_error {
-                y += Self::info_row_height(w, error);
-                y += 4.0 + Self::info_row_height(w, "SIFS through daemon");
-            } else if files.details_loading {
-                y += Self::info_row_height(w, "Waiting for daemon metadata");
-            } else if details.is_none() {
-                y += Self::info_row_height(w, "Metadata has not returned for this object yet");
-                y += 4.0 + Self::info_row_height(w, "SIFS through daemon");
-            }
-
-            let policy = details
-                .map(|details| details.policy.as_str())
-                .unwrap_or("not loaded");
-            y += 4.0 + Self::info_row_height(w, policy);
-            let locations = details
-                .map(details_locations)
-                .unwrap_or_else(|| "not reported".to_string());
-            y += 4.0 + Self::info_row_height(w, &locations);
-
-            if let Some(details) = details {
-                y += 4.0 + Self::info_row_height(w, &sifs_pin_detail_summary(details));
-                y += 4.0 + Self::info_row_height(w, &details.file_system_id);
-                y += 4.0 + Self::info_row_height(w, &short(&details.object_id, 28));
-                y += 4.0 + Self::info_row_height(w, &short(&details.version, 28));
-                y += 4.0
-                    + Self::info_row_height(
-                        w,
-                        &format!("{:o} · {} links", details.mode, details.link_count),
-                    );
-                y += 4.0
-                    + Self::info_row_height(
-                        w,
-                        &format!("uid {} · gid {}", details.uid, details.gid),
-                    );
-                y += 4.0
-                    + Self::info_row_height(w, &unix_nanos_label(details.modified_at_unix_nanos));
-                if let Some(hash) = &details.content_hash {
-                    y += 4.0 + Self::info_row_height(w, &short(hash, 28));
-                }
-            }
-        }
-
-        if !files.clustered {
-            let lines = Self::estimated_line_count(
-                "Join a cluster to spread this object across nodes and tune replication.",
-                w,
-                7.0,
-            );
-            y += lines as f32 * 17.0;
-        }
-
-        if !entry.is_dir {
-            let preview_error = files
-                .preview_error
-                .as_deref()
-                .map(|error| file_preview_error_display(files.source, error));
-            y += 10.0
-                + Self::preview_section_height(
-                    w,
-                    files.preview_loading,
-                    preview_error.as_deref(),
-                    files.selected_preview.as_ref(),
-                );
-        }
-
-        finish(y)
-    }
-
-    fn state_panel_height(w: f32, rows: &[(&str, String)]) -> f32 {
-        let value_w = (w - 24.0).max(0.0);
-        44.0 + rows
-            .iter()
-            .map(|(_, value)| {
-                let lines = Self::estimated_line_count(value, value_w, 7.2)
-                    .min(3)
-                    .max(1);
-                14.0 + 2.0 + (lines as f32 * 17.0) + 6.0
-            })
-            .sum::<f32>()
-    }
-
-    fn info_row_height(w: f32, value: &str) -> f32 {
-        let lines = Self::estimated_line_count(value, w, 7.2);
-        18.0 + lines as f32 * 17.0 + 6.0
-    }
-
-    fn estimated_line_count(value: &str, width: f32, avg_char_width: f32) -> usize {
-        let chars_per_line = (width / avg_char_width).floor().max(8.0) as usize;
-        value
-            .split('\n')
-            .map(|line| line.chars().count().max(1).div_ceil(chars_per_line))
-            .sum::<usize>()
-            .max(1)
-    }
-
-    fn preview_section_height(
-        w: f32,
-        loading: bool,
-        error: Option<&str>,
-        preview: Option<&FilesPreview>,
-    ) -> f32 {
-        let inner_w = (w - 24.0).max(0.0);
-        let mut height = 42.0;
-        if loading {
-            return height + 18.0 + 12.0;
-        }
-        if let Some(error) = error {
-            let lines = Self::estimated_line_count(error, inner_w, 7.0).min(3);
-            return height + lines as f32 * 17.0 + 12.0;
-        }
-        let Some(preview) = preview else {
-            return height + 18.0 + 12.0;
-        };
-
-        if preview.binary {
-            let value = preview.lines.join(" ");
-            let lines = Self::estimated_line_count(&value, inner_w, 7.0).min(3);
-            height += lines as f32 * 17.0;
-        } else {
-            for line in preview.lines.iter().take(FILE_PREVIEW_MAX_LINES) {
-                height += Self::estimated_line_count(line, inner_w, 7.0).min(2) as f32 * 17.0;
-            }
-        }
-        if preview.truncated {
-            height += 17.0;
-        }
-        height + 12.0
-    }
-}
-
-const INSPECTOR_PAD: f32 = CONTENT_PAD;
-const INSPECTOR_DETAIL_BUTTON_W: f32 = 104.0;
-const INSPECTOR_DETAIL_BUTTON_H: f32 = 24.0;
-const INSPECTOR_ACTION_BUTTON_H: f32 = 28.0;
-const INSPECTOR_ACTION_GAP: f32 = 8.0;
-const INSPECTOR_BOTTOM_PAD: f32 = 18.0;
-const INSPECTOR_STATE_PANEL_MIN_EXTRA_H: f32 = 170.0;
-
-fn inspector_state_panel_y() -> f32 {
-    0.0
-}
-
-fn inspector_min_content_h() -> f32 {
-    inspector_state_panel_y() + INSPECTOR_STATE_PANEL_MIN_EXTRA_H
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8553,584 +8210,631 @@ fn inspector_detail_button_label(details_open: bool) -> &'static str {
     }
 }
 
-fn inspector_detail_button_rect(bounds: Rect) -> Rect {
-    let content_x = bounds.x() + INSPECTOR_PAD;
-    let content_w = (bounds.width() - INSPECTOR_PAD * 2.0).max(0.0);
-    let button_w = INSPECTOR_DETAIL_BUTTON_W.min((content_w - 24.0).max(0.0));
-    Rect::new(
-        content_x + content_w - 12.0 - button_w,
-        bounds.y() + inspector_state_panel_y() + 8.0,
-        button_w,
-        INSPECTOR_DETAIL_BUTTON_H,
-    )
+// ---------------------------------------------------------------------------
+// Composed inspector — stock controls own generic chrome, focus, and semantics.
+// ---------------------------------------------------------------------------
+
+/// The interactive Files inspector is rebuilt from a compact state signature. Generic cards,
+/// fields, badges, and actions are composed from SUI widgets; only the file-list and placement
+/// data remain app-owned.
+struct InspectorView {
+    child: WidgetPod,
 }
 
-fn inspector_detail_button_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
-    sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(7_401))
-}
-
-fn inspector_details_available(files: &FilesState) -> bool {
-    files.loading
-        || files.error.is_some()
-        || files.selected_entry().is_some()
-        || files.source == FilesSourceKind::Sifs
-}
-
-fn inspector_actions_origin_y(bounds: Rect) -> f32 {
-    bounds.y() + inspector_state_panel_y() + 26.0 + 30.0
-}
-
-fn inspector_action_button_rect(bounds: Rect, index: usize) -> Rect {
-    let content_x = bounds.x() + INSPECTOR_PAD;
-    let content_w = (bounds.width() - INSPECTOR_PAD * 2.0).max(0.0);
-    let col_w = ((content_w - INSPECTOR_ACTION_GAP) * 0.5).max(0.0);
-    let col = index % 2;
-    let row = index / 2;
-    Rect::new(
-        content_x + col as f32 * (col_w + INSPECTOR_ACTION_GAP),
-        inspector_actions_origin_y(bounds)
-            + row as f32 * (INSPECTOR_ACTION_BUTTON_H + INSPECTOR_ACTION_GAP),
-        col_w,
-        INSPECTOR_ACTION_BUTTON_H,
-    )
-}
-
-fn root_inspector_action_button_rect(
-    bounds: Rect,
-    rows: &[(&'static str, String)],
-    index: usize,
-) -> Rect {
-    let content_x = bounds.x() + INSPECTOR_PAD;
-    let content_w = (bounds.width() - INSPECTOR_PAD * 2.0).max(0.0);
-    let col_w = ((content_w - INSPECTOR_ACTION_GAP) * 0.5).max(0.0);
-    let panel_y = bounds.y() + inspector_state_panel_y();
-    let action_y = panel_y + InspectorView::state_panel_height(content_w, rows) + 10.0;
-    let col = index % 2;
-    let row = index / 2;
-    Rect::new(
-        content_x + col as f32 * (col_w + INSPECTOR_ACTION_GAP),
-        action_y + row as f32 * (INSPECTOR_ACTION_BUTTON_H + INSPECTOR_ACTION_GAP),
-        col_w,
-        INSPECTOR_ACTION_BUTTON_H,
-    )
-}
-
-fn inspector_actions_height(action_count: usize) -> f32 {
-    if action_count == 0 {
-        return 0.0;
+impl InspectorView {
+    fn new(shared: Shared) -> Self {
+        let reader: ThemeReader = {
+            let s = shared.clone();
+            Rc::new(move || s.theme().with_size(ControlSize::Small))
+        };
+        let key_shared = shared.clone();
+        let build_shared = shared.clone();
+        let build_reader = Rc::clone(&reader);
+        let child = RebuildOnChange::new(
+            move || inspector_summary(&key_shared),
+            move |_key| composed_inspector_content(&build_shared, &build_reader),
+        );
+        Self {
+            child: WidgetPod::new(child),
+        }
     }
-    let rows = action_count.div_ceil(2) as f32;
-    rows * INSPECTOR_ACTION_BUTTON_H + (rows - 1.0) * INSPECTOR_ACTION_GAP
-}
-
-fn inspector_action_button_widget_id(
-    parent: sui::WidgetId,
-    action: InspectorAction,
-) -> sui::WidgetId {
-    let salt = match action {
-        InspectorAction::OpenFolder => 7_497,
-        InspectorAction::Copy => 7_511,
-        InspectorAction::CopyIdentifiers => 7_513,
-        InspectorAction::CopyToSifs => 7_515,
-        InspectorAction::CopyToLocal => 7_519,
-        InspectorAction::Move => 7_523,
-        InspectorAction::Rename => 7_541,
-        InspectorAction::Delete => 7_553,
-        InspectorAction::RefreshPlacement => 7_571,
-        InspectorAction::RepairReplicas => 7_579,
-        InspectorAction::MakeMetadataPrimary => 7_581,
-        InspectorAction::PinMetadata => 7_583,
-        InspectorAction::UnpinMetadata => 7_585,
-        InspectorAction::PinContent => 7_587,
-        InspectorAction::UnpinContent => 7_599,
-        InspectorAction::ConnectionSettings => 7_603,
-    };
-    sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(salt))
-}
-
-fn root_inspector_action_button_widget_id(
-    parent: sui::WidgetId,
-    action: RootInspectorAction,
-) -> sui::WidgetId {
-    let salt = match action {
-        RootInspectorAction::RefreshFolder => 7_701,
-        RootInspectorAction::RepairReplicas => 7_702,
-        RootInspectorAction::OpenCluster => 7_703,
-        RootInspectorAction::ConnectionSettings => 7_707,
-    };
-    sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(salt))
 }
 
 impl Widget for InspectorView {
-    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        if let Event::Pointer(pointer) = event
-            && pointer.kind == PointerEventKind::Up
-            && pointer.button == Some(PointerButton::Primary)
-        {
-            let root_action = {
-                let files = self.shared.files();
-                if files.selected_entry().is_none() && !files.loading && files.error.is_none() {
-                    let rows = unselected_inspector_rows(&files);
-                    unselected_inspector_actions(&files)
-                        .into_iter()
-                        .enumerate()
-                        .find(|(index, _)| {
-                            root_inspector_action_button_rect(ctx.bounds(), &rows, *index)
-                                .contains(pointer.position)
-                        })
-                        .map(|(_, action)| action)
-                } else {
-                    None
-                }
-            };
-            if let Some(action) = root_action {
-                match action {
-                    RootInspectorAction::RefreshFolder => {
-                        self.shared.files_mut().reload();
-                        request_files_overlay_rebuild(ctx);
-                    }
-                    RootInspectorAction::RepairReplicas => {
-                        let waker = { self.shared.borrow().waker.clone() };
-                        self.shared
-                            .files_mut()
-                            .start_current_location_replica_repair(waker);
-                        request_files_overlay_rebuild(ctx);
-                    }
-                    RootInspectorAction::OpenCluster => {
-                        open_cluster_tab(&self.shared);
-                        ctx.request_measure();
-                    }
-                    RootInspectorAction::ConnectionSettings => {
-                        open_settings_section(&self.shared, SettingsSection::Connection);
-                        ctx.request_measure();
-                    }
-                }
-                ctx.request_paint();
-                ctx.request_semantics();
-                ctx.set_handled();
-                return;
-            }
-
-            let selected_action = {
-                let files = self.shared.files();
-                files.selected_entry().cloned().and_then(|entry| {
-                    inspector_actions(&files, &entry)
-                        .into_iter()
-                        .enumerate()
-                        .find(|(index, _)| {
-                            inspector_action_button_rect(ctx.bounds(), *index)
-                                .contains(pointer.position)
-                        })
-                        .map(|(_, action)| (action, entry.path))
-                })
-            };
-            if let Some((action, path)) = selected_action {
-                match action {
-                    InspectorAction::OpenFolder => {
-                        self.shared.files_mut().navigate(path);
-                        ctx.request_measure();
-                    }
-                    InspectorAction::RefreshPlacement => {
-                        let waker = { self.shared.borrow().waker.clone() };
-                        self.shared.files_mut().start_placement_refresh(waker);
-                        request_files_overlay_rebuild(ctx);
-                    }
-                    InspectorAction::RepairReplicas => {
-                        let waker = { self.shared.borrow().waker.clone() };
-                        self.shared.files_mut().start_replica_repair(waker);
-                        request_files_overlay_rebuild(ctx);
-                    }
-                    InspectorAction::MakeMetadataPrimary => {
-                        let waker = { self.shared.borrow().waker.clone() };
-                        self.shared.files_mut().start_make_metadata_primary(waker);
-                        request_files_overlay_rebuild(ctx);
-                    }
-                    InspectorAction::PinMetadata => {
-                        let waker = { self.shared.borrow().waker.clone() };
-                        self.shared.files_mut().start_pin_metadata(waker);
-                        request_files_overlay_rebuild(ctx);
-                    }
-                    InspectorAction::UnpinMetadata => {
-                        let waker = { self.shared.borrow().waker.clone() };
-                        self.shared.files_mut().start_unpin_metadata(waker);
-                        request_files_overlay_rebuild(ctx);
-                    }
-                    InspectorAction::PinContent => {
-                        let waker = { self.shared.borrow().waker.clone() };
-                        self.shared.files_mut().start_pin_content(waker);
-                        request_files_overlay_rebuild(ctx);
-                    }
-                    InspectorAction::UnpinContent => {
-                        let waker = { self.shared.borrow().waker.clone() };
-                        self.shared.files_mut().start_unpin_content(waker);
-                        request_files_overlay_rebuild(ctx);
-                    }
-                    InspectorAction::ConnectionSettings => {
-                        open_settings_section(&self.shared, SettingsSection::Connection);
-                        ctx.request_measure();
-                    }
-                    InspectorAction::CopyIdentifiers => {
-                        let value = {
-                            let files = self.shared.files();
-                            files
-                                .selected_details
-                                .as_ref()
-                                .map(sifs_identifiers_for_clipboard)
-                        };
-                        if let Some(value) = value {
-                            ctx.set_clipboard_text(value);
-                        }
-                    }
-                    InspectorAction::Copy
-                    | InspectorAction::CopyToSifs
-                    | InspectorAction::CopyToLocal
-                    | InspectorAction::Move
-                    | InspectorAction::Rename
-                    | InspectorAction::Delete => {
-                        if let Some(kind) = action.prompt_kind() {
-                            self.shared.files_mut().open_action_prompt(kind);
-                            request_files_overlay_rebuild(ctx);
-                        }
-                    }
-                }
-                ctx.request_paint();
-                ctx.request_semantics();
-                ctx.set_handled();
-                return;
-            }
-
-            let details_hit = {
-                let files = self.shared.files();
-                inspector_details_available(&files)
-                    && inspector_detail_button_rect(ctx.bounds()).contains(pointer.position)
-            };
-            if details_hit {
-                let details_open = self.shared.files().inspector_details_open;
-                self.shared.files_mut().inspector_details_open = !details_open;
-                ctx.request_measure();
-                ctx.request_paint();
-                ctx.request_semantics();
-                ctx.set_handled();
-                return;
-            }
-        }
-
-        if matches!(event, Event::Window(WindowEvent::RedrawRequested)) {
-            let summary = self.summary();
-            let mut last = self.last_seen.borrow_mut();
-            if last.as_deref() != Some(summary.as_str()) {
-                *last = Some(summary);
-                ctx.request_paint();
-                ctx.request_semantics();
-            }
-        }
-    }
+    fn event(&mut self, _ctx: &mut EventCtx, _event: &Event) {}
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let width = if constraints.max.width.is_finite() {
-            constraints.max.width
-        } else {
-            INSPECTOR_W
-        };
-        let height = self.measured_content_height(ctx, width);
-        constraints.clamp(Size::new(width, height))
+        self.child.measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
-        let theme = self.shared.theme();
-        let pal = palette(&self.shared);
-        let files = self.shared.files();
-        let bounds = ctx.bounds();
+        self.child.paint(ctx);
+    }
 
-        // Sidebar surface + left hairline (matches the surrounding inspector chrome).
-        ctx.fill_rect(bounds, pal.sidebar);
-        paint_hairline(ctx, bounds, HairlineEdge::Left, pal.border);
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
+    }
 
-        let x = bounds.x() + INSPECTOR_PAD;
-        let w = (bounds.width() - INSPECTOR_PAD * 2.0).max(0.0);
-        let mut y = bounds.y();
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
 
-        if files.loading {
-            let details_open = files.inspector_details_open;
-            let rows = sifs_loading_rows(&files.path, details_open, files.list_slow_after_secs);
-            self.state_panel(
-                ctx,
-                &theme,
-                &pal,
-                x,
-                y,
-                w,
-                "Loading SIFS",
-                &rows,
-                Some(details_open),
-            );
-            return;
-        }
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
+}
 
-        if let Some(error) = &files.error {
-            let details_open = files.inspector_details_open;
-            let rows = sifs_unavailable_rows(error, details_open);
-            self.state_panel(
-                ctx,
-                &theme,
-                &pal,
-                x,
-                y,
-                w,
-                "SIFS unavailable",
-                &rows,
-                Some(details_open),
-            );
-            return;
-        }
-
-        let Some(entry) = files.selected_entry() else {
-            let rows = unselected_inspector_rows(&files);
-            let actions = unselected_inspector_actions(&files);
-            let details_open =
-                (files.source == FilesSourceKind::Sifs).then_some(files.inspector_details_open);
-            self.state_panel(
-                ctx,
-                &theme,
-                &pal,
-                x,
-                y,
-                w,
-                unselected_inspector_title(files.source),
-                &rows,
-                details_open,
-            );
-            if !actions.is_empty() {
-                self.root_action_buttons(ctx, &theme, &pal, bounds, &rows, &actions);
-            }
-            return;
-        };
-
-        let details = files.selected_details.as_ref();
-
-        // Name + kind.
-        let details_open = files.inspector_details_open;
-        let detail_rect = inspector_detail_button_rect(bounds);
-        self.detail_button(ctx, &theme, detail_rect, details_open);
-        let title_right_gap = INSPECTOR_DETAIL_BUTTON_W + 10.0;
-        let title_rect = Rect::new(x, y, (w - title_right_gap).max(0.0), 24.0);
-        let display_name = display_name_for_width(&entry.name, title_rect.width(), 8.8);
-        paint_text_block(
-            ctx,
-            &theme,
-            title_rect,
-            &display_name,
-            TextBlockPaint::new()
-                .text_token(theme.text.xl)
-                .color(pal.text)
-                .weight(FontWeight::SEMIBOLD),
+fn inspector_summary(shared: &Shared) -> String {
+    let files = shared.files();
+    if files.loading {
+        return format!(
+            "loading|{:?}|{}|{}|{:?}",
+            files.source, files.path, files.inspector_details_open, files.list_slow_after_secs
         );
-        y += 26.0;
-        let kind = details
-            .map(|details| details.kind.as_str())
-            .unwrap_or_else(|| {
-                if entry.is_dir {
-                    "directory"
-                } else if entry.is_link {
-                    "symlink"
-                } else {
-                    "file"
-                }
-            });
-        let kind_line = if files.source == FilesSourceKind::Sifs {
-            sifs_compact_header_line(
-                entry,
-                details,
-                files.clustered,
-                files.details_loading,
-                files.details_error.as_deref(),
-            )
+    }
+    if let Some(error) = &files.error {
+        return format!(
+            "error|{:?}|{}|{}|{}",
+            files.source, files.path, error, files.inspector_details_open
+        );
+    }
+    match files.selected_entry() {
+        Some(entry) => format!(
+            "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            files.source,
+            entry.path,
+            entry.is_dir,
+            entry.is_link,
+            files.clustered,
+            files.details_loading,
+            files.details_error.as_deref().unwrap_or(""),
+            files.preview_loading,
+            files.preview_error.as_deref().unwrap_or(""),
+            files.inspector_details_open,
+            sifs_details_signature(files.selected_details.as_ref()),
+            local_details_signature(files.selected_local_details.as_ref()),
+            files_preview_signature(files.selected_preview.as_ref())
+        ),
+        None => format!(
+            "unselected|{:?}|{}|{}|{}|{}|{}",
+            files.source,
+            files.path,
+            files.clustered,
+            files.entries.len(),
+            files.inspector_details_open,
+            unselected_inspector_health_summary(&files).unwrap_or_default()
+        ),
+    }
+}
+
+fn detail_rows_widget(
+    rows: impl IntoIterator<Item = (&'static str, String)>,
+    reader: &ThemeReader,
+) -> Stack {
+    let mut body = Stack::vertical().alignment(Alignment::Stretch).spacing(4.0);
+    for (label, value) in rows {
+        body = body.with_child(
+            DetailRow::new(label, value)
+                .theme_when(clone_reader(reader))
+                .max_value_lines(6),
+        );
+    }
+    body
+}
+
+fn inspector_card<W>(
+    title: impl Into<String>,
+    child: W,
+    reader: &ThemeReader,
+    header_action: Option<sui::Button>,
+    prominent_title: bool,
+) -> Surface
+where
+    W: Widget + 'static,
+{
+    let theme = reader();
+    let mut section = PanelSection::new(title, child)
+        .theme_when(clone_reader(reader))
+        .gap(10.0);
+    if prominent_title {
+        let mut title_style = theme.text_style(theme.palette.text);
+        title_style.font_size = theme.text.xl.size;
+        title_style.line_height = theme.text.xl.line_height;
+        title_style.weight = FontWeight::SEMIBOLD;
+        section = section.title_style(title_style);
+    }
+    if let Some(action) = header_action {
+        section = section.header_action(action);
+    }
+    Surface::panel(section)
+        .theme_when(clone_reader(reader))
+        .padding(Insets {
+            left: 12.0,
+            top: 10.0,
+            right: 12.0,
+            bottom: 12.0,
+        })
+        .fill_width()
+}
+
+fn inspector_details_button(
+    shared: &Shared,
+    reader: &ThemeReader,
+    details_open: bool,
+) -> sui::Button {
+    let label = inspector_detail_button_label(details_open);
+    let s = shared.clone();
+    sui::Button::new(label)
+        .semantic_name(label)
+        .description("File storage metadata and diagnostics")
+        .icon(if details_open {
+            IconGlyph::ChevronUp
         } else {
-            format!("{kind} · {}", details_size(entry, details))
+            IconGlyph::ChevronDown
+        })
+        .appearance(ButtonAppearance::Ghost)
+        .tone(SemanticTone::Accent)
+        .min_height(24.0)
+        .theme_when(clone_reader(reader))
+        .on_press_with_ctx(move |ctx| {
+            let open = s.files().inspector_details_open;
+            s.files_mut().inspector_details_open = !open;
+            request_files_overlay_rebuild(ctx);
+        })
+}
+
+fn root_inspector_buttons(
+    shared: &Shared,
+    reader: &ThemeReader,
+    actions: Vec<RootInspectorAction>,
+) -> Flex {
+    let mut row = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(8.0)
+        .align_items(Alignment::Center);
+    for action in actions {
+        let s = shared.clone();
+        let (appearance, tone) = match action {
+            RootInspectorAction::RefreshFolder | RootInspectorAction::OpenCluster => {
+                (ButtonAppearance::Outline, SemanticTone::Neutral)
+            }
+            RootInspectorAction::RepairReplicas => (ButtonAppearance::Tonal, SemanticTone::Accent),
+            RootInspectorAction::ConnectionSettings => {
+                (ButtonAppearance::Tonal, SemanticTone::Warning)
+            }
         };
-        let kind_width = if files.source == FilesSourceKind::Sifs {
-            title_rect.width()
-        } else {
-            w
+        row = row.with_child(
+            sui::Button::new(action.label())
+                .semantic_name(action.label())
+                .description(action.description())
+                .icon(action.glyph())
+                .appearance(appearance)
+                .tone(tone)
+                .min_width(132.0)
+                .theme_when(clone_reader(reader))
+                .on_press_with_ctx(move |ctx| {
+                    activate_root_inspector_action(&s, action, ctx);
+                }),
+        );
+    }
+    row
+}
+
+fn activate_root_inspector_action(
+    shared: &Shared,
+    action: RootInspectorAction,
+    ctx: &mut EventCtx,
+) {
+    match action {
+        RootInspectorAction::RefreshFolder => shared.files_mut().reload(),
+        RootInspectorAction::RepairReplicas => {
+            let waker = { shared.borrow().waker.clone() };
+            shared
+                .files_mut()
+                .start_current_location_replica_repair(waker);
+        }
+        RootInspectorAction::OpenCluster => open_cluster_tab(shared),
+        RootInspectorAction::ConnectionSettings => {
+            open_settings_section(shared, SettingsSection::Connection);
+        }
+    }
+    request_files_overlay_rebuild(ctx);
+}
+
+fn inspector_action_description(action: InspectorAction, entry: &SifsEntry) -> String {
+    match action {
+        InspectorAction::OpenFolder => format!("Open {}", entry.path),
+        InspectorAction::RefreshPlacement => {
+            format!("Refresh SIFS placement metadata for {}", entry.path)
+        }
+        InspectorAction::RepairReplicas => {
+            format!("Request SIFS replica repair for {}", entry.path)
+        }
+        InspectorAction::MakeMetadataPrimary => format!(
+            "Transfer the SIFS metadata shard primary for {} to this node",
+            entry.path
+        ),
+        InspectorAction::PinMetadata => {
+            format!("Pin SIFS metadata on this node for {}", entry.path)
+        }
+        InspectorAction::UnpinMetadata => {
+            format!("Remove this node's SIFS metadata pin for {}", entry.path)
+        }
+        InspectorAction::PinContent => {
+            format!("Pin SIFS content on this node for {}", entry.path)
+        }
+        InspectorAction::UnpinContent => {
+            format!("Remove this node's SIFS content pin for {}", entry.path)
+        }
+        InspectorAction::ConnectionSettings => {
+            "Open Connection settings for SIFS authorization and daemon recovery".to_string()
+        }
+        InspectorAction::CopyToSifs => format!("Copy local {} into SIFS", entry.path),
+        InspectorAction::CopyToLocal => format!("Download SIFS {} to a local path", entry.path),
+        InspectorAction::Copy => format!("Copy {}", entry.path),
+        InspectorAction::CopyIdentifiers => format!(
+            "Copy the full SIFS object, version, and hash IDs for {}",
+            entry.path
+        ),
+        InspectorAction::Move => format!("Move {}", entry.path),
+        InspectorAction::Rename => format!("Rename {}", entry.path),
+        InspectorAction::Delete => format!("Delete {}", entry.path),
+    }
+}
+
+fn inspector_buttons(
+    shared: &Shared,
+    reader: &ThemeReader,
+    entry: &SifsEntry,
+    actions: Vec<InspectorAction>,
+) -> Flex {
+    let mut row = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(8.0)
+        .align_items(Alignment::Center);
+    for action in actions {
+        let s = shared.clone();
+        let action_entry = entry.clone();
+        let path = entry.path.clone();
+        let (appearance, tone) = match action {
+            InspectorAction::OpenFolder => (ButtonAppearance::Filled, SemanticTone::Accent),
+            InspectorAction::Delete => (ButtonAppearance::Tonal, SemanticTone::Danger),
+            InspectorAction::RefreshPlacement
+            | InspectorAction::RepairReplicas
+            | InspectorAction::MakeMetadataPrimary
+            | InspectorAction::PinMetadata
+            | InspectorAction::UnpinMetadata
+            | InspectorAction::PinContent
+            | InspectorAction::UnpinContent
+            | InspectorAction::ConnectionSettings
+            | InspectorAction::CopyToSifs
+            | InspectorAction::CopyToLocal => (ButtonAppearance::Tonal, SemanticTone::Accent),
+            InspectorAction::Copy
+            | InspectorAction::CopyIdentifiers
+            | InspectorAction::Move
+            | InspectorAction::Rename => (ButtonAppearance::Outline, SemanticTone::Neutral),
         };
-        paint_text_block(
-            ctx,
-            &theme,
-            Rect::new(x, y, kind_width, 20.0),
-            &display_name_for_width(&kind_line, kind_width, 6.8),
-            TextBlockPaint::new()
-                .text_token(theme.text.sm)
-                .color(pal.text_muted),
+        row = row.with_child(
+            sui::Button::new(action.label())
+                .semantic_name(action.semantic_name(entry))
+                .description(inspector_action_description(action, entry))
+                .icon(action.glyph())
+                .appearance(appearance)
+                .tone(tone)
+                .min_width(132.0)
+                .theme_when(clone_reader(reader))
+                .on_press_with_ctx(move |ctx| {
+                    activate_inspector_action(&s, action, &action_entry, &path, ctx);
+                }),
         );
-        y += 34.0;
+    }
+    row
+}
 
-        let actions = inspector_actions(&files, entry);
-        if !actions.is_empty() {
-            self.action_buttons(ctx, &theme, &pal, bounds, &actions);
-            let actions_bottom =
-                inspector_actions_origin_y(bounds) + inspector_actions_height(actions.len());
-            y = actions_bottom.max(y) + 12.0;
+fn activate_inspector_action(
+    shared: &Shared,
+    action: InspectorAction,
+    _entry: &SifsEntry,
+    path: &str,
+    ctx: &mut EventCtx,
+) {
+    match action {
+        InspectorAction::OpenFolder => shared.files_mut().navigate(path.to_string()),
+        InspectorAction::RefreshPlacement => {
+            let waker = { shared.borrow().waker.clone() };
+            shared.files_mut().start_placement_refresh(waker);
         }
-
-        y = self.info_row(ctx, &theme, &pal, x, y, w, "Path", &entry.path);
-
-        if files.source == FilesSourceKind::Local {
-            y += 10.0;
-            paint_section_label(
-                ctx,
-                &theme,
-                Rect::new(x, y, w, 16.0),
-                "Local file",
-                SectionLabelPaint::new().color(pal.text_faint),
-            );
-            y += 24.0;
-
-            let local = files.selected_local_details.as_ref();
-            let status_label = local_metadata_status_label(
-                files.details_loading,
-                files.details_error.as_deref(),
-                local,
-            );
-            let status_tone = local_metadata_status_tone(
-                files.details_loading,
-                files.details_error.as_deref(),
-                local,
-            );
-            y = self.status_badge(ctx, &theme, x, y, w, status_label, status_tone);
-            y = self.info_row(
-                ctx,
-                &theme,
-                &pal,
-                x,
-                y + 10.0,
-                w,
-                "Source",
-                "Host filesystem",
-            );
-            if let Some(local) = local {
-                y = self.info_row(
-                    ctx,
-                    &theme,
-                    &pal,
-                    x,
-                    y + 4.0,
-                    w,
-                    "Permissions",
-                    if local.readonly {
-                        "read-only"
-                    } else {
-                        "writable"
-                    },
-                );
-                if let Some(canonical) = &local.canonical_path
-                    && canonical != &local.path
-                {
-                    y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Canonical", canonical);
-                }
-            } else if let Some(error) = &files.details_error {
-                y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Reason", error);
-            } else if files.details_loading {
-                y = self.info_row(
-                    ctx,
-                    &theme,
-                    &pal,
-                    x,
-                    y + 4.0,
-                    w,
-                    "Status",
-                    "Reading metadata",
-                );
-            }
-
-            if details_open {
-                y += 14.0;
-                paint_section_label(
-                    ctx,
-                    &theme,
-                    Rect::new(x, y, w, 16.0),
-                    "Technical details",
-                    SectionLabelPaint::new().color(pal.text_faint),
-                );
-                y += 22.0;
-                if let Some(local) = local {
-                    y = self.info_row(ctx, &theme, &pal, x, y, w, "Kind", &local.kind);
-                    y = self.info_row(
-                        ctx,
-                        &theme,
-                        &pal,
-                        x,
-                        y + 4.0,
-                        w,
-                        "Accessed",
-                        &local_time_label(local.accessed_at_unix_nanos),
-                    );
-                    y = self.info_row(
-                        ctx,
-                        &theme,
-                        &pal,
-                        x,
-                        y + 4.0,
-                        w,
-                        "Modified",
-                        &local_time_label(local.modified_at_unix_nanos),
-                    );
-                    let _ = self.info_row(
-                        ctx,
-                        &theme,
-                        &pal,
-                        x,
-                        y + 4.0,
-                        w,
-                        "Created",
-                        &local_time_label(local.created_at_unix_nanos),
-                    );
-                }
-            }
-
-            if !entry.is_dir {
-                y += 10.0;
-                let preview_error = files
-                    .preview_error
-                    .as_deref()
-                    .map(|error| file_preview_error_display(files.source, error));
-                let _ = self.preview_section(
-                    ctx,
-                    &theme,
-                    &pal,
-                    x,
-                    y,
-                    w,
-                    files.preview_loading,
-                    preview_error.as_deref(),
-                    files.selected_preview.as_ref(),
-                );
-            }
-            return;
+        InspectorAction::RepairReplicas => {
+            let waker = { shared.borrow().waker.clone() };
+            shared.files_mut().start_replica_repair(waker);
         }
+        InspectorAction::MakeMetadataPrimary => {
+            let waker = { shared.borrow().waker.clone() };
+            shared.files_mut().start_make_metadata_primary(waker);
+        }
+        InspectorAction::PinMetadata => {
+            let waker = { shared.borrow().waker.clone() };
+            shared.files_mut().start_pin_metadata(waker);
+        }
+        InspectorAction::UnpinMetadata => {
+            let waker = { shared.borrow().waker.clone() };
+            shared.files_mut().start_unpin_metadata(waker);
+        }
+        InspectorAction::PinContent => {
+            let waker = { shared.borrow().waker.clone() };
+            shared.files_mut().start_pin_content(waker);
+        }
+        InspectorAction::UnpinContent => {
+            let waker = { shared.borrow().waker.clone() };
+            shared.files_mut().start_unpin_content(waker);
+        }
+        InspectorAction::ConnectionSettings => {
+            open_settings_section(shared, SettingsSection::Connection);
+        }
+        InspectorAction::CopyIdentifiers => {
+            let value = shared
+                .files()
+                .selected_details
+                .as_ref()
+                .map(sifs_identifiers_for_clipboard);
+            if let Some(value) = value {
+                ctx.set_clipboard_text(value);
+            }
+        }
+        InspectorAction::Copy
+        | InspectorAction::CopyToSifs
+        | InspectorAction::CopyToLocal
+        | InspectorAction::Move
+        | InspectorAction::Rename
+        | InspectorAction::Delete => {
+            if let Some(kind) = action.prompt_kind() {
+                shared.files_mut().open_action_prompt(kind);
+            }
+        }
+    }
+    request_files_overlay_rebuild(ctx);
+}
 
-        // Placement section.
-        y += 10.0;
-        paint_section_label(
-            ctx,
-            &theme,
-            Rect::new(x, y, w, 16.0),
-            "Placement",
-            SectionLabelPaint::new().color(pal.text_faint),
-        );
-        y += 24.0;
-
-        let node_label = short_node_label(&files.node_id);
-        paint_placement_badge(
-            ctx,
-            &theme,
-            Rect::new(x, y, w, 26.0),
-            &node_label,
-            Some(IconGlyph::Storage),
+fn preview_card(
+    source: FilesSourceKind,
+    loading: bool,
+    error: Option<&str>,
+    preview: Option<&FilesPreview>,
+    reader: &ThemeReader,
+) -> Surface {
+    let theme = reader();
+    let mut body = Stack::vertical().alignment(Alignment::Stretch).spacing(8.0);
+    let (badge, badge_tone, text, muted) = if loading {
+        (
+            "Reading preview",
             SemanticTone::Accent,
+            "Reading a bounded preview from the selected source".to_string(),
             None,
-        );
-        y += 36.0;
+        )
+    } else if let Some(error) = error {
+        (
+            "Preview unavailable",
+            SemanticTone::Warning,
+            file_preview_error_display(source, error),
+            None,
+        )
+    } else if let Some(preview) = preview {
+        let text = if preview.binary {
+            preview.lines.join(" ")
+        } else {
+            preview
+                .lines
+                .iter()
+                .take(FILE_PREVIEW_MAX_LINES)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        (
+            if preview.binary {
+                "Binary preview"
+            } else {
+                "Text preview"
+            },
+            SemanticTone::Neutral,
+            text,
+            preview
+                .truncated
+                .then(|| format!("Preview truncated to {} KB.", FILE_PREVIEW_MAX_BYTES / 1024)),
+        )
+    } else {
+        (
+            "Preview pending",
+            SemanticTone::Neutral,
+            "Preview has not loaded yet".to_string(),
+            None,
+        )
+    };
+    body = body.with_child(
+        StatusBadge::new(badge)
+            .tone(badge_tone)
+            .theme_when(clone_reader(reader)),
+    );
+    let mut body_style = theme.text_style(theme.palette.text);
+    body_style.font_size = theme.text.sm.size;
+    body_style.line_height = theme.text.sm.line_height;
+    body = body.with_child(RichText::from_plain_text(text, body_style));
+    if let Some(muted) = muted {
+        let mut muted_style = theme.text_style(theme.palette.text_muted);
+        muted_style.font_size = theme.text.xs.size;
+        muted_style.line_height = theme.text.xs.line_height;
+        body = body.with_child(RichText::from_plain_text(muted, muted_style));
+    }
+    inspector_card("Preview", body, reader, None, false)
+}
 
+fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let files = shared.files();
+    let details_button = || inspector_details_button(shared, reader, files.inspector_details_open);
+
+    if files.loading {
+        let rows = sifs_loading_rows(
+            &files.path,
+            files.inspector_details_open,
+            files.list_slow_after_secs,
+        );
+        return WidgetPod::new(inspector_card(
+            "Loading SIFS",
+            detail_rows_widget(rows, reader),
+            reader,
+            Some(details_button()),
+            false,
+        ));
+    }
+
+    if let Some(error) = &files.error {
+        let rows = sifs_unavailable_rows(error, files.inspector_details_open);
+        return WidgetPod::new(inspector_card(
+            "SIFS unavailable",
+            detail_rows_widget(rows, reader),
+            reader,
+            Some(details_button()),
+            false,
+        ));
+    }
+
+    let Some(entry) = files.selected_entry().cloned() else {
+        let rows = unselected_inspector_rows(&files);
+        let actions = unselected_inspector_actions(&files);
+        let mut body = Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .spacing(10.0)
+            .with_child(detail_rows_widget(rows, reader));
+        if !actions.is_empty() {
+            body = body.with_child(root_inspector_buttons(shared, reader, actions));
+        }
+        let header_action = (files.source == FilesSourceKind::Sifs).then(details_button);
+        return WidgetPod::new(inspector_card(
+            unselected_inspector_title(files.source),
+            body,
+            reader,
+            header_action,
+            false,
+        ));
+    };
+
+    let details = files.selected_details.as_ref();
+    let kind = details
+        .map(|details| details.kind.as_str())
+        .unwrap_or_else(|| {
+            if entry.is_dir {
+                "directory"
+            } else if entry.is_link {
+                "symlink"
+            } else {
+                "file"
+            }
+        });
+    let kind_line = if files.source == FilesSourceKind::Sifs {
+        sifs_compact_header_line(
+            &entry,
+            details,
+            files.clustered,
+            files.details_loading,
+            files.details_error.as_deref(),
+        )
+    } else {
+        format!("{kind} · {}", details_size(&entry, details))
+    };
+    let theme = reader();
+    let mut kind_style = theme.text_style(theme.palette.text_muted);
+    kind_style.font_size = theme.text.sm.size;
+    kind_style.line_height = theme.text.sm.line_height;
+    let actions = inspector_actions(&files, &entry);
+    let selected_body = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(10.0)
+        .with_child(Label::new(kind_line).style(kind_style))
+        .with_child(inspector_buttons(shared, reader, &entry, actions))
+        .with_child(
+            DetailRow::new("Path", entry.path.clone())
+                .theme_when(clone_reader(reader))
+                .max_value_lines(6),
+        );
+    let selected_card = inspector_card(
+        entry.name.clone(),
+        selected_body,
+        reader,
+        Some(details_button()),
+        true,
+    );
+
+    let mut content = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(12.0)
+        .with_child(selected_card);
+
+    if files.source == FilesSourceKind::Local {
+        let local = files.selected_local_details.as_ref();
+        let status_label = local_metadata_status_label(
+            files.details_loading,
+            files.details_error.as_deref(),
+            local,
+        );
+        let status_tone = local_metadata_status_tone(
+            files.details_loading,
+            files.details_error.as_deref(),
+            local,
+        );
+        let mut rows = vec![("Source", "Host filesystem".to_string())];
+        if let Some(local) = local {
+            rows.push((
+                "Permissions",
+                if local.readonly {
+                    "read-only".to_string()
+                } else {
+                    "writable".to_string()
+                },
+            ));
+            if let Some(canonical) = &local.canonical_path
+                && canonical != &local.path
+            {
+                rows.push(("Canonical", canonical.clone()));
+            }
+        } else if let Some(error) = &files.details_error {
+            rows.push(("Reason", error.clone()));
+        } else if files.details_loading {
+            rows.push(("Status", "Reading metadata".to_string()));
+        }
+        let body = Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .spacing(8.0)
+            .with_child(
+                StatusBadge::new(status_label)
+                    .tone(status_tone)
+                    .theme_when(clone_reader(reader)),
+            )
+            .with_child(detail_rows_widget(rows, reader));
+        content = content.with_child(inspector_card("Local file", body, reader, None, false));
+
+        if files.inspector_details_open {
+            let mut rows = Vec::new();
+            if let Some(local) = local {
+                rows.push(("Kind", local.kind.clone()));
+                rows.push(("Accessed", local_time_label(local.accessed_at_unix_nanos)));
+                rows.push(("Modified", local_time_label(local.modified_at_unix_nanos)));
+                rows.push(("Created", local_time_label(local.created_at_unix_nanos)));
+            }
+            if !rows.is_empty() {
+                content = content.with_child(inspector_card(
+                    "Technical details",
+                    detail_rows_widget(rows, reader),
+                    reader,
+                    None,
+                    false,
+                ));
+            }
+        }
+    } else {
         let status_label = sifs_metadata_status_label(
             files.details_loading,
             files.details_error.as_deref(),
@@ -9141,794 +8845,164 @@ impl Widget for InspectorView {
             files.details_error.as_deref(),
             details,
         );
-        y = self.status_badge(ctx, &theme, x, y, w, status_label, status_tone);
+        let placement_rows = vec![
+            (
+                "Placement",
+                sifs_replication_summary(details, files.clustered),
+            ),
+            ("Metadata", sifs_metadata_shard_summary(details)),
+            ("Health", sifs_health_summary(details)),
+            ("Pin", sifs_pin_summary(details)),
+            (
+                "Next",
+                sifs_inspector_next_step(
+                    details,
+                    files.clustered,
+                    files.details_loading,
+                    files.details_error.as_deref(),
+                ),
+            ),
+        ];
+        let placement_body = Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .spacing(8.0)
+            .with_child(
+                PlacementBadge::new(short_node_label(&files.node_id))
+                    .icon(IconGlyph::Storage)
+                    .tone(SemanticTone::Accent)
+                    .theme_when(clone_reader(reader)),
+            )
+            .with_child(
+                StatusBadge::new(status_label)
+                    .tone(status_tone)
+                    .theme_when(clone_reader(reader)),
+            )
+            .with_child(detail_rows_widget(placement_rows, reader));
+        content = content.with_child(inspector_card(
+            "Placement",
+            placement_body,
+            reader,
+            None,
+            false,
+        ));
 
-        let policy = details
-            .map(|details| details.policy.as_str())
-            .unwrap_or("not loaded");
-        let placement = sifs_replication_summary(details, files.clustered);
-        y = self.info_row(ctx, &theme, &pal, x, y + 10.0, w, "Placement", &placement);
-        let metadata_shard = sifs_metadata_shard_summary(details);
-        y = self.info_row(
-            ctx,
-            &theme,
-            &pal,
-            x,
-            y + 4.0,
-            w,
-            "Metadata",
-            &metadata_shard,
-        );
-        let health = sifs_health_summary(details);
-        y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Health", &health);
-        let pins = sifs_pin_summary(details);
-        y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Pin", &pins);
-        let next_step = sifs_inspector_next_step(
-            details,
-            files.clustered,
-            files.details_loading,
-            files.details_error.as_deref(),
-        );
-        y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Next", &next_step);
-
-        if details_open {
-            y += 14.0;
-            paint_section_label(
-                ctx,
-                &theme,
-                Rect::new(x, y, w, 16.0),
-                "Technical details",
-                SectionLabelPaint::new().color(pal.text_faint),
-            );
-            y += 22.0;
-
+        if files.inspector_details_open {
+            let policy = details
+                .map(|details| details.policy.clone())
+                .unwrap_or_else(|| "not loaded".to_string());
+            let mut rows = Vec::new();
             if let Some(error) = &files.details_error {
-                y = self.info_row(ctx, &theme, &pal, x, y, w, "Reason", error);
-                y = self.info_row(
-                    ctx,
-                    &theme,
-                    &pal,
-                    x,
-                    y + 4.0,
-                    w,
-                    "Authority",
-                    "SIFS through daemon",
-                );
+                rows.push(("Reason", error.clone()));
+                rows.push(("Authority", "SIFS through daemon".to_string()));
             } else if files.details_loading {
-                y = self.info_row(
-                    ctx,
-                    &theme,
-                    &pal,
-                    x,
-                    y,
-                    w,
-                    "Status",
-                    "Waiting for daemon metadata",
-                );
+                rows.push(("Status", "Waiting for daemon metadata".to_string()));
             } else if details.is_none() {
-                y = self.info_row(
-                    ctx,
-                    &theme,
-                    &pal,
-                    x,
-                    y,
-                    w,
+                rows.push((
                     "Status",
-                    "Metadata has not returned for this object yet",
-                );
-                y = self.info_row(
-                    ctx,
-                    &theme,
-                    &pal,
-                    x,
-                    y + 4.0,
-                    w,
-                    "Authority",
-                    "SIFS through daemon",
-                );
+                    "Metadata has not returned for this object yet".to_string(),
+                ));
+                rows.push(("Authority", "SIFS through daemon".to_string()));
             }
-
-            y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Policy", policy);
+            rows.push(("Policy", policy));
             if let Some(shard) = details.and_then(|details| details.metadata_shard.as_ref()) {
-                y = self.info_row(
-                    ctx,
-                    &theme,
-                    &pal,
-                    x,
-                    y + 4.0,
-                    w,
-                    "Shard",
-                    &sifs_metadata_shard_detail_summary(shard),
-                );
+                rows.push(("Shard", sifs_metadata_shard_detail_summary(shard)));
             }
             if let Some(health) = details.and_then(|details| details.health.as_ref()) {
-                y = self.info_row(
-                    ctx,
-                    &theme,
-                    &pal,
-                    x,
-                    y + 4.0,
-                    w,
-                    "Agent state",
-                    &health.agent_state,
-                );
-                y = self.info_row(
-                    ctx,
-                    &theme,
-                    &pal,
-                    x,
-                    y + 4.0,
-                    w,
+                rows.push(("Agent state", health.agent_state.clone()));
+                rows.push((
                     "Operator counts",
-                    &format!(
+                    format!(
                         "{} · {} · {}",
                         plural(health.version_count, "version"),
                         plural(health.receipt_count, "receipt"),
                         plural(health.intent_count, "intent")
                     ),
-                );
-                y = self.info_row(
-                    ctx,
-                    &theme,
-                    &pal,
-                    x,
-                    y + 4.0,
-                    w,
+                ));
+                rows.push((
                     "Repair backlog",
-                    &format!(
+                    format!(
                         "{} · {}",
                         plural(health.pending_repair_count, "missing replica"),
                         plural(health.open_conflict_count, "conflict")
                     ),
-                );
-                y = self.info_row(
-                    ctx,
-                    &theme,
-                    &pal,
-                    x,
-                    y + 4.0,
-                    w,
-                    "Missing nodes",
-                    &sifs_missing_replica_summary(health),
-                );
+                ));
+                rows.push(("Missing nodes", sifs_missing_replica_summary(health)));
             }
-            let locations = details
-                .map(details_locations)
-                .unwrap_or_else(|| "not reported".to_string());
-            y = self.info_row(
-                ctx,
-                &theme,
-                &pal,
-                x,
-                y + 4.0,
-                w,
+            rows.push((
                 "Durable nodes",
-                &locations,
-            );
-
+                details
+                    .map(details_locations)
+                    .unwrap_or_else(|| "not reported".to_string()),
+            ));
             if let Some(details) = details {
-                y = self.info_row(
-                    ctx,
-                    &theme,
-                    &pal,
-                    x,
-                    y + 4.0,
-                    w,
-                    "Local pins",
-                    &sifs_pin_detail_summary(details),
-                );
-                y = self.info_row(
-                    ctx,
-                    &theme,
-                    &pal,
-                    x,
-                    y + 4.0,
-                    w,
-                    "File system",
-                    &details.file_system_id,
-                );
-                y = self.info_row(
-                    ctx,
-                    &theme,
-                    &pal,
-                    x,
-                    y + 4.0,
-                    w,
-                    "Object",
-                    &short(&details.object_id, 28),
-                );
-                y = self.info_row(
-                    ctx,
-                    &theme,
-                    &pal,
-                    x,
-                    y + 4.0,
-                    w,
-                    "Version",
-                    &short(&details.version, 28),
-                );
-                y = self.info_row(
-                    ctx,
-                    &theme,
-                    &pal,
-                    x,
-                    y + 4.0,
-                    w,
+                rows.push(("Local pins", sifs_pin_detail_summary(details)));
+                rows.push(("File system", details.file_system_id.clone()));
+                rows.push(("Object", short(&details.object_id, 28)));
+                rows.push(("Version", short(&details.version, 28)));
+                rows.push((
                     "Mode",
-                    &format!("{:o} · {} links", details.mode, details.link_count),
-                );
-                y = self.info_row(
-                    ctx,
-                    &theme,
-                    &pal,
-                    x,
-                    y + 4.0,
-                    w,
+                    format!("{:o} · {} links", details.mode, details.link_count),
+                ));
+                rows.push((
                     "Owner",
-                    &format!("uid {} · gid {}", details.uid, details.gid),
-                );
-                y = self.info_row(
-                    ctx,
-                    &theme,
-                    &pal,
-                    x,
-                    y + 4.0,
-                    w,
-                    "Modified",
-                    &unix_nanos_label(details.modified_at_unix_nanos),
-                );
+                    format!("uid {} · gid {}", details.uid, details.gid),
+                ));
+                rows.push(("Modified", unix_nanos_label(details.modified_at_unix_nanos)));
                 if let Some(hash) = &details.content_hash {
-                    y = self.info_row(
-                        ctx,
-                        &theme,
-                        &pal,
-                        x,
-                        y + 4.0,
-                        w,
-                        "Content",
-                        &short(hash, 28),
-                    );
+                    rows.push(("Content", short(hash, 28)));
                 }
             }
+            content = content.with_child(inspector_card(
+                "Technical details",
+                detail_rows_widget(rows, reader),
+                reader,
+                None,
+                false,
+            ));
         }
 
         if !files.clustered {
-            let note = "Join a cluster to spread this object across nodes and tune replication.";
-            let note_h = Self::estimated_line_count(note, w, 7.0) as f32 * 17.0;
-            paint_text_block(
-                ctx,
-                &theme,
-                Rect::new(x, y, w, note_h),
-                note,
-                TextBlockPaint::new()
-                    .text_token(theme.text.xs)
-                    .color(pal.text_faint),
-            );
-            y += note_h;
-        }
-
-        if !entry.is_dir {
-            y += 10.0;
-            let preview_error = files
-                .preview_error
-                .as_deref()
-                .map(|error| file_preview_error_display(files.source, error));
-            let _ = self.preview_section(
-                ctx,
-                &theme,
-                &pal,
-                x,
-                y,
-                w,
-                files.preview_loading,
-                preview_error.as_deref(),
-                files.selected_preview.as_ref(),
+            let mut note_style = theme.text_style(theme.palette.text_muted);
+            note_style.font_size = theme.text.xs.size;
+            note_style.line_height = theme.text.xs.line_height;
+            content = content.with_child(
+                Surface::panel(RichText::from_plain_text(
+                    "Join a cluster to spread this object across nodes and tune replication.",
+                    note_style,
+                ))
+                .appearance(sui::SurfaceAppearance::Soft)
+                .tone(SemanticTone::Neutral)
+                .theme_when(clone_reader(reader))
+                .padding(Insets {
+                    left: 12.0,
+                    top: 10.0,
+                    right: 12.0,
+                    bottom: 10.0,
+                })
+                .fill_width(),
             );
         }
     }
 
-    fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let (selected_entry, selected_actions, root_actions, root_rows, details_open) = {
-            let files = self.shared.files();
-            let selected_entry = files.selected_entry().cloned();
-            let selected_actions = selected_entry
-                .as_ref()
-                .map(|entry| inspector_actions(&files, entry))
-                .unwrap_or_default();
-            let root_actions =
-                if selected_entry.is_none() && !files.loading && files.error.is_none() {
-                    unselected_inspector_actions(&files)
-                } else {
-                    Vec::new()
-                };
-            let root_rows = if root_actions.is_empty() {
-                Vec::new()
-            } else {
-                unselected_inspector_rows(&files)
-            };
-            (
-                selected_entry,
-                selected_actions,
-                root_actions,
-                root_rows,
-                inspector_details_available(&files).then_some(files.inspector_details_open),
-            )
-        };
-
-        let mut root = SemanticsNode::new(
-            ctx.widget_id(),
-            SemanticsRole::GenericContainer,
-            ctx.bounds(),
-        );
-        root.name = Some("File inspector".to_string());
-        root.description = Some(
-            selected_entry
-                .as_ref()
-                .map(|entry| format!("Actions and storage details for {}", entry.path))
-                .unwrap_or_else(|| "File actions and storage details".to_string()),
-        );
-        ctx.push(root);
-
-        if let Some(entry) = &selected_entry {
-            for (index, action) in selected_actions.into_iter().enumerate() {
-                let mut node = SemanticsNode::new(
-                    inspector_action_button_widget_id(ctx.widget_id(), action),
-                    SemanticsRole::Button,
-                    inspector_action_button_rect(ctx.bounds(), index),
-                );
-                node.parent = Some(ctx.widget_id());
-                node.name = Some(action.semantic_name(entry));
-                node.description = Some(match action {
-                    InspectorAction::OpenFolder => format!("Open {}", entry.path),
-                    InspectorAction::RefreshPlacement => {
-                        format!("Refresh SIFS placement metadata for {}", entry.path)
-                    }
-                    InspectorAction::RepairReplicas => {
-                        format!("Request SIFS replica repair for {}", entry.path)
-                    }
-                    InspectorAction::MakeMetadataPrimary => {
-                        format!(
-                            "Transfer the SIFS metadata shard primary for {} to this node",
-                            entry.path
-                        )
-                    }
-                    InspectorAction::PinMetadata => {
-                        format!("Pin SIFS metadata on this node for {}", entry.path)
-                    }
-                    InspectorAction::UnpinMetadata => {
-                        format!("Remove this node's SIFS metadata pin for {}", entry.path)
-                    }
-                    InspectorAction::PinContent => {
-                        format!("Pin SIFS content on this node for {}", entry.path)
-                    }
-                    InspectorAction::UnpinContent => {
-                        format!("Remove this node's SIFS content pin for {}", entry.path)
-                    }
-                    InspectorAction::ConnectionSettings => {
-                        "Open Connection settings for SIFS authorization and daemon recovery"
-                            .to_string()
-                    }
-                    InspectorAction::CopyToSifs => {
-                        format!("Copy local {} into SIFS", entry.path)
-                    }
-                    InspectorAction::CopyToLocal => {
-                        format!("Download SIFS {} to a local path", entry.path)
-                    }
-                    InspectorAction::Copy => format!("Copy {}", entry.path),
-                    InspectorAction::CopyIdentifiers => {
-                        format!(
-                            "Copy the full SIFS object, version, and hash IDs for {}",
-                            entry.path
-                        )
-                    }
-                    InspectorAction::Move => format!("Move {}", entry.path),
-                    InspectorAction::Rename => format!("Rename {}", entry.path),
-                    InspectorAction::Delete => format!("Delete {}", entry.path),
-                });
-                node.actions = vec![SemanticsAction::Activate];
-                ctx.push(node);
-            }
-        }
-
-        if selected_entry.is_none() {
-            for (index, action) in root_actions.into_iter().enumerate() {
-                let mut node = SemanticsNode::new(
-                    root_inspector_action_button_widget_id(ctx.widget_id(), action),
-                    SemanticsRole::Button,
-                    root_inspector_action_button_rect(ctx.bounds(), &root_rows, index),
-                );
-                node.parent = Some(ctx.widget_id());
-                node.name = Some(action.label().to_string());
-                node.description = Some(action.description().to_string());
-                node.actions = vec![SemanticsAction::Activate];
-                ctx.push(node);
-            }
-        }
-
-        let Some(details_open) = details_open else {
-            return;
-        };
-
-        let mut node = SemanticsNode::new(
-            inspector_detail_button_widget_id(ctx.widget_id()),
-            SemanticsRole::Button,
-            inspector_detail_button_rect(ctx.bounds()),
-        );
-        node.parent = Some(ctx.widget_id());
-        node.name = Some(inspector_detail_button_label(details_open).to_string());
-        node.description = Some("File storage metadata and diagnostics".to_string());
-        node.actions = vec![SemanticsAction::Activate];
-        node.state.selected = details_open;
-        ctx.push(node);
+    if !entry.is_dir {
+        content = content.with_child(preview_card(
+            files.source,
+            files.preview_loading,
+            files.preview_error.as_deref(),
+            files.selected_preview.as_ref(),
+            reader,
+        ));
     }
+
+    WidgetPod::new(content)
 }
 
-impl InspectorView {
-    #[allow(clippy::too_many_arguments)]
-    fn state_panel(
-        &self,
-        ctx: &mut PaintCtx,
-        theme: &sui::DefaultTheme,
-        pal: &Palette,
-        x: f32,
-        y: f32,
-        w: f32,
-        title: &str,
-        rows: &[(&str, String)],
-        details_open: Option<bool>,
-    ) {
-        let value_w = (w - 24.0).max(0.0);
-        let row_heights = rows
-            .iter()
-            .map(|(_, value)| detail_row_height_for_value(ctx, theme, value_w, value, Some(3)))
-            .collect::<Vec<_>>();
-        let panel_h = 44.0 + row_heights.iter().sum::<f32>();
-        let panel = Rect::new(x, y, w, panel_h);
-        let detail_button =
-            details_open.map(|open| (inspector_detail_button_rect(ctx.bounds()), open));
-        let title_right_gap = if detail_button.is_some() {
-            INSPECTOR_DETAIL_BUTTON_W + 10.0
-        } else {
-            0.0
-        };
-        let geometry = paint_section_panel(
-            ctx,
-            theme,
-            panel,
-            title,
-            SectionPanelPaint::new()
-                .fill(pal.panel)
-                .border(pal.border)
-                .title_color(pal.text)
-                .radius(10.0)
-                .header_height(38.0)
-                .content_padding(Insets {
-                    left: 12.0,
-                    top: 0.0,
-                    right: 12.0,
-                    bottom: 6.0,
-                })
-                .title_token(theme.text.base)
-                .trailing_width(title_right_gap),
-        );
-        if let Some((rect, open)) = detail_button {
-            self.detail_button(ctx, theme, rect, open);
-        }
-
-        let mut row_y = geometry.content_rect.y();
-        for (label, value) in rows {
-            row_y += paint_detail_row_at(
-                ctx,
-                theme,
-                Point::new(geometry.content_rect.x(), row_y),
-                geometry.content_rect.width(),
-                label,
-                value,
-                Some(3),
-            );
-        }
-    }
-
-    fn detail_button(
-        &self,
-        ctx: &mut PaintCtx,
-        theme: &sui::DefaultTheme,
-        rect: Rect,
-        details_open: bool,
-    ) {
-        let (icon, paint) = if details_open {
-            (
-                IconGlyph::ChevronUp,
-                CommandButtonPaint::tonal(SemanticTone::Accent).icon_tone(SemanticTone::Accent),
-            )
-        } else {
-            (
-                IconGlyph::ChevronDown,
-                CommandButtonPaint::neutral().icon_tone(SemanticTone::Neutral),
-            )
-        };
-        paint_command_button(
-            ctx,
-            theme,
-            rect,
-            inspector_detail_button_label(details_open),
-            Some(icon),
-            paint,
-        );
-    }
-
-    fn status_badge(
-        &self,
-        ctx: &mut PaintCtx,
-        theme: &sui::DefaultTheme,
-        x: f32,
-        y: f32,
-        w: f32,
-        label: &str,
-        tone: SemanticTone,
-    ) -> f32 {
-        let (_, tone_text) = theme.semantic_tone_colors(tone);
-        let mut text_style = theme.text_style(tone_text);
-        text_style.font_size = theme.text.sm.size;
-        text_style.line_height = theme.text.sm.line_height;
-        text_style.weight = FontWeight::SEMIBOLD;
-        let text_w = ctx
-            .measure_text(label.to_string(), text_style.clone())
-            .map(|m| m.width)
-            .unwrap_or(120.0);
-        let badge_w = (text_w + 22.0).min(w).max(80.0);
-        let badge = Rect::new(x, y, badge_w, 26.0);
-        paint_status_badge(ctx, badge, theme, label, None, tone);
-        badge.max_y()
-    }
-
-    fn action_buttons(
-        &self,
-        ctx: &mut PaintCtx,
-        theme: &sui::DefaultTheme,
-        pal: &Palette,
-        bounds: Rect,
-        actions: &[InspectorAction],
-    ) {
-        for (index, action) in actions.iter().copied().enumerate() {
-            self.action_button(
-                ctx,
-                theme,
-                pal,
-                inspector_action_button_rect(bounds, index),
-                action,
-            );
-        }
-    }
-
-    fn root_action_buttons(
-        &self,
-        ctx: &mut PaintCtx,
-        theme: &sui::DefaultTheme,
-        pal: &Palette,
-        bounds: Rect,
-        rows: &[(&'static str, String)],
-        actions: &[RootInspectorAction],
-    ) {
-        for (index, action) in actions.iter().copied().enumerate() {
-            self.root_action_button(
-                ctx,
-                theme,
-                pal,
-                root_inspector_action_button_rect(bounds, rows, index),
-                action,
-            );
-        }
-    }
-
-    fn root_action_button(
-        &self,
-        ctx: &mut PaintCtx,
-        theme: &sui::DefaultTheme,
-        _pal: &Palette,
-        rect: Rect,
-        action: RootInspectorAction,
-    ) {
-        let style = match action {
-            RootInspectorAction::RefreshFolder | RootInspectorAction::OpenCluster => {
-                CommandButtonPaint::neutral().icon_tone(SemanticTone::Accent)
-            }
-            RootInspectorAction::RepairReplicas => CommandButtonPaint::tonal(SemanticTone::Accent),
-            RootInspectorAction::ConnectionSettings => {
-                CommandButtonPaint::tonal(SemanticTone::Warning)
-            }
-        };
-        paint_command_button(
-            ctx,
-            theme,
-            rect,
-            action.label(),
-            Some(action.glyph()),
-            style,
-        );
-    }
-
-    fn action_button(
-        &self,
-        ctx: &mut PaintCtx,
-        theme: &sui::DefaultTheme,
-        _pal: &Palette,
-        rect: Rect,
-        action: InspectorAction,
-    ) {
-        let style = match action {
-            InspectorAction::OpenFolder => CommandButtonPaint::filled(SemanticTone::Accent),
-            InspectorAction::Delete => CommandButtonPaint::tonal(SemanticTone::Danger),
-            InspectorAction::RefreshPlacement
-            | InspectorAction::RepairReplicas
-            | InspectorAction::MakeMetadataPrimary
-            | InspectorAction::PinMetadata
-            | InspectorAction::UnpinMetadata
-            | InspectorAction::PinContent
-            | InspectorAction::UnpinContent
-            | InspectorAction::ConnectionSettings => {
-                CommandButtonPaint::tonal(SemanticTone::Accent)
-            }
-            InspectorAction::CopyToSifs | InspectorAction::CopyToLocal => {
-                CommandButtonPaint::tonal(SemanticTone::Accent)
-            }
-            InspectorAction::Copy
-            | InspectorAction::CopyIdentifiers
-            | InspectorAction::Move
-            | InspectorAction::Rename => CommandButtonPaint::neutral(),
-        };
-        paint_command_button(
-            ctx,
-            theme,
-            rect,
-            action.label(),
-            Some(action.glyph()),
-            style,
-        );
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn info_row(
-        &self,
-        ctx: &mut PaintCtx,
-        theme: &sui::DefaultTheme,
-        _pal: &Palette,
-        x: f32,
-        y: f32,
-        w: f32,
-        label: &str,
-        value: &str,
-    ) -> f32 {
-        y + paint_detail_row_at(ctx, theme, Point::new(x, y), w, label, value, None)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn preview_section(
-        &self,
-        ctx: &mut PaintCtx,
-        theme: &sui::DefaultTheme,
-        pal: &Palette,
-        x: f32,
-        y: f32,
-        w: f32,
-        loading: bool,
-        error: Option<&str>,
-        preview: Option<&FilesPreview>,
-    ) -> f32 {
-        let height = Self::preview_section_height(w, loading, error, preview);
-        let panel = Rect::new(x, y, w, height);
-        let geometry = paint_section_panel(
-            ctx,
-            theme,
-            panel,
-            "PREVIEW",
-            SectionPanelPaint::new()
-                .fill(pal.panel)
-                .border(pal.border)
-                .title_color(pal.text_faint)
-                .radius(10.0)
-                .header_height(34.0)
-                .content_padding(Insets {
-                    left: 12.0,
-                    top: 0.0,
-                    right: 12.0,
-                    bottom: 8.0,
-                })
-                .title_token(theme.text.xs),
-        );
-
-        let row_y = geometry.content_rect.y();
-        let inner_x = geometry.content_rect.x();
-        let inner_w = geometry.content_rect.width();
-        let body_paint = TextBlockPaint::new()
-            .text_token(theme.text.sm)
-            .color(pal.text);
-        let muted_paint = TextBlockPaint::new()
-            .text_token(theme.text.xs)
-            .color(pal.text_faint);
-
-        if loading {
-            paint_text_block(
-                ctx,
-                theme,
-                Rect::new(inner_x, row_y, inner_w, 18.0),
-                "Reading bounded preview",
-                body_paint,
-            );
-            return geometry.panel_rect.max_y();
-        }
-
-        if let Some(error) = error {
-            let text_h = Self::estimated_line_count(error, inner_w, 7.0).min(3) as f32 * 17.0;
-            paint_text_block(
-                ctx,
-                theme,
-                Rect::new(inner_x, row_y, inner_w, text_h),
-                error,
-                body_paint,
-            );
-            return geometry.panel_rect.max_y();
-        }
-
-        let Some(preview) = preview else {
-            paint_text_block(
-                ctx,
-                theme,
-                Rect::new(inner_x, row_y, inner_w, 18.0),
-                "Preview not loaded yet",
-                body_paint,
-            );
-            return geometry.panel_rect.max_y();
-        };
-
-        let (preview_text, body_h) = if preview.binary {
-            let value = preview.lines.join(" ");
-            let height = Self::estimated_line_count(&value, inner_w, 7.0).min(3) as f32 * 17.0;
-            (value, height)
-        } else {
-            let lines = preview
-                .lines
-                .iter()
-                .take(FILE_PREVIEW_MAX_LINES)
-                .cloned()
-                .collect::<Vec<_>>();
-            let height = lines
-                .iter()
-                .map(|line| Self::estimated_line_count(line, inner_w, 7.0).min(2) as f32 * 17.0)
-                .sum::<f32>();
-            (lines.join("\n"), height)
-        };
-        paint_text_block(
-            ctx,
-            theme,
-            Rect::new(inner_x, row_y, inner_w, body_h),
-            &preview_text,
-            body_paint,
-        );
-
-        if preview.truncated {
-            paint_text_block(
-                ctx,
-                theme,
-                Rect::new(inner_x, row_y + body_h, inner_w, 17.0),
-                &format!("Preview truncated to {} KB.", FILE_PREVIEW_MAX_BYTES / 1024),
-                muted_paint,
-            );
-        }
-
-        geometry.panel_rect.max_y()
-    }
-}
-
-/// The inspector wrapped in a `PanelSection`-less host so it can be a `SizedBox` child. We keep the
-/// inspector as a single painter (above), so this is just the bare widget. A thin wrapper exists so
-/// the composed pod reads cleanly.
+/// Assemble the wide inspector and the compact sheet body from the same stock SUI controls.
 fn inspector(
     shared: &Shared,
     reader: &ThemeReader,
     scroll_state: &ScrollState,
 ) -> impl Widget + use<> {
-    let s = shared.clone();
     let header = WidgetPadding::horizontal(
         CONTENT_PAD,
         SizedBox::new().height(18.0).with_child(
@@ -9956,14 +9030,16 @@ fn inspector(
             .with_child(InspectorView::new(shared.clone())),
     )
     .fill_child_width();
-    Background::new(
-        Color::TRANSPARENT,
+    Surface::new(
+        SurfaceRole::Sidebar,
         ScrollView::vertical(body)
             .state(scroll_state.clone())
             .name("File inspector")
             .viewport_width_hint(true),
     )
-    .brush_when(move || palette(&s).sidebar)
+    .border(SurfaceBorder::Left)
+    .theme_when(clone_reader(reader))
+    .fill()
 }
 
 // ---------------------------------------------------------------------------
@@ -10548,7 +9624,9 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         let s = shared.clone();
         sui::Button::new("Cancel")
             .min_width(112.0)
-            .theme_when(secondary_button_theme(reader))
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
             .on_press_with_ctx(move |ctx| {
                 s.files_mut().close_action_prompt();
                 request_files_overlay_rebuild(ctx);
@@ -10627,22 +9705,16 @@ fn compact_files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
     let inspector_scroll_state = ScrollState::new();
     let body = SwitchView::new()
         .selected(selected)
-        .with_child(
-            SizedBox::new()
-                .height(500.0)
-                .with_child(compact_files_commands(shared, reader)),
-        )
-        .with_child(SizedBox::new().height(520.0).with_child(inspector(
-            shared,
-            reader,
-            &inspector_scroll_state,
-        )));
+        .with_child(compact_files_commands(shared, reader))
+        .with_child(inspector(shared, reader, &inspector_scroll_state));
     let dismiss_shared = shared.clone();
     Some(WidgetPod::new(
-        sui::Dialog::new(title, body)
-            .theme(shared.theme())
+        SideSheet::new(title, body)
+            .theme_when(clone_reader(reader))
             .description(description)
-            .max_width(560.0)
+            .placement(SideSheetPlacement::Right)
+            .width(420.0)
+            .modal(true)
             .dismiss_on_scrim(true)
             .on_dismiss(move || dismiss_shared.files_mut().close_compact_overlay()),
     ))
@@ -12058,15 +11130,13 @@ mod tests {
             files.error = Some("device authorization was denied".to_string());
         }
 
-        let inspector = InspectorView::new(shared.clone());
-
         assert_eq!(
-            inspector.summary(),
+            inspector_summary(&shared),
             "error|Sifs|/|device authorization was denied|false"
         );
         shared.files_mut().inspector_details_open = true;
         assert_eq!(
-            inspector.summary(),
+            inspector_summary(&shared),
             "error|Sifs|/|device authorization was denied|true"
         );
     }
@@ -12080,14 +11150,19 @@ mod tests {
             files.loading = true;
             files.path = "/services".to_string();
         }
-        let inspector = InspectorView::new(shared.clone());
-        assert_eq!(inspector.summary(), "loading|Sifs|/services|false");
+        assert_eq!(
+            inspector_summary(&shared),
+            "loading|Sifs|/services|false|None"
+        );
 
         {
             let mut files = shared.files_mut();
             files.inspector_details_open = true;
         }
-        assert_eq!(inspector.summary(), "loading|Sifs|/services|true");
+        assert_eq!(
+            inspector_summary(&shared),
+            "loading|Sifs|/services|true|None"
+        );
 
         {
             let mut files = shared.files_mut();
@@ -12095,7 +11170,7 @@ mod tests {
             files.entries.clear();
         }
         assert_eq!(
-            inspector.summary(),
+            inspector_summary(&shared),
             "unselected|Sifs|/services|false|0|true|Not checked yet; refresh this folder to update health"
         );
     }
@@ -12120,13 +11195,12 @@ mod tests {
             files.details_error = Some("device authorization was denied".to_string());
         }
 
-        let inspector = InspectorView::new(shared.clone());
-        assert!(inspector.summary().contains(
+        assert!(inspector_summary(&shared).contains(
             "/artifact.txt|false|false|true|false|device authorization was denied|false||false|"
         ));
 
         shared.files_mut().inspector_details_open = true;
-        assert!(inspector.summary().contains(
+        assert!(inspector_summary(&shared).contains(
             "/artifact.txt|false|false|true|false|device authorization was denied|false||true|"
         ));
     }
@@ -13403,21 +12477,6 @@ mod tests {
         assert!(compact.starts_with("sinomo-agent"));
         assert!(compact.ends_with("hkn0kfr8t.json"));
         assert!(compact.contains('…'));
-    }
-
-    #[test]
-    fn files_secondary_button_theme_remaps_accent_slots() {
-        let reader: ThemeReader = Rc::new(DefaultTheme::light);
-        let base = reader();
-        let secondary = secondary_button_theme(&reader)();
-
-        assert_eq!(secondary.palette.accent, base.palette.control);
-        assert_eq!(secondary.palette.accent_hover, base.palette.control_hover);
-        assert_eq!(
-            secondary.palette.accent_pressed,
-            base.palette.control_active
-        );
-        assert_eq!(secondary.palette.accent_text, base.palette.text);
     }
 
     #[test]
