@@ -46,7 +46,7 @@ pub fn mount_sifs_background(mut options: DfsFuseMountOptions) -> Result<DfsFuse
     let mount_point = prepare_background_mount_point(&options.mount_point)?;
     options.mount_point = mount_point.clone();
     let fs = SifsFuseFileSystem::open(options.clone())?;
-    let mount_options = background_fuse_mount_options(&options);
+    let mount_options = background_fuse_mount_options(&options, mount_helper.is_some());
     let session = fuser::spawn_mount2(fs, &mount_point, &mount_options)
         .map_err(|source| map_mount_error(&mount_point, mount_helper.is_some(), source))?;
     Ok(DfsFuseMountHandle::new(mount_point, session))
@@ -75,15 +75,16 @@ fn fuse_mount_options(
     mount_options
 }
 
-fn background_fuse_mount_options(options: &DfsFuseMountOptions) -> Vec<MountOption> {
-    let mut mount_options = fuse_mount_options(options, false);
-    if !mount_options.contains(&MountOption::AutoUnmount) {
-        // Background mounts are process resources. fuser retains owner-only
-        // userspace ACL enforcement when it adds the helper's required
-        // allow_other kernel option for AutoUnmount.
-        mount_options.push(MountOption::AutoUnmount);
-    }
-    mount_options
+fn background_fuse_mount_options(
+    options: &DfsFuseMountOptions,
+    mount_helper_available: bool,
+) -> Vec<MountOption> {
+    // BackgroundSession owns the mount and unmounts it when dropped. Do not
+    // force AutoUnmount for an owner-only mount: fuser implements that option
+    // by implicitly adding allow_other, which fails on standard installations
+    // without `user_allow_other` in /etc/fuse.conf and silently widens the
+    // kernel mount request beyond the caller's intent.
+    fuse_mount_options(options, mount_helper_available)
 }
 
 fn fuse_mount_helper() -> Option<PathBuf> {
@@ -2591,11 +2592,11 @@ mod errno_tests {
     }
 
     #[test]
-    fn owner_only_background_mount_uses_helper_auto_unmount() {
+    fn owner_only_background_mount_does_not_implicitly_request_allow_other() {
         let options = DfsFuseMountOptions::new("/mnt/sinomo");
 
-        let background_options = background_fuse_mount_options(&options);
-        assert!(background_options.contains(&MountOption::AutoUnmount));
+        let background_options = background_fuse_mount_options(&options, true);
+        assert!(!background_options.contains(&MountOption::AutoUnmount));
         assert!(!background_options.contains(&MountOption::AllowOther));
     }
 

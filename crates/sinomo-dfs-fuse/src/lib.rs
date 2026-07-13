@@ -72,8 +72,9 @@ pub type Result<T> = std::result::Result<T, DfsFuseError>;
 ///
 /// The resolved mount root remains valid for as long as this handle is kept
 /// alive. Dropping the handle closes the background FUSE session and unmounts
-/// the filesystem. Background mounts request FUSE automatic unmounting so an
-/// orderly or abrupt process exit does not leave a disconnected mount behind.
+/// the filesystem. Owner-only mounts intentionally avoid FUSE `auto_unmount`,
+/// because fuser implements that option by implicitly requesting
+/// `allow_other`; the owning session still guarantees orderly unmounting.
 #[must_use = "dropping the SIFS mount handle immediately unmounts the filesystem"]
 pub struct DfsFuseMountHandle {
     mount_root: PathBuf,
