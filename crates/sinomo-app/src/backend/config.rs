@@ -11,13 +11,16 @@
 use serde_json::Value;
 use sinomo_cli::app_api::ProviderSummary;
 use sinomo_lm::{
-    DEFAULT_PROVIDER_ACCOUNT, LM_PROVIDER_CONFIG_KEY, LanguageModelProviderOptions, ModelConfig,
-    ProviderAccountConfig, ProviderReasoningEffort, model_supports_reasoning_effort,
-    normalize_model_provider, normalize_provider_account_name, upsert_provider_account_config,
+    DEFAULT_PROVIDER_ACCOUNT, LM_PROVIDER_CONFIG_KEY, LM_PROVIDER_HEALTH_CONFIG_KEY,
+    LanguageModelProviderHealthConfig, LanguageModelProviderHealthSnapshot,
+    LanguageModelProviderOptions, ModelConfig, ProviderAccountConfig, ProviderReasoningEffort,
+    ProviderTextVerbosity, model_supports_reasoning_effort, normalize_model_provider,
+    normalize_provider_account_name, provider_health_account_key, upsert_provider_account_config,
 };
 use sinomo_runtime::config::{
     ConfigClient, ConfigSchema, ConfigStore, ConfigValueSource, ConfigValueType, ConfigWriteTarget,
 };
+use sinomo_runtime::local::SinomoDataDir;
 
 /// How a config value is edited in the Advanced settings UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,6 +283,29 @@ mod tests {
     }
 
     #[test]
+    fn provider_forms_include_complete_known_model_catalogs() {
+        let (client, _root) = test_client("known-models");
+        add_provider_account(
+            &client,
+            "deepseek",
+            "default",
+            "sk-test",
+            sinomo_lm::DEEPSEEK_DEFAULT_MODEL,
+            "",
+        )
+        .expect("add provider");
+
+        let form = provider_forms(&client).pop().expect("provider form");
+        assert_eq!(
+            form.known_models,
+            vec![
+                sinomo_lm::DEEPSEEK_V4_FLASH_MODEL.to_string(),
+                sinomo_lm::DEEPSEEK_V4_PRO_MODEL.to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn resolved_config_items_include_declared_schema() {
         let (client, _root) = test_client("schema-catalog");
         let items = resolve_items(&client);
@@ -402,6 +428,75 @@ mod tests {
                 .any(|form| form.account == "work" && !form.is_default)
         );
     }
+
+    #[test]
+    fn provider_options_round_trip_through_settings_helpers() {
+        let (client, _root) = test_client("provider-options");
+        add_provider_account(
+            &client,
+            "anthropic",
+            "default",
+            "sk-test",
+            "claude-sonnet-4-20250514",
+            "",
+        )
+        .expect("add provider");
+
+        set_provider_effort(&client, "anthropic", "default", 4).expect("effort");
+        set_provider_reasoning_budget(&client, "anthropic", "default", "8192").expect("budget");
+        set_provider_text_verbosity(&client, "anthropic", "default", 2).expect("verbosity");
+        set_provider_vendor_options(
+            &client,
+            "anthropic",
+            "default",
+            r#"{"metadata.trace":"enabled"}"#,
+        )
+        .expect("vendor options");
+
+        let form = provider_forms(&client).pop().expect("provider form");
+        assert_eq!(form.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(form.reasoning_budget_tokens, Some(8192));
+        assert_eq!(form.text_verbosity.as_deref(), Some("medium"));
+        assert_eq!(form.vendor_options, r#"{"metadata.trace":"enabled"}"#);
+    }
+
+    #[test]
+    fn provider_health_persists_across_config_clients_and_can_be_invalidated() {
+        let (client, root) = test_client("provider-health-persistence");
+        let key = provider_health_account_key("openai", "work");
+        let snapshot = LanguageModelProviderHealthSnapshot {
+            provider: "openai".to_string(),
+            account: "work".to_string(),
+            checked_at_unix: 1_700_000_000,
+            last_verified_at_unix: Some(1_700_000_000),
+            healthy: true,
+            error: None,
+            models: vec!["gpt-5".to_string()],
+            model_discovery_error: None,
+            usage: None,
+            usage_error: Some("usage unavailable".to_string()),
+            stale: false,
+        };
+        let mut health = LanguageModelProviderHealthConfig::default();
+        health.accounts.insert(key.clone(), snapshot);
+
+        write_provider_health(&client, &health).expect("persist health");
+        mark_provider_health_stale(&client, "openai", "work").expect("invalidate health");
+
+        let store = Arc::new(build_config_store().expect("config store"));
+        let reloaded_client = LocalConfigClient::new(store, SinomoDataDir::new(root.clone()), None);
+        let reloaded = load_provider_health(&reloaded_client);
+        let snapshot = reloaded.accounts.get(&key).expect("persisted health");
+
+        assert!(snapshot.healthy);
+        assert!(snapshot.stale);
+        assert_eq!(snapshot.last_verified_at_unix, Some(1_700_000_000));
+        assert_eq!(snapshot.models, ["gpt-5"]);
+        assert_eq!(snapshot.usage_error.as_deref(), Some("usage unavailable"));
+
+        remove_provider_health(&reloaded_client, "openai", "work").expect("remove health");
+        assert!(load_provider_health(&reloaded_client).accounts.is_empty());
+    }
 }
 
 /// Resolve the `lm.providers` config object into a `ModelConfig` via the client.
@@ -470,9 +565,14 @@ pub struct ProviderForm {
     pub is_default: bool,
     pub enabled: bool,
     pub default_model: String,
+    /// Complete built-in model options available without credential or network discovery.
+    pub known_models: Vec<String>,
     pub api_base_url: String,
     /// The configured reasoning effort (e.g. "high"), or `None` for the provider default.
     pub reasoning_effort: Option<String>,
+    pub reasoning_budget_tokens: Option<u32>,
+    pub text_verbosity: Option<String>,
+    pub vendor_options: String,
     /// Whether reasoning effort applies to this provider/model at all.
     pub supports_reasoning: bool,
     /// Whether an API-key credential is stored for this account.
@@ -535,18 +635,177 @@ pub fn provider_forms(client: &dyn ConfigClient) -> Vec<ProviderForm> {
                 && account_name == default_account,
             enabled: account.enabled,
             supports_reasoning: model_supports_reasoning_effort(&provider, &default_model),
+            known_models: sinomo_lm::provider_known_model_ids(&provider),
             default_model,
             api_base_url: account.api_base_url.clone().unwrap_or_default(),
             reasoning_effort: account
                 .options
                 .reasoning_effort
                 .map(|e| e.as_config_value().to_string()),
+            reasoning_budget_tokens: account.options.reasoning_budget_tokens,
+            text_verbosity: account
+                .options
+                .text_verbosity
+                .map(|value| value.as_config_value().to_string()),
+            vendor_options: serde_json::to_string(&account.options.vendor_options)
+                .unwrap_or_else(|_| "{}".to_string()),
             has_api_key,
             uses_device_login,
             signed_in,
         });
     }
     forms
+}
+
+pub fn load_provider_health(client: &dyn ConfigClient) -> LanguageModelProviderHealthConfig {
+    client
+        .get(LM_PROVIDER_HEALTH_CONFIG_KEY)
+        .ok()
+        .and_then(|resolution| serde_json::from_value(resolution.value).ok())
+        .unwrap_or_default()
+}
+
+fn write_provider_health(
+    client: &dyn ConfigClient,
+    health: &LanguageModelProviderHealthConfig,
+) -> Result<(), String> {
+    let value = serde_json::to_value(health).map_err(|error| error.to_string())?;
+    client
+        .set(
+            LM_PROVIDER_HEALTH_CONFIG_KEY,
+            value,
+            ConfigWriteTarget::Auto,
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+pub fn mark_provider_health_stale(
+    client: &dyn ConfigClient,
+    provider: &str,
+    account: &str,
+) -> Result<(), String> {
+    let mut health = load_provider_health(client);
+    if let Some(snapshot) = health
+        .accounts
+        .get_mut(&provider_health_account_key(provider, account))
+    {
+        snapshot.stale = snapshot.last_verified_at_unix.is_some();
+        write_provider_health(client, &health)?;
+    }
+    Ok(())
+}
+
+pub fn remove_provider_health(
+    client: &dyn ConfigClient,
+    provider: &str,
+    account: &str,
+) -> Result<(), String> {
+    let mut health = load_provider_health(client);
+    if health
+        .accounts
+        .remove(&provider_health_account_key(provider, account))
+        .is_some()
+    {
+        write_provider_health(client, &health)?;
+    }
+    Ok(())
+}
+
+pub fn test_provider_connection(
+    data_dir: &SinomoDataDir,
+    client: &dyn ConfigClient,
+    provider: &str,
+    account: &str,
+) -> Result<LanguageModelProviderHealthSnapshot, String> {
+    let provider = normalize_configurable_provider(provider)?;
+    let account_name = normalize_provider_account_name(Some(account));
+    let config = load_provider_config(client).unwrap_or_default();
+    let account_config = config.accounts.iter().find(|candidate| {
+        normalize_model_provider(&candidate.provider).as_deref() == Some(provider.as_str())
+            && normalize_provider_account_name(Some(&candidate.account)) == account_name
+    });
+    let account_config = account_config.ok_or_else(|| {
+        format!(
+            "{} account {} was not found",
+            provider_display_name(&provider),
+            account_name
+        )
+    })?;
+
+    let key = provider_health_account_key(&provider, &account_name);
+    let mut health = load_provider_health(client);
+    let previous = health.accounts.get(&key).cloned();
+    let checked_at_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+    let verification = sinomo_lm::test_provider_account_credentials_in_data_dir(
+        data_dir,
+        &provider,
+        Some(account_config),
+    );
+    let snapshot = match verification {
+        Ok(()) => {
+            let (models, model_discovery_error) =
+                match sinomo_lm::provider_available_model_ids_for_account_in_data_dir(
+                    data_dir,
+                    &provider,
+                    Some(account_config),
+                ) {
+                    Ok(models) => (models, None),
+                    Err(error) => (Vec::new(), Some(error.to_string())),
+                };
+            let (usage, usage_error) =
+                if sinomo_lm::subscription_usage_provider_ids().contains(&provider.as_str()) {
+                    match sinomo_lm::provider_usage_in_data_dir(data_dir, &provider) {
+                        Ok(usage) => (Some(usage), None),
+                        Err(error) => (None, Some(error.to_string())),
+                    }
+                } else {
+                    (None, None)
+                };
+            LanguageModelProviderHealthSnapshot {
+                provider,
+                account: account_name,
+                checked_at_unix,
+                last_verified_at_unix: Some(checked_at_unix),
+                healthy: true,
+                error: None,
+                models,
+                model_discovery_error,
+                usage,
+                usage_error,
+                stale: false,
+            }
+        }
+        Err(error) => LanguageModelProviderHealthSnapshot {
+            provider,
+            account: account_name,
+            checked_at_unix,
+            last_verified_at_unix: previous
+                .as_ref()
+                .and_then(|snapshot| snapshot.last_verified_at_unix),
+            healthy: false,
+            error: Some(error.to_string()),
+            models: previous
+                .as_ref()
+                .map(|snapshot| snapshot.models.clone())
+                .unwrap_or_default(),
+            model_discovery_error: previous
+                .as_ref()
+                .and_then(|snapshot| snapshot.model_discovery_error.clone()),
+            usage: previous
+                .as_ref()
+                .and_then(|snapshot| snapshot.usage.clone()),
+            usage_error: previous
+                .as_ref()
+                .and_then(|snapshot| snapshot.usage_error.clone()),
+            stale: previous
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.last_verified_at_unix.is_some()),
+        },
+    };
+    health.accounts.insert(key, snapshot.clone());
+    write_provider_health(client, &health)?;
+    Ok(snapshot)
 }
 
 /// Run a provider's OAuth device-login flow (codex / github-copilot). Blocks while polling — call
@@ -718,6 +977,18 @@ pub const REASONING_EFFORT_OPTIONS: &[&str] = &[
     "default", "minimal", "low", "medium", "high", "xhigh", "max",
 ];
 
+pub const TEXT_VERBOSITY_OPTIONS: &[&str] = &["default", "low", "medium", "high"];
+
+pub fn text_verbosity_index(verbosity: Option<&str>) -> usize {
+    verbosity
+        .and_then(|value| {
+            TEXT_VERBOSITY_OPTIONS
+                .iter()
+                .position(|option| *option == value)
+        })
+        .unwrap_or(0)
+}
+
 /// Resolve a provider form's current reasoning effort to its index into
 /// [`REASONING_EFFORT_OPTIONS`] (0 = default / unset).
 pub fn reasoning_effort_index(effort: Option<&str>) -> usize {
@@ -744,6 +1015,64 @@ pub fn set_provider_effort(
     };
     update_provider_account(client, provider, account, move |account| {
         account.options.reasoning_effort = effort;
+    })
+}
+
+pub fn set_provider_text_verbosity(
+    client: &dyn ConfigClient,
+    provider: &str,
+    account: &str,
+    index: usize,
+) -> Result<(), String> {
+    let verbosity = match TEXT_VERBOSITY_OPTIONS.get(index) {
+        Some(&"default") | None => None,
+        Some(value) => Some(value.parse::<ProviderTextVerbosity>()?),
+    };
+    update_provider_account(client, provider, account, move |account| {
+        account.options.text_verbosity = verbosity;
+    })
+}
+
+pub fn set_provider_reasoning_budget(
+    client: &dyn ConfigClient,
+    provider: &str,
+    account: &str,
+    raw: &str,
+) -> Result<(), String> {
+    let value = raw.trim();
+    let budget = if value.is_empty() {
+        None
+    } else {
+        Some(
+            value
+                .parse::<u32>()
+                .map_err(|_| "reasoning budget must be a positive whole number".to_string())?,
+        )
+    };
+    if budget == Some(0) {
+        return Err("reasoning budget must be greater than zero".to_string());
+    }
+    update_provider_account(client, provider, account, move |account| {
+        account.options.reasoning_budget_tokens = budget;
+    })
+}
+
+pub fn set_provider_vendor_options(
+    client: &dyn ConfigClient,
+    provider: &str,
+    account: &str,
+    raw: &str,
+) -> Result<(), String> {
+    let value = raw.trim();
+    let options = if value.is_empty() {
+        std::collections::BTreeMap::new()
+    } else {
+        serde_json::from_str::<std::collections::BTreeMap<String, String>>(value).map_err(
+            |error| format!("provider options must be a JSON object of strings: {error}"),
+        )?
+    };
+    update_provider_account(client, provider, account, move |account| {
+        account.options.vendor_options = options;
     })
 }
 

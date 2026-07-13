@@ -112,6 +112,54 @@ fn boot_settings_with_provider_accounts(
         "",
     )
     .expect("seed DeepSeek provider");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let mut health = sinomo_lm::LanguageModelProviderHealthConfig::default();
+    health.accounts.insert(
+        sinomo_lm::provider_health_account_key("openai", "work"),
+        sinomo_lm::LanguageModelProviderHealthSnapshot {
+            provider: "openai".to_string(),
+            account: "work".to_string(),
+            checked_at_unix: now - 720,
+            last_verified_at_unix: Some(now - 720),
+            healthy: true,
+            error: None,
+            models: vec!["gpt-5".to_string(), "gpt-5-mini".to_string()],
+            model_discovery_error: None,
+            usage: Some(sinomo_lm::LanguageModelProviderUsage {
+                provider: "openai".to_string(),
+                plan: Some("Pro".to_string()),
+                captured_at_unix: now as u64,
+                limits: vec![sinomo_lm::LanguageModelUsageLimit {
+                    id: "five-hour".to_string(),
+                    name: Some("Five-hour limit".to_string()),
+                    scope: None,
+                    unlimited: None,
+                    allowed: Some(true),
+                    exhausted: Some(false),
+                    remaining: None,
+                    entitlement: None,
+                    used_percent: Some(64.0),
+                    remaining_percent: Some(36.0),
+                    window_seconds: Some(18_000),
+                    reset_at_unix: Some(now + 8_040),
+                }],
+                credits: Some(sinomo_lm::LanguageModelCreditUsage {
+                    has_credits: Some(true),
+                    unlimited: Some(false),
+                    balance: Some("$18.40".to_string()),
+                }),
+            }),
+            usage_error: None,
+            stale: false,
+        },
+    );
+    config
+        .set(
+            sinomo_lm::LM_PROVIDER_HEALTH_CONFIG_KEY,
+            serde_json::to_value(health).expect("serialize provider health"),
+            sinomo_runtime::config::ConfigWriteTarget::Auto,
+        )
+        .expect("seed provider health");
 
     let mut state = sinomo_app::state::AppState::ready(backend);
     state.active_tab = Tab::Settings;
@@ -1088,6 +1136,13 @@ fn capture_providers_settings() {
     let app = TestApp::from_runtime(runtime).expect("headless test app");
     let window = app.main_window().expect("main window");
     app.run_until_idle().expect("settle providers layout");
+    window
+        .root()
+        .dispatch_event(sui::Event::Window(sui::WindowEvent::Resized(
+            sui::Size::new(1280.0, 1080.0),
+        )))
+        .expect("resize provider capture");
+    app.run_until_idle().expect("settle tall provider layout");
 
     let shot = window.capture_screenshot().expect("capture screenshot");
     let path = dir.join("sinomo-app-settings-providers.png");

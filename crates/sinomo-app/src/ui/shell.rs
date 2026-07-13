@@ -577,35 +577,40 @@ impl Widget for Shell {
                 let connection_changed = self.shared.pump_connection_probe();
                 let cluster_changed = self.pump_cluster_refresh();
                 let chat_visible = self.shared.active_tab() == Tab::Sinomo;
-                let chat_changed = if self.shared.is_ready() {
-                    let mut chat = self.shared.chat_mut();
-                    let worker_changed = chat.pump_worker_events();
-                    let providers_changed = chat.pump_provider_list();
-                    let agents_changed = chat.pump_agent_list();
-                    let list_changed = chat.pump_session_list();
-                    let delete_changed = chat.pump_delete();
-                    let media_changed = chat.pump_media_call_runtime();
-                    let media_visibility_changed = if chat_visible {
-                        false
+                let (chat_changed, chat_semantics_changed, chat_layout_changed) =
+                    if self.shared.is_ready() {
+                        let mut chat = self.shared.chat_mut();
+                        let worker_changed = chat.pump_worker_events();
+                        let providers_changed = chat.pump_provider_list();
+                        let agents_changed = chat.pump_agent_list();
+                        let list_changed = chat.pump_session_list();
+                        let delete_changed = chat.pump_delete();
+                        let media_changed = chat.pump_media_call_runtime();
+                        let media_visibility_changed = if chat_visible {
+                            false
+                        } else {
+                            chat.sync_media_setup_visibility(false)
+                        };
+                        let structural_changed = worker_changed
+                            || providers_changed
+                            || agents_changed
+                            || list_changed
+                            || delete_changed
+                            || media_visibility_changed;
+                        (
+                            structural_changed || media_changed.paint,
+                            structural_changed || media_changed.semantics,
+                            structural_changed || media_changed.layout,
+                        )
                     } else {
-                        chat.sync_media_setup_visibility(false)
+                        (false, false, false)
                     };
-                    worker_changed
-                        || providers_changed
-                        || agents_changed
-                        || list_changed
-                        || delete_changed
-                        || media_changed
-                        || media_visibility_changed
-                } else {
-                    false
-                };
                 self.schedule_chat_session_timer(ctx);
                 if device_changed
                     || files_changed
                     || connection_changed
                     || cluster_changed
-                    || chat_changed
+                    || chat_layout_changed
                     || device_changed
                     || settings_changed
                     || settings_operations_changed
@@ -613,6 +618,8 @@ impl Widget for Shell {
                 {
                     ctx.request_measure();
                     ctx.request_arrange();
+                    ctx.request_semantics();
+                } else if chat_semantics_changed {
                     ctx.request_semantics();
                 }
                 if changed
@@ -642,7 +649,10 @@ impl Widget for Shell {
             let connection_changed = self.shared.pump_connection_probe();
             let cluster_changed = self.pump_cluster_refresh();
             let chat_visible = self.shared.active_tab() == Tab::Sinomo;
-            let chat_changed = if self.shared.is_ready() {
+            let (chat_changed, chat_semantics_changed, chat_layout_changed) = if self
+                .shared
+                .is_ready()
+            {
                 let mut chat = self.shared.chat_mut();
                 let providers_changed = chat.pump_provider_list();
                 let agents_changed = chat.pump_agent_list();
@@ -653,13 +663,15 @@ impl Widget for Shell {
                 } else {
                     chat.sync_media_setup_visibility(false)
                 };
-                providers_changed
-                    || agents_changed
-                    || list_changed
-                    || media_changed
-                    || media_visibility_changed
+                let structural_changed =
+                    providers_changed || agents_changed || list_changed || media_visibility_changed;
+                (
+                    structural_changed || media_changed.paint,
+                    structural_changed || media_changed.semantics,
+                    structural_changed || media_changed.layout,
+                )
             } else {
-                false
+                (false, false, false)
             };
             let settings_changed = if self.shared.is_ready() {
                 self.shared.settings_mut().pump_initial_load()
@@ -679,7 +691,7 @@ impl Widget for Shell {
             self.schedule_chat_session_timer(ctx);
             if connection_changed
                 || cluster_changed
-                || chat_changed
+                || chat_layout_changed
                 || settings_changed
                 || settings_operations_changed
                 || evolution_changed
@@ -688,6 +700,13 @@ impl Widget for Shell {
                 ctx.request_arrange();
                 ctx.request_semantics();
                 ctx.request_paint();
+            } else {
+                if chat_semantics_changed {
+                    ctx.request_semantics();
+                }
+                if chat_changed {
+                    ctx.request_paint();
+                }
             }
             self.sync_active_tab(ctx);
             self.sync_render_options(ctx);

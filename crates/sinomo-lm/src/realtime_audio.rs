@@ -2,8 +2,12 @@ use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use http::header::{AUTHORIZATION, HeaderName};
 use http::{HeaderValue, Uri};
+use image::codecs::{jpeg::JpegEncoder, png::PngEncoder};
+use image::imageops::FilterType;
+use image::{DynamicImage, ImageEncoder, RgbImage, RgbaImage};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -15,6 +19,8 @@ const OPENAI_DEFAULT_REALTIME_BASE_URL: &str = "https://api.openai.com/v1";
 const MINICPM_DEFAULT_REALTIME_BASE_URL: &str = "https://minicpmo45.modelbest.cn";
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_RECEIVE_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_VIDEO_ENCODING_QUALITY: u8 = 85;
+const DEFAULT_VIDEO_MAX_DIMENSION: u32 = 1_280;
 
 type RealtimeWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -79,6 +85,7 @@ impl RealtimeAudioSampleFormat {
     }
 }
 
+/// JPEG/PNG encoding used after a raw frame crosses the model-provider boundary.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum RealtimeVideoFrameFormat {
@@ -131,6 +138,15 @@ impl RealtimeVideoFrameDetail {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct RealtimeVideoInputConfig {
     pub frame_format: RealtimeVideoFrameFormat,
+    /// JPEG quality on a 1-100 scale. PNG encoding is lossless.
+    #[serde(default = "default_video_encoding_quality")]
+    pub encoding_quality: u8,
+    /// Longest encoded edge in pixels, or `None` to keep the source dimensions.
+    #[serde(
+        default = "default_video_max_dimension",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_dimension: Option<u32>,
     #[serde(default)]
     pub detail: RealtimeVideoFrameDetail,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -141,10 +157,30 @@ impl Default for RealtimeVideoInputConfig {
     fn default() -> Self {
         Self {
             frame_format: RealtimeVideoFrameFormat::Jpeg,
+            encoding_quality: DEFAULT_VIDEO_ENCODING_QUALITY,
+            max_dimension: Some(DEFAULT_VIDEO_MAX_DIMENSION),
             detail: RealtimeVideoFrameDetail::Auto,
             max_frame_rate_hz: Some(2),
         }
     }
+}
+
+impl RealtimeVideoInputConfig {
+    /// Minimum interval between frames sampled for model inference. Native
+    /// capture and local preview remain independent of this outbound cadence.
+    pub fn model_frame_interval(&self) -> Option<Duration> {
+        self.max_frame_rate_hz
+            .filter(|rate| *rate > 0)
+            .map(|rate| Duration::from_nanos((1_000_000_000_u64 / u64::from(rate)).max(1)))
+    }
+}
+
+const fn default_video_encoding_quality() -> u8 {
+    DEFAULT_VIDEO_ENCODING_QUALITY
+}
+
+const fn default_video_max_dimension() -> Option<u32> {
+    Some(DEFAULT_VIDEO_MAX_DIMENSION)
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -267,6 +303,25 @@ impl RealtimeAudioSessionConfig {
     }
 
     pub fn validate(&self) -> Result<(), RealtimeAudioError> {
+        if let Some(video) = &self.input_video {
+            if !(1..=100).contains(&video.encoding_quality) {
+                return Err(RealtimeAudioError::InvalidConfig {
+                    detail: "realtime video encoding quality must be between 1 and 100".to_string(),
+                });
+            }
+            if video.max_dimension == Some(0) {
+                return Err(RealtimeAudioError::InvalidConfig {
+                    detail: "realtime video maximum dimension must be greater than zero"
+                        .to_string(),
+                });
+            }
+            if video.max_frame_rate_hz == Some(0) {
+                return Err(RealtimeAudioError::InvalidConfig {
+                    detail: "realtime video maximum frame rate must be greater than zero"
+                        .to_string(),
+                });
+            }
+        }
         match self.provider {
             RealtimeAudioProvider::OpenAi => {
                 if self.input_format != RealtimeAudioSampleFormat::Pcm16Le {
@@ -315,22 +370,80 @@ impl RealtimeAudioInputChunk {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RealtimeVideoPixelFormat {
+    Rgb8,
+    Rgba8,
+    Bgra8,
+}
+
+impl RealtimeVideoPixelFormat {
+    pub const fn bytes_per_pixel(self) -> usize {
+        match self {
+            Self::Rgb8 => 3,
+            Self::Rgba8 | Self::Bgra8 => 4,
+        }
+    }
+}
+
+/// A hot camera frame. Raw pixels deliberately do not implement serialization.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RealtimeVideoFrameInput {
-    pub frame: Vec<u8>,
-    pub format: RealtimeVideoFrameFormat,
-    #[serde(default)]
+    pub pixels: Arc<[u8]>,
+    pub pixel_format: RealtimeVideoPixelFormat,
+    pub width: u32,
+    pub height: u32,
+    pub stride: usize,
     pub detail: RealtimeVideoFrameDetail,
     pub sequence: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_ms: Option<u64>,
 }
 
 impl RealtimeVideoFrameInput {
-    pub fn new(frame: Vec<u8>, format: RealtimeVideoFrameFormat, sequence: u64) -> Self {
+    pub fn new(
+        pixels: Arc<[u8]>,
+        pixel_format: RealtimeVideoPixelFormat,
+        width: u32,
+        height: u32,
+        stride: usize,
+        sequence: u64,
+    ) -> Self {
         Self {
-            frame,
+            pixels,
+            pixel_format,
+            width,
+            height,
+            stride,
+            detail: RealtimeVideoFrameDetail::Auto,
+            sequence,
+            timestamp_ms: None,
+        }
+    }
+}
+
+/// An image that has already crossed an explicit JPEG/PNG encoding boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealtimeEncodedVideoFrameInput {
+    pub image: Arc<[u8]>,
+    pub format: RealtimeVideoFrameFormat,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub detail: RealtimeVideoFrameDetail,
+    pub sequence: u64,
+    pub timestamp_ms: Option<u64>,
+}
+
+impl RealtimeEncodedVideoFrameInput {
+    pub fn new(
+        image: impl Into<Arc<[u8]>>,
+        format: RealtimeVideoFrameFormat,
+        sequence: u64,
+    ) -> Self {
+        Self {
+            image: image.into(),
             format,
+            width: None,
+            height: None,
             detail: RealtimeVideoFrameDetail::Auto,
             sequence,
             timestamp_ms: None,
@@ -415,6 +528,10 @@ pub enum RealtimeAudioError {
     Protocol { detail: String },
     #[error("realtime audio JSON error: {detail}")]
     Json { detail: String },
+    #[error("invalid realtime video frame: {detail}")]
+    InvalidVideoFrame { detail: String },
+    #[error("realtime video frame encoding failed: {detail}")]
+    VideoEncode { detail: String },
 }
 
 pub struct RealtimeAudioSession {
@@ -516,6 +633,39 @@ impl RealtimeAudioSession {
     pub async fn send_video_frame(
         &mut self,
         frame: &RealtimeVideoFrameInput,
+    ) -> Result<(), RealtimeAudioError> {
+        self.send_video_frame_and_return_encoded(frame)
+            .await
+            .map(|_| ())
+    }
+
+    /// Encodes and sends a raw frame, returning the exact encoded image used by the provider.
+    pub async fn send_video_frame_and_return_encoded(
+        &mut self,
+        frame: &RealtimeVideoFrameInput,
+    ) -> Result<RealtimeEncodedVideoFrameInput, RealtimeAudioError> {
+        let video_config =
+            self.config
+                .input_video
+                .clone()
+                .ok_or_else(|| RealtimeAudioError::InvalidConfig {
+                    detail: "realtime session is not configured for video input".to_string(),
+                })?;
+        let frame = frame.clone();
+        let encoded =
+            tokio::task::spawn_blocking(move || encode_realtime_video_frame(&frame, &video_config))
+                .await
+                .map_err(|source| RealtimeAudioError::VideoEncode {
+                    detail: format!("video encoder task failed: {source}"),
+                })??;
+        self.send_encoded_video_frame(&encoded).await?;
+        Ok(encoded)
+    }
+
+    /// Sends an explicitly pre-encoded JPEG/PNG image without decoding or re-encoding it.
+    pub async fn send_encoded_video_frame(
+        &mut self,
+        frame: &RealtimeEncodedVideoFrameInput,
     ) -> Result<(), RealtimeAudioError> {
         if self.config.input_video.is_none() {
             return Err(RealtimeAudioError::InvalidConfig {
@@ -753,11 +903,164 @@ pub fn minicpm_input_audio_append_payload(chunk: &RealtimeAudioInputChunk) -> se
     payload
 }
 
-pub fn openai_input_video_frame_payload(frame: &RealtimeVideoFrameInput) -> serde_json::Value {
+fn encode_realtime_video_frame(
+    frame: &RealtimeVideoFrameInput,
+    config: &RealtimeVideoInputConfig,
+) -> Result<RealtimeEncodedVideoFrameInput, RealtimeAudioError> {
+    if !(1..=100).contains(&config.encoding_quality) {
+        return Err(RealtimeAudioError::InvalidConfig {
+            detail: "realtime video encoding quality must be between 1 and 100".to_string(),
+        });
+    }
+    if config.max_dimension == Some(0) {
+        return Err(RealtimeAudioError::InvalidConfig {
+            detail: "realtime video maximum dimension must be greater than zero".to_string(),
+        });
+    }
+
+    let mut image = raw_video_frame_image(frame)?;
+    if let Some(max_dimension) = config.max_dimension {
+        let source_max = image.width().max(image.height());
+        if source_max > max_dimension {
+            let width = ((u64::from(image.width()) * u64::from(max_dimension)
+                + u64::from(source_max) / 2)
+                / u64::from(source_max))
+            .max(1) as u32;
+            let height = ((u64::from(image.height()) * u64::from(max_dimension)
+                + u64::from(source_max) / 2)
+                / u64::from(source_max))
+            .max(1) as u32;
+            image = image.resize_exact(width, height, FilterType::Triangle);
+        }
+    }
+
+    let encoded_width = image.width();
+    let encoded_height = image.height();
+    let mut encoded = Vec::new();
+    match config.frame_format {
+        RealtimeVideoFrameFormat::Jpeg => {
+            let image = image.to_rgb8();
+            JpegEncoder::new_with_quality(&mut encoded, config.encoding_quality)
+                .encode(
+                    image.as_raw(),
+                    image.width(),
+                    image.height(),
+                    image::ExtendedColorType::Rgb8,
+                )
+                .map_err(|source| RealtimeAudioError::VideoEncode {
+                    detail: source.to_string(),
+                })?;
+        }
+        RealtimeVideoFrameFormat::Png => {
+            let image = image.to_rgba8();
+            PngEncoder::new(&mut encoded)
+                .write_image(
+                    image.as_raw(),
+                    image.width(),
+                    image.height(),
+                    image::ExtendedColorType::Rgba8,
+                )
+                .map_err(|source| RealtimeAudioError::VideoEncode {
+                    detail: source.to_string(),
+                })?;
+        }
+    }
+
+    let mut output =
+        RealtimeEncodedVideoFrameInput::new(encoded, config.frame_format, frame.sequence);
+    output.width = Some(encoded_width);
+    output.height = Some(encoded_height);
+    output.detail = frame.detail;
+    output.timestamp_ms = frame.timestamp_ms;
+    Ok(output)
+}
+
+fn raw_video_frame_image(
+    frame: &RealtimeVideoFrameInput,
+) -> Result<DynamicImage, RealtimeAudioError> {
+    if frame.width == 0 || frame.height == 0 {
+        return Err(RealtimeAudioError::InvalidVideoFrame {
+            detail: "width and height must be greater than zero".to_string(),
+        });
+    }
+    let width =
+        usize::try_from(frame.width).map_err(|_| RealtimeAudioError::InvalidVideoFrame {
+            detail: "frame width does not fit this platform".to_string(),
+        })?;
+    let height =
+        usize::try_from(frame.height).map_err(|_| RealtimeAudioError::InvalidVideoFrame {
+            detail: "frame height does not fit this platform".to_string(),
+        })?;
+    let row_bytes = width
+        .checked_mul(frame.pixel_format.bytes_per_pixel())
+        .ok_or_else(|| RealtimeAudioError::InvalidVideoFrame {
+            detail: "frame row size overflowed".to_string(),
+        })?;
+    if frame.stride < row_bytes {
+        return Err(RealtimeAudioError::InvalidVideoFrame {
+            detail: format!(
+                "stride {} is smaller than the packed row size {row_bytes}",
+                frame.stride
+            ),
+        });
+    }
+    let required_len = frame
+        .stride
+        .checked_mul(height.saturating_sub(1))
+        .and_then(|offset| offset.checked_add(row_bytes))
+        .ok_or_else(|| RealtimeAudioError::InvalidVideoFrame {
+            detail: "frame buffer size overflowed".to_string(),
+        })?;
+    if frame.pixels.len() < required_len {
+        return Err(RealtimeAudioError::InvalidVideoFrame {
+            detail: format!(
+                "pixel buffer has {} bytes but the dimensions and stride require {required_len}",
+                frame.pixels.len()
+            ),
+        });
+    }
+    let capacity =
+        row_bytes
+            .checked_mul(height)
+            .ok_or_else(|| RealtimeAudioError::InvalidVideoFrame {
+                detail: "packed frame size overflowed".to_string(),
+            })?;
+    let mut packed = Vec::with_capacity(capacity);
+    for row in 0..height {
+        let start = row * frame.stride;
+        let source = &frame.pixels[start..start + row_bytes];
+        if frame.pixel_format == RealtimeVideoPixelFormat::Bgra8 {
+            for pixel in source.chunks_exact(4) {
+                packed.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+            }
+        } else {
+            packed.extend_from_slice(source);
+        }
+    }
+
+    match frame.pixel_format {
+        RealtimeVideoPixelFormat::Rgb8 => RgbImage::from_raw(frame.width, frame.height, packed)
+            .map(DynamicImage::ImageRgb8)
+            .ok_or_else(|| RealtimeAudioError::InvalidVideoFrame {
+                detail: "could not construct RGB image from raw pixels".to_string(),
+            }),
+        RealtimeVideoPixelFormat::Rgba8 | RealtimeVideoPixelFormat::Bgra8 => {
+            RgbaImage::from_raw(frame.width, frame.height, packed)
+                .map(DynamicImage::ImageRgba8)
+                .ok_or_else(|| RealtimeAudioError::InvalidVideoFrame {
+                    detail: "could not construct RGBA image from raw pixels".to_string(),
+                })
+        }
+    }
+}
+
+pub fn openai_input_video_frame_payload(
+    frame: &RealtimeEncodedVideoFrameInput,
+) -> serde_json::Value {
     let image_url = format!(
         "data:{};base64,{}",
         frame.format.mime_type(),
-        base64::engine::general_purpose::STANDARD.encode(&frame.frame)
+        base64::engine::general_purpose::STANDARD.encode(frame.image.as_ref())
     );
     serde_json::json!({
         "type": "conversation.item.create",
@@ -773,10 +1076,12 @@ pub fn openai_input_video_frame_payload(frame: &RealtimeVideoFrameInput) -> serd
     })
 }
 
-pub fn minicpm_input_video_frame_payload(frame: &RealtimeVideoFrameInput) -> serde_json::Value {
+pub fn minicpm_input_video_frame_payload(
+    frame: &RealtimeEncodedVideoFrameInput,
+) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "type": "input_image_buffer.append",
-        "image": base64::engine::general_purpose::STANDARD.encode(&frame.frame),
+        "image": base64::engine::general_purpose::STANDARD.encode(frame.image.as_ref()),
         "mime_type": frame.format.mime_type(),
         "format": frame.format.as_config_value(),
         "sequence": frame.sequence,
@@ -968,9 +1273,45 @@ mod tests {
     }
 
     #[test]
+    fn video_input_config_deserializes_encoding_defaults() {
+        let config: RealtimeVideoInputConfig = serde_json::from_value(serde_json::json!({
+            "frame_format": "jpeg",
+            "detail": "auto",
+            "max_frame_rate_hz": 2
+        }))
+        .expect("video input config");
+
+        assert_eq!(config.encoding_quality, DEFAULT_VIDEO_ENCODING_QUALITY);
+        assert_eq!(config.max_dimension, Some(DEFAULT_VIDEO_MAX_DIMENSION));
+        assert_eq!(
+            config.model_frame_interval(),
+            Some(Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn video_input_config_rejects_zero_model_frame_rate() {
+        let mut config =
+            RealtimeAudioSessionConfig::new(RealtimeAudioProvider::OpenAi, "gpt-realtime-2");
+        config.input_video = Some(RealtimeVideoInputConfig {
+            max_frame_rate_hz: Some(0),
+            ..Default::default()
+        });
+
+        assert!(matches!(
+            config.validate(),
+            Err(RealtimeAudioError::InvalidConfig { detail })
+                if detail.contains("maximum frame rate")
+        ));
+    }
+
+    #[test]
     fn openai_video_frame_uses_input_image_item() {
-        let mut frame =
-            RealtimeVideoFrameInput::new(vec![0, 1, 2, 3], RealtimeVideoFrameFormat::Jpeg, 7);
+        let mut frame = RealtimeEncodedVideoFrameInput::new(
+            vec![0, 1, 2, 3],
+            RealtimeVideoFrameFormat::Jpeg,
+            7,
+        );
         frame.detail = RealtimeVideoFrameDetail::Low;
         let payload = openai_input_video_frame_payload(&frame);
 
@@ -986,7 +1327,7 @@ mod tests {
     #[test]
     fn minicpm_video_frame_uses_image_buffer_append() {
         let mut frame =
-            RealtimeVideoFrameInput::new(vec![0, 1, 2, 3], RealtimeVideoFrameFormat::Png, 7);
+            RealtimeEncodedVideoFrameInput::new(vec![0, 1, 2, 3], RealtimeVideoFrameFormat::Png, 7);
         frame.timestamp_ms = Some(1234);
         let payload = minicpm_input_video_frame_payload(&frame);
 
@@ -995,6 +1336,119 @@ mod tests {
         assert_eq!(payload["mime_type"], "image/png");
         assert_eq!(payload["sequence"], 7);
         assert_eq!(payload["timestamp_ms"], 1234);
+    }
+
+    #[test]
+    fn raw_rgba_frame_is_resized_and_jpeg_encoded_before_payload_creation() {
+        let mut frame = RealtimeVideoFrameInput::new(
+            Arc::<[u8]>::from([255, 0, 0, 255].repeat(8)),
+            RealtimeVideoPixelFormat::Rgba8,
+            4,
+            2,
+            16,
+            9,
+        );
+        frame.detail = RealtimeVideoFrameDetail::High;
+        frame.timestamp_ms = Some(4500);
+        let config = RealtimeVideoInputConfig {
+            encoding_quality: 92,
+            max_dimension: Some(2),
+            ..Default::default()
+        };
+
+        let encoded = encode_realtime_video_frame(&frame, &config).expect("encoded frame");
+
+        assert_eq!(encoded.format, RealtimeVideoFrameFormat::Jpeg);
+        assert_eq!((encoded.width, encoded.height), (Some(2), Some(1)));
+        assert_eq!(encoded.detail, RealtimeVideoFrameDetail::High);
+        assert_eq!(encoded.sequence, 9);
+        assert_eq!(encoded.timestamp_ms, Some(4500));
+        assert!(encoded.image.starts_with(&[0xff, 0xd8, 0xff]));
+        let decoded =
+            image::load_from_memory_with_format(encoded.image.as_ref(), image::ImageFormat::Jpeg)
+                .expect("decode JPEG");
+        assert_eq!((decoded.width(), decoded.height()), (2, 1));
+
+        let payload = openai_input_video_frame_payload(&encoded);
+        assert_eq!(payload["item"]["content"][0]["detail"], "high");
+        let image_url = payload["item"]["content"][0]["image_url"]
+            .as_str()
+            .expect("image URL");
+        assert!(image_url.starts_with("data:image/jpeg;base64,/9j/"));
+        let payload_image = base64::engine::general_purpose::STANDARD
+            .decode(image_url.split_once(',').expect("data URL").1)
+            .expect("payload image");
+        assert_eq!(payload_image, encoded.image.as_ref());
+    }
+
+    #[test]
+    fn bgra_frame_with_padded_stride_is_repacked_and_png_encoded() {
+        let frame = RealtimeVideoFrameInput::new(
+            Arc::<[u8]>::from(vec![10, 20, 30, 40, 0, 0, 0, 0, 50, 60, 70, 80]),
+            RealtimeVideoPixelFormat::Bgra8,
+            1,
+            2,
+            8,
+            3,
+        );
+        let config = RealtimeVideoInputConfig {
+            frame_format: RealtimeVideoFrameFormat::Png,
+            max_dimension: None,
+            ..Default::default()
+        };
+
+        let encoded = encode_realtime_video_frame(&frame, &config).expect("encoded frame");
+        let decoded =
+            image::load_from_memory_with_format(encoded.image.as_ref(), image::ImageFormat::Png)
+                .expect("decode PNG")
+                .to_rgba8();
+
+        assert_eq!(decoded.as_raw(), &[30, 20, 10, 40, 70, 60, 50, 80]);
+    }
+
+    #[test]
+    fn packed_rgb_frame_is_png_encoded() {
+        let frame = RealtimeVideoFrameInput::new(
+            Arc::<[u8]>::from(vec![12, 34, 56]),
+            RealtimeVideoPixelFormat::Rgb8,
+            1,
+            1,
+            3,
+            1,
+        );
+        let config = RealtimeVideoInputConfig {
+            frame_format: RealtimeVideoFrameFormat::Png,
+            max_dimension: None,
+            ..Default::default()
+        };
+
+        let encoded = encode_realtime_video_frame(&frame, &config).expect("encoded frame");
+        let decoded =
+            image::load_from_memory_with_format(encoded.image.as_ref(), image::ImageFormat::Png)
+                .expect("decode PNG")
+                .to_rgba8();
+
+        assert_eq!(decoded.as_raw(), &[12, 34, 56, 255]);
+    }
+
+    #[test]
+    fn raw_frame_rejects_stride_smaller_than_packed_row() {
+        let frame = RealtimeVideoFrameInput::new(
+            Arc::<[u8]>::from(vec![0; 6]),
+            RealtimeVideoPixelFormat::Rgb8,
+            2,
+            1,
+            5,
+            0,
+        );
+
+        let error = encode_realtime_video_frame(&frame, &RealtimeVideoInputConfig::default())
+            .expect_err("invalid stride");
+
+        assert!(matches!(
+            error,
+            RealtimeAudioError::InvalidVideoFrame { .. }
+        ));
     }
 
     #[test]

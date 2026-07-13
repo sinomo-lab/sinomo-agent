@@ -50,6 +50,13 @@ pub struct NvidiaProvider {
 impl NvidiaProvider {
     pub const PROVIDER_ID: &'static str = "nvidia";
 
+    pub fn known_model_ids() -> Vec<String> {
+        NVIDIA_MODEL_IDS
+            .iter()
+            .map(|model| model.to_string())
+            .collect()
+    }
+
     pub fn new(config: NvidiaConfig) -> Self {
         Self {
             config,
@@ -82,10 +89,7 @@ impl NvidiaProvider {
 
     pub fn list_models(&self) -> Result<Vec<String>, LanguageModelError> {
         self.api_key()?;
-        Ok(NVIDIA_MODEL_IDS
-            .iter()
-            .map(|model| model.to_string())
-            .collect())
+        Ok(Self::known_model_ids())
     }
 
     pub fn test_connection(&self) -> Result<(), LanguageModelError> {

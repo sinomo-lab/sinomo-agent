@@ -52,8 +52,9 @@ pub use openai::{OpenAiConfig, OpenAiProvider};
 pub use realtime_audio::{
     RealtimeAudioError, RealtimeAudioEvent, RealtimeAudioInputChunk, RealtimeAudioProvider,
     RealtimeAudioSampleFormat, RealtimeAudioSession, RealtimeAudioSessionConfig,
-    RealtimeAudioTurnDetection, RealtimeVideoFrameDetail, RealtimeVideoFrameFormat,
-    RealtimeVideoFrameInput, RealtimeVideoInputConfig, minicpm_input_audio_append_payload,
+    RealtimeAudioTurnDetection, RealtimeEncodedVideoFrameInput, RealtimeVideoFrameDetail,
+    RealtimeVideoFrameFormat, RealtimeVideoFrameInput, RealtimeVideoInputConfig,
+    RealtimeVideoPixelFormat, minicpm_input_audio_append_payload,
     minicpm_input_video_frame_payload, minicpm_realtime_ws_url, minicpm_realtime_ws_url_for_video,
     minicpm_session_update_payload, openai_input_audio_append_payload,
     openai_input_video_frame_payload, openai_realtime_ws_url, openai_session_update_payload,
@@ -969,8 +970,10 @@ pub struct ProviderAccountInfo {
 
 pub const DEFAULT_PROVIDER_ACCOUNT: &str = "default";
 pub const LM_PROVIDER_CONFIG_KEY: &str = "lm.providers";
+pub const LM_PROVIDER_HEALTH_CONFIG_KEY: &str = "lm.provider_health";
 pub const LM_RUNTIME_CONFIG_KEY: &str = "lm.runtime";
 pub const LM_PROVIDER_CONFIG_KV_KEY: &str = "/config/lm/providers";
+pub const LM_PROVIDER_HEALTH_CONFIG_KV_KEY: &str = "/config/lm/provider_health";
 pub const LM_RUNTIME_CONFIG_KV_KEY: &str = "/config/lm/runtime";
 const LM_CREDENTIALS_DOCUMENT_PREFIX: &str = "lm.credentials";
 
@@ -980,6 +983,41 @@ fn default_provider_account_name() -> String {
 
 fn provider_account_enabled_default() -> bool {
     true
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct LanguageModelProviderHealthConfig {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub accounts: BTreeMap<String, LanguageModelProviderHealthSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LanguageModelProviderHealthSnapshot {
+    pub provider: String,
+    pub account: String,
+    pub checked_at_unix: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verified_at_unix: Option<i64>,
+    pub healthy: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_discovery_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<LanguageModelProviderUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_error: Option<String>,
+    #[serde(default)]
+    pub stale: bool,
+}
+
+pub fn provider_health_account_key(provider: &str, account: &str) -> String {
+    let provider =
+        normalize_model_provider(provider).unwrap_or_else(|| provider.trim().to_string());
+    let account = normalize_provider_account_name(Some(account));
+    format!("{provider}:{account}")
 }
 
 pub fn normalize_provider_account_name(account: Option<&str>) -> String {
@@ -1200,6 +1238,24 @@ pub fn model_runtime_config_definition()
     Ok(definition)
 }
 
+pub fn provider_health_config_definition()
+-> Result<sinomo_runtime::config::ConfigDefinition, LanguageModelError> {
+    let definition = sinomo_runtime::config::ConfigDefinition::new(
+        LM_PROVIDER_HEALTH_CONFIG_KEY,
+        "sinomo-lm",
+        sinomo_runtime::config::ConfigValueType::Object {
+            schema_name: "LanguageModelProviderHealthConfig".to_string(),
+        },
+        "Cluster-visible provider verification, model discovery, and usage snapshots.",
+        sinomo_runtime::config::ConfigClusterMode::ClusterOverrideLocal,
+    )
+    .map_err(map_lm_config_error)?
+    .with_default(&LanguageModelProviderHealthConfig::default())
+    .map_err(map_lm_config_error)?;
+    debug_assert_eq!(definition.cluster_key(), LM_PROVIDER_HEALTH_CONFIG_KV_KEY);
+    Ok(definition)
+}
+
 fn provider_credentials_document_key(provider: &str) -> Result<String, LanguageModelError> {
     let provider = normalize_model_provider(provider).unwrap_or_else(|| provider.to_string());
     let key = format!("{LM_CREDENTIALS_DOCUMENT_PREFIX}.{provider}");
@@ -1214,6 +1270,8 @@ pub fn register_config_definitions(
         .register(model_config_definition()?)
         .map_err(map_lm_config_error)?
         .register(model_runtime_config_definition()?)
+        .map_err(map_lm_config_error)?
+        .register(provider_health_config_definition()?)
         .map_err(map_lm_config_error)
 }
 
@@ -1779,6 +1837,16 @@ pub fn subscription_usage_provider_ids() -> &'static [&'static str] {
     ]
 }
 
+/// Return a provider's complete built-in model catalog without reading credentials or making a
+/// network request. Providers whose catalog is account- or server-defined return an empty list.
+pub fn provider_known_model_ids(provider: &str) -> Vec<String> {
+    match provider {
+        DeepSeekProvider::PROVIDER_ID => DeepSeekProvider::known_model_ids(),
+        NvidiaProvider::PROVIDER_ID => NvidiaProvider::known_model_ids(),
+        _ => Vec::new(),
+    }
+}
+
 pub fn provider_available_model_ids(provider: &str) -> Result<Vec<String>, LanguageModelError> {
     match provider {
         GitHubCopilotProvider::PROVIDER_ID => {
@@ -1825,6 +1893,174 @@ pub fn provider_available_model_ids(provider: &str) -> Result<Vec<String>, Langu
             model: PROVIDER_DEFAULT_MODEL.to_string(),
             detail: format!("unknown provider `{provider}`"),
         }),
+    }
+}
+
+/// Resolve picker-visible models using a configured provider account.
+///
+/// Subscription providers use their authenticated remote catalogs. API-key
+/// providers use the account's credential/base URL and expose the provider's
+/// known catalog, including a configured custom default model.
+pub fn provider_available_model_ids_for_account(
+    provider: &str,
+    account: Option<&ProviderAccountConfig>,
+) -> Result<Vec<String>, LanguageModelError> {
+    let configured_model = account
+        .and_then(|account| account.default_model.as_deref())
+        .filter(|model| !model.trim().is_empty())
+        .map(str::to_string);
+    let mut models = match provider {
+        AnthropicProvider::PROVIDER_ID => {
+            let mut config = AnthropicConfig::default();
+            apply_account_to_api_config(
+                account,
+                &mut config.api_base_url,
+                &mut config.default_model,
+                &mut config.api_key,
+            );
+            let provider = AnthropicProvider::new(config.clone());
+            provider.api_key()?;
+            vec![config.default_model]
+        }
+        OpenAiProvider::PROVIDER_ID => {
+            let mut config = OpenAiConfig::default();
+            apply_account_to_api_config(
+                account,
+                &mut config.api_base_url,
+                &mut config.default_model,
+                &mut config.api_key,
+            );
+            let provider = OpenAiProvider::new(config.clone());
+            provider.api_key()?;
+            vec![config.default_model]
+        }
+        DeepSeekProvider::PROVIDER_ID => {
+            let mut config = DeepSeekConfig::default();
+            apply_account_to_api_config(
+                account,
+                &mut config.api_base_url,
+                &mut config.default_model,
+                &mut config.api_key,
+            );
+            DeepSeekProvider::new(config).list_models()?
+        }
+        GeminiProvider::PROVIDER_ID => {
+            let mut config = GeminiConfig::default();
+            apply_account_to_api_config(
+                account,
+                &mut config.api_base_url,
+                &mut config.default_model,
+                &mut config.api_key,
+            );
+            let provider = GeminiProvider::new(config.clone());
+            provider.api_key()?;
+            vec![config.default_model]
+        }
+        NvidiaProvider::PROVIDER_ID => {
+            let mut config = NvidiaConfig::default();
+            apply_account_to_api_config(
+                account,
+                &mut config.api_base_url,
+                &mut config.default_model,
+                &mut config.api_key,
+            );
+            NvidiaProvider::new(config).list_models()?
+        }
+        _ => provider_available_model_ids(provider)?,
+    };
+    if let Some(model) = configured_model
+        && !models.contains(&model)
+    {
+        models.push(model);
+    }
+    models.sort();
+    models.dedup();
+    Ok(models)
+}
+
+pub fn provider_available_model_ids_for_account_in_data_dir(
+    data_dir: &SinomoDataDir,
+    provider: &str,
+    account: Option<&ProviderAccountConfig>,
+) -> Result<Vec<String>, LanguageModelError> {
+    let mut models = match provider {
+        CODEX_PROVIDER_ID => {
+            let mut config = OpenAiResponsesCodexConfig::default();
+            config.credentials_path = Some(data_dir.provider_credentials_file(CODEX_PROVIDER_ID));
+            if let Some(account) = account {
+                if let Some(base_url) = account.api_base_url.as_deref() {
+                    config.api_base_url = base_url.to_string();
+                }
+                if let Some(model) = account.default_model.as_deref() {
+                    config.default_model = model.to_string();
+                }
+            }
+            OpenAiResponsesCodexClient::new(config).list_models()?
+        }
+        ClaudeProvider::PROVIDER_ID => {
+            let mut config = ClaudeConfig::default();
+            config.credentials_path =
+                Some(data_dir.provider_credentials_file(ClaudeProvider::PROVIDER_ID));
+            ClaudeProvider::new(config).list_models()?
+        }
+        GitHubCopilotProvider::PROVIDER_ID => {
+            let mut config = GitHubCopilotConfig::default();
+            config.token_store_path =
+                Some(data_dir.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID));
+            if let Some(account) = account {
+                if let Some(base_url) = account.api_base_url.as_deref() {
+                    config.api_base_url = base_url.to_string();
+                }
+                if let Some(model) = account.default_model.as_deref() {
+                    config.default_model = model.to_string();
+                }
+            }
+            GitHubCopilotProvider::new(config).list_models()?
+        }
+        _ => provider_available_model_ids_for_account(provider, account)?,
+    };
+    if let Some(model) = account
+        .and_then(|account| account.default_model.as_deref())
+        .filter(|model| !model.trim().is_empty())
+        .map(str::to_string)
+        && !models.contains(&model)
+    {
+        models.push(model);
+    }
+    models.sort();
+    models.dedup();
+    Ok(models)
+}
+
+fn apply_account_to_api_config(
+    account: Option<&ProviderAccountConfig>,
+    api_base_url: &mut String,
+    default_model: &mut String,
+    api_key: &mut Option<String>,
+) {
+    let Some(account) = account else {
+        return;
+    };
+    if let Some(value) = account
+        .api_base_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        *api_base_url = value.trim().to_string();
+    }
+    if let Some(value) = account
+        .default_model
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        *default_model = value.trim().to_string();
+    }
+    if let Some(value) = account
+        .api_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        *api_key = Some(value.trim().to_string());
     }
 }
 
@@ -1901,6 +2137,32 @@ pub fn provider_usage(provider: &str) -> Result<LanguageModelProviderUsage, Lang
             model: PROVIDER_DEFAULT_MODEL.to_string(),
             detail: format!("provider `{provider}` does not expose subscription usage"),
         }),
+    }
+}
+
+pub fn provider_usage_in_data_dir(
+    data_dir: &SinomoDataDir,
+    provider: &str,
+) -> Result<LanguageModelProviderUsage, LanguageModelError> {
+    match provider {
+        CODEX_PROVIDER_ID => {
+            let mut config = OpenAiResponsesCodexConfig::default();
+            config.credentials_path = Some(data_dir.provider_credentials_file(CODEX_PROVIDER_ID));
+            OpenAiResponsesCodexClient::new(config).usage()
+        }
+        ClaudeProvider::PROVIDER_ID => {
+            let mut config = ClaudeConfig::default();
+            config.credentials_path =
+                Some(data_dir.provider_credentials_file(ClaudeProvider::PROVIDER_ID));
+            ClaudeProvider::new(config).usage()
+        }
+        GitHubCopilotProvider::PROVIDER_ID => {
+            let mut config = GitHubCopilotConfig::default();
+            config.token_store_path =
+                Some(data_dir.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID));
+            GitHubCopilotProvider::new(config).usage()
+        }
+        _ => provider_usage(provider),
     }
 }
 
@@ -2905,14 +3167,22 @@ pub fn test_provider_account_credentials(
     provider: &str,
     account: Option<&ProviderAccountConfig>,
 ) -> Result<(), LanguageModelError> {
-    let model = account
-        .and_then(|account| account.default_model.as_deref())
-        .unwrap_or(PROVIDER_DEFAULT_MODEL);
     let data_dir =
         SinomoDataDir::from_env_or_home().map_err(|source| LanguageModelError::ConfigStore {
             path: "<data-dir>".to_string(),
             detail: source.to_string(),
         })?;
+    test_provider_account_credentials_in_data_dir(&data_dir, provider, account)
+}
+
+pub fn test_provider_account_credentials_in_data_dir(
+    data_dir: &SinomoDataDir,
+    provider: &str,
+    account: Option<&ProviderAccountConfig>,
+) -> Result<(), LanguageModelError> {
+    let model = account
+        .and_then(|account| account.default_model.as_deref())
+        .unwrap_or(PROVIDER_DEFAULT_MODEL);
     let request = LanguageModelRequest {
         provider: provider.to_string(),
         model: model.to_string(),
@@ -2930,7 +3200,7 @@ pub fn test_provider_account_credentials(
         metadata: serde_json::Value::Null,
     };
     complete_configured_model_request_with_account(
-        &data_dir, provider, model, account, None, &request,
+        data_dir, provider, model, account, None, &request,
     )
     .map(|_| ())
 }
@@ -3728,9 +3998,22 @@ mod tests {
 
         assert!(keys.iter().any(|key| key == LM_PROVIDER_CONFIG_KEY));
         assert!(keys.iter().any(|key| key == LM_RUNTIME_CONFIG_KEY));
+        assert!(keys.iter().any(|key| key == LM_PROVIDER_HEALTH_CONFIG_KEY));
         assert!(
             !keys.iter().any(|key| key.starts_with("lm.credentials.")),
             "provider credentials are represented by account entries in lm.providers"
+        );
+    }
+
+    #[test]
+    fn provider_health_config_is_cluster_authoritative() {
+        let definition = provider_health_config_definition().expect("health definition");
+
+        assert_eq!(definition.key.as_str(), LM_PROVIDER_HEALTH_CONFIG_KEY);
+        assert_eq!(definition.cluster_key(), LM_PROVIDER_HEALTH_CONFIG_KV_KEY);
+        assert_eq!(
+            definition.cluster_mode,
+            sinomo_runtime::config::ConfigClusterMode::ClusterOverrideLocal
         );
     }
 
@@ -4235,6 +4518,42 @@ mod tests {
             LanguageModelError::ProviderInvocationFailed { provider, .. }
                 if provider == "unknown-provider"
         ));
+    }
+
+    #[test]
+    fn account_model_catalog_uses_inline_credential_and_custom_model() {
+        let account = ProviderAccountConfig {
+            provider: OpenAiProvider::PROVIDER_ID.to_string(),
+            account: DEFAULT_PROVIDER_ACCOUNT.to_string(),
+            default_model: Some("gpt-5.5-custom".to_string()),
+            api_base_url: Some("https://example.invalid/v1".to_string()),
+            api_key: Some("sk-test".to_string()),
+            enabled: true,
+            options: LanguageModelProviderOptions::default(),
+            model_options: Vec::new(),
+        };
+
+        assert_eq!(
+            provider_available_model_ids_for_account(OpenAiProvider::PROVIDER_ID, Some(&account),)
+                .expect("account catalog"),
+            vec!["gpt-5.5-custom".to_string()]
+        );
+    }
+
+    #[test]
+    fn known_model_catalogs_do_not_require_credentials_or_network_access() {
+        assert_eq!(
+            provider_known_model_ids(DeepSeekProvider::PROVIDER_ID),
+            vec![
+                DEEPSEEK_V4_FLASH_MODEL.to_string(),
+                DEEPSEEK_V4_PRO_MODEL.to_string()
+            ]
+        );
+        assert!(
+            provider_known_model_ids(NvidiaProvider::PROVIDER_ID)
+                .contains(&NVIDIA_DEFAULT_MODEL.to_string())
+        );
+        assert!(provider_known_model_ids(OpenAiProvider::PROVIDER_ID).is_empty());
     }
 
     #[test]

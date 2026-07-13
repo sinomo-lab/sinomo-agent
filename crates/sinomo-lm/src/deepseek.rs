@@ -51,6 +51,13 @@ pub struct DeepSeekProvider {
 impl DeepSeekProvider {
     pub const PROVIDER_ID: &'static str = "deepseek";
 
+    pub fn known_model_ids() -> Vec<String> {
+        DEEPSEEK_MODEL_IDS
+            .iter()
+            .map(|model| model.to_string())
+            .collect()
+    }
+
     pub fn new(config: DeepSeekConfig) -> Self {
         Self {
             config,
@@ -83,10 +90,7 @@ impl DeepSeekProvider {
 
     pub fn list_models(&self) -> Result<Vec<String>, LanguageModelError> {
         self.api_key()?;
-        Ok(DEEPSEEK_MODEL_IDS
-            .iter()
-            .map(|model| model.to_string())
-            .collect())
+        Ok(Self::known_model_ids())
     }
 
     pub fn test_connection(&self) -> Result<(), LanguageModelError> {

@@ -6,17 +6,11 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     feature = "native-devices",
     any(target_os = "windows", target_os = "macos")
 ))]
-use image::{ExtendedColorType, codecs::jpeg::JpegEncoder};
-#[cfg(all(
-    feature = "native-devices",
-    any(target_os = "windows", target_os = "macos")
-))]
 use nokhwa::{
     Camera,
-    pixel_format::{FormatDecoder, RgbFormat},
     utils::{
         ApiBackend, CameraFormat, CameraIndex, CameraInfo, FrameFormat, RequestedFormat,
-        RequestedFormatType,
+        RequestedFormatType, frame_formats,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -28,10 +22,11 @@ use std::collections::VecDeque;
 use std::fs;
 #[cfg(all(feature = "native-devices", target_os = "linux"))]
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 #[cfg(feature = "native-devices")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "native-devices")]
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Condvar, Mutex, mpsc};
 #[cfg(feature = "native-devices")]
 use std::thread;
 use std::time::Duration;
@@ -40,13 +35,18 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const DEFAULT_AUDIO_CHUNK_MS: u64 = 100;
-const DEFAULT_CAMERA_FRAME_MS: u64 = 500;
+/// Interactive local previews target roughly 30 FPS. Realtime consumers that
+/// transmit fewer frames must throttle their outbound path independently so
+/// local camera feedback stays responsive.
+pub const NATIVE_CAMERA_PREVIEW_FRAME_INTERVAL_MS: u64 = 33;
 const DEFAULT_CAMERA_WIDTH: u32 = 640;
 const DEFAULT_CAMERA_HEIGHT: u32 = 480;
 #[cfg(feature = "native-devices")]
 const MICROPHONE_CAPTURE_QUEUE_CAPACITY: usize = 4;
 #[cfg(feature = "native-devices")]
 const CAMERA_WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+#[cfg(any(feature = "native-devices", test))]
+const MAX_CONSECUTIVE_CAMERA_SAMPLE_FAILURES: u8 = 3;
 #[cfg(feature = "native-devices")]
 const SPEAKER_QUEUE_MAX_LATENCY_MS: u64 = 1_000;
 #[cfg(all(feature = "native-devices", target_os = "macos"))]
@@ -267,20 +267,6 @@ impl Default for NativeSpeakerPlaybackConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum NativeVideoFrameFormat {
-    Jpeg,
-}
-
-impl NativeVideoFrameFormat {
-    pub fn mime_type(self) -> &'static str {
-        match self {
-            Self::Jpeg => "image/jpeg",
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct NativeCameraCaptureConfig {
     pub device: Option<String>,
@@ -295,19 +281,72 @@ impl Default for NativeCameraCaptureConfig {
             device: None,
             width: DEFAULT_CAMERA_WIDTH,
             height: DEFAULT_CAMERA_HEIGHT,
-            frame_interval_ms: DEFAULT_CAMERA_FRAME_MS,
+            frame_interval_ms: NATIVE_CAMERA_PREVIEW_FRAME_INTERVAL_MS,
         }
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct NativeVideoFrame {
-    pub sequence: u64,
-    pub format: NativeVideoFrameFormat,
+/// Native camera sample formats preserved by the capture layer. Compressed
+/// MJPEG is passed through unchanged; every other variant is raw pixel data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeVideoSampleFormat {
+    Mjpeg,
+    Nv12,
+    Yuyv,
+    Rgb8,
+    Bgr8,
+    Gray8,
+}
+
+impl NativeVideoSampleFormat {
+    #[must_use]
+    pub const fn is_encoded(self) -> bool {
+        matches!(self, Self::Mjpeg)
+    }
+}
+
+/// Descriptor for one plane inside [`NativeVideoSample::data`]. `stride` is
+/// bytes per row and is zero for an encoded MJPEG payload. Plane dimensions
+/// describe samples stored in this plane rather than the full display size.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeVideoPlane {
+    pub offset: usize,
+    pub len: usize,
     pub width: u32,
     pub height: u32,
+    pub stride: u32,
+}
+
+/// A timestamped sample from a continuous native camera stream.
+///
+/// `timestamp_ns` is a monotonic presentation timestamp relative to stream
+/// start. `captured_at_unix_ms` supplies wall-clock correlation. Capture keeps
+/// the native format and never performs an implicit JPEG re-encode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeVideoSample {
+    pub sequence: u64,
+    pub format: NativeVideoSampleFormat,
+    pub width: u32,
+    pub height: u32,
+    pub timestamp_ns: u64,
+    pub duration_ns: u64,
     pub captured_at_unix_ms: u128,
-    pub bytes: Vec<u8>,
+    pub data: Arc<[u8]>,
+    pub planes: Arc<[NativeVideoPlane]>,
+}
+
+impl NativeVideoSample {
+    pub fn validate(&self) -> Result<(), NativeDeviceError> {
+        validate_native_video_sample(self)
+    }
+
+    /// Return the immutable bytes described by one native plane.
+    #[must_use]
+    pub fn plane_data(&self, index: usize) -> Option<&[u8]> {
+        let plane = self.planes.get(index)?;
+        self.data
+            .get(plane.offset..plane.offset.checked_add(plane.len)?)
+    }
 }
 
 pub struct NativeMicrophoneCapture {
@@ -429,7 +468,7 @@ impl NativeSpeakerPlayback {
 
 pub struct NativeCameraCapture {
     #[cfg(feature = "native-devices")]
-    receiver: LatestCaptureReceiver<Result<NativeVideoFrame, NativeDeviceError>>,
+    receiver: LatestCaptureReceiver<Result<NativeVideoSample, NativeDeviceError>>,
     #[cfg(feature = "native-devices")]
     stream_error: Arc<Mutex<Option<NativeDeviceError>>>,
     #[cfg(feature = "native-devices")]
@@ -439,10 +478,13 @@ pub struct NativeCameraCapture {
 }
 
 impl NativeCameraCapture {
-    pub fn recv_timeout(
+    /// Receive the newest available sample from the continuous native stream.
+    /// If capture outruns the consumer, unread samples are replaced rather
+    /// than queued, so latency remains bounded to one sample.
+    pub fn recv_sample_timeout(
         &self,
         timeout: Duration,
-    ) -> Result<Option<NativeVideoFrame>, NativeDeviceError> {
+    ) -> Result<Option<NativeVideoSample>, NativeDeviceError> {
         #[cfg(not(feature = "native-devices"))]
         {
             let _ = timeout;
@@ -452,7 +494,7 @@ impl NativeCameraCapture {
         {
             self.check_health()?;
             match self.receiver.recv_timeout(timeout) {
-                Ok(Ok(frame)) => Ok(Some(frame)),
+                Ok(Ok(sample)) => Ok(Some(sample)),
                 Ok(Err(error)) => Err(error),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     self.check_health()?;
@@ -672,24 +714,250 @@ fn try_send_capture_result<T>(
     }
 }
 
-#[cfg(feature = "native-devices")]
-fn wait_for_camera_stop(stop: &AtomicBool, duration: Duration) -> bool {
-    let started = Instant::now();
-    loop {
-        if stop.load(Ordering::Acquire) {
-            return true;
-        }
-        let remaining = duration.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            return false;
-        }
-        thread::park_timeout(remaining.min(Duration::from_millis(10)));
+fn validate_native_video_sample(sample: &NativeVideoSample) -> Result<(), NativeDeviceError> {
+    if sample.width == 0 || sample.height == 0 {
+        return Err(NativeDeviceError::Camera {
+            detail: "native video sample dimensions must be non-zero".to_string(),
+        });
     }
+    let expected_planes = usize::from(matches!(sample.format, NativeVideoSampleFormat::Nv12)) + 1;
+    if sample.planes.len() != expected_planes {
+        return Err(NativeDeviceError::Camera {
+            detail: format!(
+                "native {:?} sample has {} planes, expected {expected_planes}",
+                sample.format,
+                sample.planes.len()
+            ),
+        });
+    }
+    match sample.format {
+        NativeVideoSampleFormat::Mjpeg => {
+            let plane = &sample.planes[0];
+            validate_native_video_plane_bounds(plane, sample.data.len())?;
+            if plane.len == 0 {
+                return Err(NativeDeviceError::Camera {
+                    detail: "native MJPEG sample is empty".to_string(),
+                });
+            }
+        }
+        NativeVideoSampleFormat::Nv12 => {
+            validate_native_video_plane(
+                &sample.planes[0],
+                sample.data.len(),
+                sample.width,
+                sample.height,
+                sample.width,
+            )?;
+            validate_native_video_plane(
+                &sample.planes[1],
+                sample.data.len(),
+                sample.width.div_ceil(2),
+                sample.height.div_ceil(2),
+                sample.width.div_ceil(2).saturating_mul(2),
+            )?;
+        }
+        NativeVideoSampleFormat::Yuyv => validate_native_video_plane(
+            &sample.planes[0],
+            sample.data.len(),
+            sample.width,
+            sample.height,
+            sample.width.div_ceil(2).saturating_mul(4),
+        )?,
+        NativeVideoSampleFormat::Rgb8 | NativeVideoSampleFormat::Bgr8 => {
+            validate_native_video_plane(
+                &sample.planes[0],
+                sample.data.len(),
+                sample.width,
+                sample.height,
+                sample.width.saturating_mul(3),
+            )?;
+        }
+        NativeVideoSampleFormat::Gray8 => validate_native_video_plane(
+            &sample.planes[0],
+            sample.data.len(),
+            sample.width,
+            sample.height,
+            sample.width,
+        )?,
+    }
+    Ok(())
 }
 
-#[cfg(feature = "native-devices")]
-fn capture_throttle_delay(frame_interval: Duration, capture_elapsed: Duration) -> Duration {
-    frame_interval.saturating_sub(capture_elapsed)
+fn validate_native_video_plane(
+    plane: &NativeVideoPlane,
+    sample_len: usize,
+    expected_width: u32,
+    expected_height: u32,
+    minimum_stride: u32,
+) -> Result<(), NativeDeviceError> {
+    validate_native_video_plane_bounds(plane, sample_len)?;
+    if plane.width != expected_width || plane.height != expected_height {
+        return Err(NativeDeviceError::Camera {
+            detail: format!(
+                "native video plane is {}x{}, expected {expected_width}x{expected_height}",
+                plane.width, plane.height
+            ),
+        });
+    }
+    if plane.stride < minimum_stride {
+        return Err(NativeDeviceError::Camera {
+            detail: format!(
+                "native video plane stride {} is smaller than {minimum_stride}",
+                plane.stride
+            ),
+        });
+    }
+    let required = usize::try_from(plane.stride)
+        .ok()
+        .and_then(|stride| stride.checked_mul(plane.height as usize))
+        .ok_or_else(|| NativeDeviceError::Camera {
+            detail: "native video plane length overflowed".to_string(),
+        })?;
+    if plane.len < required {
+        return Err(NativeDeviceError::Camera {
+            detail: format!(
+                "native video plane has {} bytes, expected at least {required}",
+                plane.len
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_native_video_plane_bounds(
+    plane: &NativeVideoPlane,
+    sample_len: usize,
+) -> Result<(), NativeDeviceError> {
+    let end = plane
+        .offset
+        .checked_add(plane.len)
+        .ok_or_else(|| NativeDeviceError::Camera {
+            detail: "native video plane range overflowed".to_string(),
+        })?;
+    if end > sample_len {
+        return Err(NativeDeviceError::Camera {
+            detail: format!(
+                "native video plane range {}..{end} exceeds the {sample_len}-byte sample",
+                plane.offset
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(any(feature = "native-devices", test))]
+fn native_video_sample_from_contiguous(
+    format: NativeVideoSampleFormat,
+    width: u32,
+    height: u32,
+    stride: u32,
+    data: Vec<u8>,
+    sequence: u64,
+    timestamp_ns: u64,
+    duration_ns: u64,
+    captured_at_unix_ms: u128,
+) -> Result<NativeVideoSample, NativeDeviceError> {
+    let data: Arc<[u8]> = data.into();
+    let planes: Arc<[NativeVideoPlane]> = match format {
+        NativeVideoSampleFormat::Mjpeg => vec![NativeVideoPlane {
+            offset: 0,
+            len: data.len(),
+            width,
+            height,
+            stride: 0,
+        }]
+        .into(),
+        NativeVideoSampleFormat::Nv12 => {
+            let y_stride = stride.max(width);
+            let uv_width = width.div_ceil(2);
+            let uv_height = height.div_ceil(2);
+            let uv_stride = y_stride.max(uv_width.saturating_mul(2));
+            let y_len = usize::try_from(y_stride)
+                .ok()
+                .and_then(|stride| stride.checked_mul(height as usize))
+                .ok_or_else(|| NativeDeviceError::Camera {
+                    detail: "native NV12 luma plane length overflowed".to_string(),
+                })?;
+            let uv_len = usize::try_from(uv_stride)
+                .ok()
+                .and_then(|stride| stride.checked_mul(uv_height as usize))
+                .ok_or_else(|| NativeDeviceError::Camera {
+                    detail: "native NV12 chroma plane length overflowed".to_string(),
+                })?;
+            if data.len() < y_len.saturating_add(uv_len) {
+                return Err(NativeDeviceError::Camera {
+                    detail: format!(
+                        "native NV12 sample has {} bytes, expected at least {}",
+                        data.len(),
+                        y_len.saturating_add(uv_len)
+                    ),
+                });
+            }
+            vec![
+                NativeVideoPlane {
+                    offset: 0,
+                    len: y_len,
+                    width,
+                    height,
+                    stride: y_stride,
+                },
+                NativeVideoPlane {
+                    offset: y_len,
+                    len: uv_len,
+                    width: uv_width,
+                    height: uv_height,
+                    stride: uv_stride,
+                },
+            ]
+            .into()
+        }
+        NativeVideoSampleFormat::Yuyv
+        | NativeVideoSampleFormat::Rgb8
+        | NativeVideoSampleFormat::Bgr8
+        | NativeVideoSampleFormat::Gray8 => {
+            let minimum_stride = match format {
+                NativeVideoSampleFormat::Yuyv => width.div_ceil(2).saturating_mul(4),
+                NativeVideoSampleFormat::Rgb8 | NativeVideoSampleFormat::Bgr8 => {
+                    width.saturating_mul(3)
+                }
+                NativeVideoSampleFormat::Gray8 => width,
+                NativeVideoSampleFormat::Mjpeg | NativeVideoSampleFormat::Nv12 => unreachable!(),
+            };
+            vec![NativeVideoPlane {
+                offset: 0,
+                len: data.len(),
+                width,
+                height,
+                stride: stride.max(minimum_stride),
+            }]
+            .into()
+        }
+    };
+    let sample = NativeVideoSample {
+        sequence,
+        format,
+        width,
+        height,
+        timestamp_ns,
+        duration_ns,
+        captured_at_unix_ms,
+        data,
+        planes,
+    };
+    sample.validate()?;
+    Ok(sample)
+}
+
+#[cfg(any(feature = "native-devices", test))]
+fn native_video_duration_ns(frame_rate_hz: u32) -> u64 {
+    1_000_000_000_u64 / u64::from(frame_rate_hz.max(1))
+}
+
+#[cfg(any(feature = "native-devices", test))]
+fn camera_sample_failure_is_terminal(failures: &mut u8) -> bool {
+    *failures = failures.saturating_add(1);
+    *failures >= MAX_CONSECUTIVE_CAMERA_SAMPLE_FAILURES
 }
 
 #[cfg(feature = "native-devices")]
@@ -722,7 +990,6 @@ fn enumerate_native_devices_with_camera(
     node_id: NodeId,
     include_camera: bool,
 ) -> NativeDeviceInventory {
-    #[cfg(all(not(target_os = "android"), not(feature = "native-devices")))]
     let _ = include_camera;
     let mut inventory = NativeDeviceInventory {
         node_id: node_id.clone(),
@@ -1656,7 +1923,7 @@ fn open_nokhwa_camera(
     config: &NativeCameraCaptureConfig,
 ) -> Result<Camera, NativeDeviceError> {
     let (api_backend, _, _) = nokhwa_camera_backend();
-    let request = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
+    let request = RequestedFormat::with_formats(RequestedFormatType::None, frame_formats());
     let mut camera =
         Camera::with_backend(index, request, api_backend).map_err(native_nokhwa_camera_error)?;
     let formats = camera
@@ -1670,21 +1937,19 @@ fn open_nokhwa_camera(
         requested_fps,
     )
     .ok_or_else(|| NativeDeviceError::Camera {
-        detail: "camera exposes no RGB-decodable capture format".to_string(),
+        detail: "camera exposes no supported native sample format".to_string(),
     })?;
     camera
-        .set_camera_requset(RequestedFormat::new::<RgbFormat>(
+        .set_camera_requset(RequestedFormat::with_formats(
             RequestedFormatType::Exact(selected),
+            frame_formats(),
         ))
         .map_err(native_nokhwa_camera_error)?;
     camera.open_stream().map_err(native_nokhwa_camera_error)?;
     Ok(camera)
 }
 
-#[cfg(all(
-    feature = "native-devices",
-    any(target_os = "windows", target_os = "macos")
-))]
+#[cfg(feature = "native-devices")]
 fn requested_camera_fps(frame_interval_ms: u64) -> u32 {
     let interval = frame_interval_ms.max(1);
     ((1_000_u64 + interval / 2) / interval).clamp(1, 120) as u32
@@ -1703,15 +1968,27 @@ fn closest_nokhwa_camera_format(
     formats
         .iter()
         .copied()
-        .filter(|format| RgbFormat::FORMATS.contains(&format.format()))
+        .filter(|format| native_sample_format_from_nokhwa(format.format()).is_some())
         .min_by_key(|format| {
+            let frame_rate = format.frame_rate();
+            let minimum_acceptable_fps = requested_fps.saturating_mul(3).div_ceil(4);
+            let severe_fps_shortfall = frame_rate < minimum_acceptable_fps;
+            let shortfall = if severe_fps_shortfall {
+                requested_fps.saturating_sub(frame_rate)
+            } else {
+                0
+            };
             let width_delta = u64::from(format.width().abs_diff(requested_width));
             let height_delta = u64::from(format.height().abs_diff(requested_height));
             let resolution_distance = u128::from(width_delta) * u128::from(width_delta)
                 + u128::from(height_delta) * u128::from(height_delta);
-            let frame_rate_distance = format.frame_rate().abs_diff(requested_fps);
-            let jpeg_penalty = u8::from(format.format() != FrameFormat::MJPEG);
-            (resolution_distance, frame_rate_distance, jpeg_penalty)
+            let frame_rate_distance = frame_rate.abs_diff(requested_fps);
+            (
+                severe_fps_shortfall,
+                shortfall,
+                resolution_distance,
+                frame_rate_distance,
+            )
         })
 }
 
@@ -1719,29 +1996,48 @@ fn closest_nokhwa_camera_format(
     feature = "native-devices",
     any(target_os = "windows", target_os = "macos")
 ))]
-fn nokhwa_frame_to_jpeg(frame: &nokhwa::Buffer) -> Result<Vec<u8>, NativeDeviceError> {
-    if frame.source_frame_format() == FrameFormat::MJPEG
-        && frame.buffer().starts_with(&[0xff, 0xd8])
-        && frame.buffer().ends_with(&[0xff, 0xd9])
-    {
-        return Ok(frame.buffer().to_vec());
+fn native_sample_format_from_nokhwa(format: FrameFormat) -> Option<NativeVideoSampleFormat> {
+    match format {
+        FrameFormat::MJPEG => Some(NativeVideoSampleFormat::Mjpeg),
+        FrameFormat::NV12 => Some(NativeVideoSampleFormat::Nv12),
+        FrameFormat::YUYV => Some(NativeVideoSampleFormat::Yuyv),
+        FrameFormat::RAWRGB => Some(NativeVideoSampleFormat::Rgb8),
+        FrameFormat::RAWBGR => Some(NativeVideoSampleFormat::Bgr8),
+        FrameFormat::GRAY => Some(NativeVideoSampleFormat::Gray8),
     }
+}
 
-    let decoded = frame
-        .decode_image::<RgbFormat>()
-        .map_err(native_nokhwa_camera_error)?;
-    let mut jpeg = Vec::new();
-    JpegEncoder::new_with_quality(&mut jpeg, 85)
-        .encode(
-            decoded.as_raw(),
-            decoded.width(),
-            decoded.height(),
-            ExtendedColorType::Rgb8,
-        )
-        .map_err(|source| NativeDeviceError::Camera {
-            detail: format!("failed to encode camera frame as JPEG: {source}"),
+#[cfg(all(
+    feature = "native-devices",
+    any(target_os = "windows", target_os = "macos")
+))]
+fn native_video_sample_from_nokhwa_buffer(
+    frame: &nokhwa::Buffer,
+    sequence: u64,
+    timestamp_ns: u64,
+    duration_ns: u64,
+) -> Result<NativeVideoSample, NativeDeviceError> {
+    let resolution = frame.resolution();
+    let format =
+        native_sample_format_from_nokhwa(frame.source_frame_format()).ok_or_else(|| {
+            NativeDeviceError::Unsupported {
+                detail: format!(
+                    "unsupported native camera sample format {}",
+                    frame.source_frame_format()
+                ),
+            }
         })?;
-    Ok(jpeg)
+    native_video_sample_from_contiguous(
+        format,
+        resolution.width(),
+        resolution.height(),
+        0,
+        frame.buffer().to_vec(),
+        sequence,
+        timestamp_ns,
+        duration_ns,
+        now_unix_ms(),
+    )
 }
 
 #[cfg(all(feature = "native-devices", target_os = "linux"))]
@@ -1754,14 +2050,53 @@ fn camera_display_name(path: &Path) -> Option<String> {
 }
 
 #[cfg(all(feature = "native-devices", target_os = "linux"))]
+fn native_sample_format_from_v4l(fourcc: v4l::FourCC) -> Option<NativeVideoSampleFormat> {
+    match &fourcc.repr {
+        b"MJPG" => Some(NativeVideoSampleFormat::Mjpeg),
+        b"NV12" => Some(NativeVideoSampleFormat::Nv12),
+        b"YUYV" => Some(NativeVideoSampleFormat::Yuyv),
+        b"RGB3" => Some(NativeVideoSampleFormat::Rgb8),
+        b"BGR3" => Some(NativeVideoSampleFormat::Bgr8),
+        b"GREY" => Some(NativeVideoSampleFormat::Gray8),
+        _ => None,
+    }
+}
+
+#[cfg(all(feature = "native-devices", target_os = "linux"))]
+fn preferred_v4l_sample_format(
+    current: v4l::FourCC,
+    available: &[v4l::format::Description],
+) -> Option<v4l::FourCC> {
+    if native_sample_format_from_v4l(current).is_some() {
+        return Some(current);
+    }
+    [b"NV12", b"YUYV", b"RGB3", b"BGR3", b"GREY", b"MJPG"]
+        .into_iter()
+        .map(v4l::FourCC::new)
+        .find(|candidate| available.iter().any(|format| format.fourcc == *candidate))
+}
+
+#[cfg(all(feature = "native-devices", target_os = "linux"))]
+fn v4l_frame_duration_ns(interval: v4l::Fraction, fallback_fps: u32) -> u64 {
+    if interval.denominator == 0 {
+        return native_video_duration_ns(fallback_fps);
+    }
+    1_000_000_000_u64
+        .saturating_mul(u64::from(interval.numerator))
+        .checked_div(u64::from(interval.denominator))
+        .filter(|duration| *duration > 0)
+        .unwrap_or_else(|| native_video_duration_ns(fallback_fps))
+}
+
+#[cfg(all(feature = "native-devices", target_os = "linux"))]
 fn start_platform_camera_capture(
     config: NativeCameraCaptureConfig,
 ) -> Result<NativeCameraCapture, NativeDeviceError> {
+    use v4l::Device;
     use v4l::buffer::Type;
     use v4l::io::mmap::Stream as MmapStream;
     use v4l::io::traits::CaptureStream;
     use v4l::video::Capture;
-    use v4l::{Device, FourCC};
 
     let path = select_v4l2_camera(config.device.as_deref())?;
     let (tx, rx) = latest_capture_channel();
@@ -1782,23 +2117,43 @@ fn start_platform_camera_capture(
                     .map_err(|source| NativeDeviceError::Camera {
                         detail: source.to_string(),
                     })?;
+                let available =
+                    device
+                        .enum_formats()
+                        .map_err(|source| NativeDeviceError::Camera {
+                            detail: source.to_string(),
+                        })?;
+                format.fourcc =
+                    preferred_v4l_sample_format(format.fourcc, &available).ok_or_else(|| {
+                        NativeDeviceError::Unsupported {
+                            detail: "camera exposes no supported native video sample format"
+                                .to_string(),
+                        }
+                    })?;
                 format.width = config.width.max(1);
                 format.height = config.height.max(1);
-                format.fourcc = FourCC::new(b"MJPG");
                 let format =
                     device
                         .set_format(&format)
                         .map_err(|source| NativeDeviceError::Camera {
                             detail: source.to_string(),
                         })?;
-                if format.fourcc != FourCC::new(b"MJPG") {
-                    return Err(NativeDeviceError::Camera {
-                        detail: format!(
-                            "selected camera negotiated {} instead of required MJPEG",
-                            format.fourcc
-                        ),
-                    });
-                }
+                let sample_format =
+                    native_sample_format_from_v4l(format.fourcc).ok_or_else(|| {
+                        NativeDeviceError::Unsupported {
+                            detail: format!(
+                                "camera negotiated unsupported native format {}",
+                                format.fourcc
+                            ),
+                        }
+                    })?;
+                let requested_fps = requested_camera_fps(config.frame_interval_ms);
+                let params = device
+                    .set_params(&v4l::video::capture::Parameters::with_fps(requested_fps))
+                    .map_err(|source| NativeDeviceError::Camera {
+                        detail: format!("failed to negotiate {requested_fps} FPS: {source}"),
+                    })?;
+                let duration_ns = v4l_frame_duration_ns(params.interval, requested_fps);
                 let mut stream =
                     MmapStream::with_buffers(&device, Type::VideoCapture, 4).map_err(|source| {
                         NativeDeviceError::Camera {
@@ -1808,10 +2163,10 @@ fn start_platform_camera_capture(
                 // A finite driver poll lets Drop's stop flag be observed even
                 // when a camera stops producing frames without disconnecting.
                 stream.set_timeout(Duration::from_millis(100));
-                let frame_interval = Duration::from_millis(config.frame_interval_ms.max(1));
+                let stream_started = Instant::now();
                 let mut sequence = 0_u64;
+                let mut sample_failures = 0_u8;
                 while !worker_stop.load(Ordering::Acquire) {
-                    let capture_started = Instant::now();
                     let (data, meta) = match stream.next() {
                         Ok(frame) => frame,
                         Err(source) if source.kind() == std::io::ErrorKind::TimedOut => continue,
@@ -1825,20 +2180,35 @@ fn start_platform_camera_capture(
                         break;
                     }
                     let used = (meta.bytesused as usize).min(data.len());
-                    let frame = NativeVideoFrame {
-                        sequence,
-                        format: NativeVideoFrameFormat::Jpeg,
-                        width: format.width,
-                        height: format.height,
-                        captured_at_unix_ms: now_unix_ms(),
-                        bytes: data[..used].to_vec(),
-                    };
+                    let timestamp_ns = stream_started
+                        .elapsed()
+                        .as_nanos()
+                        .min(u128::from(u64::MAX)) as u64;
+                    let sample_sequence = sequence;
                     sequence = sequence.saturating_add(1);
-                    if !tx.send_latest(Ok(frame)) {
-                        break;
-                    }
-                    let delay = capture_throttle_delay(frame_interval, capture_started.elapsed());
-                    if wait_for_camera_stop(&worker_stop, delay) {
+                    let sample = match native_video_sample_from_contiguous(
+                        sample_format,
+                        format.width,
+                        format.height,
+                        format.stride,
+                        data[..used].to_vec(),
+                        sample_sequence,
+                        timestamp_ns,
+                        duration_ns,
+                        now_unix_ms(),
+                    ) {
+                        Ok(sample) => {
+                            sample_failures = 0;
+                            sample
+                        }
+                        Err(error) => {
+                            if camera_sample_failure_is_terminal(&mut sample_failures) {
+                                return Err(error);
+                            }
+                            continue;
+                        }
+                    };
+                    if !tx.send_latest(Ok(sample)) {
                         break;
                     }
                 }
@@ -1880,31 +2250,41 @@ fn start_platform_camera_capture(
             let result = (|| -> Result<(), NativeDeviceError> {
                 let mut camera = open_nokhwa_camera(camera_index, &config)?;
                 let capture_result = (|| -> Result<(), NativeDeviceError> {
-                    let frame_interval = Duration::from_millis(config.frame_interval_ms.max(1));
+                    let frame_rate_hz = camera.camera_format().frame_rate();
+                    let duration_ns = native_video_duration_ns(frame_rate_hz);
+                    let stream_started = Instant::now();
                     let mut sequence = 0_u64;
+                    let mut sample_failures = 0_u8;
                     while !worker_stop.load(Ordering::Acquire) {
-                        let capture_started = Instant::now();
                         let frame = camera.frame().map_err(native_nokhwa_camera_error)?;
                         if worker_stop.load(Ordering::Acquire) {
                             break;
                         }
-                        let resolution = frame.resolution();
-                        let bytes = nokhwa_frame_to_jpeg(&frame)?;
-                        let frame = NativeVideoFrame {
-                            sequence,
-                            format: NativeVideoFrameFormat::Jpeg,
-                            width: resolution.width(),
-                            height: resolution.height(),
-                            captured_at_unix_ms: now_unix_ms(),
-                            bytes,
-                        };
+                        let timestamp_ns = stream_started
+                            .elapsed()
+                            .as_nanos()
+                            .min(u128::from(u64::MAX))
+                            as u64;
+                        let sample_sequence = sequence;
                         sequence = sequence.saturating_add(1);
-                        if !tx.send_latest(Ok(frame)) {
-                            break;
-                        }
-                        let delay =
-                            capture_throttle_delay(frame_interval, capture_started.elapsed());
-                        if wait_for_camera_stop(&worker_stop, delay) {
+                        let sample = match native_video_sample_from_nokhwa_buffer(
+                            &frame,
+                            sample_sequence,
+                            timestamp_ns,
+                            duration_ns,
+                        ) {
+                            Ok(sample) => {
+                                sample_failures = 0;
+                                sample
+                            }
+                            Err(error) => {
+                                if camera_sample_failure_is_terminal(&mut sample_failures) {
+                                    return Err(error);
+                                }
+                                continue;
+                            }
+                        };
+                        if !tx.send_latest(Ok(sample)) {
                             break;
                         }
                     }
@@ -2067,6 +2447,71 @@ mod failure_tests {
         }
         assert!(!NativeDeviceFailureKind::Unsupported.is_recoverable());
     }
+
+    #[test]
+    fn native_camera_default_targets_interactive_preview_cadence() {
+        let config = NativeCameraCaptureConfig::default();
+
+        assert_eq!(config.frame_interval_ms, 33);
+        assert!(config.frame_interval_ms <= 1_000 / 30);
+    }
+
+    #[test]
+    fn native_video_samples_preserve_format_planes_and_stride() {
+        let nv12 = native_video_sample_from_contiguous(
+            NativeVideoSampleFormat::Nv12,
+            2,
+            2,
+            2,
+            vec![16, 32, 48, 64, 128, 192],
+            7,
+            1_000,
+            native_video_duration_ns(30),
+            42,
+        )
+        .expect("NV12 sample");
+        assert_eq!(nv12.planes.len(), 2);
+        assert_eq!((nv12.planes[0].width, nv12.planes[0].height), (2, 2));
+        assert_eq!(nv12.planes[0].stride, 2);
+        assert_eq!(nv12.planes[0].offset, 0);
+        assert_eq!(nv12.plane_data(0), Some(&[16, 32, 48, 64][..]));
+        assert_eq!((nv12.planes[1].width, nv12.planes[1].height), (1, 1));
+        assert_eq!(nv12.planes[1].stride, 2);
+        assert_eq!(nv12.planes[1].offset, 4);
+        assert_eq!(nv12.plane_data(1), Some(&[128, 192][..]));
+        assert_eq!(nv12.timestamp_ns, 1_000);
+        let cloned = nv12.clone();
+        assert!(Arc::ptr_eq(&nv12.data, &cloned.data));
+        assert!(Arc::ptr_eq(&nv12.planes, &cloned.planes));
+
+        for (format, bytes, expected_stride) in [
+            (NativeVideoSampleFormat::Yuyv, vec![16; 8], 4),
+            (NativeVideoSampleFormat::Rgb8, vec![32; 12], 6),
+            (NativeVideoSampleFormat::Bgr8, vec![48; 12], 6),
+            (NativeVideoSampleFormat::Gray8, vec![64; 4], 2),
+        ] {
+            let sample = native_video_sample_from_contiguous(format, 2, 2, 0, bytes, 0, 0, 1, 0)
+                .expect("packed raw sample");
+            assert_eq!(sample.format, format);
+            assert_eq!(sample.planes[0].stride, expected_stride);
+        }
+
+        let mjpeg = native_video_sample_from_contiguous(
+            NativeVideoSampleFormat::Mjpeg,
+            2,
+            2,
+            0,
+            vec![0xff, 0xd8, 0xff, 0xd9],
+            0,
+            0,
+            1,
+            0,
+        )
+        .expect("native MJPEG sample");
+        assert!(mjpeg.format.is_encoded());
+        assert_eq!(mjpeg.planes[0].stride, 0);
+        assert_eq!(mjpeg.plane_data(0), Some(&[0xff, 0xd8, 0xff, 0xd9][..]));
+    }
 }
 
 #[cfg(all(test, feature = "native-devices"))]
@@ -2181,22 +2626,39 @@ mod tests {
     }
 
     #[test]
-    fn camera_handoff_replaces_an_unread_frame_with_the_latest() {
+    fn camera_handoff_replaces_an_unread_sample_with_the_latest() {
         let (tx, rx) = latest_capture_channel();
+        let sample = |sequence, value| {
+            native_video_sample_from_contiguous(
+                NativeVideoSampleFormat::Gray8,
+                1,
+                1,
+                1,
+                vec![value],
+                sequence,
+                sequence * 33_333_333,
+                33_333_333,
+                0,
+            )
+            .expect("gray sample")
+        };
 
-        assert!(tx.send_latest(Ok::<u8, NativeDeviceError>(1)));
-        assert!(tx.send_latest(Ok::<u8, NativeDeviceError>(2)));
-        assert_eq!(
-            rx.recv_timeout(Duration::ZERO).expect("latest frame"),
-            Ok(2)
-        );
+        assert!(tx.send_latest(Ok::<NativeVideoSample, NativeDeviceError>(sample(1, 10))));
+        assert!(tx.send_latest(Ok::<NativeVideoSample, NativeDeviceError>(sample(2, 20))));
+        let latest = rx
+            .recv_timeout(Duration::ZERO)
+            .expect("latest sample")
+            .expect("healthy sample");
+        assert_eq!(latest.sequence, 2);
+        assert_eq!(latest.timestamp_ns, 66_666_666);
+        assert_eq!(latest.plane_data(0), Some(&[20][..]));
         assert!(matches!(
             rx.recv_timeout(Duration::ZERO),
             Err(mpsc::RecvTimeoutError::Timeout)
         ));
 
         drop(rx);
-        assert!(!tx.send_latest(Ok::<u8, NativeDeviceError>(3)));
+        assert!(!tx.send_latest(Ok::<NativeVideoSample, NativeDeviceError>(sample(3, 30))));
     }
 
     #[test]
@@ -2225,16 +2687,20 @@ mod tests {
     }
 
     #[test]
-    fn capture_throttle_subtracts_time_spent_waiting_for_a_frame() {
-        let interval = Duration::from_millis(500);
-        assert_eq!(
-            capture_throttle_delay(interval, Duration::from_millis(125)),
-            Duration::from_millis(375)
-        );
-        assert_eq!(
-            capture_throttle_delay(interval, Duration::from_millis(750)),
-            Duration::ZERO
-        );
+    fn negotiated_frame_rate_defines_sample_duration_without_software_sleep() {
+        assert_eq!(requested_camera_fps(33), 30);
+        assert_eq!(native_video_duration_ns(30), 33_333_333);
+    }
+
+    #[test]
+    fn continuous_camera_stream_drops_isolated_invalid_samples() {
+        let mut failures = 0;
+        assert!(!camera_sample_failure_is_terminal(&mut failures));
+        assert!(!camera_sample_failure_is_terminal(&mut failures));
+        assert!(camera_sample_failure_is_terminal(&mut failures));
+
+        failures = 0;
+        assert!(!camera_sample_failure_is_terminal(&mut failures));
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -2274,25 +2740,26 @@ mod tests {
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[test]
-    fn nokhwa_camera_frames_are_encoded_as_jpeg() {
+    fn nokhwa_camera_buffers_preserve_their_native_format() {
         let frame = nokhwa::Buffer::new(
             nokhwa::utils::Resolution::new(1, 1),
             &[255, 0, 0],
             FrameFormat::RAWRGB,
         );
 
-        let jpeg = nokhwa_frame_to_jpeg(&frame).expect("encode camera frame");
+        let sample = native_video_sample_from_nokhwa_buffer(&frame, 7, 11, 13)
+            .expect("preserve native RGB sample");
 
-        assert!(jpeg.starts_with(&[0xff, 0xd8]));
-        assert!(jpeg.ends_with(&[0xff, 0xd9]));
-        let decoded = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg)
-            .expect("decode encoded camera frame");
-        assert_eq!((decoded.width(), decoded.height()), (1, 1));
+        assert_eq!(sample.format, NativeVideoSampleFormat::Rgb8);
+        assert_eq!(sample.plane_data(0), Some(&[255, 0, 0][..]));
+        assert_eq!(sample.sequence, 7);
+        assert_eq!(sample.timestamp_ns, 11);
+        assert_eq!(sample.duration_ns, 13);
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[test]
-    fn nokhwa_camera_format_uses_nearest_resolution_then_fps() {
+    fn nokhwa_camera_format_rejects_severe_fps_shortfall_before_resolution_distance() {
         let formats = [
             CameraFormat::new_from(640, 480, FrameFormat::MJPEG, 30),
             CameraFormat::new_from(1280, 720, FrameFormat::YUYV, 30),
@@ -2301,15 +2768,27 @@ mod tests {
 
         assert_eq!(
             closest_nokhwa_camera_format(&formats, 1280, 720, 30),
-            Some(formats[1]),
-            "exact FPS wins before the JPEG passthrough tie-breaker"
+            Some(formats[1])
         );
         assert_eq!(
             closest_nokhwa_camera_format(&formats, 1280, 720, 18),
             Some(formats[2])
         );
+        let low_rate_exact_resolution = [
+            CameraFormat::new_from(640, 480, FrameFormat::MJPEG, 5),
+            CameraFormat::new_from(1280, 720, FrameFormat::MJPEG, 30),
+        ];
+        assert_eq!(
+            closest_nokhwa_camera_format(&low_rate_exact_resolution, 640, 480, 30),
+            Some(low_rate_exact_resolution[1]),
+            "a severe frame-rate shortfall must not win merely because its resolution is exact"
+        );
         assert_eq!(requested_camera_fps(500), 2);
         assert_eq!(requested_camera_fps(333), 3);
+        assert_eq!(
+            requested_camera_fps(NATIVE_CAMERA_PREVIEW_FRAME_INTERVAL_MS),
+            30
+        );
         assert_eq!(requested_camera_fps(2_000), 1);
         assert_eq!(requested_camera_fps(1), 120);
     }
