@@ -1,9 +1,10 @@
 use crate::{
-    LanguageModelCreditUsage, LanguageModelError, LanguageModelInvocation, LanguageModelMessage,
-    LanguageModelProvider, LanguageModelProviderInfo, LanguageModelProviderOptions,
-    LanguageModelProviderUsage, LanguageModelRequest, LanguageModelRequestItem,
-    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelResponseItem,
-    LanguageModelRole, LanguageModelStreamEvent, LanguageModelToolCall, LanguageModelToolChoice,
+    LanguageModelCancellation, LanguageModelCreditUsage, LanguageModelError,
+    LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
+    LanguageModelProviderInfo, LanguageModelProviderOptions, LanguageModelProviderUsage,
+    LanguageModelRequest, LanguageModelRequestItem, LanguageModelResponse,
+    LanguageModelResponseFormat, LanguageModelResponseItem, LanguageModelRole,
+    LanguageModelStreamEvent, LanguageModelToolCall, LanguageModelToolChoice,
     LanguageModelToolSpec, LanguageModelUsage, LanguageModelUsageLimit, LanguageModelUsageProvider,
     PROVIDER_DEFAULT_MODEL, apply_provider_vendor_options_to_payload,
     read_provider_credentials_json_value, selected_model, unix_timestamp,
@@ -11,11 +12,14 @@ use crate::{
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use futures_util::StreamExt;
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::time::Duration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -30,6 +34,9 @@ pub const CODEX_AUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const CODEX_CHATGPT_API_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 // Match the open-source Codex workspace version used by its models manager.
 pub const CODEX_MODELS_CLIENT_VERSION: &str = "0.0.0";
+const CODEX_STREAM_MAX_TRANSPORT_RETRIES: usize = 2;
+const CODEX_STREAM_RETRY_BASE_DELAY: Duration = Duration::from_millis(50);
+const CODEX_STREAM_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexConfig {
@@ -58,6 +65,9 @@ pub struct OpenAiResponsesCodexConfig {
     pub client_version: String,
     pub default_model: String,
     pub credentials_path: Option<PathBuf>,
+    /// Connect and per-read health timeout. This is not a total RPC deadline:
+    /// every successfully received response-body chunk resets the read timer.
+    pub transport_health_timeout: Duration,
 }
 
 impl Default for OpenAiResponsesCodexConfig {
@@ -69,6 +79,7 @@ impl Default for OpenAiResponsesCodexConfig {
             client_version: CODEX_MODELS_CLIENT_VERSION.to_string(),
             default_model: CODEX_DEFAULT_MODEL.to_string(),
             credentials_path: default_codex_credentials_path(),
+            transport_health_timeout: sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
         }
     }
 }
@@ -299,10 +310,11 @@ pub struct OpenAiResponsesCodexClient {
 
 impl OpenAiResponsesCodexClient {
     pub fn new(config: OpenAiResponsesCodexConfig) -> Self {
-        Self {
-            config,
-            http: Client::new(),
-        }
+        let http = Client::builder()
+            .connect_timeout(config.transport_health_timeout)
+            .build()
+            .expect("Codex HTTP client configuration is valid");
+        Self { config, http }
     }
 
     pub fn chatgpt_tokens(&self) -> Result<CodexChatGptTokens, LanguageModelError> {
@@ -575,42 +587,446 @@ impl CodexClient for OpenAiResponsesCodexClient {
         request: &CodexModelRequest,
         on_event: &mut dyn FnMut(LanguageModelStreamEvent),
     ) -> Result<CodexModelResponse, LanguageModelError> {
-        let mut tokens = self.chatgpt_tokens()?;
+        let cancellation = LanguageModelCancellation::default();
+        self.complete_streaming_with_cancellation(request, &cancellation, on_event)
+    }
+
+    fn complete_streaming_with_cancellation(
+        &self,
+        request: &CodexModelRequest,
+        cancellation: &LanguageModelCancellation,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<CodexModelResponse, LanguageModelError> {
+        if cancellation.is_cancelled() {
+            return Err(codex_cancelled_error(&request.model, "before request"));
+        }
+        let tokens = self.chatgpt_tokens()?;
         let request = request.with_chatgpt_supported_model();
         let url = format!(
             "{}/responses",
             self.config.api_base_url.trim_end_matches('/')
         );
         let payload = openai_responses_codex_payload(&request);
-        let mut response = self.post_responses(&url, &request, &tokens, &payload)?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            tokens = self.refresh_chatgpt_tokens()?;
-            response = self.post_responses(&url, &request, &tokens, &payload)?;
+        let response_model = request.model.clone();
+        let worker_client = self.clone();
+        let worker_cancellation = cancellation.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("sinomo-codex-stream".to_string())
+            .spawn(move || {
+                let result = worker_client.complete_streaming_worker(
+                    &url,
+                    &request,
+                    tokens,
+                    &payload,
+                    &worker_cancellation,
+                    &sender,
+                );
+                let _ = sender.send(CodexStreamingWorkerMessage::Finished(result));
+            })
+            .map_err(|source| {
+                codex_provider_invocation_error(
+                    &response_model,
+                    format!("failed to start Codex streaming transport worker: {source}"),
+                )
+            })?;
+
+        let mut completed = None;
+        let mut emitted_error = false;
+        while let Ok(message) = receiver.recv() {
+            match message {
+                CodexStreamingWorkerMessage::Event(event) => {
+                    emitted_error |= matches!(event, LanguageModelStreamEvent::Error { .. });
+                    on_event(event);
+                }
+                CodexStreamingWorkerMessage::Finished(result) => {
+                    completed = Some(result);
+                    break;
+                }
+            }
         }
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().unwrap_or_default();
-            return Err(LanguageModelError::ProviderInvocationFailed {
-                provider: CODEX_PROVIDER_ID.to_string(),
-                model: request.model.clone(),
-                detail: format!("Codex backend Responses API failed: HTTP {status}: {body}"),
+
+        if worker.join().is_err() {
+            return Err(codex_provider_invocation_error(
+                &response_model,
+                "Codex streaming transport worker panicked".to_string(),
+            ));
+        }
+        let result = completed.ok_or_else(|| {
+            codex_provider_invocation_error(
+                &response_model,
+                "Codex streaming transport worker closed without a result".to_string(),
+            )
+        })?;
+        if let Err(error) = &result
+            && !emitted_error
+        {
+            on_event(LanguageModelStreamEvent::Error {
+                detail: error.to_string(),
             });
         }
-
-        let body =
-            response
-                .text()
-                .map_err(|source| LanguageModelError::ProviderInvocationFailed {
-                    provider: CODEX_PROVIDER_ID.to_string(),
-                    model: request.model.clone(),
-                    detail: source.to_string(),
-                })?;
-
-        parse_openai_responses_codex_body_with_events(&body, &request.model, on_event)
+        result
     }
 }
 
+enum CodexStreamingWorkerMessage {
+    Event(LanguageModelStreamEvent),
+    Finished(Result<CodexModelResponse, LanguageModelError>),
+}
+
+enum CodexHttpAttempt {
+    Unauthorized,
+    Finished(CodexModelResponse),
+}
+
+enum CodexHttpAttemptError {
+    /// The transport failed before any decoded model event reached the caller, so replaying the
+    /// request cannot duplicate caller-visible progress or a locally executed tool call.
+    RetryableBeforeProgress(LanguageModelError),
+    Terminal(LanguageModelError),
+}
+
 impl OpenAiResponsesCodexClient {
+    fn complete_streaming_worker(
+        &self,
+        url: &str,
+        request: &CodexModelRequest,
+        mut tokens: CodexChatGptTokens,
+        payload: &serde_json::Value,
+        cancellation: &LanguageModelCancellation,
+        sender: &mpsc::Sender<CodexStreamingWorkerMessage>,
+    ) -> Result<CodexModelResponse, LanguageModelError> {
+        if cancellation.is_cancelled() {
+            return Err(codex_cancelled_error(&request.model, "before transport"));
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|source| {
+                codex_provider_invocation_error(
+                    &request.model,
+                    format!("failed to start Codex async transport runtime: {source}"),
+                )
+            })?;
+        let async_http = {
+            let _runtime = runtime.enter();
+            reqwest::Client::builder()
+                .connect_timeout(self.config.transport_health_timeout)
+                .read_timeout(self.config.transport_health_timeout)
+                .build()
+                .map_err(|source| {
+                    codex_provider_invocation_error(
+                        &request.model,
+                        format!("failed to configure Codex streaming transport: {source}"),
+                    )
+                })?
+        };
+
+        let mut transport_retries = 0;
+        let mut refreshed_credentials = false;
+        loop {
+            let attempt = runtime.block_on(self.post_responses_streaming_attempt(
+                &async_http,
+                url,
+                request,
+                &tokens,
+                payload,
+                cancellation,
+                sender,
+            ));
+            match attempt {
+                Ok(CodexHttpAttempt::Finished(response)) => return Ok(response),
+                Ok(CodexHttpAttempt::Unauthorized) if !refreshed_credentials => {
+                    if cancellation.is_cancelled() {
+                        return Err(codex_cancelled_error(
+                            &request.model,
+                            "before credential refresh",
+                        ));
+                    }
+                    tokens = runtime
+                        .block_on(self.refresh_chatgpt_tokens_async(&async_http, request))?;
+                    refreshed_credentials = true;
+                    if cancellation.is_cancelled() {
+                        return Err(codex_cancelled_error(
+                            &request.model,
+                            "after credential refresh",
+                        ));
+                    }
+                }
+                Ok(CodexHttpAttempt::Unauthorized) => {
+                    return Err(LanguageModelError::AuthenticationRequired {
+                        provider: CODEX_PROVIDER_ID.to_string(),
+                        detail: "Codex backend rejected refreshed ChatGPT credentials; run `sinomo providers auth codex` again".to_string(),
+                    });
+                }
+                Err(CodexHttpAttemptError::Terminal(error)) => return Err(error),
+                Err(CodexHttpAttemptError::RetryableBeforeProgress(error))
+                    if transport_retries >= CODEX_STREAM_MAX_TRANSPORT_RETRIES =>
+                {
+                    return Err(error);
+                }
+                Err(CodexHttpAttemptError::RetryableBeforeProgress(_)) => {
+                    let delay = codex_stream_retry_backoff(transport_retries);
+                    transport_retries += 1;
+                    runtime.block_on(wait_for_codex_retry_backoff(request, cancellation, delay))?;
+                }
+            }
+        }
+    }
+
+    async fn post_responses_streaming_attempt(
+        &self,
+        http: &reqwest::Client,
+        url: &str,
+        request: &CodexModelRequest,
+        tokens: &CodexChatGptTokens,
+        payload: &serde_json::Value,
+        cancellation: &LanguageModelCancellation,
+        sender: &mpsc::Sender<CodexStreamingWorkerMessage>,
+    ) -> Result<CodexHttpAttempt, CodexHttpAttemptError> {
+        if cancellation.is_cancelled() {
+            return Err(CodexHttpAttemptError::Terminal(codex_cancelled_error(
+                &request.model,
+                "before HTTP request",
+            )));
+        }
+        let send = http
+            .post(url)
+            .headers(
+                codex_headers(tokens, CODEX_PROVIDER_ID, &request.model)
+                    .map_err(CodexHttpAttemptError::Terminal)?,
+            )
+            .json(payload)
+            .send();
+        tokio::pin!(send);
+        let response = tokio::select! {
+            _ = wait_for_codex_cancellation(cancellation) => {
+                return Err(CodexHttpAttemptError::Terminal(codex_cancelled_error(
+                    &request.model,
+                    "while connecting or waiting for response headers",
+                )));
+            }
+            response = &mut send => response.map_err(|source| {
+                codex_http_attempt_transport_error(
+                    &request.model,
+                    "connecting or waiting for response headers",
+                    self.config.transport_health_timeout,
+                    source,
+                    false,
+                )
+            })?,
+        };
+        if cancellation.is_cancelled() {
+            return Err(CodexHttpAttemptError::Terminal(codex_cancelled_error(
+                &request.model,
+                "while waiting for response headers",
+            )));
+        }
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(CodexHttpAttempt::Unauthorized);
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.map_err(|source| {
+                CodexHttpAttemptError::Terminal(codex_transport_error(
+                    &request.model,
+                    "reading an error response body",
+                    self.config.transport_health_timeout,
+                    source,
+                ))
+            })?;
+            return Err(CodexHttpAttemptError::Terminal(
+                codex_provider_invocation_error(
+                    &request.model,
+                    format!("Codex backend Responses API failed: HTTP {status}: {body}"),
+                ),
+            ));
+        }
+
+        let is_event_stream = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
+        let mut chunks = response.bytes_stream();
+        if is_event_stream {
+            let mut decoder = OpenAiResponsesCodexSseDecoder::default();
+            let mut meaningful_progress = false;
+            loop {
+                let next_chunk = tokio::select! {
+                    _ = wait_for_codex_cancellation(cancellation) => {
+                        return Err(CodexHttpAttemptError::Terminal(codex_cancelled_error(
+                            &request.model,
+                            "during streaming response",
+                        )));
+                    }
+                    chunk = chunks.next() => chunk,
+                };
+                let Some(chunk) = next_chunk else {
+                    break;
+                };
+                let chunk = chunk.map_err(|source| {
+                    codex_http_attempt_transport_error(
+                        &request.model,
+                        "waiting for streaming response-body progress",
+                        self.config.transport_health_timeout,
+                        source,
+                        meaningful_progress,
+                    )
+                })?;
+                let mut receiver_open = true;
+                let decoded = decoder
+                    .push(&chunk, &request.model, &mut |event| {
+                        meaningful_progress = true;
+                        if !cancellation.is_cancelled() {
+                            receiver_open &= sender
+                                .send(CodexStreamingWorkerMessage::Event(event))
+                                .is_ok();
+                        }
+                    })
+                    .map_err(CodexHttpAttemptError::Terminal)?;
+                if cancellation.is_cancelled() {
+                    return Err(CodexHttpAttemptError::Terminal(codex_cancelled_error(
+                        &request.model,
+                        "during streaming response",
+                    )));
+                }
+                if let Some(response) = decoded {
+                    return Ok(CodexHttpAttempt::Finished(response));
+                }
+                if !receiver_open {
+                    return Err(CodexHttpAttemptError::Terminal(
+                        codex_provider_invocation_error(
+                            &request.model,
+                            "Codex stream consumer closed".to_string(),
+                        ),
+                    ));
+                }
+            }
+            if cancellation.is_cancelled() {
+                return Err(CodexHttpAttemptError::Terminal(codex_cancelled_error(
+                    &request.model,
+                    "during streaming response",
+                )));
+            }
+            let response = decoder.finish(&request.model, &mut |event| {
+                meaningful_progress = true;
+                let _ = sender.send(CodexStreamingWorkerMessage::Event(event));
+            });
+            let response = match response {
+                Ok(response) => response,
+                Err(error) if !meaningful_progress => {
+                    return Err(CodexHttpAttemptError::RetryableBeforeProgress(error));
+                }
+                Err(error) => return Err(CodexHttpAttemptError::Terminal(error)),
+            };
+            return Ok(CodexHttpAttempt::Finished(response));
+        }
+
+        let mut body = Vec::new();
+        loop {
+            let next_chunk = tokio::select! {
+                _ = wait_for_codex_cancellation(cancellation) => {
+                    return Err(CodexHttpAttemptError::Terminal(codex_cancelled_error(
+                        &request.model,
+                        "during response body",
+                    )));
+                }
+                chunk = chunks.next() => chunk,
+            };
+            let Some(chunk) = next_chunk else {
+                break;
+            };
+            let chunk = chunk.map_err(|source| {
+                codex_http_attempt_transport_error(
+                    &request.model,
+                    "waiting for response-body progress",
+                    self.config.transport_health_timeout,
+                    source,
+                    false,
+                )
+            })?;
+            body.extend_from_slice(&chunk);
+        }
+        if cancellation.is_cancelled() {
+            return Err(CodexHttpAttemptError::Terminal(codex_cancelled_error(
+                &request.model,
+                "during response body",
+            )));
+        }
+        let body = String::from_utf8(body).map_err(|source| {
+            CodexHttpAttemptError::Terminal(codex_provider_invocation_error(
+                &request.model,
+                format!("Codex backend returned a non-UTF-8 response body: {source}"),
+            ))
+        })?;
+        let response =
+            parse_openai_responses_codex_body_with_events(&body, &request.model, &mut |event| {
+                let _ = sender.send(CodexStreamingWorkerMessage::Event(event));
+            })
+            .map_err(CodexHttpAttemptError::Terminal)?;
+        Ok(CodexHttpAttempt::Finished(response))
+    }
+
+    async fn refresh_chatgpt_tokens_async(
+        &self,
+        http: &reqwest::Client,
+        request: &CodexModelRequest,
+    ) -> Result<CodexChatGptTokens, LanguageModelError> {
+        let current = self.chatgpt_tokens()?;
+        if current.refresh_token.trim().is_empty() {
+            return Err(LanguageModelError::AuthenticationRequired {
+                provider: CODEX_PROVIDER_ID.to_string(),
+                detail: "Codex ChatGPT auth is missing a refresh token; run `sinomo providers auth codex` again".to_string(),
+            });
+        }
+        let issuer = self.config.auth_issuer.trim_end_matches('/');
+        let response = http
+            .post(format!("{issuer}/oauth/token"))
+            .json(&serde_json::json!({
+                "client_id": self.config.client_id.as_str(),
+                "grant_type": "refresh_token",
+                "refresh_token": current.refresh_token.clone(),
+            }))
+            .send()
+            .await
+            .map_err(|source| {
+                codex_transport_error(
+                    &request.model,
+                    "refreshing ChatGPT credentials",
+                    self.config.transport_health_timeout,
+                    source,
+                )
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(LanguageModelError::AuthenticationRequired {
+                provider: CODEX_PROVIDER_ID.to_string(),
+                detail: format!("Codex ChatGPT token refresh failed: HTTP {status}: {body}"),
+            });
+        }
+        let refreshed = response
+            .json::<CodexRefreshResponse>()
+            .await
+            .map_err(|source| {
+                codex_transport_error(
+                    &request.model,
+                    "reading refreshed ChatGPT credentials",
+                    self.config.transport_health_timeout,
+                    source,
+                )
+            })?;
+        let tokens = tokens_from_response(
+            refreshed.id_token.unwrap_or(current.id_token),
+            refreshed.access_token.unwrap_or(current.access_token),
+            refreshed.refresh_token.unwrap_or(current.refresh_token),
+            current.account_id,
+        );
+        self.save_chatgpt_tokens(tokens.clone())?;
+        Ok(tokens)
+    }
+
     fn get_models(
         &self,
         tokens: &CodexChatGptTokens,
@@ -667,27 +1083,80 @@ impl OpenAiResponsesCodexClient {
             .unwrap_or_else(|| self.config.api_base_url.trim_end_matches('/'))
             .to_string()
     }
+}
 
-    fn post_responses(
-        &self,
-        url: &str,
-        request: &CodexModelRequest,
-        tokens: &CodexChatGptTokens,
-        payload: &serde_json::Value,
-    ) -> Result<reqwest::blocking::Response, LanguageModelError> {
-        let response = self
-            .http
-            .post(url)
-            .headers(codex_headers(tokens, CODEX_PROVIDER_ID, &request.model)?)
-            .json(payload)
-            .send()
-            .map_err(|source| LanguageModelError::ProviderInvocationFailed {
-                provider: CODEX_PROVIDER_ID.to_string(),
-                model: request.model.clone(),
-                detail: source.to_string(),
-            })?;
-        Ok(response)
+fn codex_transport_error(
+    model: &str,
+    phase: &str,
+    health_timeout: Duration,
+    source: reqwest::Error,
+) -> LanguageModelError {
+    let detail = if source.is_timeout() {
+        format!(
+            "Codex transport idle/unhealthy while {phase}: no network progress for {health_timeout:?}; this is a transport health timeout, not a total RPC deadline"
+        )
+    } else {
+        format!("Codex transport failed while {phase}: {source}")
+    };
+    codex_provider_invocation_error(model, detail)
+}
+
+fn codex_http_attempt_transport_error(
+    model: &str,
+    phase: &str,
+    health_timeout: Duration,
+    source: reqwest::Error,
+    meaningful_progress: bool,
+) -> CodexHttpAttemptError {
+    let retryable = !meaningful_progress
+        && (source.is_timeout()
+            || source.is_connect()
+            || (source.is_body() && !source.is_decode())
+            || (source.is_request()
+                && !source.is_builder()
+                && !source.is_redirect()
+                && !source.is_status()));
+    let error = codex_transport_error(model, phase, health_timeout, source);
+    if retryable {
+        CodexHttpAttemptError::RetryableBeforeProgress(error)
+    } else {
+        CodexHttpAttemptError::Terminal(error)
     }
+}
+
+fn codex_stream_retry_backoff(retry_index: usize) -> Duration {
+    CODEX_STREAM_RETRY_BASE_DELAY.saturating_mul(1_u32 << retry_index.min(10))
+}
+
+async fn wait_for_codex_retry_backoff(
+    request: &CodexModelRequest,
+    cancellation: &LanguageModelCancellation,
+    delay: Duration,
+) -> Result<(), LanguageModelError> {
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(codex_cancelled_error(
+                &request.model,
+                "during transport retry backoff",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        tokio::time::sleep(remaining.min(CODEX_STREAM_CANCELLATION_POLL_INTERVAL)).await;
+    }
+}
+
+async fn wait_for_codex_cancellation(cancellation: &LanguageModelCancellation) {
+    while !cancellation.is_cancelled() {
+        tokio::time::sleep(CODEX_STREAM_CANCELLATION_POLL_INTERVAL).await;
+    }
+}
+
+fn codex_cancelled_error(model: &str, phase: &'static str) -> LanguageModelError {
+    codex_provider_invocation_error(model, format!("Codex model invocation cancelled {phase}"))
 }
 
 pub trait CodexClient {
@@ -704,6 +1173,26 @@ pub trait CodexClient {
         let response = self.complete(request)?;
         for event in &response.stream_events {
             on_event(event.clone());
+        }
+        Ok(response)
+    }
+
+    fn complete_streaming_with_cancellation(
+        &self,
+        request: &CodexModelRequest,
+        cancellation: &LanguageModelCancellation,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<CodexModelResponse, LanguageModelError> {
+        if cancellation.is_cancelled() {
+            return Err(codex_cancelled_error(&request.model, "before request"));
+        }
+        let response = self.complete_streaming(request, &mut |event| {
+            if !cancellation.is_cancelled() {
+                on_event(event);
+            }
+        })?;
+        if cancellation.is_cancelled() {
+            return Err(codex_cancelled_error(&request.model, "during response"));
         }
         Ok(response)
     }
@@ -945,6 +1434,16 @@ where
         request: &LanguageModelRequest,
         on_event: &mut dyn FnMut(LanguageModelStreamEvent),
     ) -> Result<LanguageModelResponse, LanguageModelError> {
+        let cancellation = LanguageModelCancellation::default();
+        self.complete_streaming_events_with_cancellation(request, &cancellation, on_event)
+    }
+
+    fn complete_streaming_events_with_cancellation(
+        &self,
+        request: &LanguageModelRequest,
+        cancellation: &LanguageModelCancellation,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
         let model = selected_model(&self.config.default_model, request);
         let mut messages = self.context_manager.prepare_messages(request);
         if let Some(system_prompt) = self.prompt_builder.build_system_prompt(request) {
@@ -953,6 +1452,9 @@ where
         let tools = codex_tool_descriptors(self.tools.descriptors(), &request.tools);
 
         for _ in 0..self.config.max_iterations {
+            if cancellation.is_cancelled() {
+                return Err(codex_cancelled_error(&model, "before model iteration"));
+            }
             on_event(LanguageModelStreamEvent::Started {
                 provider: self.config.provider_id.clone(),
                 model: model.clone(),
@@ -969,7 +1471,11 @@ where
                 tool_choice: request.tool_choice.clone(),
                 parallel_tool_calls: request.parallel_tool_calls,
             };
-            let response = self.client.complete_streaming(&codex_request, on_event)?;
+            let response = self.client.complete_streaming_with_cancellation(
+                &codex_request,
+                cancellation,
+                on_event,
+            )?;
             if response.tool_calls.is_empty() {
                 return Ok(LanguageModelResponse {
                     provider: self.config.provider_id.clone(),
@@ -1763,14 +2269,99 @@ fn parse_openai_responses_codex_sse_response_with_events(
     model: &str,
     on_event: &mut dyn FnMut(LanguageModelStreamEvent),
 ) -> Result<CodexModelResponse, LanguageModelError> {
-    let mut output = Vec::new();
-    let mut output_text = String::new();
-    let mut stream_events = Vec::new();
-    let normalized = body.replace("\r\n", "\n");
+    let mut decoder = OpenAiResponsesCodexSseDecoder::default();
+    if let Some(response) = decoder.push(body.as_bytes(), model, on_event)? {
+        return Ok(response);
+    }
+    decoder.finish(model, on_event)
+}
 
-    for block in normalized.split("\n\n") {
+#[derive(Default)]
+struct OpenAiResponsesCodexSseDecoder {
+    pending: Vec<u8>,
+    output: Vec<serde_json::Value>,
+    output_text: String,
+    saw_output_text_delta: bool,
+    stream_events: Vec<LanguageModelStreamEvent>,
+}
+
+impl OpenAiResponsesCodexSseDecoder {
+    fn push(
+        &mut self,
+        bytes: &[u8],
+        model: &str,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<Option<CodexModelResponse>, LanguageModelError> {
+        self.pending.extend_from_slice(bytes);
+        while let Some((block_end, delimiter_len)) = sse_block_boundary(&self.pending) {
+            let block = self.pending[..block_end].to_vec();
+            self.pending.drain(..block_end + delimiter_len);
+            let block = String::from_utf8(block).map_err(|source| {
+                codex_provider_invocation_error(
+                    model,
+                    format!("Codex stream contained a non-UTF-8 event: {source}"),
+                )
+            })?;
+            if let Some(response) = self.process_block(&block, model, on_event)? {
+                return Ok(Some(response));
+            }
+        }
+        Ok(None)
+    }
+
+    fn finish(
+        mut self,
+        model: &str,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<CodexModelResponse, LanguageModelError> {
+        if !self.pending.is_empty() {
+            let pending = std::mem::take(&mut self.pending);
+            let block = String::from_utf8(pending).map_err(|source| {
+                codex_provider_invocation_error(
+                    model,
+                    format!("Codex stream contained a non-UTF-8 event: {source}"),
+                )
+            })?;
+            if let Some(response) = self.process_block(&block, model, on_event)? {
+                return Ok(response);
+            }
+        }
+
+        if !self.output.is_empty() || !self.output_text.is_empty() {
+            let mut response = serde_json::json!({ "output": self.output });
+            if !self.output_text.is_empty() {
+                response["output_text"] = serde_json::json!(self.output_text);
+            }
+            let mut parsed = parse_openai_responses_codex_response(&response);
+            if self
+                .stream_events
+                .iter()
+                .all(|event| !matches!(event, LanguageModelStreamEvent::Finished { .. }))
+            {
+                let stream_event = LanguageModelStreamEvent::Finished {
+                    finish_reason: None,
+                };
+                on_event(stream_event.clone());
+                self.stream_events.push(stream_event);
+            }
+            parsed.stream_events = self.stream_events;
+            return Ok(parsed);
+        }
+
+        Err(codex_provider_invocation_error(
+            model,
+            "Codex backend stream closed before response.completed".to_string(),
+        ))
+    }
+
+    fn process_block(
+        &mut self,
+        block: &str,
+        model: &str,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<Option<CodexModelResponse>, LanguageModelError> {
         let Some(event) = parse_sse_event(block, model)? else {
-            continue;
+            return Ok(None);
         };
         let kind = event
             .get("type")
@@ -1781,20 +2372,26 @@ fn parse_openai_responses_codex_sse_response_with_events(
             "response.output_item.done" => {
                 if let Some(item) = event.get("item") {
                     for stream_event in stream_events_from_openai_output_item(item) {
+                        if self.saw_output_text_delta
+                            && matches!(&stream_event, LanguageModelStreamEvent::TextDelta { .. })
+                        {
+                            continue;
+                        }
                         on_event(stream_event.clone());
-                        stream_events.push(stream_event);
+                        self.stream_events.push(stream_event);
                     }
-                    output.push(item.clone());
+                    self.output.push(item.clone());
                 }
             }
             "response.output_text.delta" => {
                 if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str) {
-                    output_text.push_str(delta);
+                    self.saw_output_text_delta = true;
+                    self.output_text.push_str(delta);
                     let stream_event = LanguageModelStreamEvent::TextDelta {
                         delta: delta.to_string(),
                     };
                     on_event(stream_event.clone());
-                    stream_events.push(stream_event);
+                    self.stream_events.push(stream_event);
                 }
             }
             "response.completed" => {
@@ -1806,11 +2403,11 @@ fn parse_openai_responses_codex_sse_response_with_events(
                     .get("output")
                     .and_then(serde_json::Value::as_array)
                     .is_none_or(Vec::is_empty);
-                if missing_or_empty_output && !output.is_empty() {
-                    response["output"] = serde_json::json!(output);
+                if missing_or_empty_output && !self.output.is_empty() {
+                    response["output"] = serde_json::json!(self.output);
                 }
-                if response.get("output_text").is_none() && !output_text.is_empty() {
-                    response["output_text"] = serde_json::json!(output_text);
+                if response.get("output_text").is_none() && !self.output_text.is_empty() {
+                    response["output_text"] = serde_json::json!(self.output_text);
                 }
                 let mut parsed = parse_openai_responses_codex_response(&response);
                 if let Some(usage) = &parsed.usage {
@@ -1818,15 +2415,15 @@ fn parse_openai_responses_codex_sse_response_with_events(
                         usage: usage.clone(),
                     };
                     on_event(stream_event.clone());
-                    stream_events.push(stream_event);
+                    self.stream_events.push(stream_event);
                 }
                 let stream_event = LanguageModelStreamEvent::Finished {
                     finish_reason: openai_responses_finish_reason(&response),
                 };
                 on_event(stream_event.clone());
-                stream_events.push(stream_event);
-                parsed.stream_events = stream_events;
-                return Ok(parsed);
+                self.stream_events.push(stream_event);
+                parsed.stream_events = std::mem::take(&mut self.stream_events);
+                return Ok(Some(parsed));
             }
             "response.failed" => {
                 let detail = openai_responses_event_error_message(&event)
@@ -1838,32 +2435,18 @@ fn parse_openai_responses_codex_sse_response_with_events(
             }
             _ => {}
         }
+        Ok(None)
     }
+}
 
-    if !output.is_empty() || !output_text.is_empty() {
-        let mut response = serde_json::json!({ "output": output });
-        if !output_text.is_empty() {
-            response["output_text"] = serde_json::json!(output_text);
-        }
-        let mut parsed = parse_openai_responses_codex_response(&response);
-        if stream_events
-            .iter()
-            .all(|event| !matches!(event, LanguageModelStreamEvent::Finished { .. }))
-        {
-            let stream_event = LanguageModelStreamEvent::Finished {
-                finish_reason: None,
-            };
-            on_event(stream_event.clone());
-            stream_events.push(stream_event);
-        }
-        parsed.stream_events = stream_events;
-        return Ok(parsed);
-    }
-
-    Err(codex_provider_invocation_error(
-        model,
-        "Codex backend stream closed before response.completed".to_string(),
-    ))
+fn sse_block_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
+    let lf = bytes.windows(2).position(|window| window == b"\n\n");
+    let crlf = bytes.windows(4).position(|window| window == b"\r\n\r\n");
+    let cr = bytes.windows(2).position(|window| window == b"\r\r");
+    [(lf, 2), (crlf, 4), (cr, 2)]
+        .into_iter()
+        .filter_map(|(position, delimiter_len)| position.map(|position| (position, delimiter_len)))
+        .min_by_key(|(position, _)| *position)
 }
 
 fn stream_events_from_openai_output(output: &[serde_json::Value]) -> Vec<LanguageModelStreamEvent> {
@@ -2067,7 +2650,13 @@ mod tests {
     use crate::{PROVIDER_DEFAULT_MODEL, ProviderReasoningEffort, ProviderTextVerbosity};
     use std::cell::RefCell;
     use std::fs;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Instant;
 
     fn request() -> LanguageModelRequest {
         LanguageModelRequest {
@@ -2092,6 +2681,116 @@ mod tests {
             response_format: LanguageModelResponseFormat::Text,
             metadata: serde_json::Value::Null,
         }
+    }
+
+    fn transport_request() -> CodexModelRequest {
+        CodexModelRequest {
+            model: CODEX_DEFAULT_MODEL.to_string(),
+            messages: vec![CodexMessage::user("hello")],
+            tools: Vec::new(),
+            temperature: None,
+            max_output_tokens: None,
+            response_format: LanguageModelResponseFormat::Text,
+            metadata: serde_json::Value::Null,
+            options: LanguageModelProviderOptions::default(),
+            tool_choice: None,
+            parallel_tool_calls: None,
+        }
+    }
+
+    fn transport_client(
+        base_url: &str,
+        health_timeout: Duration,
+        dir: &sinomo_testdir::TestDir,
+    ) -> OpenAiResponsesCodexClient {
+        let credentials_path = Some(dir.join("credentials.json"));
+        save_codex_chatgpt_tokens(
+            &credentials_path,
+            tokens_from_response(
+                fake_chatgpt_id_token("transport-account", false),
+                "transport-access".to_string(),
+                "transport-refresh".to_string(),
+                None,
+            ),
+        )
+        .expect("save transport test credentials");
+        OpenAiResponsesCodexClient::new(OpenAiResponsesCodexConfig {
+            api_base_url: base_url.to_string(),
+            auth_issuer: base_url.to_string(),
+            credentials_path,
+            transport_health_timeout: health_timeout,
+            ..OpenAiResponsesCodexConfig::default()
+        })
+    }
+
+    fn test_server(
+        handler: impl FnOnce(TcpListener) + Send + 'static,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let worker = thread::spawn(move || handler(listener));
+        (format!("http://{address}"), worker)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("request read timeout");
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        let header_end = loop {
+            let read = stream.read(&mut buffer).expect("read request");
+            assert!(read > 0, "request closed before headers");
+            bytes.extend_from_slice(&buffer[..read]);
+            if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        while bytes.len() < header_end + content_length {
+            let read = stream.read(&mut buffer).expect("read request body");
+            assert!(read > 0, "request closed before body");
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+        headers.lines().next().expect("request line").to_string()
+    }
+
+    fn write_chunked_headers(stream: &mut TcpStream, content_type: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write response headers");
+        stream.flush().expect("flush response headers");
+    }
+
+    fn write_http_chunk(stream: &mut TcpStream, chunk: &str) {
+        write!(stream, "{:x}\r\n{chunk}\r\n", chunk.len()).expect("write response chunk");
+        stream.flush().expect("flush response chunk");
+    }
+
+    fn finish_http_chunks(stream: &mut TcpStream) {
+        stream.write_all(b"0\r\n\r\n").expect("finish chunks");
+        stream.flush().expect("flush chunk finish");
+    }
+
+    fn write_json_response(stream: &mut TcpStream, status: &str, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("write JSON response");
+        stream.flush().expect("flush JSON response");
     }
 
     #[test]
@@ -2544,6 +3243,431 @@ mod tests {
     }
 
     #[test]
+    fn codex_transport_delivers_sse_events_before_response_completion() {
+        let (release_sender, release_receiver) = mpsc::channel();
+        let (base_url, server) = test_server(move |listener| {
+            let (mut stream, _) = listener.accept().expect("accept responses request");
+            assert!(read_http_request(&mut stream).starts_with("POST /responses "));
+            write_chunked_headers(&mut stream, "text/event-stream");
+            write_http_chunk(
+                &mut stream,
+                "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"live\"}\n\n",
+            );
+            release_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("test observed incremental event");
+            write_http_chunk(
+                &mut stream,
+                "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            );
+            finish_http_chunks(&mut stream);
+        });
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-stream-incremental");
+        let client = transport_client(&base_url, Duration::from_secs(1), &dir);
+        let (event_sender, event_receiver) = mpsc::channel();
+        let invocation = thread::spawn(move || {
+            client.complete_streaming(&transport_request(), &mut |event| {
+                event_sender.send(event).expect("send observed event");
+            })
+        });
+
+        let event = event_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("receive event before completion is released");
+        assert_eq!(
+            event,
+            LanguageModelStreamEvent::TextDelta {
+                delta: "live".to_string()
+            }
+        );
+        release_sender.send(()).expect("release completion");
+        let response = invocation
+            .join()
+            .expect("invocation thread")
+            .expect("streaming response");
+        server.join().expect("server thread");
+        assert_eq!(response.content, "live");
+    }
+
+    #[test]
+    fn codex_transport_resets_idle_timeout_on_stream_progress() {
+        let health_timeout = Duration::from_millis(120);
+        let (base_url, server) = test_server(move |listener| {
+            let (mut stream, _) = listener.accept().expect("accept responses request");
+            read_http_request(&mut stream);
+            write_chunked_headers(&mut stream, "text/event-stream");
+            for delta in ["a", "b", "c", "d", "e"] {
+                write_http_chunk(
+                    &mut stream,
+                    &format!(
+                        "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"{delta}\"}}\n\n"
+                    ),
+                );
+                thread::sleep(Duration::from_millis(40));
+            }
+            write_http_chunk(
+                &mut stream,
+                "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            );
+            finish_http_chunks(&mut stream);
+        });
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-stream-progress");
+        let client = transport_client(&base_url, health_timeout, &dir);
+        let started = Instant::now();
+
+        let response = client
+            .complete_streaming(&transport_request(), &mut |_| {})
+            .expect("progressing stream outlives one idle window");
+
+        server.join().expect("server thread");
+        assert!(started.elapsed() > health_timeout);
+        assert_eq!(response.content, "abcde");
+    }
+
+    #[test]
+    fn codex_transport_cancels_a_continuously_progressing_stream_promptly() {
+        let (base_url, server) = test_server(move |listener| {
+            let (mut stream, _) = listener.accept().expect("accept responses request");
+            read_http_request(&mut stream);
+            write_chunked_headers(&mut stream, "text/event-stream");
+            for _ in 0..200 {
+                let chunk = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n";
+                if write!(stream, "{:x}\r\n{chunk}\r\n", chunk.len()).is_err()
+                    || stream.flush().is_err()
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-stream-cancel");
+        let client = transport_client(&base_url, Duration::from_secs(2), &dir);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = {
+            let cancelled = Arc::clone(&cancelled);
+            LanguageModelCancellation::new(move || cancelled.load(Ordering::SeqCst))
+        };
+        let cancel_worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(75));
+            cancelled.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+
+        let error = client
+            .complete_streaming_with_cancellation(&transport_request(), &cancellation, &mut |_| {})
+            .expect_err("cancelled stream must stop");
+
+        cancel_worker.join().expect("cancellation thread");
+        server.join().expect("server thread");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error.to_string().contains("cancelled"), "{error}");
+    }
+
+    #[test]
+    fn codex_transport_reports_stalled_response_body_as_idle_unhealthy() {
+        let health_timeout = Duration::from_millis(80);
+        let (base_url, server) = test_server(move |listener| {
+            for _ in 0..=CODEX_STREAM_MAX_TRANSPORT_RETRIES {
+                let (mut stream, _) = listener.accept().expect("accept responses request");
+                read_http_request(&mut stream);
+                write_chunked_headers(&mut stream, "text/event-stream");
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-stream-stall");
+        let client = transport_client(&base_url, health_timeout, &dir);
+        let mut events = Vec::new();
+
+        let error = client
+            .complete_streaming(&transport_request(), &mut |event| events.push(event))
+            .expect_err("stalled stream must fail");
+
+        server.join().expect("server thread");
+        let detail = error.to_string();
+        assert!(detail.contains("idle/unhealthy"), "{detail}");
+        assert!(detail.contains("80ms"), "{detail}");
+        assert!(detail.contains("not a total RPC deadline"), "{detail}");
+        assert!(events.iter().any(|event| {
+            matches!(event, LanguageModelStreamEvent::Error { detail } if detail.contains("idle/unhealthy"))
+        }));
+    }
+
+    #[test]
+    fn codex_transport_accepts_non_streaming_json_response() {
+        let (base_url, server) = test_server(move |listener| {
+            let (mut stream, _) = listener.accept().expect("accept responses request");
+            read_http_request(&mut stream);
+            write_json_response(
+                &mut stream,
+                "200 OK",
+                "{\"output_text\":\"json-ok\",\"output\":[],\"status\":\"completed\"}",
+            );
+        });
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-json-response");
+        let client = transport_client(&base_url, Duration::from_secs(1), &dir);
+        let mut events = Vec::new();
+
+        let response = client
+            .complete_streaming(&transport_request(), &mut |event| events.push(event))
+            .expect("JSON response");
+
+        server.join().expect("server thread");
+        assert_eq!(response.content, "json-ok");
+        assert!(events.iter().any(|event| {
+            matches!(event, LanguageModelStreamEvent::Finished { finish_reason } if finish_reason.as_deref() == Some("completed"))
+        }));
+    }
+
+    #[test]
+    fn codex_transport_preserves_http_error_status_and_body() {
+        let (base_url, server) = test_server(move |listener| {
+            let (mut stream, _) = listener.accept().expect("accept responses request");
+            read_http_request(&mut stream);
+            write_json_response(
+                &mut stream,
+                "503 Service Unavailable",
+                "{\"error\":\"maintenance\"}",
+            );
+        });
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-http-error");
+        let client = transport_client(&base_url, Duration::from_secs(1), &dir);
+
+        let error = client
+            .complete_streaming(&transport_request(), &mut |_| {})
+            .expect_err("provider error response");
+
+        server.join().expect("server thread");
+        let detail = error.to_string();
+        assert!(detail.contains("503 Service Unavailable"), "{detail}");
+        assert!(detail.contains("maintenance"), "{detail}");
+    }
+
+    #[test]
+    fn codex_transport_refreshes_once_after_unauthorized_response() {
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let server_paths = Arc::clone(&paths);
+        let (base_url, server) = test_server(move |listener| {
+            for index in 0..3 {
+                let (mut stream, _) = listener.accept().expect("accept transport request");
+                let request_line = read_http_request(&mut stream);
+                server_paths
+                    .lock()
+                    .expect("paths lock")
+                    .push(request_line.clone());
+                match index {
+                    0 => write_json_response(&mut stream, "401 Unauthorized", "{}"),
+                    1 => write_json_response(
+                        &mut stream,
+                        "200 OK",
+                        "{\"access_token\":\"refreshed-access\",\"refresh_token\":\"refreshed-refresh\"}",
+                    ),
+                    _ => write_json_response(
+                        &mut stream,
+                        "200 OK",
+                        "{\"output_text\":\"retried-ok\",\"output\":[],\"status\":\"completed\"}",
+                    ),
+                }
+            }
+        });
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-unauthorized-retry");
+        let client = transport_client(&base_url, Duration::from_secs(1), &dir);
+
+        let response = client
+            .complete_streaming(&transport_request(), &mut |_| {})
+            .expect("response succeeds after refresh");
+
+        server.join().expect("server thread");
+        assert_eq!(response.content, "retried-ok");
+        let paths = paths.lock().expect("paths lock");
+        assert!(paths[0].starts_with("POST /responses "), "{paths:?}");
+        assert!(paths[1].starts_with("POST /oauth/token "), "{paths:?}");
+        assert!(paths[2].starts_with("POST /responses "), "{paths:?}");
+        assert_eq!(
+            client
+                .chatgpt_tokens()
+                .expect("refreshed credentials")
+                .access_token,
+            "refreshed-access"
+        );
+    }
+
+    #[test]
+    fn codex_transport_retries_before_semantic_stream_progress() {
+        let health_timeout = Duration::from_millis(80);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let (base_url, server) = test_server(move |listener| {
+            for index in 0..3 {
+                let (mut stream, _) = listener.accept().expect("accept responses request");
+                server_attempts.fetch_add(1, Ordering::SeqCst);
+                read_http_request(&mut stream);
+                if index == 0 {
+                    // A connection that dies before response headers is safe to retry as well.
+                    continue;
+                }
+                write_chunked_headers(&mut stream, "text/event-stream");
+                if index == 1 {
+                    // Network bytes alone are not semantic model progress. This partial event may
+                    // be replayed because nothing has escaped the decoder to the caller.
+                    write_http_chunk(
+                        &mut stream,
+                        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":",
+                    );
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                write_http_chunk(
+                    &mut stream,
+                    "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"retried\"}\n\n",
+                );
+                write_http_chunk(
+                    &mut stream,
+                    "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+                );
+                finish_http_chunks(&mut stream);
+            }
+        });
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-before-progress-retry");
+        let client = transport_client(&base_url, health_timeout, &dir);
+        let mut events = Vec::new();
+
+        let response = client
+            .complete_streaming(&transport_request(), &mut |event| events.push(event))
+            .expect("transient pre-progress failure is retried");
+
+        server.join().expect("server thread");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(response.content, "retried");
+        assert!(events.iter().any(|event| {
+            matches!(event, LanguageModelStreamEvent::TextDelta { delta } if delta == "retried")
+        }));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, LanguageModelStreamEvent::Error { .. }))
+        );
+    }
+
+    #[test]
+    fn codex_transport_never_retries_after_semantic_stream_progress() {
+        let health_timeout = Duration::from_millis(80);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let (base_url, server) = test_server(move |listener| {
+            let (mut stream, _) = listener.accept().expect("accept responses request");
+            server_attempts.fetch_add(1, Ordering::SeqCst);
+            read_http_request(&mut stream);
+            write_chunked_headers(&mut stream, "text/event-stream");
+            write_http_chunk(
+                &mut stream,
+                "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"visible\"}\n\n",
+            );
+            thread::sleep(Duration::from_millis(240));
+            drop(stream);
+
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking retry probe");
+            let deadline = Instant::now() + Duration::from_millis(200);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        server_attempts.fetch_add(1, Ordering::SeqCst);
+                        read_http_request(&mut stream);
+                        write_json_response(
+                            &mut stream,
+                            "200 OK",
+                            "{\"output_text\":\"unsafe-replay\",\"output\":[],\"status\":\"completed\"}",
+                        );
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("retry probe failed: {error}"),
+                }
+            }
+        });
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-after-progress-no-retry");
+        let client = transport_client(&base_url, health_timeout, &dir);
+        let mut events = Vec::new();
+
+        let error = client
+            .complete_streaming(&transport_request(), &mut |event| events.push(event))
+            .expect_err("failure after visible progress must not be replayed");
+
+        server.join().expect("server thread");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(error.to_string().contains("idle/unhealthy"), "{error}");
+        assert!(events.iter().any(|event| {
+            matches!(event, LanguageModelStreamEvent::TextDelta { delta } if delta == "visible")
+        }));
+    }
+
+    #[test]
+    fn codex_transport_cancellation_stops_retry_backoff() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let (first_attempt_sender, first_attempt_receiver) = mpsc::channel();
+        let (base_url, server) = test_server(move |listener| {
+            let (mut stream, _) = listener.accept().expect("accept responses request");
+            server_attempts.fetch_add(1, Ordering::SeqCst);
+            read_http_request(&mut stream);
+            write_chunked_headers(&mut stream, "text/event-stream");
+            write_http_chunk(
+                &mut stream,
+                "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":",
+            );
+            finish_http_chunks(&mut stream);
+            first_attempt_sender.send(()).expect("signal first attempt");
+            drop(stream);
+
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking retry probe");
+            let deadline = Instant::now() + Duration::from_millis(150);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((_stream, _)) => {
+                        server_attempts.fetch_add(1, Ordering::SeqCst);
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("retry probe failed: {error}"),
+                }
+            }
+        });
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-retry-cancel");
+        let client = transport_client(&base_url, Duration::from_secs(1), &dir);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = {
+            let cancelled = Arc::clone(&cancelled);
+            LanguageModelCancellation::new(move || cancelled.load(Ordering::SeqCst))
+        };
+        let cancel_worker = {
+            let cancelled = Arc::clone(&cancelled);
+            thread::spawn(move || {
+                first_attempt_receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("first attempt completes");
+                thread::sleep(Duration::from_millis(20));
+                cancelled.store(true, Ordering::SeqCst);
+            })
+        };
+
+        let error = client
+            .complete_streaming_with_cancellation(&transport_request(), &cancellation, &mut |_| {})
+            .expect_err("cancellation stops retry backoff");
+
+        cancel_worker.join().expect("cancellation thread");
+        server.join().expect("server thread");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(error.to_string().contains("cancelled"), "{error}");
+    }
+
+    #[test]
     fn openai_responses_sse_parser_extracts_completed_response() {
         let body = concat!(
             "event: response.output_item.done\n",
@@ -2582,6 +3706,57 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn openai_responses_sse_parser_does_not_repeat_completed_message_after_text_deltas() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hel\"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"summary\":[{\"text\":\"checked\"}]}}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_context\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}\n\n",
+        );
+        let mut streamed = Vec::new();
+
+        let parsed = parse_openai_responses_codex_sse_response_with_events(
+            body,
+            CODEX_DEFAULT_MODEL,
+            &mut |event| streamed.push(event),
+        )
+        .expect("sse");
+
+        assert_eq!(parsed.content, "hello");
+        assert_eq!(
+            streamed
+                .iter()
+                .filter_map(|event| match event {
+                    LanguageModelStreamEvent::TextDelta { delta } => Some(delta.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["hel", "lo"]
+        );
+        assert!(streamed.iter().any(|event| {
+            matches!(
+                event,
+                LanguageModelStreamEvent::ReasoningSummary { summary } if summary == "checked"
+            )
+        }));
+        assert!(streamed.iter().any(|event| {
+            matches!(
+                event,
+                LanguageModelStreamEvent::ToolCallCompleted { name, input, .. }
+                    if name == "read_context" && input["path"] == "README.md"
+            )
+        }));
     }
 
     #[test]

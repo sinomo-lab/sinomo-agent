@@ -1,40 +1,47 @@
 //! Simple native sandbox runtime.
 //!
 //! This runtime executes host binaries directly and exposes the host filesystem
-//! layout as-is. On Linux, it uses Landlock as a best-effort filesystem
-//! allowlist guard. On Windows, it uses a restricted low-integrity token and
-//! labels configured write paths for low-integrity writes. This is intended to
-//! prevent accidental access to unapproved paths; it is not a hostile-code
-//! security boundary.
+//! layout as-is. Enabling it explicitly opts into normal host-process
+//! filesystem semantics; structured sandbox filesystem permissions are not an
+//! isolation boundary for this backend.
 
-use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 #[cfg(not(windows))]
-use std::io::Write;
+use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
-#[cfg(not(windows))]
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use sinomo_core::node::NodeId;
-#[cfg(not(windows))]
-use sinomo_sandbox::SandboxCancellationToken;
 use sinomo_sandbox::{
     LocalSandboxFileSystem, LocalSandboxInstanceLayout, LocalSandboxInstanceStore,
-    SANDBOX_UNLIMITED_WALL_TIME_MS, SandboxCommandExecutionError, SandboxCommandId,
-    SandboxCommandRecord, SandboxCommandRecordStatus, SandboxCommandRequest, SandboxFsError,
-    SandboxLocalCommandOutcome, SandboxOutputSink, SandboxOutputStream, SandboxPath, SandboxPolicy,
-    SandboxProcessPlan, SandboxProcessPlanOutcome, SandboxResourceLimits, SandboxResourceUsage,
-    SandboxStoreError, SandboxWasiError, effective_sandbox_timeout_ms, persist_command_outputs,
-    record_local_command_history, sandbox_command_record_status_for_wasi_error,
-    sandbox_command_stderr_path, sandbox_command_stdout_path, sandbox_output_chunks,
-    validate_sandbox_process_plan, validate_sandbox_process_plan_working_directories,
-    validate_sandbox_toolchain_argv, validate_toolchain_command_name, validate_workspace_usage,
-    validate_written_bytes,
+    SANDBOX_OUTPUT_CHUNK_BYTES, SANDBOX_RESOURCE_USAGE_UNAVAILABLE, SANDBOX_UNLIMITED_WALL_TIME_MS,
+    SandboxCancellationToken, SandboxCommandExecutionError, SandboxCommandId, SandboxCommandRecord,
+    SandboxCommandRecordStatus, SandboxCommandRequest, SandboxFsError, SandboxLocalCommandOutcome,
+    SandboxLocalExecutionJournal, SandboxLocalExecutionLease, SandboxLocalExecutionOutcome,
+    SandboxMount, SandboxMountMode, SandboxOutputChunk, SandboxOutputSink, SandboxOutputStream,
+    SandboxPath, SandboxPolicy, SandboxProcessPlan, SandboxProcessPlanOutcome,
+    SandboxResourceLimits, SandboxResourceUsage, SandboxStoreError, SandboxWasiError,
+    activate_sandbox_local_execution_journal, begin_sandbox_local_execution_journal,
+    cleanup_sandbox_local_execution_external_owner, effective_sandbox_timeout_ms,
+    persist_command_outputs, prepare_sandbox_local_execution_audit_identity,
+    record_local_command_history, recover_sandbox_local_execution_journal_with_lease,
+    sandbox_command_record_status_for_wasi_error, sandbox_command_stderr_path,
+    sandbox_command_stdout_path, sandbox_output_chunks, settle_sandbox_local_execution_journal,
+    try_acquire_sandbox_local_execution_lease, validate_sandbox_process_plan,
+    validate_sandbox_toolchain_argv, validate_toolchain_command_name,
+};
+#[cfg(target_os = "linux")]
+use sinomo_sandbox::{
+    SandboxLocalExecutionExternalOwner, prepare_sandbox_local_execution_external_owner,
 };
 use time::OffsetDateTime;
 
@@ -44,8 +51,16 @@ pub const SINOMO_SANDBOX_SIMPLE_ALLOW_UNENFORCED_ENV: &str =
 pub const SINOMO_SANDBOX_SIMPLE_READ_PATHS_ENV: &str = "SINOMO_SANDBOX_SIMPLE_READ_PATHS";
 pub const SINOMO_SANDBOX_SIMPLE_WRITE_PATHS_ENV: &str = "SINOMO_SANDBOX_SIMPLE_WRITE_PATHS";
 pub const SINOMO_SANDBOX_SIMPLE_EXECUTE_PATHS_ENV: &str = "SINOMO_SANDBOX_SIMPLE_EXECUTE_PATHS";
+pub const SINOMO_SANDBOX_SIMPLE_HOST_SIFS_ROOT_ENV: &str = "SINOMO_SANDBOX_SIMPLE_HOST_SIFS_ROOT";
 
 const SIMPLE_NATIVE_WAIT_POLL_MS: u64 = 50;
+#[cfg(not(windows))]
+const SIMPLE_NATIVE_TERMINATION_WAIT_MS: u64 = 5_000;
+const SIMPLE_NATIVE_MAX_CAPTURE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn effective_simple_native_output_limit(configured: u64) -> u64 {
+    configured.min(SIMPLE_NATIVE_MAX_CAPTURE_BYTES)
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SandboxSimpleNativeConfig {
@@ -53,6 +68,9 @@ pub struct SandboxSimpleNativeConfig {
     pub extra_read_paths: Vec<PathBuf>,
     pub extra_write_paths: Vec<PathBuf>,
     pub extra_execute_paths: Vec<PathBuf>,
+    /// Host path where the live SIFS/FUSE namespace is mounted. Declared
+    /// sandbox mounts are projected from this tree without copying.
+    pub host_sifs_root: Option<PathBuf>,
 }
 
 impl SandboxSimpleNativeConfig {
@@ -62,6 +80,9 @@ impl SandboxSimpleNativeConfig {
             extra_read_paths: env_path_list(SINOMO_SANDBOX_SIMPLE_READ_PATHS_ENV),
             extra_write_paths: env_path_list(SINOMO_SANDBOX_SIMPLE_WRITE_PATHS_ENV),
             extra_execute_paths: env_path_list(SINOMO_SANDBOX_SIMPLE_EXECUTE_PATHS_ENV),
+            host_sifs_root: env::var_os(SINOMO_SANDBOX_SIMPLE_HOST_SIFS_ROOT_ENV)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
         })
     }
 }
@@ -80,12 +101,8 @@ impl SandboxSimpleNativeCommandRunner {
         Ok(Self::new(SandboxSimpleNativeConfig::from_env()?))
     }
 
-    #[cfg(target_os = "linux")]
-    pub fn landlock_supported() -> bool {
-        linux::landlock_abi_version().is_ok()
-    }
-
-    #[cfg(not(target_os = "linux"))]
+    /// Retained for API compatibility. The simple host backend deliberately
+    /// does not install Landlock or mount-namespace restrictions.
     pub fn landlock_supported() -> bool {
         false
     }
@@ -103,6 +120,75 @@ impl SandboxSimpleNativeCommandRunner {
         execution_node_id: &NodeId,
         policy: &SandboxPolicy,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
+    ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
+        self.run_toolchain_command_with_stdin_policy_output_sink_and_cancellation(
+            store,
+            _toolchain_store,
+            sandbox_id,
+            command_name,
+            argv,
+            stdin,
+            timeout_ms,
+            execution_node_id,
+            policy,
+            output_sink,
+            SandboxCancellationToken::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_toolchain_command_with_stdin_policy_output_sink_and_cancellation(
+        &self,
+        store: &LocalSandboxInstanceStore,
+        _toolchain_store: &sinomo_sandbox::LocalSandboxToolchainStore,
+        sandbox_id: &sinomo_sandbox::SandboxId,
+        command_name: &str,
+        argv: Vec<String>,
+        stdin: Option<Vec<u8>>,
+        timeout_ms: u64,
+        execution_node_id: &NodeId,
+        policy: &SandboxPolicy,
+        output_sink: Option<Arc<dyn SandboxOutputSink>>,
+        cancellation_token: SandboxCancellationToken,
+    ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
+        let local_execution_lease = try_acquire_sandbox_local_execution_lease(store, sandbox_id)?;
+        recover_sandbox_local_execution_journal_with_lease(
+            store,
+            &local_execution_lease,
+            sandbox_id,
+            OffsetDateTime::now_utc(),
+        )?;
+        self.run_toolchain_command_with_stdin_policy_output_sink_cancellation_and_lease(
+            store,
+            _toolchain_store,
+            sandbox_id,
+            command_name,
+            argv,
+            stdin,
+            timeout_ms,
+            execution_node_id,
+            policy,
+            output_sink,
+            cancellation_token,
+            &local_execution_lease,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_toolchain_command_with_stdin_policy_output_sink_cancellation_and_lease(
+        &self,
+        store: &LocalSandboxInstanceStore,
+        _toolchain_store: &sinomo_sandbox::LocalSandboxToolchainStore,
+        sandbox_id: &sinomo_sandbox::SandboxId,
+        command_name: &str,
+        argv: Vec<String>,
+        stdin: Option<Vec<u8>>,
+        timeout_ms: u64,
+        execution_node_id: &NodeId,
+        policy: &SandboxPolicy,
+        output_sink: Option<Arc<dyn SandboxOutputSink>>,
+        cancellation_token: SandboxCancellationToken,
+        local_execution_lease: &SandboxLocalExecutionLease,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
         validate_toolchain_command_name(command_name)?;
         validate_sandbox_toolchain_argv(command_name, &argv).map_err(invalid_request)?;
@@ -131,7 +217,15 @@ impl SandboxSimpleNativeCommandRunner {
             env,
             timeout_ms,
         };
-        self.run_native_command(store, &manifest, &layout, request, output_sink)
+        self.run_native_command(
+            store,
+            &manifest,
+            &layout,
+            request,
+            output_sink,
+            &cancellation_token,
+            &local_execution_lease,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -146,10 +240,41 @@ impl SandboxSimpleNativeCommandRunner {
         policy: &SandboxPolicy,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
     ) -> Result<SandboxProcessPlanOutcome, SandboxCommandExecutionError> {
+        self.run_process_plan_with_policy_output_sink_and_cancellation(
+            store,
+            _toolchain_store,
+            sandbox_id,
+            plan,
+            timeout_ms,
+            execution_node_id,
+            policy,
+            output_sink,
+            SandboxCancellationToken::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_process_plan_with_policy_output_sink_and_cancellation(
+        &self,
+        store: &LocalSandboxInstanceStore,
+        _toolchain_store: &sinomo_sandbox::LocalSandboxToolchainStore,
+        sandbox_id: &sinomo_sandbox::SandboxId,
+        plan: &SandboxProcessPlan,
+        timeout_ms: u64,
+        execution_node_id: &NodeId,
+        policy: &SandboxPolicy,
+        output_sink: Option<Arc<dyn SandboxOutputSink>>,
+        cancellation_token: SandboxCancellationToken,
+    ) -> Result<SandboxProcessPlanOutcome, SandboxCommandExecutionError> {
         validate_sandbox_process_plan(plan)?;
+        let local_execution_lease = try_acquire_sandbox_local_execution_lease(store, sandbox_id)?;
+        recover_sandbox_local_execution_journal_with_lease(
+            store,
+            &local_execution_lease,
+            sandbox_id,
+            OffsetDateTime::now_utc(),
+        )?;
         let (manifest, layout) = store.load(sandbox_id)?;
-        let fs = LocalSandboxFileSystem::new(layout.clone());
-        validate_sandbox_process_plan_working_directories(plan, &fs, &manifest.cwd)?;
         policy
             .validate_manifest(&manifest, execution_node_id)
             .map_err(SandboxCommandExecutionError::PolicyDenied)?;
@@ -176,8 +301,15 @@ impl SandboxSimpleNativeCommandRunner {
                 env,
                 timeout_ms,
             };
-            let outcome =
-                self.run_native_command(store, &manifest, &layout, request, output_sink.clone())?;
+            let outcome = self.run_native_command(
+                store,
+                &manifest,
+                &layout,
+                request,
+                output_sink.clone(),
+                &cancellation_token,
+                &local_execution_lease,
+            )?;
             if step.pipe_stdout_to_next {
                 piped_stdin = Some(outcome.stdout.clone());
             }
@@ -213,6 +345,8 @@ impl SandboxSimpleNativeCommandRunner {
         layout: &LocalSandboxInstanceLayout,
         request: SandboxCommandRequest,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
+        cancellation_token: &SandboxCancellationToken,
+        local_execution_lease: &SandboxLocalExecutionLease,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
         let Some(argv0) = request.argv.first() else {
             return Err(invalid_request(
@@ -248,22 +382,9 @@ impl SandboxSimpleNativeCommandRunner {
             return Err(error.into());
         }
 
-        let sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
-        let cwd = resolve_native_cwd(&sandbox_fs, layout, &request.cwd)?;
-        let before = sandbox_fs.snapshot()?;
-        let policy = SandboxSimpleNativePolicy::for_layout(layout, &self.config);
-        policy.validate_cwd(&cwd)?;
-        let started = Instant::now();
-        let output = match execute_native_command(
-            &request,
-            layout,
-            &cwd,
-            &policy,
-            timeout_ms,
-            &self.config,
-            &manifest.limits,
-        ) {
-            Ok(output) => output,
+        let mount_projection = match prepare_native_mount_projection(&manifest.mounts, &self.config)
+        {
+            Ok(projection) => projection,
             Err(error) => {
                 persist_failed_command(
                     store,
@@ -281,12 +402,134 @@ impl SandboxSimpleNativeCommandRunner {
                 return Err(error.into());
             }
         };
+        let sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
+        let cwd = resolve_native_cwd(&sandbox_fs, layout, &request.cwd, mount_projection.as_ref())?;
+        let before = sandbox_fs.snapshot()?;
+        let mut local_journal = begin_sandbox_local_execution_journal(
+            store,
+            local_execution_lease,
+            manifest,
+            OffsetDateTime::now_utc(),
+        )?;
+        prepare_sandbox_local_execution_audit_identity(
+            store,
+            local_execution_lease,
+            &mut local_journal,
+            SandboxCommandRecord {
+                sandbox_id: manifest.sandbox_id.clone(),
+                command_id: command_id.clone(),
+                status: SandboxCommandRecordStatus::Failed,
+                workspace_root: manifest.workspace_root.clone(),
+                toolchain_id: manifest.toolchain_id.clone(),
+                argv: request.argv.clone(),
+                cwd: request.cwd.clone(),
+                env: request.env.clone(),
+                started_at,
+                completed_at: None,
+                response: None,
+                error: Some(
+                    "sandbox host stopped while the simple-native guest was active".to_string(),
+                ),
+            },
+            OffsetDateTime::now_utc(),
+        )?;
+        activate_sandbox_local_execution_journal(
+            store,
+            local_execution_lease,
+            &mut local_journal,
+            OffsetDateTime::now_utc(),
+        )?;
+        let started = Instant::now();
+        let output = execute_native_command(
+            &request,
+            layout,
+            &cwd,
+            mount_projection.as_ref(),
+            timeout_ms,
+            &self.config,
+            &manifest.limits,
+            cancellation_token,
+            &command_id,
+            output_sink.clone(),
+            store,
+            local_execution_lease,
+            &mut local_journal,
+        );
+        let (output, _completion_guard) =
+            transition_after_native_return(cancellation_token, output);
+        if let Err(cleanup_error) = cleanup_sandbox_local_execution_external_owner(
+            store,
+            local_execution_lease,
+            &mut local_journal,
+            OffsetDateTime::now_utc(),
+        ) {
+            let cancelled = cancellation_token.is_cancelled()
+                || matches!(&output, Err(SandboxWasiError::Cancelled))
+                || matches!(
+                    &output,
+                    Ok(NativeCommandOutput {
+                        terminal_error: Some(SandboxWasiError::Cancelled),
+                        ..
+                    })
+                );
+            if cancelled {
+                return Err(SandboxWasiError::CancelledCleanupFailed {
+                    detail: cleanup_error.to_string(),
+                }
+                .into());
+            }
+            return Err(cleanup_error.into());
+        }
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                let completed_at = OffsetDateTime::now_utc();
+                let command_record = SandboxCommandRecord {
+                    sandbox_id: manifest.sandbox_id.clone(),
+                    command_id: command_id.clone(),
+                    status: sandbox_command_record_status_for_wasi_error(&error),
+                    workspace_root: manifest.workspace_root.clone(),
+                    toolchain_id: manifest.toolchain_id.clone(),
+                    argv: request.argv.clone(),
+                    cwd: request.cwd.clone(),
+                    env: request.env.clone(),
+                    started_at,
+                    completed_at: Some(completed_at),
+                    response: None,
+                    error: Some(error.to_string()),
+                };
+                let cancelled = matches!(error, SandboxWasiError::Cancelled);
+                settle_sandbox_local_execution_journal(
+                    store,
+                    local_execution_lease,
+                    &mut local_journal,
+                    if cancelled {
+                        SandboxLocalExecutionOutcome::Cancelled
+                    } else {
+                        SandboxLocalExecutionOutcome::Failed {
+                            detail: error.to_string(),
+                        }
+                    },
+                    command_record,
+                    Vec::new(),
+                    Vec::new(),
+                    completed_at,
+                )?;
+                recover_sandbox_local_execution_journal_with_lease(
+                    store,
+                    local_execution_lease,
+                    &manifest.sandbox_id,
+                    OffsetDateTime::now_utc(),
+                )?;
+                return Err(error.into());
+            }
+        };
 
         let wall_time_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         let exit_status = output.exit_status;
         let stdout = output.stdout;
         let stderr = output.stderr;
-        let output_bytes = stdout.len().saturating_add(stderr.len()) as u64;
+        let terminal_error = output.terminal_error;
         let mut output_chunks = sandbox_output_chunks(
             &manifest.sandbox_id,
             &command_id,
@@ -299,16 +542,8 @@ impl SandboxSimpleNativeCommandRunner {
             SandboxOutputStream::Stderr,
             &stderr,
         ));
-        if let Some(sink) = output_sink.as_ref() {
-            for chunk in &output_chunks {
-                sink.output_chunk(chunk.clone());
-            }
-        }
-
         let sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
         let changed_paths = sandbox_fs.changed_paths_since(&before)?;
-        let after = sandbox_fs.snapshot()?;
-        let written_bytes = after.written_bytes_since(&before);
         let response = sinomo_sandbox::SandboxCommandResponse {
             command_id: command_id.clone(),
             exit_status,
@@ -320,33 +555,28 @@ impl SandboxSimpleNativeCommandRunner {
                 peak_memory_bytes: 0,
                 stdout_bytes: stdout.len() as u64,
                 stderr_bytes: stderr.len() as u64,
-                written_bytes,
+                // simple-native deliberately permits arbitrary host writes;
+                // its sandbox-local snapshot is only a partial view and
+                // cannot honestly enforce max_written_bytes_per_command.
+                written_bytes: SANDBOX_RESOURCE_USAGE_UNAVAILABLE,
             },
         };
 
-        let limit_error = if output_bytes > manifest.limits.max_output_bytes {
-            Some(SandboxCommandExecutionError::Wasi(
-                SandboxWasiError::OutputLimitExceeded {
-                    limit: manifest.limits.max_output_bytes.min(usize::MAX as u64) as usize,
-                },
-            ))
-        } else if let Err(error) =
-            validate_workspace_usage(&after.workspace_usage(), &manifest.limits)
-        {
-            Some(SandboxCommandExecutionError::Fs(error))
-        } else if let Err(error) = validate_written_bytes(written_bytes, &manifest.limits) {
-            Some(SandboxCommandExecutionError::Fs(error))
+        let execution_error = if let Some(error) = terminal_error {
+            Some(SandboxCommandExecutionError::Wasi(error))
         } else {
             None
         };
 
         let completed_at = OffsetDateTime::now_utc();
-        let status = if limit_error.is_some() {
-            SandboxCommandRecordStatus::ResourceExhausted
-        } else {
-            SandboxCommandRecordStatus::Completed
+        let status = match execution_error.as_ref() {
+            Some(SandboxCommandExecutionError::Wasi(error)) => {
+                sandbox_command_record_status_for_wasi_error(error)
+            }
+            Some(_) => SandboxCommandRecordStatus::ResourceExhausted,
+            None => SandboxCommandRecordStatus::Completed,
         };
-        let error = limit_error.as_ref().map(ToString::to_string);
+        let error = execution_error.as_ref().map(ToString::to_string);
         let record = SandboxCommandRecord {
             sandbox_id: manifest.sandbox_id.clone(),
             command_id: command_id.clone(),
@@ -361,12 +591,40 @@ impl SandboxSimpleNativeCommandRunner {
             response: Some(response.clone()),
             error,
         };
-        let mut sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
-        persist_command_outputs(&mut sandbox_fs, &record, &stdout, &stderr)?;
-        record_local_command_history(store, &manifest.sandbox_id, &command_id, completed_at)?;
-        if let Some(error) = limit_error {
+        let primary_outcome = match execution_error.as_ref() {
+            None => SandboxLocalExecutionOutcome::Succeeded,
+            Some(SandboxCommandExecutionError::Wasi(
+                SandboxWasiError::Cancelled | SandboxWasiError::CancelledCleanupFailed { .. },
+            )) => SandboxLocalExecutionOutcome::Cancelled,
+            Some(error) => SandboxLocalExecutionOutcome::Failed {
+                detail: error.to_string(),
+            },
+        };
+        settle_sandbox_local_execution_journal(
+            store,
+            local_execution_lease,
+            &mut local_journal,
+            primary_outcome,
+            record,
+            stdout.clone(),
+            stderr.clone(),
+            completed_at,
+        )?;
+        if let Some(error) = execution_error {
+            recover_sandbox_local_execution_journal_with_lease(
+                store,
+                local_execution_lease,
+                &manifest.sandbox_id,
+                OffsetDateTime::now_utc(),
+            )?;
             return Err(error);
         }
+        recover_sandbox_local_execution_journal_with_lease(
+            store,
+            local_execution_lease,
+            &manifest.sandbox_id,
+            OffsetDateTime::now_utc(),
+        )?;
         Ok(SandboxLocalCommandOutcome {
             response,
             stdout,
@@ -376,83 +634,287 @@ impl SandboxSimpleNativeCommandRunner {
     }
 }
 
-#[derive(Clone, Debug)]
-struct SandboxSimpleNativePolicy {
-    read_paths: Vec<PathBuf>,
-    write_paths: Vec<PathBuf>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    execute_paths: Vec<PathBuf>,
-}
-
 #[derive(Debug)]
 struct NativeCommandOutput {
     exit_status: i32,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    terminal_error: Option<SandboxWasiError>,
 }
 
-impl SandboxSimpleNativePolicy {
-    fn for_layout(layout: &LocalSandboxInstanceLayout, config: &SandboxSimpleNativeConfig) -> Self {
-        let mut read_paths = existing_paths([
-            PathBuf::from("/bin"),
-            PathBuf::from("/usr"),
-            PathBuf::from("/lib"),
-            PathBuf::from("/lib64"),
-            PathBuf::from("/etc"),
-            PathBuf::from("/proc"),
-            PathBuf::from("/dev/null"),
-            PathBuf::from("/dev/urandom"),
-        ]);
-        read_paths.extend(config.extra_read_paths.iter().cloned());
+struct NativeCompletionGuard<'a> {
+    cancellation_token: &'a SandboxCancellationToken,
+    claimed: bool,
+}
 
-        let mut write_paths = existing_paths([
-            layout.root_dir.clone(),
-            layout.home.clone(),
-            layout.tmp.clone(),
-            layout.work.clone(),
-            layout.var.clone(),
-            layout.logs.clone(),
-            layout.artifacts.clone(),
-            PathBuf::from("/dev/null"),
-        ]);
-        write_paths.extend(config.extra_write_paths.iter().cloned());
-
-        let mut execute_paths = existing_paths([
-            PathBuf::from("/bin"),
-            PathBuf::from("/usr/bin"),
-            PathBuf::from("/usr/local/bin"),
-            PathBuf::from("/lib"),
-            PathBuf::from("/lib64"),
-            PathBuf::from("/usr/lib"),
-            PathBuf::from("/usr/lib64"),
-            layout.work.clone(),
-            layout.artifacts.clone(),
-        ]);
-        execute_paths.extend(config.extra_execute_paths.iter().cloned());
-
-        Self {
-            read_paths: dedup_paths(read_paths),
-            write_paths: dedup_paths(write_paths),
-            execute_paths: dedup_paths(execute_paths),
+impl Drop for NativeCompletionGuard<'_> {
+    fn drop(&mut self) {
+        if self.claimed {
+            self.cancellation_token.complete();
         }
     }
+}
 
-    fn validate_cwd(&self, cwd: &Path) -> Result<(), SandboxCommandExecutionError> {
-        if self.path_is_allowed(cwd) {
-            Ok(())
-        } else {
-            Err(invalid_request(format!(
-                "simple-native cwd {} is outside allowed read/write paths",
-                cwd.display()
-            )))
-        }
+fn transition_after_native_return(
+    cancellation_token: &SandboxCancellationToken,
+    result: Result<NativeCommandOutput, SandboxWasiError>,
+) -> (
+    Result<NativeCommandOutput, SandboxWasiError>,
+    NativeCompletionGuard<'_>,
+) {
+    let cancelled = matches!(&result, Err(SandboxWasiError::Cancelled))
+        || matches!(
+            &result,
+            Ok(NativeCommandOutput {
+                terminal_error: Some(SandboxWasiError::Cancelled),
+                ..
+            })
+        );
+    if cancelled {
+        return (
+            result,
+            NativeCompletionGuard {
+                cancellation_token,
+                claimed: false,
+            },
+        );
     }
+    if cancellation_token.begin_completing() {
+        (
+            result,
+            NativeCompletionGuard {
+                cancellation_token,
+                claimed: true,
+            },
+        )
+    } else {
+        (
+            Err(SandboxWasiError::Cancelled),
+            NativeCompletionGuard {
+                cancellation_token,
+                claimed: false,
+            },
+        )
+    }
+}
 
-    fn path_is_allowed(&self, path: &Path) -> bool {
-        self.read_paths
+#[derive(Clone, Debug)]
+struct NativeProjectedMount {
+    source_host_path: PathBuf,
+    guest_path: PathBuf,
+    mode: SandboxMountMode,
+}
+
+#[derive(Clone, Debug)]
+struct NativeMountProjection {
+    bwrap_program: PathBuf,
+    mounts: Vec<NativeProjectedMount>,
+}
+
+impl NativeMountProjection {
+    fn projected_source_for_guest_path(&self, guest_path: &Path) -> Option<PathBuf> {
+        self.mounts
             .iter()
-            .chain(self.write_paths.iter())
-            .any(|allowed| path_has_prefix(path, allowed))
+            .filter_map(|mount| {
+                guest_path
+                    .strip_prefix(&mount.guest_path)
+                    .ok()
+                    .map(|suffix| {
+                        (
+                            mount.guest_path.components().count(),
+                            mount.source_host_path.join(suffix),
+                        )
+                    })
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, source)| source)
+    }
+}
+
+fn prepare_native_mount_projection(
+    mounts: &[SandboxMount],
+    config: &SandboxSimpleNativeConfig,
+) -> Result<Option<NativeMountProjection>, SandboxWasiError> {
+    if mounts.is_empty() {
+        return Ok(None);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = config;
+        return Err(SandboxWasiError::Runtime {
+            detail: "simple-native declared mounts require Linux bubblewrap functional projection; copying mount contents is not supported"
+                .to_string(),
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let host_sifs_root = config.host_sifs_root.as_deref().ok_or_else(|| {
+            SandboxWasiError::InvalidRequest {
+                detail: format!(
+                    "simple-native manifest declares {} mount(s), but no live host SIFS/FUSE root is configured via {}",
+                    mounts.len(),
+                    SINOMO_SANDBOX_SIMPLE_HOST_SIFS_ROOT_ENV
+                ),
+            }
+        })?;
+        let host_sifs_root =
+            fs::canonicalize(host_sifs_root).map_err(|source| SandboxWasiError::Runtime {
+                detail: format!(
+                    "failed to resolve live host SIFS/FUSE root {}: {source}",
+                    host_sifs_root.display()
+                ),
+            })?;
+        if !host_sifs_root.is_dir() {
+            return Err(SandboxWasiError::Runtime {
+                detail: format!(
+                    "configured live host SIFS/FUSE root {} is not a directory",
+                    host_sifs_root.display()
+                ),
+            });
+        }
+        let bwrap_program = find_host_program("bwrap").ok_or_else(|| SandboxWasiError::Runtime {
+            detail: "simple-native manifest declares mounts, but `bwrap` is unavailable; live mounts cannot be represented without copying"
+                .to_string(),
+        })?;
+        let mut projected = Vec::with_capacity(mounts.len());
+        for mount in mounts {
+            let relative = normalized_sifs_relative_path(&mount.source_sifs_path)?;
+            let joined = host_sifs_root.join(relative);
+            let source_host_path =
+                fs::canonicalize(&joined).map_err(|source| SandboxWasiError::Runtime {
+                    detail: format!(
+                        "failed to resolve declared SIFS mount source {} beneath {}: {source}",
+                        mount.source_sifs_path,
+                        host_sifs_root.display()
+                    ),
+                })?;
+            if !source_host_path.starts_with(&host_sifs_root) {
+                return Err(SandboxWasiError::InvalidRequest {
+                    detail: format!(
+                        "declared SIFS mount source {} resolves outside configured host root {}",
+                        mount.source_sifs_path,
+                        host_sifs_root.display()
+                    ),
+                });
+            }
+            projected.push(NativeProjectedMount {
+                source_host_path,
+                guest_path: PathBuf::from(mount.mount_path.as_str()),
+                mode: mount.mode.clone(),
+            });
+        }
+        Ok(Some(NativeMountProjection {
+            bwrap_program,
+            mounts: projected,
+        }))
+    }
+}
+
+fn normalized_sifs_relative_path(path: &str) -> Result<PathBuf, SandboxWasiError> {
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return Err(SandboxWasiError::InvalidRequest {
+            detail: format!("declared SIFS mount source must be absolute: {path:?}"),
+        });
+    }
+    let mut relative = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(component) => relative.push(component),
+            _ => {
+                return Err(SandboxWasiError::InvalidRequest {
+                    detail: format!(
+                        "declared SIFS mount source is not canonical: {}",
+                        path.display()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(relative)
+}
+
+fn find_host_program(name: &str) -> Option<PathBuf> {
+    env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+#[derive(Debug)]
+struct BoundedOutputBudget {
+    limit: u64,
+    consumed: AtomicU64,
+    exceeded: AtomicBool,
+}
+
+impl BoundedOutputBudget {
+    fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            consumed: AtomicU64::new(0),
+            exceeded: AtomicBool::new(false),
+        }
+    }
+
+    fn reserve(&self, requested: usize) -> usize {
+        let requested = requested as u64;
+        let start = self.consumed.fetch_add(requested, Ordering::AcqRel);
+        let allowed = self.limit.saturating_sub(start).min(requested) as usize;
+        if allowed < requested as usize {
+            self.exceeded.store(true, Ordering::Release);
+        }
+        allowed
+    }
+
+    fn exceeded(&self) -> bool {
+        self.exceeded.load(Ordering::Acquire)
+    }
+}
+
+struct LiveOutputEmitter {
+    sink: Option<Arc<dyn SandboxOutputSink>>,
+    sandbox_id: sinomo_sandbox::SandboxId,
+    command_id: SandboxCommandId,
+    stream: SandboxOutputStream,
+    offset: u64,
+}
+
+impl LiveOutputEmitter {
+    fn new(
+        sink: Option<Arc<dyn SandboxOutputSink>>,
+        sandbox_id: sinomo_sandbox::SandboxId,
+        command_id: SandboxCommandId,
+        stream: SandboxOutputStream,
+    ) -> Self {
+        Self {
+            sink,
+            sandbox_id,
+            command_id,
+            stream,
+            offset: 0,
+        }
+    }
+
+    fn emit(&mut self, bytes: &[u8]) {
+        let Some(sink) = self.sink.as_ref() else {
+            self.offset = self.offset.saturating_add(bytes.len() as u64);
+            return;
+        };
+        for bytes in bytes.chunks(SANDBOX_OUTPUT_CHUNK_BYTES) {
+            sink.output_chunk(SandboxOutputChunk {
+                sandbox_id: self.sandbox_id.clone(),
+                command_id: self.command_id.clone(),
+                stream: self.stream.clone(),
+                offset: self.offset,
+                bytes: bytes.to_vec(),
+            });
+            self.offset = self.offset.saturating_add(bytes.len() as u64);
+        }
     }
 }
 
@@ -460,20 +922,53 @@ fn execute_native_command(
     request: &SandboxCommandRequest,
     layout: &LocalSandboxInstanceLayout,
     cwd: &Path,
-    policy: &SandboxSimpleNativePolicy,
+    mount_projection: Option<&NativeMountProjection>,
     timeout_ms: u64,
     config: &SandboxSimpleNativeConfig,
     limits: &SandboxResourceLimits,
+    cancellation_token: &SandboxCancellationToken,
+    command_id: &SandboxCommandId,
+    output_sink: Option<Arc<dyn SandboxOutputSink>>,
+    store: &LocalSandboxInstanceStore,
+    local_execution_lease: &SandboxLocalExecutionLease,
+    local_journal: &mut SandboxLocalExecutionJournal,
 ) -> Result<NativeCommandOutput, SandboxWasiError> {
     #[cfg(windows)]
     {
-        let _ = policy;
-        return windows::execute_native_command(request, layout, cwd, timeout_ms, config, limits);
+        let _ = mount_projection;
+        let _ = store;
+        let _ = local_execution_lease;
+        let _ = local_journal;
+        return windows::execute_native_command(
+            request,
+            layout,
+            cwd,
+            timeout_ms,
+            config,
+            limits,
+            cancellation_token,
+            command_id,
+            output_sink,
+        );
     }
 
     #[cfg(not(windows))]
     {
-        execute_native_command_std(request, layout, cwd, policy, timeout_ms, config, limits)
+        let _ = config;
+        execute_native_command_std(
+            request,
+            layout,
+            cwd,
+            mount_projection,
+            timeout_ms,
+            limits,
+            cancellation_token,
+            command_id,
+            output_sink,
+            store,
+            local_execution_lease,
+            local_journal,
+        )
     }
 }
 
@@ -482,10 +977,15 @@ fn execute_native_command_std(
     request: &SandboxCommandRequest,
     layout: &LocalSandboxInstanceLayout,
     cwd: &Path,
-    policy: &SandboxSimpleNativePolicy,
+    mount_projection: Option<&NativeMountProjection>,
     timeout_ms: u64,
-    config: &SandboxSimpleNativeConfig,
     limits: &SandboxResourceLimits,
+    cancellation_token: &SandboxCancellationToken,
+    command_id: &SandboxCommandId,
+    output_sink: Option<Arc<dyn SandboxOutputSink>>,
+    store: &LocalSandboxInstanceStore,
+    local_execution_lease: &SandboxLocalExecutionLease,
+    local_journal: &mut SandboxLocalExecutionJournal,
 ) -> Result<NativeCommandOutput, SandboxWasiError> {
     let argv0 = request
         .argv
@@ -493,14 +993,56 @@ fn execute_native_command_std(
         .ok_or_else(|| SandboxWasiError::InvalidRequest {
             detail: "simple-native command argv must include argv[0]".to_string(),
         })?;
-    linux::ensure_landlock_or_allowed(config.allow_unenforced)?;
-
     let env = native_environment(request, layout, cwd);
     let program = resolve_native_program(argv0, &env, cwd)?;
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut handshake = Command::new("/bin/sh");
+        handshake.args([
+            "-c",
+            "IFS= read -r _ <&3; exec 3<&-; exec \"$@\"",
+            "sinomo-handshake",
+        ]);
+        if let Some(projection) = mount_projection {
+            handshake
+                .arg(&projection.bwrap_program)
+                // Functional projection only: the host root remains entirely
+                // visible and writable inside the mount namespace. Preserve
+                // host device-node usability too: plain `--bind / /` maps
+                // devices such as /dev/null to unusable user-namespace nodes.
+                .args(["--dev-bind", "/", "/"]);
+            for mount in &projection.mounts {
+                handshake
+                    .arg(if mount.mode == SandboxMountMode::ReadOnly {
+                        "--ro-bind"
+                    } else {
+                        "--bind"
+                    })
+                    .arg(&mount.source_host_path)
+                    .arg(&mount.guest_path);
+            }
+            handshake
+                .arg("--chdir")
+                .arg(cwd)
+                .arg("--")
+                .arg(&program)
+                .args(request.argv.iter().skip(1));
+        } else {
+            handshake.arg(&program).args(request.argv.iter().skip(1));
+        }
+        handshake
+    };
+    #[cfg(not(target_os = "linux"))]
     let mut command = Command::new(&program);
+    #[cfg(not(target_os = "linux"))]
+    command.args(request.argv.iter().skip(1));
+    let launch_cwd = if mount_projection.is_some() {
+        Path::new("/")
+    } else {
+        cwd
+    };
     command
-        .args(request.argv.iter().skip(1))
-        .current_dir(cwd)
+        .current_dir(launch_cwd)
         .stdin(if request.stdin.is_some() {
             Stdio::piped()
         } else {
@@ -513,17 +1055,38 @@ fn execute_native_command_std(
         command.env(name, value);
     }
     #[cfg(target_os = "linux")]
+    let (mut launch_handshake, launch_handshake_child) =
+        UnixStream::pair().map_err(|source| SandboxWasiError::Runtime {
+            detail: format!("failed to create simple-native launch handshake: {source}"),
+        })?;
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::process::CommandExt;
-        let policy = policy.clone();
-        let allow_unenforced = config.allow_unenforced;
         let memory_mb = limits.memory_mb;
+        let expected_parent_pid = std::process::id() as libc::pid_t;
+        let handshake_fd = launch_handshake_child.as_raw_fd();
         // SAFETY: pre_exec only calls async-signal-safe libc/syscall operations
         // and returns an io::Error on failure before exec.
         unsafe {
             command.pre_exec(move || {
-                linux::prepare_child_process(&policy, allow_unenforced, memory_mb)
+                if handshake_fd != 3 && libc::dup2(handshake_fd, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                linux::prepare_child_process(memory_mb, expected_parent_pid)
             });
+        }
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        use std::os::unix::process::CommandExt;
+        let memory_mb = limits.memory_mb;
+        // SAFETY: pre_exec only invokes async-signal-safe setpgid/setrlimit
+        // operations and returns an io::Error before exec on failure.
+        unsafe {
+            command.pre_exec(move || linux::prepare_child_process(memory_mb, 0));
         }
     }
 
@@ -539,68 +1102,231 @@ fn execute_native_command_std(
                 )
             },
         })?;
-    let child_pid = child.id() as i32;
-    if let Some(stdin) = &request.stdin {
+    #[cfg(target_os = "linux")]
+    {
+        drop(launch_handshake_child);
+        let owner =
+            SandboxLocalExecutionExternalOwner::linux_process_group(child.id() as i32, child.id())
+                .map_err(|detail| {
+                    linux::kill_process_group(child.id() as i32);
+                    let _ = child.wait();
+                    SandboxWasiError::Runtime { detail }
+                })?;
+        if let Err(error) = prepare_sandbox_local_execution_external_owner(
+            store,
+            local_execution_lease,
+            local_journal,
+            owner,
+            OffsetDateTime::now_utc(),
+        ) {
+            linux::kill_process_group(child.id() as i32);
+            let _ = child.wait();
+            return Err(SandboxWasiError::Runtime {
+                detail: format!(
+                    "failed to persist simple-native process identity before launch: {error}"
+                ),
+            });
+        }
+        if let Err(source) = launch_handshake.write_all(b"go\n") {
+            linux::kill_process_group(child.id() as i32);
+            let _ = child.wait();
+            return Err(SandboxWasiError::Runtime {
+                detail: format!("failed to release simple-native launch handshake: {source}"),
+            });
+        }
+        drop(launch_handshake);
+    }
+    let stdin_writer = if let Some(stdin) = request.stdin.clone() {
         let mut child_stdin = child
             .stdin
             .take()
             .ok_or_else(|| SandboxWasiError::Runtime {
                 detail: "simple-native stdin pipe was not available".to_string(),
             })?;
-        child_stdin
-            .write_all(stdin)
-            .map_err(|source| SandboxWasiError::Runtime {
+        Some(std::thread::spawn(move || child_stdin.write_all(&stdin)))
+    } else {
+        None
+    };
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| SandboxWasiError::Runtime {
+            detail: "simple-native stdout pipe was not available".to_string(),
+        })?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| SandboxWasiError::Runtime {
+            detail: "simple-native stderr pipe was not available".to_string(),
+        })?;
+    let output_limit = effective_simple_native_output_limit(limits.max_output_bytes);
+    let output_budget = Arc::new(BoundedOutputBudget::new(output_limit));
+    let stdout_reader = spawn_bounded_native_reader(
+        stdout,
+        Arc::clone(&output_budget),
+        "stdout",
+        LiveOutputEmitter::new(
+            output_sink.clone(),
+            request.sandbox_id.clone(),
+            command_id.clone(),
+            SandboxOutputStream::Stdout,
+        ),
+    );
+    let stderr_reader = spawn_bounded_native_reader(
+        stderr,
+        Arc::clone(&output_budget),
+        "stderr",
+        LiveOutputEmitter::new(
+            output_sink,
+            request.sandbox_id.clone(),
+            command_id.clone(),
+            SandboxOutputStream::Stderr,
+        ),
+    );
+    let (status, mut terminal_error) = wait_for_native_output(
+        &mut child,
+        timeout_ms,
+        cancellation_token,
+        &output_budget,
+        output_limit,
+    )?;
+    let stdout = join_bounded_native_reader(stdout_reader, "stdout")?;
+    let stderr = join_bounded_native_reader(stderr_reader, "stderr")?;
+    if terminal_error.is_none() && output_budget.exceeded() {
+        terminal_error = Some(SandboxWasiError::OutputLimitExceeded {
+            limit: output_limit.min(usize::MAX as u64) as usize,
+        });
+    }
+    if let Some(writer) = stdin_writer {
+        let stdin_result = writer.join().map_err(|_| SandboxWasiError::Runtime {
+            detail: "simple-native stdin writer panicked".to_string(),
+        })?;
+        if terminal_error.is_none() {
+            stdin_result.map_err(|source| SandboxWasiError::Runtime {
                 detail: format!("failed to write simple-native stdin: {source}"),
             })?;
+        }
     }
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    let output =
-        wait_for_native_output(child_pid, rx, timeout_ms, &SandboxCancellationToken::new())?;
     Ok(NativeCommandOutput {
-        exit_status: exit_status_code(&output),
-        stdout: output.stdout,
-        stderr: output.stderr,
+        exit_status: exit_status_code(status),
+        stdout,
+        stderr,
+        terminal_error,
     })
 }
 
 #[cfg(not(windows))]
 fn wait_for_native_output(
-    child_pid: i32,
-    rx: mpsc::Receiver<std::io::Result<Output>>,
+    child: &mut Child,
     timeout_ms: u64,
     cancellation_token: &SandboxCancellationToken,
-) -> Result<Output, SandboxWasiError> {
+    output_budget: &BoundedOutputBudget,
+    output_limit: u64,
+) -> Result<(ExitStatus, Option<SandboxWasiError>), SandboxWasiError> {
     let started = Instant::now();
     loop {
         if cancellation_token.is_cancelled() {
-            linux::kill_process_group(child_pid);
-            return Err(SandboxWasiError::Cancelled);
+            let status = terminate_native_process_group_and_reap(child, "cancellation")?;
+            return Ok((status, Some(SandboxWasiError::Cancelled)));
+        }
+        if output_budget.exceeded() {
+            let status = terminate_native_process_group_and_reap(child, "output limit")?;
+            return Ok((
+                status,
+                Some(SandboxWasiError::OutputLimitExceeded {
+                    limit: output_limit.min(usize::MAX as u64) as usize,
+                }),
+            ));
         }
         let wait = match native_wait_poll_duration(started, timeout_ms) {
             Ok(wait) => wait,
             Err(SandboxWasiError::TimedOut { timeout_ms }) => {
-                linux::kill_process_group(child_pid);
-                return Err(SandboxWasiError::TimedOut { timeout_ms });
+                let status = terminate_native_process_group_and_reap(child, "timeout")?;
+                return Ok((status, Some(SandboxWasiError::TimedOut { timeout_ms })));
             }
             Err(error) => return Err(error),
         };
-        match rx.recv_timeout(wait) {
-            Ok(output) => {
-                return output.map_err(|source| SandboxWasiError::Runtime {
-                    detail: format!("simple-native command wait failed: {source}"),
-                });
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(SandboxWasiError::Runtime {
-                    detail: "simple-native wait channel disconnected".to_string(),
-                });
-            }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| SandboxWasiError::Runtime {
+                detail: format!("simple-native command wait failed: {source}"),
+            })?
+        {
+            // The command lifetime owns the whole process group. A shell may
+            // exit while a background descendant still holds a pipe open.
+            linux::kill_process_group(child.id() as i32);
+            return Ok((status, None));
         }
+        std::thread::sleep(wait);
     }
+}
+
+#[cfg(not(windows))]
+fn terminate_native_process_group_and_reap(
+    child: &mut Child,
+    reason: &str,
+) -> Result<ExitStatus, SandboxWasiError> {
+    linux::kill_process_group(child.id() as i32);
+    let deadline = Instant::now() + Duration::from_millis(SIMPLE_NATIVE_TERMINATION_WAIT_MS);
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| SandboxWasiError::Runtime {
+                detail: format!("simple-native {reason} failed while reaping process: {source}"),
+            })?
+        {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            return Err(SandboxWasiError::Runtime {
+                detail: format!(
+                    "simple-native {reason} could not confirm process-group termination within {SIMPLE_NATIVE_TERMINATION_WAIT_MS}ms"
+                ),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(windows))]
+fn spawn_bounded_native_reader<R>(
+    mut reader: R,
+    budget: Arc<BoundedOutputBudget>,
+    stream: &'static str,
+    mut emitter: LiveOutputEmitter,
+) -> std::thread::JoinHandle<Result<Vec<u8>, String>>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .map_err(|source| format!("failed to read simple-native {stream}: {source}"))?;
+            if read == 0 {
+                break;
+            }
+            let keep = budget.reserve(read);
+            output.extend_from_slice(&buffer[..keep]);
+            emitter.emit(&buffer[..keep]);
+        }
+        Ok(output)
+    })
+}
+
+#[cfg(not(windows))]
+fn join_bounded_native_reader(
+    reader: std::thread::JoinHandle<Result<Vec<u8>, String>>,
+    stream: &str,
+) -> Result<Vec<u8>, SandboxWasiError> {
+    reader
+        .join()
+        .map_err(|_| SandboxWasiError::Runtime {
+            detail: format!("simple-native {stream} reader panicked"),
+        })?
+        .map_err(|detail| SandboxWasiError::Runtime { detail })
 }
 
 fn native_wait_poll_duration(
@@ -625,7 +1351,19 @@ fn resolve_native_cwd(
     fs: &LocalSandboxFileSystem,
     layout: &LocalSandboxInstanceLayout,
     cwd: &SandboxPath,
+    mount_projection: Option<&NativeMountProjection>,
 ) -> Result<PathBuf, SandboxCommandExecutionError> {
+    let guest_cwd = PathBuf::from(cwd.as_str());
+    if let Some(source_cwd) = mount_projection
+        .and_then(|projection| projection.projected_source_for_guest_path(&guest_cwd))
+    {
+        if source_cwd.is_dir() {
+            return Ok(guest_cwd);
+        }
+        return Err(SandboxCommandExecutionError::Fs(SandboxFsError::NotFound {
+            path: cwd.clone(),
+        }));
+    }
     match fs.host_path(cwd) {
         Ok(path) if path.exists() => Ok(path),
         Ok(_) => resolve_host_or_root_cwd(layout, cwd),
@@ -778,31 +1516,6 @@ fn ensure_layout_dirs(layout: &LocalSandboxInstanceLayout) -> Result<(), Sandbox
     Ok(())
 }
 
-fn existing_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
-    paths
-        .into_iter()
-        .filter(|path| path.exists())
-        .collect::<Vec<_>>()
-}
-
-fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut seen = BTreeSet::new();
-    let mut result = Vec::new();
-    for path in paths {
-        let key = fs::canonicalize(&path).unwrap_or(path.clone());
-        if seen.insert(key.clone()) {
-            result.push(key);
-        }
-    }
-    result
-}
-
-fn path_has_prefix(path: &Path, prefix: &Path) -> bool {
-    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let prefix = fs::canonicalize(prefix).unwrap_or_else(|_| prefix.to_path_buf());
-    path == prefix || path.starts_with(prefix)
-}
-
 fn env_path_list(name: &str) -> Vec<PathBuf> {
     env::var_os(name)
         .map(|value| env::split_paths(&value).collect())
@@ -833,18 +1546,17 @@ fn invalid_request(detail: impl Into<String>) -> SandboxCommandExecutionError {
 }
 
 #[cfg(all(not(windows), unix))]
-fn exit_status_code(output: &Output) -> i32 {
+fn exit_status_code(status: ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
-    output
-        .status
+    status
         .code()
-        .or_else(|| output.status.signal().map(|signal| 128 + signal))
+        .or_else(|| status.signal().map(|signal| 128 + signal))
         .unwrap_or(128)
 }
 
 #[cfg(all(not(windows), not(unix)))]
-fn exit_status_code(output: &Output) -> i32 {
-    output.status.code().unwrap_or(128)
+fn exit_status_code(status: ExitStatus) -> i32 {
+    status.code().unwrap_or(128)
 }
 
 #[cfg(windows)]
@@ -855,6 +1567,7 @@ mod windows {
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
     use std::ptr;
+    use std::sync::Arc;
     use std::thread;
     use std::time::Instant;
 
@@ -893,9 +1606,10 @@ mod windows {
     };
 
     use super::{
-        LocalSandboxInstanceLayout, NativeCommandOutput, SandboxCommandRequest,
-        SandboxResourceLimits, SandboxSimpleNativeConfig, SandboxWasiError, native_environment,
-        native_wait_poll_duration,
+        BoundedOutputBudget, LiveOutputEmitter, LocalSandboxInstanceLayout, NativeCommandOutput,
+        SandboxCancellationToken, SandboxCommandId, SandboxCommandRequest, SandboxOutputSink,
+        SandboxOutputStream, SandboxResourceLimits, SandboxSimpleNativeConfig, SandboxWasiError,
+        effective_simple_native_output_limit, native_environment, native_wait_poll_duration,
     };
 
     const READ_BUFFER_SIZE: usize = 64 * 1024;
@@ -908,42 +1622,22 @@ mod windows {
         timeout_ms: u64,
         config: &SandboxSimpleNativeConfig,
         limits: &SandboxResourceLimits,
+        cancellation_token: &SandboxCancellationToken,
+        command_id: &SandboxCommandId,
+        output_sink: Option<Arc<dyn SandboxOutputSink>>,
     ) -> Result<NativeCommandOutput, SandboxWasiError> {
-        let low_integrity = match prepare_low_integrity_layout(layout, config) {
-            Ok(()) => true,
-            Err(error) if config.allow_unenforced => {
-                let _ = error;
-                false
-            }
-            Err(error) => return Err(error),
-        };
-        let token = match create_restricted_token(low_integrity) {
-            Ok(token) => Some(token),
-            Err(error) if config.allow_unenforced => {
-                let _ = error;
-                None
-            }
-            Err(error) => return Err(error),
-        };
-        match execute_with_windows_process(
+        let _ = config;
+        execute_with_windows_process(
             request,
             layout,
             cwd,
             timeout_ms,
             limits,
-            token.as_ref(),
-        ) {
-            Ok(output) => Ok(output),
-            Err(error) if token.is_some() && config.allow_unenforced => {
-                execute_with_windows_process(request, layout, cwd, timeout_ms, limits, None)
-                    .map_err(|fallback_error| SandboxWasiError::Runtime {
-                        detail: format!(
-                            "simple-native restricted Windows process failed ({error}); unrestricted fallback failed ({fallback_error})"
-                        ),
-                    })
-            }
-            Err(error) => Err(error),
-        }
+            None,
+            cancellation_token,
+            command_id,
+            output_sink,
+        )
     }
 
     fn execute_with_windows_process(
@@ -953,6 +1647,9 @@ mod windows {
         timeout_ms: u64,
         limits: &SandboxResourceLimits,
         token: Option<&OwnedHandle>,
+        cancellation_token: &SandboxCancellationToken,
+        command_id: &SandboxCommandId,
+        output_sink: Option<Arc<dyn SandboxOutputSink>>,
     ) -> Result<NativeCommandOutput, SandboxWasiError> {
         let argv0 = request
             .argv
@@ -1028,37 +1725,69 @@ mod windows {
         drop(stdin_read);
         drop(stdout_write);
         drop(stderr_write);
-        let stdout_reader = spawn_pipe_reader(stdout_read, "stdout");
-        let stderr_reader = spawn_pipe_reader(stderr_read, "stderr");
+        let output_limit = effective_simple_native_output_limit(limits.max_output_bytes);
+        let output_budget = Arc::new(BoundedOutputBudget::new(output_limit));
+        let stdout_reader = spawn_pipe_reader(
+            stdout_read,
+            "stdout",
+            Arc::clone(&output_budget),
+            LiveOutputEmitter::new(
+                output_sink.clone(),
+                request.sandbox_id.clone(),
+                command_id.clone(),
+                SandboxOutputStream::Stdout,
+            ),
+        );
+        let stderr_reader = spawn_pipe_reader(
+            stderr_read,
+            "stderr",
+            Arc::clone(&output_budget),
+            LiveOutputEmitter::new(
+                output_sink,
+                request.sandbox_id.clone(),
+                command_id.clone(),
+                SandboxOutputStream::Stderr,
+            ),
+        );
 
-        let stdin_result = if let Some(stdin) = &request.stdin {
-            write_pipe_all(&stdin_write, stdin)
+        let stdin_writer = if let Some(stdin) = request.stdin.clone() {
+            Some(thread::spawn(move || write_pipe_all(&stdin_write, &stdin)))
         } else {
-            Ok(())
+            drop(stdin_write);
+            None
         };
-        drop(stdin_write);
-        if let Err(error) = stdin_result {
-            terminate_job_and_wait(&job, &process);
-            let _ = join_pipe_reader(stdout_reader, "stdout");
-            let _ = join_pipe_reader(stderr_reader, "stderr");
-            return Err(error);
-        }
-
-        if let Err(error) = wait_for_process(&job, &process, timeout_ms) {
-            let _ = join_pipe_reader(stdout_reader, "stdout");
-            let _ = join_pipe_reader(stderr_reader, "stderr");
-            return Err(error);
-        }
+        let mut terminal_error = wait_for_process(
+            &job,
+            &process,
+            timeout_ms,
+            cancellation_token,
+            &output_budget,
+            output_limit,
+        )?;
         let exit_status = process_exit_code(&process);
         let stdout = join_pipe_reader(stdout_reader, "stdout");
         let stderr = join_pipe_reader(stderr_reader, "stderr");
         let exit_status = exit_status?;
         let stdout = stdout?;
         let stderr = stderr?;
+        if terminal_error.is_none() && output_budget.exceeded() {
+            terminal_error = Some(SandboxWasiError::OutputLimitExceeded {
+                limit: output_limit.min(usize::MAX as u64) as usize,
+            });
+        }
+        if let Some(stdin_writer) = stdin_writer {
+            let stdin_result = stdin_writer.join().map_err(|_| SandboxWasiError::Runtime {
+                detail: "simple-native stdin writer panicked".to_string(),
+            })?;
+            if terminal_error.is_none() {
+                stdin_result?;
+            }
+        }
         Ok(NativeCommandOutput {
             exit_status,
             stdout,
             stderr,
+            terminal_error,
         })
     }
 
@@ -1288,20 +2017,37 @@ mod windows {
         job: &OwnedHandle,
         process: &OwnedHandle,
         timeout_ms: u64,
-    ) -> Result<(), SandboxWasiError> {
+        cancellation_token: &SandboxCancellationToken,
+        output_budget: &BoundedOutputBudget,
+        output_limit: u64,
+    ) -> Result<Option<SandboxWasiError>, SandboxWasiError> {
         let started = Instant::now();
         loop {
+            if cancellation_token.is_cancelled() {
+                terminate_job_and_wait(job, process);
+                return Ok(Some(SandboxWasiError::Cancelled));
+            }
+            if output_budget.exceeded() {
+                terminate_job_and_wait(job, process);
+                return Ok(Some(SandboxWasiError::OutputLimitExceeded {
+                    limit: output_limit.min(usize::MAX as u64) as usize,
+                }));
+            }
             let wait = match native_wait_poll_duration(started, timeout_ms) {
                 Ok(wait) => wait,
                 Err(SandboxWasiError::TimedOut { timeout_ms }) => {
                     terminate_job_and_wait(job, process);
-                    return Err(SandboxWasiError::TimedOut { timeout_ms });
+                    return Ok(Some(SandboxWasiError::TimedOut { timeout_ms }));
                 }
                 Err(error) => return Err(error),
             };
             let wait_ms = wait.as_millis().min(u128::from(u32::MAX)) as u32;
             match unsafe { WaitForSingleObject(process.raw(), wait_ms) } {
-                WAIT_OBJECT_0 => return Ok(()),
+                WAIT_OBJECT_0 => {
+                    // Close the whole job before joining inherited pipe handles.
+                    terminate_job_and_wait(job, process);
+                    return Ok(None);
+                }
                 WAIT_TIMEOUT => continue,
                 WAIT_FAILED => return Err(last_error("failed to wait for simple-native process")),
                 other => {
@@ -1336,9 +2082,11 @@ mod windows {
     fn spawn_pipe_reader(
         handle: OwnedHandle,
         stream: &'static str,
+        budget: Arc<BoundedOutputBudget>,
+        mut emitter: LiveOutputEmitter,
     ) -> thread::JoinHandle<Result<Vec<u8>, String>> {
         thread::spawn(move || {
-            read_pipe_to_end(handle)
+            read_pipe_to_end(handle, &budget, &mut emitter)
                 .map_err(|error| format!("failed to read simple-native {stream}: {error}"))
         })
     }
@@ -1355,7 +2103,11 @@ mod windows {
             .map_err(|detail| SandboxWasiError::Runtime { detail })
     }
 
-    fn read_pipe_to_end(handle: OwnedHandle) -> Result<Vec<u8>, String> {
+    fn read_pipe_to_end(
+        handle: OwnedHandle,
+        budget: &BoundedOutputBudget,
+        emitter: &mut LiveOutputEmitter,
+    ) -> Result<Vec<u8>, String> {
         let mut output = Vec::new();
         let mut buffer = [0u8; READ_BUFFER_SIZE];
         loop {
@@ -1379,7 +2131,10 @@ mod windows {
             if bytes_read == 0 {
                 break;
             }
-            output.extend_from_slice(&buffer[..bytes_read as usize]);
+            let read = bytes_read as usize;
+            let keep = budget.reserve(read);
+            output.extend_from_slice(&buffer[..keep]);
+            emitter.emit(&buffer[..keep]);
         }
         Ok(output)
     }
@@ -1548,97 +2303,29 @@ mod windows {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::fs;
     use std::io;
-    use std::mem;
-    use std::os::fd::AsRawFd;
-    use std::path::Path;
 
-    use libc::{c_int, c_void};
-    use sinomo_sandbox::{SANDBOX_UNLIMITED_SIZE_LIMIT, SandboxWasiError};
-
-    use super::SandboxSimpleNativePolicy;
-
-    const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
-    const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
-
-    const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
-    const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
-    const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
-    const LANDLOCK_ACCESS_FS_READ_DIR: u64 = 1 << 3;
-    const LANDLOCK_ACCESS_FS_REMOVE_DIR: u64 = 1 << 4;
-    const LANDLOCK_ACCESS_FS_REMOVE_FILE: u64 = 1 << 5;
-    const LANDLOCK_ACCESS_FS_MAKE_CHAR: u64 = 1 << 6;
-    const LANDLOCK_ACCESS_FS_MAKE_DIR: u64 = 1 << 7;
-    const LANDLOCK_ACCESS_FS_MAKE_REG: u64 = 1 << 8;
-    const LANDLOCK_ACCESS_FS_MAKE_SOCK: u64 = 1 << 9;
-    const LANDLOCK_ACCESS_FS_MAKE_FIFO: u64 = 1 << 10;
-    const LANDLOCK_ACCESS_FS_MAKE_BLOCK: u64 = 1 << 11;
-    const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
-    const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
-    const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
-    const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
-
-    #[repr(C)]
-    struct LandlockRulesetAttr {
-        handled_access_fs: u64,
-    }
-
-    #[repr(C)]
-    struct LandlockPathBeneathAttr {
-        allowed_access: u64,
-        parent_fd: i32,
-    }
-
-    pub(super) fn ensure_landlock_or_allowed(
-        allow_unenforced: bool,
-    ) -> Result<(), SandboxWasiError> {
-        if landlock_abi_version().is_ok() || allow_unenforced {
-            Ok(())
-        } else {
-            Err(SandboxWasiError::Runtime {
-                detail: format!(
-                    "simple-native requires Linux Landlock; set {}=1 for explicit unenforced development runs",
-                    super::SINOMO_SANDBOX_SIMPLE_ALLOW_UNENFORCED_ENV
-                ),
-            })
-        }
-    }
+    use sinomo_sandbox::SANDBOX_UNLIMITED_SIZE_LIMIT;
 
     pub(super) fn prepare_child_process(
-        policy: &SandboxSimpleNativePolicy,
-        allow_unenforced: bool,
         memory_mb: u64,
+        expected_parent_pid: libc::pid_t,
     ) -> io::Result<()> {
-        // New process group lets the parent cancel a whole simple-native run tree.
-        unsafe {
-            libc::setpgid(0, 0);
+        // Keep host-death fencing, process-tree ownership, and the memory
+        // ceiling without installing a filesystem namespace or allowlist.
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+            return Err(io::Error::last_os_error());
         }
-        apply_memory_limit(memory_mb)?;
-        match apply_landlock(policy) {
-            Ok(()) => Ok(()),
-            Err(error) if allow_unenforced => {
-                let _ = error;
-                Ok(())
-            }
-            Err(error) => Err(io::Error::other(error.to_string())),
+        if unsafe { libc::getppid() } != expected_parent_pid {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "simple-native parent exited during child launch",
+            ));
         }
-    }
-
-    pub(super) fn landlock_abi_version() -> io::Result<i32> {
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_landlock_create_ruleset,
-                std::ptr::null::<c_void>(),
-                0usize,
-                LANDLOCK_CREATE_RULESET_VERSION,
-            )
-        };
-        if result < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(result as i32)
+        if unsafe { libc::setpgid(0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
         }
+        apply_memory_limit(memory_mb)
     }
 
     pub(super) fn kill_process_group(child_pid: i32) {
@@ -1657,194 +2344,63 @@ mod linux {
             rlim_cur: bytes as libc::rlim_t,
             rlim_max: bytes as libc::rlim_t,
         };
-        let result = unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) };
-        if result == 0 {
+        if unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) } == 0 {
             Ok(())
         } else {
             Err(io::Error::last_os_error())
         }
-    }
-
-    fn apply_landlock(policy: &SandboxSimpleNativePolicy) -> io::Result<()> {
-        let abi = landlock_abi_version()?;
-        let handled = handled_access_for_abi(abi);
-        let ruleset_attr = LandlockRulesetAttr {
-            handled_access_fs: handled,
-        };
-        let ruleset_fd = unsafe {
-            libc::syscall(
-                libc::SYS_landlock_create_ruleset,
-                &ruleset_attr as *const LandlockRulesetAttr,
-                mem::size_of::<LandlockRulesetAttr>(),
-                0u32,
-            )
-        };
-        if ruleset_fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let ruleset_fd = ruleset_fd as c_int;
-        let result = (|| {
-            for path in &policy.read_paths {
-                add_path_rule(ruleset_fd, path, read_access(), handled)?;
-            }
-            for path in &policy.execute_paths {
-                add_path_rule(ruleset_fd, path, read_execute_access(), handled)?;
-            }
-            for path in &policy.write_paths {
-                add_path_rule(
-                    ruleset_fd,
-                    path,
-                    read_write_execute_access(handled),
-                    handled,
-                )?;
-            }
-            let nnp = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
-            if nnp != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let restricted =
-                unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset_fd, 0u32) };
-            if restricted != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        })();
-        unsafe {
-            libc::close(ruleset_fd);
-        }
-        result
-    }
-
-    fn add_path_rule(
-        ruleset_fd: c_int,
-        path: &Path,
-        allowed_access: u64,
-        handled: u64,
-    ) -> io::Result<()> {
-        let allowed_access = allowed_access_for_path(path, allowed_access, handled)?;
-        if allowed_access == 0 {
-            return Ok(());
-        }
-        let file = fs::File::open(path)?;
-        let attr = LandlockPathBeneathAttr {
-            allowed_access,
-            parent_fd: file.as_raw_fd(),
-        };
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_landlock_add_rule,
-                ruleset_fd,
-                LANDLOCK_RULE_PATH_BENEATH,
-                &attr as *const LandlockPathBeneathAttr,
-                0u32,
-            )
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-
-    fn allowed_access_for_path(path: &Path, allowed_access: u64, handled: u64) -> io::Result<u64> {
-        let metadata = fs::metadata(path)?;
-        let compatible = if metadata.is_dir() {
-            handled & !LANDLOCK_ACCESS_FS_REFER
-        } else {
-            LANDLOCK_ACCESS_FS_EXECUTE
-                | LANDLOCK_ACCESS_FS_WRITE_FILE
-                | LANDLOCK_ACCESS_FS_READ_FILE
-                | (handled & LANDLOCK_ACCESS_FS_TRUNCATE)
-                | (handled & LANDLOCK_ACCESS_FS_IOCTL_DEV)
-        };
-        Ok(allowed_access & handled & compatible)
-    }
-
-    fn handled_access_for_abi(abi: i32) -> u64 {
-        let mut handled = LANDLOCK_ACCESS_FS_EXECUTE
-            | LANDLOCK_ACCESS_FS_WRITE_FILE
-            | LANDLOCK_ACCESS_FS_READ_FILE
-            | LANDLOCK_ACCESS_FS_READ_DIR
-            | LANDLOCK_ACCESS_FS_REMOVE_DIR
-            | LANDLOCK_ACCESS_FS_REMOVE_FILE
-            | LANDLOCK_ACCESS_FS_MAKE_CHAR
-            | LANDLOCK_ACCESS_FS_MAKE_DIR
-            | LANDLOCK_ACCESS_FS_MAKE_REG
-            | LANDLOCK_ACCESS_FS_MAKE_SOCK
-            | LANDLOCK_ACCESS_FS_MAKE_FIFO
-            | LANDLOCK_ACCESS_FS_MAKE_BLOCK
-            | LANDLOCK_ACCESS_FS_MAKE_SYM;
-        if abi >= 2 {
-            handled |= LANDLOCK_ACCESS_FS_REFER;
-        }
-        if abi >= 3 {
-            handled |= LANDLOCK_ACCESS_FS_TRUNCATE;
-        }
-        if abi >= 5 {
-            handled |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
-        }
-        handled
-    }
-
-    fn read_access() -> u64 {
-        LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR
-    }
-
-    fn read_execute_access() -> u64 {
-        read_access() | LANDLOCK_ACCESS_FS_EXECUTE
-    }
-
-    fn read_write_execute_access(handled: u64) -> u64 {
-        handled & !LANDLOCK_ACCESS_FS_REFER
     }
 }
 
-#[cfg(all(not(target_os = "linux"), not(windows)))]
+#[cfg(all(unix, not(target_os = "linux")))]
 mod linux {
     use std::io;
 
-    use sinomo_sandbox::SandboxWasiError;
-
-    use super::SandboxSimpleNativePolicy;
-
-    pub(super) fn ensure_landlock_or_allowed(
-        allow_unenforced: bool,
-    ) -> Result<(), SandboxWasiError> {
-        if allow_unenforced {
-            Ok(())
-        } else {
-            Err(SandboxWasiError::Runtime {
-                detail:
-                    "simple-native filesystem enforcement is currently implemented only on Linux"
-                        .to_string(),
-            })
-        }
-    }
+    use sinomo_sandbox::SANDBOX_UNLIMITED_SIZE_LIMIT;
 
     pub(super) fn prepare_child_process(
-        _policy: &SandboxSimpleNativePolicy,
-        _allow_unenforced: bool,
-        _memory_mb: u64,
+        memory_mb: u64,
+        _expected_parent_pid: i32,
     ) -> io::Result<()> {
-        Ok(())
-    }
-
-    pub(super) fn landlock_abi_version() -> io::Result<i32> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Landlock is Linux-only",
-        ))
+        if unsafe { libc::setpgid(0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        apply_memory_limit(memory_mb)
     }
 
     pub(super) fn kill_process_group(child_pid: i32) {
-        let _ = child_pid;
+        unsafe {
+            let _ = libc::kill(-child_pid, libc::SIGKILL);
+            let _ = libc::kill(child_pid, libc::SIGKILL);
+        }
     }
+
+    fn apply_memory_limit(memory_mb: u64) -> io::Result<()> {
+        if memory_mb == SANDBOX_UNLIMITED_SIZE_LIMIT {
+            return Ok(());
+        }
+        let bytes = memory_mb.saturating_mul(1024 * 1024);
+        let limit = libc::rlimit {
+            rlim_cur: bytes as libc::rlim_t,
+            rlim_max: bytes as libc::rlim_t,
+        };
+        if unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+mod linux {
+    pub(super) fn kill_process_group(_child_pid: i32) {}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_sandbox::{SandboxId, SandboxToolchainId};
+    use sinomo_sandbox::{SandboxFileSystem, SandboxId, SandboxToolchainId};
 
     fn create_store() -> (
         sinomo_testdir::TestDir,
@@ -1868,6 +2424,7 @@ mod tests {
             extra_read_paths: Vec::new(),
             extra_write_paths: Vec::new(),
             extra_execute_paths: Vec::new(),
+            host_sifs_root: None,
         })
     }
 
@@ -1895,12 +2452,348 @@ mod tests {
             .expect("simple-native command")
     }
 
+    fn successful_native_output() -> NativeCommandOutput {
+        NativeCommandOutput {
+            exit_status: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            terminal_error: None,
+        }
+    }
+
+    #[test]
+    fn native_completion_fences_late_cancellation_until_audit_finishes() {
+        let cancellation = SandboxCancellationToken::new();
+        let observer = cancellation.clone();
+        let (result, completion) =
+            transition_after_native_return(&cancellation, Ok(successful_native_output()));
+
+        assert!(result.is_ok());
+        assert!(
+            !observer.cancel(),
+            "finalization must win a late cancellation"
+        );
+        assert!(observer.is_completing_or_completed());
+        drop(completion);
+        assert!(observer.is_completing_or_completed());
+    }
+
+    #[test]
+    fn native_cancellation_wins_before_completion_claim() {
+        let cancellation = SandboxCancellationToken::new();
+        assert!(cancellation.cancel());
+        let (result, completion) =
+            transition_after_native_return(&cancellation, Ok(successful_native_output()));
+
+        assert!(matches!(result, Err(SandboxWasiError::Cancelled)));
+        drop(completion);
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn simple_native_streams_first_chunk_before_delayed_exit_without_replay() {
+        let (_dir, store, sandbox_id) = create_store();
+        let (tx, rx) = std::sync::mpsc::channel::<SandboxOutputChunk>();
+        let sink: Arc<dyn SandboxOutputSink> = Arc::new(move |chunk| {
+            let _ = tx.send(chunk);
+        });
+        let join = std::thread::spawn(move || {
+            let node_id = NodeId::from_legacy_named("sandbox_simple_live_output").expect("node");
+            let toolchain_store =
+                sinomo_sandbox::LocalSandboxToolchainStore::new(std::env::temp_dir());
+            runner().run_toolchain_command_with_stdin_policy_and_output_sink(
+                &store,
+                &toolchain_store,
+                &sandbox_id,
+                "sh",
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf first; sleep 1; printf second; printf error >&2".to_string(),
+                ],
+                None,
+                5_000,
+                &node_id,
+                &SandboxPolicy::default(),
+                Some(sink),
+            )
+        });
+
+        let first = rx
+            .recv_timeout(Duration::from_millis(750))
+            .expect("first live output chunk before delayed exit");
+        assert_eq!(first.stream, SandboxOutputStream::Stdout);
+        assert_eq!(first.offset, 0);
+        assert_eq!(first.bytes, b"first");
+        assert!(
+            !join.is_finished(),
+            "the first sink callback must arrive while the command is still running"
+        );
+
+        let outcome = join
+            .join()
+            .expect("live output command thread")
+            .expect("live output command");
+        let mut streamed = vec![first];
+        streamed.extend(rx.try_iter());
+        let streamed_stdout = streamed
+            .iter()
+            .filter(|chunk| chunk.stream == SandboxOutputStream::Stdout)
+            .flat_map(|chunk| chunk.bytes.iter().copied())
+            .collect::<Vec<_>>();
+        let streamed_stderr = streamed
+            .iter()
+            .filter(|chunk| chunk.stream == SandboxOutputStream::Stderr)
+            .flat_map(|chunk| chunk.bytes.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(streamed_stdout, outcome.stdout);
+        assert_eq!(streamed_stderr, outcome.stderr);
+        assert_eq!(outcome.stdout, b"firstsecond");
+        assert_eq!(outcome.stderr, b"error");
+        let stdout_offsets = streamed
+            .iter()
+            .filter(|chunk| chunk.stream == SandboxOutputStream::Stdout)
+            .scan(0_u64, |expected, chunk| {
+                let contiguous = chunk.offset == *expected;
+                *expected = expected.saturating_add(chunk.bytes.len() as u64);
+                Some(contiguous)
+            })
+            .collect::<Vec<_>>();
+        assert!(stdout_offsets.into_iter().all(|contiguous| contiguous));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn simple_native_cancellation_kills_the_active_process_group() {
+        let (_dir, store, sandbox_id) = create_store();
+        let (_manifest, layout) = store.load(&sandbox_id).expect("load");
+        let started_path = layout.work.join("cancel-started");
+        let preserved_path = layout.work.join("cancel-preserved");
+        let progress_path = layout.work.join("cancel-progress");
+        let cancellation = SandboxCancellationToken::new();
+        let thread_cancellation = cancellation.clone();
+        let streamed = Arc::new(std::sync::Mutex::new(Vec::<SandboxOutputChunk>::new()));
+        let streamed_sink = Arc::clone(&streamed);
+        let sink: Arc<dyn SandboxOutputSink> = Arc::new(move |chunk| {
+            streamed_sink
+                .lock()
+                .expect("streamed cancellation output lock")
+                .push(chunk);
+        });
+        let runner = runner();
+        let join = std::thread::spawn(move || {
+            let node_id = NodeId::from_legacy_named("sandbox_simple_cancel").expect("node");
+            let toolchain_store =
+                sinomo_sandbox::LocalSandboxToolchainStore::new(std::env::temp_dir());
+            runner.run_toolchain_command_with_stdin_policy_output_sink_and_cancellation(
+                &store,
+                &toolchain_store,
+                &sandbox_id,
+                "sh",
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf live-output; printf preserved > \"$SINOMO_WORK/cancel-preserved\"; touch \"$SINOMO_WORK/cancel-started\"; while :; do printf x >> \"$SINOMO_WORK/cancel-progress\"; sleep 0.02; done"
+                        .to_string(),
+                ],
+                None,
+                SANDBOX_UNLIMITED_WALL_TIME_MS,
+                &node_id,
+                &SandboxPolicy::default(),
+                Some(sink),
+                thread_cancellation,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !started_path.exists() {
+            assert!(Instant::now() < deadline, "native command did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        while fs::metadata(&progress_path).map_or(0, |metadata| metadata.len()) == 0 {
+            assert!(Instant::now() < deadline, "native writer made no progress");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let cancelled_at = Instant::now();
+        assert!(cancellation.cancel());
+        let error = join
+            .join()
+            .expect("simple-native thread")
+            .expect_err("active command must be cancelled");
+        assert!(matches!(
+            error,
+            SandboxCommandExecutionError::Wasi(SandboxWasiError::Cancelled)
+        ));
+        assert!(cancelled_at.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            fs::read_to_string(&preserved_path).expect("completed pre-cancel write"),
+            "preserved"
+        );
+        let progress_after_cancel = fs::metadata(&progress_path).expect("progress file").len();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            fs::metadata(&progress_path)
+                .expect("progress file after cancellation")
+                .len(),
+            progress_after_cancel,
+            "the terminated process group must not write after cancellation returns"
+        );
+        let streamed_stdout = streamed
+            .lock()
+            .expect("streamed cancellation output")
+            .iter()
+            .filter(|chunk| chunk.stream == SandboxOutputStream::Stdout)
+            .flat_map(|chunk| chunk.bytes.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(streamed_stdout, b"live-output");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn simple_native_output_limit_stops_unbounded_stream_and_keeps_bounded_audit() {
+        let (_dir, store, sandbox_id) = create_store();
+        let (mut manifest, layout) = store.load(&sandbox_id).expect("load");
+        manifest.limits.max_output_bytes = 4 * 1024;
+        store.save_manifest(&manifest).expect("save output limit");
+        let node_id = NodeId::from_legacy_named("sandbox_simple_output_limit").expect("node");
+        let toolchain_store = sinomo_sandbox::LocalSandboxToolchainStore::new(std::env::temp_dir());
+        let streamed = Arc::new(std::sync::Mutex::new(Vec::<SandboxOutputChunk>::new()));
+        let streamed_sink = Arc::clone(&streamed);
+        let sink: Arc<dyn SandboxOutputSink> = Arc::new(move |chunk| {
+            streamed_sink
+                .lock()
+                .expect("streamed output-limit lock")
+                .push(chunk);
+        });
+        let started = Instant::now();
+        let error = runner()
+            .run_toolchain_command_with_stdin_policy_and_output_sink(
+                &store,
+                &toolchain_store,
+                &sandbox_id,
+                "sh",
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "while :; do printf 0123456789abcdef; done".to_string(),
+                ],
+                None,
+                SANDBOX_UNLIMITED_WALL_TIME_MS,
+                &node_id,
+                &SandboxPolicy::default(),
+                Some(sink),
+            )
+            .expect_err("unbounded output must be stopped at the configured limit");
+        assert!(matches!(
+            error,
+            SandboxCommandExecutionError::Wasi(SandboxWasiError::OutputLimitExceeded {
+                limit: 4096
+            })
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        sinomo_sandbox::recover_sandbox_local_execution_journal(
+            &store,
+            &sandbox_id,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("recover output-limit audit");
+        let manifest = store.load(&sandbox_id).expect("reload audit manifest").0;
+        let command_id = manifest.command_history.last().expect("command audit id");
+        let mut fs = LocalSandboxFileSystem::new(layout);
+        let stdout = fs
+            .read_unchecked_mut(
+                &sinomo_sandbox::sandbox_command_stdout_log_path(command_id)
+                    .expect("stdout log path"),
+                None,
+            )
+            .expect("bounded stdout audit");
+        assert_eq!(stdout.len(), 4096);
+        let streamed_stdout = streamed
+            .lock()
+            .expect("streamed output-limit output")
+            .iter()
+            .filter(|chunk| chunk.stream == SandboxOutputStream::Stdout)
+            .flat_map(|chunk| chunk.bytes.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(streamed_stdout, stdout);
+        let record = sinomo_sandbox::load_command_record(&mut fs, command_id)
+            .expect("output-limit command record");
+        assert_eq!(record.status, SandboxCommandRecordStatus::ResourceExhausted);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn simple_native_cancellation_interrupts_a_blocked_stdin_writer() {
+        let (_dir, store, sandbox_id) = create_store();
+        let (_manifest, layout) = store.load(&sandbox_id).expect("load");
+        let started_path = layout.work.join("stdin-blocked-started");
+        let cancellation = SandboxCancellationToken::new();
+        let thread_cancellation = cancellation.clone();
+        let join = std::thread::spawn(move || {
+            let node_id = NodeId::from_legacy_named("sandbox_simple_stdin_cancel").expect("node");
+            let toolchain_store =
+                sinomo_sandbox::LocalSandboxToolchainStore::new(std::env::temp_dir());
+            runner().run_toolchain_command_with_stdin_policy_output_sink_and_cancellation(
+                &store,
+                &toolchain_store,
+                &sandbox_id,
+                "sh",
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "touch \"$SINOMO_WORK/stdin-blocked-started\"; sleep 30".to_string(),
+                ],
+                Some(vec![0x5a; 16 * 1024 * 1024]),
+                SANDBOX_UNLIMITED_WALL_TIME_MS,
+                &node_id,
+                &SandboxPolicy::default(),
+                None,
+                thread_cancellation,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !started_path.exists() {
+            assert!(Instant::now() < deadline, "native command did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let cancelled_at = Instant::now();
+        assert!(cancellation.cancel());
+        let error = join
+            .join()
+            .expect("simple-native thread")
+            .expect_err("blocked stdin command must be cancelled");
+        assert!(matches!(
+            error,
+            SandboxCommandExecutionError::Wasi(SandboxWasiError::Cancelled)
+        ));
+        assert!(cancelled_at.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn simple_native_leader_exit_terminates_background_pipe_holders() {
+        let (dir, store, sandbox_id) = create_store();
+        let delayed_write = dir.path().join("background-must-die");
+        let started = Instant::now();
+        let outcome = run_shell(
+            &store,
+            &sandbox_id,
+            &format!("(sleep 0.3; touch {}) &", delayed_write.display()),
+            0,
+        );
+        assert_eq!(outcome.response.exit_status, 0);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !delayed_write.exists(),
+            "a background descendant must not survive command completion"
+        );
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn simple_native_can_read_system_files() {
-        if !SandboxSimpleNativeCommandRunner::landlock_supported() {
-            return;
-        }
         let (_dir, store, sandbox_id) = create_store();
         let outcome = run_shell(&store, &sandbox_id, "cat /etc/passwd >/dev/null", 0);
         assert_eq!(outcome.response.exit_status, 0);
@@ -1908,10 +2801,7 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn simple_native_blocks_unapproved_host_reads() {
-        if !SandboxSimpleNativeCommandRunner::landlock_supported() {
-            return;
-        }
+    fn simple_native_allows_arbitrary_host_reads() {
         let (dir, store, sandbox_id) = create_store();
         let secret = dir.path().join("secret.txt");
         fs::write(&secret, b"secret").expect("secret");
@@ -1921,15 +2811,12 @@ mod tests {
             &format!("cat {} >/dev/null", secret.display()),
             0,
         );
-        assert_ne!(outcome.response.exit_status, 0);
+        assert_eq!(outcome.response.exit_status, 0);
     }
 
     #[test]
     #[cfg(target_os = "linux")]
     fn simple_native_allows_sandbox_work_writes() {
-        if !SandboxSimpleNativeCommandRunner::landlock_supported() {
-            return;
-        }
         let (_dir, store, sandbox_id) = create_store();
         let (_manifest, layout) = store.load(&sandbox_id).expect("load");
         let outcome = run_shell(
@@ -1947,10 +2834,7 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn simple_native_can_execute_from_extra_host_workspace_cwd() {
-        if !SandboxSimpleNativeCommandRunner::landlock_supported() {
-            return;
-        }
+    fn simple_native_can_execute_from_arbitrary_host_workspace_cwd() {
         let (dir, store, sandbox_id) = create_store();
         let workspace = dir.path().join("workspace");
         fs::create_dir_all(&workspace).expect("workspace");
@@ -1960,45 +2844,203 @@ mod tests {
         store.save_manifest(&manifest).expect("save manifest");
         let node_id = NodeId::from_legacy_named("sandbox_simple_test").expect("node");
         let toolchain_store = sinomo_sandbox::LocalSandboxToolchainStore::new(std::env::temp_dir());
-        let outcome = SandboxSimpleNativeCommandRunner::new(SandboxSimpleNativeConfig {
-            allow_unenforced: false,
-            extra_read_paths: vec![workspace.clone()],
-            extra_write_paths: vec![workspace],
-            extra_execute_paths: Vec::new(),
-        })
-        .run_toolchain_command_with_stdin_policy_and_output_sink(
-            &store,
-            &toolchain_store,
-            &sandbox_id,
-            "true",
-            vec!["true".to_string()],
-            None,
-            0,
-            &node_id,
-            &SandboxPolicy::default(),
-            None,
-        )
-        .expect("simple-native host workspace cwd command");
+        let outcome = runner()
+            .run_toolchain_command_with_stdin_policy_and_output_sink(
+                &store,
+                &toolchain_store,
+                &sandbox_id,
+                "true",
+                vec!["true".to_string()],
+                None,
+                0,
+                &node_id,
+                &SandboxPolicy::default(),
+                None,
+            )
+            .expect("simple-native host workspace cwd command");
 
         assert_eq!(outcome.response.exit_status, 0);
     }
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn simple_native_blocks_unapproved_host_writes() {
-        if !SandboxSimpleNativeCommandRunner::landlock_supported() {
-            return;
-        }
+    fn simple_native_allows_arbitrary_host_writes() {
         let (dir, store, sandbox_id) = create_store();
-        let denied = dir.path().join("denied.txt");
+        let host_path = dir.path().join("arbitrary-host-write.txt");
+        let (mut manifest, _) = store.load(&sandbox_id).expect("load manifest");
+        manifest.limits.max_written_bytes_per_command = 1;
+        store.save_manifest(&manifest).expect("save write limit");
         let outcome = run_shell(
             &store,
             &sandbox_id,
-            &format!("printf no > {}", denied.display()),
+            &format!("printf ok > {}", host_path.display()),
             0,
         );
+        assert_eq!(outcome.response.exit_status, 0);
+        assert_eq!(fs::read_to_string(host_path).expect("host write"), "ok");
+        assert_eq!(
+            outcome.response.resource_usage.written_bytes, SANDBOX_RESOURCE_USAGE_UNAVAILABLE,
+            "simple-native must not claim complete host-write accounting or enforce a partial count"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn simple_native_projects_live_rw_and_ro_sifs_mounts() {
+        let Some(bwrap) = find_host_program("bwrap") else {
+            return;
+        };
+        let projection_probe = Command::new(&bwrap)
+            .args(["--dev-bind", "/", "/", "--", "/bin/true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if !projection_probe.is_ok_and(|status| status.success()) {
+            return;
+        }
+
+        let (dir, store, sandbox_id) = create_store();
+        let host_sifs_root = dir.path().join("live-sifs");
+        let source = host_sifs_root.join("services/sandbox-shared/live");
+        fs::create_dir_all(&source).expect("live SIFS source");
+        let (mut manifest, layout) = store.load(&sandbox_id).expect("load");
+        let guest = layout.root.join("projected-live");
+        fs::create_dir_all(&guest).expect("guest mount target");
+        let guest_mount_path =
+            SandboxPath::new(guest.display().to_string()).expect("guest mount path");
+        manifest.cwd = guest_mount_path.clone();
+        manifest.mounts = vec![SandboxMount {
+            source_sifs_path: "/services/sandbox-shared/live".to_string(),
+            mount_path: guest_mount_path,
+            mode: SandboxMountMode::ReadWrite,
+        }];
+        store.save_manifest(&manifest).expect("save RW mount");
+
+        let runner = SandboxSimpleNativeCommandRunner::new(SandboxSimpleNativeConfig {
+            host_sifs_root: Some(host_sifs_root.clone()),
+            ..SandboxSimpleNativeConfig::default()
+        });
+        let thread_store = store.clone();
+        let thread_manifest = manifest.clone();
+        let thread_layout = layout.clone();
+        let guest_for_script = guest.clone();
+        let join = std::thread::spawn(move || {
+            let lease = try_acquire_sandbox_local_execution_lease(
+                &thread_store,
+                &thread_manifest.sandbox_id,
+            )
+            .expect("execution lease");
+            runner.run_native_command(
+                &thread_store,
+                &thread_manifest,
+                &thread_layout,
+                SandboxCommandRequest {
+                    sandbox_id: thread_manifest.sandbox_id.clone(),
+                    argv: vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        format!(
+                            "printf probe >/dev/null || exit 97; touch {}/started; while [ ! -f {}/remote-input ] || [ \"$(cat {}/remote-input)\" != remote ]; do sleep 0.01; done; cat {}/remote-input > {}/value; touch {}/published; sleep 0.3; printf done >> {}/value",
+                            guest_for_script.display(),
+                            guest_for_script.display(),
+                            guest_for_script.display(),
+                            guest_for_script.display(),
+                            guest_for_script.display(),
+                            guest_for_script.display(),
+                            guest_for_script.display()
+                        ),
+                    ],
+                    cwd: thread_manifest.cwd.clone(),
+                    stdin: None,
+                    env: thread_manifest.env.clone(),
+                    timeout_ms: 5_000,
+                },
+                None,
+                &SandboxCancellationToken::new(),
+                &lease,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !source.join("started").exists() {
+            assert!(Instant::now() < deadline, "projected writer did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fs::write(source.join("remote-input"), b"remote").expect("external live SIFS update");
+        while !source.join("published").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "projected command did not observe and publish the external update"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            fs::read_to_string(source.join("value")).expect("live projected write"),
+            "remote",
+            "the command must observe an external live-mount update and publish its write before completion"
+        );
+        assert!(
+            !join.is_finished(),
+            "the projected write must be visible before command/checkpoint completion"
+        );
+        let outcome = join
+            .join()
+            .expect("projected writer thread")
+            .expect("projected writer command");
+        assert_eq!(outcome.response.exit_status, 0);
+        assert_eq!(
+            fs::read_to_string(source.join("value")).expect("completed projected write"),
+            "remotedone"
+        );
+
+        manifest.mounts[0].mode = SandboxMountMode::ReadOnly;
+        store.save_manifest(&manifest).expect("save RO mount");
+        let runner = SandboxSimpleNativeCommandRunner::new(SandboxSimpleNativeConfig {
+            host_sifs_root: Some(host_sifs_root),
+            ..SandboxSimpleNativeConfig::default()
+        });
+        let lease = try_acquire_sandbox_local_execution_lease(&store, &sandbox_id)
+            .expect("RO execution lease");
+        let outcome = runner
+            .run_native_command(
+                &store,
+                &manifest,
+                &layout,
+                SandboxCommandRequest {
+                    sandbox_id: sandbox_id.clone(),
+                    argv: vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        format!("printf denied > {}/ro-write", guest.display()),
+                    ],
+                    cwd: manifest.cwd.clone(),
+                    stdin: None,
+                    env: manifest.env.clone(),
+                    timeout_ms: 5_000,
+                },
+                None,
+                &SandboxCancellationToken::new(),
+                &lease,
+            )
+            .expect("RO projection command outcome");
         assert_ne!(outcome.response.exit_status, 0);
-        assert!(!denied.exists());
+        assert!(!source.join("ro-write").exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn simple_native_declared_mount_requires_a_live_host_sifs_root() {
+        let error = prepare_native_mount_projection(
+            &[SandboxMount {
+                source_sifs_path: "/services/sandbox-shared/live".to_string(),
+                mount_path: SandboxPath::new("/mnt/live").expect("mount path"),
+                mode: SandboxMountMode::ReadOnly,
+            }],
+            &SandboxSimpleNativeConfig::default(),
+        )
+        .expect_err("declared mounts must never fall back to copied data");
+        assert!(matches!(error, SandboxWasiError::InvalidRequest { .. }));
+        assert!(error.to_string().contains("SIFS/FUSE root"));
     }
 
     #[test]
@@ -2013,7 +3055,7 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn simple_native_windows_runs_restricted_cmd() {
+    fn simple_native_windows_runs_direct_cmd() {
         let (_dir, store, sandbox_id) = create_store();
         let node_id = NodeId::from_legacy_named("sandbox_simple_windows_test").expect("node");
         let toolchain_store = sinomo_sandbox::LocalSandboxToolchainStore::new(std::env::temp_dir());
@@ -2059,6 +3101,7 @@ mod tests {
             extra_read_paths: vec![allowed.clone()],
             extra_write_paths: vec![allowed.clone()],
             extra_execute_paths: Vec::new(),
+            host_sifs_root: None,
         })
         .run_toolchain_command_with_stdin_policy_and_output_sink(
             &store,
@@ -2097,7 +3140,7 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn simple_native_windows_blocks_unlabeled_host_read() {
+    fn simple_native_windows_allows_arbitrary_host_read() {
         let (dir, store, sandbox_id) = create_store();
         let secret = dir.path().join("outside-sandbox-secret.txt");
         fs::write(&secret, "outside-secret").expect("secret");
@@ -2123,15 +3166,15 @@ mod tests {
             )
             .expect("simple-native Windows host read command");
 
-        assert_ne!(outcome.response.exit_status, 0);
-        assert!(!String::from_utf8_lossy(&outcome.stdout).contains("outside-secret"));
+        assert_eq!(outcome.response.exit_status, 0);
+        assert!(String::from_utf8_lossy(&outcome.stdout).contains("outside-secret"));
     }
 
     #[test]
     #[cfg(windows)]
-    fn simple_native_windows_blocks_unapproved_host_write() {
+    fn simple_native_windows_allows_arbitrary_host_write() {
         let (dir, store, sandbox_id) = create_store();
-        let denied = dir.path().join("denied.txt");
+        let host_path = dir.path().join("arbitrary-write.txt");
         let node_id = NodeId::from_legacy_named("sandbox_simple_windows_write_gap").expect("node");
         let toolchain_store = sinomo_sandbox::LocalSandboxToolchainStore::new(std::env::temp_dir());
 
@@ -2144,7 +3187,7 @@ mod tests {
                 vec![
                     "cmd.exe".to_string(),
                     "/C".to_string(),
-                    format!("echo no>{}", denied.display()),
+                    format!("echo ok>{}", host_path.display()),
                 ],
                 None,
                 5000,
@@ -2154,7 +3197,7 @@ mod tests {
             )
             .expect("simple-native Windows host write command");
 
-        assert_ne!(outcome.response.exit_status, 0);
-        assert!(!denied.exists());
+        assert_eq!(outcome.response.exit_status, 0);
+        assert!(host_path.exists());
     }
 }

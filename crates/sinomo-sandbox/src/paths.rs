@@ -20,7 +20,68 @@ pub fn bundled_toolchains_dir() -> std::path::PathBuf {
 }
 
 pub fn sandbox_manifest_path(sandbox_id: &SandboxId) -> String {
-    format!("{}/manifest.sobj", sandbox_instance_root(sandbox_id))
+    format!("{}/manifest.sobj", sandbox_control_root(sandbox_id))
+}
+
+pub fn sandbox_control_root(sandbox_id: &SandboxId) -> String {
+    format!("{SIFS_SANDBOX_ROOT}/control/{sandbox_id}")
+}
+
+/// Immutable workspace generations built by authoritative sandbox transactions.
+/// The stable instance path is an atomically replaceable symlink to one complete
+/// generation; the manifest and transaction fence live outside that symlink.
+pub fn sandbox_transaction_root(sandbox_id: &SandboxId) -> String {
+    format!("{SIFS_SANDBOX_ROOT}/generations/{sandbox_id}")
+}
+
+pub fn sandbox_transaction_workspace_root(
+    sandbox_id: &SandboxId,
+    incarnation_id: &sinomo_core::Id,
+    transaction_id: &sinomo_core::Id,
+) -> String {
+    format!(
+        "{}/{incarnation_id}/{transaction_id}",
+        sandbox_transaction_root(sandbox_id)
+    )
+}
+
+pub fn sandbox_incarnation_generation_root(
+    sandbox_id: &SandboxId,
+    incarnation_id: &sinomo_core::Id,
+) -> String {
+    format!("{}/{incarnation_id}", sandbox_transaction_root(sandbox_id))
+}
+
+pub fn sandbox_transaction_swap_link(
+    sandbox_id: &SandboxId,
+    transaction_id: &sinomo_core::Id,
+) -> String {
+    format!("{SIFS_SANDBOX_ROOT}/instances/.swap-{sandbox_id}-{transaction_id}")
+}
+
+pub fn sandbox_legacy_backup_root(
+    sandbox_id: &SandboxId,
+    transaction_id: &sinomo_core::Id,
+) -> String {
+    format!("{SIFS_SANDBOX_ROOT}/legacy-backups/{sandbox_id}/{transaction_id}")
+}
+
+/// Checkpoints are control-plane state and deliberately stay outside the
+/// swappable workspace generation. Publishing a new workspace pointer must
+/// not orphan the checkpoint catalog used to recover it.
+pub fn sandbox_checkpoint_root(sandbox_id: &SandboxId) -> String {
+    format!("{}/checkpoints", sandbox_control_root(sandbox_id))
+}
+
+/// Persistent coordination root. Lock anchors deliberately live outside an
+/// instance subtree so destroy/recreate cannot evade a still-live execution
+/// lease on the previous instance generation.
+pub fn sandbox_lock_root() -> String {
+    format!("{SIFS_SANDBOX_ROOT}/locks")
+}
+
+pub fn sandbox_lock_anchor_path(sandbox_id: &SandboxId) -> String {
+    format!("{}/{sandbox_id}.lock", sandbox_lock_root())
 }
 
 pub fn sandbox_toolchain_root(toolchain_id: &SandboxToolchainId) -> String {

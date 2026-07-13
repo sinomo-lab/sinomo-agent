@@ -13,9 +13,10 @@ use crate::posix_path::{
 };
 use crate::{
     DFS_ROUTED_NAMESPACE_OP_TIMEOUT, DfsControlPlaneStore, DfsError, DfsMessageTransport,
-    DfsMetadataShardConfig, DfsMetadataShardId, DfsNamespaceJobKind, DfsNamespaceOperation,
-    DfsNamespaceResult, DfsObjectKind, DfsObjectMetadata, DfsPosixCoordinationResult,
-    NetworkedDfsService, PendingRoutedNamespaceResult, sifs_file_system_id,
+    DfsMetadataShardConfig, DfsMetadataShardId, DfsNamespaceJobKind, DfsNamespaceJobRecord,
+    DfsNamespaceOperation, DfsNamespaceResult, DfsObjectKind, DfsObjectMetadata,
+    DfsPosixCoordinationResult, NetworkedDfsService, PendingRoutedNamespaceResult,
+    sifs_file_system_id,
 };
 use sinomo_core::node::NodeId;
 use std::time::{Duration, Instant};
@@ -101,7 +102,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(Some(shards))
     }
 
-    fn select_sifs_metadata_shard_for_path_from_snapshot(
+    pub(super) fn select_sifs_metadata_shard_for_path_from_snapshot(
         &self,
         path: &str,
         shards: &[DfsMetadataShardConfig],
@@ -418,6 +419,40 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }))
     }
 
+    pub(super) fn route_namespace_job_operation(
+        &mut self,
+        primary_node_id: NodeId,
+        operation: DfsNamespaceOperation,
+    ) -> Result<DfsNamespaceJobRecord> {
+        let routed = self
+            .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
+                sifs_file_system_id(),
+                primary_node_id,
+                operation.clone(),
+                DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+                true,
+                true,
+            )
+            .map_err(DfsPosixError::Dfs)?;
+        match routed.result.clone() {
+            DfsNamespaceResult::Applied => {
+                self.finish_routed_namespace_catch_up_if_needed(&operation, &routed)?;
+                match routed.posix_coordination_result {
+                    Some(DfsPosixCoordinationResult::NamespaceJob(job)) => Ok(job),
+                    _ => Err(DfsPosixError::Dfs(DfsError::Distributed {
+                        message: "bounded namespace job response omitted its typed receipt"
+                            .to_string(),
+                    })),
+                }
+            }
+            DfsNamespaceResult::Rejected {
+                reason,
+                posix_error,
+                ..
+            } => Err(posix_error_for_namespace_rejection(reason, posix_error)),
+        }
+    }
+
     fn finish_routed_namespace_catch_up_if_needed(
         &mut self,
         operation: &DfsNamespaceOperation,
@@ -575,12 +610,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         match operation {
             DfsNamespaceOperation::Mkdir { path } => self.posix_mkdir_local(path).map(drop),
+            DfsNamespaceOperation::MkdirWithAttrs { path, attrs } => self
+                .posix_mkdir_local_with_create_attrs(path, *attrs)
+                .map(drop),
             DfsNamespaceOperation::MkdirAll { path } => self.posix_mkdir_all_local(path),
             DfsNamespaceOperation::Rmdir { path } => self.posix_rmdir_local(path).map(drop),
             DfsNamespaceOperation::Unlink { path } => self.posix_unlink_local(path).map(drop),
             DfsNamespaceOperation::Rename { from, to } => {
                 self.posix_rename_local(from, to).map(drop)
             }
+            DfsNamespaceOperation::RenameSingleNamespaceAtomic {
+                from,
+                to,
+                expected_shard_id,
+                expected_shard_epoch,
+            } => self
+                .posix_rename_single_namespace_atomic_local(
+                    from,
+                    to,
+                    Some((expected_shard_id, *expected_shard_epoch)),
+                )
+                .map(drop),
             DfsNamespaceOperation::Hardlink {
                 existing_path,
                 link_path,
@@ -593,6 +643,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNamespaceOperation::SetOwner { path, uid, gid } => {
                 self.posix_set_owner_local(path, *uid, *gid).map(drop)
             }
+            DfsNamespaceOperation::SetSymlinkOwner { path, uid, gid } => self
+                .posix_set_symlink_owner_local(path, *uid, *gid)
+                .map(drop),
             DfsNamespaceOperation::SetTimes {
                 path,
                 accessed_at_unix_nanos,
@@ -637,6 +690,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNamespaceOperation::AdvisoryLock { .. }
             | DfsNamespaceOperation::FileSync { .. }
             | DfsNamespaceOperation::DirectorySync { .. }
+            | DfsNamespaceOperation::RenameDirectoryBounded { .. }
+            | DfsNamespaceOperation::ResumeNamespaceJobBounded { .. }
             | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. } => {
                 Err(DfsPosixError::Dfs(DfsError::Distributed {
                     message: "POSIX coordination operation bypassed its typed executor".to_string(),
@@ -904,11 +959,13 @@ fn validate_advisory_lock_migration_receipt(
 fn namespace_operation_routing_path(operation: &DfsNamespaceOperation) -> Option<&str> {
     match operation {
         DfsNamespaceOperation::Mkdir { path }
+        | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
         | DfsNamespaceOperation::MkdirAll { path }
         | DfsNamespaceOperation::Rmdir { path }
         | DfsNamespaceOperation::Unlink { path }
         | DfsNamespaceOperation::SetMode { path, .. }
         | DfsNamespaceOperation::SetOwner { path, .. }
+        | DfsNamespaceOperation::SetSymlinkOwner { path, .. }
         | DfsNamespaceOperation::SetTimes { path, .. }
         | DfsNamespaceOperation::TouchDirectoryModified { path }
         | DfsNamespaceOperation::ClearDirRecursive { path }
@@ -916,10 +973,13 @@ fn namespace_operation_routing_path(operation: &DfsNamespaceOperation) -> Option
         | DfsNamespaceOperation::LookupPath { path }
         | DfsNamespaceOperation::AdvisoryLock { path, .. }
         | DfsNamespaceOperation::FileSync { path, .. }
-        | DfsNamespaceOperation::DirectorySync { path, .. } => Some(path.as_str()),
+        | DfsNamespaceOperation::DirectorySync { path, .. }
+        | DfsNamespaceOperation::ResumeNamespaceJobBounded { path, .. } => Some(path.as_str()),
         DfsNamespaceOperation::AdvisoryLockMigrationPrepare { path, .. } => Some(path.as_str()),
         DfsNamespaceOperation::LookupPaths { paths } => paths.first().map(String::as_str),
-        DfsNamespaceOperation::Rename { from, .. } => Some(from.as_str()),
+        DfsNamespaceOperation::Rename { from, .. }
+        | DfsNamespaceOperation::RenameSingleNamespaceAtomic { from, .. }
+        | DfsNamespaceOperation::RenameDirectoryBounded { from, .. } => Some(from.as_str()),
         DfsNamespaceOperation::Hardlink { existing_path, .. } => Some(existing_path.as_str()),
         DfsNamespaceOperation::ApplyTransaction { transaction } => transaction
             .objects

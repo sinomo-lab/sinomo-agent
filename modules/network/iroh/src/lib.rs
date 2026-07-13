@@ -13,7 +13,7 @@
 //!   `network_transports: ["iroh"]`, telling the daemon to also resolve the
 //!   network entry);
 //! - the pinned network-module vtable entry
-//!   `sinomo_network_module_create_v1` (see
+//!   `sinomo_network_module_create_v2` (see
 //!   `sinomo_network::network_module_abi`), which the daemon wraps in
 //!   `FfiNetworkModule` and registers in its `NetworkModuleRegistry`.
 
@@ -24,11 +24,11 @@ mod proxy;
 use endpoint::{iroh_endpoint_public_key, stable_iroh_endpoint_id};
 use sinomo_core::ClusterTransportKind;
 use sinomo_core::network::network_module_abi::{
-    SINOMO_NETWORK_MODULE_ABI_VERSION, SINOMO_NETWORK_MODULE_STATUS_INVALID_ARGUMENT,
-    SINOMO_NETWORK_MODULE_STATUS_OK, SINOMO_NETWORK_MODULE_STATUS_RUNTIME_ERROR,
-    SinomoNetworkByteBuffer, SinomoNetworkByteSlice, SinomoNetworkModuleConfigV1,
-    SinomoNetworkModuleStatusCode, SinomoNetworkModuleVtableV1, SinomoNetworkRpcStreamV1,
-    encode_network_module_rpc_error, encode_network_module_sobj,
+    SINOMO_NETWORK_MODULE_ABI_MAGIC, SINOMO_NETWORK_MODULE_ABI_VERSION,
+    SINOMO_NETWORK_MODULE_STATUS_INVALID_ARGUMENT, SINOMO_NETWORK_MODULE_STATUS_OK,
+    SINOMO_NETWORK_MODULE_STATUS_RUNTIME_ERROR, SinomoNetworkByteBuffer, SinomoNetworkByteSlice,
+    SinomoNetworkModuleConfigV1, SinomoNetworkModuleStatusCode, SinomoNetworkModuleVtableV2,
+    SinomoNetworkRpcStreamV1, encode_network_module_rpc_error, encode_network_module_sobj,
 };
 use sinomo_core::network::{
     ClusterPaths, DaemonRpcTimeouts, NetworkError, NetworkModuleDescriptor,
@@ -43,17 +43,19 @@ use sinomo_module_api::{
     SINOMO_NATIVE_MODULE_ABI_VERSION, SinomoModuleByteBuffer, SinomoModuleByteSlice,
     SinomoModuleHostApiV1, SinomoModuleStatusCode, decode_sobj, encode_sobj,
 };
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
+use std::thread;
 use std::time::Duration;
 
 /// Module id under which the dylib installs (`[package.metadata.sinomo.native-dylib]`).
 pub const SINOMO_NETWORK_IROH_MODULE_ID: &str = "module.network-iroh";
 /// Interface version pinned in the loader state.
-pub const SINOMO_NETWORK_IROH_INTERFACE_VERSION: &str = "sinomo.network-iroh.v1";
+pub const SINOMO_NETWORK_IROH_INTERFACE_VERSION: &str = "sinomo.network-iroh.v2";
 /// Network-module descriptor id (`NetworkModuleDescriptor::id`).
 pub const SINOMO_NETWORK_IROH_NETWORK_MODULE_ID: &str = "iroh";
 const SINOMO_DISABLE_IROH_ENV: &str = "SINOMO_DISABLE_IROH";
@@ -229,9 +231,24 @@ pub fn iroh_network_module_descriptor() -> NetworkModuleDescriptor {
 /// currently running proxy (when started with a cluster identity).
 struct IrohNetworkModuleInstance {
     runtime: OnceLock<tokio::runtime::Runtime>,
+    runtime_init: Mutex<()>,
     proxy: Mutex<Option<proxy::IrohDaemonProxy>>,
     dialer: dial::IrohDaemonDialer,
 }
+
+/// Live raw instances exported through the C ABI. Besides rejecting stale
+/// callback pointers, claiming an entry before destruction makes destroy
+/// idempotent: only one caller can reconstruct the owning Box.
+static LIVE_IROH_NETWORK_MODULE_INSTANCES: LazyLock<Mutex<HashSet<usize>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+#[derive(Clone, Copy)]
+struct OwnedIrohNetworkModuleInstance(*mut IrohNetworkModuleInstance);
+
+// SAFETY: the pointer represents unique Box ownership after it has been
+// atomically removed from LIVE_IROH_NETWORK_MODULE_INSTANCES. It is moved to
+// at most one teardown thread and never dereferenced elsewhere.
+unsafe impl Send for OwnedIrohNetworkModuleInstance {}
 
 /// One native QUIC bidirectional stream retained behind the opaque network
 /// module ABI handle. Separate locks allow a blocking read and write to make
@@ -256,7 +273,7 @@ impl IrohNetworkRpcStream {
         let result = match self.no_progress_timeout {
             Some(timeout) => self
                 .runtime
-                .block_on(tokio::time::timeout(timeout, read))
+                .block_on(async { tokio::time::timeout(timeout, read).await })
                 .map_err(|_| {
                     NetworkError::timeout(
                         "read iroh RPC stream",
@@ -288,7 +305,7 @@ impl IrohNetworkRpcStream {
         let result = match self.no_progress_timeout {
             Some(timeout) => self
                 .runtime
-                .block_on(tokio::time::timeout(timeout, write))
+                .block_on(async { tokio::time::timeout(timeout, write).await })
                 .map_err(|_| {
                     NetworkError::timeout(
                         "write iroh RPC stream",
@@ -324,6 +341,7 @@ impl IrohNetworkModuleInstance {
     fn new() -> Self {
         Self {
             runtime: OnceLock::new(),
+            runtime_init: Mutex::new(()),
             proxy: Mutex::new(None),
             dialer: dial::IrohDaemonDialer::new(),
         }
@@ -332,6 +350,16 @@ impl IrohNetworkModuleInstance {
     /// The module's own runtime (the proxy supervisor and blocking dials run
     /// here, never on the host's executor).
     fn runtime(&self) -> Result<&tokio::runtime::Runtime, NetworkError> {
+        if let Some(runtime) = self.runtime.get() {
+            return Ok(runtime);
+        }
+        // Serialize lazy initialization. Without this guard, concurrent first
+        // callers can build two runtimes and the losing Runtime would be
+        // dropped on an arbitrary (possibly Tokio) caller thread.
+        let _init = self
+            .runtime_init
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(runtime) = self.runtime.get() {
             return Ok(runtime);
         }
@@ -344,8 +372,16 @@ impl IrohNetworkModuleInstance {
                 operation: "build iroh network module runtime".to_string(),
                 detail: source.to_string(),
             })?;
-        let _ = self.runtime.set(runtime);
-        Ok(self.runtime.get().expect("runtime just initialized"))
+        if let Err(unused_runtime) = self.runtime.set(runtime) {
+            // The initialization mutex makes this unreachable in normal
+            // operation. Keep the fallback non-blocking and safe even if that
+            // invariant is changed later.
+            unused_runtime.shutdown_background();
+        }
+        self.runtime.get().ok_or_else(|| NetworkError::Io {
+            operation: "build iroh network module runtime".to_string(),
+            detail: "runtime initialization completed without installing a runtime".to_string(),
+        })
     }
 
     fn start(&self, config: IrohModuleStartConfig) -> Result<(), NetworkError> {
@@ -374,10 +410,10 @@ impl IrohNetworkModuleInstance {
             node_id: config.node_id,
             daemon_forward_address: config.daemon_forward_address,
         };
-        let handle = runtime.block_on(proxy::start_iroh_daemon_proxy(
-            runtime.handle().clone(),
-            proxy_config,
-        ))?;
+        let runtime_handle = runtime.handle().clone();
+        let handle = run_iroh_sync_operation_outside_tokio("start iroh network module", || {
+            runtime.block_on(proxy::start_iroh_daemon_proxy(runtime_handle, proxy_config))
+        })?;
         *self
             .proxy
             .lock()
@@ -386,12 +422,28 @@ impl IrohNetworkModuleInstance {
     }
 
     fn stop(&self) -> Result<(), NetworkError> {
+        // A never-used or dial-only pre-cluster module has no async resources;
+        // stopping it remains an idempotent no-op and no longer creates a
+        // runtime merely to tear it down.
+        if self.runtime.get().is_none() {
+            return Ok(());
+        }
+        run_iroh_sync_operation_outside_tokio("stop iroh network module", || {
+            self.stop_on_plain_thread()
+        })
+    }
+
+    /// Stops proxy and dialer resources. The caller must not be inside any
+    /// Tokio runtime because this synchronously drives the module runtime.
+    fn stop_on_plain_thread(&self) -> Result<(), NetworkError> {
         let proxy = self
             .proxy
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
-        let runtime = self.runtime()?;
+        let Some(runtime) = self.runtime.get() else {
+            return Ok(());
+        };
         if let Some(proxy) = proxy {
             runtime.block_on(proxy.shutdown());
         }
@@ -412,7 +464,9 @@ impl IrohNetworkModuleInstance {
         }
         let runtime = self.runtime()?;
         let (send, recv) =
-            runtime.block_on(self.dialer.open_daemon_stream_async(address, timeouts))?;
+            run_iroh_sync_operation_outside_tokio("open iroh network module stream", || {
+                runtime.block_on(self.dialer.open_daemon_stream_async(address, timeouts))
+            })?;
         Ok(IrohNetworkRpcStream {
             runtime: runtime.handle().clone(),
             recv: Mutex::new(Some(recv)),
@@ -429,6 +483,84 @@ impl IrohNetworkModuleInstance {
             .map(|proxy| vec![proxy.record().endpoint()])
             .unwrap_or_default()
     }
+
+    /// Consumes the sole instance owner on a plain OS thread. Runtime shutdown
+    /// is isolated from unwinding so no Runtime is ever dropped while another
+    /// panic is active, and the private runtime is fully gone before the ABI
+    /// destroy callback returns (allowing the host to unload the dylib).
+    fn destroy_on_plain_thread(mut instance: Box<Self>) {
+        let runtime = instance.runtime.take();
+        let proxy = instance
+            .proxy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+
+        if let Some(runtime) = runtime {
+            let shutdown = catch_unwind(AssertUnwindSafe(|| {
+                if let Some(proxy) = proxy {
+                    runtime.block_on(proxy.shutdown());
+                }
+                runtime.block_on(instance.dialer.shutdown());
+            }));
+            if shutdown.is_err() {
+                eprintln!("sinomo iroh network module async shutdown panicked");
+            }
+
+            // This thread has no entered Tokio context. Dropping the Runtime
+            // here waits for its worker threads and prevents module code from
+            // surviving past dynamic-library unload.
+            let runtime_drop = catch_unwind(AssertUnwindSafe(|| drop(runtime)));
+            if runtime_drop.is_err() {
+                eprintln!("sinomo iroh network module runtime shutdown panicked");
+            }
+        } else {
+            drop(proxy);
+        }
+
+        // The Runtime has already been taken, so even a pathological field
+        // destructor cannot trigger Tokio's nested-runtime drop panic.
+        let instance_drop = catch_unwind(AssertUnwindSafe(|| drop(instance)));
+        if instance_drop.is_err() {
+            eprintln!("sinomo iroh network module instance destruction panicked");
+        }
+    }
+}
+
+/// Runs a synchronous operation that drives the private Iroh runtime. Tokio
+/// forbids Runtime::block_on from an entered runtime, so callers on Tokio
+/// workers are bridged through one scoped plain OS thread. Spawn and join
+/// failures become normal module errors rather than unwinding through FFI.
+fn run_iroh_sync_operation_outside_tokio<T, F>(
+    operation: &'static str,
+    operation_fn: F,
+) -> Result<T, NetworkError>
+where
+    T: Send,
+    F: FnOnce() -> Result<T, NetworkError> + Send,
+{
+    let run = || catch_unwind(AssertUnwindSafe(operation_fn));
+    let result = if tokio::runtime::Handle::try_current().is_ok() {
+        thread::scope(|scope| {
+            let worker = thread::Builder::new()
+                .name("sinomo-iroh-runtime-bridge".to_string())
+                .spawn_scoped(scope, run)
+                .map_err(|source| NetworkError::Io {
+                    operation: operation.to_string(),
+                    detail: format!("spawn runtime bridge: {source}"),
+                })?;
+            worker.join().map_err(|_| NetworkError::Io {
+                operation: operation.to_string(),
+                detail: "runtime bridge thread panicked".to_string(),
+            })
+        })?
+    } else {
+        run()
+    };
+    result.map_err(|_| NetworkError::Io {
+        operation: operation.to_string(),
+        detail: "operation panicked while driving the iroh runtime".to_string(),
+    })?
 }
 
 fn iroh_endpoint_role(endpoint: &sinomo_core::ClusterEndpointRecord) -> NetworkModuleEndpointRole {
@@ -516,11 +648,55 @@ fn ffi_timeout(ms: u64) -> Option<Duration> {
     (ms != 0).then(|| Duration::from_millis(ms))
 }
 
+fn live_iroh_network_module_instances() -> std::sync::MutexGuard<'static, HashSet<usize>> {
+    LIVE_IROH_NETWORK_MODULE_INSTANCES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn register_iroh_network_module_instance(instance: *mut IrohNetworkModuleInstance) {
+    live_iroh_network_module_instances().insert(instance as usize);
+}
+
+fn is_live_iroh_network_module_instance(instance: *mut c_void) -> bool {
+    !instance.is_null() && live_iroh_network_module_instances().contains(&(instance as usize))
+}
+
+fn claim_iroh_network_module_instance(
+    instance: *mut c_void,
+) -> Option<OwnedIrohNetworkModuleInstance> {
+    if instance.is_null() || !live_iroh_network_module_instances().remove(&(instance as usize)) {
+        return None;
+    }
+    Some(OwnedIrohNetworkModuleInstance(
+        instance as *mut IrohNetworkModuleInstance,
+    ))
+}
+
+impl OwnedIrohNetworkModuleInstance {
+    /// Reconstructs and consumes the Box on a thread that has no entered Tokio
+    /// runtime. The live-instance claim guarantees unique ownership.
+    ///
+    /// # Safety
+    ///
+    /// `self` must have been returned by `claim_iroh_network_module_instance`
+    /// and this method must be called at most once.
+    unsafe fn destroy_on_plain_thread(self) {
+        // SAFETY: the claim removed this exact pointer from the live registry,
+        // transferring its sole allocation ownership to `self`.
+        let instance = unsafe { Box::from_raw(self.0) };
+        IrohNetworkModuleInstance::destroy_on_plain_thread(instance);
+    }
+}
+
 /// # Safety
 ///
-/// `instance` must be a pointer produced by [`sinomo_network_module_create_v1`]
+/// `instance` must be a pointer produced by [`sinomo_network_module_create_v2`]
 /// that has not been destroyed.
 unsafe fn module_instance<'a>(instance: *mut c_void) -> Option<&'a IrohNetworkModuleInstance> {
+    if !is_live_iroh_network_module_instance(instance) {
+        return None;
+    }
     // SAFETY: caller contract above.
     unsafe { (instance as *const IrohNetworkModuleInstance).as_ref() }
 }
@@ -836,55 +1012,86 @@ unsafe extern "C" fn iroh_network_module_free_buffer_ffi(buffer: SinomoNetworkBy
 
 unsafe extern "C" fn iroh_network_module_destroy_ffi(instance: *mut c_void) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        if instance.is_null() {
+        let Some(instance) = claim_iroh_network_module_instance(instance) else {
+            // Null and already-destroyed handles are both harmless no-ops.
             return;
-        }
-        // SAFETY: the host destroys each instance exactly once; the pointer
-        // was produced by Box::into_raw in the entry function.
-        let instance = unsafe { Box::from_raw(instance as *mut IrohNetworkModuleInstance) };
-        let _ = instance.stop();
-        // Dropping a runtime inside an async context panics; destroy runs on
-        // a plain host thread, but shutdown_background is safe either way.
-        if let Some(runtime) = instance.runtime.into_inner() {
-            runtime.shutdown_background();
+        };
+
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let worker_instance = instance;
+            match thread::Builder::new()
+                .name("sinomo-iroh-module-destroy".to_string())
+                .spawn(move || {
+                    // SAFETY: successful spawn transfers the claimed Box
+                    // ownership to this plain teardown thread.
+                    unsafe { worker_instance.destroy_on_plain_thread() };
+                }) {
+                Ok(worker) => {
+                    // Destruction is synchronous at the ABI boundary: once it
+                    // returns, the host may unload this dylib safely.
+                    if worker.join().is_err() {
+                        eprintln!("sinomo iroh network module teardown thread panicked");
+                    }
+                }
+                Err(error) => {
+                    // The raw Box remains allocated and the live registry has
+                    // already been claimed. Leak rather than reconstructing
+                    // it on a Tokio worker, where Runtime drop can abort.
+                    eprintln!(
+                        "sinomo iroh network module teardown thread failed to spawn; \
+                         leaking instance safely: {error}"
+                    );
+                    let _ = instance;
+                }
+            }
+        } else {
+            // SAFETY: this thread has no entered Tokio runtime and owns the
+            // unique claimed instance.
+            unsafe { instance.destroy_on_plain_thread() };
         }
     }));
 }
 
-/// The pinned v1 entry: creates the module instance and fills the vtable.
+/// The pinned v2 entry: creates the module instance and fills the
+/// self-describing vtable. Its symbol is intentionally distinct from the old
+/// response-buffer v1 entry.
 ///
 /// # Safety
 ///
 /// `instance_out` and `vtable_out` must be valid, writable pointers. The host
 /// must eventually pass the returned instance to the vtable's `destroy`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sinomo_network_module_create_v1(
+pub unsafe extern "C" fn sinomo_network_module_create_v2(
     instance_out: *mut *mut c_void,
-    vtable_out: *mut SinomoNetworkModuleVtableV1,
+    vtable_out: *mut SinomoNetworkModuleVtableV2,
 ) -> SinomoNetworkModuleStatusCode {
     let result = catch_unwind(AssertUnwindSafe(|| {
         if instance_out.is_null() || vtable_out.is_null() {
             return SINOMO_NETWORK_MODULE_STATUS_INVALID_ARGUMENT;
         }
         let instance = Box::new(IrohNetworkModuleInstance::new());
+        let instance = Box::into_raw(instance);
+        register_iroh_network_module_instance(instance);
         // SAFETY: both out pointers were null-checked above and are writable
         // per the entry contract.
         unsafe {
-            *instance_out = Box::into_raw(instance) as *mut c_void;
-            *vtable_out = SinomoNetworkModuleVtableV1 {
+            *instance_out = instance as *mut c_void;
+            *vtable_out = SinomoNetworkModuleVtableV2 {
+                abi_magic: SINOMO_NETWORK_MODULE_ABI_MAGIC,
                 abi_version: SINOMO_NETWORK_MODULE_ABI_VERSION,
-                descriptor: iroh_network_module_descriptor_ffi,
-                start: iroh_network_module_start_ffi,
-                stop: iroh_network_module_stop_ffi,
-                open_rpc_stream: iroh_network_module_open_rpc_stream_ffi,
-                read_rpc_stream: iroh_network_module_read_rpc_stream_ffi,
-                write_rpc_stream: iroh_network_module_write_rpc_stream_ffi,
-                shutdown_rpc_stream_write: iroh_network_module_shutdown_rpc_stream_write_ffi,
-                close_rpc_stream: iroh_network_module_close_rpc_stream_ffi,
-                local_endpoints: iroh_network_module_local_endpoints_ffi,
+                struct_size: SinomoNetworkModuleVtableV2::expected_struct_size(),
+                descriptor: Some(iroh_network_module_descriptor_ffi),
+                start: Some(iroh_network_module_start_ffi),
+                stop: Some(iroh_network_module_stop_ffi),
+                open_rpc_stream: Some(iroh_network_module_open_rpc_stream_ffi),
+                read_rpc_stream: Some(iroh_network_module_read_rpc_stream_ffi),
+                write_rpc_stream: Some(iroh_network_module_write_rpc_stream_ffi),
+                shutdown_rpc_stream_write: Some(iroh_network_module_shutdown_rpc_stream_write_ffi),
+                close_rpc_stream: Some(iroh_network_module_close_rpc_stream_ffi),
+                local_endpoints: Some(iroh_network_module_local_endpoints_ffi),
                 endpoint_role: Some(iroh_network_module_endpoint_role_ffi),
-                free_buffer: iroh_network_module_free_buffer_ffi,
-                destroy: iroh_network_module_destroy_ffi,
+                free_buffer: Some(iroh_network_module_free_buffer_ffi),
+                destroy: Some(iroh_network_module_destroy_ffi),
             };
         }
         SINOMO_NETWORK_MODULE_STATUS_OK
@@ -895,6 +1102,26 @@ pub unsafe extern "C" fn sinomo_network_module_create_v1(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_core::network::FfiNetworkModule;
+    use std::sync::mpsc;
+
+    struct TeardownSignal(mpsc::Sender<()>);
+
+    impl Drop for TeardownSignal {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    fn create_test_network_module_instance() -> (*mut c_void, SinomoNetworkModuleVtableV2) {
+        let mut instance: *mut c_void = std::ptr::null_mut();
+        let mut vtable = SinomoNetworkModuleVtableV2::empty();
+        // SAFETY: both output slots remain valid for the call.
+        let status = unsafe { sinomo_network_module_create_v2(&mut instance, &mut vtable) };
+        assert_eq!(status, SINOMO_NETWORK_MODULE_STATUS_OK);
+        assert!(!instance.is_null());
+        (instance, vtable)
+    }
 
     #[test]
     fn native_descriptor_declares_the_network_transport_surface() {
@@ -923,18 +1150,17 @@ mod tests {
 
     #[test]
     fn entry_creates_instance_and_vtable_and_round_trips_descriptor() {
-        let mut instance: *mut c_void = std::ptr::null_mut();
-        let mut vtable = std::mem::MaybeUninit::<SinomoNetworkModuleVtableV1>::uninit();
-        // SAFETY: valid out pointers; instance destroyed below.
-        let status = unsafe { sinomo_network_module_create_v1(&mut instance, vtable.as_mut_ptr()) };
-        assert_eq!(status, SINOMO_NETWORK_MODULE_STATUS_OK);
-        // SAFETY: entry returned OK, so the vtable was fully written.
-        let vtable = unsafe { vtable.assume_init() };
+        let (instance, vtable) = create_test_network_module_instance();
+        assert_eq!(vtable.abi_magic, SINOMO_NETWORK_MODULE_ABI_MAGIC);
         assert_eq!(vtable.abi_version, SINOMO_NETWORK_MODULE_ABI_VERSION);
+        assert_eq!(
+            vtable.struct_size,
+            SinomoNetworkModuleVtableV2::expected_struct_size()
+        );
 
         let mut buffer = SinomoNetworkByteBuffer::null();
         // SAFETY: calling the module's own descriptor fn with a valid slot.
-        let status = unsafe { (vtable.descriptor)(&mut buffer) };
+        let status = unsafe { (vtable.descriptor.expect("descriptor"))(&mut buffer) };
         assert_eq!(status, SINOMO_NETWORK_MODULE_STATUS_OK);
         // SAFETY: buffer produced by this module above.
         let bytes = unsafe { SinomoNetworkByteBuffer::into_vec(buffer) };
@@ -945,12 +1171,13 @@ mod tests {
 
         // Stop before start is a no-op success (runtime toggle safety).
         // SAFETY: valid instance from the entry call.
-        let status = unsafe { (vtable.stop)(instance) };
+        let status = unsafe { (vtable.stop.expect("stop"))(instance) };
         assert_eq!(status, SINOMO_NETWORK_MODULE_STATUS_OK);
 
         let mut endpoints = SinomoNetworkByteBuffer::null();
         // SAFETY: valid instance + output slot.
-        let status = unsafe { (vtable.local_endpoints)(instance, &mut endpoints) };
+        let status =
+            unsafe { (vtable.local_endpoints.expect("local endpoints"))(instance, &mut endpoints) };
         assert_eq!(status, SINOMO_NETWORK_MODULE_STATUS_OK);
         // SAFETY: buffer produced by this module above.
         let bytes = unsafe { SinomoNetworkByteBuffer::into_vec(endpoints) };
@@ -959,13 +1186,13 @@ mod tests {
                 .expect("decode endpoints");
         assert!(decoded.is_empty(), "no listener yet, no endpoints");
 
-        // The v1 ABI exposes an opaque byte stream, not a whole-response
+        // The v2 ABI exposes an opaque byte stream, not a whole-response
         // buffer. A rejected open leaves the handle null and reports the
         // structured transport error through the module-owned error buffer.
         let mut stream = SinomoNetworkRpcStreamV1::null();
         let mut error = SinomoNetworkByteBuffer::null();
         let status = unsafe {
-            (vtable.open_rpc_stream)(
+            (vtable.open_rpc_stream.expect("open rpc stream"))(
                 instance,
                 SinomoNetworkByteSlice::from_slice(b"not-an-iroh-address"),
                 5_000,
@@ -978,9 +1205,217 @@ mod tests {
         assert!(stream.is_null());
         assert!(!error.ptr.is_null(), "failed open should carry detail");
         // SAFETY: release through the same module vtable that allocated it.
-        unsafe { (vtable.free_buffer)(error) };
+        unsafe { (vtable.free_buffer.expect("free buffer"))(error) };
 
         // SAFETY: destroy exactly once with the instance from the entry.
-        unsafe { (vtable.destroy)(instance) };
+        unsafe { (vtable.destroy.expect("destroy"))(instance) };
+    }
+
+    #[test]
+    fn stop_and_destroy_are_idempotent_and_destroy_is_null_safe() {
+        let (instance, vtable) = create_test_network_module_instance();
+        let stop = vtable.stop.expect("stop");
+        let destroy = vtable.destroy.expect("destroy");
+
+        // Stop before initialization is a true no-op and remains safe across
+        // repeated runtime-toggle requests.
+        // SAFETY: the instance is live for both calls.
+        assert_eq!(unsafe { stop(instance) }, SINOMO_NETWORK_MODULE_STATUS_OK);
+        // SAFETY: as above; stop is explicitly idempotent.
+        assert_eq!(unsafe { stop(instance) }, SINOMO_NETWORK_MODULE_STATUS_OK);
+
+        // SAFETY: destroy defines null as a harmless no-op.
+        unsafe { destroy(std::ptr::null_mut()) };
+        // SAFETY: the first call claims and consumes this live instance.
+        unsafe { destroy(instance) };
+        assert!(!is_live_iroh_network_module_instance(instance));
+        // SAFETY: a repeated destroy is rejected by the live-instance claim
+        // before the stale pointer is dereferenced.
+        unsafe { destroy(instance) };
+    }
+
+    #[test]
+    fn direct_destroy_with_private_runtime_from_current_thread_tokio_is_safe() {
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("iroh-direct-destroy-regression".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build outer current-thread runtime");
+                runtime.block_on(async {
+                    let (instance, vtable) = create_test_network_module_instance();
+                    // Materialize the private runtime so this covers the
+                    // historical nested Runtime::drop abort, not merely the
+                    // uninitialized fast path.
+                    // SAFETY: instance is live and owned until destroy below.
+                    unsafe { module_instance(instance) }
+                        .expect("live instance")
+                        .runtime()
+                        .expect("build private iroh runtime");
+
+                    let stop = vtable.stop.expect("stop");
+                    // SAFETY: the instance is live. These calls exercise the
+                    // runtime-toggle path while another runtime is entered.
+                    assert_eq!(unsafe { stop(instance) }, SINOMO_NETWORK_MODULE_STATUS_OK);
+                    // SAFETY: stop remains idempotent after initialized
+                    // resources have already been drained.
+                    assert_eq!(unsafe { stop(instance) }, SINOMO_NETWORK_MODULE_STATUS_OK);
+
+                    // SAFETY: valid live instance. Destroy detects the entered
+                    // outer runtime and performs teardown on a plain thread.
+                    unsafe { (vtable.destroy.expect("destroy"))(instance) };
+                    // SAFETY: verifies the stale-handle no-op on the same path.
+                    unsafe { (vtable.destroy.expect("destroy"))(instance) };
+                });
+                let _ = done_tx.send(());
+            })
+            .expect("spawn watchdog worker");
+
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("destroy must not panic or hang on a current-thread Tokio worker");
+        worker.join().expect("destroy regression worker");
+    }
+
+    #[test]
+    fn timed_iroh_stream_read_and_write_work_without_an_ambient_tokio_reactor() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build private iroh runtime");
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .expect("bind daemon fixture");
+        let daemon_address = listener
+            .local_addr()
+            .expect("daemon fixture address")
+            .to_string();
+        let fixture = runtime.spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept daemon fixture");
+            let mut request = Vec::new();
+            stream
+                .read_to_end(&mut request)
+                .await
+                .expect("read daemon fixture request");
+            assert_eq!(request, b"plain-thread request");
+            stream
+                .write_all(b"plain-thread response")
+                .await
+                .expect("write daemon fixture response");
+        });
+
+        let root = sinomo_testdir::TestDir::new("sinomo-network-iroh-plain-thread-stream");
+        let paths = ClusterPaths::new(&sinomo_core::local::SinomoDataDir::new(&root));
+        paths.ensure().expect("cluster paths");
+        let proxy = runtime
+            .block_on(proxy::start_iroh_daemon_proxy(
+                runtime.handle().clone(),
+                proxy::IrohProxyConfig {
+                    paths,
+                    cluster_id: ClusterId::from_legacy_named("cluster_iroh_plain_thread_stream")
+                        .expect("cluster"),
+                    node_id: NodeId::from_legacy_named("node_iroh_plain_thread_stream")
+                        .expect("node"),
+                    daemon_forward_address: daemon_address,
+                },
+            ))
+            .expect("start iroh proxy");
+        let dialer = dial::IrohDaemonDialer::new();
+        let (send, recv) = runtime
+            .block_on(dialer.open_daemon_stream_async(
+                &proxy.record().endpoint().address,
+                DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5)),
+            ))
+            .expect("open raw iroh daemon stream");
+        let stream = IrohNetworkRpcStream {
+            runtime: runtime.handle().clone(),
+            recv: Mutex::new(Some(recv)),
+            send: Mutex::new(Some(send)),
+            no_progress_timeout: Some(Duration::from_secs(5)),
+        };
+
+        let worker = thread::Builder::new()
+            .name("iroh-timed-stream-plain-thread-regression".to_string())
+            .spawn(move || {
+                assert!(
+                    tokio::runtime::Handle::try_current().is_err(),
+                    "regression worker must not have an ambient Tokio reactor"
+                );
+                let request = b"plain-thread request";
+                let mut written = 0;
+                while written < request.len() {
+                    written += stream
+                        .write(&request[written..])
+                        .expect("timed write from plain thread");
+                }
+                stream.shutdown_write().expect("finish request stream");
+
+                let mut response = Vec::new();
+                let mut buffer = [0_u8; 64];
+                loop {
+                    let read = stream
+                        .read(&mut buffer)
+                        .expect("timed read from plain thread");
+                    if read == 0 {
+                        break;
+                    }
+                    response.extend_from_slice(&buffer[..read]);
+                }
+                response
+            })
+            .expect("spawn plain-thread stream worker");
+        let response = worker.join();
+
+        runtime.block_on(async {
+            dialer.shutdown().await;
+            proxy.shutdown().await;
+            fixture.await.expect("daemon fixture");
+        });
+        assert_eq!(
+            response.expect("plain-thread stream worker"),
+            b"plain-thread response"
+        );
+    }
+
+    #[test]
+    fn last_ffi_adapter_arc_drops_iroh_instance_off_current_thread_tokio_worker() {
+        let (instance, vtable) = create_test_network_module_instance();
+        // SAFETY: the instance is live and remains owned until it transfers to
+        // FfiNetworkModule below.
+        unsafe { module_instance(instance) }
+            .expect("live instance")
+            .runtime()
+            .expect("build private iroh runtime");
+
+        let (destroyed_tx, destroyed_rx) = mpsc::channel();
+        // SAFETY: instance/vtable were returned by the entry above; the signal
+        // token stands in for the dylib Library and outlives destroy.
+        let module = unsafe {
+            FfiNetworkModule::from_entry_parts(
+                instance,
+                vtable,
+                Box::new(TeardownSignal(destroyed_tx)),
+            )
+        }
+        .expect("wrap iroh FFI module");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime");
+        runtime.block_on(async move {
+            // This is the final adapter/Arc owner. Its Drop must return without
+            // invoking or waiting on the Iroh runtime from this Tokio worker.
+            drop(module);
+        });
+
+        destroyed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("detached teardown must destroy instance before keepalive release");
     }
 }

@@ -53,6 +53,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.posix_set_owner_local(path, uid, gid)
     }
 
+    pub fn posix_set_symlink_owner(&mut self, path: &str, uid: u32, gid: u32) -> Result<DfsStat> {
+        let normalized = normalize_posix_path(path)?;
+        if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
+            self.route_namespace_operation(
+                primary,
+                DfsNamespaceOperation::SetSymlinkOwner {
+                    path: path.to_string(),
+                    uid,
+                    gid,
+                },
+            )?;
+            return self.posix_lstat(&normalized);
+        }
+        self.posix_set_symlink_owner_local(path, uid, gid)
+    }
+
     pub(crate) fn posix_set_owner_local(
         &mut self,
         path: &str,
@@ -60,6 +76,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         gid: u32,
     ) -> Result<DfsStat> {
         self.posix_update_metadata_target(path, true, |target| {
+            target.uid = uid;
+            target.gid = gid;
+            true
+        })
+    }
+
+    pub(crate) fn posix_set_symlink_owner_local(
+        &mut self,
+        path: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<DfsStat> {
+        self.posix_update_metadata_target(path, false, |target| {
             target.uid = uid;
             target.gid = gid;
             true

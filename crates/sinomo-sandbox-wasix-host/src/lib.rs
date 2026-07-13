@@ -23,8 +23,7 @@ use sinomo_sandbox_wasix_api::{
 };
 
 pub use runner::{
-    SandboxWasixModuleCommandRunner, SandboxWasixSifsCommandOutcome, SandboxWasixSifsCommandRunner,
-    SandboxWasixSifsProcessPlanOutcome, run_sandbox_wasm_module_replay_fixture_with_active_module,
+    SandboxWasixModuleCommandRunner, run_sandbox_wasm_module_replay_fixture_with_active_module,
 };
 
 #[derive(Debug, thiserror::Error)]

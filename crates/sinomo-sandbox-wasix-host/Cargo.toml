@@ -13,7 +13,6 @@ ring = "r1"
 
 [dependencies]
 sinomo-core = { path = "../sinomo-core" }
-sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-module = { path = "../sinomo-module" }
 sinomo-module-api = { path = "../sinomo-module-api" }
 sinomo-sandbox = { path = "../sinomo-sandbox" }
@@ -22,4 +21,5 @@ thiserror.workspace = true
 time.workspace = true
 
 [dev-dependencies]
+sinomo-testdir = { path = "../sinomo-testdir" }
 wat = "1.248.0"

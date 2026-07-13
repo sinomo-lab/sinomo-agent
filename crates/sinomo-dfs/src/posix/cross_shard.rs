@@ -112,7 +112,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
         let mut moved = source.clone();
         moved.path = to.clone();
-        moved.changed_at_unix_nanos = now_unix_nanos();
+        moved.changed_at_unix_nanos =
+            now_unix_nanos().max(source.changed_at_unix_nanos.saturating_add(1));
         moved.version = next_version(&source.version);
         let job = match self.namespace_job(&job_id)? {
             Some(job) => job,
@@ -244,7 +245,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         self.ensure_no_open_write_state_for_object(&current, source_root)?;
         moved.path = target_root.to_string();
-        moved.changed_at_unix_nanos = now_unix_nanos();
+        moved.changed_at_unix_nanos =
+            now_unix_nanos().max(current.changed_at_unix_nanos.saturating_add(1));
         moved.version = next_version(&current.version);
         self.adopt_moved_object_on_destination_primary(&moved, source_root)?;
         self.complete_cross_shard_move_locally(&moved, source_root, false)
@@ -300,6 +302,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.ensure_no_open_write_state_for_object(&current, &object_path)?;
             let mut moved = current.clone();
             moved.path = target_child_path.clone();
+            moved.changed_at_unix_nanos =
+                now_unix_nanos().max(current.changed_at_unix_nanos.saturating_add(1));
+            moved.version = next_version(&current.version);
             self.adopt_moved_object_on_destination_primary(&moved, &object_path)?;
             if let Some(backend) = self.metadata_backend.as_mut() {
                 backend.evict_object_record_for_foreign_shard_move(&moved, &object_path)?;
@@ -417,7 +422,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.ensure_no_open_write_state_for_object(&current, &old_path)?;
         let mut moved = current;
         moved.path = target_path;
-        moved.changed_at_unix_nanos = now_unix_nanos();
+        moved.changed_at_unix_nanos =
+            now_unix_nanos().max(moved.changed_at_unix_nanos.saturating_add(1));
         moved.version = next_version(&moved.version);
         self.adopt_moved_object_on_destination_primary(&moved, &old_path)
     }
@@ -833,13 +839,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if needs_tombstone {
             let mut old_path_tombstone = moved_object.clone();
             old_path_tombstone.object_id = DfsObjectId::generate();
-            old_path_tombstone.path = old_path.clone();
-            old_path_tombstone.kind = DfsObjectKind::Tombstone;
-            old_path_tombstone.version = next_version(&moved_object.version);
-            old_path_tombstone.content_hash = None;
-            old_path_tombstone.content_size_bytes = None;
-            old_path_tombstone.link_target_object_id = None;
-            old_path_tombstone.current_locations = vec![self.node_id.clone()];
+            let old_path_tombstone =
+                self.tombstone_path_object_at(old_path_tombstone, old_path.clone());
             self.apply_namespace_transaction(DfsNamespaceTransaction {
                 transaction_id: namespace_transaction_id_for_path(
                     "rename-cross-shard",
@@ -898,7 +899,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let path = normalize_posix_path(&object.path)?;
         let mut transaction_objects = Vec::new();
         let mut already_adopted = false;
-        if let Some(mut destination) = self.lookup_sifs_path(&path)? {
+        if let Some(destination) = self.lookup_sifs_path(&path)? {
             if destination.object_id == object.object_id && destination.kind == object.kind {
                 let adopted_version_is_ancestor = if destination.version == object.version {
                     true
@@ -966,13 +967,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         }
                     }
                 }
-                destination.kind = DfsObjectKind::Tombstone;
-                destination.version = next_version(&destination.version);
-                destination.content_hash = None;
-                destination.content_size_bytes = None;
-                destination.link_target_object_id = None;
-                destination.current_locations = vec![self.node_id.clone()];
-                transaction_objects.push(destination);
+                transaction_objects.push(self.tombstone_path_object(destination));
             }
         }
         let rebound_advisory_lock_state = advisory_lock_state

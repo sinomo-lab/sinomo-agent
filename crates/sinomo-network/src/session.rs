@@ -12,8 +12,8 @@ use crate::daemon_auth::{
 };
 pub(crate) use crate::transfer::NetworkCallPolicy;
 use crate::transfer::{
-    TransferControl, TransferDataFrame, TransferDataHeader, TransferDigest,
-    TransferEncodedWireFrameHeader, TransferFlowWindow, TransferId, TransferOpen,
+    MAX_TRANSFER_CONTROL_FRAME_BYTES, TransferControl, TransferDataFrame, TransferDataHeader,
+    TransferDigest, TransferEncodedWireFrameHeader, TransferFlowWindow, TransferId, TransferOpen,
     TransferReceiverState, TransferSenderState, TransferVerifiedData,
     read_transfer_data_payload_to_vec, read_transfer_encoded_frame_header,
     write_transfer_data_frame, write_transfer_encoded_control_frame,
@@ -37,6 +37,9 @@ const BODY_READER_BUFFER_DEPTH: usize = 2;
 const OBJECT_RPC_SESSION_PROTOCOL: &str = "sinomo.object-rpc-session.v1";
 const OBJECT_RPC_SESSION_METADATA_KEY: &str = "sinomo.rpc-session";
 const OBJECT_RPC_RESPONSE_HEAD_PROOF_METADATA_KEY: &str = "sinomo.rpc-response-head-proof";
+const OBJECT_RPC_BUFFERED_RESPONSE_BODY_METADATA_KEY: &str =
+    "sinomo.rpc-session.buffered-response-body";
+const OBJECT_RPC_BUFFERED_RESPONSE_BODY_METADATA_VALUE: &str = "v1";
 const SESSION_ZERO_DIGEST: TransferDigest = TransferDigest::new([0_u8; 32]);
 
 /// Returns whether a non-consuming transport peek identifies the canonical
@@ -158,8 +161,21 @@ fn decode_response_head_proof(
     crate::SinomoObjectCodec::network_frame().decode(&bytes)
 }
 
+#[cfg(test)]
 async fn ensure_response_head_proof<W>(
     writer: &Arc<tokio::sync::Mutex<SessionFrameWriter<W>>>,
+    session_id: &TransferId,
+    response: &mut crate::ObjectRpcResponse,
+) -> Result<(), NetworkError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let writer = writer.lock().await;
+    ensure_response_head_proof_with_writer(&writer, session_id, response)
+}
+
+fn ensure_response_head_proof_with_writer<W>(
+    writer: &SessionFrameWriter<W>,
     session_id: &TransferId,
     response: &mut crate::ObjectRpcResponse,
 ) -> Result<(), NetworkError>
@@ -172,10 +188,7 @@ where
     {
         return Ok(());
     }
-    let proof = writer
-        .lock()
-        .await
-        .sign_response_head(session_id.clone(), response_head_digest(response)?);
+    let proof = writer.sign_response_head(session_id.clone(), response_head_digest(response)?);
     response.metadata.insert(
         OBJECT_RPC_RESPONSE_HEAD_PROOF_METADATA_KEY.to_string(),
         encode_response_head_proof(&proof)?,
@@ -348,7 +361,10 @@ where
         })
     }
 
-    async fn send(&mut self, payload: SessionWirePayload) -> Result<(), NetworkError> {
+    fn encode_control(
+        &self,
+        payload: SessionWirePayload,
+    ) -> Result<(Vec<u8>, TransferDigest), NetworkError> {
         let encoded_payload = crate::SinomoObjectCodec::network_frame().encode(&payload)?;
         let payload_digest = match &payload {
             SessionWirePayload::Data(header) => Some(header.payload_digest),
@@ -366,6 +382,16 @@ where
         let next_digest = proof.transcript_digest;
         let encoded = crate::SinomoObjectCodec::network_frame()
             .encode(&SignedSessionWireControl { payload, proof })?;
+        Ok((encoded, next_digest))
+    }
+
+    fn encoded_control_len(&self, payload: SessionWirePayload) -> Result<usize, NetworkError> {
+        self.encode_control(payload)
+            .map(|(encoded, _)| encoded.len())
+    }
+
+    async fn send(&mut self, payload: SessionWirePayload) -> Result<(), NetworkError> {
+        let (encoded, next_digest) = self.encode_control(payload)?;
         self.deadline
             .run(
                 "write object RPC session control",
@@ -1519,41 +1545,125 @@ impl ObjectRpcSessionResponder {
         mut self,
         mut response: ObjectRpcSessionResponse,
     ) -> Result<(), NetworkError> {
-        ensure_response_head_proof(&self.writer, &self.session_id, &mut response.response).await?;
-        let body_open = (!response.body.is_empty()).then(|| TransferOpen {
-            transfer_id: TransferId::generate(),
-            route: response.response.route.clone(),
-            operation_id: self.operation_id.clone(),
-            total_bytes: response.body.total_bytes(),
-            expected_digest: response.body.known_digest(),
-            replayable: response.body.is_replayable(),
-            requested_window: TransferFlowWindow::default(),
-        });
-        if body_open.is_some() {
-            response
-                .body
-                .ensure_local_finish_binding(response_body_finish_binding(
-                    &self.session_id,
-                    &response.response,
-                )?)?;
-        }
+        let response_had_origin_proof = response
+            .response
+            .metadata
+            .contains_key(OBJECT_RPC_RESPONSE_HEAD_PROOF_METADATA_KEY);
+        let existing_buffered_marker = response
+            .response
+            .metadata
+            .get(OBJECT_RPC_BUFFERED_RESPONSE_BODY_METADATA_KEY)
+            .cloned();
+        if let Some(marker) = existing_buffered_marker.as_deref()
+            && !(marker == OBJECT_RPC_BUFFERED_RESPONSE_BODY_METADATA_VALUE
+                && response_had_origin_proof
+                && response.response.body.is_empty()
+                && !response.body.is_empty())
         {
-            let mut outgoing = self.outgoing.lock().map_err(|_| NetworkError::Io {
-                operation: "initialize object RPC response transfer".to_string(),
-                detail: "outgoing transfer state lock poisoned".to_string(),
-            })?;
-            outgoing.initialized = true;
-            outgoing.transfer_id = body_open.as_ref().map(|open| open.transfer_id.clone());
-            outgoing.complete = body_open.is_none();
+            return Err(NetworkError::Serialization {
+                detail: "reserved buffered object RPC response marker is invalid on a local or malformed response"
+                    .to_string(),
+            });
         }
-        send_session_payload(
-            &self.writer,
-            SessionWirePayload::ResponseHead {
+        let buffered_body_bytes = response.response.body.len();
+        let can_spill_buffered_body = existing_buffered_marker.is_none()
+            && !response_had_origin_proof
+            && response.body.is_empty()
+            && buffered_body_bytes != 0;
+        if can_spill_buffered_body
+            && buffered_body_bytes > crate::OBJECT_RPC_UNARY_ADAPTER_MAX_BODY_BYTES
+        {
+            return Err(NetworkError::FrameTooLarge {
+                actual_bytes: buffered_body_bytes,
+                max_bytes: crate::OBJECT_RPC_UNARY_ADAPTER_MAX_BODY_BYTES,
+            });
+        }
+        let body_open = {
+            // Keep the writer guard across exact signed-head sizing and the
+            // actual write. A keepalive must not advance the transcript between
+            // those two operations.
+            let mut writer = self.writer.lock().await;
+            let mut spilled_buffered_body = false;
+            let mut inline_head_bytes = None;
+            if can_spill_buffered_body && buffered_body_bytes >= MAX_TRANSFER_CONTROL_FRAME_BYTES {
+                response.spill_buffered_response_body()?;
+                spilled_buffered_body = true;
+            } else {
+                ensure_response_head_proof_with_writer(
+                    &writer,
+                    &self.session_id,
+                    &mut response.response,
+                )?;
+                let inline_payload = SessionWirePayload::ResponseHead {
+                    response: response.response.clone(),
+                    body: None,
+                };
+                let measured = writer.encoded_control_len(inline_payload)?;
+                inline_head_bytes = Some(measured);
+                if measured > MAX_TRANSFER_CONTROL_FRAME_BYTES && can_spill_buffered_body {
+                    response
+                        .response
+                        .metadata
+                        .remove(OBJECT_RPC_RESPONSE_HEAD_PROOF_METADATA_KEY);
+                    response.spill_buffered_response_body()?;
+                    spilled_buffered_body = true;
+                }
+            }
+            if spilled_buffered_body {
+                ensure_response_head_proof_with_writer(
+                    &writer,
+                    &self.session_id,
+                    &mut response.response,
+                )?;
+                tracing::debug!(
+                    target: "sinomo.network.object_rpc",
+                    route = %response.response.route,
+                    inline_head_bytes = inline_head_bytes.unwrap_or(buffered_body_bytes),
+                    frame_limit_bytes = MAX_TRANSFER_CONTROL_FRAME_BYTES,
+                    transferred_body_bytes = response.body.total_bytes().unwrap_or_default(),
+                    "spilling oversized buffered object RPC response into transfer body"
+                );
+            }
+            let body_open = (!response.body.is_empty()).then(|| TransferOpen {
+                transfer_id: TransferId::generate(),
+                route: response.response.route.clone(),
+                operation_id: self.operation_id.clone(),
+                total_bytes: response.body.total_bytes(),
+                expected_digest: response.body.known_digest(),
+                replayable: response.body.is_replayable(),
+                requested_window: TransferFlowWindow::default(),
+            });
+            if body_open.is_some() {
+                response
+                    .body
+                    .ensure_local_finish_binding(response_body_finish_binding(
+                        &self.session_id,
+                        &response.response,
+                    )?)?;
+            }
+            {
+                let mut outgoing = self.outgoing.lock().map_err(|_| NetworkError::Io {
+                    operation: "initialize object RPC response transfer".to_string(),
+                    detail: "outgoing transfer state lock poisoned".to_string(),
+                })?;
+                outgoing.initialized = true;
+                outgoing.transfer_id = body_open.as_ref().map(|open| open.transfer_id.clone());
+                outgoing.complete = body_open.is_none();
+            }
+            let payload = SessionWirePayload::ResponseHead {
                 response: response.response,
                 body: body_open.clone(),
-            },
-        )
-        .await?;
+            };
+            let head_bytes = writer.encoded_control_len(payload.clone())?;
+            if head_bytes > MAX_TRANSFER_CONTROL_FRAME_BYTES {
+                return Err(NetworkError::FrameTooLarge {
+                    actual_bytes: head_bytes,
+                    max_bytes: MAX_TRANSFER_CONTROL_FRAME_BYTES,
+                });
+            }
+            writer.send(payload).await?;
+            body_open
+        };
         if let Some(open) = body_open {
             let feedback = self.feedback.take().ok_or_else(|| NetworkError::Io {
                 operation: "start object RPC response transfer".to_string(),
@@ -1792,6 +1902,20 @@ impl ObjectRpcBodySource {
             lifetime_guards: Arc::new(Mutex::new(Vec::new())),
             finish_proof: BodyFinishProofSource::Local(None),
         }
+    }
+
+    fn replace_empty_with_bytes(&mut self, bytes: Vec<u8>) -> Result<(), NetworkError> {
+        if !self.is_empty() || !matches!(self.finish_proof, BodyFinishProofSource::Local(_)) {
+            return Err(NetworkError::Serialization {
+                detail: "cannot replace a non-empty or forwarded object RPC body source"
+                    .to_string(),
+            });
+        }
+        self.kind = ObjectRpcBodySourceKind::Bytes(ReplayableBytes {
+            bytes: Arc::from(bytes),
+        });
+        self.finish_proof = BodyFinishProofSource::Local(None);
+        Ok(())
     }
 
     pub fn file(path: impl Into<PathBuf>) -> Result<Self, NetworkError> {
@@ -2874,6 +2998,19 @@ impl ObjectRpcSessionResponse {
     pub fn buffered(response: crate::ObjectRpcResponse) -> Self {
         Self::new(response, ObjectRpcBodySource::empty())
     }
+
+    fn spill_buffered_response_body(&mut self) -> Result<(), NetworkError> {
+        if !self.body.is_empty() || self.response.body.is_empty() {
+            return Ok(());
+        }
+        let bytes = std::mem::take(&mut self.response.body);
+        self.response.metadata.insert(
+            OBJECT_RPC_BUFFERED_RESPONSE_BODY_METADATA_KEY.to_string(),
+            OBJECT_RPC_BUFFERED_RESPONSE_BODY_METADATA_VALUE.to_string(),
+        );
+        self.body.replace_empty_with_bytes(bytes)?;
+        Ok(())
+    }
 }
 
 /// Client-side received response head and body.
@@ -2917,6 +3054,37 @@ impl ObjectRpcSessionResult {
 
     pub(crate) const fn response_origin_verified(&self) -> bool {
         self.response_origin_verified
+    }
+
+    pub(crate) async fn restore_large_buffered_response_body(
+        mut self,
+    ) -> Result<Self, NetworkError> {
+        let Some(version) = self
+            .response
+            .metadata
+            .get(OBJECT_RPC_BUFFERED_RESPONSE_BODY_METADATA_KEY)
+        else {
+            return Ok(self);
+        };
+        if version != OBJECT_RPC_BUFFERED_RESPONSE_BODY_METADATA_VALUE
+            || !self.response.body.is_empty()
+            || self.body.is_empty()
+        {
+            return Err(NetworkError::Serialization {
+                detail: "invalid buffered object RPC response transfer marker".to_string(),
+            });
+        }
+        let body = std::mem::replace(&mut self.body, ObjectRpcIncomingBody::empty());
+        self.response.body = body
+            .collect_to_vec(crate::OBJECT_RPC_UNARY_ADAPTER_MAX_BODY_BYTES)
+            .await?;
+        self.response
+            .metadata
+            .remove(OBJECT_RPC_BUFFERED_RESPONSE_BODY_METADATA_KEY);
+        self.response
+            .metadata
+            .remove(OBJECT_RPC_RESPONSE_HEAD_PROOF_METADATA_KEY);
+        Ok(self)
     }
 }
 
@@ -3772,6 +3940,211 @@ mod body_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn large_buffered_response_uses_transfer_body_and_restores_payload() {
+        let client_root = sinomo_testdir::TestDir::new("sinomo-session-buffered-client");
+        let server_root = sinomo_testdir::TestDir::new("sinomo-session-buffered-server");
+        let client_data_dir = SinomoDataDir::new(client_root.path());
+        let server_data_dir = SinomoDataDir::new(server_root.path());
+        let server_public_key = proof_public_key(&server_data_dir);
+        let response_bytes = vec![0x92_u8; 237_451];
+        let expected_response = response_bytes.clone();
+        let request = crate::ObjectRpcRequest::encode_body(
+            "/test/session/large-buffered-response",
+            "test",
+            &"request-head",
+        )
+        .expect("request head");
+        let prepared = ObjectRpcSessionCall::buffered(request)
+            .prepare_for_signing()
+            .expect("prepare session call");
+        let request_auth =
+            sign_daemon_rpc_request_from_data_dir(&client_data_dir, &prepared.request)
+                .expect("request auth");
+        let (client_stream, server_stream) = tokio::io::duplex(128 * 1024);
+        let server = tokio::spawn(async move {
+            let (_request, responder) = accept_object_rpc_server_session(
+                Box::new(server_stream),
+                server_data_dir,
+                NetworkCallPolicy::default(),
+                authenticate_test_request,
+            )
+            .await
+            .expect("accept session");
+            responder
+                .respond(ObjectRpcSessionResponse::buffered(
+                    crate::ObjectRpcResponse::from_encoded_body(
+                        "/test/session/large-buffered-response",
+                        response_bytes,
+                    ),
+                ))
+                .await
+                .expect("send large buffered response");
+        });
+        let result = start_object_rpc_client_session(
+            Box::new(client_stream),
+            prepared,
+            request_auth,
+            client_data_dir,
+            server_public_key.clone(),
+            server_public_key,
+            NetworkCallPolicy::default(),
+        )
+        .await
+        .expect("receive transferred buffered response");
+        assert!(result.response.body.is_empty());
+        assert!(!result.body.is_empty());
+        let result = result
+            .restore_large_buffered_response_body()
+            .await
+            .expect("restore buffered response payload");
+
+        assert_eq!(result.response.body, expected_response);
+        assert!(result.body.is_empty());
+        assert!(
+            !result
+                .response
+                .metadata
+                .contains_key(OBJECT_RPC_BUFFERED_RESPONSE_BODY_METADATA_KEY)
+        );
+        assert!(
+            !result
+                .response
+                .metadata
+                .contains_key(OBJECT_RPC_RESPONSE_HEAD_PROOF_METADATA_KEY)
+        );
+        server.await.expect("server task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn oversized_metadata_only_response_remains_a_control_frame_error() {
+        let client_root = sinomo_testdir::TestDir::new("sinomo-session-metadata-client");
+        let server_root = sinomo_testdir::TestDir::new("sinomo-session-metadata-server");
+        let client_data_dir = SinomoDataDir::new(client_root.path());
+        let server_data_dir = SinomoDataDir::new(server_root.path());
+        let server_public_key = proof_public_key(&server_data_dir);
+        let request = crate::ObjectRpcRequest::encode_body(
+            "/test/session/oversized-metadata",
+            "test",
+            &"request-head",
+        )
+        .expect("request head");
+        let prepared = ObjectRpcSessionCall::buffered(request)
+            .prepare_for_signing()
+            .expect("prepare session call");
+        let request_auth =
+            sign_daemon_rpc_request_from_data_dir(&client_data_dir, &prepared.request)
+                .expect("request auth");
+        let (client_stream, server_stream) = tokio::io::duplex(128 * 1024);
+        let server = tokio::spawn(async move {
+            let (_request, responder) = accept_object_rpc_server_session(
+                Box::new(server_stream),
+                server_data_dir,
+                NetworkCallPolicy::default(),
+                authenticate_test_request,
+            )
+            .await
+            .expect("accept session");
+            let mut response = crate::ObjectRpcResponse::from_encoded_body(
+                "/test/session/oversized-metadata",
+                Vec::new(),
+            );
+            response.metadata.insert(
+                "test-oversized-metadata".to_string(),
+                "x".repeat(128 * 1024),
+            );
+            responder
+                .respond(ObjectRpcSessionResponse::buffered(response))
+                .await
+        });
+        let client_error = start_object_rpc_client_session(
+            Box::new(client_stream),
+            prepared,
+            request_auth,
+            client_data_dir,
+            server_public_key.clone(),
+            server_public_key,
+            NetworkCallPolicy::default(),
+        )
+        .await
+        .expect_err("oversized metadata-only response must close before a head arrives");
+        assert!(matches!(client_error, NetworkError::Io { .. }));
+        let server_error = server
+            .await
+            .expect("server task")
+            .expect_err("metadata-only head cannot spill");
+        assert!(matches!(
+            server_error,
+            NetworkError::FrameTooLarge {
+                max_bytes: MAX_TRANSFER_CONTROL_FRAME_BYTES,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn local_response_cannot_claim_the_reserved_buffered_transfer_marker() {
+        let client_root = sinomo_testdir::TestDir::new("sinomo-session-marker-client");
+        let server_root = sinomo_testdir::TestDir::new("sinomo-session-marker-server");
+        let client_data_dir = SinomoDataDir::new(client_root.path());
+        let server_data_dir = SinomoDataDir::new(server_root.path());
+        let server_public_key = proof_public_key(&server_data_dir);
+        let request = crate::ObjectRpcRequest::encode_body(
+            "/test/session/reserved-marker",
+            "test",
+            &"request-head",
+        )
+        .expect("request head");
+        let prepared = ObjectRpcSessionCall::buffered(request)
+            .prepare_for_signing()
+            .expect("prepare session call");
+        let request_auth =
+            sign_daemon_rpc_request_from_data_dir(&client_data_dir, &prepared.request)
+                .expect("request auth");
+        let (client_stream, server_stream) = tokio::io::duplex(128 * 1024);
+        let server = tokio::spawn(async move {
+            let (_request, responder) = accept_object_rpc_server_session(
+                Box::new(server_stream),
+                server_data_dir,
+                NetworkCallPolicy::default(),
+                authenticate_test_request,
+            )
+            .await
+            .expect("accept session");
+            let mut response = crate::ObjectRpcResponse::from_encoded_body(
+                "/test/session/reserved-marker",
+                Vec::new(),
+            );
+            response.metadata.insert(
+                OBJECT_RPC_BUFFERED_RESPONSE_BODY_METADATA_KEY.to_string(),
+                OBJECT_RPC_BUFFERED_RESPONSE_BODY_METADATA_VALUE.to_string(),
+            );
+            responder
+                .respond(ObjectRpcSessionResponse::new(
+                    response,
+                    ObjectRpcBodySource::bytes(b"semantic-stream".to_vec()),
+                ))
+                .await
+        });
+        let client_error = start_object_rpc_client_session(
+            Box::new(client_stream),
+            prepared,
+            request_auth,
+            client_data_dir,
+            server_public_key.clone(),
+            server_public_key,
+            NetworkCallPolicy::default(),
+        )
+        .await
+        .expect_err("reserved local marker must prevent a response head");
+        assert!(matches!(client_error, NetworkError::Io { .. }));
+        let server_error = server
+            .await
+            .expect("server task")
+            .expect_err("local response marker must be rejected");
+        assert!(matches!(server_error, NetworkError::Serialization { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ignored_request_body_is_drained_without_spooling_or_losing_the_response() {
         let client_root = sinomo_testdir::TestDir::new("sinomo-session-ignore-body-client");
         let server_root = sinomo_testdir::TestDir::new("sinomo-session-ignore-body-server");
@@ -3824,6 +4197,13 @@ mod body_tests {
         )
         .await
         .expect("ignored request body must still complete its transport");
+        assert!(result.body.is_empty());
+        assert!(
+            !result
+                .response
+                .metadata
+                .contains_key(OBJECT_RPC_BUFFERED_RESPONSE_BODY_METADATA_KEY)
+        );
         assert_eq!(
             result
                 .response

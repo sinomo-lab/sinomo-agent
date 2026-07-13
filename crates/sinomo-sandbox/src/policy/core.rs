@@ -72,6 +72,13 @@ impl std::error::Error for SandboxSchedulingError {}
 pub struct SandboxPolicy {
     #[serde(default)]
     pub allowed_mount_prefixes: Vec<String>,
+    /// Permit explicitly allowlisted SIFS prefixes to be mounted read-write.
+    ///
+    /// This remains false for persisted policies that predate the field and
+    /// for the default policy. Callers granting it must still add the exact
+    /// source prefix to `allowed_mount_prefixes`.
+    #[serde(default)]
+    pub allow_read_write_sifs_mounts: bool,
     #[serde(default)]
     pub allow_remote_local_owned_mounts: bool,
     #[serde(default)]
@@ -102,7 +109,8 @@ pub struct SandboxPolicy {
 impl Default for SandboxPolicy {
     fn default() -> Self {
         Self {
-            allowed_mount_prefixes: vec![SIFS_SANDBOX_ROOT.to_string()],
+            allowed_mount_prefixes: vec![SIFS_SANDBOX_SHARED_ROOT.to_string()],
+            allow_read_write_sifs_mounts: false,
             allow_remote_local_owned_mounts: false,
             allowed_command_capabilities: BTreeSet::new(),
             allowed_toolchain_ids: BTreeSet::new(),
@@ -302,7 +310,16 @@ impl SandboxPolicy {
                     format!("duplicate mount path {}", mount.mount_path),
                 ));
             }
-            let source = normalize_sandbox_sifs_root(&mount.source_sifs_path);
+            let source = canonical_sandbox_mount_source(&mount.source_sifs_path)
+                .map_err(|detail| SandboxPolicyDenial::new("mount-source-noncanonical", detail))?;
+            if mount.mode == SandboxMountMode::ReadWrite && !self.allow_read_write_sifs_mounts {
+                return Err(SandboxPolicyDenial::new(
+                    "mount-shared-rw-capability-required",
+                    format!(
+                        "read-write mount source {source} requires an explicit reviewed sharing capability"
+                    ),
+                ));
+            }
             if !self
                 .allowed_mount_prefixes
                 .iter()
@@ -912,6 +929,28 @@ pub fn effective_sandbox_timeout_ms(requested_timeout_ms: u64, limit_timeout_ms:
     }
 }
 
+pub fn canonical_sandbox_mount_source(source: &str) -> Result<String, String> {
+    if !source.starts_with('/') || source == "/" {
+        return Err(format!(
+            "mount source must be a non-root absolute path: {source}"
+        ));
+    }
+    if source.contains('\0')
+        || source.contains("//")
+        || source.ends_with('/')
+        || source.split('/').skip(1).any(|part| {
+            part.is_empty()
+                || part == "."
+                || part == ".."
+                || part.eq_ignore_ascii_case("%2e")
+                || part.eq_ignore_ascii_case("%2e%2e")
+        })
+    {
+        return Err(format!("mount source is not canonical: {source}"));
+    }
+    Ok(source.to_string())
+}
+
 fn sifs_path_has_prefix(path: &str, prefix: &str) -> bool {
     let path = normalize_sandbox_sifs_root(path);
     let prefix = normalize_sandbox_sifs_root(prefix);
@@ -995,5 +1034,155 @@ mod tests {
             .expect("decode entries")
             .expect("policy config");
         assert_eq!(decoded, config);
+    }
+
+    fn manifest_with_mount(source: &str, mode: SandboxMountMode) -> SandboxInstanceManifest {
+        let sandbox_id = SandboxId::from_legacy_named("mount_policy_sandbox").expect("sandbox id");
+        let toolchain_id =
+            SandboxToolchainId::from_legacy_named("mount_policy_toolchain").expect("toolchain id");
+        let mut manifest =
+            SandboxInstanceManifest::new(sandbox_id, toolchain_id, OffsetDateTime::UNIX_EPOCH)
+                .expect("manifest");
+        manifest.mounts.push(SandboxMount {
+            source_sifs_path: source.to_string(),
+            mount_path: SandboxPath::new("/mnt/share").expect("mount path"),
+            mode,
+        });
+        manifest
+    }
+
+    #[test]
+    fn default_mount_policy_denies_non_shared_namespaces() {
+        let policy = SandboxPolicy::default();
+        let node = NodeId::from_legacy_named("mount_policy_node").expect("node");
+        for source in [
+            "/services/sandbox",
+            "/services/sandbox/instances/other/work",
+            "/services/sandbox/control/other/manifest.sobj",
+            "/services/sandbox/generations/other/txn/work",
+            "/services/sandbox/locks/other.lock",
+            "/services/sandbox/toolchains/tool/bin/sh.wasm",
+            "/services/sandbox/legacy-backups/other/txn",
+        ] {
+            let denial = policy
+                .validate_manifest(
+                    &manifest_with_mount(source, SandboxMountMode::ReadOnly),
+                    &node,
+                )
+                .expect_err("managed source must be denied");
+            assert_eq!(denial.code, "mount-source-denied", "{source}");
+        }
+    }
+
+    #[test]
+    fn mount_policy_rejects_noncanonical_and_encoded_traversal() {
+        let policy = SandboxPolicy::default();
+        let node = NodeId::from_legacy_named("mount_traversal_node").expect("node");
+        for source in [
+            "/services/sandbox-shared/share/../../sandbox/control",
+            "/services//sandbox-shared/share",
+            "/services/sandbox-shared/%2e%2e/control",
+            "/services/sandbox-shared/share/",
+        ] {
+            let denial = policy
+                .validate_manifest(
+                    &manifest_with_mount(source, SandboxMountMode::ReadOnly),
+                    &node,
+                )
+                .expect_err("noncanonical source must be denied");
+            assert_eq!(denial.code, "mount-source-noncanonical", "{source}");
+        }
+    }
+
+    #[test]
+    fn explicit_share_is_read_only_without_reviewed_write_capability() {
+        let policy = SandboxPolicy::default();
+        let node = NodeId::from_legacy_named("mount_share_node").expect("node");
+        policy
+            .validate_manifest(
+                &manifest_with_mount(
+                    "/services/sandbox-shared/team/data",
+                    SandboxMountMode::ReadOnly,
+                ),
+                &node,
+            )
+            .expect("read-only explicit share");
+        let denial = policy
+            .validate_manifest(
+                &manifest_with_mount(
+                    "/services/sandbox-shared/team/data",
+                    SandboxMountMode::ReadWrite,
+                ),
+                &node,
+            )
+            .expect_err("write requires reviewed capability");
+        assert_eq!(denial.code, "mount-shared-rw-capability-required");
+    }
+
+    #[test]
+    fn reviewed_read_write_capability_still_requires_an_allowlisted_prefix() {
+        let mut policy = SandboxPolicy {
+            allow_read_write_sifs_mounts: true,
+            ..SandboxPolicy::default()
+        };
+        let node = NodeId::from_legacy_named("mount_rw_capability_node").expect("node");
+        let agent_home = manifest_with_mount(
+            "/sinomo/agents/test-agent/home",
+            SandboxMountMode::ReadWrite,
+        );
+
+        let denial = policy
+            .validate_manifest(&agent_home, &node)
+            .expect_err("unlisted read-write prefix remains denied");
+        assert_eq!(denial.code, "mount-source-denied");
+
+        policy
+            .allowed_mount_prefixes
+            .push("/sinomo/agents".to_string());
+        policy
+            .validate_manifest(&agent_home, &node)
+            .expect("explicitly reviewed read-write prefix");
+    }
+
+    #[test]
+    fn explicit_read_only_prefixes_and_local_owned_placement_remain_composable() {
+        let owner = NodeId::from_legacy_named("mount_policy_owner").expect("owner");
+        let other = NodeId::from_legacy_named("mount_policy_other").expect("other");
+        let mut policy = SandboxPolicy::default();
+        policy
+            .allowed_mount_prefixes
+            .extend(["/users/shared".to_string(), "/sinomo/nodes".to_string()]);
+
+        policy
+            .validate_manifest(
+                &manifest_with_mount("/users/shared/team", SandboxMountMode::ReadOnly),
+                &other,
+            )
+            .expect("explicit read-only prefix");
+
+        let local_owned = manifest_with_mount(
+            &format!("/sinomo/nodes/{owner}/files/project"),
+            SandboxMountMode::ReadOnly,
+        );
+        policy
+            .validate_manifest(&local_owned, &owner)
+            .expect("local-owned mount on owner");
+        let denial = policy
+            .validate_manifest(&local_owned, &other)
+            .expect_err("remote local-owned mount remains denied");
+        assert_eq!(denial.code, "mount-local-owned-remote-denied");
+    }
+
+    #[test]
+    fn read_write_mount_capability_defaults_false_when_deserializing_legacy_policy() {
+        let mut value = serde_json::to_value(SandboxPolicy::default()).expect("policy json");
+        value
+            .as_object_mut()
+            .expect("policy object")
+            .remove("allow_read_write_sifs_mounts");
+
+        let policy: SandboxPolicy = serde_json::from_value(value).expect("legacy policy");
+
+        assert!(!policy.allow_read_write_sifs_mounts);
     }
 }

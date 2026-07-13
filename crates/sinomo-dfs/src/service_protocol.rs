@@ -209,7 +209,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNetworkMessage::BulkReadResponse(response) => {
                 events.push(self.handle_networked_bulk_read_response(source_node_id, response)?);
             }
-            DfsNetworkMessage::DistributedWriteRequest(command) => {
+            DfsNetworkMessage::DistributedWriteRequest(mut command) => {
+                // The additive command field is internal transfer state, not a
+                // wire-level capability: peers predating it would ignore it.
+                // Only the distinct message variant may request fail-closed
+                // exclusive creation.
+                command.exclusive_create = false;
+                events.push(self.handle_distributed_write_request(source_node_id, command)?);
+            }
+            DfsNetworkMessage::ExclusiveCreateRequest(mut command) => {
+                command.exclusive_create = true;
                 events.push(self.handle_distributed_write_request(source_node_id, command)?);
             }
             DfsNetworkMessage::DistributedWriteResponse(response) => {

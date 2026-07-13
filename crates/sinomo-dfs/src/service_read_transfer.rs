@@ -838,9 +838,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         },
                     });
                 }
-                if let Some(expected_size) = pending.content_size_bytes
-                    && expected_size != data.total_size_bytes
-                {
+                let Some(expected_size) = pending.content_size_bytes else {
+                    return Ok(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                        request_id: response.request_id,
+                        object_id: response.object_id,
+                        source_node_id,
+                        result: DfsReadResult::Rejected {
+                            reason: "DFS range read request lacks authoritative object size"
+                                .to_string(),
+                        },
+                    });
+                };
+                if expected_size != data.total_size_bytes {
                     self.mark_remote_read_location_missing(
                         &pending.object_id,
                         &pending.version,
@@ -859,8 +868,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         },
                     });
                 }
-                let expected_offset = requested_offset.min(data.total_size_bytes);
+                let expected_offset = requested_offset.min(expected_size);
                 if data.offset != expected_offset {
+                    self.mark_remote_read_location_missing(
+                        &pending.object_id,
+                        &pending.version,
+                        &pending.content_hash,
+                        &source_node_id,
+                    )?;
                     return Ok(NetworkedDfsServiceEvent::RemoteReadCompleted {
                         request_id: response.request_id,
                         object_id: response.object_id,
@@ -873,20 +888,34 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         },
                     });
                 }
-                if data.bytes.len() > requested_max_bytes {
+                let expected_range_size =
+                    range_transfer_size_bytes(expected_size, requested_offset, requested_max_bytes);
+                let actual_range_size = u64::try_from(data.bytes.len()).unwrap_or(u64::MAX);
+                if actual_range_size != expected_range_size {
+                    self.mark_remote_read_location_missing(
+                        &pending.object_id,
+                        &pending.version,
+                        &pending.content_hash,
+                        &source_node_id,
+                    )?;
                     return Ok(NetworkedDfsServiceEvent::RemoteReadCompleted {
                         request_id: response.request_id,
                         object_id: response.object_id,
                         source_node_id,
                         result: DfsReadResult::Rejected {
                             reason: format!(
-                                "DFS range read response exceeds requested window: expected at most {requested_max_bytes}, actual {}",
-                                data.bytes.len()
+                                "DFS range read response length mismatch: expected {expected_range_size}, actual {actual_range_size}"
                             ),
                         },
                     });
                 }
                 let Some(range_end) = data.offset.checked_add(data.bytes.len() as u64) else {
+                    self.mark_remote_read_location_missing(
+                        &pending.object_id,
+                        &pending.version,
+                        &pending.content_hash,
+                        &source_node_id,
+                    )?;
                     return Ok(NetworkedDfsServiceEvent::RemoteReadCompleted {
                         request_id: response.request_id,
                         object_id: response.object_id,
@@ -897,6 +926,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     });
                 };
                 if range_end > data.total_size_bytes {
+                    self.mark_remote_read_location_missing(
+                        &pending.object_id,
+                        &pending.version,
+                        &pending.content_hash,
+                        &source_node_id,
+                    )?;
                     return Ok(NetworkedDfsServiceEvent::RemoteReadCompleted {
                         request_id: response.request_id,
                         object_id: response.object_id,

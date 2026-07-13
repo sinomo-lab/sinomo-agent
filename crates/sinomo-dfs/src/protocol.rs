@@ -1,10 +1,11 @@
 use crate::{
     DfsAdvisoryLockCommand, DfsAdvisoryLockOutcome, DfsAdvisoryLockStateRecord, DfsConflictRecord,
     DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataShardConfig, DfsMetadataShardId,
-    DfsMetadataTableSnapshot, DfsNamespaceTransaction, DfsObjectId, DfsObjectMetadata,
-    DfsObjectVersionRecord, DfsPosixDirectorySyncCertificate, DfsPosixDirectorySyncTarget,
-    DfsPosixFileSyncCertificate, DfsPosixFileSyncTarget, DfsReplicaReceiptRecord,
-    DfsReplicationPolicy, DfsVersion, DfsWriteIntentRecord, NetworkedDfsWriteOutcome,
+    DfsMetadataTableSnapshot, DfsNamespaceJobRecord, DfsNamespaceTransaction, DfsObjectId,
+    DfsObjectMetadata, DfsObjectVersionRecord, DfsPosixCreateAttrs,
+    DfsPosixDirectorySyncCertificate, DfsPosixDirectorySyncTarget, DfsPosixFileSyncCertificate,
+    DfsPosixFileSyncTarget, DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsVersion,
+    DfsWriteIntentRecord, NetworkedDfsWriteOutcome,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
@@ -160,6 +161,10 @@ pub struct DfsDistributedWriteCommand {
     pub touch_parent_on_create: bool,
     #[serde(default = "default_true")]
     pub foreground_replica_repair: bool,
+    /// Reject the write at the metadata authority if the path already names a
+    /// current object. Used by POSIX O_EXCL/mknod and symlink creation.
+    #[serde(default)]
+    pub exclusive_create: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -233,6 +238,10 @@ pub enum DfsNamespaceOperation {
     Mkdir {
         path: String,
     },
+    MkdirWithAttrs {
+        path: String,
+        attrs: DfsPosixCreateAttrs,
+    },
     MkdirAll {
         path: String,
     },
@@ -246,6 +255,22 @@ pub enum DfsNamespaceOperation {
         from: String,
         to: String,
     },
+    RenameSingleNamespaceAtomic {
+        from: String,
+        to: String,
+        expected_shard_id: String,
+        expected_shard_epoch: u64,
+    },
+    RenameDirectoryBounded {
+        from: String,
+        to: String,
+        max_steps: u64,
+    },
+    ResumeNamespaceJobBounded {
+        job_id: String,
+        path: String,
+        max_steps: u64,
+    },
     Hardlink {
         existing_path: String,
         link_path: String,
@@ -255,6 +280,11 @@ pub enum DfsNamespaceOperation {
         mode: u32,
     },
     SetOwner {
+        path: String,
+        uid: u32,
+        gid: u32,
+    },
+    SetSymlinkOwner {
         path: String,
         uid: u32,
         gid: u32,
@@ -371,20 +401,27 @@ impl DfsNamespaceOperation {
     pub fn involved_paths(&self) -> Vec<&str> {
         match self {
             DfsNamespaceOperation::Mkdir { path }
+            | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
             | DfsNamespaceOperation::MkdirAll { path }
             | DfsNamespaceOperation::Rmdir { path }
             | DfsNamespaceOperation::Unlink { path }
             | DfsNamespaceOperation::SetMode { path, .. }
             | DfsNamespaceOperation::SetOwner { path, .. }
+            | DfsNamespaceOperation::SetSymlinkOwner { path, .. }
             | DfsNamespaceOperation::SetTimes { path, .. }
             | DfsNamespaceOperation::TouchDirectoryModified { path }
             | DfsNamespaceOperation::ClearDirRecursive { path }
             | DfsNamespaceOperation::SyncPath { path }
-            | DfsNamespaceOperation::LookupPath { path } => vec![path],
+            | DfsNamespaceOperation::LookupPath { path }
+            | DfsNamespaceOperation::ResumeNamespaceJobBounded { path, .. } => vec![path],
             DfsNamespaceOperation::LookupPaths { paths } => {
                 paths.iter().map(String::as_str).collect()
             }
-            DfsNamespaceOperation::Rename { from, to } => vec![from, to],
+            DfsNamespaceOperation::Rename { from, to }
+            | DfsNamespaceOperation::RenameSingleNamespaceAtomic { from, to, .. }
+            | DfsNamespaceOperation::RenameDirectoryBounded { from, to, .. } => {
+                vec![from, to]
+            }
             DfsNamespaceOperation::Hardlink {
                 existing_path,
                 link_path,
@@ -430,6 +467,7 @@ pub struct DfsNamespaceResponse {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsPosixCoordinationResult {
+    NamespaceJob(DfsNamespaceJobRecord),
     AdvisoryLock(DfsAdvisoryLockOutcome),
     /// Capability acknowledgement for a lock-bearing cross-shard adoption.
     /// An older destination that ignores the optional lock aggregate cannot
@@ -764,6 +802,10 @@ pub enum DfsNetworkMessage {
     WriteRequest(DfsWriteCommand),
     WriteResponse(DfsWriteResponse),
     DistributedWriteRequest(DfsDistributedWriteCommand),
+    /// Exclusive namespace creation. Kept as a distinct message variant so
+    /// older peers reject it instead of ignoring an additive flag and
+    /// accidentally executing it as an overwrite-capable write.
+    ExclusiveCreateRequest(DfsDistributedWriteCommand),
     DistributedWriteResponse(DfsDistributedWriteResponse),
     NamespaceRequest(DfsNamespaceCommand),
     NamespaceResponse(DfsNamespaceResponse),

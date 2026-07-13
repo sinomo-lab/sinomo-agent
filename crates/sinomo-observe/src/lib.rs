@@ -563,10 +563,16 @@ where
             path: path.display().to_string(),
             detail: source.to_string(),
         })?;
-        if line.trim().is_empty() {
+        // A Windows process killed during an append can leave a sparse,
+        // zero-filled prefix before the next complete JSONL record. Recover
+        // that complete record without weakening validation of the JSON that
+        // follows the hole.
+        let line = line.trim();
+        let line = line.trim_start_matches('\0').trim_start();
+        if line.is_empty() {
             continue;
         }
-        let record: T = serde_json::from_str(&line).map_err(|source| ObserveError::Json {
+        let record: T = serde_json::from_str(line).map_err(|source| ObserveError::Json {
             path: format!("{}:{}", path.display(), index + 1),
             detail: source.to_string(),
         })?;
@@ -1031,6 +1037,88 @@ mod tests {
         .expect("read limited events");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].event.kind.as_str(), "rollout.stage.progress");
+    }
+
+    #[test]
+    fn operational_events_recover_zero_filled_windows_append_hole() {
+        let root = unique_temp("sinomo-daemon-operational-zero-hole");
+        let path = operational_events_path(&root);
+        append_operational_event(
+            &root,
+            None,
+            OperationalSeverity::Info,
+            "daemon-control",
+            "daemon.lifecycle.started",
+            "first daemon start",
+            None,
+            serde_json::Value::Null,
+        )
+        .expect("append first event");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open event log")
+            .write_all(&[0; 512])
+            .expect("write sparse-hole equivalent");
+        append_operational_event(
+            &root,
+            None,
+            OperationalSeverity::Info,
+            "daemon-control",
+            "daemon.lifecycle.started",
+            "second daemon start",
+            None,
+            serde_json::Value::Null,
+        )
+        .expect("append second event");
+
+        let records = read_operational_events(
+            &root,
+            &OperationalEventQuery {
+                limit: 10,
+                ..OperationalEventQuery::default()
+            },
+        )
+        .expect("read events around sparse hole");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].message, "first daemon start");
+        assert_eq!(records[1].message, "second daemon start");
+    }
+
+    #[test]
+    fn operational_events_reject_trailing_zero_corruption() {
+        let root = unique_temp("sinomo-daemon-operational-trailing-zero");
+        let path = operational_events_path(&root);
+        let record = append_operational_event(
+            &root,
+            None,
+            OperationalSeverity::Info,
+            "daemon-control",
+            "daemon.lifecycle.started",
+            "valid daemon start",
+            None,
+            serde_json::Value::Null,
+        )
+        .expect("append valid event");
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open event log");
+        serde_json::to_writer(&mut file, &record).expect("append corrupt event payload");
+        file.write_all(b"\0\n")
+            .expect("append trailing zero corruption");
+
+        let error = read_operational_events(
+            &root,
+            &OperationalEventQuery {
+                limit: 10,
+                ..OperationalEventQuery::default()
+            },
+        )
+        .expect_err("trailing zero must remain invalid JSON");
+
+        assert!(matches!(error, ObserveError::Json { .. }));
     }
 
     #[test]

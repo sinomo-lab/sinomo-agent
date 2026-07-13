@@ -22,3 +22,6 @@ thiserror.workspace = true
 [target.'cfg(unix)'.dependencies]
 fuser = { version = "0.15", optional = true, default-features = false, features = ["abi-7-31"] }
 libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+sinomo-testdir = { path = "../sinomo-testdir" }

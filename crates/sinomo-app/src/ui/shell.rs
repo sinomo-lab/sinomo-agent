@@ -160,20 +160,24 @@ impl Shell {
     }
 
     fn schedule_chat_session_timer(&self, ctx: &mut EventCtx) {
-        if self.chat_session_timer.get().is_some() || !self.shared.is_ready() {
+        if self.chat_session_timer.get().is_some()
+            || !self.shared.is_ready()
+            || self.shared.borrow().waker.is_none()
+        {
             return;
         }
-        if self.shared.chat().session_list_is_loading() {
-            let token = ctx.schedule_timer_after(1.0);
-            self.chat_session_timer.set(Some(token));
-        }
+        let token = ctx.schedule_timer_after(chat::MULTI_DEVICE_SYNC_INTERVAL_SECS);
+        self.chat_session_timer.set(Some(token));
     }
 
     fn drain_chat_session_timer(&self, ctx: &mut EventCtx) -> bool {
         if !self.shared.is_ready() {
             return false;
         }
-        let changed = self.shared.chat_mut().pump_session_list();
+        let mut chat = self.shared.chat_mut();
+        chat.begin_multi_device_sync();
+        let changed = chat.pump_session_list() || chat.pump_transcript_load();
+        drop(chat);
         self.schedule_chat_session_timer(ctx);
         changed
     }
@@ -187,7 +191,10 @@ impl Shell {
     }
 
     fn schedule_health_probe_timer(&self, ctx: &mut EventCtx) {
-        if !self.shared.is_ready() || self.health_probe_timer.get().is_some() {
+        if !self.shared.is_ready()
+            || self.health_probe_timer.get().is_some()
+            || self.shared.borrow().waker.is_none()
+        {
             return;
         }
         self.health_probe_timer

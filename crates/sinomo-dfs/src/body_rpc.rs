@@ -43,14 +43,16 @@ pub(crate) fn split_dfs_message_request_body(
             let digest = content_hash(&bytes);
             (bytes, digest)
         }
-        DfsNetworkMessage::DistributedWriteRequest(command) => {
+        DfsNetworkMessage::DistributedWriteRequest(command)
+        | DfsNetworkMessage::ExclusiveCreateRequest(command) => {
             let bytes = std::mem::take(&mut command.bytes);
-            let digest = command
-                .content_hash
-                .clone()
-                .unwrap_or_else(|| content_hash(&bytes));
-            command.content_hash = Some(digest.clone());
-            command.content_size_bytes = u64::try_from(bytes.len()).ok();
+            // These bytes are still an inline DFS write semantically; only
+            // their wire transport is streamed as an RPC attachment. Keep the
+            // manifest fields empty in the head so reassembly cannot turn the
+            // command into an invalid manifest-plus-inline hybrid.
+            let digest = content_hash(&bytes);
+            command.content_hash = None;
+            command.content_size_bytes = None;
             (bytes, digest)
         }
         DfsNetworkMessage::StageBlob(command) => (
@@ -101,9 +103,10 @@ pub(crate) fn attach_dfs_message_request_body(
     validate_body(&head.body, &bytes, "DFS request")?;
     match &mut head.command.routed_message.message {
         DfsNetworkMessage::WriteRequest(command) => command.bytes = bytes,
-        DfsNetworkMessage::DistributedWriteRequest(command) => {
-            command.content_hash = head.body.content_hash.clone();
-            command.content_size_bytes = Some(head.body.total_size_bytes);
+        DfsNetworkMessage::DistributedWriteRequest(command)
+        | DfsNetworkMessage::ExclusiveCreateRequest(command) => {
+            command.content_hash = None;
+            command.content_size_bytes = None;
             command.bytes = bytes;
         }
         DfsNetworkMessage::StageBlob(command) => command.bytes = bytes,
@@ -299,7 +302,11 @@ fn serialization_error(detail: impl Into<String>) -> NetworkError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DfsFileSystemId, DfsObjectId, DfsRoutedMessage, DfsStageBlobCommand, DfsVersion};
+    use crate::{
+        DfsDistributedWriteCommand, DfsFileSystemId, DfsObjectId, DfsReplicationPolicy,
+        DfsRoutedMessage, DfsStageBlobCommand, DfsVersion,
+    };
+    use sinomo_core::DfsWriteRequest;
     use sinomo_core::node::NodeId;
 
     fn stage_blob_command(bytes: Vec<u8>) -> DfsMessageCommand {
@@ -349,6 +356,69 @@ mod tests {
                 body: descriptor,
             },
             bytes,
+        )
+        .expect("attach body");
+        assert_eq!(attached, command);
+    }
+
+    #[test]
+    fn distributed_write_attachment_round_trip_preserves_inline_semantics() {
+        let source = NodeId::from_legacy_named("body-inline-source").expect("source id");
+        let target = NodeId::from_legacy_named("body-inline-target").expect("target id");
+        let bytes = b"streamed on the wire, inline in DFS".to_vec();
+        let command = DfsMessageCommand {
+            request_id: "body-inline-request".to_string(),
+            routed_message: DfsRoutedMessage {
+                source_node_id: source.clone(),
+                target_node_id: target,
+                frame_id: 13,
+                message_id: 17,
+                message: DfsNetworkMessage::DistributedWriteRequest(DfsDistributedWriteCommand {
+                    request_id: "distributed-inline".to_string(),
+                    request: DfsWriteRequest {
+                        file_system_id: DfsFileSystemId::from_legacy_named("body-inline-fs")
+                            .expect("filesystem id"),
+                        object_id: DfsObjectId::from_legacy_named("body-inline-object")
+                            .expect("object id"),
+                        target_version: DfsVersion::from_legacy_named("body-inline-version")
+                            .expect("version"),
+                        requesting_node_id: source.clone(),
+                    },
+                    expected_base_version: None,
+                    metadata_journal_after_sequence: None,
+                    bytes: bytes.clone(),
+                    content_hash: None,
+                    content_size_bytes: None,
+                    desired_replica_nodes: vec![source],
+                    policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+                    object_metadata: None,
+                    touch_parent_on_create: true,
+                    foreground_replica_repair: true,
+                    exclusive_create: false,
+                }),
+            },
+        };
+
+        let (head, descriptor, body) =
+            split_dfs_message_request_body(&command).expect("split body");
+        let DfsNetworkMessage::DistributedWriteRequest(head_write) = &head.routed_message.message
+        else {
+            panic!("expected distributed write head");
+        };
+        assert!(head_write.bytes.is_empty());
+        assert_eq!(head_write.content_hash, None);
+        assert_eq!(head_write.content_size_bytes, None);
+        assert_eq!(
+            descriptor.content_hash.as_deref(),
+            Some(content_hash(&bytes).as_str())
+        );
+
+        let attached = attach_dfs_message_request_body(
+            DfsBodyMessageCommand {
+                command: head,
+                body: descriptor,
+            },
+            body,
         )
         .expect("attach body");
         assert_eq!(attached, command);

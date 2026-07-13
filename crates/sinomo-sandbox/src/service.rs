@@ -19,7 +19,8 @@ use crate::{
     SANDBOX_STATUS_ROUTE, SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE,
     SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE, SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE,
     SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE, SANDBOX_UPDATE_ROUTE, SANDBOX_WRITE_ROUTE,
-    SandboxBackend, SandboxBackendError, SandboxCancellationToken, SandboxRunCancelResponse,
+    SandboxBackend, SandboxBackendError, SandboxCancellationToken, SandboxId,
+    SandboxRunCancelResponse,
 };
 use sinomo_core::network::{ObjectRpcCancelRequest, ObjectRpcRequest, ObjectRpcResponse};
 
@@ -60,6 +61,45 @@ impl SandboxBackendFactory for LocalSandboxBackendFactory {
 pub struct SandboxService {
     factory: Arc<dyn SandboxBackendFactory>,
     active_run_cancellations: Arc<Mutex<BTreeMap<String, SandboxCancellationToken>>>,
+    active_sandbox_operations: Arc<Mutex<BTreeMap<SandboxId, SandboxOperationState>>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SandboxOperationState {
+    active_runs: u64,
+    mutation_active: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SandboxOperationKind {
+    Run,
+    Mutation,
+}
+
+struct SandboxOperationGuard {
+    active: Arc<Mutex<BTreeMap<SandboxId, SandboxOperationState>>>,
+    sandbox_id: SandboxId,
+    kind: SandboxOperationKind,
+}
+
+impl Drop for SandboxOperationGuard {
+    fn drop(&mut self) {
+        let Ok(mut active) = self.active.lock() else {
+            return;
+        };
+        let Some(state) = active.get_mut(&self.sandbox_id) else {
+            return;
+        };
+        match self.kind {
+            SandboxOperationKind::Run => {
+                state.active_runs = state.active_runs.saturating_sub(1);
+            }
+            SandboxOperationKind::Mutation => state.mutation_active = false,
+        }
+        if state.active_runs == 0 && !state.mutation_active {
+            active.remove(&self.sandbox_id);
+        }
+    }
 }
 
 impl SandboxService {
@@ -67,8 +107,39 @@ impl SandboxService {
         Self {
             factory,
             active_run_cancellations: Arc::new(Mutex::new(BTreeMap::new())),
+            active_sandbox_operations: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
+}
+
+fn begin_sandbox_operation(
+    active: &Arc<Mutex<BTreeMap<SandboxId, SandboxOperationState>>>,
+    sandbox_id: &SandboxId,
+    kind: SandboxOperationKind,
+) -> Result<SandboxOperationGuard, ServiceError> {
+    let mut states = active
+        .lock()
+        .map_err(|_| ServiceError::Service("sandbox operation tracker lock failed".to_string()))?;
+    let state = states.entry(sandbox_id.clone()).or_default();
+    match kind {
+        SandboxOperationKind::Run if state.mutation_active || state.active_runs > 0 => {
+            return Err(ServiceError::Service(format!(
+                "sandbox `{sandbox_id}` already has an active execution or lifecycle mutation"
+            )));
+        }
+        SandboxOperationKind::Run => state.active_runs = state.active_runs.saturating_add(1),
+        SandboxOperationKind::Mutation if state.mutation_active || state.active_runs > 0 => {
+            return Err(ServiceError::Service(format!(
+                "sandbox `{sandbox_id}` is active; retry the lifecycle mutation after execution completes"
+            )));
+        }
+        SandboxOperationKind::Mutation => state.mutation_active = true,
+    }
+    Ok(SandboxOperationGuard {
+        active: Arc::clone(active),
+        sandbox_id: sandbox_id.clone(),
+        kind,
+    })
 }
 
 pub fn register_services(builder: ServiceRegistryBuilder) -> ServiceRegistryBuilder {
@@ -86,46 +157,77 @@ fn dispatch_sandbox_backend_request(
     backend: &mut dyn SandboxBackend,
     request: ObjectRpcRequest,
     active_run_cancellations: &Arc<Mutex<BTreeMap<String, SandboxCancellationToken>>>,
+    active_sandbox_operations: &Arc<Mutex<BTreeMap<SandboxId, SandboxOperationState>>>,
 ) -> Result<ObjectRpcResponse, ServiceError> {
     let response = match request.route.as_str() {
         SANDBOX_CREATE_ROUTE => {
-            let payload = request.decode_body()?;
+            let payload: crate::SandboxCreateInstanceRequest = request.decode_body()?;
             ObjectRpcResponse::encode_body(SANDBOX_CREATE_ROUTE, &backend.create(payload)?)?
         }
         SANDBOX_STATUS_ROUTE => {
-            let payload = request.decode_body()?;
+            let payload: crate::SandboxStatusRequest = request.decode_body()?;
             ObjectRpcResponse::encode_body(SANDBOX_STATUS_ROUTE, &backend.status(payload)?)?
         }
         SANDBOX_UPDATE_ROUTE => {
-            let payload = request.decode_body()?;
+            let payload: crate::SandboxUpdateInstanceRequest = request.decode_body()?;
+            let _guard = begin_sandbox_operation(
+                active_sandbox_operations,
+                &payload.sandbox_id,
+                SandboxOperationKind::Mutation,
+            )?;
             ObjectRpcResponse::encode_body(SANDBOX_UPDATE_ROUTE, &backend.update(payload)?)?
         }
         SANDBOX_CHECKPOINT_ROUTE => {
-            let payload = request.decode_body()?;
+            let payload: crate::SandboxCheckpointRequest = request.decode_body()?;
+            let _guard = begin_sandbox_operation(
+                active_sandbox_operations,
+                &payload.sandbox_id,
+                SandboxOperationKind::Mutation,
+            )?;
             ObjectRpcResponse::encode_body(SANDBOX_CHECKPOINT_ROUTE, &backend.checkpoint(payload)?)?
         }
         SANDBOX_RESUME_ROUTE => {
-            let payload = request.decode_body()?;
+            let payload: crate::SandboxResumeRequest = request.decode_body()?;
+            let _guard = begin_sandbox_operation(
+                active_sandbox_operations,
+                &payload.sandbox_id,
+                SandboxOperationKind::Mutation,
+            )?;
             ObjectRpcResponse::encode_body(SANDBOX_RESUME_ROUTE, &backend.resume(payload)?)?
         }
         SANDBOX_REBOOT_ROUTE => {
-            let payload = request.decode_body()?;
+            let payload: crate::SandboxRebootRequest = request.decode_body()?;
+            let _guard = begin_sandbox_operation(
+                active_sandbox_operations,
+                &payload.sandbox_id,
+                SandboxOperationKind::Mutation,
+            )?;
             ObjectRpcResponse::encode_body(SANDBOX_REBOOT_ROUTE, &backend.reboot(payload)?)?
         }
         SANDBOX_DESTROY_ROUTE => {
-            let payload = request.decode_body()?;
+            let payload: crate::SandboxDestroyRequest = request.decode_body()?;
+            let _guard = begin_sandbox_operation(
+                active_sandbox_operations,
+                &payload.sandbox_id,
+                SandboxOperationKind::Mutation,
+            )?;
             ObjectRpcResponse::encode_body(SANDBOX_DESTROY_ROUTE, &backend.destroy(payload)?)?
         }
         SANDBOX_LIST_ROUTE => {
-            let payload = request.decode_body()?;
+            let payload: crate::SandboxListRequest = request.decode_body()?;
             ObjectRpcResponse::encode_body(SANDBOX_LIST_ROUTE, &backend.list(payload)?)?
         }
         SANDBOX_READ_ROUTE => {
-            let payload = request.decode_body()?;
+            let payload: crate::SandboxReadRequest = request.decode_body()?;
             ObjectRpcResponse::encode_body(SANDBOX_READ_ROUTE, &backend.read(payload)?)?
         }
         SANDBOX_WRITE_ROUTE => {
-            let payload = request.decode_body()?;
+            let payload: crate::SandboxWriteRequest = request.decode_body()?;
+            let _guard = begin_sandbox_operation(
+                active_sandbox_operations,
+                &payload.sandbox_id,
+                SandboxOperationKind::Mutation,
+            )?;
             ObjectRpcResponse::encode_body(SANDBOX_WRITE_ROUTE, &backend.write(payload)?)?
         }
         SANDBOX_HTTP_FETCH_ROUTE => {
@@ -133,7 +235,12 @@ fn dispatch_sandbox_backend_request(
             ObjectRpcResponse::encode_body(SANDBOX_HTTP_FETCH_ROUTE, &backend.http_fetch(payload)?)?
         }
         SANDBOX_HTTP_FETCH_TO_FILE_ROUTE => {
-            let payload = request.decode_body()?;
+            let payload: crate::SandboxHttpFetchToFileRequest = request.decode_body()?;
+            let _guard = begin_sandbox_operation(
+                active_sandbox_operations,
+                &payload.sandbox_id,
+                SandboxOperationKind::Mutation,
+            )?;
             ObjectRpcResponse::encode_body(
                 SANDBOX_HTTP_FETCH_TO_FILE_ROUTE,
                 &backend.http_fetch_to_file(payload)?,
@@ -176,7 +283,12 @@ fn dispatch_sandbox_backend_request(
         }
         SANDBOX_RUN_TOOLCHAIN_ROUTE => {
             let operation_id = request.operation_id().map(str::to_string);
-            let payload = request.decode_body()?;
+            let payload: crate::SandboxRunToolchainRequest = request.decode_body()?;
+            let _guard = begin_sandbox_operation(
+                active_sandbox_operations,
+                &payload.sandbox_id,
+                SandboxOperationKind::Run,
+            )?;
             let cancellation_token = register_sandbox_run_cancellation(
                 active_run_cancellations,
                 operation_id.as_deref(),
@@ -188,7 +300,12 @@ fn dispatch_sandbox_backend_request(
         }
         SANDBOX_RUN_PROCESS_PLAN_ROUTE => {
             let operation_id = request.operation_id().map(str::to_string);
-            let payload = request.decode_body()?;
+            let payload: crate::SandboxRunProcessPlanRequest = request.decode_body()?;
+            let _guard = begin_sandbox_operation(
+                active_sandbox_operations,
+                &payload.sandbox_id,
+                SandboxOperationKind::Run,
+            )?;
             let cancellation_token = register_sandbox_run_cancellation(
                 active_run_cancellations,
                 operation_id.as_deref(),
@@ -264,8 +381,14 @@ fn dispatch_sandbox_run_cancel_request(
         .get(&operation_id)
         .cloned();
     let (cancelled, detail) = if let Some(token) = token {
-        token.cancel();
-        (true, payload.reason)
+        if token.cancel() {
+            (true, payload.reason)
+        } else {
+            (
+                false,
+                "sandbox run operation is already completing or completed".to_string(),
+            )
+        }
     } else {
         (false, "sandbox run operation is not active".to_string())
     };
@@ -321,6 +444,7 @@ impl Service for SandboxService {
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         let factory = Arc::clone(&self.factory);
         let active_run_cancellations = Arc::clone(&self.active_run_cancellations);
+        let active_sandbox_operations = Arc::clone(&self.active_sandbox_operations);
         Box::pin(async move {
             if request.route == SANDBOX_RUN_CANCEL_ROUTE {
                 let response =
@@ -330,11 +454,13 @@ impl Service for SandboxService {
             }
             let mut backend = factory.open(&ctx)?;
             let active_run_cancellations_for_task = Arc::clone(&active_run_cancellations);
+            let active_sandbox_operations_for_task = Arc::clone(&active_sandbox_operations);
             let response = tokio::task::spawn_blocking(move || {
                 dispatch_sandbox_backend_request(
                     backend.as_mut(),
                     request,
                     &active_run_cancellations_for_task,
+                    &active_sandbox_operations_for_task,
                 )
             })
             .await
@@ -564,6 +690,29 @@ exit 0
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
+        let overlapping_run = SandboxRunToolchainRequest {
+            sandbox_id: SandboxId::from_legacy_named("sandbox_service_cancel").expect("sandbox"),
+            command_name: "sh".to_string(),
+            argv: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
+            stdin: None,
+            timeout_ms: SANDBOX_UNLIMITED_WALL_TIME_MS,
+        };
+        let overlapping_request =
+            ObjectRpcRequest::encode_body(SANDBOX_RUN_TOOLCHAIN_ROUTE, "sandbox", &overlapping_run)
+                .expect("overlapping run request")
+                .with_operation_id("sandbox_run_overlap");
+        let overlap_error = registry
+            .dispatch(
+                local_context(&dir, CollectingSink::default()),
+                overlapping_request,
+            )
+            .await
+            .expect_err("a second run must not share the mutable local workspace");
+        assert!(
+            overlap_error.to_string().contains("active execution"),
+            "unexpected overlap error: {overlap_error}"
+        );
+
         let cancel_sink = CollectingSink::default();
         let cancel_frames = Arc::clone(&cancel_sink.frames);
         let cancel_request = ObjectRpcRequest::encode_body(
@@ -596,5 +745,70 @@ exit 0
             "unexpected run error: {run_error}"
         );
         assert!(cancel_marker.exists());
+    }
+
+    #[test]
+    fn lifecycle_mutation_is_fenced_while_sandbox_run_is_active() {
+        let active = Arc::new(Mutex::new(BTreeMap::new()));
+        let sandbox_id = SandboxId::from_legacy_named("service_lifecycle_fence").expect("id");
+        let run = begin_sandbox_operation(&active, &sandbox_id, SandboxOperationKind::Run)
+            .expect("begin run");
+
+        let error = begin_sandbox_operation(&active, &sandbox_id, SandboxOperationKind::Mutation)
+            .err()
+            .expect("mutation must be fenced");
+        assert!(error.to_string().contains("is active"));
+
+        drop(run);
+        let mutation =
+            begin_sandbox_operation(&active, &sandbox_id, SandboxOperationKind::Mutation)
+                .expect("mutation after run");
+        assert!(begin_sandbox_operation(&active, &sandbox_id, SandboxOperationKind::Run).is_err());
+        drop(mutation);
+        assert!(active.lock().expect("tracker").is_empty());
+    }
+
+    #[test]
+    fn concurrent_runs_are_fenced_until_the_first_run_releases_the_workspace() {
+        let active = Arc::new(Mutex::new(BTreeMap::new()));
+        let sandbox_id = SandboxId::from_legacy_named("service_run_fence").expect("id");
+        let first = begin_sandbox_operation(&active, &sandbox_id, SandboxOperationKind::Run)
+            .expect("begin first run");
+
+        let error = begin_sandbox_operation(&active, &sandbox_id, SandboxOperationKind::Run)
+            .err()
+            .expect("overlapping run must be fenced");
+        assert!(error.to_string().contains("active execution"));
+
+        drop(first);
+        let second = begin_sandbox_operation(&active, &sandbox_id, SandboxOperationKind::Run)
+            .expect("run after first released workspace");
+        drop(second);
+        assert!(active.lock().expect("tracker").is_empty());
+    }
+
+    #[test]
+    fn late_cancel_is_not_acknowledged_after_completion_wins_cas() {
+        let active = Arc::new(Mutex::new(BTreeMap::new()));
+        let operation_id = "sandbox_late_cancel";
+        let token = SandboxCancellationToken::new();
+        assert!(token.begin_completing());
+        active
+            .lock()
+            .expect("active cancellations")
+            .insert(operation_id.to_string(), token);
+        let request = ObjectRpcRequest::encode_body(
+            SANDBOX_RUN_CANCEL_ROUTE,
+            "sandbox",
+            &ObjectRpcCancelRequest::new(operation_id, "too late"),
+        )
+        .expect("cancel request")
+        .with_cancels_operation_id(operation_id);
+
+        let response =
+            dispatch_sandbox_run_cancel_request(&active, request).expect("cancel response");
+        let response: SandboxRunCancelResponse = response.decode_body().expect("response body");
+        assert!(!response.cancelled);
+        assert!(response.detail.contains("completing"));
     }
 }

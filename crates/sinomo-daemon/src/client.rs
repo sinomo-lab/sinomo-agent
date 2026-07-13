@@ -605,6 +605,26 @@ pub(crate) async fn send_object_rpc_session_to_target_async_with_daemon_paths_an
     runtime: &tokio::runtime::Handle,
     observe_connectivity: bool,
 ) -> Result<ObjectRpcSessionResult, DaemonError> {
+    send_object_rpc_session_to_target_async_with_daemon_paths_and_network_error(
+        daemon_paths,
+        target_node_id,
+        call,
+        options,
+        runtime,
+        observe_connectivity,
+    )
+    .await
+    .map_err(DaemonError::from)
+}
+
+pub(crate) async fn send_object_rpc_session_to_target_async_with_daemon_paths_and_network_error(
+    daemon_paths: &DaemonPaths,
+    target_node_id: &NodeId,
+    call: ObjectRpcSessionCall,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+    runtime: &tokio::runtime::Handle,
+    observe_connectivity: bool,
+) -> Result<ObjectRpcSessionResult, sinomo_core::network::NetworkError> {
     let data_dir = daemon_data_dir_from_paths(daemon_paths)?;
     let paths = sinomo_core::network::ClusterPaths::new(&data_dir);
     let state = sinomo_core::cluster::read_cluster_state(&paths)?;
@@ -615,7 +635,6 @@ pub(crate) async fn send_object_rpc_session_to_target_async_with_daemon_paths_an
     client
         .call_target_session(&state, target_node_id, call, options)
         .await
-        .map_err(DaemonError::from)
 }
 
 fn block_on_daemon_client<F, T>(future: F) -> Result<T, DaemonError>
@@ -1051,6 +1070,32 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonSignedObjec
             )
             .await;
             Ok(())
+        })
+    }
+
+    fn open_object_rpc_session_stream_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        health: sinomo_core::network::NetworkHealthPolicy,
+    ) -> sinomo_core::network::ClusterSignedObjectRpcFuture<
+        'a,
+        Box<dyn sinomo_core::network::NetworkDuplexStream>,
+    > {
+        let runtime = self.runtime.clone();
+        let daemon_paths = self.paths.clone();
+        let use_tcp_tunnel = self.tcp_tunnel_available() && daemon_endpoint_is_tcp_tunnel(endpoint);
+        Box::pin(async move {
+            if use_tcp_tunnel {
+                return crate::tcp_tunnel::open_object_rpc_session_stream_via_tcp_tunnel(
+                    endpoint,
+                    health,
+                    &runtime,
+                    daemon_paths.as_ref(),
+                )
+                .await;
+            }
+            sinomo_core::network::open_daemon_rpc_stream_to_cluster_endpoint_async(endpoint, health)
+                .await
         })
     }
 
@@ -1806,24 +1851,12 @@ pub fn send_daemon_rollout_binary(
     request: &ClusterRolloutBinaryRequest,
     body_path: &Path,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    let (cluster_paths, state) = local_session_cluster_state()?;
-    let endpoint = state
-        .members
-        .iter()
-        .flat_map(|member| member.endpoints.iter())
-        .find(|endpoint| endpoint.address == address)
-        .cloned()
-        .ok_or_else(|| DaemonError::Network {
-            address: address.to_string(),
-            detail: "rollout session endpoint is not authorized in local cluster state".to_string(),
-        })?;
-    send_daemon_rollout_binary_to_endpoint_with_state(
-        &cluster_paths,
-        &state,
-        &endpoint,
-        request,
-        body_path,
-    )
+    block_on_rollout_session(send_daemon_rollout_binary_to_address_async(
+        local_session_data_dir()?,
+        address.to_string(),
+        request.clone(),
+        body_path.to_path_buf(),
+    ))
 }
 
 pub fn send_daemon_rollout_binary_to_endpoint(
@@ -1831,6 +1864,17 @@ pub fn send_daemon_rollout_binary_to_endpoint(
     request: &ClusterRolloutBinaryRequest,
     body_path: &Path,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    // Loopback endpoint records are host-relative and can be advertised by
+    // every cluster member. Resolving one through the shared member list can
+    // pin a remote member key while the socket reaches this host's daemon.
+    if sinomo_core::network::is_loopback_connect_address(&endpoint.address) {
+        return block_on_rollout_session(send_daemon_rollout_binary_to_loopback_async(
+            local_session_data_dir()?,
+            endpoint.address.clone(),
+            request.clone(),
+            body_path.to_path_buf(),
+        ));
+    }
     let (cluster_paths, state) = local_session_cluster_state()?;
     send_daemon_rollout_binary_to_endpoint_with_state(
         &cluster_paths,
@@ -1880,12 +1924,21 @@ fn local_session_endpoint_for_address(
     state: &sinomo_core::ClusterBootstrapState,
     address: &str,
 ) -> Result<ClusterEndpointRecord, DaemonError> {
-    if let Some(endpoint) = state
+    let mut matches = state
         .members
         .iter()
         .flat_map(|member| member.endpoints.iter())
-        .find(|endpoint| endpoint.address == address)
-    {
+        .filter(|endpoint| endpoint.address == address);
+    if let Some(endpoint) = matches.next() {
+        if let Some(conflict) = matches.find(|candidate| candidate.node_id != endpoint.node_id) {
+            return Err(DaemonError::Network {
+                address: address.to_string(),
+                detail: format!(
+                    "daemon session address is ambiguous between cluster nodes {} and {}; target a node or endpoint explicitly",
+                    endpoint.node_id, conflict.node_id
+                ),
+            });
+        }
         return Ok(endpoint.clone());
     }
     Err(DaemonError::Network {
@@ -1954,6 +2007,58 @@ fn rollout_binary_session_call(
     Ok(sinomo_core::network::ObjectRpcSessionCall::new(head, body))
 }
 
+async fn send_daemon_rollout_binary_to_address_async(
+    data_dir: sinomo_core::local::SinomoDataDir,
+    address: String,
+    request: ClusterRolloutBinaryRequest,
+    body_path: std::path::PathBuf,
+) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    // Never resolve a loopback address through cluster endpoint records: the
+    // same address can legitimately belong to every node in the snapshot.
+    if sinomo_core::network::is_loopback_connect_address(&address) {
+        return send_daemon_rollout_binary_to_loopback_async(data_dir, address, request, body_path)
+            .await;
+    }
+    let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+    let endpoint = local_session_endpoint_for_address(&state, &address)?;
+    send_daemon_rollout_binary_to_endpoint_async(cluster_paths, state, endpoint, request, body_path)
+        .await
+}
+
+async fn send_daemon_rollout_binary_to_loopback_async(
+    data_dir: sinomo_core::local::SinomoDataDir,
+    address: String,
+    request: ClusterRolloutBinaryRequest,
+    body_path: std::path::PathBuf,
+) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    let runtime = tokio::runtime::Handle::current();
+    let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+    let mut host =
+        DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+    let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
+    let result = client
+        .call_loopback_session(
+            &data_dir,
+            &address,
+            rollout_binary_session_call(&request, &body_path)?,
+            sinomo_core::network::ClusterObjectRpcOptions::default(),
+        )
+        .await?;
+    decode_rollout_binary_session_result(result)
+}
+
+fn decode_rollout_binary_session_result(
+    result: ObjectRpcSessionResult,
+) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    if !result.body.is_empty() {
+        return Err(DaemonError::Parse {
+            detail: "rollout binary response unexpectedly contained a body attachment".to_string(),
+        });
+    }
+    result.response.decode_body().map_err(Into::into)
+}
+
 async fn send_daemon_rollout_binary_to_endpoint_async(
     cluster_paths: sinomo_core::network::ClusterPaths,
     state: sinomo_core::ClusterBootstrapState,
@@ -1974,12 +2079,7 @@ async fn send_daemon_rollout_binary_to_endpoint_async(
             sinomo_core::network::ClusterObjectRpcOptions::default(),
         )
         .await?;
-    if !result.body.is_empty() {
-        return Err(DaemonError::Parse {
-            detail: "rollout binary response unexpectedly contained a body attachment".to_string(),
-        });
-    }
-    result.response.decode_body().map_err(Into::into)
+    decode_rollout_binary_session_result(result)
 }
 
 async fn send_daemon_rollout_binary_to_target_async(
@@ -2002,12 +2102,7 @@ async fn send_daemon_rollout_binary_to_target_async(
             sinomo_core::network::ClusterObjectRpcOptions::default(),
         )
         .await?;
-    if !result.body.is_empty() {
-        return Err(DaemonError::Parse {
-            detail: "rollout binary response unexpectedly contained a body attachment".to_string(),
-        });
-    }
-    result.response.decode_body().map_err(Into::into)
+    decode_rollout_binary_session_result(result)
 }
 
 pub fn send_daemon_rollout_native_dylib_module(
@@ -2240,6 +2335,7 @@ mod tests {
     use sinomo_core::network::ClusterEndpointId;
     use sinomo_core::network::ObjectRpcRequest;
     use std::time::Duration;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn object_rpc_transfer_timeouts_use_default_no_progress_limit() {
@@ -2281,6 +2377,151 @@ mod tests {
             !call.request.is_response_retry_safe(),
             "remote builds are not idempotent and must not retry after possible delivery"
         );
+    }
+
+    #[tokio::test]
+    async fn rollout_binary_loopback_session_pins_the_local_daemon_identity() {
+        let root = sinomo_testdir::TestDir::new("sinomo-rollout-binary-loopback-session");
+        let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data directory");
+        sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
+            .expect("main node identity");
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+
+        let bytes = b"loopback rollout body".to_vec();
+        let body_path = root.join("candidate");
+        std::fs::write(&body_path, &bytes).expect("candidate body");
+        let artifact_id = "loopback-binary".to_string();
+        let request = sinomo_rollout::ClusterRolloutBinaryRequest {
+            manifest: sinomo_rollout::ClusterRolloutBinaryManifest {
+                upload_id: "loopback-upload".to_string(),
+                source: "test".to_string(),
+                target_os: std::env::consts::OS.to_string(),
+                target_arch: std::env::consts::ARCH.to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 21_353,
+                shadow_port: 21_354,
+                requested_at: "2026-07-12T00:00:00Z".to_string(),
+                binary: sinomo_rollout::ClusterRolloutUploadArtifactSpec {
+                    artifact_id: artifact_id.clone(),
+                    total_bytes: bytes.len() as u64,
+                    blake3: blake3::hash(&bytes).as_bytes().to_vec(),
+                },
+                native_dylib_modules: Vec::new(),
+            },
+            artifact_id,
+            activate: false,
+        };
+        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("listener address");
+        let server_data_dir = data_dir.clone();
+        let expected = bytes.clone();
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept loopback session");
+            let (mut incoming, responder) = sinomo_core::network::accept_object_rpc_server_session(
+                Box::new(stream.into_inner()),
+                server_data_dir,
+                sinomo_core::network::NetworkCallPolicy::default(),
+                |_request, _node_id, _public_key| Ok(()),
+            )
+            .await
+            .expect("accept object RPC session");
+            let mut received = Vec::new();
+            incoming
+                .body
+                .read_to_end(&mut received)
+                .await
+                .expect("read rollout body");
+            assert_eq!(received, expected);
+            let response = sinomo_core::network::ObjectRpcResponse::encode_body(
+                sinomo_rollout::ROLLOUT_BINARY_ROUTE,
+                &sinomo_rollout::ClusterRolloutBinaryResponse {
+                    status: "staged".to_string(),
+                    detail: "received loopback body".to_string(),
+                    main_binary: "main".into(),
+                    shadow_binary: "shadow".into(),
+                    source_head: None,
+                },
+            )
+            .expect("response head");
+            responder
+                .respond(sinomo_core::network::ObjectRpcSessionResponse::buffered(
+                    response,
+                ))
+                .await
+                .expect("respond");
+        });
+
+        let response = super::send_daemon_rollout_binary_to_address_async(
+            data_dir, address, request, body_path,
+        )
+        .await
+        .expect("loopback binary rollout");
+        server.await.expect("server task");
+
+        assert_eq!(response.status, "staged");
+        assert_eq!(response.detail, "received loopback body");
+    }
+
+    #[test]
+    fn daemon_session_address_rejects_cross_node_ambiguity() {
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_ambiguous_session_address")
+                .expect("cluster id");
+        let first_node =
+            sinomo_core::node::NodeId::from_legacy_named("node_ambiguous_session_first")
+                .expect("first node");
+        let second_node =
+            sinomo_core::node::NodeId::from_legacy_named("node_ambiguous_session_second")
+                .expect("second node");
+        let now = time::OffsetDateTime::now_utc();
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "ambiguous session address",
+            first_node.clone(),
+            "first",
+            "pk-first",
+            now,
+        );
+        state.members[0].endpoints.push(ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_ambiguous_first")
+                .expect("first endpoint"),
+            node_id: first_node,
+            transport: ClusterTransportKind::LanTcp,
+            address: "198.51.100.7:21353".to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 0,
+            last_observed_latency_ms: None,
+        });
+        let mut second = sinomo_core::ClusterMemberRecord::local_non_voting(
+            cluster_id,
+            second_node.clone(),
+            "second",
+            "pk-second",
+            now,
+        );
+        second.endpoints.push(ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_ambiguous_second")
+                .expect("second endpoint"),
+            node_id: second_node,
+            transport: ClusterTransportKind::LanTcp,
+            address: "198.51.100.7:21353".to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 0,
+            last_observed_latency_ms: None,
+        });
+        state.members.push(second);
+
+        let error = super::local_session_endpoint_for_address(&state, "198.51.100.7:21353")
+            .expect_err("cross-node address must be ambiguous");
+
+        assert!(error.to_string().contains("address is ambiguous"));
+        assert!(error.to_string().contains("target a node or endpoint"));
     }
 
     #[test]

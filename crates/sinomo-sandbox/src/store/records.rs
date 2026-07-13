@@ -61,6 +61,7 @@ pub fn record_local_command_history(
     let (mut manifest, _) = store.load(sandbox_id)?;
     if !manifest.command_history.iter().any(|id| id == command_id) {
         manifest.command_history.push(command_id.clone());
+        manifest.advance_generation()?;
     }
     manifest.updated_at = now;
     store.save_manifest(&manifest).map(|_| ())

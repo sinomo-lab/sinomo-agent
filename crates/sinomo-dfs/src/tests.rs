@@ -73,6 +73,154 @@ impl DfsMessageTransport for ReceiveOnlyTransport {
     }
 }
 
+#[test]
+fn namespace_set_owner_preserves_legacy_wire_shape() {
+    #[derive(Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+    #[serde(rename_all = "kebab-case")]
+    enum LegacyNamespaceOwnerOperation {
+        SetOwner { path: String, uid: u32, gid: u32 },
+    }
+
+    let legacy = LegacyNamespaceOwnerOperation::SetOwner {
+        path: "/users/legacy-owner".to_string(),
+        uid: 1001,
+        gid: 1002,
+    };
+    let current = DfsNamespaceOperation::SetOwner {
+        path: "/users/legacy-owner".to_string(),
+        uid: 1001,
+        gid: 1002,
+    };
+    let codec = sinomo_core::network::SinomoObjectCodec::network_frame();
+    let legacy_bytes = codec.encode(&legacy).expect("encode legacy SetOwner");
+    let current_bytes = codec.encode(&current).expect("encode current SetOwner");
+    assert_eq!(
+        current_bytes, legacy_bytes,
+        "SetOwner must retain its original path/uid/gid wire shape"
+    );
+    assert_eq!(
+        codec
+            .decode::<LegacyNamespaceOwnerOperation>(&current_bytes)
+            .expect("decode current SetOwner as legacy"),
+        legacy
+    );
+    assert_eq!(
+        codec
+            .decode::<DfsNamespaceOperation>(&legacy_bytes)
+            .expect("decode legacy SetOwner as current"),
+        current
+    );
+
+    for operation in [
+        DfsNamespaceOperation::SetSymlinkOwner {
+            path: "/users/link-owner".to_string(),
+            uid: 1001,
+            gid: 1002,
+        },
+        DfsNamespaceOperation::MkdirWithAttrs {
+            path: "/users/private".to_string(),
+            attrs: DfsPosixCreateAttrs::new(0o700, 1001, 1002),
+        },
+    ] {
+        let bytes = codec.encode(&operation).expect("encode new operation");
+        assert_ne!(bytes, legacy_bytes);
+        assert!(
+            codec
+                .decode::<LegacyNamespaceOwnerOperation>(&bytes)
+                .is_err(),
+            "new operation must not masquerade as legacy SetOwner"
+        );
+    }
+}
+
+#[test]
+fn exclusive_create_message_fails_closed_for_legacy_peers() {
+    #[allow(dead_code)]
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    enum LegacyDfsNetworkMessage {
+        DistributedWriteRequest(DfsDistributedWriteCommand),
+    }
+
+    let requester = NodeId::from_legacy_named("node_exclusive_create_wire").expect("node");
+    let object_id =
+        DfsObjectId::from_legacy_named("object_exclusive_create_wire").expect("object id");
+    let mut command = test_routed_write_command("exclusive_create_wire", &requester, &object_id);
+    command.exclusive_create = true;
+
+    let codec = sinomo_core::network::SinomoObjectCodec::network_frame();
+    let bytes = codec
+        .encode(&DfsNetworkMessage::ExclusiveCreateRequest(command.clone()))
+        .expect("encode exclusive create message");
+    assert!(
+        codec.decode::<LegacyDfsNetworkMessage>(&bytes).is_err(),
+        "a peer that only understands overwrite-capable distributed writes must reject exclusive create"
+    );
+    assert_eq!(
+        codec
+            .decode::<DfsNetworkMessage>(&bytes)
+            .expect("decode exclusive create message"),
+        DfsNetworkMessage::ExclusiveCreateRequest(command)
+    );
+}
+
+#[test]
+fn dfs_request_ids_remain_unique_across_service_restarts() {
+    let node = NodeId::from_legacy_named("node_request_id_restart").expect("node");
+    let first_root = temp_root("request-id-first");
+    let restarted_root = temp_root("request-id-restarted");
+    let mut first = NetworkedDfsService::new(
+        ReceiveOnlyTransport::new(node.clone()),
+        LocalContentStore::new(&first_root).expect("first content"),
+    );
+    let mut restarted = NetworkedDfsService::new(
+        ReceiveOnlyTransport::new(node),
+        LocalContentStore::new(&restarted_root).expect("restarted content"),
+    );
+
+    let first_id = first.next_request_id();
+    let restarted_id = restarted.next_request_id();
+    assert!(first_id.starts_with("dfs_net_req_1_"), "{first_id}");
+    assert!(restarted_id.starts_with("dfs_net_req_1_"), "{restarted_id}");
+    assert_ne!(first_id, restarted_id);
+    std::fs::remove_dir_all(first_root).ok();
+    std::fs::remove_dir_all(restarted_root).ok();
+}
+
+#[test]
+fn sifs_bootstrap_repairs_untraversable_legacy_system_directories() {
+    let root = temp_root("sifs-bootstrap-legacy-zero-mode");
+    let node = NodeId::from_legacy_named("node_sifs_bootstrap_legacy_mode").expect("node");
+    let content = LocalContentStore::new(root.join("content")).expect("content store");
+    let mut dfs = NetworkedDfsService::new(ReceiveOnlyTransport::new(node), content);
+    dfs.bootstrap_distributed_sifs().expect("bootstrap SIFS");
+    for path in ["/", "/sinomo"] {
+        let mut legacy = crate::namespace::directory_object(path, dfs.node_id().clone());
+        legacy.mode = 0;
+        dfs.add_object_metadata(legacy)
+            .expect("seed legacy bootstrap directory");
+    }
+    assert_eq!(dfs.posix_stat("/").expect("zero root").mode, 0);
+    assert_eq!(dfs.posix_stat("/sinomo").expect("zero sinomo").mode, 0);
+
+    dfs.bootstrap_distributed_sifs()
+        .expect("repair SIFS bootstrap modes");
+
+    assert_eq!(dfs.posix_stat("/").expect("root").mode, 0o755);
+    assert_eq!(dfs.posix_stat("/sinomo").expect("sinomo").mode, 0o755);
+
+    dfs.posix_set_mode("/sinomo", 0)
+        .expect("intentional chmod after migration");
+    dfs.bootstrap_distributed_sifs()
+        .expect("re-bootstrap after intentional chmod");
+    assert_eq!(
+        dfs.posix_stat("/sinomo").expect("intentional mode").mode,
+        0,
+        "bootstrap must not mistake a real chmod(000) for legacy metadata"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
 fn test_dfs_lookup_routed_message(
     source_node_id: &NodeId,
     target_node_id: &NodeId,
@@ -425,6 +573,9 @@ fn dfs_message_trace_label(message: &DfsNetworkMessage) -> String {
         DfsNetworkMessage::DistributedWriteRequest(command) => {
             format!("distributed-write-request:{}", command.request_id)
         }
+        DfsNetworkMessage::ExclusiveCreateRequest(command) => {
+            format!("exclusive-create-request:{}", command.request_id)
+        }
         DfsNetworkMessage::DistributedWriteResponse(response) => {
             format!("distributed-write-response:{}", response.request_id)
         }
@@ -521,6 +672,7 @@ fn dfs_protocol_binary_payloads_use_native_bytes_codec() {
             object_metadata: None,
             touch_parent_on_create: true,
             foreground_replica_repair: true,
+            exclusive_create: false,
         },
         "bytes",
     );
@@ -910,6 +1062,7 @@ fn test_routed_write_command(
         object_metadata: None,
         touch_parent_on_create: true,
         foreground_replica_repair: true,
+        exclusive_create: false,
     }
 }
 
@@ -1977,6 +2130,24 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         distributed_request.is_response_retry_safe(),
         "distributed write request IDs make a lost response safe to redispatch"
     );
+    let mut exclusive_create =
+        test_routed_write_command("exclusive-create-request", &local, &DfsObjectId::generate());
+    exclusive_create.exclusive_create = true;
+    let exclusive_request = dfs_message_rpc_request(&DfsMessageCommand {
+        request_id: "exclusive-create-request".to_string(),
+        routed_message: DfsRoutedMessage {
+            source_node_id: local.clone(),
+            target_node_id: remote.clone(),
+            frame_id: 10,
+            message_id: 11,
+            message: DfsNetworkMessage::ExclusiveCreateRequest(exclusive_create),
+        },
+    })
+    .expect("exclusive create message request");
+    assert!(
+        !exclusive_request.is_response_retry_safe(),
+        "exclusive create cannot be redispatched until its success response is durably replayable"
+    );
     let repair_object_id = DfsObjectId::generate();
     let repair_version = DfsVersion::generate();
     let repair_request = dfs_message_rpc_request(&DfsMessageCommand {
@@ -2975,6 +3146,7 @@ fn served_message_drains_nested_stage_response_before_returning() {
         object_metadata: None,
         touch_parent_on_create: false,
         foreground_replica_repair: true,
+        exclusive_create: false,
     };
     let routed_message = build_dfs_routed_message(
         &requester,
@@ -3155,6 +3327,7 @@ fn served_non_foreground_write_does_not_retry_unrelated_repairs() {
         object_metadata: None,
         touch_parent_on_create: false,
         foreground_replica_repair: false,
+        exclusive_create: false,
     };
     let routed_message = build_dfs_routed_message(
         &requester,
@@ -3316,6 +3489,7 @@ fn served_foreground_write_returns_committed_response_before_replica_repair_comp
         object_metadata: None,
         touch_parent_on_create: false,
         foreground_replica_repair: true,
+        exclusive_create: false,
     };
     let routed_message = build_dfs_routed_message(
         &requester,
@@ -8861,6 +9035,7 @@ fn routed_write_replay_uses_existing_committed_intent_after_service_restart() {
         object_metadata: Some(object.clone()),
         touch_parent_on_create: false,
         foreground_replica_repair: true,
+        exclusive_create: false,
     };
 
     let mut primary_service = NetworkedDfsService::new(
@@ -8965,6 +9140,161 @@ fn routed_write_replay_uses_existing_committed_intent_after_service_restart() {
 }
 
 #[test]
+fn routed_exclusive_create_replays_only_the_exact_request_and_rolls_back_rejection() {
+    let requester =
+        NodeId::from_legacy_named("node_routed_exclusive_requester").expect("requester");
+    let primary = NodeId::from_legacy_named("node_routed_exclusive_primary").expect("primary");
+    let root = temp_root("routed-exclusive-create-identity");
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control_plane.with_client(|kv| {
+        DfsControlPlaneStore::new(kv)
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: sifs_file_system_id(),
+                shard_id: "root".to_string(),
+                primary_node_id: primary.clone(),
+                replica_node_ids: vec![requester.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("metadata shard");
+    });
+    let mut service = NetworkedDfsService::new(
+        DroppingSendTransport {
+            local_node_id: primary.clone(),
+        },
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_control_plane(control_plane);
+    service
+        .bootstrap_distributed_sifs()
+        .expect("bootstrap SIFS");
+
+    let command_for = |request_id: &str, path: &str| {
+        let mut object =
+            crate::posix_object::new_posix_metadata_object(&primary, path, DfsObjectKind::File);
+        crate::posix_object::apply_posix_create_attrs(
+            &mut object,
+            DfsPosixCreateAttrs::new(0o640, 8101, 8102),
+        );
+        DfsDistributedWriteCommand {
+            request_id: request_id.to_string(),
+            request: DfsWriteRequest {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                target_version: crate::namespace::next_version(&object.version),
+                requesting_node_id: requester.clone(),
+            },
+            expected_base_version: Some(object.version.clone()),
+            metadata_journal_after_sequence: None,
+            bytes: Vec::new(),
+            content_hash: None,
+            content_size_bytes: None,
+            desired_replica_nodes: vec![primary.clone()],
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            object_metadata: Some(object),
+            touch_parent_on_create: true,
+            foreground_replica_repair: true,
+            exclusive_create: true,
+        }
+    };
+
+    let command = command_for("exclusive-create-original", "/users/exclusive-routed");
+    let first = service
+        .handle_distributed_write_request(requester.clone(), command.clone())
+        .expect("serve first exclusive create");
+    assert!(
+        matches!(
+            &first,
+            NetworkedDfsServiceEvent::RemoteWriteServed {
+                result: DfsDistributedWriteResult::Outcome {
+                    outcome: NetworkedDfsWriteOutcome::Committed { .. }
+                },
+                ..
+            }
+        ),
+        "first exclusive create: {first:?}"
+    );
+    let duplicate = service
+        .handle_distributed_write_request(requester.clone(), command.clone())
+        .expect("serve exact duplicate");
+    assert!(matches!(
+        duplicate,
+        NetworkedDfsServiceEvent::RemoteWriteServed {
+            result: DfsDistributedWriteResult::Outcome {
+                outcome: NetworkedDfsWriteOutcome::Committed { .. }
+            },
+            ..
+        }
+    ));
+
+    let mut altered_attrs = command.clone();
+    altered_attrs
+        .object_metadata
+        .as_mut()
+        .expect("create metadata")
+        .mode = 0o600;
+    let altered_attrs = service
+        .handle_distributed_write_request(requester.clone(), altered_attrs)
+        .expect("serve same request id with altered attrs");
+    assert!(matches!(
+        altered_attrs,
+        NetworkedDfsServiceEvent::RemoteWriteServed {
+            result: DfsDistributedWriteResult::Rejected { ref reason, .. },
+            ..
+        } if reason.contains("already exists")
+    ));
+
+    let mut fresh = command;
+    fresh.request_id = "exclusive-create-fresh".to_string();
+    let fresh = service
+        .handle_distributed_write_request(requester.clone(), fresh)
+        .expect("serve fresh exclusive create");
+    assert!(matches!(
+        fresh,
+        NetworkedDfsServiceEvent::RemoteWriteServed {
+            result: DfsDistributedWriteResult::Rejected { ref reason, .. },
+            ..
+        } if reason.contains("already exists")
+    ));
+
+    let failed_path = "/users/exclusive-routed-rejected";
+    let mut invalid = command_for("exclusive-create-invalid", failed_path);
+    invalid.desired_replica_nodes.clear();
+    let rejected = service
+        .handle_distributed_write_request(requester.clone(), invalid)
+        .expect("serve invalid exclusive create");
+    assert!(matches!(
+        rejected,
+        NetworkedDfsServiceEvent::RemoteWriteServed {
+            result: DfsDistributedWriteResult::Rejected { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        service.posix_lstat(failed_path),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    let retry = service
+        .handle_distributed_write_request(
+            requester.clone(),
+            command_for("exclusive-create-valid-retry", failed_path),
+        )
+        .expect("serve valid retry");
+    assert!(matches!(
+        retry,
+        NetworkedDfsServiceEvent::RemoteWriteServed {
+            result: DfsDistributedWriteResult::Outcome {
+                outcome: NetworkedDfsWriteOutcome::Committed { .. }
+            },
+            ..
+        }
+    ));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn routed_write_replay_pending_intent_requires_matching_content_identity() {
     let requester =
         NodeId::from_legacy_named("node_routed_pending_replay_requester").expect("requester");
@@ -9005,6 +9335,7 @@ fn routed_write_replay_pending_intent_requires_matching_content_identity() {
         object_metadata: Some(object.clone()),
         touch_parent_on_create: false,
         foreground_replica_repair: true,
+        exclusive_create: false,
     };
 
     let mut primary_service = NetworkedDfsService::new(
@@ -10494,6 +10825,7 @@ fn routed_inline_write_preserves_nonforeground_repair_mode() {
         true,
         false,
         false,
+        false,
         true,
     )
     .expect("route inline nonforeground write");
@@ -10515,6 +10847,7 @@ fn routed_inline_write_preserves_nonforeground_repair_mode() {
         false,
         false,
         false,
+        false,
     )
     .expect("route inline write without response journal");
     dfs.route_distributed_write_to_metadata_primary(
@@ -10532,6 +10865,7 @@ fn routed_inline_write_preserves_nonforeground_repair_mode() {
         object,
         shard,
         true,
+        false,
         false,
         true,
         true,
@@ -10672,6 +11006,7 @@ fn routed_write_nonforeground_response_replay_is_one_batch() {
             object_metadata: Some(object),
             touch_parent_on_create: false,
             foreground_replica_repair: false,
+            exclusive_create: false,
         },
     )
     .expect("serve routed write");
@@ -13656,6 +13991,7 @@ fn recovered_new_object_parent_metadata(
             vec![owner.clone(), requester.clone(), replica.clone()],
             DfsReplicationPolicy::new(3, 3).expect("policy"),
             touch_parent_on_create,
+            false,
             true,
             false,
             true,
@@ -15981,6 +16317,134 @@ fn remote_read_content_mismatch_prunes_stale_location() {
         Vec::<NodeId>::new()
     );
     std::fs::remove_dir_all(root).ok();
+}
+
+fn assert_malformed_remote_range_rejected(
+    name: &str,
+    mutate: impl FnOnce(&mut DfsReadRangeData),
+    expected_reason: &str,
+) {
+    let root = temp_root(name);
+    let reader = NodeId::from_legacy_named(&format!("{name}_reader")).expect("reader node");
+    let source = NodeId::from_legacy_named(&format!("{name}_source")).expect("source node");
+    let object_id = DfsObjectId::from_legacy_named(&format!("{name}_object")).expect("object");
+    let version = DfsVersion::from_legacy_named(&format!("{name}_version")).expect("version");
+    let bytes = b"authoritative ranged response bytes".to_vec();
+    let content_hash = content_hash(&bytes);
+    let offset = 3_u64;
+    let max_bytes = 7_usize;
+    let request_id = format!("{name}_request");
+    let mut dfs = networked_sifs_with_backend(&root, reader);
+    let mut object = file_metadata(source.clone());
+    object.object_id = object_id.clone();
+    object.version = version.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![source.clone()];
+    object.content_hash = Some(content_hash.clone());
+    object.content_size_bytes = Some(bytes.len() as u64);
+    dfs.add_object_metadata(object).expect("object metadata");
+    dfs.pending_reads.insert(
+        request_id.clone(),
+        PendingNetworkedRead {
+            object_id: object_id.clone(),
+            version: version.clone(),
+            content_hash: Some(content_hash.clone()),
+            content_size_bytes: Some(bytes.len() as u64),
+            range_offset: Some(offset),
+            range_max_bytes: Some(max_bytes),
+            target_node_id: source.clone(),
+            next_retry_at: Instant::now() + DFS_REMOTE_READ_RETRY_DELAY,
+            cache_response: false,
+        },
+    );
+    let start = offset as usize;
+    let mut data = DfsReadRangeData {
+        object_id: object_id.clone(),
+        version,
+        content_hash: Some(content_hash),
+        offset,
+        total_size_bytes: bytes.len() as u64,
+        bytes: bytes[start..start + max_bytes].to_vec(),
+    };
+    mutate(&mut data);
+
+    let event = dfs
+        .handle_networked_read_response(
+            source.clone(),
+            DfsReadResponse {
+                request_id: request_id.clone(),
+                object_id: object_id.clone(),
+                result: DfsReadResult::RangeFound(data),
+            },
+        )
+        .expect("malformed range response handled");
+
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::RemoteReadCompleted {
+            request_id: completed_request_id,
+            result: DfsReadResult::Rejected { reason },
+            ..
+        } if completed_request_id == request_id && reason.contains(expected_reason)
+    ));
+    assert!(!dfs.pending_reads.contains_key(&request_id));
+    assert!(
+        !dfs.current_read_object_metadata(&object_id)
+            .expect("current metadata")
+            .current_locations
+            .contains(&source),
+        "source returning malformed range metadata must be pruned"
+    );
+}
+
+#[test]
+fn remote_range_rejects_wrong_version() {
+    assert_malformed_remote_range_rejected(
+        "range_wrong_version",
+        |data| {
+            data.version =
+                DfsVersion::from_legacy_named("range_wrong_version_other").expect("version")
+        },
+        "expected version",
+    );
+}
+
+#[test]
+fn remote_range_rejects_wrong_offset() {
+    assert_malformed_remote_range_rejected(
+        "range_wrong_offset",
+        |data| data.offset += 1,
+        "offset mismatch",
+    );
+}
+
+#[test]
+fn remote_range_rejects_short_length() {
+    assert_malformed_remote_range_rejected(
+        "range_short_length",
+        |data| {
+            data.bytes.pop();
+        },
+        "length mismatch",
+    );
+}
+
+#[test]
+fn remote_range_rejects_wrong_total_size() {
+    assert_malformed_remote_range_rejected(
+        "range_wrong_total",
+        |data| data.total_size_bytes += 1,
+        "does not match object metadata",
+    );
+}
+
+#[test]
+fn remote_range_rejects_wrong_content_hash() {
+    assert_malformed_remote_range_rejected(
+        "range_wrong_hash",
+        |data| data.content_hash = Some("blake3:wrong-range-hash".to_string()),
+        "expected content hash",
+    );
 }
 
 #[test]
@@ -20202,6 +20666,185 @@ fn conflicting_metadata_receipt_from_same_replica_is_rejected() {
 }
 
 #[test]
+fn sifs_posix_exclusive_create_never_overwrites_an_existing_file() {
+    let root = temp_root("sifs-posix-exclusive-create");
+    let node_id = NodeId::from_legacy_named("node_sifs_exclusive_create").expect("node");
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.posix_mkdir_all("/services/exclusive-create")
+        .expect("mkdir parent");
+    let options = DfsWriteOptions::replicated_eventual(vec![node_id]);
+    let path = "/services/exclusive-create/file";
+    dfs.posix_write_file_with_create_attrs(
+        path,
+        b"keep me",
+        options.clone(),
+        DfsPosixCreateAttrs::new(0o640, 1001, 1002),
+    )
+    .expect("seed existing file");
+
+    assert!(matches!(
+        dfs.posix_create_file_with_attrs(
+            path,
+            options.clone(),
+            DfsPosixCreateAttrs::new(0o600, 2001, 2002),
+        ),
+        Err(DfsPosixError::AlreadyExists { .. })
+    ));
+    assert_eq!(
+        dfs.posix_read_file(path).expect("existing bytes"),
+        b"keep me"
+    );
+    let existing = dfs.posix_stat(path).expect("existing attrs");
+    assert_eq!(
+        (existing.mode, existing.uid, existing.gid),
+        (0o640, 1001, 1002)
+    );
+
+    dfs.posix_unlink(path).expect("unlink existing file");
+    let recreated = dfs
+        .posix_create_file_with_attrs(path, options, DfsPosixCreateAttrs::new(0o600, 2001, 2002))
+        .expect("exclusive create over tombstone");
+    assert_eq!(recreated.size_bytes, Some(0));
+    assert_eq!(
+        (recreated.mode, recreated.uid, recreated.gid),
+        (0o600, 2001, 2002)
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sifs_posix_nonexclusive_create_follows_a_dangling_symlink() {
+    let root = temp_root("sifs-posix-create-dangling-symlink");
+    let node_id = NodeId::from_legacy_named("node_sifs_create_dangling_symlink").expect("node");
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.posix_mkdir_all("/services/dangling-create")
+        .expect("mkdir parent");
+    let options = DfsWriteOptions::replicated_eventual(vec![node_id]);
+    let link = "/services/dangling-create/link";
+    let target = "/services/dangling-create/target";
+    dfs.posix_symlink("target", link, options.clone())
+        .expect("create dangling symlink");
+
+    assert!(matches!(
+        dfs.posix_create_file_with_attrs(
+            link,
+            options.clone(),
+            DfsPosixCreateAttrs::new(0o600, 7001, 7002),
+        ),
+        Err(DfsPosixError::AlreadyExists { .. })
+    ));
+    let created = dfs
+        .posix_create_file_following_symlink_with_attrs(
+            link,
+            options,
+            DfsPosixCreateAttrs::new(0o640, 7001, 7002),
+        )
+        .expect("create dangling symlink target");
+    assert_eq!(created.path, target);
+    assert_eq!(
+        (created.mode, created.uid, created.gid),
+        (0o640, 7001, 7002)
+    );
+    assert_eq!(
+        dfs.posix_lstat(link).expect("link remains").kind,
+        DfsObjectKind::Symlink
+    );
+    assert_eq!(dfs.posix_readlink(link).expect("read link"), "target");
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sifs_posix_create_attrs_are_installed_atomically_and_only_on_create() {
+    let root = temp_root("sifs-posix-create-attrs");
+    let node_id = NodeId::from_legacy_named("node_sifs_create_attrs").expect("node");
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.posix_mkdir_all("/services/create-attrs")
+        .expect("mkdir parent");
+
+    let dir_path = "/services/create-attrs/private";
+    let dir = dfs
+        .posix_mkdir_with_create_attrs(dir_path, DfsPosixCreateAttrs::new(0o2750, 1001, 2001))
+        .expect("mkdir with attrs");
+    assert_eq!((dir.mode, dir.uid, dir.gid), (0o2750, 1001, 2001));
+
+    let options = DfsWriteOptions::replicated_eventual(vec![node_id.clone()]);
+    let file_path = "/services/create-attrs/private/file";
+    let file = dfs
+        .posix_write_file_with_create_attrs(
+            file_path,
+            b"one",
+            options.clone(),
+            DfsPosixCreateAttrs::new(0o640, 1002, 2002),
+        )
+        .expect("file with attrs");
+    assert_eq!((file.mode, file.uid, file.gid), (0o640, 1002, 2001));
+    let overwritten = dfs
+        .posix_write_file_with_create_attrs(
+            file_path,
+            b"two",
+            options.clone(),
+            DfsPosixCreateAttrs::new(0o600, 3002, 4002),
+        )
+        .expect("overwrite existing file");
+    assert_eq!(
+        (overwritten.mode, overwritten.uid, overwritten.gid),
+        (0o640, 1002, 2001),
+        "create attributes must not mutate an existing inode"
+    );
+
+    dfs.posix_unlink(file_path).expect("unlink file");
+    let recreated = dfs
+        .posix_write_file_with_create_attrs(
+            file_path,
+            b"three",
+            options.clone(),
+            DfsPosixCreateAttrs::new(0o600, 3002, 4002),
+        )
+        .expect("recreate tombstoned file");
+    assert_eq!(
+        (recreated.mode, recreated.uid, recreated.gid),
+        (0o600, 3002, 2001)
+    );
+
+    let streamed = dfs
+        .posix_write_file_from_reader_with_create_attrs(
+            "/services/create-attrs/private/streamed",
+            std::io::Cursor::new(b"streamed"),
+            options.clone(),
+            DfsPosixCreateAttrs::new(0o620, 3003, 4003),
+        )
+        .expect("reader-backed file with attrs");
+    assert_eq!(
+        (streamed.mode, streamed.uid, streamed.gid),
+        (0o620, 3003, 2001)
+    );
+
+    let link_path = "/services/create-attrs/private/link";
+    let link = dfs
+        .posix_symlink_with_create_attrs(
+            "file",
+            link_path,
+            options,
+            DfsPosixCreateAttrs::new(0o777, 1003, 2003),
+        )
+        .expect("symlink with attrs");
+    assert_eq!((link.mode, link.uid, link.gid), (0o777, 1003, 2001));
+    assert_eq!(
+        (
+            dfs.posix_lstat(link_path).expect("lstat link").mode,
+            dfs.posix_lstat(link_path).expect("lstat link").uid,
+            dfs.posix_lstat(link_path).expect("lstat link").gid,
+        ),
+        (0o777, 1003, 2001)
+    );
+
+    dfs.posix_rmdir(dir_path).expect_err("non-empty dir");
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn sifs_posix_symlink_preserves_target_as_object_content() {
     let root = temp_root("sifs-posix-symlink");
     let node_id = NodeId::from_legacy_named("node_sifs_symlink").expect("node");
@@ -20223,6 +20866,17 @@ fn sifs_posix_symlink_preserves_target_as_object_content() {
     assert_eq!(
         dfs.posix_readlink(link_path).expect("readlink"),
         "../shared/lib"
+    );
+    let owned_link = dfs
+        .posix_set_symlink_owner(link_path, 1001, 1002)
+        .expect("set symlink owner without following missing target");
+    assert_eq!((owned_link.uid, owned_link.gid), (1001, 1002));
+    assert_eq!(
+        (
+            dfs.posix_lstat(link_path).expect("owned link lstat").uid,
+            dfs.posix_lstat(link_path).expect("owned link lstat").gid,
+        ),
+        (1001, 1002)
     );
     dfs.posix_set_symlink_times(link_path, Some(12_345), Some(67_890))
         .expect("old symlink times");
@@ -22731,6 +23385,86 @@ fn sifs_posix_read_updates_atime_without_changing_mtime() {
 }
 
 #[test]
+fn sifs_opened_object_ranges_allow_one_atime_update_for_many_chunks() {
+    let root = temp_root("sifs-opened-range-atime");
+    let node_id = NodeId::from_legacy_named("node_sifs_opened_range_atime").expect("node");
+    let file_path = "/services/sandbox/instances/sandbox_range_atime/work/file.txt";
+    let bytes = b"content split across several FUSE reads";
+
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_range_atime/work")
+        .expect("mkdir");
+    let written = dfs
+        .posix_write_file(
+            file_path,
+            bytes,
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("write");
+    dfs.posix_set_times(file_path, Some(12_345), Some(67_890))
+        .expect("old times");
+    let before = dfs.posix_stat(file_path).expect("before stat");
+
+    assert_eq!(
+        dfs.posix_read_file_range_for_object(&written.object_id, 0, 7)
+            .expect("first no-atime range"),
+        &bytes[..7]
+    );
+    let after_no_atime = dfs.posix_stat(file_path).expect("no-atime stat");
+    assert_eq!(after_no_atime.version, before.version);
+    assert_eq!(after_no_atime.accessed_at_unix_nanos, 12_345);
+
+    assert_eq!(
+        dfs.posix_read_file_range_for_object_update_access(&written.object_id, 7, 9)
+            .expect("first handle range updates atime"),
+        &bytes[7..16]
+    );
+    let after_access = dfs.posix_stat(file_path).expect("updated atime stat");
+    assert_ne!(after_access.version, before.version);
+    assert!(after_access.accessed_at_unix_nanos > 12_345);
+    assert_eq!(after_access.modified_at_unix_nanos, 67_890);
+
+    assert_eq!(
+        dfs.posix_read_file_range_for_object(&written.object_id, 16, 8)
+            .expect("subsequent no-atime range"),
+        &bytes[16..24]
+    );
+    let after_next_chunk = dfs.posix_stat(file_path).expect("next chunk stat");
+    assert_eq!(
+        after_next_chunk.version, after_access.version,
+        "subsequent chunks must not append authoritative atime metadata"
+    );
+
+    let renamed_path = "/services/sandbox/instances/sandbox_range_atime/work/file-renamed.txt";
+    dfs.posix_rename(file_path, renamed_path)
+        .expect("rename opened file");
+    assert_eq!(
+        dfs.posix_read_file_range_for_opened_object(renamed_path, &written.object_id, 5, 6, false,)
+            .expect("renamed opened-object range"),
+        &bytes[5..11]
+    );
+
+    let local_node_id = dfs.node_id().clone();
+    dfs.posix_write_file(
+        file_path,
+        b"replacement",
+        DfsWriteOptions::replicated_eventual(vec![local_node_id]),
+    )
+    .expect("pathname replacement");
+    assert!(matches!(
+        dfs.posix_read_file_range_for_opened_object(file_path, &written.object_id, 0, 4, false,),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert_eq!(
+        dfs.posix_read_file_range_for_opened_object(renamed_path, &written.object_id, 0, 4, false,)
+            .expect("old handle keeps renamed identity"),
+        &bytes[..4]
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn sifs_posix_list_updates_directory_atime_without_changing_mtime() {
     let root = temp_root("sifs-posix-list-atime");
     let node_id = NodeId::from_legacy_named("node_sifs_list_atime").expect("node");
@@ -23396,6 +24130,73 @@ fn sifs_posix_cluster_node(
             .expect("cluster node metadata backend"),
     )
     .expect("cluster node metadata backend attach")
+}
+
+#[test]
+fn atomic_namespace_rename_rejects_shard_epoch_change_before_commit() {
+    let root = temp_root("atomic-namespace-rename-shard-change");
+    let node_id = NodeId::from_legacy_named("node_atomic_namespace_primary").expect("primary node");
+    let network = InProcessNetwork::new();
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    let shard = |epoch| DfsMetadataShardConfig {
+        file_system_id: sifs_file_system_id(),
+        shard_id: "root".to_string(),
+        primary_node_id: node_id.clone(),
+        replica_node_ids: Vec::new(),
+        epoch,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                node_id.clone(),
+            )))
+            .expect("filesystem config");
+        control
+            .put_metadata_shard(&shard(1))
+            .expect("initial shard config");
+    });
+    let mut service =
+        sifs_posix_cluster_node(&network, &shared_kv, &root, "primary", node_id.clone());
+    service
+        .bootstrap_distributed_sifs()
+        .expect("bootstrap SIFS");
+    service
+        .posix_mkdir_all("/services/sandbox/instances")
+        .expect("instance namespace");
+    service
+        .posix_symlink(
+            "/services/sandbox/generations/one",
+            "/services/sandbox/instances/.swap",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("staged link");
+
+    shared_kv.with_client(|kv| {
+        DfsControlPlaneStore::new(kv)
+            .put_metadata_shard(&shard(2))
+            .expect("advance shard epoch");
+    });
+
+    let error = service
+        .posix_rename_single_namespace_atomic_local(
+            "/services/sandbox/instances/.swap",
+            "/services/sandbox/instances/one",
+            Some(("root", 1)),
+        )
+        .expect_err("stale atomic authority must fail closed");
+    assert!(matches!(error, DfsPosixError::InvalidPath { .. }));
+    assert!(
+        service
+            .posix_lstat_distributed("/services/sandbox/instances/.swap")
+            .is_ok()
+    );
+    assert!(matches!(
+        service.posix_lstat_distributed("/services/sandbox/instances/one"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
 }
 
 fn sifs_posix_cluster(name: &str) -> SifsPosixCluster {
@@ -24883,7 +25684,15 @@ fn sifs_posix_child_create_rejects_parent_removed_by_fresh_shared_metadata_handl
     let mut remover =
         open_shared_metadata_posix_service(&root, &metadata_root, node.clone(), "content-rmdir");
 
-    remover.posix_rmdir(dir).expect("rmdir commits first");
+    let live_changed_at = remover
+        .posix_lstat(dir)
+        .expect("live directory stat")
+        .changed_at_unix_nanos;
+    let removed = remover.posix_rmdir(dir).expect("rmdir commits first");
+    assert!(
+        removed.changed_at_unix_nanos > live_changed_at,
+        "rmdir tombstone ctime must fence historical namespace transactions"
+    );
     assert!(matches!(
         child_writer.posix_write_file(
             child,
@@ -24897,14 +25706,62 @@ fn sifs_posix_child_create_rejects_parent_removed_by_fresh_shared_metadata_handl
 
     let verifier =
         open_shared_metadata_posix_service(&root, &metadata_root, node, "content-verify");
-    assert!(matches!(
-        verifier.posix_stat(dir),
-        Err(DfsPosixError::NotFound { .. })
-    ));
+    let verifier_dir = verifier.posix_stat(dir);
+    assert!(
+        matches!(verifier_dir, Err(DfsPosixError::NotFound { .. })),
+        "removed parent resurrected after rejected child create: {verifier_dir:?}"
+    );
     assert!(matches!(
         verifier.posix_stat(child),
         Err(DfsPosixError::NotFound { .. })
     ));
+}
+
+#[test]
+fn sifs_posix_unlink_tombstone_survives_fresh_shared_metadata_recovery() {
+    let root = temp_root("sifs-unlink-shared-metadata-recovery");
+    let metadata_root = root.join("metadata");
+    let node = NodeId::from_legacy_named("node_sifs_unlink_shared_metadata").expect("node");
+    let path = "/services/shared-unlink-recovery.txt";
+
+    let mut seed =
+        open_shared_metadata_posix_service(&root, &metadata_root, node.clone(), "content-seed");
+    seed.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    seed.posix_write_file(
+        path,
+        b"delete me",
+        DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+    )
+    .expect("create file");
+
+    let mut remover =
+        open_shared_metadata_posix_service(&root, &metadata_root, node.clone(), "content-unlink");
+    let live_changed_at = remover
+        .posix_lstat(path)
+        .expect("live file stat")
+        .changed_at_unix_nanos;
+    let removed = remover.posix_unlink(path).expect("unlink file");
+    assert!(
+        removed.changed_at_unix_nanos > live_changed_at,
+        "unlink tombstone ctime must fence historical namespace transactions"
+    );
+
+    let verifier =
+        open_shared_metadata_posix_service(&root, &metadata_root, node, "content-verify");
+    assert!(matches!(
+        verifier.posix_stat(path),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert_eq!(
+        verifier
+            .metadata_backend()
+            .expect("verifier backend")
+            .get_object_by_path(&sifs_file_system_id(), path)
+            .expect("durable path lookup")
+            .expect("durable tombstone")
+            .kind,
+        DfsObjectKind::Tombstone
+    );
 }
 
 #[test]
@@ -27460,7 +28317,7 @@ fn sifs_cluster_posix_routed_namespace_ops_have_read_your_write_semantics() {
         root,
         primary_node: _,
         writer_node,
-        observer_node: _,
+        observer_node,
         primary,
         mut writer,
         mut observer,
@@ -27490,6 +28347,101 @@ fn sifs_cluster_posix_routed_namespace_ops_have_read_your_write_semantics() {
             .iter()
             .any(|entry| entry.path == "/users/routed-dir"),
         "routed mkdir must be locally listed after it returns"
+    );
+
+    let attrs_dir = writer
+        .posix_mkdir_with_create_attrs(
+            "/users/routed-attrs",
+            DfsPosixCreateAttrs::new(0o2750, 4101, 4201),
+        )
+        .expect("routed mkdir with attrs");
+    assert_eq!(
+        (attrs_dir.mode, attrs_dir.uid, attrs_dir.gid),
+        (0o2750, 4101, 4201)
+    );
+    // Give the second creator a parent snapshot, then leave it deliberately
+    // stale while the first creator publishes the children. A distributed
+    // stat returns the authoritative value but intentionally does not mutate
+    // the requester's metadata cache, so seed the already-committed parent as
+    // a replica journal replay would.
+    let observer_parent = writer
+        .lookup_sifs_path("/users/routed-attrs")
+        .expect("lookup routed attrs parent")
+        .expect("routed attrs parent metadata");
+    let observer_parent_id = observer_parent.object_id.clone();
+    observer
+        .add_transient_object_metadata(observer_parent)
+        .expect("seed stale creator parent snapshot");
+    observer
+        .transient_metadata_object_ids
+        .remove(&observer_parent_id);
+    let attrs_child_dir = writer
+        .posix_mkdir_with_create_attrs(
+            "/users/routed-attrs/child",
+            DfsPosixCreateAttrs::new(0o750, 4104, 4204),
+        )
+        .expect("routed child mkdir with attrs");
+    assert_eq!(
+        (
+            attrs_child_dir.mode,
+            attrs_child_dir.uid,
+            attrs_child_dir.gid
+        ),
+        (0o2750, 4104, 4201)
+    );
+    let attrs_file = writer
+        .posix_write_file_with_create_attrs(
+            "/users/routed-attrs/file",
+            b"attrs",
+            DfsWriteOptions::replicated_eventual(vec![writer_node.clone()]),
+            DfsPosixCreateAttrs::new(0o640, 4102, 4202),
+        )
+        .expect("routed file with attrs");
+    assert_eq!(
+        (attrs_file.mode, attrs_file.uid, attrs_file.gid),
+        (0o640, 4102, 4201)
+    );
+    let raced_file_create = observer.posix_create_file_with_attrs(
+        "/users/routed-attrs/file",
+        DfsWriteOptions::replicated_eventual(vec![observer_node.clone()]),
+        DfsPosixCreateAttrs::new(0o600, 5102, 5202),
+    );
+    assert!(
+        matches!(raced_file_create, Err(DfsPosixError::AlreadyExists { .. })),
+        "stale routed exclusive create must lose at the metadata primary: {raced_file_create:?}"
+    );
+    let parent_before_symlink = writer
+        .posix_set_times("/users/routed-attrs", None, Some(123_000_000))
+        .expect("set routed parent mtime before symlink")
+        .modified_at_unix_nanos;
+    let attrs_link = writer
+        .posix_symlink_with_create_attrs(
+            "file",
+            "/users/routed-attrs/link",
+            DfsWriteOptions::replicated_eventual(vec![writer_node.clone()]),
+            DfsPosixCreateAttrs::new(0o777, 4103, 4203),
+        )
+        .expect("routed symlink with attrs");
+    assert_eq!(
+        (attrs_link.mode, attrs_link.uid, attrs_link.gid),
+        (0o777, 4103, 4201)
+    );
+    assert!(matches!(
+        observer.posix_symlink_with_create_attrs(
+            "other",
+            "/users/routed-attrs/link",
+            DfsWriteOptions::replicated_eventual(vec![observer_node]),
+            DfsPosixCreateAttrs::new(0o777, 5103, 5203),
+        ),
+        Err(DfsPosixError::AlreadyExists { .. })
+    ));
+    let parent_after_symlink = writer
+        .posix_stat("/users/routed-attrs")
+        .expect("routed parent after symlink")
+        .modified_at_unix_nanos;
+    assert!(
+        parent_after_symlink > parent_before_symlink,
+        "routed symlink create must journal and replay its parent mtime update"
     );
 
     // mkdir_all creates the whole chain through the primary.
@@ -27684,6 +28636,14 @@ fn sifs_cluster_posix_routed_namespace_ops_have_read_your_write_semantics() {
         primary.posix_stat("/users/routed-dir"),
         Err(DfsPosixError::NotFound { .. })
     ));
+    assert_eq!(
+        primary
+            .posix_stat("/users/routed-attrs")
+            .expect("primary routed symlink parent")
+            .modified_at_unix_nanos,
+        parent_after_symlink,
+        "requester and metadata primary must agree on the routed symlink parent generation"
+    );
 
     // Journals stayed aligned: publication to both replicas applies cleanly.
     let mut rejections = Vec::new();
@@ -27721,6 +28681,68 @@ fn sifs_cluster_posix_routed_namespace_ops_have_read_your_write_semantics() {
         "routed namespace ops must keep replica journals aligned: {rejections:?}"
     );
 
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sifs_cluster_routes_bounded_directory_rename_and_resume_receipts() {
+    let cluster = sifs_posix_cluster("sifs-cluster-bounded-rename");
+    let SifsPosixCluster {
+        root,
+        primary,
+        writer_node,
+        mut writer,
+        ..
+    } = cluster;
+    let stop_primary = Arc::new(AtomicBool::new(false));
+    let primary_stop = Arc::clone(&stop_primary);
+    let primary_thread = std::thread::spawn(move || {
+        let mut primary = primary;
+        while !primary_stop.load(Ordering::SeqCst) {
+            primary.process_incoming().expect("primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        primary
+    });
+
+    let from = "/users/bounded-old";
+    let to = "/users/bounded-new";
+    writer
+        .posix_mkdir_all(&format!("{from}/nested"))
+        .expect("routed source tree");
+    for index in 0..4 {
+        writer
+            .posix_write_file(
+                &format!("{from}/nested/{index}.txt"),
+                index.to_string().as_bytes(),
+                DfsWriteOptions::replicated_eventual(vec![writer_node.clone()]),
+            )
+            .expect("routed source file");
+    }
+    let mut job = writer
+        .posix_rename_directory_bounded_routed(from, to, 1)
+        .expect("first routed bounded batch");
+    while job.status == DfsNamespaceJobStatus::Running {
+        job = writer
+            .posix_resume_namespace_job_bounded_routed(&job.job_id, from, 1)
+            .expect("next routed bounded batch");
+    }
+    assert_eq!(job.status, DfsNamespaceJobStatus::Completed);
+    assert!(matches!(
+        writer.posix_stat(from),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    for index in 0..4 {
+        assert_eq!(
+            writer
+                .posix_read_file(&format!("{to}/nested/{index}.txt"))
+                .expect("renamed file"),
+            index.to_string().as_bytes()
+        );
+    }
+
+    stop_primary.store(true, Ordering::SeqCst);
+    let _primary = primary_thread.join().expect("primary thread");
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -28143,9 +29165,17 @@ fn sifs_cluster_posix_mkdir_all_remote_primary_falls_back_when_local_chain_exist
     local
         .bootstrap_distributed_sifs()
         .expect("bootstrap local mirror");
+    let stale_path = "/services/dfs-smoke";
+    let stale = crate::posix_object::new_posix_metadata_object(
+        &local_node,
+        stale_path,
+        DfsObjectKind::Directory,
+    );
+    let stale_id = stale.object_id.clone();
     local
-        .posix_mkdir_all_local("/services/dfs-smoke")
-        .expect("local replicated chain");
+        .add_transient_object_metadata(stale)
+        .expect("seed stale local replicated chain");
+    local.transient_metadata_object_ids.remove(&stale_id);
 
     local
         .posix_mkdir_all("/services/dfs-smoke")
@@ -28176,9 +29206,16 @@ fn sifs_cluster_routed_mkdir_all_repairs_primary_when_local_chain_exists() {
 
     let base = "/services/cluster-tests";
     let path = "/services/cluster-tests/primary-repair.txt";
+    let stale = crate::posix_object::new_posix_metadata_object(
+        &replica_node,
+        base,
+        DfsObjectKind::Directory,
+    );
+    let stale_id = stale.object_id.clone();
     replica
-        .posix_mkdir_all_local(base)
-        .expect("replica has stale local chain");
+        .add_transient_object_metadata(stale)
+        .expect("seed stale local chain");
+    replica.transient_metadata_object_ids.remove(&stale_id);
     assert!(
         replica.posix_stat(base).is_ok(),
         "replica precondition should have local parent"
@@ -28199,8 +29236,13 @@ fn sifs_cluster_routed_mkdir_all_repairs_primary_when_local_chain_exists() {
     replica
         .posix_mkdir_all(base)
         .expect("routed mkdir_all should repair primary despite local chain");
-    let mut write_options =
-        DfsWriteOptions::replicated_eventual(vec![replica_node, services_primary_node]);
+    let unused_content_candidate =
+        NodeId::from_legacy_named("node_sifs_routed_mkdir_unused_content").expect("unused node");
+    let mut write_options = DfsWriteOptions::replicated_eventual(vec![
+        replica_node,
+        services_primary_node,
+        unused_content_candidate,
+    ]);
     write_options.foreground_replica_repair = false;
     replica
         .posix_write_file(path, b"child", write_options)
@@ -31373,6 +32415,18 @@ fn sifs_non_replica_prefix_read_reuses_authoritative_metadata_for_remote_range()
     assert!(
         observer.posix_read_file(path).is_err(),
         "an uncached prefix read must not materialize the full remote object locally"
+    );
+
+    let opened = observer
+        .posix_stat_distributed(path)
+        .expect("outsider authoritative open metadata");
+    let opened_range = observer
+        .posix_read_file_range_for_opened_object(path, &opened.object_id, 17, 31, true)
+        .expect("outsider opened-object remote range read");
+    assert_eq!(opened_range, bytes[17..48]);
+    assert!(
+        observer.posix_read_file(path).is_err(),
+        "an opened-object range read must not materialize the full remote object locally"
     );
 
     let complete = observer

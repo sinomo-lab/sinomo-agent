@@ -29,34 +29,37 @@ macro_rules! eprintln {
 use sinomo_agent::{
     AGENT_RPC_CATEGORY, AGENT_SESSION_FOLLOW_UP_ROUTE, AGENT_SESSION_INSPECT_ROUTE,
     AGENT_SESSION_INTERRUPT_ROUTE, AGENT_SESSION_PROGRESS_ROUTE, AGENT_SESSION_RESUME_ROUTE,
-    AGENT_SESSION_STEER_ROUTE, AGENT_SESSION_TERMINAL_RESULTS_ROUTE, Agent, AgentCatalog,
-    AgentDefinition, AgentDefinitionSifsStore, AgentDefinitionStore, AgentEventPayload,
-    AgentLoopDecision, AgentLoopInput, AgentModelEvent, AgentOp, AgentPackageProvenance,
-    AgentPackageSource, AgentReadinessCheckStatus, AgentReadinessReport, AgentRole,
-    AgentRuntimeEvent, AgentRuntimeEventCursor, AgentRuntimeEventPayload, AgentRuntimeStorage,
-    AgentSession, AgentSessionControlEventCursor, AgentSessionControlResponse,
+    AGENT_SESSION_STEER_ROUTE, AGENT_SESSION_TERMINAL_RESULTS_ROUTE, Agent, AgentCancellationToken,
+    AgentCatalog, AgentDefinition, AgentDefinitionSifsStore, AgentDefinitionStore,
+    AgentEventPayload, AgentLoopDecision, AgentLoopInput, AgentModelEvent, AgentOp,
+    AgentPackageProvenance, AgentPackageSource, AgentReadinessCheckStatus, AgentReadinessReport,
+    AgentRole, AgentRuntimeEvent, AgentRuntimeEventCursor, AgentRuntimeEventPayload,
+    AgentRuntimeStorage, AgentSession, AgentSessionControlEventCursor, AgentSessionControlResponse,
     AgentSessionFollowUpRequest, AgentSessionInspectRequest, AgentSessionInspectResponse,
     AgentSessionInterruptRequest, AgentSessionProgressRequest, AgentSessionProgressResponse,
     AgentSessionResumeRequest, AgentSessionResumeResponse, AgentSessionRuntime,
-    AgentSessionSteerRequest, AgentSessionTerminalResultsRequest,
-    AgentSessionTerminalResultsResponse, AgentTaskTerminalResult, AgentToolProgressEvent,
-    AgentToolRegistry, ConfigAgentToolConfig, EventEnvelopeExt, InteractionModel,
-    InteractionOutput, InteractionSession, InteractionSurface, InteractionSurfaceKind,
-    LocalWorkspaceAgentConfig, SkillActivationScope, SkillCatalogEntry, SkillCatalogSifsStore,
-    SkillCatalogSource, SkillCatalogSourceKind, SkillCatalogStore, SkillCatalogWrite, TaskId,
-    interaction_event, render_common_skill_markdown, run_local_agent_readiness_gate,
-    user_interaction_input_event,
+    AgentSessionSteerRequest, AgentSessionStore, AgentSessionTerminalResultsRequest,
+    AgentSessionTerminalResultsResponse, AgentTaskTerminalResult, AgentTool, AgentToolDescriptor,
+    AgentToolEvidence, AgentToolKind, AgentToolProgressEvent, AgentToolRegistry, AgentToolRequest,
+    AgentToolResult, AgentToolSpec, ConfigAgentToolConfig, EventEnvelopeExt, FileAgentSessionStore,
+    FileAgentTraceStore, InteractionModel, InteractionOutput, InteractionSession,
+    InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig, SkillActivationScope,
+    SkillCatalogEntry, SkillCatalogSifsStore, SkillCatalogSource, SkillCatalogSourceKind,
+    SkillCatalogStore, SkillCatalogWrite, TaskId, WorkspaceRef, interaction_event,
+    render_common_skill_markdown, run_local_agent_readiness_gate, user_interaction_input_event,
 };
 use sinomo_lm::{
     AnthropicProvider, CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, ClaudeProvider, CurrentDefaultModel,
     DEFAULT_PROVIDER_ACCOUNT, DeepSeekProvider, GeminiProvider, GitHubCopilotProvider,
     LM_PROVIDER_CONFIG_KEY, LM_PROVIDER_CONFIG_KV_KEY, LM_RUNTIME_CONFIG_KEY,
-    LM_RUNTIME_CONFIG_KV_KEY, LanguageModelError, LanguageModelModelOptions,
-    LanguageModelProviderOptions, LanguageModelProviderUsage, LanguageModelRequest,
-    LanguageModelResponse, LanguageModelStreamEvent, ModelConfig, ModelPaths, ModelRuntimeConfig,
-    NvidiaProvider, OpenAiProvider, ProviderAccountConfig, ProviderReasoningEffort,
-    ProviderTextVerbosity, claude_provider, codex_provider, collect_provider_model_catalogs,
-    collect_provider_usage, complete_configured_model_request_streaming_events_with_account,
+    LM_RUNTIME_CONFIG_KV_KEY, LanguageModelCancellation, LanguageModelError,
+    LanguageModelModelOptions, LanguageModelProviderOptions, LanguageModelProviderUsage,
+    LanguageModelRequest, LanguageModelResponse, LanguageModelStreamEvent, ModelConfig, ModelPaths,
+    ModelRuntimeConfig, NvidiaProvider, OpenAiProvider, ProviderAccountConfig,
+    ProviderReasoningEffort, ProviderTextVerbosity, claude_provider, codex_provider,
+    collect_provider_model_catalogs, collect_provider_usage,
+    complete_configured_model_request_streaming_events_with_account,
+    complete_configured_model_request_streaming_events_with_account_and_cancellation,
     complete_configured_model_request_with_account,
     current_default_model as resolve_current_default_model, default_model_provider_ids,
     github_copilot_provider, load_model_config, model_config_cluster_kv_txn,
@@ -227,15 +230,18 @@ use sinomo_runtime::rollout::{
     LocalRolloutNativeDylibModuleArtifact, ManagedSourceDeployOptions, ManagedSourceStatus,
     RolloutActivationStrategy, RolloutController, RolloutError, RolloutMainActivation,
     RolloutObservation, RolloutRuntimeState, RolloutTelemetryGateConfig, SelfRolloutPaths,
-    clear_rollout_status, ensure_rollout_layout, ensure_rollout_source_repo_with_options,
+    acquire_rollout_activation_guard, clear_rollout_status, ensure_rollout_layout,
+    ensure_rollout_source_repo_with_options,
     install_local_rollout_native_dylib_modules as rollout_install_local_rollout_native_dylib_modules,
     managed_source_status, prepare_cluster_rollout_binary_manifest,
     prepare_cluster_rollout_build_request, prepare_cluster_rollout_native_dylib_module_request,
     prepare_local_rollout_artifacts_with_options, prepare_rollout_dev_artifacts,
     prepare_rollout_source_bundle, read_rollout_runtime_state, read_rollout_telemetry_gate_config,
+    reconcile_rollout_native_dylib_platforms, restore_native_dylib_loader_state_for_activation,
     rollout_build_dev_native_dylib_module, rollout_source_head, rollout_status_view,
     shadow_telemetry_scorecard_from_event_store, source_heads_match,
-    sync_external_repo_from_managed, unique_rollout_targets, write_rollout_telemetry_gate_config,
+    stage_native_dylib_loader_state_rollback, sync_external_repo_from_managed,
+    unique_rollout_targets, write_rollout_telemetry_gate_config,
 };
 use sinomo_runtime::rollout::{
     SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV, SHADOW_MAIN_PORT_ENV,
@@ -252,6 +258,8 @@ use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
+#[cfg(all(unix, feature = "dfs-fuse"))]
+use std::sync::Weak;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -597,6 +605,68 @@ static CLI_RUNTIME_CONFIG: OnceLock<CliRuntimeConfig> = OnceLock::new();
 
 #[cfg(unix)]
 static PROCESS_STDIO_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(all(unix, feature = "dfs-fuse"))]
+static SIMPLE_SANDBOX_SIFS_MOUNTS: OnceLock<
+    Mutex<BTreeMap<PathBuf, Weak<Mutex<sinomo_dfs_fuse::DfsFuseMountHandle>>>>,
+> = OnceLock::new();
+
+#[derive(Clone)]
+struct SimpleSandboxSifsMount {
+    mount_root: PathBuf,
+    #[cfg(all(unix, feature = "dfs-fuse"))]
+    handle: Arc<Mutex<sinomo_dfs_fuse::DfsFuseMountHandle>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ResolvedWorkspaceRoot {
+    root: PathBuf,
+    _live_sifs_mount: Option<SimpleSandboxSifsMount>,
+}
+
+pub(crate) struct ResolvedWorkspaceBinding {
+    binding: WorkspaceRef,
+    _live_sifs_mount: Option<SimpleSandboxSifsMount>,
+}
+
+impl ResolvedWorkspaceBinding {
+    pub(crate) fn binding(&self) -> &WorkspaceRef {
+        &self.binding
+    }
+}
+
+impl ResolvedWorkspaceRoot {
+    fn local(root: PathBuf) -> Self {
+        Self {
+            root,
+            _live_sifs_mount: None,
+        }
+    }
+
+    fn live_sifs(root: PathBuf, mount: SimpleSandboxSifsMount) -> Self {
+        Self {
+            root,
+            _live_sifs_mount: Some(mount),
+        }
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl SimpleSandboxSifsMount {
+    fn mount_root(&self) -> &Path {
+        &self.mount_root
+    }
+
+    fn retain_for_registry(&self, registry: &AgentToolRegistry) {
+        #[cfg(all(unix, feature = "dfs-fuse"))]
+        registry.retain_resource(Arc::clone(&self.handle));
+
+        #[cfg(not(all(unix, feature = "dfs-fuse")))]
+        let _ = registry;
+    }
+}
 
 pub type CliConfigRegistryHook = Box<
     dyn Fn(
@@ -1147,7 +1217,9 @@ pub(crate) fn cli_command_requires_cluster_state(command: &CliCommand) -> bool {
     match command {
         CliCommand::Dfs(command) => dfs_command_requires_cluster_state(command),
         CliCommand::Test(command) => test_command_requires_cluster_state(command),
-        CliCommand::Registered(command) => command.policy().requires_cluster_state,
+        CliCommand::Registered(command) | CliCommand::RegisteredRolloutMutation(command) => {
+            command.policy().requires_cluster_state
+        }
         _ => false,
     }
 }
@@ -1161,7 +1233,9 @@ pub(crate) fn cli_command_supports_degraded_local_mode(command: &CliCommand) -> 
         | CliCommand::Skill(_) => true,
         CliCommand::Test(command) => !test_command_requires_cluster_state(command),
         CliCommand::Dfs(command) => !dfs_command_requires_cluster_state(command),
-        CliCommand::Registered(command) => command.policy().supports_degraded_local_mode,
+        CliCommand::Registered(command) | CliCommand::RegisteredRolloutMutation(command) => {
+            command.policy().supports_degraded_local_mode
+        }
         _ => false,
     }
 }
@@ -1181,7 +1255,9 @@ pub(crate) fn cli_command_is_help(command: &CliCommand) -> bool {
         | CliCommand::Agent(AgentCliCommand::Help)
         | CliCommand::Skill(SkillCliCommand::Help)
         | CliCommand::Agent(AgentCliCommand::Session(AgentSessionCliCommand::Help)) => true,
-        CliCommand::Registered(command) => command.is_help(),
+        CliCommand::Registered(command) | CliCommand::RegisteredRolloutMutation(command) => {
+            command.is_help()
+        }
         _ => false,
     }
 }
@@ -1293,6 +1369,7 @@ pub(crate) enum CliCommand {
     Agent(AgentCliCommand),
     Skill(SkillCliCommand),
     Registered(RegisteredCliCommand),
+    RegisteredRolloutMutation(RegisteredCliCommand),
     Usage(UsageOptions),
 }
 
@@ -1481,10 +1558,23 @@ pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError>
             Ok(CliCommand::Usage(parse_usage_options(rest)?))
         }
         _ => match cli_command_registry().parse(args)? {
+            Some(command) if registered_command_requires_rollout_admission(args) => {
+                Ok(CliCommand::RegisteredRolloutMutation(command))
+            }
             Some(command) => Ok(CliCommand::Registered(command)),
             None => Err(CliError::Usage),
         },
     }
+}
+
+fn registered_command_requires_rollout_admission(args: &[String]) -> bool {
+    matches!(
+        args,
+        [module, native_dylib, mutation, ..]
+            if module == "module"
+                && native_dylib == "native-dylib"
+                && matches!(mutation.as_str(), "activate" | "unload")
+    )
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1597,9 +1687,14 @@ pub(crate) struct AgentReadinessOptions {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct AgentRunOptions {
     pub prompt: String,
+    pub agent: String,
+    pub agent_explicit: bool,
     pub provider: String,
     pub model: String,
     pub account: Option<String>,
+    pub session_id: Option<SessionId>,
+    pub compact_after: bool,
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -2352,15 +2447,29 @@ pub(crate) fn parse_agent_validate_options(
 
 pub(crate) fn parse_agent_run_options(args: &[String]) -> Result<AgentRunOptions, CliError> {
     let mut prompt = None;
+    let mut agent = "main-agent".to_string();
+    let mut agent_explicit = false;
     let mut provider = CODEX_PROVIDER_ID.to_string();
     let mut model = CODEX_DEFAULT_MODEL.to_string();
     let mut account = None;
+    let mut session_id = None;
+    let mut compact_after = false;
+    let mut json = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--prompt" => {
                 index += 1;
-                prompt = args.get(index).cloned();
+                prompt = Some(args.get(index).cloned().ok_or_else(|| CliError::Parse {
+                    detail: "--prompt requires a value".to_string(),
+                })?);
+            }
+            "--agent" => {
+                index += 1;
+                agent = args.get(index).cloned().ok_or_else(|| CliError::Parse {
+                    detail: "--agent requires a value".to_string(),
+                })?;
+                agent_explicit = true;
             }
             "--provider" => {
                 index += 1;
@@ -2380,6 +2489,12 @@ pub(crate) fn parse_agent_run_options(args: &[String]) -> Result<AgentRunOptions
                     detail: "--account requires a value".to_string(),
                 })?);
             }
+            "--session" | "--session-id" => {
+                index += 1;
+                session_id = Some(parse_agent_session_id_arg(args.get(index), "--session")?);
+            }
+            "--compact-after" => compact_after = true,
+            "--json" => json = true,
             value if prompt.is_none() => {
                 prompt = Some(value.to_string());
             }
@@ -2395,9 +2510,14 @@ pub(crate) fn parse_agent_run_options(args: &[String]) -> Result<AgentRunOptions
         prompt: prompt.ok_or_else(|| CliError::Parse {
             detail: "agent run requires --prompt <text>".to_string(),
         })?,
+        agent,
+        agent_explicit,
         provider,
         model,
         account,
+        session_id,
+        compact_after,
+        json,
     })
 }
 
@@ -2564,6 +2684,52 @@ impl InteractionModel for ConfiguredInteractionModel {
             request,
             on_event,
         )
+    }
+
+    fn complete_streaming_events_with_cancellation(
+        &self,
+        request: &LanguageModelRequest,
+        cancellation_token: &AgentCancellationToken,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        if self.provider != MINICPM_PROVIDER_ID {
+            let token = cancellation_token.clone();
+            let cancellation = LanguageModelCancellation::new(move || token.is_cancelled());
+            return complete_configured_model_request_streaming_events_with_account_and_cancellation(
+                &self.data_dir,
+                &self.provider,
+                &self.model,
+                self.account.as_ref(),
+                None,
+                request,
+                &cancellation,
+                on_event,
+            );
+        }
+
+        if cancellation_token.is_cancelled() {
+            return Err(configured_model_cancelled_error(request, "before request"));
+        }
+        let response = self.complete_streaming_events(request, &mut |event| {
+            if !cancellation_token.is_cancelled() {
+                on_event(event);
+            }
+        })?;
+        if cancellation_token.is_cancelled() {
+            return Err(configured_model_cancelled_error(request, "during response"));
+        }
+        Ok(response)
+    }
+}
+
+fn configured_model_cancelled_error(
+    request: &LanguageModelRequest,
+    phase: &'static str,
+) -> LanguageModelError {
+    LanguageModelError::ProviderInvocationFailed {
+        provider: request.provider.clone(),
+        model: request.model.clone(),
+        detail: format!("model invocation cancelled {phase}"),
     }
 }
 
@@ -3936,21 +4102,105 @@ pub(crate) fn best_effort_skill_catalog_texts(
 
 pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
+    let session_id = options
+        .session_id
+        .clone()
+        .unwrap_or_else(SessionId::generate);
+    let session_store = FileAgentSessionStore::for_data_dir(&data_dir);
+    let persisted_session = if options.session_id.is_some() {
+        session_store
+            .load_session(&session_id)
+            .map_err(|source| CliError::Parse {
+                detail: format!("load agent session `{session_id}` failed: {source}"),
+            })?
+    } else {
+        None
+    };
+    let agent_name = match persisted_session
+        .as_ref()
+        .and_then(|session| session.agent_definition_key.as_deref())
+    {
+        Some(persisted_key) if options.agent_explicit && persisted_key != options.agent => {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "agent session `{session_id}` belongs to `{persisted_key}` and cannot be resumed as `{}`",
+                    options.agent
+                ),
+            });
+        }
+        Some(persisted_key) => persisted_key.to_string(),
+        None if persisted_session.is_some() && !options.agent_explicit => {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "legacy agent session `{session_id}` has no persisted agent definition; resume it once with an explicit `--agent <name>`"
+                ),
+            });
+        }
+        None => options.agent.clone(),
+    };
+    let catalog = load_agent_catalog_for_cli()?;
+    let definition = agent_definition_from_catalog(&catalog, &agent_name)?.clone();
+    let current_root = std::env::current_dir().map_err(|source| CliError::Io {
+        path: "current directory".to_string(),
+        detail: source.to_string(),
+    })?;
+    let coding_authority = agent_definition_has_coding_authority(&definition);
+    let mut _resolved_workspace_root = None;
+    let mut _resolved_workspace_binding = None;
+    let (workspace_root, workspace_binding) = if coding_authority {
+        match persisted_session.as_ref() {
+            Some(session) => {
+                let binding = session.workspace_binding.as_ref().ok_or_else(|| CliError::Parse {
+                    detail: format!(
+                        "coding-agent session `{session_id}` has no workspace binding; refusing a mutation-capable resume because its original workspace cannot be verified"
+                    ),
+                })?;
+                let resolved =
+                    workspace_binding_root_for_data_dir(&data_dir, &session_id, binding)?;
+                let root = resolved.root().to_path_buf();
+                _resolved_workspace_root = Some(resolved);
+                (root, Some(binding.clone()))
+            }
+            None => {
+                let resolved = coding_agent_workspace_binding(&data_dir, &current_root)?;
+                let binding = resolved.binding().clone();
+                _resolved_workspace_binding = Some(resolved);
+                (current_root.clone(), Some(binding))
+            }
+        }
+    } else {
+        (current_root, None)
+    };
     let account = if let Some(account_name) = options.account.as_deref() {
         let config = load_model_config(&ModelPaths::new(&data_dir))?;
         provider_account_config(&config, &options.provider, Some(account_name)).cloned()
     } else {
         None
     };
+    let (agent_session, resumed) = load_or_create_agent_run_session(
+        &session_store,
+        session_id.clone(),
+        definition.role.clone(),
+        definition.key(),
+        workspace_binding.as_ref(),
+    )?;
+    let node_id = match read_cluster_state(&ClusterPaths::new(&data_dir)) {
+        Ok(state) => state.local_node_id,
+        Err(CliError::ClusterOrphan) => {
+            NodeId::from_legacy_named("node_agent_cli").expect("legacy node id")
+        }
+        Err(error) => return Err(error),
+    };
     let session = InteractionSession::new(
-        SessionId::generate(),
-        NodeId::from_legacy_named("node_agent_cli").expect("legacy node id"),
+        session_id.clone(),
+        node_id,
         InteractionSurface::new("cli.agent", InteractionSurfaceKind::CommandLine),
     );
     let input_event = user_interaction_input_event(&session, &options.prompt);
     let input = AgentLoopInput {
         session,
         latest_event: input_event,
+        transient_system_context: None,
         async_update: None,
         context_attachments: Vec::new(),
         tool_specs: Vec::new(),
@@ -3958,7 +4208,14 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
     let provider = options.provider.clone();
     let model = options.model.clone();
     let (runtime_config, _) = load_model_runtime_config_for_node(&data_dir)?;
-    let tool_registry = main_agent_config_tool_registry(&data_dir)?;
+    let tool_registry = agent_tool_registry_for_workspace(
+        &data_dir,
+        &workspace_root,
+        &definition,
+        Some(&session_id),
+        None,
+        true,
+    )?;
     let skill_catalog = best_effort_reconciled_skill_catalog(&data_dir);
     let skill_catalog_texts = best_effort_skill_catalog_texts(&data_dir, &skill_catalog);
     let loop_model = ConfiguredInteractionModel {
@@ -3970,20 +4227,19 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         managed_pytorch: Mutex::new(None),
     };
     let agent_config = sinomo_agent::AgentConfig::new(provider.clone(), model.clone())
-        .with_agent_definition(AgentDefinition::main())
+        .with_agent_definition(definition.clone())
+        .with_workspace_root(&workspace_root)
         .with_skill_catalog(skill_catalog)
         .with_skill_catalog_texts(skill_catalog_texts);
     let agent = Agent::new(loop_model, provider, model)
         .with_config(agent_config)
         .with_tool_registry(tool_registry)
-        .with_tool_surface(sinomo_agent::AgentToolSurface::default_for_role(
-            AgentRole::Main,
+        .with_session_store(session_store)
+        .with_trace_store(FileAgentTraceStore::for_data_dir_session(
+            &data_dir,
+            &session_id,
         ));
-    let runtime = AgentSessionRuntime::with_data_dir_storage(
-        agent,
-        AgentSession::new(input.session.session_id.clone(), AgentRole::Main),
-        &data_dir,
-    );
+    let runtime = AgentSessionRuntime::with_data_dir_storage(agent, agent_session, &data_dir);
     let op = AgentOp::start_turn(input);
     let op_id = op.op_id.clone();
     let submit = runtime.submit_op(op)?;
@@ -3995,7 +4251,7 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
                 AgentEventPayload::OperationRejected { reason, .. } => Some(reason.clone()),
                 _ => None,
             })
-            .unwrap_or_else(|| "main agent turn was rejected".to_string());
+            .unwrap_or_else(|| format!("agent `{}` turn was rejected", definition.key()));
         return Err(CliError::Parse { detail: reason });
     }
     runtime.join_active_turn()?;
@@ -4004,9 +4260,67 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         .and_then(|outcome| outcome.run)
         .map(|run| run.final_decision)
         .ok_or_else(|| CliError::Parse {
-            detail: format!("main agent runtime turn `{op_id}` completed without a decision"),
+            detail: format!(
+                "agent `{}` runtime turn `{op_id}` completed without a decision",
+                definition.key()
+            ),
         })?;
-    if decision.text.trim().is_empty() {
+    let compaction_evidence = if options.compact_after {
+        let compact_op = AgentOp::compact(format!(
+            "CLI --compact-after following completed turn {op_id}"
+        ));
+        let compact_op_id = compact_op.op_id.clone();
+        let compact_submit = runtime.submit_op(compact_op)?;
+        if !compact_submit.accepted {
+            let reason = compact_submit
+                .events
+                .iter()
+                .find_map(|event| match &event.payload {
+                    AgentEventPayload::OperationRejected { reason, .. } => Some(reason.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| format!("agent `{}` compaction was rejected", definition.key()));
+            return Err(CliError::Parse { detail: reason });
+        }
+        let persisted_session = FileAgentSessionStore::for_data_dir(&data_dir)
+            .load_session(&session_id)
+            .map_err(|source| CliError::Parse {
+                detail: format!(
+                    "reload compacted agent session `{session_id}` failed: {source}"
+                ),
+            })?
+            .ok_or_else(|| CliError::Parse {
+                detail: format!(
+                    "compacted agent session `{session_id}` was not persisted after operation `{compact_op_id}`"
+                ),
+            })?;
+        Some(agent_run_compaction_evidence(
+            &compact_op_id,
+            &compact_submit.events,
+            &persisted_session,
+        )?)
+    } else {
+        None
+    };
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "session": session_id,
+                "op": op_id,
+                "agent": definition.key(),
+                "provider": options.provider,
+                "model": options.model,
+                "decision": decision,
+                "resumed": resumed,
+                "compaction": compaction_evidence.as_ref(),
+            }))
+            .map_err(|source| CliError::Json {
+                path: "<agent run>".to_string(),
+                detail: source.to_string(),
+            })?
+        );
+    } else if decision.text.trim().is_empty() {
         println!("{}", agent_decision_json(&decision)?);
     } else {
         println!("{}", decision.text);
@@ -4014,7 +4328,361 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
             println!("{}", agent_decision_json(&decision)?);
         }
     }
+    if !options.json {
+        if let Some(evidence) = compaction_evidence.as_ref() {
+            eprintln!(
+                "compaction: persisted projection {}",
+                evidence["projection"]["projection_id"]
+                    .as_str()
+                    .unwrap_or("<unknown>")
+            );
+        }
+        eprintln!(
+            "session: {session_id} (resume with `sinomo agent run --session {session_id} --prompt <text>`)"
+        );
+    }
     Ok(())
+}
+
+fn agent_run_compaction_evidence(
+    compact_op_id: &TaskId,
+    events: &[sinomo_agent::AgentEvent],
+    persisted_session: &AgentSession,
+) -> Result<serde_json::Value, CliError> {
+    let (summary, item_count_after) = events
+        .iter()
+        .find_map(|event| match &event.payload {
+            AgentEventPayload::Compacted {
+                summary,
+                item_count,
+            } => Some((summary, *item_count)),
+            _ => None,
+        })
+        .ok_or_else(|| CliError::Parse {
+            detail: format!(
+                "agent compaction operation `{compact_op_id}` completed without compaction evidence"
+            ),
+        })?;
+    let projection = persisted_session
+        .projection
+        .as_ref()
+        .filter(|projection| projection.projection_id == summary.projection.projection_id)
+        .ok_or_else(|| CliError::Parse {
+            detail: format!(
+                "agent compaction operation `{compact_op_id}` did not persist projection `{}`",
+                summary.projection.projection_id
+            ),
+        })?;
+    Ok(serde_json::json!({
+        "op": compact_op_id,
+        "compaction_id": summary.compaction_id,
+        "reason": summary.reason,
+        "strategy_id": summary.strategy_id,
+        "trigger": summary.trigger,
+        "summary": summary.summary,
+        "summary_model": summary.summary_model,
+        "fallback_reason": summary.fallback_reason,
+        "token_estimate_before": summary.token_estimate_before,
+        "retained_tail_count": summary.retained_tail_count,
+        "item_count_after": item_count_after,
+        "transcript_item_count_after": persisted_session.transcript.items.len(),
+        "raw_item_count_after": persisted_session.raw_transcript.items.len(),
+        "projection": projection,
+        "persisted": true,
+    }))
+}
+
+fn load_or_create_agent_run_session(
+    store: &FileAgentSessionStore,
+    session_id: SessionId,
+    role: AgentRole,
+    definition_key: &str,
+    workspace_binding: Option<&WorkspaceRef>,
+) -> Result<(AgentSession, bool), CliError> {
+    let loaded = store
+        .load_session(&session_id)
+        .map_err(|source| CliError::Parse {
+            detail: format!("load agent session `{session_id}` failed: {source}"),
+        })?;
+    match loaded {
+        Some(mut session) => {
+            if let Some(existing_key) = session.agent_definition_key.as_deref()
+                && existing_key != definition_key
+            {
+                return Err(CliError::Parse {
+                    detail: format!(
+                        "agent session `{}` belongs to `{existing_key}` and cannot be resumed as `{definition_key}`",
+                        session.session_id
+                    ),
+                });
+            }
+            session.role = role;
+            if let Some(requested_binding) = workspace_binding {
+                match session.workspace_binding.as_ref() {
+                    Some(existing_binding) => validate_agent_session_workspace_binding(
+                        &session.session_id,
+                        existing_binding,
+                        requested_binding,
+                    )?,
+                    None => {
+                        return Err(CliError::Parse {
+                            detail: format!(
+                                "coding-agent session `{}` has no workspace binding; refusing a mutation-capable resume because its original workspace cannot be verified; start a new session without `--session`",
+                                session.session_id
+                            ),
+                        });
+                    }
+                }
+            }
+            let needs_identity_migration = session.agent_definition_key.is_none();
+            session.agent_definition_key = Some(definition_key.to_string());
+            if needs_identity_migration {
+                store
+                    .save_session(&session)
+                    .map_err(|source| CliError::Parse {
+                        detail: format!(
+                            "persist agent identity for session `{}` failed: {source}",
+                            session.session_id
+                        ),
+                    })?;
+            }
+            Ok((session, true))
+        }
+        None => {
+            let mut session = AgentSession::new(session_id, role);
+            session.agent_definition_key = Some(definition_key.to_string());
+            session.workspace_binding = workspace_binding.cloned();
+            store
+                .save_session(&session)
+                .map_err(|source| CliError::Parse {
+                    detail: format!(
+                        "create agent session `{}` failed: {source}",
+                        session.session_id
+                    ),
+                })?;
+            Ok((session, false))
+        }
+    }
+}
+
+pub(crate) fn coding_agent_workspace_binding(
+    data_dir: &SinomoDataDir,
+    workspace_root: &Path,
+) -> Result<ResolvedWorkspaceBinding, CliError> {
+    let verified_sifs_mount = live_sifs_mount_for_selected_root(data_dir, workspace_root)?;
+    validate_mutating_workspace_root_with_live_mount(
+        data_dir,
+        workspace_root,
+        verified_sifs_mount
+            .as_ref()
+            .map(SimpleSandboxSifsMount::mount_root),
+    )?;
+    let binding = workspace_ref_for_root_with_verified_sifs_mount(
+        workspace_root,
+        verified_sifs_mount
+            .as_ref()
+            .map(SimpleSandboxSifsMount::mount_root),
+    )?;
+    Ok(ResolvedWorkspaceBinding {
+        binding,
+        _live_sifs_mount: verified_sifs_mount,
+    })
+}
+
+const LIVE_POSIX_SIFS_WRITE_POLICY: &str = "live-posix";
+
+pub(crate) fn workspace_ref_for_selected_root(
+    data_dir: &SinomoDataDir,
+    workspace_root: &Path,
+) -> Result<ResolvedWorkspaceBinding, CliError> {
+    let verified_sifs_mount = live_sifs_mount_for_selected_root(data_dir, workspace_root)?;
+    let binding = workspace_ref_for_root_with_verified_sifs_mount(
+        workspace_root,
+        verified_sifs_mount
+            .as_ref()
+            .map(SimpleSandboxSifsMount::mount_root),
+    )?;
+    Ok(ResolvedWorkspaceBinding {
+        binding,
+        _live_sifs_mount: verified_sifs_mount,
+    })
+}
+
+pub(crate) fn workspace_ref_for_root_with_verified_sifs_mount(
+    workspace_root: &Path,
+    verified_sifs_mount: Option<&Path>,
+) -> Result<WorkspaceRef, CliError> {
+    let workspace_root = absolute_normalized_path(workspace_root)?;
+    let Some(mount_root) = verified_sifs_mount else {
+        return Ok(WorkspaceRef::local_path(workspace_root));
+    };
+    let mount_root = absolute_normalized_path(mount_root)?;
+    let relative = workspace_root
+        .strip_prefix(&mount_root)
+        .map_err(|_| CliError::Parse {
+            detail: format!(
+                "workspace `{}` is not beneath verified live SIFS mount `{}`",
+                workspace_root.display(),
+                mount_root.display()
+            ),
+        })?;
+    let mut segments = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(segment) => {
+                let segment = segment.to_str().ok_or_else(|| CliError::Parse {
+                    detail: format!(
+                        "SIFS workspace path contains non-Unicode component: {}",
+                        workspace_root.display()
+                    ),
+                })?;
+                segments.push(segment);
+            }
+            std::path::Component::CurDir => {}
+            _ => {
+                return Err(CliError::Parse {
+                    detail: format!("invalid SIFS workspace path: {}", workspace_root.display()),
+                });
+            }
+        }
+    }
+    let sifs_root = if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
+    };
+    Ok(WorkspaceRef::sifs(format!("sifs:{sifs_root}"), sifs_root)
+        .with_write_policy(LIVE_POSIX_SIFS_WRITE_POLICY))
+}
+
+pub(crate) fn validate_agent_session_workspace_binding(
+    session_id: &SessionId,
+    existing_binding: &WorkspaceRef,
+    requested_binding: &WorkspaceRef,
+) -> Result<(), CliError> {
+    match (
+        existing_binding.sifs_root.as_deref(),
+        requested_binding.sifs_root.as_deref(),
+    ) {
+        (Some(existing), Some(requested)) => {
+            if normalize_logical_sifs_root(existing)? == normalize_logical_sifs_root(requested)? {
+                return Ok(());
+            }
+        }
+        (None, None) => {
+            let existing_root = local_workspace_binding_root(session_id, existing_binding)?;
+            let requested_root = local_workspace_binding_root(session_id, requested_binding)?;
+            if absolute_normalized_path(existing_root)? == absolute_normalized_path(requested_root)?
+            {
+                return Ok(());
+            }
+        }
+        _ => {}
+    }
+    Err(CliError::Parse {
+        detail: format!(
+            "agent session `{session_id}` is bound to workspace `{}` and cannot be resumed from `{}`; choose the original workspace or start a new session",
+            workspace_binding_display(existing_binding),
+            workspace_binding_display(requested_binding)
+        ),
+    })
+}
+
+fn workspace_binding_display(binding: &WorkspaceRef) -> String {
+    binding
+        .sifs_root
+        .as_ref()
+        .map(|root| format!("sifs:{root}"))
+        .or_else(|| {
+            binding
+                .local_root
+                .as_ref()
+                .map(|root| root.display().to_string())
+        })
+        .unwrap_or_else(|| binding.id.clone())
+}
+
+fn normalize_logical_sifs_root(root: &str) -> Result<String, CliError> {
+    if !root.starts_with('/') {
+        return Err(CliError::Parse {
+            detail: format!("SIFS workspace root must be absolute: {root}"),
+        });
+    }
+    let mut segments = Vec::new();
+    for segment in root.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                return Err(CliError::Parse {
+                    detail: format!("SIFS workspace root escapes its mount: {root}"),
+                });
+            }
+            segment => segments.push(segment),
+        }
+    }
+    Ok(if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
+    })
+}
+
+pub(crate) fn local_workspace_binding_root<'a>(
+    session_id: &SessionId,
+    binding: &'a WorkspaceRef,
+) -> Result<&'a Path, CliError> {
+    binding.local_root.as_deref().ok_or_else(|| CliError::Parse {
+        detail: format!(
+            "coding-agent session `{session_id}` has a non-local workspace binding and cannot be resumed by the local CLI"
+        ),
+    })
+}
+
+pub(crate) fn workspace_binding_root_for_data_dir(
+    data_dir: &SinomoDataDir,
+    session_id: &SessionId,
+    binding: &WorkspaceRef,
+) -> Result<ResolvedWorkspaceRoot, CliError> {
+    if binding.sifs_root.is_none() {
+        let root = absolute_normalized_path(local_workspace_binding_root(session_id, binding)?)?;
+        let metadata = fs::metadata(&root).map_err(|source| CliError::Io {
+            path: root.display().to_string(),
+            detail: format!("persisted workspace is unavailable: {source}"),
+        })?;
+        if !metadata.is_dir() {
+            return Err(CliError::Parse {
+                detail: format!("persisted workspace is not a directory: {}", root.display()),
+            });
+        }
+        return Ok(ResolvedWorkspaceRoot::local(root));
+    }
+    let mount = ensure_simple_sandbox_sifs_mount(data_dir)?.ok_or_else(|| CliError::Parse {
+        detail: format!(
+            "agent session `{session_id}` uses SIFS workspace `{}`, but this device has no active live SIFS mount",
+            workspace_binding_display(binding)
+        ),
+    })?;
+    let root =
+        workspace_binding_root_with_verified_sifs_mount(session_id, binding, mount.mount_root())?;
+    Ok(ResolvedWorkspaceRoot::live_sifs(root, mount))
+}
+
+pub(crate) fn workspace_binding_root_with_verified_sifs_mount(
+    session_id: &SessionId,
+    binding: &WorkspaceRef,
+    verified_sifs_mount: &Path,
+) -> Result<PathBuf, CliError> {
+    let Some(sifs_root) = binding.sifs_root.as_deref() else {
+        return absolute_normalized_path(local_workspace_binding_root(session_id, binding)?);
+    };
+    let sifs_root = normalize_logical_sifs_root(sifs_root)?;
+    let mut local_root = absolute_normalized_path(verified_sifs_mount)?;
+    for segment in sifs_root.trim_start_matches('/').split('/') {
+        if !segment.is_empty() {
+            local_root.push(segment);
+        }
+    }
+    Ok(local_root)
 }
 
 pub(crate) fn main_agent_config_tool_registry(
@@ -4031,33 +4699,215 @@ pub(crate) fn main_agent_tool_registry_for_workspace(
     data_dir: &SinomoDataDir,
     workspace_root: &Path,
 ) -> Result<AgentToolRegistry, CliError> {
+    agent_tool_registry_for_workspace(
+        data_dir,
+        workspace_root,
+        &AgentDefinition::main(),
+        None,
+        None,
+        false,
+    )
+}
+
+pub(crate) fn agent_tool_registry_for_workspace(
+    data_dir: &SinomoDataDir,
+    workspace_root: &Path,
+    definition: &AgentDefinition,
+    session_id: Option<&SessionId>,
+    sandbox_node_id: Option<NodeId>,
+    allow_coding_mutation: bool,
+) -> Result<AgentToolRegistry, CliError> {
     let registry = AgentToolRegistry::new();
-    main_agent_configure_tool_registry_for_workspace(
+    configure_agent_tool_registry_for_workspace(
         &registry,
         data_dir,
         workspace_root,
-        None,
-        None,
+        definition,
+        session_id,
+        sandbox_node_id,
+        allow_coding_mutation,
     )?;
     Ok(registry)
 }
 
-pub(crate) fn main_agent_configure_tool_registry_for_workspace(
+#[derive(Clone)]
+struct CliClusterStatusAgentTool {
+    data_dir: SinomoDataDir,
+}
+
+impl CliClusterStatusAgentTool {
+    fn new(data_dir: SinomoDataDir) -> Self {
+        Self { data_dir }
+    }
+}
+
+impl AgentTool for CliClusterStatusAgentTool {
+    fn descriptor(&self) -> AgentToolDescriptor {
+        AgentToolDescriptor::new(AgentToolSpec::new(
+            AgentToolKind::ClusterStatus,
+            "cluster_status",
+            "Read live health for every known node in the local Sinomo cluster.",
+            false,
+        ))
+        .with_input_schema(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["cluster", "local"],
+                    "description": "Optional compatibility hint; both values inspect the cluster reached through this local node."
+                }
+            },
+            "additionalProperties": false
+        }))
+        .with_output_schema(serde_json::json!({
+            "type": "object",
+            "required": ["cluster_id", "local_node_id", "summary", "nodes"],
+            "properties": {
+                "cluster_id": { "type": "string" },
+                "local_node_id": { "type": "string" },
+                "summary": {
+                    "type": "object",
+                    "required": ["online", "offline", "unknown", "total"]
+                },
+                "nodes": { "type": "array" }
+            }
+        }))
+    }
+
+    fn execute(&self, _request: AgentToolRequest<'_>) -> AgentToolResult {
+        let (state, rows) = match cluster_health_rows_for_data_dir(&self.data_dir) {
+            Ok(result) => result,
+            Err(error) => {
+                return AgentToolResult::failed(
+                    format!("cluster health is unavailable: {error}"),
+                    serde_json::json!({
+                        "error": "cluster_health_unavailable",
+                        "detail": error.to_string(),
+                    }),
+                );
+            }
+        };
+        let count = |availability: ClusterNodeAvailability| {
+            rows.iter()
+                .filter(|row| row.availability == availability)
+                .count()
+        };
+        let online = count(ClusterNodeAvailability::Online);
+        let offline = count(ClusterNodeAvailability::Offline);
+        let unknown = count(ClusterNodeAvailability::Unknown);
+        let output = serde_json::json!({
+            "cluster_id": state.cluster_id,
+            "local_node_id": state.local_node_id,
+            "summary": {
+                "online": online,
+                "offline": offline,
+                "unknown": unknown,
+                "total": rows.len(),
+            },
+            "nodes": rows,
+        });
+        AgentToolResult::succeeded(
+            format!("cluster health: {online} online, {offline} offline, {unknown} unknown"),
+            output.clone(),
+        )
+        .with_evidence(
+            AgentToolEvidence::availability_only(
+                true,
+                "read cluster health through the local Sinomo control plane",
+            )
+            .with_output_value(&output, false),
+        )
+    }
+}
+
+pub(crate) fn configure_agent_tool_registry_for_workspace(
     registry: &AgentToolRegistry,
     data_dir: &SinomoDataDir,
     workspace_root: &Path,
+    definition: &AgentDefinition,
     session_id: Option<&SessionId>,
     sandbox_node_id: Option<NodeId>,
+    allow_coding_mutation: bool,
 ) -> Result<(), CliError> {
     let store = main_agent_config_store()?;
     let mut config = LocalWorkspaceAgentConfig::new(workspace_root);
+    let coding_authority = agent_definition_has_coding_authority(definition);
+    let live_sifs_mount_result = if coding_authority {
+        ensure_simple_sandbox_sifs_mount(data_dir)
+    } else {
+        live_sifs_mount_for_selected_root(data_dir, workspace_root)
+    };
+    let live_sifs_mount = if coding_authority {
+        match live_sifs_mount_result {
+            Ok(mount) => mount,
+            Err(error)
+                if !workspace_root_uses_simple_sandbox_sifs_mount(data_dir, workspace_root)? =>
+            {
+                // SIFS is an optional integration for an ordinary local
+                // workspace. Keep the coding tools and generic host shell
+                // available, with the sandbox inheriting the local host HOME.
+                eprintln!(
+                    "warning: live SIFS integration for simple sandbox is unavailable; using the local workspace and preserving the host HOME: {error}"
+                );
+                None
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        live_sifs_mount_result?
+    };
+    if allow_coding_mutation && agent_definition_has_coding_authority(definition) {
+        validate_mutating_workspace_root_with_live_mount(
+            data_dir,
+            workspace_root,
+            live_sifs_mount
+                .as_ref()
+                .map(SimpleSandboxSifsMount::mount_root),
+        )?;
+        config = config
+            .allowing_shell_commands(true)
+            .allowing_file_writes(true);
+    }
     if let Some(session_id) = session_id {
         config = config.with_data_dir_evidence(data_dir, session_id);
+    }
+    if coding_authority {
+        match live_sifs_mount.as_ref() {
+            Some(mount) => {
+                config = config.with_sandbox_sifs_mount_root(mount.mount_root());
+                if let Some(session_id) = session_id {
+                    match prepare_simple_sandbox_agent_home(data_dir, session_id) {
+                        Ok(home_sifs_path) => {
+                            config = config.with_agent_home_sifs_path(home_sifs_path);
+                        }
+                        Err(detail) => {
+                            // The private DFS home is optional. A permissions,
+                            // ownership, or cluster availability problem must
+                            // not veto an otherwise valid generic host command.
+                            eprintln!(
+                                "warning: live SIFS agent home is unavailable; preserving the host HOME for this session: {detail}"
+                            );
+                            config = config.without_agent_home_sifs_path();
+                        }
+                    }
+                }
+            }
+            None => {
+                // A SIFS path label without a live filesystem would falsely
+                // imply synchronization. Keep the generic shell usable when
+                // this platform has no host mount implementation.
+                config = config.without_agent_home_sifs_path();
+            }
+        }
     }
     if let Some(sandbox_node_id) = sandbox_node_id {
         config = config.with_sandbox_runtime_node_id(sandbox_node_id);
     }
     registry.clear();
+    if let Some(mount) = live_sifs_mount.as_ref() {
+        mount.retain_for_registry(registry);
+    }
     sinomo_agent::local_workspace::register_tools(registry, config);
     sinomo_agent::config::register_tools(
         registry,
@@ -4067,7 +4917,180 @@ pub(crate) fn main_agent_configure_tool_registry_for_workspace(
         registry,
         sinomo_agent::SkillAgentToolConfig::new(data_dir.clone()),
     );
+    registry.register(CliClusterStatusAgentTool::new(data_dir.clone()));
     Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_simple_sandbox_agent_home(
+    data_dir: &SinomoDataDir,
+    session_id: &SessionId,
+) -> Result<String, String> {
+    let path = format!("/sinomo/agents/{session_id}/home");
+    // These libc accessors have no preconditions and only read the effective
+    // credentials of the current process.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    sifs_file_manager::SifsFileManagerBackend::open(data_dir)?
+        .ensure_posix_directory_with_attrs(&path, uid, gid, 0o700)?;
+    Ok(path)
+}
+
+#[cfg(not(unix))]
+fn prepare_simple_sandbox_agent_home(
+    _data_dir: &SinomoDataDir,
+    _session_id: &SessionId,
+) -> Result<String, String> {
+    Err("POSIX SIFS agent homes are unavailable on this platform".to_string())
+}
+
+#[cfg(all(unix, feature = "dfs-fuse"))]
+fn ensure_simple_sandbox_sifs_mount(
+    data_dir: &SinomoDataDir,
+) -> Result<Option<SimpleSandboxSifsMount>, CliError> {
+    if read_cluster_state(&ClusterPaths::new(data_dir)).is_err() {
+        return Ok(None);
+    }
+    let data_root =
+        fs::canonicalize(data_dir.root()).unwrap_or_else(|_| data_dir.root().to_path_buf());
+    let mounts = SIMPLE_SANDBOX_SIFS_MOUNTS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut mounts = mounts.lock().map_err(|_| CliError::Parse {
+        detail: "simple-sandbox SIFS mount registry is unavailable".to_string(),
+    })?;
+    if let Some(handle) = mounts.get(&data_root).and_then(Weak::upgrade) {
+        let existing = handle.lock().map_err(|_| CliError::Parse {
+            detail: "simple-sandbox SIFS mount handle is unavailable".to_string(),
+        })?;
+        if existing.is_active() {
+            let mount_root = existing.mount_root().to_path_buf();
+            drop(existing);
+            return Ok(Some(SimpleSandboxSifsMount { mount_root, handle }));
+        }
+    }
+    mounts.remove(&data_root);
+    let mount_point = simple_sandbox_sifs_mount_point(data_dir);
+    let mut options = sinomo_dfs_fuse::DfsFuseMountOptions::new(mount_point)
+        .with_data_dir(data_dir.root())
+        .with_root_path("/");
+    // Live sandbox paths must not wait for a command/checkpoint boundary or a
+    // metadata cache interval before observing cluster changes.
+    options.attr_ttl = Duration::ZERO;
+    options.entry_ttl = Duration::ZERO;
+    let handle =
+        sinomo_dfs_fuse::mount_sifs_background(options).map_err(|source| CliError::Parse {
+            detail: format!("mount live SIFS for simple sandbox: {source}"),
+        })?;
+    let mount_root = handle.mount_root().to_path_buf();
+    let handle = Arc::new(Mutex::new(handle));
+    mounts.insert(data_root, Arc::downgrade(&handle));
+    Ok(Some(SimpleSandboxSifsMount { mount_root, handle }))
+}
+
+#[cfg(not(all(unix, feature = "dfs-fuse")))]
+fn ensure_simple_sandbox_sifs_mount(
+    _data_dir: &SinomoDataDir,
+) -> Result<Option<SimpleSandboxSifsMount>, CliError> {
+    Ok(None)
+}
+
+fn simple_sandbox_sifs_mount_point(data_dir: &SinomoDataDir) -> PathBuf {
+    simple_sandbox_sifs_mount_point_for_process(data_dir, std::process::id())
+}
+
+fn simple_sandbox_sifs_mount_point_for_process(
+    data_dir: &SinomoDataDir,
+    process_id: u32,
+) -> PathBuf {
+    data_dir
+        .root()
+        .join("mounts")
+        .join("sifs")
+        .join("by-process")
+        .join(process_id.to_string())
+}
+
+fn live_sifs_mount_for_selected_root(
+    data_dir: &SinomoDataDir,
+    workspace_root: &Path,
+) -> Result<Option<SimpleSandboxSifsMount>, CliError> {
+    if !workspace_root_uses_simple_sandbox_sifs_mount(data_dir, workspace_root)? {
+        return Ok(None);
+    }
+    let workspace_root = absolute_normalized_path(workspace_root)?;
+    let Some(active_mount) = ensure_simple_sandbox_sifs_mount(data_dir)? else {
+        return Ok(None);
+    };
+    let active_mount_root = absolute_normalized_path(active_mount.mount_root())?;
+    if workspace_root.starts_with(&active_mount_root) {
+        Ok(Some(active_mount))
+    } else {
+        Ok(None)
+    }
+}
+
+fn workspace_root_uses_simple_sandbox_sifs_mount(
+    data_dir: &SinomoDataDir,
+    workspace_root: &Path,
+) -> Result<bool, CliError> {
+    let workspace_root = absolute_normalized_path(workspace_root)?;
+    let expected_mount_root = absolute_normalized_path(&simple_sandbox_sifs_mount_point(data_dir))?;
+    Ok(workspace_root.starts_with(expected_mount_root))
+}
+
+pub(crate) fn agent_definition_has_coding_authority(definition: &AgentDefinition) -> bool {
+    definition.package.provenance.source == AgentPackageSource::BuiltIn
+        && definition.key() == "coding-agent"
+}
+
+fn validate_mutating_workspace_root_with_live_mount(
+    data_dir: &SinomoDataDir,
+    workspace_root: &Path,
+    verified_sifs_mount: Option<&Path>,
+) -> Result<(), CliError> {
+    let workspace_root = absolute_normalized_path(workspace_root)?;
+    if workspace_root.parent().is_none() {
+        return Err(unsafe_coding_workspace_error(&workspace_root));
+    }
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let home = absolute_normalized_path(Path::new(&home))?;
+        if workspace_root == home {
+            return Err(unsafe_coding_workspace_error(&workspace_root));
+        }
+    }
+    let data_root = absolute_normalized_path(&data_dir.root())?;
+    let is_live_sifs_workspace = verified_sifs_mount
+        .map(absolute_normalized_path)
+        .transpose()?
+        .is_some_and(|mount_root| workspace_root.starts_with(mount_root));
+    if (workspace_root == data_root || workspace_root.starts_with(&data_root))
+        && !is_live_sifs_workspace
+    {
+        return Err(unsafe_coding_workspace_error(&workspace_root));
+    }
+    Ok(())
+}
+
+pub(crate) fn absolute_normalized_path(path: &Path) -> Result<PathBuf, CliError> {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return Ok(canonical);
+    }
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|current| current.join(path))
+        .map_err(|source| CliError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })
+}
+
+fn unsafe_coding_workspace_error(workspace_root: &Path) -> CliError {
+    CliError::Parse {
+        detail: format!(
+            "coding-agent mutation is disabled for unsafe workspace root `{}`; run the command from an explicit workspace directory",
+            workspace_root.display()
+        ),
+    }
 }
 
 pub(crate) fn main_agent_config_store() -> Result<sinomo_runtime::config::ConfigStore, CliError> {
@@ -4111,6 +5134,31 @@ pub fn run(args: Vec<String>) -> Result<(), CliError> {
 
 fn run_cli_command(args: &[String]) -> Result<(), CliError> {
     run_parsed_cli_invocation(parse_cli_invocation(args)?)
+}
+
+pub(crate) fn with_rollout_activation_admission<T>(
+    rollout_paths: &SelfRolloutPaths,
+    operation: impl FnOnce() -> Result<T, CliError>,
+) -> Result<T, CliError> {
+    let _admission = acquire_rollout_activation_guard(rollout_paths)?;
+    operation()
+}
+
+fn run_registered_cli_command(
+    command: RegisteredCliCommand,
+    force_local: bool,
+) -> Result<(), CliError> {
+    let command_name = command.name().to_string();
+    let mut stdout = CliStdoutWriter;
+    let mut stderr = CliStderrWriter;
+    let mut context =
+        CliCommandContext::new(&mut stdout, &mut stderr).with_force_local(force_local);
+    command
+        .run(&mut context)
+        .map_err(|error| CliError::ExternalCommand {
+            command: command_name,
+            detail: error.to_string(),
+        })
 }
 
 fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> {
@@ -4166,18 +5214,13 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
         CliCommand::Test(command) => run_test_command(command),
         CliCommand::Agent(command) => run_agent_command(command),
         CliCommand::Skill(command) => run_skill_command(command),
-        CliCommand::Registered(command) => {
-            let command_name = command.name().to_string();
-            let mut stdout = CliStdoutWriter;
-            let mut stderr = CliStderrWriter;
-            let mut context =
-                CliCommandContext::new(&mut stdout, &mut stderr).with_force_local(force_local);
-            command
-                .run(&mut context)
-                .map_err(|error| CliError::ExternalCommand {
-                    command: command_name,
-                    detail: error.to_string(),
-                })
+        CliCommand::Registered(command) => run_registered_cli_command(command, force_local),
+        CliCommand::RegisteredRolloutMutation(command) => {
+            let data_dir = SinomoDataDir::from_env_or_home()?;
+            let rollout_paths = SelfRolloutPaths::new(&data_dir.root());
+            with_rollout_activation_admission(&rollout_paths, || {
+                run_registered_cli_command(command, force_local)
+            })
         }
         CliCommand::Usage(options) => usage(options),
     }

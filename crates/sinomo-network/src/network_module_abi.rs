@@ -7,9 +7,9 @@
 //! mirror `sinomo-module-api` (0 ok, 1 invalid argument, 2 unsupported ABI,
 //! 3 runtime error).
 //!
-//! Contract (v1):
+//! Contract (v2):
 //! - The dylib exports [`SINOMO_NETWORK_MODULE_ENTRY_SYMBOL`] with signature
-//!   `extern "C" fn(*mut *mut c_void, *mut SinomoNetworkModuleVtableV1) -> i32`,
+//!   `extern "C" fn(*mut *mut c_void, *mut SinomoNetworkModuleVtableV2) -> i32`,
 //!   creating a module instance and filling the vtable.
 //! - All vtable functions must be callable from any thread; the instance is
 //!   shared across threads by the host.
@@ -25,8 +25,11 @@
 //!   [`encode_network_module_sobj`] (`SINOMO_NETWORK_MODULE_OBJECT_VERSION`).
 //! - Timeouts are milliseconds; `0` means "no timeout".
 //!
-//! Sinomo is still pre-release, so v1 evolves in place with the canonical
-//! transport contract rather than carrying a second response-only ABI.
+//! The entry symbol deliberately names the stream-shaped ABI. The earlier
+//! response-buffer vtable also called itself v1, but had a different size and
+//! field layout; resolving it as this table would turn stale module state into
+//! function-pointer memory corruption. The table is therefore self-describing
+//! and every callback slot is nullable until the host validates it.
 
 use crate::error::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase};
 use crate::network_module::{
@@ -44,14 +47,21 @@ use std::ffi::c_void;
 use std::ptr;
 use std::slice;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// ABI version filled into [`SinomoNetworkModuleVtableV1::abi_version`].
-pub const SINOMO_NETWORK_MODULE_ABI_VERSION: u32 = 1;
+/// ABI discriminator filled into [`SinomoNetworkModuleVtableV2::abi_magic`].
+pub const SINOMO_NETWORK_MODULE_ABI_MAGIC: u64 = u64::from_le_bytes(*b"SNMSTRM2");
+/// ABI version filled into [`SinomoNetworkModuleVtableV2::abi_version`].
+pub const SINOMO_NETWORK_MODULE_ABI_VERSION: u32 = 2;
 /// Exported entry symbol creating the instance and filling the vtable.
 /// Not NUL-terminated; append `\0` (or let the loader do so) when resolving.
-pub const SINOMO_NETWORK_MODULE_ENTRY_SYMBOL: &[u8] = b"sinomo_network_module_create_v1";
+///
+/// This is intentionally incompatible with the old response-buffer entry
+/// symbol. A stale dylib must fail symbol resolution before the host calls into
+/// a table with a different layout.
+pub const SINOMO_NETWORK_MODULE_ENTRY_SYMBOL: &[u8] = b"sinomo_network_module_create_v2";
 /// SOBJ document version for descriptor/endpoint payloads crossing this ABI.
 pub const SINOMO_NETWORK_MODULE_OBJECT_VERSION: u16 = 1;
 
@@ -140,7 +150,7 @@ impl SinomoNetworkByteBuffer {
     }
 }
 
-/// Start configuration passed to [`SinomoNetworkModuleVtableV1::start`].
+/// Start configuration passed to [`SinomoNetworkModuleVtableV2::start`].
 /// All fields are UTF-8 byte views owned by the host for the call duration.
 #[repr(C)]
 pub struct SinomoNetworkModuleConfigV1 {
@@ -179,76 +189,127 @@ unsafe impl Send for SinomoNetworkRpcStreamV1 {}
 // SAFETY: read and write callbacks may run concurrently for full duplex.
 unsafe impl Sync for SinomoNetworkRpcStreamV1 {}
 
-/// The pinned v1 vtable a network module fills in its entry function.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct SinomoNetworkModuleVtableV1 {
-    pub abi_version: u32,
-    /// SOBJ NetworkModuleDescriptor into a module-owned buffer.
-    pub descriptor:
-        unsafe extern "C" fn(*mut SinomoNetworkByteBuffer) -> SinomoNetworkModuleStatusCode,
-    pub start: unsafe extern "C" fn(
-        *mut c_void,
-        *const SinomoNetworkModuleConfigV1,
-    ) -> SinomoNetworkModuleStatusCode,
-    pub stop: unsafe extern "C" fn(*mut c_void) -> SinomoNetworkModuleStatusCode,
-    /// Opens a raw bidirectional byte stream. Object-RPC and transfer framing
-    /// stays entirely on the host side. The blocking operation is bridged off
-    /// the async executor by [`FfiNetworkModule`].
-    pub open_rpc_stream: unsafe extern "C" fn(
-        *mut c_void,
-        SinomoNetworkByteSlice,        // endpoint address utf8
-        u64,                           // connect timeout ms
-        u64,                           // no-progress timeout ms
-        *mut SinomoNetworkRpcStreamV1, // module-owned stream handle
-        *mut SinomoNetworkByteBuffer,  // structured error on failure
-    ) -> SinomoNetworkModuleStatusCode,
-    /// Blocking read into host-owned storage. `read_out == 0` means EOF.
-    pub read_rpc_stream: unsafe extern "C" fn(
-        SinomoNetworkRpcStreamV1,
-        *mut u8,
-        usize,
-        *mut usize,
-        *mut SinomoNetworkByteBuffer,
-    ) -> SinomoNetworkModuleStatusCode,
-    /// Blocking write from host-owned storage. Partial writes are allowed.
-    pub write_rpc_stream: unsafe extern "C" fn(
+pub type SinomoNetworkModuleDescriptorFn =
+    unsafe extern "C" fn(*mut SinomoNetworkByteBuffer) -> SinomoNetworkModuleStatusCode;
+pub type SinomoNetworkModuleStartFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const SinomoNetworkModuleConfigV1,
+) -> SinomoNetworkModuleStatusCode;
+pub type SinomoNetworkModuleStopFn =
+    unsafe extern "C" fn(*mut c_void) -> SinomoNetworkModuleStatusCode;
+pub type SinomoNetworkModuleOpenRpcStreamFn = unsafe extern "C" fn(
+    *mut c_void,
+    SinomoNetworkByteSlice,
+    u64,
+    u64,
+    *mut SinomoNetworkRpcStreamV1,
+    *mut SinomoNetworkByteBuffer,
+)
+    -> SinomoNetworkModuleStatusCode;
+pub type SinomoNetworkModuleReadRpcStreamFn = unsafe extern "C" fn(
+    SinomoNetworkRpcStreamV1,
+    *mut u8,
+    usize,
+    *mut usize,
+    *mut SinomoNetworkByteBuffer,
+)
+    -> SinomoNetworkModuleStatusCode;
+pub type SinomoNetworkModuleWriteRpcStreamFn =
+    unsafe extern "C" fn(
         SinomoNetworkRpcStreamV1,
         SinomoNetworkByteSlice,
         *mut usize,
         *mut SinomoNetworkByteBuffer,
-    ) -> SinomoNetworkModuleStatusCode,
-    /// Flushes and half-closes the write side while preserving the read side.
-    pub shutdown_rpc_stream_write: unsafe extern "C" fn(
+    ) -> SinomoNetworkModuleStatusCode;
+pub type SinomoNetworkModuleShutdownRpcStreamWriteFn =
+    unsafe extern "C" fn(
         SinomoNetworkRpcStreamV1,
         *mut SinomoNetworkByteBuffer,
-    ) -> SinomoNetworkModuleStatusCode,
-    /// Releases the opaque stream. Called exactly once after all callbacks
-    /// using the handle have returned.
-    pub close_rpc_stream: unsafe extern "C" fn(SinomoNetworkRpcStreamV1),
-    /// SOBJ Vec<ClusterEndpointRecord> the module currently advertises.
-    pub local_endpoints: unsafe extern "C" fn(
+    ) -> SinomoNetworkModuleStatusCode;
+pub type SinomoNetworkModuleCloseRpcStreamFn = unsafe extern "C" fn(SinomoNetworkRpcStreamV1);
+pub type SinomoNetworkModuleLocalEndpointsFn =
+    unsafe extern "C" fn(
         *mut c_void,
         *mut SinomoNetworkByteBuffer,
-    ) -> SinomoNetworkModuleStatusCode,
+    ) -> SinomoNetworkModuleStatusCode;
+pub type SinomoNetworkModuleEndpointRoleFn = unsafe extern "C" fn(
+    *mut c_void,
+    SinomoNetworkByteSlice,
+    *mut SinomoNetworkByteBuffer,
+) -> SinomoNetworkModuleStatusCode;
+pub type SinomoNetworkModuleFreeBufferFn = unsafe extern "C" fn(SinomoNetworkByteBuffer);
+pub type SinomoNetworkModuleDestroyFn = unsafe extern "C" fn(*mut c_void);
+
+/// The pinned v2 stream table a network module fills in its entry function.
+///
+/// Callback slots are `Option<fn>` so an all-zero/empty table is a valid Rust
+/// value. The host starts from [`Self::empty`] and validates the discriminator,
+/// exact structural size, and every required callback before constructing the
+/// internal callable table. A module that only writes an obsolete prefix can
+/// therefore be rejected without reading uninitialized memory.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SinomoNetworkModuleVtableV2 {
+    pub abi_magic: u64,
+    pub abi_version: u32,
+    pub struct_size: u32,
+    /// SOBJ NetworkModuleDescriptor into a module-owned buffer.
+    pub descriptor: Option<SinomoNetworkModuleDescriptorFn>,
+    pub start: Option<SinomoNetworkModuleStartFn>,
+    pub stop: Option<SinomoNetworkModuleStopFn>,
+    /// Opens a raw bidirectional byte stream. Object-RPC and transfer framing
+    /// stays entirely on the host side. The blocking operation is bridged off
+    /// the async executor by [`FfiNetworkModule`].
+    pub open_rpc_stream: Option<SinomoNetworkModuleOpenRpcStreamFn>,
+    /// Blocking read into host-owned storage. `read_out == 0` means EOF.
+    pub read_rpc_stream: Option<SinomoNetworkModuleReadRpcStreamFn>,
+    /// Blocking write from host-owned storage. Partial writes are allowed.
+    pub write_rpc_stream: Option<SinomoNetworkModuleWriteRpcStreamFn>,
+    /// Flushes and half-closes the write side while preserving the read side.
+    pub shutdown_rpc_stream_write: Option<SinomoNetworkModuleShutdownRpcStreamWriteFn>,
+    /// Releases the opaque stream. Called exactly once after all callbacks
+    /// using the handle have returned.
+    pub close_rpc_stream: Option<SinomoNetworkModuleCloseRpcStreamFn>,
+    /// SOBJ Vec<ClusterEndpointRecord> the module currently advertises.
+    pub local_endpoints: Option<SinomoNetworkModuleLocalEndpointsFn>,
     /// Optional SOBJ endpoint -> SOBJ NetworkModuleEndpointRole classifier.
     /// Null means the module does not classify endpoint roles.
-    pub endpoint_role: Option<
-        unsafe extern "C" fn(
-            *mut c_void,
-            SinomoNetworkByteSlice,
-            *mut SinomoNetworkByteBuffer,
-        ) -> SinomoNetworkModuleStatusCode,
-    >,
-    pub free_buffer: unsafe extern "C" fn(SinomoNetworkByteBuffer),
-    pub destroy: unsafe extern "C" fn(*mut c_void),
+    pub endpoint_role: Option<SinomoNetworkModuleEndpointRoleFn>,
+    pub free_buffer: Option<SinomoNetworkModuleFreeBufferFn>,
+    pub destroy: Option<SinomoNetworkModuleDestroyFn>,
+}
+
+impl SinomoNetworkModuleVtableV2 {
+    pub const fn empty() -> Self {
+        Self {
+            abi_magic: 0,
+            abi_version: 0,
+            struct_size: 0,
+            descriptor: None,
+            start: None,
+            stop: None,
+            open_rpc_stream: None,
+            read_rpc_stream: None,
+            write_rpc_stream: None,
+            shutdown_rpc_stream_write: None,
+            close_rpc_stream: None,
+            local_endpoints: None,
+            endpoint_role: None,
+            free_buffer: None,
+            destroy: None,
+        }
+    }
+
+    pub const fn expected_struct_size() -> u32 {
+        std::mem::size_of::<Self>() as u32
+    }
 }
 
 /// Signature of the exported [`SINOMO_NETWORK_MODULE_ENTRY_SYMBOL`]: creates
 /// the instance (`*mut *mut c_void` out) and fills the vtable.
-pub type SinomoNetworkModuleCreateV1Fn = unsafe extern "C" fn(
+pub type SinomoNetworkModuleCreateV2Fn = unsafe extern "C" fn(
     *mut *mut c_void,
-    *mut SinomoNetworkModuleVtableV1,
+    *mut SinomoNetworkModuleVtableV2,
 ) -> SinomoNetworkModuleStatusCode;
 
 /// Encodes an ABI payload (descriptor, endpoint list) as the name-keyed SOBJ
@@ -364,15 +425,118 @@ unsafe impl Sync for FfiNetworkModuleInstance {}
 ///
 /// Held behind an `Arc` so in-flight dials (which run on `spawn_blocking`
 /// threads and may outlive the adapter when a module is replaced or dropped)
-/// keep the instance and library alive until they finish. `destroy` runs when
-/// the LAST owner drops; field order keeps `_keep_alive` alive until after
-/// `destroy` returns.
+/// keep the instance and library alive until they finish. The LAST owner moves
+/// the instance and library token to a dedicated teardown thread; this avoids
+/// invoking a module's synchronous destroy callback (which may own an async
+/// runtime) from an unrelated Tokio worker.
 struct FfiNetworkModuleShared {
     instance: FfiNetworkModuleInstance,
-    vtable: SinomoNetworkModuleVtableV1,
-    /// Dropped last (field order): keeps the dylib mapped until after
-    /// `destroy` runs in [`Drop::drop`].
+    vtable: ValidatedNetworkModuleVtable,
+    /// Taken by [`Drop::drop`] and moved with the instance to the teardown
+    /// thread. `None` means ownership has already been transferred.
+    keep_alive: Option<Box<dyn Any + Send + Sync>>,
+}
+
+/// Complete ownership bundle transferred out of the final Arc drop. Keeping
+/// the dylib token in the same allocation guarantees that its callback code
+/// stays mapped until `destroy` has returned.
+struct FfiNetworkModuleTeardown {
+    instance: FfiNetworkModuleInstance,
+    vtable: ValidatedNetworkModuleVtable,
     _keep_alive: Box<dyn Any + Send + Sync>,
+}
+
+#[derive(Clone, Copy)]
+struct FfiNetworkModuleTeardownPtr(*mut FfiNetworkModuleTeardown);
+
+// SAFETY: ownership of the pointed-to teardown bundle is transferred exactly
+// once to the teardown thread. No other thread dereferences the pointer.
+unsafe impl Send for FfiNetworkModuleTeardownPtr {}
+
+impl FfiNetworkModuleTeardownPtr {
+    /// # Safety
+    ///
+    /// This must be called exactly once after successful thread creation.
+    unsafe fn destroy(self) {
+        // SAFETY: the pointer came from Box::into_raw below and ownership was
+        // transferred to this one teardown worker.
+        let teardown = unsafe { Box::from_raw(self.0) };
+        // SAFETY: the entry contract made this instance/vtable pair callable;
+        // the keep-alive token remains owned by `teardown` until return.
+        unsafe { (teardown.vtable.destroy)(teardown.instance.0) };
+        // `teardown` now drops on this plain OS thread, unloading the library
+        // only after the module has synchronously finished destruction.
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ValidatedNetworkModuleVtable {
+    descriptor: SinomoNetworkModuleDescriptorFn,
+    start: SinomoNetworkModuleStartFn,
+    stop: SinomoNetworkModuleStopFn,
+    open_rpc_stream: SinomoNetworkModuleOpenRpcStreamFn,
+    read_rpc_stream: SinomoNetworkModuleReadRpcStreamFn,
+    write_rpc_stream: SinomoNetworkModuleWriteRpcStreamFn,
+    shutdown_rpc_stream_write: SinomoNetworkModuleShutdownRpcStreamWriteFn,
+    close_rpc_stream: SinomoNetworkModuleCloseRpcStreamFn,
+    local_endpoints: SinomoNetworkModuleLocalEndpointsFn,
+    endpoint_role: Option<SinomoNetworkModuleEndpointRoleFn>,
+    free_buffer: SinomoNetworkModuleFreeBufferFn,
+    destroy: SinomoNetworkModuleDestroyFn,
+}
+
+impl TryFrom<SinomoNetworkModuleVtableV2> for ValidatedNetworkModuleVtable {
+    type Error = NetworkError;
+
+    fn try_from(vtable: SinomoNetworkModuleVtableV2) -> Result<Self, Self::Error> {
+        let invalid = |detail: String| NetworkError::Io {
+            operation: "load network module".to_string(),
+            detail,
+        };
+        if vtable.abi_magic != SINOMO_NETWORK_MODULE_ABI_MAGIC {
+            return Err(invalid(format!(
+                "unsupported network module ABI discriminator 0x{:016x} (host expects 0x{:016x})",
+                vtable.abi_magic, SINOMO_NETWORK_MODULE_ABI_MAGIC
+            )));
+        }
+        if vtable.abi_version != SINOMO_NETWORK_MODULE_ABI_VERSION {
+            return Err(invalid(format!(
+                "unsupported network module ABI version {} (host expects {})",
+                vtable.abi_version, SINOMO_NETWORK_MODULE_ABI_VERSION
+            )));
+        }
+        let expected_size = SinomoNetworkModuleVtableV2::expected_struct_size();
+        if vtable.struct_size != expected_size {
+            return Err(invalid(format!(
+                "unsupported network module vtable size {} (host expects {expected_size})",
+                vtable.struct_size
+            )));
+        }
+        macro_rules! required {
+            ($field:ident) => {
+                vtable.$field.ok_or_else(|| {
+                    invalid(format!(
+                        "network module vtable is missing required callback `{}`",
+                        stringify!($field)
+                    ))
+                })?
+            };
+        }
+        Ok(Self {
+            descriptor: required!(descriptor),
+            start: required!(start),
+            stop: required!(stop),
+            open_rpc_stream: required!(open_rpc_stream),
+            read_rpc_stream: required!(read_rpc_stream),
+            write_rpc_stream: required!(write_rpc_stream),
+            shutdown_rpc_stream_write: required!(shutdown_rpc_stream_write),
+            close_rpc_stream: required!(close_rpc_stream),
+            local_endpoints: required!(local_endpoints),
+            endpoint_role: vtable.endpoint_role,
+            free_buffer: required!(free_buffer),
+            destroy: required!(destroy),
+        })
+    }
 }
 
 /// Shared ownership of one opaque module stream. Each bridge pump owns a
@@ -397,10 +561,37 @@ const FFI_NETWORK_STREAM_IO_BYTES: usize = 64 * 1024;
 
 impl Drop for FfiNetworkModuleShared {
     fn drop(&mut self) {
-        // SAFETY: this shared state owns the instance; destroy is called
-        // exactly once (last Arc owner), and `_keep_alive` (declared after
-        // `instance`/`vtable`) keeps the library mapped until this returns.
-        unsafe { (self.vtable.destroy)(self.instance.0) };
+        let Some(keep_alive) = self.keep_alive.take() else {
+            return;
+        };
+        let teardown = Box::new(FfiNetworkModuleTeardown {
+            instance: self.instance,
+            vtable: self.vtable,
+            _keep_alive: keep_alive,
+        });
+        let teardown = FfiNetworkModuleTeardownPtr(Box::into_raw(teardown));
+        let worker_teardown = teardown;
+        match thread::Builder::new()
+            .name("sinomo-network-module-destroy".to_string())
+            .spawn(move || {
+                // SAFETY: successful spawn transfers the sole Box ownership
+                // to this worker.
+                unsafe { worker_teardown.destroy() };
+            }) {
+            Ok(worker) => {
+                // Detach: final Arc release must not block an async executor.
+                // The worker owns both the instance and library token.
+                drop(worker);
+            }
+            Err(error) => {
+                // `teardown` still names the raw allocation because the
+                // pointer is Copy. Deliberately leak instance + dylib token:
+                // unloading code underneath a live async runtime is UB, while
+                // a bounded process-lifetime leak is safe.
+                tracing::error!(%error, "failed to spawn network module teardown worker; leaking module safely");
+                let _ = teardown;
+            }
+        }
     }
 }
 
@@ -427,22 +618,29 @@ impl FfiNetworkModule {
     ///   module's [`SINOMO_NETWORK_MODULE_ENTRY_SYMBOL`] entry.
     /// - `keep_alive` must keep the dynamic library (and thus every vtable
     ///   function pointer) loaded for as long as it lives.
-    /// - Ownership of `instance` transfers to the returned adapter, which
-    ///   calls `vtable.destroy` on drop.
+    /// - Ownership of `instance` transfers to this function. A validated
+    ///   instance is destroyed through the vtable on final drop; a non-null
+    ///   instance paired with an invalid vtable is deliberately leaked with
+    ///   `keep_alive` because no destructor can be trusted.
     pub unsafe fn from_entry_parts(
         instance: *mut c_void,
-        vtable: SinomoNetworkModuleVtableV1,
+        vtable: SinomoNetworkModuleVtableV2,
         keep_alive: Box<dyn Any + Send + Sync>,
     ) -> Result<Self, NetworkError> {
-        if vtable.abi_version != SINOMO_NETWORK_MODULE_ABI_VERSION {
-            return Err(NetworkError::Io {
-                operation: "load network module".to_string(),
-                detail: format!(
-                    "unsupported network module ABI version {} (host expects {})",
-                    vtable.abi_version, SINOMO_NETWORK_MODULE_ABI_VERSION
-                ),
-            });
-        }
+        let vtable = match ValidatedNetworkModuleVtable::try_from(vtable) {
+            Ok(vtable) => vtable,
+            Err(error) => {
+                if !instance.is_null() {
+                    // A non-null instance may own threads or other resources
+                    // whose destructors live in the dylib. The malformed
+                    // table gives us no callback we can safely invoke, so the
+                    // only sound failure mode is to leak both the instance and
+                    // its library token for the rest of the process.
+                    std::mem::forget(keep_alive);
+                }
+                return Err(error);
+            }
+        };
         if instance.is_null() {
             return Err(NetworkError::Io {
                 operation: "load network module".to_string(),
@@ -453,11 +651,12 @@ impl FfiNetworkModule {
         // must still destroy the instance (via the shared state's Drop) and
         // only then release the library keep-alive. The two checks above run
         // first because destroy cannot be trusted without a matching ABI
-        // version and a non-null instance — leaking there is the safe choice.
+        // version and a non-null instance — leaking the instance and library
+        // token together is the safe choice.
         let shared = Arc::new(FfiNetworkModuleShared {
             instance: FfiNetworkModuleInstance(instance),
             vtable,
-            _keep_alive: keep_alive,
+            keep_alive: Some(keep_alive),
         });
         let mut buffer = SinomoNetworkByteBuffer::null();
         // SAFETY: descriptor/free_buffer are valid per the entry contract.
@@ -876,6 +1075,15 @@ fn network_module_status_error(
 mod tests {
     use super::*;
     use sinomo_base::ClusterTransportKind;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct KeepAliveDropProbe(Arc<AtomicBool>);
+
+    impl Drop for KeepAliveDropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
 
     #[test]
     fn network_module_sobj_round_trips_descriptor() {
@@ -906,6 +1114,87 @@ mod tests {
             network_module_timeout_ms(Some(Duration::from_secs(2))),
             2_000
         );
+    }
+
+    #[test]
+    fn network_module_v2_rejects_zero_initialized_and_partial_tables() {
+        let empty = SinomoNetworkModuleVtableV2::empty();
+        let empty_error = ValidatedNetworkModuleVtable::try_from(empty)
+            .expect_err("zero-initialized table must not be callable");
+        assert!(empty_error.to_string().contains("ABI discriminator"));
+
+        let mut partial = SinomoNetworkModuleVtableV2::empty();
+        partial.abi_magic = SINOMO_NETWORK_MODULE_ABI_MAGIC;
+        partial.abi_version = SINOMO_NETWORK_MODULE_ABI_VERSION;
+        partial.struct_size = SinomoNetworkModuleVtableV2::expected_struct_size();
+        let partial_error = ValidatedNetworkModuleVtable::try_from(partial)
+            .expect_err("matching header without callbacks must be rejected");
+        assert!(partial_error.to_string().contains("`descriptor`"));
+    }
+
+    #[test]
+    fn network_module_v2_rejects_obsolete_table_size_before_callbacks() {
+        let mut obsolete = SinomoNetworkModuleVtableV2::empty();
+        obsolete.abi_magic = SINOMO_NETWORK_MODULE_ABI_MAGIC;
+        obsolete.abi_version = SINOMO_NETWORK_MODULE_ABI_VERSION;
+        obsolete.struct_size = SinomoNetworkModuleVtableV2::expected_struct_size() - 1;
+
+        let error = ValidatedNetworkModuleVtable::try_from(obsolete)
+            .expect_err("obsolete table shape must be rejected");
+        assert!(error.to_string().contains("vtable size"));
+        assert_eq!(
+            SINOMO_NETWORK_MODULE_ENTRY_SYMBOL,
+            b"sinomo_network_module_create_v2"
+        );
+    }
+
+    #[test]
+    fn malformed_vtable_keeps_library_loaded_for_a_leaked_live_instance() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let instance = Box::into_raw(Box::new(())) as *mut c_void;
+
+        // SAFETY: this deliberately models a successful entry that returned a
+        // non-null instance but a malformed table. No callback is callable.
+        let error = unsafe {
+            FfiNetworkModule::from_entry_parts(
+                instance,
+                SinomoNetworkModuleVtableV2::empty(),
+                Box::new(KeepAliveDropProbe(Arc::clone(&dropped))),
+            )
+        }
+        .err()
+        .expect("malformed table must be rejected");
+
+        assert!(error.to_string().contains("ABI discriminator"));
+        assert!(
+            !dropped.load(Ordering::Acquire),
+            "the dylib token must remain loaded with the untrusted live instance"
+        );
+
+        // The production failure path intentionally leaks this opaque
+        // instance. The test knows its concrete dummy type and may reclaim it.
+        // SAFETY: `instance` came from Box<()> above and was never dereferenced.
+        unsafe { drop(Box::from_raw(instance.cast::<()>())) };
+    }
+
+    #[test]
+    fn malformed_vtable_releases_library_when_entry_returned_no_instance() {
+        let dropped = Arc::new(AtomicBool::new(false));
+
+        // SAFETY: a null instance carries no module-owned resources; rejecting
+        // the malformed table may release its library token normally.
+        let error = unsafe {
+            FfiNetworkModule::from_entry_parts(
+                ptr::null_mut(),
+                SinomoNetworkModuleVtableV2::empty(),
+                Box::new(KeepAliveDropProbe(Arc::clone(&dropped))),
+            )
+        }
+        .err()
+        .expect("malformed table must be rejected");
+
+        assert!(error.to_string().contains("ABI discriminator"));
+        assert!(dropped.load(Ordering::Acquire));
     }
 
     #[test]

@@ -1846,6 +1846,18 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost
             .observe_signed_endpoint_rpc_async(endpoint, observation)
     }
 
+    fn open_object_rpc_session_stream_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        health: sinomo_core::network::NetworkHealthPolicy,
+    ) -> sinomo_core::network::ClusterSignedObjectRpcFuture<
+        'a,
+        Box<dyn sinomo_core::network::NetworkDuplexStream>,
+    > {
+        self.object_rpc_host
+            .open_object_rpc_session_stream_async(endpoint, health)
+    }
+
     fn send_signed_object_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
@@ -6456,6 +6468,26 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonClusterCont
         })
     }
 
+    fn open_object_rpc_session_stream_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        health: sinomo_core::network::NetworkHealthPolicy,
+    ) -> sinomo_core::network::ClusterSignedObjectRpcFuture<
+        'a,
+        Box<dyn sinomo_core::network::NetworkDuplexStream>,
+    > {
+        let runtime = self.rpc_mode.runtime().clone();
+        let cluster_paths = self.cluster_paths_for_routed_control_rpc();
+        Box::pin(async move {
+            let mut host = DaemonSignedObjectRpcAsyncHost::new(&runtime, true);
+            if let Some(paths) = cluster_paths.as_ref() {
+                host = host.with_cluster_paths(paths);
+            }
+            host.open_object_rpc_session_stream_async(endpoint, health)
+                .await
+        })
+    }
+
     fn send_signed_object_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
@@ -7722,6 +7754,18 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost
     ) -> sinomo_core::network::ClusterSignedObjectRpcFuture<'a, ()> {
         self.inner
             .observe_signed_endpoint_rpc_async(endpoint, observation)
+    }
+
+    fn open_object_rpc_session_stream_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        health: sinomo_core::network::NetworkHealthPolicy,
+    ) -> sinomo_core::network::ClusterSignedObjectRpcFuture<
+        'a,
+        Box<dyn sinomo_core::network::NetworkDuplexStream>,
+    > {
+        self.inner
+            .open_object_rpc_session_stream_async(endpoint, health)
     }
 
     fn send_signed_object_rpc_async<'a>(

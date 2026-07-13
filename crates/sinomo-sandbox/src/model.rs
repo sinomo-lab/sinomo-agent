@@ -165,6 +165,20 @@ fn host_memory_limit_mb() -> u64 {
 pub struct SandboxInstanceManifest {
     pub sandbox_id: SandboxId,
     pub workspace_root: String,
+    /// Stable identity for this incarnation of a sandbox ID. A destroy followed by
+    /// recreate receives a new value even when its fencing generation restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation_id: Option<Id>,
+    /// Cluster-visible fail-closed fence for explicit lifecycle operations.
+    /// The stable `workspace_root` symlink is not switched until a replacement
+    /// generation is complete, and sandbox APIs remain quarantined until the
+    /// lifecycle operation has been finalized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_reconciliation: Option<SandboxAuthoritativeReconciliationFence>,
+    /// Monotone fencing generation advanced under the sandbox's exclusive DFS
+    /// lifecycle lease.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub generation: u64,
     pub toolchain_id: SandboxToolchainId,
     pub cwd: SandboxPath,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -200,6 +214,9 @@ impl SandboxInstanceManifest {
         Ok(Self {
             workspace_root: sandbox_instance_root(&sandbox_id),
             sandbox_id,
+            incarnation_id: Some(Id::generate()),
+            pending_reconciliation: None,
+            generation: 1,
             toolchain_id,
             cwd: SandboxPath::new("/work")?,
             env: BTreeMap::new(),
@@ -216,10 +233,115 @@ impl SandboxInstanceManifest {
             updated_at: now,
         })
     }
+
+    /// Advance the authoritative sandbox generation while the caller holds the
+    /// sandbox lifecycle lease.
+    pub fn advance_generation(&mut self) -> Result<u64, SandboxManifestGenerationError> {
+        self.generation = self.generation.checked_add(1).ok_or_else(|| {
+            SandboxManifestGenerationError::Exhausted {
+                sandbox_id: self.sandbox_id.clone(),
+            }
+        })?;
+        Ok(self.generation)
+    }
+
+    /// Return the lifecycle incarnation fence. Legacy manifests did not persist
+    /// an incarnation ID, so derive one from immutable creation data. A newly
+    /// created manifest always carries a random persisted ID.
+    pub fn effective_incarnation_id(&self) -> Id {
+        self.incarnation_id.clone().unwrap_or_else(|| {
+            Id::derived(
+                "sinomo.sandbox.legacy-incarnation.v1",
+                format!(
+                    "{}:{}",
+                    self.sandbox_id,
+                    self.created_at.unix_timestamp_nanos()
+                ),
+            )
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SandboxAuthoritativeReconciliationFence {
+    pub transaction_id: Id,
+    pub source_incarnation_id: Id,
+    pub source_generation: u64,
+    /// Previously published immutable generation target. Recovery uses it to
+    /// prove that the stable symlink has either not switched or switched once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_workspace_root: Option<String>,
+    /// Fully staged replacement workspace. Present for operations which publish
+    /// a new workspace generation; reboot only changes the temp-epoch pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_workspace_root: Option<String>,
+    /// Durable DFS namespace job used by operations whose legacy tree move is
+    /// intentionally resumable rather than atomic.
+    #[serde(default)]
+    pub operation: SandboxAuthoritativeMutationOperation,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "operation", rename_all = "kebab-case")]
+pub enum SandboxAuthoritativeMutationOperation {
+    /// Deserialization tombstone for pre-live-FUSE command transactions. No
+    /// current API creates or recovers this operation.
+    #[default]
+    #[serde(rename = "reconciliation")]
+    UnsupportedLegacyCommandTransaction,
+    ResumeCheckpoint {
+        checkpoint_id: SandboxCheckpointId,
+    },
+    Reboot {
+        target_temp_epoch: u64,
+    },
+    Create,
+    Destroy,
+    LegacyMigration,
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum SandboxManifestGenerationError {
+    #[error("sandbox manifest generation exhausted for {sandbox_id}")]
+    Exhausted { sandbox_id: SandboxId },
 }
 
 pub(crate) fn is_zero_u64(value: &u64) -> bool {
     *value == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_incarnation_changes_on_recreate_and_legacy_fallback_is_stable() {
+        let sandbox_id = SandboxId::from_legacy_named("incarnation-fence").expect("sandbox id");
+        let toolchain_id =
+            SandboxToolchainId::from_legacy_named("incarnation-toolchain").expect("toolchain id");
+        let first = SandboxInstanceManifest::new(
+            sandbox_id.clone(),
+            toolchain_id.clone(),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .expect("first manifest");
+        let second =
+            SandboxInstanceManifest::new(sandbox_id, toolchain_id, OffsetDateTime::UNIX_EPOCH)
+                .expect("second manifest");
+        assert_ne!(
+            first.effective_incarnation_id(),
+            second.effective_incarnation_id(),
+            "destroy and recreate must not reuse a generation-one fence"
+        );
+
+        let mut legacy = first;
+        legacy.incarnation_id = None;
+        assert_eq!(
+            legacy.effective_incarnation_id(),
+            legacy.effective_incarnation_id(),
+            "legacy fallback must be deterministic for the same manifest"
+        );
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -240,8 +362,13 @@ pub struct SandboxResourceUsage {
     pub peak_memory_bytes: u64,
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,
+    /// Bytes written when the backend can account for every writable path.
+    /// [`SANDBOX_RESOURCE_USAGE_UNAVAILABLE`] means the backend deliberately
+    /// exposes host paths whose writes cannot be measured completely.
     pub written_bytes: u64,
 }
+
+pub const SANDBOX_RESOURCE_USAGE_UNAVAILABLE: u64 = u64::MAX;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SandboxWorkspaceUsage {

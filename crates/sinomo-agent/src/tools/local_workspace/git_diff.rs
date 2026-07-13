@@ -202,6 +202,7 @@ fn run_git_diff_command(
         &execution.output,
         execution.timed_out,
         execution.cancelled,
+        execution.cleanup_pending,
         execution.duration_ms,
         timeout_ms,
         "git_diff",

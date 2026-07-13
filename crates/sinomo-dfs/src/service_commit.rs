@@ -19,7 +19,7 @@ use crate::posix_path::parent_posix_path;
 use crate::transfer::PendingNetworkedWrite;
 use crate::*;
 
-fn ensure_atomic_create_parent_touch_shard(
+pub(crate) fn ensure_atomic_create_parent_touch_shard(
     file_system_id: &DfsFileSystemId,
     local_node_id: &NodeId,
     child_path: &str,
@@ -510,6 +510,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         {
             self.metadata.add_object(backend_object)?;
         }
+        let transient_create = self.transient_metadata_object_ids.contains(object_id);
         let object =
             self.metadata
                 .objects
@@ -531,7 +532,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             object.modified_at_unix_nanos = write_time_unix_nanos;
             object.changed_at_unix_nanos = write_time_unix_nanos;
         }
-        if !already_current {
+        if !already_current && !(transient_create && object.last_modified_by_event_id.is_some()) {
             object.last_modified_by_event_id = Some(EventId::generate());
         }
         if !object.current_locations.contains(&self.node_id) {
@@ -945,7 +946,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         committed_object.content_size_bytes = Some(pending.size_bytes);
         committed_object.modified_at_unix_nanos = write_time_unix_nanos;
         committed_object.changed_at_unix_nanos = write_time_unix_nanos;
-        committed_object.last_modified_by_event_id = Some(EventId::generate());
+        if !(intent.touch_parent_on_create && committed_object.last_modified_by_event_id.is_some())
+        {
+            committed_object.last_modified_by_event_id = Some(EventId::generate());
+        }
         committed_object.current_locations = durable_locations;
         let visible_version = object_version_record(&committed_object, Some(pending.size_bytes));
         let required_replica_node_ids: Vec<NodeId> = durable_nodes.into_iter().collect();
@@ -1030,7 +1034,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// persists it in the same namespace transaction that first publishes the
     /// child, so a restart can observe neither mutation or both and can never
     /// advance the parent twice while replaying a commit-ready intent.
-    fn parent_directory_touch_metadata_for_create(
+    pub(crate) fn parent_directory_touch_metadata_for_create(
         &mut self,
         child: &DfsObjectMetadata,
     ) -> Result<Option<DfsObjectMetadata>, DfsError> {
@@ -1111,7 +1115,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         committed_object.content_size_bytes = Some(content_size_bytes);
         committed_object.modified_at_unix_nanos = write_time;
         committed_object.changed_at_unix_nanos = write_time;
-        committed_object.last_modified_by_event_id = Some(EventId::generate());
+        if !(intent.touch_parent_on_create && committed_object.last_modified_by_event_id.is_some())
+        {
+            committed_object.last_modified_by_event_id = Some(EventId::generate());
+        }
         committed_object.current_locations = durable_nodes.iter().cloned().collect();
         let visible_version = object_version_record(&committed_object, Some(content_size_bytes));
 

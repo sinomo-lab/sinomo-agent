@@ -603,17 +603,22 @@ fn networked_dfs_retries_stage_after_replica_rejection() {
         other => panic!("expected pending write, got {other:?}"),
     };
 
+    let original_stage = drain_dfs_test_messages(&mut replica_control, "drain original stage");
     assert_eq!(
-        drain_dfs_test_messages(&mut replica_control, "drain original stage").len(),
+        original_stage.len(),
         1,
         "the original stage is withheld so the rejected response drives the retry path"
     );
+    let request_id = match &original_stage[0].message {
+        DfsNetworkMessage::StageBlob(command) => command.request_id.clone(),
+        other => panic!("expected original stage request, got {other:?}"),
+    };
     send_dfs_test_message(
         &mut replica_control,
         &replica,
         &owner,
         DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
-            request_id: "dfs_net_req_1".to_string(),
+            request_id,
             intent_id: intent_id.clone(),
             file_system_id: file_system_id.clone(),
             object_id: object_id.clone(),
@@ -6511,6 +6516,7 @@ fn networked_dfs_rejects_wrong_source_remote_read_response_without_consuming_req
         network.add_node(reader.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("reader")).expect("reader store"),
     );
+    let mut owner_control = network.add_node(owner.clone());
     let mut attacker_transport = network.add_node(attacker.clone());
     let file_system = DfsFileSystem {
         file_system_id: file_system_id.clone(),
@@ -6564,7 +6570,16 @@ fn networked_dfs_rejects_wrong_source_remote_read_response_without_consuming_req
             .expect("request read"),
         vec![owner.clone()]
     );
-    let request_id = "dfs_net_req_1".to_string();
+    let mut pending_requests = drain_dfs_test_messages(&mut owner_control, "owner read mailbox");
+    assert_eq!(pending_requests.len(), 1, "one owner read request");
+    let pending_request = pending_requests.pop().expect("owner read request");
+    let request_id = match &pending_request.message {
+        DfsNetworkMessage::ReadRequest(request) => request.request_id.clone(),
+        other => panic!("expected remote read request, got {other:?}"),
+    };
+    owner_control
+        .send_routed_message(&owner, pending_request)
+        .expect("restore owner read request");
     let forged_response = DfsNetworkMessage::ReadResponse(DfsReadResponse {
         request_id: request_id.clone(),
         object_id: object_id.clone(),
@@ -9372,7 +9387,7 @@ fn posix_open_file_stream_reads_file_and_range_incrementally() {
 }
 
 #[test]
-fn posix_self_only_create_publishes_object_and_version_without_namespace_transaction() {
+fn posix_self_only_create_publishes_object_and_version_atomically() {
     let owner = NodeId::from_legacy_named("node_posix_create_grouped_owner").expect("node");
     let root = temp_root("posix_create_grouped_metadata");
     let network = InProcessNetwork::new();
@@ -9437,21 +9452,45 @@ fn posix_self_only_create_publishes_object_and_version_without_namespace_transac
         .collect::<Vec<_>>();
     assert_eq!(
         file_publish_entries.len(),
-        2,
-        "self-only create should publish file object and version without extra file metadata journal entries"
+        1,
+        "self-only create should publish the file, version, and parent touch in one transaction"
     );
-    assert!(matches!(
-        file_publish_entries[0].mutation,
-        DfsMetadataMutation::PutObject { .. }
-    ));
-    assert!(matches!(
-        file_publish_entries[1].mutation,
-        DfsMetadataMutation::PutVersion { .. }
-    ));
+    let DfsMetadataMutation::ApplyNamespaceTransaction {
+        transaction: Some(transaction),
+        ..
+    } = &file_publish_entries[0].mutation
+    else {
+        panic!("self-only create must use one namespace transaction")
+    };
+    assert!(
+        transaction
+            .objects
+            .iter()
+            .any(|object| object.path == "/services/web/grouped.bin")
+    );
+    assert!(
+        transaction
+            .objects
+            .iter()
+            .any(|object| object.path == "/services/web")
+    );
+    assert!(
+        transaction
+            .versions
+            .iter()
+            .any(|version| version.content_hash == stat.content_hash)
+    );
     assert!(!write_entries.iter().any(|entry| {
         matches!(
             entry.mutation,
-            DfsMetadataMutation::ApplyNamespaceTransaction { .. }
+            DfsMetadataMutation::PutObject { ref path, .. }
+                if path == "/services/web/grouped.bin"
+        ) || matches!(
+            entry.mutation,
+            DfsMetadataMutation::PutVersion {
+                version_record: Some(ref version),
+                ..
+            } if version.content_hash == stat.content_hash
         )
     }));
 

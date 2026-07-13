@@ -57,6 +57,8 @@ pub enum DfsError {
     Busy { path: String },
     #[error("directory is not empty: {path}")]
     DirectoryNotEmpty { path: String },
+    #[error("path already exists: {path}")]
+    AlreadyExists { path: String },
     /// The caller cancelled the operation through the service's
     /// [`DfsCancellationFlag`](crate::DfsCancellationFlag) — typically a budgeted
     /// load giving up while the cluster/DFS link is degraded. Distributed wait
@@ -98,6 +100,11 @@ pub(crate) fn namespace_rejection_current_primary(
 /// Reconstructs the retriable `Busy` class from a routed-write rejection
 /// reason, so `EAGAIN` semantics survive the string-typed wire result.
 pub(crate) fn routed_write_rejection_error(reason: &str) -> DfsError {
+    if let Some(path) = reason.strip_prefix("path already exists: ") {
+        return DfsError::AlreadyExists {
+            path: path.to_string(),
+        };
+    }
     if reason.contains("is moving between metadata shards") {
         let path = reason
             .strip_prefix("path ")

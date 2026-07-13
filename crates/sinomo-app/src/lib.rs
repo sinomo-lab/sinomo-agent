@@ -24,9 +24,7 @@ use crate::ui::shell::logo_image_handle;
 /// Construct the application around a given shared state. Exposed so headless
 /// tooling (visual tests) can build and render the same widget tree the app uses.
 pub fn build_application(shared: Shared) -> sui::Result<App> {
-    let external_textures = shared.external_texture_registry();
     App::new()
-        .external_texture_registry(external_textures)
         .render_options(shared.render_options())
         .with_resources(|resources| {
             let logo = default_sui_logo_image(96)?;
@@ -186,7 +184,7 @@ mod tests {
     fn render_options_match_widget_book_text_policy() {
         let options = resolve_render_options(AppRenderMode::Automatic);
 
-        assert_eq!(options.text_hinting, WindowTextHinting::None);
+        assert_eq!(options.text_hinting, WindowTextHinting::default());
         assert_eq!(options.stem_darkening, WindowStemDarkening::None);
         assert_eq!(
             options.color_management_mode,

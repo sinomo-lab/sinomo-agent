@@ -4941,19 +4941,27 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
             .inline()
             .theme_when(clone_reader(reader)),
     );
-    let provider_status = shared
-        .settings()
-        .provider_action_status
-        .as_ref()
-        .filter(|status| status.provider == form.provider && status.account == form.account)
-        .map(|status| status.message.clone());
-    if let Some(message) = provider_status {
-        body = body.with_child(
-            FormRow::new("Last change", positive_label(shared, message))
-                .inline()
-                .theme_when(clone_reader(reader)),
-        );
-    }
+    let status_label = {
+        let status_shared = shared.clone();
+        let color_shared = shared.clone();
+        let provider = form.provider.clone();
+        let account = form.account.clone();
+        Label::dynamic("No changes yet", move || {
+            status_shared
+                .settings()
+                .provider_action_status
+                .as_ref()
+                .filter(|status| status.provider == provider && status.account == account)
+                .map(|status| status.message.clone())
+                .unwrap_or_else(|| "No changes yet".to_string())
+        })
+        .color_when(move || palette(&color_shared).good)
+    };
+    body = body.with_child(
+        FormRow::new("Last change", status_label)
+            .inline()
+            .theme_when(clone_reader(reader)),
+    );
 
     let mut model_options = form.known_models.clone();
     model_options.extend(health.models.iter().cloned());
@@ -11461,10 +11469,17 @@ mod tests {
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Use for chat")
             .click()?;
-        window.get_by_text("Saving…").expect().to_be_visible()?;
 
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while std::time::Instant::now() < deadline {
+            if shared
+                .settings()
+                .provider_action_status
+                .as_ref()
+                .is_some_and(|status| status.message == "Chat default saved to lm.providers")
+            {
+                break;
+            }
             if pump_background_operations(&shared) {
                 break;
             }

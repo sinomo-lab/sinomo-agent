@@ -440,6 +440,7 @@ fn agent_loop_input(session: &InteractionSession, message: &str) -> AgentLoopInp
     AgentLoopInput {
         session: session.clone(),
         latest_event,
+        transient_system_context: None,
         async_update: None,
         context_attachments: Vec::new(),
         tool_specs: default_coding_agent_tools(),

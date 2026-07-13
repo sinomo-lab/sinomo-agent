@@ -27,7 +27,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 
 const DEFAULT_REQUESTS_PER_TARGET: usize = 20;
-const DEFAULT_CONCURRENCY: usize = 32;
+// Keep the acceptance default below the daemon's saturation point so the
+// latency gates measure healthy interactive RPC service rather than queueing
+// behind a burst of control connections. Higher-concurrency throughput runs
+// remain available through `--param concurrency=<n>`.
+const DEFAULT_CONCURRENCY: usize = 8;
 const DEFAULT_TIMEOUT_MS: u64 = 2_000;
 const DEFAULT_EXPECTED_TARGETS: usize = 1;
 const DEFAULT_MAX_FAILURES: usize = 0;

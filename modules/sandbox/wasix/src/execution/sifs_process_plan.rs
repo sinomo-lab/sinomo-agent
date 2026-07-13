@@ -1,7 +1,7 @@
 use crate::internal::*;
 
 #[cfg(feature = "wasix-runtime")]
-use super::sifs::{restore_sandbox_filesystem_with_roots, snapshot_sandbox_filesystem_with_roots};
+use super::sifs::snapshot_sandbox_filesystem_with_roots;
 #[cfg(feature = "wasix-runtime")]
 use super::staging::*;
 
@@ -349,19 +349,9 @@ impl SifsStagedSandboxCommandRunner {
         let process: Result<SandboxProcessPlanOutcome, SandboxCommandExecutionError>;
 
         if let Some(error) = panic_error {
-            restore_sandbox_filesystem_with_roots(
-                &mut *sifs_fs_guard,
-                &before_snapshot,
-                &snapshot_roots,
-            )?;
             process = Err(SandboxCommandExecutionError::from(error));
         } else if let Some(failed_index) = step_runs.iter().position(|step| step.result.is_err()) {
             let failed_step = step_runs.remove(failed_index);
-            restore_sandbox_filesystem_with_roots(
-                &mut *sifs_fs_guard,
-                &before_snapshot,
-                &snapshot_roots,
-            )?;
             let Err(error) = failed_step.result else {
                 unreachable!("failed step selected by is_err");
             };
@@ -396,11 +386,6 @@ impl SifsStagedSandboxCommandRunner {
                     .err()
                     .map(|error| (step, error))
             }) {
-                restore_sandbox_filesystem_with_roots(
-                    &mut *sifs_fs_guard,
-                    &before_snapshot,
-                    &snapshot_roots,
-                )?;
                 let outcome = step
                     .result
                     .as_ref()

@@ -64,7 +64,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.write_distributed_eventual(request, bytes, plan.desired_replica_nodes, policy)
     }
 
-    pub(crate) fn write_distributed_eventual_with_candidates_and_repair_mode(
+    pub(crate) fn write_distributed_eventual_with_candidates_and_parent_touch(
         &mut self,
         request: DfsWriteRequest,
         bytes: Vec<u8>,
@@ -74,12 +74,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let plan =
             self.plan_distributed_eventual_replicas(&request, candidate_nodes, policy.clone())?;
-        self.write_distributed_eventual_with_repair_mode(
+        let object = self.current_object_for_write(&request.object_id)?;
+        self.write_distributed_eventual_with_base_and_parent_touch_and_repair_mode(
             request,
+            Some(object.version),
             bytes,
             plan.desired_replica_nodes,
             policy,
+            true,
+            true,
             foreground_replica_repair,
+            false,
+            true,
         )
     }
 
@@ -172,6 +178,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             plan.desired_replica_nodes,
             policy,
             touch_parent_on_create,
+            false,
             foreground_replica_repair,
         )
     }
@@ -980,7 +987,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             reader,
         )?;
 
-        if object.policy == DfsObjectPolicy::ReplicatedEventual
+        if !touch_parent_on_create
+            && object.policy == DfsObjectPolicy::ReplicatedEventual
             && policy.min_commit_replicas == 1
             && desired_replica_nodes.len() == 1
             && desired_replica_nodes[0] == self.node_id
@@ -1103,6 +1111,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             desired_replica_nodes,
             policy,
             false,
+            false,
             foreground_replica_repair,
         )
     }
@@ -1117,6 +1126,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
         touch_parent_on_create: bool,
+        _exclusive_create: bool,
         foreground_replica_repair: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let trace_started = Instant::now();
@@ -1379,6 +1389,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             desired_replica_nodes,
             policy,
             false,
+            false,
             foreground_replica_repair,
             false,
             true,
@@ -1394,6 +1405,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
         touch_parent_on_create: bool,
+        exclusive_create: bool,
         foreground_replica_repair: bool,
         detach_remote_primary_request: bool,
         replay_response_journal: bool,
@@ -1463,6 +1475,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     object,
                     shard,
                     touch_parent_on_create,
+                    exclusive_create,
                     foreground_replica_repair,
                     detach_remote_primary_request,
                     replay_response_journal,
@@ -1505,7 +1518,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Err(error.into());
         }
 
-        if object.policy == DfsObjectPolicy::ReplicatedEventual
+        if !touch_parent_on_create
+            && object.policy == DfsObjectPolicy::ReplicatedEventual
             && policy.min_commit_replicas == 1
             && desired_replica_nodes.len() == 1
             && desired_replica_nodes[0] == self.node_id
@@ -1715,6 +1729,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object: DfsObjectMetadata,
         shard: DfsMetadataShardConfig,
         touch_parent_on_create: bool,
+        exclusive_create: bool,
         foreground_replica_repair: bool,
         detach_request: bool,
         replay_response_journal: bool,
@@ -1749,8 +1764,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             object_metadata: Some(object.clone()),
             touch_parent_on_create,
             foreground_replica_repair,
+            exclusive_create,
         };
-        let message = DfsNetworkMessage::DistributedWriteRequest(command.clone());
+        let message = if command.exclusive_create {
+            DfsNetworkMessage::ExclusiveCreateRequest(command.clone())
+        } else {
+            DfsNetworkMessage::DistributedWriteRequest(command.clone())
+        };
         let sent = if detach_request {
             self.send_dfs_message_if_routable_detached(&primary_node_id, message)?
         } else {
@@ -1802,6 +1822,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             object_metadata: Some(object.clone()),
             touch_parent_on_create,
             foreground_replica_repair,
+            exclusive_create: false,
         };
         let message = DfsNetworkMessage::DistributedWriteRequest(command.clone());
         let sent = if detach_request {
@@ -1902,6 +1923,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             object_metadata: Some(object.clone()),
             touch_parent_on_create,
             foreground_replica_repair,
+            exclusive_create: false,
         };
         let send_started = Instant::now();
         let sent = self.send_dfs_message_if_routable(

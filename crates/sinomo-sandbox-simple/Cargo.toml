@@ -16,7 +16,7 @@ sinomo-core = { path = "../sinomo-core" }
 sinomo-sandbox = { path = "../sinomo-sandbox" }
 time.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]

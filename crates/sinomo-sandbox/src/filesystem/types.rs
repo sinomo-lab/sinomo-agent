@@ -44,6 +44,10 @@ pub struct SandboxMetadata {
     pub inode: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_identity: Option<String>,
+    /// Authoritative full-file content hash when the backing filesystem exposes
+    /// one. Ranged materialization verifies the assembled bytes against it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
     #[serde(default = "default_sandbox_timestamp")]
     pub accessed_at_unix_nanos: u64,
     #[serde(default = "default_sandbox_timestamp")]

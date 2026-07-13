@@ -651,10 +651,12 @@ fn sandbox_cli_help() -> CliCommandHelp {
         [
             "  sinomo sandbox",
             "      Show sandbox commands.",
-            "  sinomo sandbox create [--daemon] [--id <sandbox-id>] [--toolchain <toolchain-id>] [--memory-mb <n>] [--wall-time-ms <n>] [--tmp clear|retain] [--mount <sifs-path>:<mount-path>[:ro|rw]]",
+            "  sinomo sandbox create [--daemon] [--id <lowercase-ulid>] [--toolchain <toolchain-id>] [--memory-mb <n>] [--wall-time-ms <ms>] [--tmp clear|retain] [--mount <sifs-path>:<mount-path>[:ro|rw]]",
             "      Create a sandbox instance.",
-            "  sinomo sandbox status|config|logs|ls|cat|write <sandbox-id> ... [--daemon]",
+            "  sinomo sandbox status|config|doctor|logs|ls|cat|write|fetch <sandbox-id> ... [--daemon]",
             "      View and manage sandbox metadata and files.",
+            "  sinomo sandbox checkpoint|resume|reboot|destroy <sandbox-id> ... [--daemon]",
+            "      Manage the sandbox lifecycle, including durable cleanup with `destroy`.",
             "  sinomo sandbox run <sandbox-id> [--daemon|--simple-native|--container-runtime docker|podman --container-image <image>] [--stdin] [--timeout-ms <ms>] <command> -- [args...]",
             "      Run a pinned toolchain command, native host command, container command, or explicit WASI module.",
             "  sinomo sandbox process-plan <sandbox-id> [--daemon|--simple-native|--container-runtime docker|podman --container-image <image>] <plan.json> [--timeout-ms <ms>]",
@@ -6957,6 +6959,8 @@ fn print_sandbox_command_outcome(
         }
     }
 
+    ensure_sandbox_stream_line_endings(&outcome.output_chunks)?;
+
     println!("sandbox command: {}", outcome.response.command_id);
     println!("exit status: {}", outcome.response.exit_status);
     println!("stdout: {}", outcome.response.stdout_ref);
@@ -6972,6 +6976,28 @@ fn print_sandbox_command_outcome(
         outcome.response.exit_status,
         Some(outcome.response.stderr_ref.as_str()),
     )
+}
+
+fn ensure_sandbox_stream_line_endings(
+    chunks: &[crate::SandboxOutputChunk],
+) -> Result<(), CliError> {
+    let stdout_needs_newline = chunks
+        .iter()
+        .rev()
+        .find(|chunk| chunk.stream == crate::SandboxOutputStream::Stdout)
+        .is_some_and(|chunk| !chunk.bytes.is_empty() && !chunk.bytes.ends_with(b"\n"));
+    let stderr_needs_newline = chunks
+        .iter()
+        .rev()
+        .find(|chunk| chunk.stream == crate::SandboxOutputStream::Stderr)
+        .is_some_and(|chunk| !chunk.bytes.is_empty() && !chunk.bytes.ends_with(b"\n"));
+    if stdout_needs_newline {
+        write_cli_stdout_bytes(b"\n").map_err(CliError::stdio)?;
+    }
+    if stderr_needs_newline {
+        write_cli_stderr_bytes(b"\n").map_err(CliError::stdio)?;
+    }
+    Ok(())
 }
 
 fn print_sandbox_process_plan_outcome(
@@ -7693,7 +7719,11 @@ fn print_sandbox_command_record_summary(record: &crate::SandboxCommandRecord) {
         println!("exit status: {}", response.exit_status);
         println!("stdout: {}", response.stdout_ref);
         println!("stderr: {}", response.stderr_ref);
-        println!("written bytes: {}", response.resource_usage.written_bytes);
+        if response.resource_usage.written_bytes == crate::SANDBOX_RESOURCE_USAGE_UNAVAILABLE {
+            println!("written bytes: unavailable (host writes are not fully observable)");
+        } else {
+            println!("written bytes: {}", response.resource_usage.written_bytes);
+        }
         if !response.changed_paths.is_empty() {
             println!("changed paths:");
             for path in &response.changed_paths {
@@ -8105,6 +8135,23 @@ fn sandbox_mount_mode_label(mode: &crate::SandboxMountMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_help_exposes_lifecycle_and_id_requirements() {
+        let help = sandbox_cli_help();
+
+        assert!(
+            help.lines
+                .iter()
+                .any(|line| line.contains("<lowercase-ulid>"))
+        );
+        for command in ["checkpoint", "resume", "reboot", "destroy"] {
+            assert!(
+                help.lines.iter().any(|line| line.contains(command)),
+                "sandbox help is missing lifecycle command {command}"
+            );
+        }
+    }
 
     #[test]
     fn sandbox_doctor_reports_coding_toolchain_readiness() {

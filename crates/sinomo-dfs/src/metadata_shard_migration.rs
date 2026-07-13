@@ -237,11 +237,96 @@ pub(crate) fn put_cross_shard_tombstone<B: DfsMetadataBackend + ?Sized>(
     if previous.kind == DfsObjectKind::Tombstone {
         return Ok(());
     }
+    let previous_changed_at = previous.changed_at_unix_nanos;
     let mut tombstone = previous;
     tombstone.kind = DfsObjectKind::Tombstone;
     tombstone.version = object.version.clone();
-    tombstone.changed_at_unix_nanos = object.changed_at_unix_nanos;
+    // The source record must be later than the live record it replaces and at
+    // least as new as the destination frame that triggered the eviction. A
+    // stale caller may carry the original generation (for example while
+    // paging a directory move), so fence historical namespace transactions
+    // here instead of relying on every migration caller to advance ctime.
+    tombstone.changed_at_unix_nanos = previous_changed_at
+        .saturating_add(1)
+        .max(object.changed_at_unix_nanos);
     tombstone.last_modified_by_event_id = object.last_modified_by_event_id.clone();
     source.put_object(&tombstone)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::namespace::{directory_object, distributed_sifs};
+    use crate::{DfsMetadataBackend, LocalSobjMetadataBackend};
+    use sinomo_core::node::NodeId;
+
+    #[test]
+    fn source_eviction_tombstone_survives_namespace_recovery_with_stale_move_generation() {
+        let root = sinomo_testdir::TestDir::new("dfs-source-eviction-generation");
+        let source_shard_id = DfsMetadataShardId::new("source");
+        let target_shard_id = DfsMetadataShardId::new("target");
+        let node = NodeId::from_legacy_named("node_source_eviction_generation").expect("node");
+        let file_system = distributed_sifs(node.clone());
+        let mut source_object = directory_object("/services/source-child", node);
+        source_object.changed_at_unix_nanos = 42;
+        let historical_transaction = DfsNamespaceTransaction {
+            transaction_id: "namespace-source-child-create".to_string(),
+            file_system_id: source_object.file_system_id.clone(),
+            objects: vec![source_object.clone()],
+            versions: Vec::new(),
+            advisory_lock_states: Vec::new(),
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+        };
+
+        let mut source =
+            LocalSobjMetadataBackend::new(source_shard_id.clone(), root.path()).expect("source");
+        source
+            .put_file_system(&file_system)
+            .expect("source filesystem");
+        source
+            .apply_namespace_transaction(&historical_transaction)
+            .expect("historical directory create");
+
+        // Directory scans used to change only the path, leaving this frame at
+        // the exact generation recorded by the historical create transaction.
+        let mut stale_moved_object = source_object.clone();
+        stale_moved_object.path = "/users/source-child".to_string();
+        put_cross_shard_tombstone(
+            &mut source,
+            &stale_moved_object,
+            &source_shard_id,
+            &target_shard_id,
+        )
+        .expect("source eviction tombstone");
+        let durable_tombstone = source
+            .get_object(&source_object.object_id)
+            .expect("source object lookup")
+            .expect("source tombstone");
+        assert_eq!(durable_tombstone.kind, DfsObjectKind::Tombstone);
+        assert!(
+            durable_tombstone.changed_at_unix_nanos > source_object.changed_at_unix_nanos,
+            "source eviction must fence the historical create generation"
+        );
+        drop(source);
+
+        let reopened =
+            LocalSobjMetadataBackend::new(source_shard_id, root.path()).expect("reopened source");
+        let recovered = reopened
+            .get_object(&source_object.object_id)
+            .expect("recovered object lookup")
+            .expect("recovered tombstone");
+        assert_eq!(
+            recovered.kind,
+            DfsObjectKind::Tombstone,
+            "namespace recovery must not resurrect the evicted directory"
+        );
+        assert_eq!(
+            reopened
+                .get_object_by_path(&source_object.file_system_id, &source_object.path)
+                .expect("recovered path lookup")
+                .map(|object| object.kind),
+            Some(DfsObjectKind::Tombstone)
+        );
+    }
 }

@@ -327,11 +327,20 @@ pub(crate) fn install_current_modules(
         return Ok(Vec::new());
     }
     let artifacts = prepare_rollout_dev_artifacts(&rollout_paths, &repo, Some(&layout.binary))?;
-    rollout_install_local_rollout_native_dylib_modules(
-        &layout.data_dir,
-        &artifacts.native_dylib_modules,
-    )
-    .map_err(Into::into)
+    install_prepared_native_dylib_modules(&layout.data_dir, &repo, &artifacts.native_dylib_modules)
+}
+
+pub(crate) fn install_prepared_native_dylib_modules(
+    data_dir: &Path,
+    installed_managed_source: &Path,
+    artifacts: &[LocalRolloutNativeDylibModuleArtifact],
+) -> Result<Vec<sinomo_runtime::module::NativeDylibModuleInstallResult>, CliError> {
+    let rollout_paths = SelfRolloutPaths::new(data_dir);
+    with_rollout_activation_admission(&rollout_paths, || {
+        let installed = rollout_install_local_rollout_native_dylib_modules(data_dir, artifacts)?;
+        reconcile_rollout_native_dylib_platforms(data_dir, installed_managed_source)?;
+        Ok(installed)
+    })
 }
 
 pub(crate) fn default_boot_dir(data_dir: &SinomoDataDir) -> Result<PathBuf, CliError> {

@@ -2610,7 +2610,8 @@ fn check_version_control_active_cancellation_smoke() -> AgentReadinessCheck {
     let registry = AgentToolRegistry::local_workspace_with_config(
         LocalWorkspaceAgentConfig::new(&workspace_root)
             .using_local_process_commands()
-            .with_git_program(fake_git_program.clone()),
+            .with_git_program(fake_git_program.clone())
+            .enabling_git_tools(),
     );
     let session = readiness_session();
     let cancellation_token = AgentCancellationToken::new();
@@ -4467,7 +4468,11 @@ fn check_compaction_eval_harness_smoke(workspace_root: &Path) -> AgentReadinessC
         "requires_live_cluster=True",
         "validate_scenario_definitions",
         "choices=[\"plan\", \"fixture\", \"run\"]",
-        "generated_continuation_uses_compaction_summary",
+        "continuation_resumes_durable_cli_session",
+        "continuation_does_not_reinject_summary",
+        "phase_one_invokes_agent_op_compact",
+        "phase_one_requires_persisted_projection_evidence",
+        "--compact-after",
         "missing_marker_phases",
     ];
     for marker in required_script_markers {
@@ -4519,7 +4524,7 @@ fn check_compaction_eval_harness_smoke(workspace_root: &Path) -> AgentReadinessC
     if failures.is_empty() {
         passed(
             "compaction_eval_harness_smoke",
-            "compaction quality stays in the benchmark eval harness with required scenarios and plan/fixture/run modes",
+            "compaction quality stays in the benchmark eval harness with required scenarios, durable CLI resume, and plan/fixture/run modes",
             serde_json::json!({
                 "script_path": script_path,
                 "catalog_path": catalog_path,
@@ -7172,6 +7177,7 @@ fn readiness_agent_loop_input(prompt: &str) -> AgentLoopInput {
     AgentLoopInput {
         session: session.clone(),
         latest_event,
+        transient_system_context: None,
         async_update: None,
         context_attachments: Vec::new(),
         tool_specs: Vec::new(),
@@ -7181,6 +7187,46 @@ fn readiness_agent_loop_input(prompt: &str) -> AgentLoopInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_eval_harness_readiness_requires_true_compaction_and_durable_resume() {
+        let check = check_compaction_eval_harness_smoke(Path::new(env!("CARGO_MANIFEST_DIR")));
+
+        assert_eq!(
+            check.status,
+            AgentReadinessCheckStatus::Passed,
+            "{check:#?}"
+        );
+        let markers = check.evidence["required_script_markers"]
+            .as_array()
+            .expect("required script marker evidence");
+        assert!(
+            markers.iter().any(|marker| {
+                marker.as_str() == Some("continuation_resumes_durable_cli_session")
+            })
+        );
+        assert!(
+            markers.iter().any(|marker| {
+                marker.as_str() == Some("continuation_does_not_reinject_summary")
+            })
+        );
+        assert!(
+            markers
+                .iter()
+                .any(|marker| { marker.as_str() == Some("phase_one_invokes_agent_op_compact") })
+        );
+        assert!(markers.iter().any(|marker| {
+            marker.as_str() == Some("phase_one_requires_persisted_projection_evidence")
+        }));
+        assert!(
+            markers
+                .iter()
+                .any(|marker| marker.as_str() == Some("--compact-after"))
+        );
+        assert!(!markers.iter().any(|marker| {
+            marker.as_str() == Some("generated_continuation_uses_compaction_summary")
+        }));
+    }
 
     #[test]
     fn local_agent_readiness_gate_passes_on_workspace_root() {

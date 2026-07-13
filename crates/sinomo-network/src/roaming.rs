@@ -220,7 +220,7 @@ pub async fn send_daemon_rpc_to_cluster_endpoint_async(
 /// Opens the transport-neutral byte stream used by the canonical object-RPC
 /// session engine. Endpoint selection and retry stay in `route`; transports do
 /// not see object heads or transfer frames.
-pub(crate) async fn open_daemon_rpc_stream_to_cluster_endpoint_async(
+pub async fn open_daemon_rpc_stream_to_cluster_endpoint_async(
     endpoint: &ClusterEndpointRecord,
     health: NetworkHealthPolicy,
 ) -> Result<Box<dyn NetworkDuplexStream>, NetworkError> {

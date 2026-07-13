@@ -62,6 +62,7 @@ mod posix_model;
 mod posix_object;
 mod posix_path;
 mod protocol;
+mod renewable_lease;
 mod repair;
 mod routes;
 mod service;
@@ -334,6 +335,7 @@ pub use mounted_sifs::{
     MountedSifsService, OpenedMountedSifsService, discover_mounted_sifs_content_replica_candidates,
     open_mounted_sifs_service, open_mounted_sifs_service_with_cancellation,
     open_mounted_sifs_service_with_peer_transports,
+    open_mounted_sifs_service_with_peer_transports_and_default_control_plane,
 };
 pub use namespace::{
     SIFS_NODES_PATH, SIFS_ROOT_PATH, SIFS_SERVICES_PATH, SIFS_SINOMO_PATH, SIFS_USERS_PATH,
@@ -372,7 +374,7 @@ pub use operator::{
 pub use posix::sync::{DfsPosixDirectorySyncCertificate, DfsPosixFileSyncCertificate};
 pub use posix_model::{
     DfsDirEntry, DfsDirEntryPage, DfsNamespaceJobFailure, DfsNamespaceJobMaintenanceReport,
-    DfsPosixDirectorySyncTarget, DfsPosixError, DfsPosixFilePrefixRead,
+    DfsPosixCreateAttrs, DfsPosixDirectorySyncTarget, DfsPosixError, DfsPosixFilePrefixRead,
     DfsPosixFileRangeReadStream, DfsPosixFileReadStream, DfsPosixFileSyncEvidence,
     DfsPosixFileSyncTarget, DfsPosixSyncKind, DfsStat, DfsWriteOptions,
 };
@@ -389,6 +391,11 @@ pub use protocol::{
     DfsReadRangeData, DfsReadRequest, DfsReadResponse, DfsReadResult, DfsRepairReplicaCommand,
     DfsRepairReplicaResponse, DfsRoutedMessage, DfsStageBlobCommand, DfsStageBlobResponse,
     DfsStagePatchCommand, DfsWriteCommand, DfsWriteResponse, DfsWriteResult,
+};
+pub use renewable_lease::{
+    DEFAULT_DFS_RENEWABLE_LEASE_RELEASE_TIMEOUT, DfsRenewableExclusiveLease,
+    DfsRenewableLeaseAnchor, DfsRenewableLeaseConfig, DfsRenewableLeaseError,
+    DfsRenewableLeaseStatus,
 };
 pub(crate) use repair::{
     repair_attempt_record_indicates_lost_authority,

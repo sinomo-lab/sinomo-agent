@@ -2,7 +2,8 @@
 
 use crate::namespace::{initial_version, object_id_for_path};
 use crate::{
-    DfsObjectId, DfsObjectKind, DfsObjectMetadata, dfs_now_unix_nanos, sifs_file_system_id,
+    DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsPosixCreateAttrs, dfs_now_unix_nanos,
+    sifs_file_system_id,
 };
 use sinomo_core::DfsObjectPolicy;
 use sinomo_core::node::NodeId;
@@ -46,6 +47,32 @@ pub(crate) fn recreated_posix_metadata_object(
     let mut object = new_posix_metadata_object(node_id, path, kind);
     object.object_id = DfsObjectId::generate();
     object
+}
+
+pub(crate) fn apply_posix_create_attrs(object: &mut DfsObjectMetadata, attrs: DfsPosixCreateAttrs) {
+    object.mode = attrs.mode & 0o7777;
+    object.uid = attrs.uid;
+    object.gid = attrs.gid;
+}
+
+pub(crate) fn inherit_posix_create_attrs(
+    attrs: DfsPosixCreateAttrs,
+    directory: bool,
+    parent_mode: u32,
+    parent_gid: u32,
+) -> DfsPosixCreateAttrs {
+    if parent_mode & 0o2000 == 0 {
+        return attrs;
+    }
+    DfsPosixCreateAttrs::new(
+        if directory {
+            attrs.mode | 0o2000
+        } else {
+            attrs.mode
+        },
+        attrs.uid,
+        parent_gid,
+    )
 }
 
 pub(crate) fn set_object_create_timestamps(object: &mut DfsObjectMetadata) {

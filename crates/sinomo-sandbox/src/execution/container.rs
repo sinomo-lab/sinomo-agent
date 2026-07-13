@@ -1,11 +1,58 @@
 use crate::internal::*;
 
 use std::ffi::OsStr;
-use std::process::{Command, Output, Stdio};
+use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixStream;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const SANDBOX_CONTAINER_WAIT_POLL_MS: u64 = 50;
+const SANDBOX_CONTAINER_TERMINATION_WAIT_MS: u64 = 5_000;
+const SANDBOX_CONTAINER_MAX_CAPTURE_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug)]
+struct ContainerCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    terminal_error: Option<SandboxWasiError>,
+}
+
+#[derive(Debug)]
+struct ContainerOutputBudget {
+    limit: u64,
+    consumed: AtomicU64,
+    exceeded: AtomicBool,
+}
+
+impl ContainerOutputBudget {
+    fn new(configured: u64) -> Self {
+        Self {
+            limit: configured.min(SANDBOX_CONTAINER_MAX_CAPTURE_BYTES),
+            consumed: AtomicU64::new(0),
+            exceeded: AtomicBool::new(false),
+        }
+    }
+
+    fn reserve(&self, requested: usize) -> usize {
+        let requested = requested as u64;
+        let start = self.consumed.fetch_add(requested, Ordering::AcqRel);
+        let allowed = self.limit.saturating_sub(start).min(requested) as usize;
+        if allowed < requested as usize {
+            self.exceeded.store(true, Ordering::Release);
+        }
+        allowed
+    }
+
+    fn exceeded(&self) -> bool {
+        self.exceeded.load(Ordering::Acquire)
+    }
+}
 
 pub const SINOMO_SANDBOX_BACKEND_ENV: &str = "SINOMO_SANDBOX_BACKEND";
 pub const SINOMO_SANDBOX_CONTAINER_RUNTIME_ENV: &str = "SINOMO_SANDBOX_CONTAINER_RUNTIME";
@@ -204,6 +251,13 @@ impl SandboxContainerCommandRunner {
         validate_sandbox_toolchain_argv(command_name, &argv).map_err(|error| {
             SandboxCommandExecutionError::Wasi(SandboxWasiError::InvalidRequest { detail: error })
         })?;
+        let local_execution_lease = try_acquire_sandbox_local_execution_lease(store, sandbox_id)?;
+        recover_sandbox_local_execution_journal_with_lease(
+            store,
+            &local_execution_lease,
+            sandbox_id,
+            OffsetDateTime::now_utc(),
+        )?;
         let (manifest, layout) = store.load(sandbox_id)?;
         let fs = LocalSandboxFileSystem::new(layout.clone());
         validate_sandbox_working_directory(&fs, &manifest.cwd)?;
@@ -222,6 +276,7 @@ impl SandboxContainerCommandRunner {
             request,
             output_sink,
             &cancellation_token,
+            &local_execution_lease,
         )
     }
 
@@ -253,6 +308,13 @@ impl SandboxContainerCommandRunner {
         cancellation_token: SandboxCancellationToken,
     ) -> Result<SandboxProcessPlanOutcome, SandboxCommandExecutionError> {
         validate_sandbox_process_plan(plan)?;
+        let local_execution_lease = try_acquire_sandbox_local_execution_lease(store, sandbox_id)?;
+        recover_sandbox_local_execution_journal_with_lease(
+            store,
+            &local_execution_lease,
+            sandbox_id,
+            OffsetDateTime::now_utc(),
+        )?;
         let (manifest, layout) = store.load(sandbox_id)?;
         let fs = LocalSandboxFileSystem::new(layout.clone());
         validate_sandbox_process_plan_working_directories(plan, &fs, &manifest.cwd)?;
@@ -283,6 +345,7 @@ impl SandboxContainerCommandRunner {
                 request,
                 output_sink.clone(),
                 &cancellation_token,
+                &local_execution_lease,
             )?;
             if step.pipe_stdout_to_next {
                 piped_stdin = Some(outcome.stdout.clone());
@@ -320,6 +383,7 @@ impl SandboxContainerCommandRunner {
         request: SandboxCommandRequest,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
         cancellation_token: &SandboxCancellationToken,
+        local_execution_lease: &SandboxLocalExecutionLease,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
         validate_sandbox_toolchain_argv(&request.argv[0], &request.argv).map_err(|error| {
             SandboxCommandExecutionError::Wasi(SandboxWasiError::InvalidRequest { detail: error })
@@ -370,37 +434,135 @@ impl SandboxContainerCommandRunner {
         let sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
         validate_sandbox_working_directory(&sandbox_fs, &request.cwd)?;
         let before = sandbox_fs.snapshot()?;
+        let mut local_journal = begin_sandbox_local_execution_journal(
+            store,
+            local_execution_lease,
+            manifest,
+            OffsetDateTime::now_utc(),
+        )?;
+        prepare_sandbox_local_execution_audit_identity(
+            store,
+            local_execution_lease,
+            &mut local_journal,
+            SandboxCommandRecord {
+                sandbox_id: manifest.sandbox_id.clone(),
+                command_id: command_id.clone(),
+                status: SandboxCommandRecordStatus::Failed,
+                workspace_root: manifest.workspace_root.clone(),
+                toolchain_id: manifest.toolchain_id.clone(),
+                argv: request.argv.clone(),
+                cwd: request.cwd.clone(),
+                env: request.env.clone(),
+                started_at,
+                completed_at: None,
+                response: None,
+                error: Some(
+                    "sandbox host stopped while the container guest was active".to_string(),
+                ),
+            },
+            OffsetDateTime::now_utc(),
+        )?;
+        // The execution journal records ownership and audit state only. The
+        // mounted workspace is authoritative and must never be rewound as an
+        // implicit consequence of command failure or cancellation.
+        let container_name = container_name(&command_id);
+        prepare_sandbox_local_execution_external_owner(
+            store,
+            local_execution_lease,
+            &mut local_journal,
+            SandboxLocalExecutionExternalOwner::container(
+                self.config.runtime.command().to_string_lossy(),
+                container_name,
+            ),
+            OffsetDateTime::now_utc(),
+        )?;
+        activate_sandbox_local_execution_journal(
+            store,
+            local_execution_lease,
+            &mut local_journal,
+            OffsetDateTime::now_utc(),
+        )?;
         let started = Instant::now();
-        let output = match self.execute_container_command(
+        let output = self.execute_container_command(
             layout,
             &command_id,
             &request,
             &manifest.limits,
             timeout_ms,
             cancellation_token,
+            store,
+            local_execution_lease,
+            &mut local_journal,
+        );
+        if let Err(cleanup_error) = cleanup_sandbox_local_execution_external_owner(
+            store,
+            local_execution_lease,
+            &mut local_journal,
+            OffsetDateTime::now_utc(),
         ) {
+            let cancelled = cancellation_token.is_cancelled()
+                || matches!(&output, Err(SandboxWasiError::Cancelled))
+                || matches!(
+                    &output,
+                    Ok(ContainerCommandOutput {
+                        terminal_error: Some(SandboxWasiError::Cancelled),
+                        ..
+                    })
+                );
+            if cancelled {
+                return Err(SandboxWasiError::CancelledCleanupFailed {
+                    detail: cleanup_error.to_string(),
+                }
+                .into());
+            }
+            return Err(cleanup_error.into());
+        }
+        let output = match output {
             Ok(output) => output,
             Err(error) => {
-                self.persist_failed_command(
+                let completed_at = OffsetDateTime::now_utc();
+                settle_sandbox_local_execution_journal(
                     store,
-                    manifest,
-                    layout,
-                    &command_id,
-                    &request,
-                    started_at,
-                    None,
+                    local_execution_lease,
+                    &mut local_journal,
+                    if matches!(error, SandboxWasiError::Cancelled) {
+                        SandboxLocalExecutionOutcome::Cancelled
+                    } else {
+                        SandboxLocalExecutionOutcome::Failed {
+                            detail: error.to_string(),
+                        }
+                    },
+                    SandboxCommandRecord {
+                        sandbox_id: manifest.sandbox_id.clone(),
+                        command_id: command_id.clone(),
+                        status: sandbox_command_record_status_for_wasi_error(&error),
+                        workspace_root: manifest.workspace_root.clone(),
+                        toolchain_id: manifest.toolchain_id.clone(),
+                        argv: request.argv.clone(),
+                        cwd: request.cwd.clone(),
+                        env: request.env.clone(),
+                        started_at,
+                        completed_at: Some(completed_at),
+                        response: None,
+                        error: Some(error.to_string()),
+                    },
                     Vec::new(),
                     Vec::new(),
-                    sandbox_command_record_status_for_wasi_error(&error),
-                    error.to_string(),
+                    completed_at,
+                )?;
+                recover_sandbox_local_execution_journal_with_lease(
+                    store,
+                    local_execution_lease,
+                    &manifest.sandbox_id,
+                    completed_at,
                 )?;
                 return Err(error.into());
             }
         };
         let wall_time_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let terminal_error = output.terminal_error;
         let stdout = output.stdout;
         let stderr = output.stderr;
-        let output_bytes = stdout.len().saturating_add(stderr.len()) as u64;
         let mut output_chunks = sandbox_output_chunks(
             &manifest.sandbox_id,
             &command_id,
@@ -439,12 +601,8 @@ impl SandboxContainerCommandRunner {
             },
         };
 
-        let limit_error = if output_bytes > manifest.limits.max_output_bytes {
-            Some(SandboxCommandExecutionError::Wasi(
-                SandboxWasiError::OutputLimitExceeded {
-                    limit: manifest.limits.max_output_bytes.min(usize::MAX as u64) as usize,
-                },
-            ))
+        let execution_error = if let Some(error) = terminal_error {
+            Some(SandboxCommandExecutionError::Wasi(error))
         } else if let Err(error) =
             validate_workspace_usage(&after.workspace_usage(), &manifest.limits)
         {
@@ -456,12 +614,14 @@ impl SandboxContainerCommandRunner {
         };
 
         let completed_at = OffsetDateTime::now_utc();
-        let status = if limit_error.is_some() {
-            SandboxCommandRecordStatus::ResourceExhausted
-        } else {
-            SandboxCommandRecordStatus::Completed
+        let status = match execution_error.as_ref() {
+            Some(SandboxCommandExecutionError::Wasi(error)) => {
+                sandbox_command_record_status_for_wasi_error(error)
+            }
+            Some(_) => SandboxCommandRecordStatus::ResourceExhausted,
+            None => SandboxCommandRecordStatus::Completed,
         };
-        let error = limit_error.as_ref().map(ToString::to_string);
+        let error = execution_error.as_ref().map(ToString::to_string);
         let record = SandboxCommandRecord {
             sandbox_id: manifest.sandbox_id.clone(),
             command_id: command_id.clone(),
@@ -476,10 +636,31 @@ impl SandboxContainerCommandRunner {
             response: Some(response.clone()),
             error,
         };
-        let mut sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
-        persist_command_outputs(&mut sandbox_fs, &record, &stdout, &stderr)?;
-        record_local_command_history(store, &manifest.sandbox_id, &command_id, completed_at)?;
-        if let Some(error) = limit_error {
+        settle_sandbox_local_execution_journal(
+            store,
+            local_execution_lease,
+            &mut local_journal,
+            match execution_error.as_ref() {
+                None => SandboxLocalExecutionOutcome::Succeeded,
+                Some(SandboxCommandExecutionError::Wasi(SandboxWasiError::Cancelled)) => {
+                    SandboxLocalExecutionOutcome::Cancelled
+                }
+                Some(error) => SandboxLocalExecutionOutcome::Failed {
+                    detail: error.to_string(),
+                },
+            },
+            record,
+            stdout.clone(),
+            stderr.clone(),
+            completed_at,
+        )?;
+        recover_sandbox_local_execution_journal_with_lease(
+            store,
+            local_execution_lease,
+            &manifest.sandbox_id,
+            completed_at,
+        )?;
+        if let Some(error) = execution_error {
             return Err(error);
         }
         Ok(SandboxLocalCommandOutcome {
@@ -534,19 +715,77 @@ impl SandboxContainerCommandRunner {
         limits: &SandboxResourceLimits,
         timeout_ms: u64,
         cancellation_token: &SandboxCancellationToken,
-    ) -> Result<Output, SandboxWasiError> {
+        store: &LocalSandboxInstanceStore,
+        local_execution_lease: &SandboxLocalExecutionLease,
+        local_journal: &mut SandboxLocalExecutionJournal,
+    ) -> Result<ContainerCommandOutput, SandboxWasiError> {
         ensure_container_layout_dirs(layout)?;
         let container_name = container_name(command_id);
         let args = self.container_run_args(layout, &container_name, request, limits)?;
-        let mut child = Command::new(self.config.runtime.command())
-            .args(&args)
+        #[cfg(target_os = "linux")]
+        let mut command = {
+            let mut command = Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    "IFS= read -r _ <&3; exec 3<&-; exec \"$@\"",
+                    "sinomo-handshake",
+                ])
+                .arg(self.config.runtime.command())
+                .args(&args);
+            command
+        };
+        #[cfg(not(target_os = "linux"))]
+        let mut command = {
+            let mut command = Command::new(self.config.runtime.command());
+            command.args(&args);
+            command
+        };
+        command
             .stdin(if request.stdin.is_some() {
                 Stdio::piped()
             } else {
                 Stdio::null()
             })
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(target_os = "linux")]
+        let (mut launch_handshake, launch_handshake_child) =
+            UnixStream::pair().map_err(|source| SandboxWasiError::Runtime {
+                detail: format!("failed to create container launch handshake: {source}"),
+            })?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            let handshake_fd = launch_handshake_child.as_raw_fd();
+            let expected_parent_pid = std::process::id() as libc::pid_t;
+            // SAFETY: this only uses async-signal-safe libc operations before
+            // exec and turns failures into child launch errors.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::getppid() != expected_parent_pid {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "container parent exited during child launch",
+                        ));
+                    }
+                    if libc::setpgid(0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if handshake_fd != 3 && libc::dup2(handshake_fd, 3) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let mut child = command
             .spawn()
             .map_err(|source| SandboxWasiError::Runtime {
                 detail: format!(
@@ -554,31 +793,119 @@ impl SandboxContainerCommandRunner {
                     self.config.runtime.command().to_string_lossy()
                 ),
             })?;
-        if let Some(stdin) = &request.stdin {
+        #[cfg(target_os = "linux")]
+        {
+            drop(launch_handshake_child);
+            let launcher =
+                SandboxLocalExecutionLinuxProcessGroup::capture(child.id() as i32, child.id())
+                    .map_err(|detail| {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        SandboxWasiError::Runtime { detail }
+                    })?;
+            let owner = local_journal
+                .external_owner
+                .clone()
+                .ok_or_else(|| SandboxWasiError::Runtime {
+                    detail: "container launch identity was not prepared".to_string(),
+                })?
+                .with_container_launcher(launcher)
+                .map_err(|detail| SandboxWasiError::Runtime { detail })?;
+            if let Err(error) = prepare_sandbox_local_execution_external_owner(
+                store,
+                local_execution_lease,
+                local_journal,
+                owner,
+                OffsetDateTime::now_utc(),
+            ) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SandboxWasiError::Runtime {
+                    detail: format!(
+                        "failed to persist container launcher identity before launch: {error}"
+                    ),
+                });
+            }
+            if let Err(source) = launch_handshake.write_all(b"go\n") {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SandboxWasiError::Runtime {
+                    detail: format!("failed to release container launch handshake: {source}"),
+                });
+            }
+            drop(launch_handshake);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = store;
+            let _ = local_execution_lease;
+            let _ = local_journal;
+        }
+        let stdin_writer = if let Some(stdin) = request.stdin.clone() {
             let mut child_stdin = child
                 .stdin
                 .take()
                 .ok_or_else(|| SandboxWasiError::Runtime {
                     detail: "container stdin pipe was not available".to_string(),
                 })?;
-            use std::io::Write;
-            child_stdin
-                .write_all(stdin)
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(child_stdin.write_all(&stdin));
+            });
+            Some(rx)
+        } else {
+            None
+        };
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| SandboxWasiError::Runtime {
+                detail: "container stdout pipe was not available".to_string(),
+            })?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| SandboxWasiError::Runtime {
+                detail: "container stderr pipe was not available".to_string(),
+            })?;
+        let output_budget = Arc::new(ContainerOutputBudget::new(limits.max_output_bytes));
+        let stdout_reader =
+            spawn_bounded_container_reader(stdout, Arc::clone(&output_budget), "stdout");
+        let stderr_reader =
+            spawn_bounded_container_reader(stderr, Arc::clone(&output_budget), "stderr");
+        let (status, mut terminal_error) = wait_for_container_runtime_output(
+            &self.config.runtime,
+            &container_name,
+            &mut child,
+            timeout_ms,
+            cancellation_token,
+            &output_budget,
+        )?;
+        let stdout = receive_bounded_container_reader(stdout_reader, "stdout")?;
+        let stderr = receive_bounded_container_reader(stderr_reader, "stderr")?;
+        if terminal_error.is_none() && output_budget.exceeded() {
+            terminal_error = Some(SandboxWasiError::OutputLimitExceeded {
+                limit: output_budget.limit.min(usize::MAX as u64) as usize,
+            });
+        }
+        if let Some(stdin_writer) = stdin_writer
+            && terminal_error.is_none()
+        {
+            stdin_writer
+                .recv_timeout(Duration::from_millis(SANDBOX_CONTAINER_TERMINATION_WAIT_MS))
+                .map_err(|_| SandboxWasiError::Runtime {
+                    detail: "container stdin writer did not finish after runtime exit".to_string(),
+                })?
                 .map_err(|source| SandboxWasiError::Runtime {
                     detail: format!("failed to write container stdin: {source}"),
                 })?;
         }
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(child.wait_with_output());
-        });
-        wait_for_container_runtime_output(
-            &self.config.runtime,
-            &container_name,
-            rx,
-            timeout_ms,
-            cancellation_token,
-        )
+        Ok(ContainerCommandOutput {
+            status,
+            stdout,
+            stderr,
+            terminal_error,
+        })
     }
 
     fn container_run_args(
@@ -640,37 +967,43 @@ impl SandboxContainerCommandRunner {
 fn wait_for_container_runtime_output(
     runtime: &SandboxContainerRuntime,
     container_name: &str,
-    rx: mpsc::Receiver<std::io::Result<Output>>,
+    child: &mut Child,
     timeout_ms: u64,
     cancellation_token: &SandboxCancellationToken,
-) -> Result<Output, SandboxWasiError> {
+    output_budget: &ContainerOutputBudget,
+) -> Result<(ExitStatus, Option<SandboxWasiError>), SandboxWasiError> {
     let started = Instant::now();
     loop {
         if cancellation_token.is_cancelled() {
-            request_container_removal(runtime, container_name);
-            return Err(SandboxWasiError::Cancelled);
+            let status = terminate_container_runtime_and_reap(runtime, container_name, child)?;
+            return Ok((status, Some(SandboxWasiError::Cancelled)));
+        }
+        if output_budget.exceeded() {
+            let status = terminate_container_runtime_and_reap(runtime, container_name, child)?;
+            return Ok((
+                status,
+                Some(SandboxWasiError::OutputLimitExceeded {
+                    limit: output_budget.limit.min(usize::MAX as u64) as usize,
+                }),
+            ));
         }
         let wait = match container_wait_poll_duration(started, timeout_ms) {
             Ok(wait) => wait,
             Err(SandboxWasiError::TimedOut { timeout_ms }) => {
-                request_container_removal(runtime, container_name);
-                return Err(SandboxWasiError::TimedOut { timeout_ms });
+                let status = terminate_container_runtime_and_reap(runtime, container_name, child)?;
+                return Ok((status, Some(SandboxWasiError::TimedOut { timeout_ms })));
             }
             Err(error) => return Err(error),
         };
-        match rx.recv_timeout(wait) {
-            Ok(output) => {
-                return output.map_err(|source| SandboxWasiError::Runtime {
-                    detail: format!("container runtime wait failed: {source}"),
-                });
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(SandboxWasiError::Runtime {
-                    detail: "container wait channel disconnected".to_string(),
-                });
-            }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| SandboxWasiError::Runtime {
+                detail: format!("container runtime wait failed: {source}"),
+            })?
+        {
+            return Ok((status, None));
         }
+        std::thread::sleep(wait);
     }
 }
 
@@ -692,12 +1025,56 @@ fn container_wait_poll_duration(
     ))
 }
 
-fn request_container_removal(runtime: &SandboxContainerRuntime, container_name: &str) {
-    let _ = Command::new(runtime.command())
-        .args(["rm", "-f", container_name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+fn terminate_container_runtime_and_reap(
+    _runtime: &SandboxContainerRuntime,
+    _container_name: &str,
+    child: &mut Child,
+) -> Result<ExitStatus, SandboxWasiError> {
+    let _ = child.kill();
+    child.wait().map_err(|source| SandboxWasiError::Runtime {
+        detail: format!("failed to force-reap container runtime: {source}"),
+    })
+}
+
+fn spawn_bounded_container_reader<R>(
+    mut reader: R,
+    budget: Arc<ContainerOutputBudget>,
+    stream: &'static str,
+) -> mpsc::Receiver<Result<Vec<u8>, String>>
+where
+    R: Read + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        let result = loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break Ok(output),
+                Ok(read) => {
+                    let keep = budget.reserve(read);
+                    output.extend_from_slice(&buffer[..keep]);
+                }
+                Err(source) => {
+                    break Err(format!("failed to read container {stream}: {source}"));
+                }
+            }
+        };
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+fn receive_bounded_container_reader(
+    reader: mpsc::Receiver<Result<Vec<u8>, String>>,
+    stream: &str,
+) -> Result<Vec<u8>, SandboxWasiError> {
+    reader
+        .recv_timeout(Duration::from_millis(SANDBOX_CONTAINER_TERMINATION_WAIT_MS))
+        .map_err(|_| SandboxWasiError::Runtime {
+            detail: format!("container {stream} reader did not finish after runtime exit"),
+        })?
+        .map_err(|detail| SandboxWasiError::Runtime { detail })
 }
 
 fn ensure_container_layout_dirs(
@@ -868,6 +1245,9 @@ mod tests {
         fs::write(
             &fake_runtime,
             r#"#!/bin/sh
+if [ "$1" = "ps" ]; then
+  exit 0
+fi
 while [ "$#" -gt 0 ]; do
   case "$1" in
     fake-image) shift; break ;;
@@ -942,13 +1322,21 @@ exec "$@"
         let root = sinomo_testdir::TestDir::new("sinomo-container-runner-cancel");
         let fake_runtime = root.join("fake-container-runtime.sh");
         let cancel_marker = root.join("container-cancelled");
+        let sandbox_id = SandboxId::from_legacy_named("container_cancel").expect("sandbox");
+        let state_path = LocalSandboxInstanceLayout::new(root.to_path_buf(), &sandbox_id)
+            .work
+            .join("state.txt");
         fs::write(
             &fake_runtime,
             format!(
                 r#"#!/bin/sh
 marker='{}'
+state='{}'
 if [ "$1" = "rm" ]; then
   touch "$marker"
+  exit 0
+fi
+if [ "$1" = "ps" ]; then
   exit 0
 fi
 while [ "$#" -gt 0 ]; do
@@ -959,12 +1347,14 @@ while [ "$#" -gt 0 ]; do
     *) shift ;;
   esac
 done
+printf partial-container-effect > "$state"
 while [ ! -f "$marker" ]; do
   sleep 0.05
 done
 exit 0
 "#,
-                cancel_marker.display()
+                cancel_marker.display(),
+                state_path.display(),
             ),
         )
         .expect("write fake runtime");
@@ -973,12 +1363,12 @@ exit 0
         fs::set_permissions(&fake_runtime, permissions).expect("permissions");
 
         let store = LocalSandboxInstanceStore::new(&root);
-        let sandbox_id = SandboxId::from_legacy_named("container_cancel").expect("sandbox");
         let toolchain_id =
             SandboxToolchainId::from_legacy_named("container_tools").expect("toolchain");
         store
             .create(sandbox_id.clone(), toolchain_id, OffsetDateTime::now_utc())
             .expect("create sandbox");
+        fs::write(&state_path, b"baseline").expect("write baseline");
         let config = SandboxContainerBackendConfig::new(
             SandboxContainerRuntime::Command(fake_runtime),
             "fake-image",
@@ -997,7 +1387,7 @@ exit 0
                 &sandbox_id_for_run,
                 "sh",
                 vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
-                None,
+                Some(vec![0x5a; 16 * 1024 * 1024]),
                 SANDBOX_UNLIMITED_WALL_TIME_MS,
                 None,
                 token_for_run,
@@ -1018,6 +1408,16 @@ exit 0
             "cancelled run should finish promptly"
         );
         assert!(cancel_marker.exists());
+        assert_eq!(
+            fs::read(&state_path).expect("read preserved state"),
+            b"partial-container-effect"
+        );
+        assert_eq!(
+            read_sandbox_local_execution_journal(&store, &sandbox_id)
+                .expect("read execution journal"),
+            None,
+            "cancel audit should be finalized after external cleanup"
+        );
 
         let (manifest, layout) = store.load(&sandbox_id).expect("load manifest");
         assert_eq!(manifest.command_history.len(), 1);
@@ -1030,6 +1430,193 @@ exit 0
                 .error
                 .as_deref()
                 .is_some_and(|error| error.contains("cancelled"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_runner_stops_infinite_output_at_bounded_audit_limit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = sinomo_testdir::TestDir::new("sinomo-container-runner-output-limit");
+        let fake_runtime = root.join("fake-container-runtime.sh");
+        let removal_marker = root.join("container-removed");
+        fs::write(
+            &fake_runtime,
+            format!(
+                r#"#!/bin/sh
+marker='{}'
+if [ "$1" = "rm" ]; then
+  touch "$marker"
+  exit 0
+fi
+if [ "$1" = "ps" ]; then
+  exit 0
+fi
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    fake-image) shift; break ;;
+    --name|--network|--cap-drop|--security-opt|--memory|--stop-timeout|--volume|--workdir|--env) shift 2 ;;
+    --rm|--pull=never|--read-only|-i) shift ;;
+    *) shift ;;
+  esac
+done
+while [ ! -f "$marker" ]; do
+  printf 0123456789abcdef
+done
+exit 0
+"#,
+                removal_marker.display()
+            ),
+        )
+        .expect("write fake runtime");
+        let mut permissions = fs::metadata(&fake_runtime).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_runtime, permissions).expect("permissions");
+
+        let store = LocalSandboxInstanceStore::new(&root);
+        let sandbox_id = SandboxId::from_legacy_named("container_output_limit").expect("sandbox");
+        let (mut manifest, layout) = store
+            .create(
+                sandbox_id.clone(),
+                SandboxToolchainId::from_legacy_named("container_tools").expect("toolchain"),
+                OffsetDateTime::now_utc(),
+            )
+            .expect("create sandbox");
+        manifest.limits.max_output_bytes = 4 * 1024;
+        store.save_manifest(&manifest).expect("save output limit");
+        let runner = SandboxContainerCommandRunner::new(
+            SandboxContainerBackendConfig::new(
+                SandboxContainerRuntime::Command(fake_runtime),
+                "fake-image",
+            )
+            .expect("config"),
+        );
+        let started = Instant::now();
+        let error = runner
+            .run_toolchain_command_with_stdin_and_output_sink(
+                &store,
+                &sandbox_id,
+                "sh",
+                vec!["sh".to_string()],
+                None,
+                SANDBOX_UNLIMITED_WALL_TIME_MS,
+                None,
+            )
+            .expect_err("infinite output must be terminated");
+        assert!(matches!(
+            error,
+            SandboxCommandExecutionError::Wasi(SandboxWasiError::OutputLimitExceeded {
+                limit: 4096
+            })
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(removal_marker.exists());
+
+        recover_sandbox_local_execution_journal(&store, &sandbox_id, OffsetDateTime::now_utc())
+            .expect("recover output-limit audit");
+        let recovered = store.load(&sandbox_id).expect("load recovered sandbox").0;
+        let command_id = recovered.command_history.last().expect("command audit");
+        let mut sandbox_fs = LocalSandboxFileSystem::new(layout);
+        let stdout = sandbox_fs
+            .read_unchecked_mut(
+                &sandbox_command_stdout_log_path(command_id).expect("stdout path"),
+                None,
+            )
+            .expect("bounded stdout audit");
+        assert_eq!(stdout.len(), 4096);
+        assert_eq!(
+            load_command_record(&mut sandbox_fs, command_id)
+                .expect("load output-limit record")
+                .status,
+            SandboxCommandRecordStatus::ResourceExhausted
+        );
+    }
+
+    #[test]
+    fn container_guest_active_crash_preserves_writes_and_audits_exactly_once() {
+        let root = sinomo_testdir::TestDir::new("sinomo-container-runner-crash-recovery");
+        let store = LocalSandboxInstanceStore::new(&root);
+        let sandbox_id = SandboxId::from_legacy_named("container_crash").expect("sandbox");
+        let (manifest, layout) = store
+            .create(
+                sandbox_id.clone(),
+                SandboxToolchainId::from_legacy_named("container_tools").expect("toolchain"),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .expect("create sandbox");
+        let state_path = layout.work.join("state.txt");
+        fs::write(&state_path, b"baseline").expect("write baseline");
+        let lease = try_acquire_sandbox_local_execution_lease(&store, &sandbox_id).expect("lease");
+        let command_id =
+            SandboxCommandId::from_legacy_named("container_crashed_command").expect("command");
+        let mut journal = begin_sandbox_local_execution_journal(
+            &store,
+            &lease,
+            &manifest,
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .expect("begin journal");
+        prepare_sandbox_local_execution_audit_identity(
+            &store,
+            &lease,
+            &mut journal,
+            SandboxCommandRecord {
+                sandbox_id: sandbox_id.clone(),
+                command_id: command_id.clone(),
+                status: SandboxCommandRecordStatus::Failed,
+                workspace_root: manifest.workspace_root.clone(),
+                toolchain_id: manifest.toolchain_id.clone(),
+                argv: vec!["container-command".to_string()],
+                cwd: manifest.cwd.clone(),
+                env: BTreeMap::new(),
+                started_at: OffsetDateTime::UNIX_EPOCH,
+                completed_at: None,
+                response: None,
+                error: Some("container host stopped while guest was active".to_string()),
+            },
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .expect("prepare crash audit");
+        activate_sandbox_local_execution_journal(
+            &store,
+            &lease,
+            &mut journal,
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .expect("activate guest");
+        fs::write(&state_path, b"partial-container-effect").expect("write partial effect");
+        drop(lease);
+
+        recover_sandbox_local_execution_journal(&store, &sandbox_id, OffsetDateTime::UNIX_EPOCH)
+            .expect("recover simulated host crash");
+        assert_eq!(
+            fs::read(&state_path).expect("read state"),
+            b"partial-container-effect"
+        );
+        let recovered = store.load(&sandbox_id).expect("load recovered sandbox").0;
+        assert_eq!(
+            recovered
+                .command_history
+                .iter()
+                .filter(|candidate| **candidate == command_id)
+                .count(),
+            1
+        );
+        let mut sandbox_fs = LocalSandboxFileSystem::new(store.layout(&sandbox_id));
+        assert_eq!(
+            load_command_record(&mut sandbox_fs, &command_id)
+                .expect("load crash record")
+                .status,
+            SandboxCommandRecordStatus::Failed
+        );
+        assert!(
+            !recover_sandbox_local_execution_journal(
+                &store,
+                &sandbox_id,
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .expect("second recovery")
         );
     }
 }

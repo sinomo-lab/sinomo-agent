@@ -10,6 +10,20 @@ pub enum SandboxEventEmissionError {
     EventStore(#[from] EventStoreError),
 }
 
+/// Append one deterministic sandbox event. A duplicate identifier means the
+/// same durable command phase was already emitted by an earlier reconciliation
+/// attempt, so replay treats it as success without appending a second event.
+pub fn append_sandbox_event_idempotently<S: EventStore>(
+    event_store: &mut S,
+    event: EventEnvelope,
+) -> Result<Option<AppendReceipt>, EventStoreError> {
+    match event_store.append(event) {
+        Ok(receipt) => Ok(Some(receipt)),
+        Err(EventStoreError::DuplicateEventId { .. }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 pub fn append_sandbox_command_record_events<F, S>(
     sandbox_fs: &mut F,
     origin_node_id: NodeId,
@@ -30,12 +44,12 @@ where
         }
         let bytes = sandbox_fs.read_unchecked_mut(&path, None)?;
         let record = decode_command_record(&bytes)?;
-        receipts.push(
-            event_store.append(sandbox_command_started_event_from_record(
-                origin_node_id.clone(),
-                &record,
-            ))?,
-        );
+        if let Some(receipt) = append_sandbox_event_idempotently(
+            event_store,
+            sandbox_command_started_event_from_record(origin_node_id.clone(), &record),
+        )? {
+            receipts.push(receipt);
+        }
         receipts.extend(append_sandbox_command_output_events_for_record(
             sandbox_fs,
             origin_node_id.clone(),
@@ -43,7 +57,9 @@ where
             event_store,
         )?);
         let event = sandbox_command_record_event(origin_node_id.clone(), &record);
-        receipts.push(event_store.append(event)?);
+        if let Some(receipt) = append_sandbox_event_idempotently(event_store, event)? {
+            receipts.push(receipt);
+        }
     }
     Ok(receipts)
 }
@@ -53,7 +69,7 @@ pub fn append_sandbox_command_record_event<F, S>(
     origin_node_id: NodeId,
     command_id: &SandboxCommandId,
     event_store: &mut S,
-) -> Result<AppendReceipt, SandboxEventEmissionError>
+) -> Result<Option<AppendReceipt>, SandboxEventEmissionError>
 where
     F: SandboxFileSystem,
     S: EventStore,
@@ -62,10 +78,10 @@ where
         .map_err(SandboxFsError::from)?;
     let bytes = sandbox_fs.read_unchecked_mut(&record_path, None)?;
     let record = decode_command_record(&bytes)?;
-    event_store.append(sandbox_command_started_event_from_record(
-        origin_node_id.clone(),
-        &record,
-    ))?;
+    append_sandbox_event_idempotently(
+        event_store,
+        sandbox_command_started_event_from_record(origin_node_id.clone(), &record),
+    )?;
     append_sandbox_command_output_events_for_record(
         sandbox_fs,
         origin_node_id.clone(),
@@ -73,7 +89,7 @@ where
         event_store,
     )?;
     let event = sandbox_command_record_event(origin_node_id, &record);
-    Ok(event_store.append(event)?)
+    Ok(append_sandbox_event_idempotently(event_store, event)?)
 }
 
 fn append_sandbox_command_output_events_for_record<F, S>(
@@ -96,9 +112,12 @@ where
             SandboxOutputStream::Stdout,
             &stdout,
         ) {
-            receipts.push(
-                event_store.append(sandbox_command_output_event(origin_node_id.clone(), &chunk))?,
-            );
+            if let Some(receipt) = append_sandbox_event_idempotently(
+                event_store,
+                sandbox_command_output_event(origin_node_id.clone(), &chunk),
+            )? {
+                receipts.push(receipt);
+            }
         }
     }
     let stderr_path =
@@ -110,9 +129,12 @@ where
             SandboxOutputStream::Stderr,
             &stderr,
         ) {
-            receipts.push(
-                event_store.append(sandbox_command_output_event(origin_node_id.clone(), &chunk))?,
-            );
+            if let Some(receipt) = append_sandbox_event_idempotently(
+                event_store,
+                sandbox_command_output_event(origin_node_id.clone(), &chunk),
+            )? {
+                receipts.push(receipt);
+            }
         }
     }
     Ok(receipts)

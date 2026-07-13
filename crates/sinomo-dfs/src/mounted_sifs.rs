@@ -63,8 +63,8 @@ pub fn open_mounted_sifs_service_with_cancellation(
     let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer_transport;
     let control_plane = if cluster_paths.kv_paths().snapshot.exists() {
         Some(Box::new(MountedSifsControlPlaneKvClient {
-            data_dir: data_dir.clone(),
             cluster_paths: cluster_paths.clone(),
+            peer_transport: Arc::clone(&sync_peer_transport),
         }) as Box<dyn DfsControlPlaneKvClient>)
     } else {
         None
@@ -79,6 +79,39 @@ pub fn open_mounted_sifs_service_with_cancellation(
         async_peer_transport,
         control_plane,
         cancellation,
+    )
+}
+
+/// Opens mounted SIFS with caller-owned peer transports and routes clustered
+/// control-plane commits through the same transport.
+///
+/// Application mounts use this entry point with a local-daemon-backed peer so
+/// both content/metadata traffic and cluster-KV transactions share the
+/// daemon's canonical routes and tunnels. Reads continue to use the local KV
+/// snapshot; no clustered write falls back to a standalone router.
+pub fn open_mounted_sifs_service_with_peer_transports_and_default_control_plane(
+    data_dir: SinomoDataDir,
+    sync_peer_transport: Arc<dyn DfsPeerTransport>,
+    async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+) -> Result<OpenedMountedSifsService, DfsError> {
+    let (cluster_paths, cluster_state, local_node_id, peer_node_ids) =
+        mounted_sifs_cluster_context(&data_dir)?;
+    let control_plane = cluster_paths.kv_paths().snapshot.exists().then(|| {
+        Box::new(MountedSifsControlPlaneKvClient {
+            cluster_paths: cluster_paths.clone(),
+            peer_transport: Arc::clone(&sync_peer_transport),
+        }) as Box<dyn DfsControlPlaneKvClient>
+    });
+    open_mounted_sifs_service_from_context(
+        &data_dir,
+        &cluster_paths,
+        cluster_state.as_ref(),
+        local_node_id,
+        peer_node_ids,
+        sync_peer_transport,
+        async_peer_transport,
+        control_plane,
+        None,
     )
 }
 
@@ -243,6 +276,36 @@ fn mounted_sifs_content_replica_candidates(
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct RecordingMountedPeerTransport {
+        targets: std::sync::Mutex<Vec<NodeId>>,
+    }
+
+    impl DfsPeerTransport for RecordingMountedPeerTransport {
+        fn call_object_rpc(
+            &self,
+            target_node_id: &NodeId,
+            request: &ObjectRpcRequest,
+            _options: DfsObjectRpcSendOptions,
+        ) -> Result<ObjectRpcResponse, DfsPeerTransportError> {
+            self.targets
+                .lock()
+                .expect("targets")
+                .push(target_node_id.clone());
+            assert_eq!(request.route, sinomo_core::kv::CLUSTER_KV_TXN_ROUTE);
+            let payload = sinomo_core::kv::cluster_kv_txn_response_rpc_payload(&KvTxnResponse {
+                succeeded: true,
+                revision: KvRevision(7),
+                responses: Vec::new(),
+            })
+            .expect("txn response payload");
+            Ok(ObjectRpcResponse::from_encoded_body(
+                payload.route,
+                payload.body,
+            ))
+        }
+    }
+
     #[test]
     fn content_replica_candidates_exclude_client_only_nodes() {
         let client = NodeId::from_legacy_named("node_mounted_sifs_client").expect("client");
@@ -262,12 +325,66 @@ mod tests {
             vec![first_server, second_server]
         );
     }
+
+    #[test]
+    fn mounted_control_plane_commits_through_the_supplied_peer_transport() {
+        let root = sinomo_testdir::TestDir::new("sinomo-mounted-sifs-control-plane-peer");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data directory");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let local_node =
+            NodeId::from_legacy_named("node_mounted_sifs_control_plane").expect("local node");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_mounted_sifs_control_plane")
+                .expect("cluster id"),
+            "mounted SIFS control plane",
+            local_node.clone(),
+            "local",
+            "public-key",
+            time::OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("cluster KV state");
+        let peer = Arc::new(RecordingMountedPeerTransport {
+            targets: std::sync::Mutex::new(Vec::new()),
+        });
+        let peer_transport: Arc<dyn DfsPeerTransport> = peer.clone();
+        let mut client = MountedSifsControlPlaneKvClient {
+            cluster_paths,
+            peer_transport,
+        };
+
+        let response = client
+            .txn(KvTxn {
+                compares: Vec::new(),
+                success: Vec::new(),
+                failure: Vec::new(),
+            })
+            .expect("txn");
+
+        assert_eq!(response.revision, KvRevision(7));
+        assert_eq!(
+            peer.targets.lock().expect("targets").as_slice(),
+            &[local_node]
+        );
+    }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct MountedSifsControlPlaneKvClient {
-    data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
+    peer_transport: Arc<dyn DfsPeerTransport>,
+}
+
+impl std::fmt::Debug for MountedSifsControlPlaneKvClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MountedSifsControlPlaneKvClient")
+            .field("cluster_paths", &self.cluster_paths)
+            .field("peer_transport", &"dyn DfsPeerTransport")
+            .finish()
+    }
 }
 
 impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
@@ -301,35 +418,16 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
                 detail: source.to_string(),
             })?;
         let request = object_rpc_request_from_kv_payload(rpc_payload);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|source| KvError::Io {
-                path: self.cluster_paths.kv_paths().snapshot.display().to_string(),
-                detail: format!("mounted SIFS cluster KV txn runtime: {source}"),
-            })?;
-        let mut host = MountedSifsObjectRpcHost {
-            data_dir: self.data_dir.clone(),
-            runtime: runtime.handle().clone(),
-        };
-        let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(
-            &mut host,
-            runtime.handle(),
-            &self.cluster_paths,
-        );
-        let response_result = runtime
-            .block_on(client.call_target(
-                &state,
+        let response = self
+            .peer_transport
+            .call_object_rpc(
                 &state.local_node_id,
                 &request,
-                sinomo_core::network::ClusterObjectRpcOptions::default(),
-            ))
-            .and_then(|response| {
-                response.error_detail()?;
-                Ok(response)
-            });
-        runtime.shutdown_timeout(Duration::from_millis(250));
-        let response = response_result
+                DfsObjectRpcSendOptions::default(),
+            )
+            .map_err(|source| mounted_sifs_kv_io_error(&self.cluster_paths, source))?;
+        response
+            .error_detail()
             .map_err(|source| mounted_sifs_kv_io_error(&self.cluster_paths, source))?;
         sinomo_core::kv::decode_cluster_kv_txn_rpc_body(&response.body).map_err(|source| {
             KvError::Io {
@@ -367,7 +465,10 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
     }
 }
 
-fn mounted_sifs_kv_io_error(cluster_paths: &ClusterPaths, source: NetworkError) -> KvError {
+fn mounted_sifs_kv_io_error(
+    cluster_paths: &ClusterPaths,
+    source: impl std::fmt::Display,
+) -> KvError {
     KvError::Io {
         path: cluster_paths.kv_paths().snapshot.display().to_string(),
         detail: source.to_string(),

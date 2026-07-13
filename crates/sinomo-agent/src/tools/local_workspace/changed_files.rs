@@ -48,6 +48,7 @@ impl AgentTool for ChangedFilesTool {
                 &execution.output,
                 execution.timed_out,
                 execution.cancelled,
+                execution.cleanup_pending,
                 execution.duration_ms,
                 input_timeout_ms(request.call),
                 "changed_files",

@@ -16,6 +16,22 @@ use crate::{
     DfsObjectId, DfsObjectKind, DfsObjectMetadata, NetworkedDfsService, sifs_file_system_id,
 };
 
+fn ensure_same_atomic_namespace_shard(
+    from_shard_id: Option<&str>,
+    to_shard_id: Option<&str>,
+    from_path: &str,
+    to_path: &str,
+) -> Result<()> {
+    if from_shard_id != to_shard_id {
+        return Err(DfsPosixError::InvalidPath {
+            path: format!(
+                "atomic namespace rename crosses metadata shards: {from_path} ({from_shard_id:?}) -> {to_path} ({to_shard_id:?})"
+            ),
+        });
+    }
+    Ok(())
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_unlink(&mut self, path: &str) -> Result<DfsStat> {
         let normalized = normalize_posix_path(path)?;
@@ -111,9 +127,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if self.sifs_dir_has_children(&path)? {
             return Err(DfsPosixError::DirectoryNotEmpty { path });
         }
-        object.kind = DfsObjectKind::Tombstone;
-        object.version = next_version(&object.version);
-        object.current_locations = vec![self.node_id.clone()];
+        object = self.tombstone_path_object(object);
         self.apply_namespace_transaction(DfsNamespaceTransaction {
             transaction_id: namespace_transaction_id_for_path("rmdir", &object.object_id, &path),
             file_system_id: object.file_system_id.clone(),
@@ -156,6 +170,113 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.stat_routed_namespace_result(&normalized_to, true)
             }
         }
+    }
+
+    /// Atomically replace one non-directory namespace entry without crossing a
+    /// metadata shard boundary. This is the publish primitive for stable
+    /// symlink pointers: callers get one namespace transaction or a fail-closed
+    /// rejection, never the cross-shard adoption protocol or recursive job.
+    pub fn posix_rename_single_namespace_atomic(
+        &mut self,
+        from: &str,
+        to: &str,
+    ) -> Result<DfsStat> {
+        let normalized_from = normalize_posix_path(from)?;
+        let normalized_to = normalize_posix_path(to)?;
+        let shard_snapshot = self.refresh_sifs_metadata_shards()?;
+        let selected_shard = if let Some(shards) = shard_snapshot.as_deref() {
+            let from_shard =
+                self.select_sifs_metadata_shard_for_path_from_snapshot(&normalized_from, shards)?;
+            let to_shard =
+                self.select_sifs_metadata_shard_for_path_from_snapshot(&normalized_to, shards)?;
+            ensure_same_atomic_namespace_shard(
+                from_shard.as_ref().map(|shard| shard.shard_id.as_str()),
+                to_shard.as_ref().map(|shard| shard.shard_id.as_str()),
+                &normalized_from,
+                &normalized_to,
+            )?;
+            from_shard
+        } else {
+            None
+        };
+        let source =
+            self.posix_lstat_distributed(&normalized_from)
+                .map_err(|error| match error {
+                    DfsPosixError::NotFound { .. } => DfsPosixError::NotFound {
+                        path: normalized_from.clone(),
+                    },
+                    other => other,
+                })?;
+        if source.kind == DfsObjectKind::Directory {
+            return Err(DfsPosixError::InvalidPath {
+                path: format!(
+                    "atomic single-entry rename refuses directory source: {normalized_from}"
+                ),
+            });
+        }
+        match selected_shard {
+            Some(shard) if shard.primary_node_id != self.node_id => {
+                self.route_namespace_operation(
+                    shard.primary_node_id,
+                    DfsNamespaceOperation::RenameSingleNamespaceAtomic {
+                        from: normalized_from,
+                        to: normalized_to.clone(),
+                        expected_shard_id: shard.shard_id,
+                        expected_shard_epoch: shard.epoch,
+                    },
+                )?;
+                self.stat_routed_namespace_result(&normalized_to, true)
+            }
+            Some(shard) => self.posix_rename_single_namespace_atomic_local(
+                &normalized_from,
+                &normalized_to,
+                Some((&shard.shard_id, shard.epoch)),
+            ),
+            None => self.posix_rename_single_namespace_atomic_local(
+                &normalized_from,
+                &normalized_to,
+                None,
+            ),
+        }
+    }
+
+    pub(crate) fn posix_rename_single_namespace_atomic_local(
+        &mut self,
+        from: &str,
+        to: &str,
+        expected_shard: Option<(&str, u64)>,
+    ) -> Result<DfsStat> {
+        let shard_snapshot = self.refresh_sifs_metadata_shards()?;
+        let actual_shard = if let Some(shards) = shard_snapshot.as_deref() {
+            let from_shard =
+                self.select_sifs_metadata_shard_for_path_from_snapshot(from, shards)?;
+            let to_shard = self.select_sifs_metadata_shard_for_path_from_snapshot(to, shards)?;
+            ensure_same_atomic_namespace_shard(
+                from_shard.as_ref().map(|shard| shard.shard_id.as_str()),
+                to_shard.as_ref().map(|shard| shard.shard_id.as_str()),
+                from,
+                to,
+            )?;
+            from_shard
+        } else {
+            None
+        };
+        match (expected_shard, actual_shard.as_ref()) {
+            (None, None) => {}
+            (Some((expected_id, expected_epoch)), Some(actual))
+                if actual.shard_id == expected_id
+                    && actual.epoch == expected_epoch
+                    && actual.primary_node_id == self.node_id => {}
+            (expected, actual) => {
+                return Err(DfsPosixError::InvalidPath {
+                    path: format!(
+                        "atomic namespace authority changed before commit for {from} -> {to}: expected {expected:?}, current {:?}",
+                        actual.map(|shard| (&shard.shard_id, shard.epoch, &shard.primary_node_id))
+                    ),
+                });
+            }
+        }
+        self.posix_rename_local(from, to)
     }
 
     pub(crate) fn posix_rename_local(&mut self, from: &str, to: &str) -> Result<DfsStat> {
@@ -367,11 +488,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.stat_object(&old_path_tombstone)
     }
 
-    fn tombstone_path_object(&self, object: DfsObjectMetadata) -> DfsObjectMetadata {
+    pub(super) fn tombstone_path_object(&self, object: DfsObjectMetadata) -> DfsObjectMetadata {
         self.tombstone_path_object_at(object, String::new())
     }
 
-    fn tombstone_path_object_at(
+    pub(super) fn tombstone_path_object_at(
         &self,
         mut object: DfsObjectMetadata,
         path: String,
@@ -381,10 +502,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         object.kind = DfsObjectKind::Tombstone;
         object.version = next_version(&object.version);
+        object.changed_at_unix_nanos =
+            now_unix_nanos().max(object.changed_at_unix_nanos.saturating_add(1));
         object.content_hash = None;
         object.content_size_bytes = None;
         object.link_target_object_id = None;
         object.current_locations = vec![self.node_id.clone()];
         object
+    }
+}
+
+#[cfg(test)]
+mod atomic_namespace_tests {
+    use super::*;
+
+    #[test]
+    fn atomic_namespace_rename_accepts_the_same_metadata_shard() {
+        ensure_same_atomic_namespace_shard(Some("shard-a"), Some("shard-a"), "/from", "/to")
+            .expect("same shard is atomic");
+    }
+
+    #[test]
+    fn atomic_namespace_rename_rejects_distinct_shards_even_with_one_owner() {
+        let error =
+            ensure_same_atomic_namespace_shard(Some("shard-a"), Some("shard-b"), "/from", "/to")
+                .expect_err("different shard ids cannot share one atomic transaction");
+        assert!(matches!(error, DfsPosixError::InvalidPath { .. }));
+    }
+
+    #[test]
+    fn atomic_namespace_rename_rejects_configured_to_unconfigured_boundary() {
+        let error = ensure_same_atomic_namespace_shard(Some("shard-a"), None, "/from", "/to")
+            .expect_err("configured and fallback namespaces are distinct");
+        assert!(matches!(error, DfsPosixError::InvalidPath { .. }));
     }
 }

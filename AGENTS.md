@@ -27,7 +27,7 @@ cargo clippy --workspace --all-targets
 cargo check -p sinomo-sandbox --features wasix-runtime      # focused sandbox runtime check.
 ```
 
-Profile note: `[profile.dev]` sets `opt-level = 2` and `incremental = false`, so dev builds are slower than typical Rust crates. Release uses `panic = "abort"`.
+Profile note: `[profile.dev]` sets `opt-level = 2` and `incremental = true`. Release uses `panic = "abort"`.
 
 ## Trust rings — load-bearing invariant
 

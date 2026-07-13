@@ -8,7 +8,7 @@ use sinomo_base::{
 use sinomo_node::NodeId;
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -24,6 +24,8 @@ pub type InteractiveObservationId = Id;
 pub const INTERACTIVE_STATE_OBSERVED: &str = "interactive.state.observed";
 pub const INTERACTIVE_ACTION_REQUESTED: &str = "interactive.action.requested";
 pub const INTERACTIVE_TRAJECTORY_STEP_RECORDED: &str = "interactive.trajectory.step.recorded";
+pub const EVENT_LOG_RELATIVE_PATH: &str = "events/event-log.jsonl";
+pub const EVENT_LOG_LOCK_RELATIVE_PATH: &str = "events/event-log.jsonl.lock";
 
 pub fn register_storage_paths(
     layout: &mut sinomo_storage::StorageLayout,
@@ -41,7 +43,12 @@ pub fn register_storage_paths(
         "events/interactive/screenshots",
         "interactive environment screenshot artifacts",
     )?;
-    layout.register_human_text("sinomo-events", StorageRing::R1, "events/event-log.jsonl")
+    layout.register_human_text("sinomo-events", StorageRing::R1, EVENT_LOG_RELATIVE_PATH)?;
+    layout.register_binary(
+        "sinomo-events",
+        StorageRing::R1,
+        EVENT_LOG_LOCK_RELATIVE_PATH,
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -679,30 +686,140 @@ impl JsonlEventStore {
         &self.path
     }
 
+    fn lock_path(&self) -> PathBuf {
+        let mut name = self
+            .path
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("event-log"))
+            .to_os_string();
+        name.push(".lock");
+        self.path.with_file_name(name)
+    }
+
+    fn acquire_exclusive_lock(&self) -> Result<fs::File, EventStoreError> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|source| EventStoreError::Io {
+                path: parent.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        }
+        let lock_path = self.lock_path();
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|source| EventStoreError::Io {
+                path: lock_path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        fs2::FileExt::lock_exclusive(&lock).map_err(|source| EventStoreError::Io {
+            path: lock_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        Ok(lock)
+    }
+
+    /// Make every previously appended event durable before a caller removes
+    /// external recovery evidence that protects replay. This syncs both the log
+    /// contents and, when present, the parent directory entry.
+    pub fn sync_all(&self) -> Result<(), EventStoreError> {
+        let _lock = self.acquire_exclusive_lock()?;
+        let file = match fs::File::open(&self.path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(EventStoreError::Io {
+                    path: self.path.display().to_string(),
+                    detail: source.to_string(),
+                });
+            }
+        };
+        file.sync_all().map_err(|source| EventStoreError::Io {
+            path: self.path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        if let Some(parent) = self.path.parent() {
+            sinomo_storage::durable_file::sync_directory(parent).map_err(|source| {
+                EventStoreError::Io {
+                    path: parent.display().to_string(),
+                    detail: source.to_string(),
+                }
+            })?;
+        }
+        Ok(())
+    }
+
     fn read_events(&self) -> Result<Vec<StoredEvent>, EventStoreError> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
-        let file = fs::File::open(&self.path).map_err(|source| EventStoreError::Io {
-            path: self.path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        let reader = std::io::BufReader::new(file);
-        let mut events = Vec::new();
-        for line in std::io::BufRead::lines(reader) {
-            let line = line.map_err(|source| EventStoreError::Io {
+        // Callers hold the sidecar lock, so repairing a tail interrupted between
+        // writing JSON and its newline cannot race another append. A malformed
+        // newline-terminated record is not repairable and remains a hard error.
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .map_err(|source| EventStoreError::Io {
                 path: self.path.display().to_string(),
                 detail: source.to_string(),
             })?;
-            if line.trim().is_empty() {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|source| EventStoreError::Io {
+                path: self.path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        let mut events = Vec::new();
+        let mut offset = 0_usize;
+        while offset < bytes.len() {
+            let remaining = &bytes[offset..];
+            let newline = remaining.iter().position(|byte| *byte == b'\n');
+            let (raw_line, terminated, next_offset) = match newline {
+                Some(index) => (&remaining[..index], true, offset + index + 1),
+                None => (remaining, false, bytes.len()),
+            };
+            let raw_line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+            if raw_line.iter().all(u8::is_ascii_whitespace) {
+                offset = next_offset;
                 continue;
             }
-            let stored: StoredEvent =
-                serde_json::from_str(&line).map_err(|source| EventStoreError::Serialization {
-                    path: self.path.display().to_string(),
-                    detail: source.to_string(),
-                })?;
-            events.push(stored);
+            match serde_json::from_slice::<StoredEvent>(raw_line) {
+                Ok(stored) => {
+                    events.push(stored);
+                    if !terminated {
+                        // The JSON payload became durable but the trailing newline
+                        // did not. Preserve the valid record and terminate it before
+                        // a later append, which would otherwise concatenate JSON.
+                        file.seek(SeekFrom::End(0))
+                            .and_then(|_| file.write_all(b"\n"))
+                            .and_then(|_| file.sync_all())
+                            .map_err(|source| EventStoreError::Io {
+                                path: self.path.display().to_string(),
+                                detail: source.to_string(),
+                            })?;
+                    }
+                }
+                Err(_) if !terminated => {
+                    // Only an invalid, non-newline-terminated final record is
+                    // provably a torn append. Keep every complete prior record.
+                    file.set_len(offset as u64)
+                        .and_then(|_| file.sync_all())
+                        .map_err(|source| EventStoreError::Io {
+                            path: self.path.display().to_string(),
+                            detail: source.to_string(),
+                        })?;
+                    break;
+                }
+                Err(source) => {
+                    return Err(EventStoreError::Serialization {
+                        path: self.path.display().to_string(),
+                        detail: source.to_string(),
+                    });
+                }
+            }
+            offset = next_offset;
         }
         Ok(events)
     }
@@ -711,6 +828,10 @@ impl JsonlEventStore {
 impl EventStore for JsonlEventStore {
     fn append(&mut self, event: EventEnvelope) -> Result<AppendReceipt, EventStoreError> {
         self.validator.validate(&event)?;
+        // Sequence allocation, duplicate detection, and append form one
+        // cross-thread/process critical section. Without this file lock, two
+        // daemon services can both observe the same tail and allocate it twice.
+        let _lock = self.acquire_exclusive_lock()?;
         let events = self.read_events()?;
         if events
             .iter()
@@ -719,12 +840,6 @@ impl EventStore for JsonlEventStore {
             return Err(EventStoreError::DuplicateEventId {
                 event_id: event.event_id,
             });
-        }
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|source| EventStoreError::Io {
-                path: parent.display().to_string(),
-                detail: source.to_string(),
-            })?;
         }
         let sequence =
             EventSequence(events.last().map(|stored| stored.sequence.0).unwrap_or(0) + 1);
@@ -760,6 +875,7 @@ impl EventStore for JsonlEventStore {
     }
 
     fn replay(&self, query: ReplayQuery) -> Result<Vec<StoredEvent>, EventStoreError> {
+        let _lock = self.acquire_exclusive_lock()?;
         let mut events: Vec<StoredEvent> = self
             .read_events()?
             .into_iter()
@@ -864,6 +980,7 @@ mod tests {
 
         let receipt = store.append(event.clone()).expect("append");
         assert_eq!(receipt.sequence, EventSequence(1));
+        store.sync_all().expect("durably sync event log");
 
         let reopened = JsonlEventStore::new(&path);
         let events = reopened
@@ -876,6 +993,23 @@ mod tests {
     }
 
     #[test]
+    fn jsonl_event_store_sync_is_idempotent_before_and_after_creation() {
+        let root = sinomo_testdir::TestDir::new("sinomo-events-jsonl-sync-test");
+        let path = root.join("events").join("event-log.jsonl");
+        let mut store = JsonlEventStore::new(&path);
+        store.sync_all().expect("missing log is already durable");
+        store
+            .append(fixture_event(
+                "evt_jsonl_sync",
+                None,
+                "sandbox.instance.created",
+            ))
+            .expect("append");
+        store.sync_all().expect("first sync");
+        store.sync_all().expect("repeat sync");
+    }
+
+    #[test]
     fn jsonl_event_store_rejects_duplicate_event_ids() {
         let root = sinomo_testdir::TestDir::new("sinomo-events-jsonl-duplicate-test");
         let path = root.join("events").join("event-log.jsonl");
@@ -885,6 +1019,114 @@ mod tests {
         store.append(event.clone()).expect("first append");
         let error = store.append(event).expect_err("duplicate append");
         assert!(matches!(error, EventStoreError::DuplicateEventId { .. }));
+    }
+
+    #[test]
+    fn jsonl_event_store_recovers_only_a_torn_final_record() {
+        let root = sinomo_testdir::TestDir::new("sinomo-events-jsonl-torn-tail-test");
+        let path = root.join("events").join("event-log.jsonl");
+        let mut store = JsonlEventStore::new(&path);
+        store
+            .append(fixture_event(
+                "evt_jsonl_before_torn_one",
+                None,
+                "sandbox.command.completed",
+            ))
+            .expect("first append");
+        store
+            .append(fixture_event(
+                "evt_jsonl_before_torn_two",
+                None,
+                "sandbox.command.completed",
+            ))
+            .expect("second append");
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open event log tail");
+        file.write_all(br#"{"sequence":3,"event"#)
+            .expect("seed torn final record");
+        file.sync_all().expect("sync torn tail");
+
+        let replayed = store.replay(ReplayQuery::all()).expect("repair and replay");
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed[0].sequence, EventSequence(1));
+        assert_eq!(replayed[1].sequence, EventSequence(2));
+
+        let after_torn = fixture_event("evt_jsonl_after_torn", None, "sandbox.command.completed");
+        let receipt = store
+            .append(after_torn.clone())
+            .expect("append after repairing torn tail");
+        assert_eq!(receipt.sequence, EventSequence(3));
+        let replayed = store.replay(ReplayQuery::all()).expect("final replay");
+        assert_eq!(replayed.len(), 3);
+        assert_eq!(replayed[2].event.event_id, after_torn.event_id);
+    }
+
+    #[test]
+    fn jsonl_event_store_serializes_concurrent_sequence_allocation_and_duplicates() {
+        const WRITERS: usize = 12;
+        let root = sinomo_testdir::TestDir::new("sinomo-events-jsonl-concurrent-test");
+        let path = root.join("events").join("event-log.jsonl");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+        let mut joins = Vec::new();
+        for index in 0..WRITERS {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let path = path.clone();
+            joins.push(std::thread::spawn(move || {
+                let mut store = JsonlEventStore::new(path);
+                let event = fixture_event(
+                    &format!("evt_jsonl_concurrent_{index}"),
+                    None,
+                    "sandbox.command.completed",
+                );
+                barrier.wait();
+                store.append(event)
+            }));
+        }
+        let mut sequences = joins
+            .into_iter()
+            .map(|join| {
+                join.join()
+                    .expect("writer thread")
+                    .expect("append")
+                    .sequence
+                    .0
+            })
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
+        assert_eq!(sequences, (1..=WRITERS as u64).collect::<Vec<_>>());
+
+        let duplicate = fixture_event(
+            "evt_jsonl_concurrent_duplicate",
+            None,
+            "sandbox.command.completed",
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let joins = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let event = duplicate.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut store = JsonlEventStore::new(path);
+                    barrier.wait();
+                    store.append(event)
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = joins
+            .into_iter()
+            .map(|join| join.join().expect("duplicate writer thread"))
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(EventStoreError::DuplicateEventId { .. })))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1069,6 +1311,7 @@ mod tests {
                 .owner_for("events/interactive/screenshots/shot.png")
                 .is_some()
         );
-        assert!(layout.owner_for("events/event-log.jsonl").is_some());
+        assert!(layout.owner_for(EVENT_LOG_RELATIVE_PATH).is_some());
+        assert!(layout.owner_for(EVENT_LOG_LOCK_RELATIVE_PATH).is_some());
     }
 }

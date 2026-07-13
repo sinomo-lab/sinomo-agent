@@ -212,6 +212,7 @@ pub use peer::{
     InProcessTransport,
 };
 pub use roaming::{
+    open_daemon_rpc_stream_to_cluster_endpoint_async,
     send_daemon_rpc_response_to_cluster_endpoint_async, send_daemon_rpc_to_cluster_endpoint_async,
 };
 pub use route::{
@@ -411,6 +412,12 @@ pub fn register_storage_paths(
         .field("target_node_id", "NodeId")
         .field("endpoint_id", "ClusterEndpointId"),
     )?;
+    layout.register_escape_path(
+        "sinomo-network",
+        StorageRing::R1,
+        "cluster/iroh",
+        "dynamic Iroh endpoint, identity, and lock records",
+    )?;
     Ok(())
 }
 
@@ -450,6 +457,29 @@ pub(crate) mod prelude {
     pub(crate) use std::time::Duration;
     pub(crate) use thiserror::Error;
     pub(crate) use time::OffsetDateTime;
+}
+
+#[cfg(test)]
+mod storage_contract_tests {
+    use super::register_storage_paths;
+    use sinomo_storage::StorageLayout;
+
+    #[test]
+    fn network_storage_contract_covers_dynamic_iroh_records() {
+        let mut layout = StorageLayout::new();
+        register_storage_paths(&mut layout).expect("register network storage paths");
+
+        for path in [
+            "cluster/iroh/node.endpoint.sobj",
+            "cluster/iroh/node.secret.sobj",
+            "cluster/iroh/node.secret.lock",
+        ] {
+            assert!(
+                layout.owner_for(path).is_some(),
+                "storage contract should cover {path}"
+            );
+        }
+    }
 }
 
 // test-support re-exports (crate internals for sibling integration tests)

@@ -1,6 +1,6 @@
 use crate::session_store::{
     AgentSessionStore, AgentSessionStoreError, AgentSessionStoreRecord,
-    AgentSessionStoreRecordKind, NoopAgentSessionStore,
+    AgentSessionStoreRecordKind, FileAgentSessionStore, NoopAgentSessionStore,
 };
 use crate::tools::{
     AGENT_CODING_EVIDENCE_KIND, AGENT_SKILL_USAGE_EVIDENCE_KIND, AgentCodingToolEvidence,
@@ -113,10 +113,23 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentSession {
     pub session_id: SessionId,
     pub role: AgentRole,
+    /// Monotonic logical revision of private/model execution state. This lets
+    /// device-local and roaming snapshots distinguish queue/control updates
+    /// that do not append a transcript item.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub state_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_definition_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_binding: Option<WorkspaceRef>,
     pub transcript: AgentTranscript,
     #[serde(default, skip_serializing_if = "AgentTranscript::is_empty")]
     pub raw_transcript: AgentTranscript,
@@ -135,6 +148,9 @@ impl AgentSession {
         Self {
             session_id,
             role,
+            state_revision: 0,
+            agent_definition_key: None,
+            workspace_binding: None,
             transcript: AgentTranscript::new(),
             raw_transcript: AgentTranscript::new(),
             projection: None,
@@ -142,6 +158,11 @@ impl AgentSession {
             follow_up_queue: Vec::new(),
             abort: None,
         }
+    }
+
+    pub fn with_agent_definition_key(mut self, key: impl Into<String>) -> Self {
+        self.agent_definition_key = Some(key.into());
+        self
     }
 
     pub fn append_run(&mut self, run: &AgentRun) {
@@ -157,6 +178,11 @@ impl AgentSession {
         {
             self.projection = Some(projection);
         }
+        self.advance_state_revision();
+    }
+
+    pub fn advance_state_revision(&mut self) {
+        self.state_revision = self.state_revision.saturating_add(1);
     }
 
     pub fn is_aborted(&self) -> bool {
@@ -650,6 +676,23 @@ impl AgentTraceStore for FileAgentTraceStore {
                 path: self.path.display().to_string(),
                 detail: source.to_string(),
             })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SessionRoutedFileAgentTraceStore {
+    paths: AgentStoragePaths,
+}
+
+impl SessionRoutedFileAgentTraceStore {
+    fn new(paths: AgentStoragePaths) -> Self {
+        Self { paths }
+    }
+}
+
+impl AgentTraceStore for SessionRoutedFileAgentTraceStore {
+    fn append(&self, record: &AgentTraceRecord) -> Result<(), AgentTraceStoreError> {
+        FileAgentTraceStore::for_session(&self.paths, &record.session_id).append(record)
     }
 }
 
@@ -2140,7 +2183,14 @@ impl ContextAssembler {
         tool_descriptors: Vec<AgentToolDescriptor>,
         step_index: usize,
     ) -> Result<TurnContext, AgentError> {
-        let system_instructions = render_agent_package_system_prompt(&config.definition);
+        let mut system_instructions = render_agent_package_system_prompt(&config.definition);
+        let transient_system_context = transient_system_context(input);
+        if let Some(context) = transient_system_context {
+            if !system_instructions.is_empty() {
+                system_instructions.push_str("\n\n");
+            }
+            system_instructions.push_str(context);
+        }
         let rendered_system_instruction_bytes = language_model_system_instructions(
             &config.provider,
             &config.model,
@@ -2306,6 +2356,13 @@ impl ContextAssembler {
                 bytes: budget_estimate.workspace_facts_bytes,
             },
         ];
+        if let Some(context) = transient_system_context {
+            included.push(ContextSource {
+                kind: "transient_system_context".to_string(),
+                label: "surface-owned turn instructions".to_string(),
+                bytes: context.len(),
+            });
+        }
         if session_projection_bytes > 0 {
             included.push(ContextSource {
                 kind: "session_projection".to_string(),
@@ -3322,6 +3379,14 @@ fn working_state_from_items(
                 state: coding_state,
                 ..
             } => {
+                // CodingRunState is the reducer's point-in-time view. A newer state supersedes
+                // validation failures and blockers from earlier attempts (for example after an
+                // environment repair and successful rerun) instead of making them permanent.
+                state.verification_state = agent_verification_state_from_coding_validation(
+                    &coding_state.validation_status,
+                );
+                state.blockers.clear();
+                state.open_risks.clear();
                 for changed_file in &coding_state.changed_files {
                     push_unique(&mut state.files_modified, changed_file.clone());
                 }
@@ -3331,7 +3396,17 @@ fn working_state_from_items(
                         format!("coding run blocked: {blocked_reason:?}"),
                     );
                 }
-                state.open_risks.extend(coding_state.open_risks.clone());
+                for risk in coding_state
+                    .open_risks
+                    .iter()
+                    .chain(&coding_state.outstanding_evidence)
+                {
+                    if risk == "no patch has been produced yet" && !state.files_modified.is_empty()
+                    {
+                        continue;
+                    }
+                    push_unique(&mut state.open_risks, risk.clone());
+                }
             }
             AgentItem::Error { detail, .. } => {
                 push_unique(&mut state.blockers, compact_multiline(detail, 500));
@@ -3399,6 +3474,21 @@ fn merge_verification_state(
             AgentVerificationState::Passed
         }
         _ => AgentVerificationState::NotRun,
+    }
+}
+
+fn agent_verification_state_from_coding_validation(
+    status: &CodingValidationStatus,
+) -> AgentVerificationState {
+    match status {
+        CodingValidationStatus::NotRun => AgentVerificationState::NotRun,
+        CodingValidationStatus::Passed => AgentVerificationState::Passed,
+        CodingValidationStatus::FailedEnvironment | CodingValidationStatus::FailedCommandSetup => {
+            AgentVerificationState::Blocked
+        }
+        CodingValidationStatus::FailedPatchRelevant
+        | CodingValidationStatus::TimedOut
+        | CodingValidationStatus::Inconclusive => AgentVerificationState::Failed,
     }
 }
 
@@ -5580,6 +5670,7 @@ where
 #[derive(Clone, Default)]
 pub struct AgentRuntimeStorage {
     memory_record_store: Option<Arc<dyn MemoryRecordStore>>,
+    durable_paths: Option<AgentStoragePaths>,
 }
 
 impl AgentRuntimeStorage {
@@ -5588,7 +5679,10 @@ impl AgentRuntimeStorage {
     }
 
     pub fn from_data_dir(data_dir: &SinomoDataDir) -> Self {
-        Self::new().with_memory_record_store(DurableMemoryStore::from_data_dir(data_dir))
+        Self {
+            memory_record_store: Some(Arc::new(DurableMemoryStore::from_data_dir(data_dir))),
+            durable_paths: Some(AgentStoragePaths::from_data_dir(data_dir)),
+        }
     }
 
     pub fn with_memory_record_store<T>(mut self, store: T) -> Self
@@ -5608,24 +5702,52 @@ impl AgentRuntimeStorage {
         self.memory_record_store.clone()
     }
 
-    fn apply_to_agent<M>(&self, agent: Agent<M>) -> Agent<M>
+    pub fn load_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<AgentSession>, AgentSessionStoreError> {
+        let Some(paths) = &self.durable_paths else {
+            return Ok(None);
+        };
+        FileAgentSessionStore::new(paths.clone()).load_session(session_id)
+    }
+
+    fn apply_to_agent<M>(&self, mut agent: Agent<M>, _session_id: &SessionId) -> Agent<M>
     where
         M: InteractionModel,
     {
-        match (
+        agent = match (
             agent.memory_record_store.is_some() || agent.memory_context_provider.is_some(),
             &self.memory_record_store,
         ) {
             (false, Some(store)) => agent.with_shared_memory_store(store.clone()),
             _ => agent,
+        };
+        if let Some(paths) = &self.durable_paths {
+            if !agent.session_store_configured {
+                agent = agent.with_session_store(FileAgentSessionStore::new(paths.clone()));
+            }
+            if !agent.trace_store_configured {
+                agent =
+                    agent.with_trace_store(SessionRoutedFileAgentTraceStore::new(paths.clone()));
+            }
         }
+        agent
     }
 }
 
 struct AgentSessionRuntimeState {
     control: AgentSessionControlPlane,
+    /// Queue items captured by the active worker. They remain in the durable
+    /// live session until successful turn completion so a crash replays rather
+    /// than silently loses them.
+    in_flight_input_ids: BTreeSet<TaskId>,
     runtime_events: Vec<AgentRuntimeEvent>,
     completed_turns: Vec<AgentOpOutcome>,
+    /// Authoritative worker-liveness marker. A joiner temporarily owns and
+    /// removes the `JoinHandle`, so handle presence alone cannot fence a new
+    /// turn while the previous worker is still exiting.
+    turn_worker_running: bool,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -5642,7 +5764,8 @@ where
         session: AgentSession,
         storage: AgentRuntimeStorage,
     ) -> Self {
-        Self::new(storage.apply_to_agent(agent), session)
+        let session_id = session.session_id.clone();
+        Self::new(storage.apply_to_agent(agent, &session_id), session)
     }
 
     pub fn with_data_dir_storage(
@@ -5658,8 +5781,10 @@ where
             agent,
             state: Arc::new(Mutex::new(AgentSessionRuntimeState {
                 control: AgentSessionControlPlane::new(session),
+                in_flight_input_ids: BTreeSet::new(),
                 runtime_events: Vec::new(),
                 completed_turns: Vec::new(),
+                turn_worker_running: false,
                 worker: None,
             })),
         }
@@ -5670,6 +5795,22 @@ where
             return self.submit_turn_op(op);
         }
         let mut state = self.lock_state()?;
+        if matches!(&op.action, AgentOpAction::Compact { .. })
+            && (state.control.active_turn.is_some() || state.turn_worker_running)
+        {
+            return Err(AgentError::Runtime {
+                detail: "cannot compact an agent session while a turn is active".to_string(),
+            });
+        }
+        if let AgentOpAction::RemoveQueuedInput { input_id } = &op.action
+            && state.in_flight_input_ids.contains(input_id)
+        {
+            return Err(AgentError::Runtime {
+                detail: format!(
+                    "queued input {input_id} is already in flight and cannot be removed"
+                ),
+            });
+        }
         let result = state.control.submit_op(self.agent.as_ref(), op)?;
         state.append_control_runtime_events(&result.events);
         Ok(result)
@@ -5700,21 +5841,13 @@ where
     pub fn replace_session(&self, session: AgentSession) -> Result<(), AgentError> {
         self.reap_finished_worker()?;
         let mut state = self.lock_state()?;
-        if state.control.active_turn.is_some() {
+        if state.control.active_turn.is_some() || state.turn_worker_running {
             return Err(AgentError::Runtime {
                 detail: "cannot replace agent session while a turn is active".to_string(),
             });
         }
-        if state
-            .worker
-            .as_ref()
-            .is_some_and(|worker| !worker.is_finished())
-        {
-            return Err(AgentError::Runtime {
-                detail: "cannot replace agent session while a worker is active".to_string(),
-            });
-        }
         state.control = AgentSessionControlPlane::new(session);
+        state.in_flight_input_ids.clear();
         state.runtime_events.clear();
         state.completed_turns.clear();
         Ok(())
@@ -5784,14 +5917,14 @@ where
             },
         )];
 
-        if state.control.active_turn.is_some() {
+        if state.control.active_turn.is_some() || state.turn_worker_running {
             events.push(agent_session_event(
                 &op_id,
                 &state.control.session.session_id,
                 AgentEventPayload::OperationRejected {
                     sequence,
                     action,
-                    reason: "session already has an active turn".to_string(),
+                    reason: "session already has an active turn worker".to_string(),
                 },
             ));
             state.control.events.extend(events.iter().cloned());
@@ -5827,8 +5960,18 @@ where
             events.push(event);
         }
         let session_for_turn = state.control.session.clone();
-        state.control.session.steering_queue.clear();
-        state.control.session.follow_up_queue.clear();
+        let base_state_revision = session_for_turn.state_revision;
+        state.in_flight_input_ids = session_for_turn
+            .steering_queue
+            .iter()
+            .map(|input| input.steering_id.clone())
+            .chain(
+                session_for_turn
+                    .follow_up_queue
+                    .iter()
+                    .map(|input| input.follow_up_id.clone()),
+            )
+            .collect();
         state.control.events.extend(events.iter().cloned());
         state.append_control_runtime_events(&events);
         state.push_runtime_event(AgentRuntimeEventPayload::WorkerStarted {
@@ -5844,15 +5987,18 @@ where
             outcome: None,
             snapshot: state.control.snapshot(),
         };
+        state.turn_worker_running = true;
 
         let worker_state = Arc::clone(&self.state);
         let progress_state = Arc::clone(&self.state);
         let model_progress_state = Arc::clone(&self.state);
         let worker_agent = Arc::clone(&self.agent);
         let worker_op_id = op_id.clone();
+        let persist_worker_op_id = worker_op_id.clone();
         let progress_op_id = op_id.clone();
         let model_progress_op_id = op_id.clone();
         let worker_action = action;
+        let persist_worker_action = worker_action.clone();
         let worker_task = task;
         let worker_started = std::time::Instant::now();
         let progress_sink = AgentToolProgressSink::new(move |event| {
@@ -5875,16 +6021,25 @@ where
         });
         let worker = thread::spawn(move || {
             let mut completed_session = session_for_turn;
-            let outcome = worker_agent.handle_op_with_cancellation_and_progress(
-                &mut completed_session,
-                op,
-                cancellation_token,
-                progress_sink,
-                model_progress_sink,
-            );
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker_agent.handle_op_with_cancellation_and_progress_and_persistence(
+                    &mut completed_session,
+                    op,
+                    cancellation_token,
+                    progress_sink,
+                    model_progress_sink,
+                    false,
+                )
+            }))
+            .unwrap_or_else(|_| {
+                Err(AgentError::Runtime {
+                    detail: "agent session runtime worker panicked".to_string(),
+                })
+            });
             let mut state = worker_state
                 .lock()
                 .expect("agent session runtime lock poisoned");
+            let persist_completed_session = outcome.is_ok();
             state.finish_turn(AgentSessionRuntimeTurnCompletion {
                 sequence,
                 op_id: worker_op_id,
@@ -5893,8 +6048,19 @@ where
                 timeout_ms,
                 started: worker_started,
                 completed_session,
+                base_state_revision,
                 outcome,
             });
+            if persist_completed_session
+                && let Err(error) = worker_agent.save_session(&state.control.session)
+            {
+                state.push_runtime_event(AgentRuntimeEventPayload::WorkerFailed {
+                    sequence,
+                    op_id: persist_worker_op_id,
+                    action: persist_worker_action,
+                    detail: format!("persist merged completed agent session failed: {error}"),
+                });
+            }
         });
         state.worker = Some(worker);
         Ok(result)
@@ -5936,6 +6102,7 @@ struct AgentSessionRuntimeTurnCompletion {
     timeout_ms: Option<u64>,
     started: std::time::Instant,
     completed_session: AgentSession,
+    base_state_revision: u64,
     outcome: Result<AgentOpOutcome, AgentError>,
 }
 
@@ -5978,12 +6145,18 @@ impl AgentSessionRuntimeState {
     }
 
     fn finish_turn(&mut self, completion: AgentSessionRuntimeTurnCompletion) {
+        self.turn_worker_running = false;
         self.control.active_turn = None;
         self.control.active_turn_cancellation = None;
         let mut events = Vec::new();
         match completion.outcome {
             Ok(outcome) => {
-                self.replace_session_preserving_live_inputs(completion.completed_session);
+                let in_flight_input_ids = std::mem::take(&mut self.in_flight_input_ids);
+                self.replace_session_preserving_live_inputs(
+                    completion.completed_session,
+                    completion.base_state_revision,
+                    &in_flight_input_ids,
+                );
                 events.extend(outcome.events.iter().cloned());
                 let stop_reason = outcome
                     .run
@@ -6018,6 +6191,7 @@ impl AgentSessionRuntimeState {
                 });
             }
             Err(error) => {
+                self.in_flight_input_ids.clear();
                 let detail = error.to_string();
                 events.push(agent_session_event(
                     &completion.op_id,
@@ -6051,15 +6225,33 @@ impl AgentSessionRuntimeState {
         self.append_control_runtime_events(&events);
     }
 
-    fn replace_session_preserving_live_inputs(&mut self, mut completed_session: AgentSession) {
+    fn replace_session_preserving_live_inputs(
+        &mut self,
+        mut completed_session: AgentSession,
+        base_state_revision: u64,
+        in_flight_input_ids: &BTreeSet<TaskId>,
+    ) {
         let live_session = &mut self.control.session;
-        let queued_steering = std::mem::take(&mut live_session.steering_queue);
-        let queued_follow_ups = std::mem::take(&mut live_session.follow_up_queue);
+        let live_state_revision = live_session.state_revision;
+        let queued_steering = std::mem::take(&mut live_session.steering_queue)
+            .into_iter()
+            .filter(|input| !in_flight_input_ids.contains(&input.steering_id))
+            .collect();
+        let queued_follow_ups = std::mem::take(&mut live_session.follow_up_queue)
+            .into_iter()
+            .filter(|input| !in_flight_input_ids.contains(&input.follow_up_id))
+            .collect();
         let live_abort = live_session.abort.clone();
         completed_session.steering_queue = queued_steering;
         completed_session.follow_up_queue = queued_follow_ups;
         if live_abort.is_some() {
             completed_session.abort = live_abort;
+        }
+        if live_state_revision > base_state_revision {
+            completed_session.state_revision = completed_session
+                .state_revision
+                .max(live_state_revision)
+                .saturating_add(1);
         }
         self.control.session = completed_session;
     }
@@ -7471,6 +7663,8 @@ pub struct Agent<M> {
     compaction_engine: Arc<RwLock<Box<dyn AgentCompactionEngine<M>>>>,
     trace_store: Box<dyn AgentTraceStore>,
     session_store: Box<dyn AgentSessionStore>,
+    trace_store_configured: bool,
+    session_store_configured: bool,
 }
 
 impl<M: InteractionModel> Agent<M> {
@@ -7493,6 +7687,8 @@ impl<M: InteractionModel> Agent<M> {
             ))),
             trace_store: Box::new(NoopAgentTraceStore),
             session_store: Box::new(NoopAgentSessionStore),
+            trace_store_configured: false,
+            session_store_configured: false,
         }
     }
 
@@ -7603,11 +7799,13 @@ impl<M: InteractionModel> Agent<M> {
 
     pub fn with_trace_store<T: AgentTraceStore + 'static>(mut self, trace_store: T) -> Self {
         self.trace_store = Box::new(trace_store);
+        self.trace_store_configured = true;
         self
     }
 
     pub fn with_session_store<T: AgentSessionStore + 'static>(mut self, session_store: T) -> Self {
         self.session_store = Box::new(session_store);
+        self.session_store_configured = true;
         self
     }
 
@@ -7658,6 +7856,25 @@ impl<M: InteractionModel> Agent<M> {
         progress_sink: AgentToolProgressSink,
         model_progress_sink: AgentModelProgressSink,
     ) -> Result<AgentOpOutcome, AgentError> {
+        self.handle_op_with_cancellation_and_progress_and_persistence(
+            session,
+            op,
+            cancellation_token,
+            progress_sink,
+            model_progress_sink,
+            true,
+        )
+    }
+
+    fn handle_op_with_cancellation_and_progress_and_persistence(
+        &self,
+        session: &mut AgentSession,
+        op: AgentOp,
+        cancellation_token: AgentCancellationToken,
+        progress_sink: AgentToolProgressSink,
+        model_progress_sink: AgentModelProgressSink,
+        persist_completed_turn: bool,
+    ) -> Result<AgentOpOutcome, AgentError> {
         let op_id = op.op_id;
         let session_id = session.session_id.clone();
         let mut events = Vec::new();
@@ -7678,13 +7895,15 @@ impl<M: InteractionModel> Agent<M> {
                         run_context: self.config.run_context.clone(),
                     },
                 ));
-                let completed_run = self.start_turn_with_cancellation_and_progress(
-                    session,
-                    &input,
-                    cancellation_token.clone(),
-                    progress_sink.clone(),
-                    model_progress_sink.clone(),
-                )?;
+                let completed_run = self
+                    .start_turn_with_cancellation_and_progress_and_persistence(
+                        session,
+                        &input,
+                        cancellation_token.clone(),
+                        progress_sink.clone(),
+                        model_progress_sink.clone(),
+                        persist_completed_turn,
+                    )?;
                 events.push(turn_completed_agent_event(
                     &op_id,
                     &session_id,
@@ -7706,13 +7925,15 @@ impl<M: InteractionModel> Agent<M> {
                         run_context: self.config.run_context.clone(),
                     },
                 ));
-                let completed_run = self.continue_turn_with_cancellation_and_progress(
-                    session,
-                    &input,
-                    cancellation_token.clone(),
-                    progress_sink.clone(),
-                    model_progress_sink.clone(),
-                )?;
+                let completed_run = self
+                    .start_turn_with_cancellation_and_progress_and_persistence(
+                        session,
+                        &input,
+                        cancellation_token.clone(),
+                        progress_sink.clone(),
+                        model_progress_sink.clone(),
+                        persist_completed_turn,
+                    )?;
                 events.push(turn_completed_agent_event(
                     &op_id,
                     &session_id,
@@ -7856,7 +8077,11 @@ impl<M: InteractionModel> Agent<M> {
             return;
         };
         let policy = MemoryPolicy::default();
-        let _ = store.promote_event(&input.latest_event, &policy);
+        if transient_system_context(input).is_none() {
+            let _ = store.promote_event(&input.latest_event, &policy);
+        }
+        // Keep useful turn outcomes, but never promote surface orchestration
+        // instructions themselves into durable user memory.
         if let Some(record) = completed_turn_memory_record(self.config.definition.key(), input, run)
         {
             let _ = store.write_record(record);
@@ -7893,6 +8118,25 @@ impl<M: InteractionModel> Agent<M> {
         cancellation_token: AgentCancellationToken,
         progress_sink: AgentToolProgressSink,
         model_progress_sink: AgentModelProgressSink,
+    ) -> Result<AgentRun, AgentError> {
+        self.start_turn_with_cancellation_and_progress_and_persistence(
+            session,
+            input,
+            cancellation_token,
+            progress_sink,
+            model_progress_sink,
+            true,
+        )
+    }
+
+    fn start_turn_with_cancellation_and_progress_and_persistence(
+        &self,
+        session: &mut AgentSession,
+        input: &AgentLoopInput,
+        cancellation_token: AgentCancellationToken,
+        progress_sink: AgentToolProgressSink,
+        model_progress_sink: AgentModelProgressSink,
+        persist_completed_turn: bool,
     ) -> Result<AgentRun, AgentError> {
         if session.is_aborted() {
             return Ok(AgentRun {
@@ -7962,7 +8206,9 @@ impl<M: InteractionModel> Agent<M> {
             },
         )?;
         self.record_completed_turn_memories(input, &run);
-        self.save_session(session)?;
+        if persist_completed_turn {
+            self.save_session(session)?;
+        }
         Ok(run)
     }
 
@@ -8007,6 +8253,7 @@ impl<M: InteractionModel> Agent<M> {
     ) -> Result<AgentSteeringMessage, AgentError> {
         let steering = AgentSteeringMessage::new(message);
         session.steering_queue.push(steering.clone());
+        session.advance_state_revision();
         self.session_store_record(
             &session.session_id,
             AgentSessionStoreRecordKind::SteeringQueued {
@@ -8024,6 +8271,7 @@ impl<M: InteractionModel> Agent<M> {
     ) -> Result<AgentFollowUpMessage, AgentError> {
         let follow_up = AgentFollowUpMessage::new(message);
         session.follow_up_queue.push(follow_up.clone());
+        session.advance_state_revision();
         self.session_store_record(
             &session.session_id,
             AgentSessionStoreRecordKind::FollowUpQueued {
@@ -8048,6 +8296,7 @@ impl<M: InteractionModel> Agent<M> {
             .position(|queued| queued.steering_id == *input_id)
         {
             let steering = session.steering_queue.remove(index);
+            session.advance_state_revision();
             self.session_store_record(
                 &session.session_id,
                 AgentSessionStoreRecordKind::SteeringRemoved {
@@ -8063,6 +8312,7 @@ impl<M: InteractionModel> Agent<M> {
             .position(|queued| queued.follow_up_id == *input_id)
         {
             let follow_up = session.follow_up_queue.remove(index);
+            session.advance_state_revision();
             self.session_store_record(
                 &session.session_id,
                 AgentSessionStoreRecordKind::FollowUpRemoved {
@@ -8110,6 +8360,7 @@ impl<M: InteractionModel> Agent<M> {
             compaction_item.clone(),
             summary.retained_tail_count,
         );
+        session.advance_state_revision();
         self.session_store_items(&session.session_id, &[compaction_item])?;
         self.session_store_projection(&session.session_id, &summary.projection)?;
         self.session_store_record(
@@ -8167,6 +8418,7 @@ impl<M: InteractionModel> Agent<M> {
     ) -> Result<AgentAbortRecord, AgentError> {
         let abort = AgentAbortRecord::new(reason);
         session.abort = Some(abort.clone());
+        session.advance_state_revision();
         self.session_store_record(
             &session.session_id,
             AgentSessionStoreRecordKind::Aborted {
@@ -8279,7 +8531,6 @@ impl<M: InteractionModel> Agent<M> {
                 run_context: self.config.run_context.clone(),
             },
         )?;
-        let initial_input = render_initial_agent_input(input)?;
         let mut transcript = transcript_prefix;
         let mut queued_agent_item = None;
         let queued_turn_context = render_queued_turn_context(steering, follow_ups)
@@ -8300,23 +8551,32 @@ impl<M: InteractionModel> Agent<M> {
             queued_agent_item = Some(queued_item);
             transcript.push(item);
         }
-        transcript.push(AgentTranscriptItem::user(0, initial_input.clone()));
+        let mut items = queued_agent_item.into_iter().collect::<Vec<_>>();
+        if transient_system_context(input).is_none() {
+            let initial_input = render_initial_agent_input(input)?;
+            transcript.push(AgentTranscriptItem::user(0, initial_input.clone()));
+            let initial_item = AgentItem::UserMessage {
+                item_id: input
+                    .latest_event
+                    .payload
+                    .get("agent_item_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| value.parse::<TaskId>().ok())
+                    .unwrap_or_else(TaskId::generate),
+                step_index: 0,
+                content: initial_input,
+                event_id: Some(input.latest_event.event_id.clone()),
+            };
+            self.trace(
+                &input.session.session_id,
+                AgentTraceRecordKind::Item {
+                    item: initial_item.clone(),
+                },
+            )?;
+            items.push(initial_item);
+        }
         let mut model_turns = Vec::new();
         let mut tool_results = Vec::new();
-        let initial_item = AgentItem::UserMessage {
-            item_id: TaskId::generate(),
-            step_index: 0,
-            content: initial_input,
-            event_id: Some(input.latest_event.event_id.clone()),
-        };
-        self.trace(
-            &input.session.session_id,
-            AgentTraceRecordKind::Item {
-                item: initial_item.clone(),
-            },
-        )?;
-        let mut items = queued_agent_item.into_iter().collect::<Vec<_>>();
-        items.push(initial_item);
         let mut context_reports = Vec::new();
         let mut model_events = Vec::new();
         let mut compactions = Vec::new();
@@ -9299,6 +9559,14 @@ fn render_initial_agent_input(input: &AgentLoopInput) -> Result<String, AgentErr
     .map_err(|source| AgentError::ModelRequest {
         detail: source.to_string(),
     })
+}
+
+fn transient_system_context(input: &AgentLoopInput) -> Option<&str> {
+    input
+        .transient_system_context
+        .as_deref()
+        .map(str::trim)
+        .filter(|context| !context.is_empty())
 }
 
 fn render_queued_turn_context(
@@ -10880,6 +11148,61 @@ mod tests {
         }
     }
 
+    struct BlockingModel {
+        started: std::sync::mpsc::Sender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl InteractionModel for BlockingModel {
+        fn complete(
+            &self,
+            request: &LanguageModelRequest,
+        ) -> Result<LanguageModelResponse, LanguageModelError> {
+            self.started.send(()).map_err(|source| {
+                LanguageModelError::ProviderInvocationFailed {
+                    provider: request.provider.clone(),
+                    model: request.model.clone(),
+                    detail: source.to_string(),
+                }
+            })?;
+            self.release
+                .lock()
+                .expect("release lock")
+                .recv()
+                .map_err(|source| LanguageModelError::ProviderInvocationFailed {
+                    provider: request.provider.clone(),
+                    model: request.model.clone(),
+                    detail: source.to_string(),
+                })?;
+            Ok(LanguageModelResponse {
+                provider: request.provider.clone(),
+                model: request.model.clone(),
+                content: r#"{
+                    "response_mode": "answer",
+                    "text": "completed after steering",
+                    "tool_calls": [],
+                    "background_handoff": null,
+                    "next_state": "listening"
+                }"#
+                .to_string(),
+                items: Vec::new(),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    struct PanickingModel;
+
+    impl InteractionModel for PanickingModel {
+        fn complete(
+            &self,
+            _request: &LanguageModelRequest,
+        ) -> Result<LanguageModelResponse, LanguageModelError> {
+            panic!("intentional agent worker panic")
+        }
+    }
+
     struct SequencedUsageModel {
         responses: Mutex<VecDeque<(String, Option<sinomo_lm::LanguageModelUsage>)>>,
         requests: Mutex<Vec<LanguageModelRequest>>,
@@ -11179,6 +11502,7 @@ mod tests {
         AgentLoopInput {
             session,
             latest_event,
+            transient_system_context: None,
             async_update: None,
             context_attachments: Vec::new(),
             tool_specs: default_coding_agent_tools(),
@@ -12394,6 +12718,107 @@ mod tests {
     }
 
     #[test]
+    fn transient_system_context_stays_out_of_two_turn_persisted_session() {
+        let data_root = sinomo_testdir::TestDir::new("sinomo-agent-transient-turn-context");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let store = crate::FileAgentSessionStore::for_data_dir(&data_dir);
+        let model = SequencedModel::new([
+            r#"{
+                "response_mode": "answer",
+                "text": "First channel reply.",
+                "tool_calls": [],
+                "background_handoff": null,
+                "next_state": "listening"
+            }"#,
+            r#"{
+                "response_mode": "answer",
+                "text": "Second channel reply.",
+                "tool_calls": [],
+                "background_handoff": null,
+                "next_state": "listening"
+            }"#,
+        ]);
+        let agent = Agent::new(model, "fake", "fake").with_session_store(store.clone());
+        let mut first_input = agent_input("");
+        first_input.transient_system_context =
+            Some("CHANNEL_CONTROL_TURN_ONE: reply only when useful".to_string());
+        let mut session =
+            AgentSession::new(first_input.session.session_id.clone(), AgentRole::Main);
+
+        let first_visible = AgentItem::UserMessage {
+            item_id: TaskId::generate(),
+            step_index: 0,
+            content: "User: first visible channel message".to_string(),
+            event_id: None,
+        };
+        session.transcript.push(first_visible.clone());
+        session.raw_transcript.push(first_visible);
+        agent
+            .start_turn(&mut session, &first_input)
+            .expect("first transient channel turn");
+
+        let second_visible = AgentItem::UserMessage {
+            item_id: TaskId::generate(),
+            step_index: 1,
+            content: "User: second visible channel message".to_string(),
+            event_id: None,
+        };
+        session.transcript.push(second_visible.clone());
+        session.raw_transcript.push(second_visible);
+        let mut second_input = agent_input("");
+        second_input.transient_system_context =
+            Some("CHANNEL_CONTROL_TURN_TWO: stay concise".to_string());
+        agent
+            .start_turn(&mut session, &second_input)
+            .expect("second transient channel turn");
+
+        let loaded = store
+            .load_session(&first_input.session.session_id)
+            .expect("load persisted session")
+            .expect("persisted session");
+        for transcript in [&loaded.transcript, &loaded.raw_transcript] {
+            let user_messages = transcript
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    AgentItem::UserMessage { content, .. } => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                user_messages,
+                vec![
+                    "User: first visible channel message",
+                    "User: second visible channel message"
+                ],
+                "each visible channel message must have exactly one durable representation"
+            );
+            assert!(
+                transcript.items.iter().all(|item| {
+                    !serde_json::to_string(item)
+                        .expect("serialize transcript item")
+                        .contains("CHANNEL_CONTROL_TURN_")
+                }),
+                "transient channel control context must not accumulate in persisted prompts"
+            );
+        }
+
+        let requests = agent.model.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        let system_message = |request: &LanguageModelRequest| {
+            request
+                .messages
+                .iter()
+                .find(|message| message.role == LanguageModelRole::System)
+                .map(|message| message.content.clone())
+                .expect("system message")
+        };
+        assert!(system_message(&requests[0]).contains("CHANNEL_CONTROL_TURN_ONE"));
+        assert!(system_message(&requests[1]).contains("CHANNEL_CONTROL_TURN_TWO"));
+        assert!(!system_message(&requests[1]).contains("CHANNEL_CONTROL_TURN_ONE"));
+    }
+
+    #[test]
     fn explicit_compaction_preserves_raw_history_and_records_working_state() {
         let model = SequencedModel::new(Vec::<String>::new());
         let agent = Agent::new(model, "fake", "fake").with_compactor(AgentCompactor {
@@ -12446,6 +12871,44 @@ mod tests {
                 .first()
                 .is_some_and(|item| matches!(item, AgentItem::CompactionSummary { .. }))
         );
+    }
+
+    #[test]
+    fn compaction_working_state_uses_latest_coding_validation_and_blockers() {
+        let changed_files = vec!["src/lib.rs".to_string()];
+        let items = vec![
+            AgentItem::CodingRunState {
+                item_id: TaskId::generate(),
+                step_index: 1,
+                state: CodingRunState {
+                    changed_files: changed_files.clone(),
+                    patch_status: CodingPatchStatus::Applied,
+                    validation_status: CodingValidationStatus::FailedEnvironment,
+                    blocked_reason: Some(CodingBlockedReason::Environment),
+                    open_risks: vec!["cargo was denied by the old sandbox policy".to_string()],
+                    ..CodingRunState::default()
+                },
+            },
+            AgentItem::CodingRunState {
+                item_id: TaskId::generate(),
+                step_index: 2,
+                state: CodingRunState {
+                    changed_files,
+                    patch_status: CodingPatchStatus::Applied,
+                    validation_status: CodingValidationStatus::Passed,
+                    outstanding_evidence: vec!["no patch has been produced yet".to_string()],
+                    stop_recommendation: CodingStopDecision::FinishWithPatch,
+                    ..CodingRunState::default()
+                },
+            },
+        ];
+
+        let state = working_state_from_items(&items, &[], &[], None);
+
+        assert_eq!(state.verification_state, AgentVerificationState::Passed);
+        assert!(state.blockers.is_empty());
+        assert!(state.open_risks.is_empty());
+        assert!(state.next_action.is_none());
     }
 
     #[test]
@@ -14916,8 +15379,9 @@ mod tests {
     #[test]
     fn tool_plan_readiness_accepts_local_workspace_visible_executors() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-readiness-local-tools");
-        let registry =
-            AgentToolRegistry::local_workspace_with_config(LocalWorkspaceAgentConfig::new(&root));
+        let registry = AgentToolRegistry::local_workspace_with_config(
+            LocalWorkspaceAgentConfig::new(&root).enabling_git_tools(),
+        );
         let plan = AgentToolPlanner::plan(
             registry.descriptors(),
             &AgentModuleToolProjection::default(),
@@ -16165,7 +16629,8 @@ mod tests {
         let registry = AgentToolRegistry::local_workspace_with_config(
             LocalWorkspaceAgentConfig::new(&root)
                 .using_local_process_commands()
-                .with_git_program(fake_git_program.clone()),
+                .with_git_program(fake_git_program.clone())
+                .enabling_git_tools(),
         );
         let input = agent_input("cancel git status");
         let cancellation_token = AgentCancellationToken::new();
@@ -18474,6 +18939,365 @@ old
         assert_eq!(
             control.snapshot().tasks[0].status,
             AgentTaskLifecycleStatus::TimedOut
+        );
+    }
+
+    #[test]
+    fn agent_session_runtime_with_data_dir_storage_persists_completed_session_and_trace() {
+        let data_root = sinomo_testdir::TestDir::new("sinomo-agent-runtime-storage");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let input = agent_input("persist this completed runtime turn");
+        let session_id = input.session.session_id.clone();
+        let agent = Agent::new(
+            SequencedModel::new([r#"{
+                "response_mode": "answer",
+                "text": "Persisted runtime answer.",
+                "tool_calls": [],
+                "background_handoff": null,
+                "next_state": "listening"
+            }"#]),
+            "fake",
+            "fake",
+        );
+        let runtime = AgentSessionRuntime::with_data_dir_storage(
+            agent,
+            AgentSession::new(session_id.clone(), AgentRole::Main),
+            &data_dir,
+        );
+
+        let op = AgentOp::start_turn(input);
+        let op_id = op.op_id.clone();
+        let submitted = runtime.submit_op(op).expect("submit persisted turn");
+        assert!(submitted.accepted);
+        runtime.join_active_turn().expect("join persisted turn");
+        assert_eq!(
+            runtime
+                .turn_result(&op_id)
+                .expect("turn result")
+                .and_then(|outcome| outcome.run)
+                .expect("completed run")
+                .final_decision
+                .text,
+            "Persisted runtime answer."
+        );
+        let completed_session = runtime.session_snapshot().expect("completed session");
+        assert!(!completed_session.transcript.items.is_empty());
+        drop(runtime);
+
+        let storage = AgentRuntimeStorage::from_data_dir(&data_dir);
+        let loaded = storage
+            .load_session(&session_id)
+            .expect("reload runtime session")
+            .expect("persisted runtime session");
+        assert_eq!(loaded, completed_session);
+
+        let paths = AgentStoragePaths::from_data_dir(&data_dir);
+        assert!(
+            paths
+                .session_snapshot_path_for_session(&session_id)
+                .is_file()
+        );
+        let trace_records = fs::read_to_string(paths.trace_path_for_session(&session_id))
+            .expect("persisted runtime trace")
+            .lines()
+            .map(|line| serde_json::from_str::<AgentTraceRecord>(line).expect("trace record"))
+            .collect::<Vec<_>>();
+        assert!(
+            trace_records
+                .iter()
+                .all(|record| record.session_id == session_id)
+        );
+        assert!(
+            trace_records
+                .iter()
+                .any(|record| { matches!(record.record, AgentTraceRecordKind::RunStarted { .. }) })
+        );
+        assert!(trace_records.iter().any(|record| {
+            matches!(
+                &record.record,
+                AgentTraceRecordKind::RunCompleted { final_decision, .. }
+                    if final_decision.text == "Persisted runtime answer."
+            )
+        }));
+    }
+
+    #[test]
+    fn runtime_merge_advances_revision_for_inputs_queued_during_a_turn() {
+        let session_id = SessionId::generate();
+        let mut base = AgentSession::new(session_id, AgentRole::Main);
+        base.state_revision = 4;
+        let mut live = base.clone();
+        live.steering_queue
+            .push(AgentSteeringMessage::new("arrived during turn"));
+        live.state_revision = 5;
+        let mut completed = base;
+        completed.transcript.push(AgentItem::AssistantText {
+            item_id: TaskId::generate(),
+            step_index: 0,
+            content: "completed turn".to_string(),
+        });
+        completed.raw_transcript = completed.transcript.clone();
+        completed.state_revision = 5;
+        let mut state = AgentSessionRuntimeState {
+            control: AgentSessionControlPlane::new(live),
+            in_flight_input_ids: BTreeSet::new(),
+            runtime_events: Vec::new(),
+            completed_turns: Vec::new(),
+            turn_worker_running: false,
+            worker: None,
+        };
+
+        state.replace_session_preserving_live_inputs(completed, 4, &BTreeSet::new());
+
+        assert_eq!(state.control.session.state_revision, 6);
+        assert_eq!(state.control.session.steering_queue.len(), 1);
+        assert_eq!(
+            state.control.session.steering_queue[0].message,
+            "arrived during turn"
+        );
+        assert_eq!(state.control.session.transcript.items.len(), 1);
+    }
+
+    #[test]
+    fn runtime_persists_inputs_queued_during_a_completed_turn() {
+        let data_root = sinomo_testdir::TestDir::new("sinomo-agent-runtime-mid-turn-input");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let input = agent_input("block while steering arrives");
+        let session_id = input.session.session_id.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let agent = Agent::new(
+            BlockingModel {
+                started: started_tx,
+                release: Mutex::new(release_rx),
+            },
+            "fake",
+            "fake",
+        );
+        let mut initial_session = AgentSession::new(session_id.clone(), AgentRole::Main);
+        initial_session
+            .steering_queue
+            .push(AgentSteeringMessage::new("consume this in the active turn"));
+        initial_session.advance_state_revision();
+        let runtime = AgentSessionRuntime::with_data_dir_storage(agent, initial_session, &data_dir);
+
+        assert!(
+            runtime
+                .submit_op(AgentOp::start_turn(input))
+                .expect("submit turn")
+                .accepted
+        );
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("model started");
+        assert!(
+            runtime
+                .submit_op(AgentOp::steer("preserve this steering"))
+                .expect("steer during turn")
+                .accepted
+        );
+        let during_turn = AgentRuntimeStorage::from_data_dir(&data_dir)
+            .load_session(&session_id)
+            .expect("load in-flight session")
+            .expect("in-flight session persisted by steering");
+        assert_eq!(
+            during_turn.steering_queue.len(),
+            2,
+            "the consumed baseline remains durable until turn commit"
+        );
+        release_tx.send(()).expect("release model");
+        runtime.join_active_turn().expect("join turn");
+
+        let merged = runtime.session_snapshot().expect("merged session");
+        assert_eq!(merged.state_revision, 3);
+        assert_eq!(merged.steering_queue.len(), 1);
+        assert_eq!(merged.steering_queue[0].message, "preserve this steering");
+        let persisted = AgentRuntimeStorage::from_data_dir(&data_dir)
+            .load_session(&session_id)
+            .expect("load persisted session")
+            .expect("persisted session");
+        assert_eq!(persisted, merged);
+    }
+
+    #[test]
+    fn runtime_rejects_a_new_turn_until_a_cancelled_worker_exits() {
+        let first_input = agent_input("block until the cancelled worker is released");
+        let session_id = first_input.session.session_id.clone();
+        let second_input = agent_input("do not start while the first worker is exiting");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let agent = Agent::new(
+            BlockingModel {
+                started: started_tx,
+                release: Mutex::new(release_rx),
+            },
+            "fake",
+            "fake",
+        );
+        let runtime =
+            AgentSessionRuntime::new(agent, AgentSession::new(session_id, AgentRole::Main));
+
+        assert!(
+            runtime
+                .submit_op(AgentOp::start_turn(first_input))
+                .expect("submit first turn")
+                .accepted
+        );
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("first worker started");
+        assert!(
+            runtime
+                .interrupt_active_turn("cancel without releasing the model")
+                .expect("request cancellation")
+                .accepted
+        );
+        let join_runtime = runtime.clone();
+        let joiner = thread::spawn(move || join_runtime.join_active_turn());
+        for _ in 0..100 {
+            let joiner_owns_handle = runtime
+                .state
+                .lock()
+                .expect("runtime state")
+                .worker
+                .is_none();
+            if joiner_owns_handle {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        {
+            let state = runtime.state.lock().expect("runtime state");
+            assert!(
+                state.worker.is_none(),
+                "joiner should own the worker handle"
+            );
+            assert!(
+                state.turn_worker_running,
+                "worker liveness must outlast handle ownership"
+            );
+        }
+
+        let rejected = runtime
+            .submit_op(AgentOp::start_turn(second_input))
+            .expect("reject overlapping turn");
+        assert!(!rejected.accepted);
+        assert!(rejected.events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                AgentEventPayload::OperationRejected { reason, .. }
+                    if reason == "session already has an active turn worker"
+            )
+        }));
+
+        release_tx.send(()).expect("release first worker");
+        joiner
+            .join()
+            .expect("join joiner thread")
+            .expect("join first worker");
+    }
+
+    #[test]
+    fn runtime_worker_panic_is_terminalized_without_fencing_the_session() {
+        let input = agent_input("panic in the model worker");
+        let session_id = input.session.session_id.clone();
+        let mut session = AgentSession::new(session_id.clone(), AgentRole::Main);
+        session
+            .steering_queue
+            .push(AgentSteeringMessage::new("retain after worker panic"));
+        session.advance_state_revision();
+        let runtime = AgentSessionRuntime::new(Agent::new(PanickingModel, "fake", "fake"), session);
+
+        assert!(
+            runtime
+                .submit_op(AgentOp::start_turn(input))
+                .expect("submit panicking turn")
+                .accepted
+        );
+        runtime
+            .join_active_turn()
+            .expect("panic is converted into a worker failure");
+
+        let snapshot = runtime.session_snapshot().expect("session snapshot");
+        assert_eq!(snapshot.steering_queue.len(), 1);
+        assert_eq!(
+            snapshot.steering_queue[0].message,
+            "retain after worker panic"
+        );
+        assert!(runtime.active_turn().expect("active turn").is_none());
+        assert!(
+            runtime
+                .runtime_events_since(AgentRuntimeEventCursor {
+                    offset: 0,
+                    last_event_id: None,
+                })
+                .expect("runtime events")
+                .events
+                .iter()
+                .any(|event| matches!(
+                    &event.payload,
+                    AgentRuntimeEventPayload::WorkerFailed { detail, .. }
+                        if detail == "agent runtime failed: agent session runtime worker panicked"
+                ))
+        );
+
+        runtime
+            .replace_session(AgentSession::new(session_id, AgentRole::Main))
+            .expect("worker panic must not fence session replacement");
+    }
+
+    #[test]
+    fn data_dir_runtime_routes_traces_after_session_replacement() {
+        let data_root = sinomo_testdir::TestDir::new("sinomo-agent-runtime-trace-routing");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let first_session_id = SessionId::generate();
+        let second_input = agent_input("trace only the replacement session");
+        let second_session_id = second_input.session.session_id.clone();
+        let agent = Agent::new(
+            SequencedModel::new([r#"{
+                "response_mode": "answer",
+                "text": "Replacement session answer.",
+                "tool_calls": [],
+                "background_handoff": null,
+                "next_state": "listening"
+            }"#]),
+            "fake",
+            "fake",
+        );
+        let runtime = AgentSessionRuntime::with_data_dir_storage(
+            agent,
+            AgentSession::new(first_session_id.clone(), AgentRole::Main),
+            &data_dir,
+        );
+        runtime
+            .replace_session(AgentSession::new(
+                second_session_id.clone(),
+                AgentRole::Main,
+            ))
+            .expect("replace runtime session");
+
+        let op = AgentOp::start_turn(second_input);
+        assert!(runtime.submit_op(op).expect("submit turn").accepted);
+        runtime.join_active_turn().expect("join replacement turn");
+
+        let paths = AgentStoragePaths::from_data_dir(&data_dir);
+        let second_trace = fs::read_to_string(paths.trace_path_for_session(&second_session_id))
+            .expect("replacement session trace");
+        assert!(!second_trace.trim().is_empty());
+        assert!(second_trace.lines().all(|line| {
+            serde_json::from_str::<AgentTraceRecord>(line)
+                .expect("trace record")
+                .session_id
+                == second_session_id
+        }));
+        let first_trace_path = paths.trace_path_for_session(&first_session_id);
+        assert!(
+            !first_trace_path.exists()
+                || fs::read_to_string(&first_trace_path)
+                    .expect("initial trace")
+                    .trim()
+                    .is_empty(),
+            "replacement turn must not cross-file traces into the initial session"
         );
     }
 

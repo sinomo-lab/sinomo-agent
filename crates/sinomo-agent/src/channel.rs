@@ -11,12 +11,13 @@ use sinomo_lm::{
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::vfs::{VfsAppendOptions, VfsError, VfsHandle, VfsObjectKind, VfsWriteOptions};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 
 pub const AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub const AGENT_CHANNEL_APP_USER_ID: &str = "user.app.local";
 pub const AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT: usize = 400;
+pub const AGENT_CHANNEL_MESSAGE_RECONCILIATION_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentChannel {
@@ -104,13 +105,18 @@ impl AgentChannel {
             .iter()
             .position(|participant| participant.agent_key == agent_key)
         {
-            let participant_id = {
+            let (participant_id, changed) = {
                 let participant = &mut self.participants[index];
-                participant.agent_name = agent_name;
-                participant.enabled = true;
-                participant.participant_id.clone()
+                let changed = participant.agent_name != agent_name || !participant.enabled;
+                if changed {
+                    participant.agent_name = agent_name;
+                    participant.enabled = true;
+                }
+                (participant.participant_id.clone(), changed)
             };
-            self.touch();
+            if changed {
+                self.touch();
+            }
             return participant_id;
         }
 
@@ -130,6 +136,8 @@ impl AgentChannel {
             order,
             tool_runtime: AgentToolRuntimeDefinition::default(),
             observed_through_sequence: 0,
+            message_reconciliation_version: AGENT_CHANNEL_MESSAGE_RECONCILIATION_VERSION,
+            observed_message_ids: Vec::new(),
         };
         let participant_id = participant.participant_id.clone();
         self.participants.push(participant);
@@ -361,8 +369,16 @@ pub struct AgentChannelParticipant {
         skip_serializing_if = "AgentToolRuntimeDefinition::is_default"
     )]
     pub tool_runtime: AgentToolRuntimeDefinition,
+    /// Legacy presentation-sequence watermark retained for snapshot compatibility.
     #[serde(default)]
     pub observed_through_sequence: u64,
+    /// Version of stable message-ID reconciliation used by this participant.
+    /// Zero denotes a legacy snapshot that only has the sequence watermark.
+    #[serde(default)]
+    pub message_reconciliation_version: u32,
+    /// Stable message IDs already projected into this participant's session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_message_ids: Vec<TaskId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -484,6 +500,11 @@ pub struct AgentChannelTurn {
     pub response_message_ids: Vec<TaskId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_message_ids: Vec<TaskId>,
+    /// Visible messages committed with the turn before their per-message
+    /// materializations are written. Readers repair any missing immutable
+    /// message records from this idempotent outbox after a process crash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outbox_messages: Vec<AgentChannelMessage>,
     #[serde(with = "crate::time_serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
 }
@@ -926,53 +947,147 @@ pub fn sync_participant_session(
     participant: &mut AgentChannelParticipant,
     session: &mut AgentSession,
 ) {
-    let mut next_step = session.transcript.items.len();
-    let observed_start = participant.observed_through_sequence;
-    for message in channel
+    let stable_item_ids = session
         .transcript
+        .items
         .iter()
-        .filter(|message| message.sequence > observed_start)
-    {
-        if message.content.trim().is_empty() && message.attachments.is_empty() {
-            participant.observed_through_sequence =
-                participant.observed_through_sequence.max(message.sequence);
-            continue;
+        .chain(session.raw_transcript.items.iter())
+        .map(crate::agent_item_id)
+        .collect::<BTreeSet<_>>();
+    let mut observed_message_ids = participant
+        .observed_message_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for message in &channel.transcript {
+        if stable_item_ids.contains(&channel_message_agent_item_id(&message.message_id)) {
+            observed_message_ids.insert(message.message_id.clone());
         }
-        let content = channel_message_content_for_agent(message);
-        let item = match &message.author {
-            AgentChannelAuthor::User { display_name, .. } => AgentItem::UserMessage {
-                item_id: TaskId::generate(),
-                step_index: next_step,
-                content: format!("{display_name}: {content}"),
-                event_id: None,
-            },
-            AgentChannelAuthor::Agent {
-                participant_id,
-                agent_name,
-                ..
-            } if participant_id == &participant.participant_id => AgentItem::AssistantText {
-                item_id: TaskId::generate(),
-                step_index: next_step,
-                content,
-            },
-            AgentChannelAuthor::Agent { agent_name, .. } => AgentItem::UserMessage {
-                item_id: TaskId::generate(),
-                step_index: next_step,
-                content: format!("{agent_name}: {content}"),
-                event_id: None,
-            },
-            AgentChannelAuthor::System => AgentItem::UserMessage {
-                item_id: TaskId::generate(),
-                step_index: next_step,
-                content: format!("System: {content}"),
-                event_id: None,
-            },
-        };
-        session.transcript.push(item.clone());
-        session.raw_transcript.push(item);
-        next_step = next_step.saturating_add(1);
+    }
+
+    if participant.message_reconciliation_version < AGENT_CHANNEL_MESSAGE_RECONCILIATION_VERSION {
+        // A legacy participant only recorded a presentation-sequence watermark.
+        // Seed the stable IDs represented by that watermark without replaying
+        // them into the model session, then use IDs exclusively from now on.
+        observed_message_ids.extend(
+            channel
+                .transcript
+                .iter()
+                .filter(|message| message.sequence <= participant.observed_through_sequence)
+                .map(|message| message.message_id.clone()),
+        );
+        participant.message_reconciliation_version = AGENT_CHANNEL_MESSAGE_RECONCILIATION_VERSION;
+    }
+
+    let mut next_step = session.transcript.items.len();
+    let mut session_changed = false;
+    for message in &channel.transcript {
         participant.observed_through_sequence =
             participant.observed_through_sequence.max(message.sequence);
+        if observed_message_ids.contains(&message.message_id) {
+            continue;
+        }
+        if message.content.trim().is_empty() && message.attachments.is_empty() {
+            observed_message_ids.insert(message.message_id.clone());
+            continue;
+        }
+        let item =
+            channel_message_agent_item(message, participant, next_step, channel.channel_kind);
+        session.transcript.push(item.clone());
+        session.raw_transcript.push(item);
+        session_changed = true;
+        observed_message_ids.insert(message.message_id.clone());
+        next_step = next_step.saturating_add(1);
+    }
+
+    // Channel snapshots retain only the recent transcript, so retaining IDs for
+    // that same bounded window is sufficient and keeps participant metadata small.
+    participant.observed_message_ids = channel
+        .transcript
+        .iter()
+        .filter(|message| observed_message_ids.contains(&message.message_id))
+        .map(|message| message.message_id.clone())
+        .collect();
+    if session_changed {
+        session.advance_state_revision();
+    }
+}
+
+/// Stable identity for the session item projected from one visible channel message.
+///
+/// Sequence numbers are presentation cursors and can change when an eventually
+/// replicated message is inserted into the timeline. Message IDs do not, so the
+/// derived item ID is the reconciliation key across retries and devices.
+pub fn channel_message_agent_item_id(message_id: &TaskId) -> TaskId {
+    TaskId::derived(
+        "sinomo-agent.channel-message-item.v1",
+        message_id.as_str().as_bytes(),
+    )
+}
+
+fn channel_message_agent_item(
+    message: &AgentChannelMessage,
+    participant: &AgentChannelParticipant,
+    step_index: usize,
+    channel_kind: AgentChannelKind,
+) -> AgentItem {
+    let item_id = channel_message_agent_item_id(&message.message_id);
+    let content = channel_message_content_for_agent(message);
+    match &message.author {
+        AgentChannelAuthor::User { display_name, .. } => AgentItem::UserMessage {
+            item_id,
+            step_index,
+            content: if channel_kind == AgentChannelKind::Chat {
+                content
+            } else {
+                format!("{display_name}: {content}")
+            },
+            event_id: None,
+        },
+        AgentChannelAuthor::Agent { participant_id, .. }
+            if participant_id == &participant.participant_id =>
+        {
+            AgentItem::AssistantText {
+                item_id,
+                step_index,
+                content,
+            }
+        }
+        AgentChannelAuthor::Agent { agent_name, .. } => AgentItem::UserMessage {
+            item_id,
+            step_index,
+            content: format!("{agent_name}: {content}"),
+            event_id: None,
+        },
+        AgentChannelAuthor::System => AgentItem::UserMessage {
+            item_id,
+            step_index,
+            content: format!("System: {content}"),
+            event_id: None,
+        },
+    }
+}
+
+pub fn mark_participant_message_observed(
+    participant: &mut AgentChannelParticipant,
+    message_id: &TaskId,
+    sequence: u64,
+) {
+    participant.message_reconciliation_version = AGENT_CHANNEL_MESSAGE_RECONCILIATION_VERSION;
+    participant.observed_through_sequence = participant.observed_through_sequence.max(sequence);
+    if !participant
+        .observed_message_ids
+        .iter()
+        .any(|observed| observed == message_id)
+    {
+        participant.observed_message_ids.push(message_id.clone());
+    }
+    let excess = participant
+        .observed_message_ids
+        .len()
+        .saturating_sub(AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT);
+    if excess > 0 {
+        participant.observed_message_ids.drain(0..excess);
     }
 }
 
@@ -1393,6 +1508,7 @@ where
             decisions: Vec::new(),
             response_message_ids: Vec::new(),
             system_message_ids: Vec::new(),
+            outbox_messages: Vec::new(),
             created_at: time::OffsetDateTime::now_utc(),
         });
         Ok(AgentChannelTurnReport {
@@ -1447,6 +1563,7 @@ where
         let mut response_message_ids = Vec::new();
         let mut system_message_ids = Vec::new();
         let mut response_messages = Vec::new();
+        let mut outbox_messages = Vec::new();
         let participants = self.channel.enabled_participants_in_order();
         let trigger_author_participant_id = trigger_agent_participant_id(trigger_message);
         for participant in participants {
@@ -1467,15 +1584,14 @@ where
                             "max_agent_messages_per_ingress": self.loop_config.max_agent_messages_per_ingress
                         })),
                     );
-                    self.store
-                        .append_message(&self.channel.channel_id, &system)?;
                     on_event(AgentChannelRuntimeEvent::System {
                         channel_id: self.channel.channel_id.clone(),
                         message_id: system.message_id.clone(),
                         message_kind: system.message_kind.clone(),
                         text: system.content.clone(),
                     });
-                    system_message_ids.push(system.message_id);
+                    system_message_ids.push(system.message_id.clone());
+                    outbox_messages.push(system);
                     *limit_notice_emitted = true;
                 }
                 break;
@@ -1520,15 +1636,14 @@ where
                             "error_type": "speak_gate"
                         })),
                     );
-                    self.store
-                        .append_message(&self.channel.channel_id, &system)?;
                     on_event(AgentChannelRuntimeEvent::System {
                         channel_id: self.channel.channel_id.clone(),
                         message_id: system.message_id.clone(),
                         message_kind: system.message_kind.clone(),
                         text: system.content.clone(),
                     });
-                    system_message_ids.push(system.message_id);
+                    system_message_ids.push(system.message_id.clone());
+                    outbox_messages.push(system);
                     decision
                 }
             };
@@ -1560,15 +1675,14 @@ where
                                 "error_type": "agent_response"
                             })),
                         );
-                        self.store
-                            .append_message(&self.channel.channel_id, &system)?;
                         on_event(AgentChannelRuntimeEvent::System {
                             channel_id: self.channel.channel_id.clone(),
                             message_id: system.message_id.clone(),
                             message_kind: system.message_kind.clone(),
                             text: system.content.clone(),
                         });
-                        system_message_ids.push(system.message_id);
+                        system_message_ids.push(system.message_id.clone());
+                        outbox_messages.push(system);
                         continue;
                     }
                 };
@@ -1580,14 +1694,16 @@ where
                 response,
                 AgentChannelSource::app(),
             );
-            self.store
-                .append_message(&self.channel.channel_id, &message)?;
             response_message_ids.push(message.message_id.clone());
             response_messages.push(message.clone());
+            outbox_messages.push(message.clone());
             *emitted_agent_messages = (*emitted_agent_messages).saturating_add(1);
             if let Some(participant) = self.channel.participant_mut(&participant_id) {
-                participant.observed_through_sequence =
-                    participant.observed_through_sequence.max(message.sequence);
+                mark_participant_message_observed(
+                    participant,
+                    &message.message_id,
+                    message.sequence,
+                );
             }
         }
 
@@ -1599,15 +1715,14 @@ where
                     "event_type": "no_agent_responded"
                 })),
             );
-            self.store
-                .append_message(&self.channel.channel_id, &system)?;
             on_event(AgentChannelRuntimeEvent::System {
                 channel_id: self.channel.channel_id.clone(),
                 message_id: system.message_id.clone(),
                 message_kind: system.message_kind.clone(),
                 text: system.content.clone(),
             });
-            system_message_ids.push(system.message_id);
+            system_message_ids.push(system.message_id.clone());
+            outbox_messages.push(system);
         }
 
         let turn = AgentChannelTurn {
@@ -1617,9 +1732,17 @@ where
             decisions,
             response_message_ids,
             system_message_ids,
+            outbox_messages,
             created_at: time::OffsetDateTime::now_utc(),
         };
+        // The turn is the durable commit point. Keep message creation and
+        // runtime-event order above unchanged, but do not expose any immutable
+        // channel message without the audit record that can repair it.
         self.store.append_turn(&self.channel.channel_id, &turn)?;
+        for message in &turn.outbox_messages {
+            self.store
+                .append_message(&self.channel.channel_id, message)?;
+        }
         Ok(AgentChannelTriggerOutcome {
             turn,
             response_messages,
@@ -1886,6 +2009,52 @@ mod tests {
     }
 
     #[test]
+    fn ensure_participant_does_not_touch_an_unchanged_participant() {
+        let mut channel = AgentChannel::with_default_title(SessionId::generate());
+        let participant_id = channel.ensure_participant("main-agent", "Main");
+        channel.updated_at = time::OffsetDateTime::UNIX_EPOCH;
+
+        let unchanged_id = channel.ensure_participant("main-agent", "Main");
+
+        assert_eq!(unchanged_id, participant_id);
+        assert_eq!(channel.updated_at, time::OffsetDateTime::UNIX_EPOCH);
+
+        channel.ensure_participant("main-agent", "Main renamed");
+        assert_ne!(channel.updated_at, time::OffsetDateTime::UNIX_EPOCH);
+        assert_eq!(
+            channel
+                .participant(&participant_id)
+                .expect("participant")
+                .agent_name,
+            "Main renamed"
+        );
+    }
+
+    #[test]
+    fn participant_reconciliation_fields_default_for_legacy_snapshots() {
+        let mut channel = AgentChannel::with_default_title(SessionId::generate());
+        let participant_id = channel.ensure_participant("main-agent", "Main");
+        channel
+            .participant_mut(&participant_id)
+            .expect("participant")
+            .observed_through_sequence = 7;
+        let mut value = serde_json::to_value(&channel).expect("serialize channel");
+        let participant = value["participants"][0]
+            .as_object_mut()
+            .expect("participant object");
+        participant.remove("message_reconciliation_version");
+        participant.remove("observed_message_ids");
+
+        let decoded: AgentChannel = serde_json::from_value(value).expect("legacy channel");
+        let participant = decoded
+            .participant(&participant_id)
+            .expect("decoded participant");
+        assert_eq!(participant.observed_through_sequence, 7);
+        assert_eq!(participant.message_reconciliation_version, 0);
+        assert!(participant.observed_message_ids.is_empty());
+    }
+
+    #[test]
     fn remove_and_readd_preserves_participant_session_state() {
         let mut channel = AgentChannel::with_default_title(SessionId::generate());
         let participant_id = channel.ensure_participant("main-agent", "Main");
@@ -1958,6 +2127,53 @@ mod tests {
     }
 
     #[test]
+    fn authored_channel_reply_is_not_reinserted_into_its_session() {
+        let mut channel = AgentChannel::with_default_title(SessionId::generate());
+        let participant_id = channel.ensure_participant("main-agent", "Main");
+        let executor = ScriptExecutor::new()
+            .with_decision("main-agent", true)
+            .with_response("main-agent", "One authored reply.");
+        let mut runtime =
+            AgentChannelRuntime::new(channel, MemoryChannelStore::default(), executor)
+                .with_loop_config(AgentChannelLoopConfig {
+                    max_agent_messages_per_ingress: 1,
+                });
+
+        let report = runtime
+            .send_user_message("Please answer once.", &mut |_| {})
+            .expect("send");
+        let response_id = report.turn.response_message_ids[0].clone();
+        let before = runtime
+            .participant_session(&participant_id)
+            .expect("participant session")
+            .transcript
+            .items
+            .len();
+        assert!(
+            runtime
+                .channel()
+                .participant(&participant_id)
+                .expect("participant")
+                .observed_message_ids
+                .contains(&response_id)
+        );
+
+        runtime
+            .sync_participant(&participant_id)
+            .expect("repeat participant sync");
+
+        assert_eq!(
+            runtime
+                .participant_session(&participant_id)
+                .expect("participant session")
+                .transcript
+                .items
+                .len(),
+            before
+        );
+    }
+
+    #[test]
     fn agent_replies_can_trigger_other_agents_without_echoing_to_author() {
         let mut channel = AgentChannel::with_default_title(SessionId::generate());
         channel.ensure_participant("main-agent", "Main");
@@ -2020,6 +2236,18 @@ mod tests {
                 .count(),
             0
         );
+        assert_eq!(report.turn.system_message_ids.len(), 2);
+        assert_eq!(report.turn.outbox_messages.len(), 2);
+        assert_eq!(
+            report
+                .turn
+                .outbox_messages
+                .iter()
+                .map(|message| message.message_id.clone())
+                .collect::<Vec<_>>(),
+            report.turn.system_message_ids,
+            "every visible system notice must be recoverable from the turn outbox in sequence order"
+        );
         assert!(
             runtime.channel().transcript.iter().any(|message| {
                 message.message_kind == AgentChannelMessageKind::Error
@@ -2047,19 +2275,19 @@ mod tests {
 
     #[test]
     fn participant_session_sync_maps_channel_messages() {
-        let mut channel = AgentChannel::with_default_title(SessionId::generate());
+        let mut channel = AgentChannel::new_channel(SessionId::generate(), "Participant sync test");
         let main_id = channel.ensure_participant("main-agent", "Main");
         let coding_id = channel.ensure_participant("coding-agent", "Coding");
         let main = channel.participant(&main_id).expect("main").clone();
-        let _user = channel.append_user_message(
+        let user = channel.append_user_message(
             AGENT_CHANNEL_APP_USER_ID,
             "Alice",
             "Please inspect this.",
             AgentChannelSource::app(),
         );
-        let _main_reply =
+        let main_reply =
             channel.append_agent_message(&main, "I will look first.", AgentChannelSource::app());
-        let _system = channel.append_system_error(
+        let system = channel.append_system_error(
             "Provider warning.",
             AgentChannelSource::system(serde_json::json!({"error_type": "provider"})),
         );
@@ -2084,7 +2312,203 @@ mod tests {
                 "System: Provider warning.".to_string(),
             ]
         );
+        assert_eq!(
+            session
+                .transcript
+                .items
+                .iter()
+                .map(crate::agent_item_id)
+                .collect::<Vec<_>>(),
+            [&user, &main_reply, &system]
+                .into_iter()
+                .map(|message| channel_message_agent_item_id(&message.message_id))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(coding.observed_through_sequence, 3);
+    }
+
+    #[test]
+    fn participant_session_sync_reconciles_retries_and_backdated_messages_by_id() {
+        let mut channel = AgentChannel::with_default_title(SessionId::generate());
+        let coding_id = channel.ensure_participant("coding-agent", "Coding");
+        let first = channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "Alice",
+            "First message.",
+            AgentChannelSource::app(),
+        );
+        let second = channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "Alice",
+            "Second message.",
+            AgentChannelSource::app(),
+        );
+        let mut coding = channel.participant(&coding_id).expect("coding").clone();
+        let mut session = AgentSession::new(coding.agent_session_id.clone(), AgentRole::Main);
+
+        sync_participant_session(&channel, &mut coding, &mut session);
+        sync_participant_session(&channel, &mut coding, &mut session);
+        assert_eq!(session.transcript.items.len(), 2, "retry must deduplicate");
+        assert_eq!(session.raw_transcript.items.len(), 2);
+
+        let mut backdated = channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "Remote",
+            "Arrived late but belongs first.",
+            AgentChannelSource::app(),
+        );
+        let mut renumbered_first = first.clone();
+        let mut renumbered_second = second.clone();
+        backdated.sequence = 1;
+        renumbered_first.sequence = 2;
+        renumbered_second.sequence = 3;
+        channel.transcript = vec![backdated.clone(), renumbered_first, renumbered_second];
+        channel.next_sequence = 4;
+
+        sync_participant_session(&channel, &mut coding, &mut session);
+        sync_participant_session(&channel, &mut coding, &mut session);
+
+        assert_eq!(session.transcript.items.len(), 3);
+        assert_eq!(session.raw_transcript.items.len(), 3);
+        let item_ids = session
+            .transcript
+            .items
+            .iter()
+            .map(crate::agent_item_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            item_ids,
+            [&first, &second, &backdated]
+                .into_iter()
+                .map(|message| channel_message_agent_item_id(&message.message_id))
+                .collect::<BTreeSet<_>>()
+        );
+        assert_eq!(coding.observed_through_sequence, 3);
+    }
+
+    #[test]
+    fn participant_session_sync_seeds_legacy_watermark_without_rewriting_history() {
+        let mut channel = AgentChannel::with_default_title(SessionId::generate());
+        let coding_id = channel.ensure_participant("coding-agent", "Coding");
+        let first = channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "Alice",
+            "First legacy message.",
+            AgentChannelSource::app(),
+        );
+        let second = channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "Alice",
+            "Second legacy message.",
+            AgentChannelSource::app(),
+        );
+        let third = channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "Alice",
+            "New stable message.",
+            AgentChannelSource::app(),
+        );
+        let mut coding = channel.participant(&coding_id).expect("coding").clone();
+        coding.observed_through_sequence = 2;
+        coding.message_reconciliation_version = 0;
+        coding.observed_message_ids.clear();
+        let mut session = AgentSession::new(coding.agent_session_id.clone(), AgentRole::Main);
+        let first_legacy_item_id = TaskId::generate();
+        let second_legacy_item_id = TaskId::generate();
+        session.transcript.items = vec![
+            AgentItem::UserMessage {
+                item_id: first_legacy_item_id.clone(),
+                step_index: 0,
+                content: "Alice: First legacy message.".to_string(),
+                event_id: None,
+            },
+            AgentItem::UserMessage {
+                item_id: second_legacy_item_id.clone(),
+                step_index: 1,
+                content: "Alice: Second legacy message.".to_string(),
+                event_id: None,
+            },
+        ];
+        session.raw_transcript = session.transcript.clone();
+        session.projection = Some(crate::AgentSessionProjection {
+            projection_id: TaskId::generate(),
+            previous_projection_id: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            reason: "legacy projection".to_string(),
+            summary: "retain legacy channel items".to_string(),
+            source_item_count: 2,
+            source_item_ids: vec![first_legacy_item_id.clone(), second_legacy_item_id.clone()],
+            retained_item_ids: vec![second_legacy_item_id.clone()],
+            working_state: crate::AgentWorkingState::default(),
+        });
+        let projection_before = session.projection.clone();
+
+        sync_participant_session(&channel, &mut coding, &mut session);
+        sync_participant_session(&channel, &mut coding, &mut session);
+
+        assert_eq!(
+            session
+                .transcript
+                .items
+                .iter()
+                .map(crate::agent_item_id)
+                .collect::<Vec<_>>(),
+            vec![
+                first_legacy_item_id,
+                second_legacy_item_id,
+                channel_message_agent_item_id(&third.message_id),
+            ]
+        );
+        assert_eq!(session.raw_transcript, session.transcript);
+        assert_eq!(session.projection, projection_before);
+        assert_eq!(coding.observed_through_sequence, 3);
+        assert_eq!(
+            coding.message_reconciliation_version,
+            AGENT_CHANNEL_MESSAGE_RECONCILIATION_VERSION
+        );
+        assert_eq!(
+            coding.observed_message_ids,
+            vec![first.message_id, second.message_id, third.message_id]
+        );
+    }
+
+    #[test]
+    fn participant_session_sync_honors_unrecoverable_legacy_watermark() {
+        let mut channel = AgentChannel::with_default_title(SessionId::generate());
+        let coding_id = channel.ensure_participant("coding-agent", "Coding");
+        channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "Alice",
+            "Already observed but absent from the legacy transcript.",
+            AgentChannelSource::app(),
+        );
+        channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "Alice",
+            "Also already observed.",
+            AgentChannelSource::app(),
+        );
+        let new_message = channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "Alice",
+            "New after restart.",
+            AgentChannelSource::app(),
+        );
+        let mut coding = channel.participant(&coding_id).expect("coding").clone();
+        coding.observed_through_sequence = 2;
+        coding.message_reconciliation_version = 0;
+        coding.observed_message_ids.clear();
+        let mut session = AgentSession::new(coding.agent_session_id.clone(), AgentRole::Main);
+
+        sync_participant_session(&channel, &mut coding, &mut session);
+        sync_participant_session(&channel, &mut coding, &mut session);
+
+        assert_eq!(session.transcript.items.len(), 1);
+        assert_eq!(
+            crate::agent_item_id(&session.transcript.items[0]),
+            channel_message_agent_item_id(&new_message.message_id)
+        );
+        assert_eq!(coding.observed_message_ids.len(), 3);
     }
 
     #[derive(Clone)]

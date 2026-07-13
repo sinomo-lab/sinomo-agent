@@ -3,7 +3,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use sinomo_dfs::{DfsMessageTransport, NetworkedDfsService};
 use sinomo_module::{
     ModuleId, NativeDylibModuleLoaderState, NativeModuleUnloadReport, native_module_cache_path,
     read_native_dylib_module_loader_state,
@@ -75,9 +74,41 @@ impl SandboxWasixModuleCommandRunner {
         stdin: Option<Vec<u8>>,
         timeout_ms: u64,
         limits: Option<SandboxResourceLimits>,
-        mut extra_preopens: Vec<SandboxWasixHostPreopen>,
+        extra_preopens: Vec<SandboxWasixHostPreopen>,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
+        self.run_module_with_stdin_limits_preopens_output_sink_toolchain_and_cancellation(
+            store,
+            toolchain_store,
+            sandbox_id,
+            wasm,
+            argv,
+            stdin,
+            timeout_ms,
+            limits,
+            extra_preopens,
+            output_sink,
+            SandboxCancellationToken::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_module_with_stdin_limits_preopens_output_sink_toolchain_and_cancellation(
+        &self,
+        store: &LocalSandboxInstanceStore,
+        toolchain_store: &LocalSandboxToolchainStore,
+        sandbox_id: &SandboxId,
+        wasm: impl AsRef<[u8]>,
+        argv: Vec<String>,
+        stdin: Option<Vec<u8>>,
+        timeout_ms: u64,
+        limits: Option<SandboxResourceLimits>,
+        mut extra_preopens: Vec<SandboxWasixHostPreopen>,
+        output_sink: Option<Arc<dyn SandboxOutputSink>>,
+        cancellation_token: SandboxCancellationToken,
+    ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
+        let local_execution_lease = try_acquire_sandbox_local_execution_lease(store, sandbox_id)?;
+        recover_pending_daemonless_execution(store, &local_execution_lease, sandbox_id)?;
         let (manifest, layout) = store.load(sandbox_id)?;
         let (toolchain, _toolchain_layout) =
             match toolchain_store.load_manifest(&manifest.toolchain_id) {
@@ -85,6 +116,7 @@ impl SandboxWasixModuleCommandRunner {
                 Err(SandboxToolchainError::NotFound { .. }) => {
                     return self.run_module_with_stdin_limits_preopens_output_sink_abi_and_env(
                         store,
+                        &local_execution_lease,
                         sandbox_id,
                         wasm,
                         argv,
@@ -102,7 +134,8 @@ impl SandboxWasixModuleCommandRunner {
                         true,
                         false,
                         Vec::new(),
-                        SandboxCancellationToken::new(),
+                        cancellation_token,
+                        true,
                     );
                 }
                 Err(error) => return Err(error.into()),
@@ -114,6 +147,7 @@ impl SandboxWasixModuleCommandRunner {
         artifact_preopens.append(&mut extra_preopens);
         self.run_module_with_stdin_limits_preopens_output_sink_abi_and_env(
             store,
+            &local_execution_lease,
             sandbox_id,
             wasm,
             argv,
@@ -131,7 +165,8 @@ impl SandboxWasixModuleCommandRunner {
             true,
             false,
             wasix_command_overrides_for_toolchain(&toolchain),
-            SandboxCancellationToken::new(),
+            cancellation_token,
+            true,
         )
     }
 
@@ -272,9 +307,60 @@ impl SandboxWasixModuleCommandRunner {
         env_override: BTreeMap<String, String>,
         cancellation_token: SandboxCancellationToken,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
+        self.run_toolchain_command_with_stdin_policy_output_sink_cwd_env_cancellation_mode(
+            store,
+            toolchain_store,
+            sandbox_id,
+            command_name,
+            argv,
+            stdin,
+            timeout_ms,
+            execution_node_id,
+            policy,
+            output_sink,
+            cwd_override,
+            env_override,
+            cancellation_token,
+            true,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_toolchain_command_with_stdin_policy_output_sink_cwd_env_cancellation_mode(
+        &self,
+        store: &LocalSandboxInstanceStore,
+        toolchain_store: &LocalSandboxToolchainStore,
+        sandbox_id: &SandboxId,
+        command_name: &str,
+        argv: Vec<String>,
+        stdin: Option<Vec<u8>>,
+        timeout_ms: u64,
+        execution_node_id: &sinomo_core::node::NodeId,
+        policy: &SandboxPolicy,
+        output_sink: Option<Arc<dyn SandboxOutputSink>>,
+        cwd_override: Option<SandboxPath>,
+        env_override: BTreeMap<String, String>,
+        cancellation_token: SandboxCancellationToken,
+        complete_outcome: bool,
+        held_local_execution_lease: Option<&SandboxLocalExecutionLease>,
+    ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
         validate_sandbox_toolchain_argv(command_name, &argv).map_err(|detail| {
             SandboxCommandExecutionError::Wasi(SandboxWasiError::InvalidRequest { detail })
         })?;
+        let owned_local_execution_lease = if held_local_execution_lease.is_none() {
+            Some(try_acquire_sandbox_local_execution_lease(
+                store, sandbox_id,
+            )?)
+        } else {
+            None
+        };
+        let local_execution_lease = held_local_execution_lease
+            .or(owned_local_execution_lease.as_ref())
+            .expect("a local execution lease is always present");
+        if owned_local_execution_lease.is_some() {
+            recover_pending_daemonless_execution(store, local_execution_lease, sandbox_id)?;
+        }
         let (manifest, layout) = store.load(sandbox_id)?;
         let (toolchain, _toolchain_layout) =
             toolchain_store.load_manifest(&manifest.toolchain_id)?;
@@ -300,6 +386,8 @@ impl SandboxWasixModuleCommandRunner {
             cwd_override,
             env_override,
             cancellation_token,
+            complete_outcome,
+            local_execution_lease,
         )
     }
 
@@ -324,6 +412,8 @@ impl SandboxWasixModuleCommandRunner {
         cwd_override: Option<SandboxPath>,
         env_override: BTreeMap<String, String>,
         cancellation_token: SandboxCancellationToken,
+        complete_outcome: bool,
+        local_execution_lease: &SandboxLocalExecutionLease,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
         let command = toolchain.command(command_name)?;
         policy
@@ -344,6 +434,7 @@ impl SandboxWasixModuleCommandRunner {
             stage_toolchain_runtime_to_local(layout, &toolchain_artifacts, &toolchain_commands)?;
         self.run_module_with_stdin_limits_preopens_output_sink_abi_and_env(
             store,
+            local_execution_lease,
             sandbox_id,
             wasm,
             argv,
@@ -362,6 +453,7 @@ impl SandboxWasixModuleCommandRunner {
             false,
             wasix_command_overrides_for_toolchain(toolchain),
             cancellation_token,
+            complete_outcome,
         )
     }
 
@@ -369,6 +461,7 @@ impl SandboxWasixModuleCommandRunner {
     fn run_module_with_stdin_limits_preopens_output_sink_abi_and_env(
         &self,
         store: &LocalSandboxInstanceStore,
+        local_execution_lease: &SandboxLocalExecutionLease,
         sandbox_id: &SandboxId,
         wasm: impl AsRef<[u8]>,
         argv: Vec<String>,
@@ -387,23 +480,12 @@ impl SandboxWasixModuleCommandRunner {
         wasix_fpcast_emu: bool,
         wasix_command_overrides: Vec<SandboxWasixCommandOverride>,
         cancellation_token: SandboxCancellationToken,
+        complete_outcome: bool,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
         let (manifest, layout) = store.load(sandbox_id)?;
         let limits = limits.unwrap_or_else(|| manifest.limits.clone());
         let effective_cwd = cwd_override.unwrap_or_else(|| manifest.cwd.clone());
-        let sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
-        sandbox_fs.validate_resource_limits(&limits)?;
-        validate_sandbox_working_directory(&sandbox_fs, &effective_cwd)?;
-        let before = sandbox_fs.snapshot()?;
-        let rollback_checkpoint = store.create_checkpoint(sandbox_id, OffsetDateTime::now_utc())?;
         let started_at = OffsetDateTime::now_utc();
-        let mut options = local_staged_sandbox_wasix_options(&layout, &limits, extra_preopens);
-        options.wasix_pinned_child_exec_only = wasix_pinned_child_exec_only;
-        options.wasix_instruction_metering = wasix_instruction_metering;
-        options.wasix_auto_asyncify = wasix_auto_asyncify;
-        options.wasix_fpcast_emu = wasix_fpcast_emu;
-        options.wasix_command_overrides = wasix_command_overrides;
-
         let mut env = default_env;
         env.extend(manifest.env.clone());
         env.extend(env_override);
@@ -416,7 +498,54 @@ impl SandboxWasixModuleCommandRunner {
             env,
             timeout_ms,
         };
-        let mut outcome = match if cancellation_token.is_cancelled() {
+        let crash_audit_record = SandboxCommandRecord {
+            sandbox_id: manifest.sandbox_id.clone(),
+            command_id: SandboxCommandId::generate(),
+            status: SandboxCommandRecordStatus::Failed,
+            workspace_root: manifest.workspace_root.clone(),
+            toolchain_id: manifest.toolchain_id.clone(),
+            argv: argv.clone(),
+            cwd: effective_cwd.clone(),
+            env: request.env.clone(),
+            started_at,
+            completed_at: None,
+            response: None,
+            error: Some("sandbox host stopped while the local guest was active".to_string()),
+        };
+        let sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
+        validate_sandbox_working_directory(&sandbox_fs, &effective_cwd)?;
+        let before = sandbox_fs
+            .snapshot_with_checkpoints(|| cancellation_checkpoint(&cancellation_token))?;
+        validate_workspace_usage(&before.workspace_usage(), &limits)?;
+        let mut journal = begin_sandbox_local_execution_journal(
+            store,
+            local_execution_lease,
+            &manifest,
+            OffsetDateTime::now_utc(),
+        )?;
+        prepare_sandbox_local_execution_audit_identity(
+            store,
+            local_execution_lease,
+            &mut journal,
+            crash_audit_record,
+            OffsetDateTime::now_utc(),
+        )?;
+        let mut local_journal = Some(journal);
+        activate_sandbox_local_execution_journal(
+            store,
+            local_execution_lease,
+            local_journal
+                .as_mut()
+                .expect("local execution journal was just created"),
+            OffsetDateTime::now_utc(),
+        )?;
+        let mut options = local_staged_sandbox_wasix_options(&layout, &limits, extra_preopens);
+        options.wasix_pinned_child_exec_only = wasix_pinned_child_exec_only;
+        options.wasix_instruction_metering = wasix_instruction_metering;
+        options.wasix_auto_asyncify = wasix_auto_asyncify;
+        options.wasix_fpcast_emu = wasix_fpcast_emu;
+        options.wasix_command_overrides = wasix_command_overrides;
+        let execution = if cancellation_token.is_cancelled() {
             Err(SandboxWasiError::Cancelled)
         } else {
             self.invoke_run_module(
@@ -427,56 +556,93 @@ impl SandboxWasixModuleCommandRunner {
                 output_sink,
                 cancellation_token.clone(),
             )
-        } {
+        };
+        let execution =
+            transition_after_native_return(&cancellation_token, complete_outcome, execution);
+        let mut outcome = match execution {
             Ok(outcome) => outcome,
             Err(error) => {
-                store.resume_checkpoint(
-                    sandbox_id,
-                    &rollback_checkpoint.checkpoint_id,
-                    OffsetDateTime::now_utc(),
-                )?;
-                let _ = store.delete_checkpoint(sandbox_id, &rollback_checkpoint.checkpoint_id);
                 let command_id = SandboxCommandId::generate();
                 let completed_at = OffsetDateTime::now_utc();
-                let mut sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
-                persist_command_record(
-                    &mut sandbox_fs,
-                    &SandboxCommandRecord {
-                        sandbox_id: manifest.sandbox_id.clone(),
-                        command_id: command_id.clone(),
-                        status: sandbox_command_record_status_for_wasi_error(&error),
-                        workspace_root: manifest.workspace_root.clone(),
-                        toolchain_id: manifest.toolchain_id.clone(),
-                        argv,
-                        cwd: effective_cwd.clone(),
-                        env: request.env.clone(),
-                        started_at,
-                        completed_at: Some(completed_at),
-                        response: None,
-                        error: Some(error.to_string()),
-                    },
-                )?;
-                record_local_command_history(store, sandbox_id, &command_id, completed_at)?;
+                let command_record = SandboxCommandRecord {
+                    sandbox_id: manifest.sandbox_id.clone(),
+                    command_id: command_id.clone(),
+                    status: sandbox_command_record_status_for_wasi_error(&error),
+                    workspace_root: manifest.workspace_root.clone(),
+                    toolchain_id: manifest.toolchain_id.clone(),
+                    argv,
+                    cwd: effective_cwd.clone(),
+                    env: request.env.clone(),
+                    started_at,
+                    completed_at: Some(completed_at),
+                    response: None,
+                    error: Some(error.to_string()),
+                };
+                let cancelled = matches!(&error, SandboxWasiError::Cancelled);
+                let journal_outcome = if cancelled {
+                    SandboxLocalExecutionOutcome::Cancelled
+                } else {
+                    SandboxLocalExecutionOutcome::Failed {
+                        detail: error.to_string(),
+                    }
+                };
+                let settlement = settle_daemonless_outcome(
+                    store,
+                    local_execution_lease,
+                    &mut local_journal,
+                    journal_outcome,
+                    command_record,
+                    Vec::new(),
+                    Vec::new(),
+                );
+                if cancelled {
+                    let detail = match settlement {
+                        Ok(()) => format!(
+                            "audit cleanup is pending in {}",
+                            sandbox_local_execution_journal_path(&store.layout(sandbox_id))
+                                .display()
+                        ),
+                        Err(settlement_error) => format!(
+                            "terminal cancellation marker update failed; GuestActive recovery remains pending: {settlement_error}"
+                        ),
+                    };
+                    cancellation_token.record_durability_failure(detail.clone());
+                    return Err(SandboxWasiError::CancelledCleanupFailed { detail }.into());
+                }
+                let cleanup = settlement.and_then(|()| {
+                    complete_daemonless_outcome(store, local_execution_lease, &mut local_journal)
+                });
+                if let Err(cleanup_error) = cleanup {
+                    cancellation_token.record_durability_failure(format!(
+                        "finalize daemonless outcome {:?}: {cleanup_error}",
+                        error
+                    ));
+                    return Err(cleanup_error);
+                }
+                if complete_outcome {
+                    cancellation_token.complete();
+                }
                 return Err(error.into());
             }
         };
 
-        let after = sandbox_fs.snapshot()?;
-        if let Err(error) = validate_workspace_usage(&after.workspace_usage(), &limits) {
-            store.resume_checkpoint(
-                sandbox_id,
-                &rollback_checkpoint.checkpoint_id,
-                OffsetDateTime::now_utc(),
-            )?;
-            let _ = store.delete_checkpoint(sandbox_id, &rollback_checkpoint.checkpoint_id);
-            let completed_at = OffsetDateTime::now_utc();
-            let mut sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
-            persist_command_record(
-                &mut sandbox_fs,
-                &SandboxCommandRecord {
+        let after = match sandbox_fs
+            .snapshot_with_checkpoints(|| cancellation_checkpoint(&cancellation_token))
+        {
+            Ok(after) => after,
+            Err(error) => {
+                let completed_at = OffsetDateTime::now_utc();
+                let command_record = SandboxCommandRecord {
                     sandbox_id: manifest.sandbox_id.clone(),
                     command_id: outcome.response.command_id.clone(),
-                    status: SandboxCommandRecordStatus::ResourceExhausted,
+                    status: if matches!(
+                        &error,
+                        SandboxCommandExecutionError::Wasi(SandboxWasiError::Cancelled)
+                    ) {
+                        SandboxCommandRecordStatus::Cancelled
+                    } else {
+                        SandboxCommandRecordStatus::Failed
+                    },
                     workspace_root: manifest.workspace_root.clone(),
                     toolchain_id: manifest.toolchain_id.clone(),
                     argv,
@@ -486,85 +652,157 @@ impl SandboxWasixModuleCommandRunner {
                     completed_at: Some(completed_at),
                     response: Some(outcome.response.clone()),
                     error: Some(error.to_string()),
-                },
-            )?;
-            record_local_command_history(
+                };
+                let cancelled = matches!(
+                    &error,
+                    SandboxCommandExecutionError::Wasi(SandboxWasiError::Cancelled)
+                );
+                let journal_outcome = if cancelled {
+                    SandboxLocalExecutionOutcome::Cancelled
+                } else {
+                    SandboxLocalExecutionOutcome::Failed {
+                        detail: error.to_string(),
+                    }
+                };
+                let settlement = settle_daemonless_outcome(
+                    store,
+                    local_execution_lease,
+                    &mut local_journal,
+                    journal_outcome,
+                    command_record,
+                    outcome.stdout.clone(),
+                    outcome.stderr.clone(),
+                );
+                if cancelled {
+                    let detail = match settlement {
+                        Ok(()) => format!(
+                            "audit cleanup is pending in {}",
+                            sandbox_local_execution_journal_path(&store.layout(sandbox_id))
+                                .display()
+                        ),
+                        Err(settlement_error) => format!(
+                            "terminal cancellation marker update failed; GuestActive recovery remains pending: {settlement_error}"
+                        ),
+                    };
+                    cancellation_token.record_durability_failure(detail.clone());
+                    return Err(SandboxWasiError::CancelledCleanupFailed { detail }.into());
+                }
+                let cleanup = settlement.and_then(|()| {
+                    complete_daemonless_outcome(store, local_execution_lease, &mut local_journal)
+                });
+                if let Err(cleanup_error) = cleanup {
+                    cancellation_token.record_durability_failure(format!(
+                        "finalize daemonless post-execution failure: {cleanup_error}"
+                    ));
+                    return Err(cleanup_error);
+                }
+                if complete_outcome {
+                    cancellation_token.complete();
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = validate_workspace_usage(&after.workspace_usage(), &limits) {
+            let completed_at = OffsetDateTime::now_utc();
+            let command_record = SandboxCommandRecord {
+                sandbox_id: manifest.sandbox_id.clone(),
+                command_id: outcome.response.command_id.clone(),
+                status: SandboxCommandRecordStatus::ResourceExhausted,
+                workspace_root: manifest.workspace_root.clone(),
+                toolchain_id: manifest.toolchain_id.clone(),
+                argv,
+                cwd: effective_cwd.clone(),
+                env: request.env.clone(),
+                started_at,
+                completed_at: Some(completed_at),
+                response: Some(outcome.response.clone()),
+                error: Some(error.to_string()),
+            };
+            settle_daemonless_outcome(
                 store,
-                sandbox_id,
-                &outcome.response.command_id,
-                completed_at,
+                local_execution_lease,
+                &mut local_journal,
+                SandboxLocalExecutionOutcome::Failed {
+                    detail: error.to_string(),
+                },
+                command_record,
+                outcome.stdout.clone(),
+                outcome.stderr.clone(),
             )?;
+            complete_daemonless_outcome(store, local_execution_lease, &mut local_journal)?;
+            if complete_outcome {
+                cancellation_token.complete();
+            }
             return Err(error.into());
         }
 
         let written_bytes = after.written_bytes_since(&before);
         if let Err(error) = validate_written_bytes(written_bytes, &limits) {
-            store.resume_checkpoint(
-                sandbox_id,
-                &rollback_checkpoint.checkpoint_id,
-                OffsetDateTime::now_utc(),
-            )?;
-            let _ = store.delete_checkpoint(sandbox_id, &rollback_checkpoint.checkpoint_id);
             let mut response = outcome.response.clone();
             response.resource_usage.written_bytes = written_bytes;
             let completed_at = OffsetDateTime::now_utc();
-            let mut sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
-            persist_command_record(
-                &mut sandbox_fs,
-                &SandboxCommandRecord {
-                    sandbox_id: manifest.sandbox_id.clone(),
-                    command_id: response.command_id.clone(),
-                    status: SandboxCommandRecordStatus::ResourceExhausted,
-                    workspace_root: manifest.workspace_root.clone(),
-                    toolchain_id: manifest.toolchain_id.clone(),
-                    argv,
-                    cwd: effective_cwd.clone(),
-                    env: request.env.clone(),
-                    started_at,
-                    completed_at: Some(completed_at),
-                    response: Some(response),
-                    error: Some(error.to_string()),
-                },
-            )?;
-            record_local_command_history(
-                store,
-                sandbox_id,
-                &outcome.response.command_id,
-                completed_at,
-            )?;
-            return Err(error.into());
-        }
-
-        let _ = store.delete_checkpoint(sandbox_id, &rollback_checkpoint.checkpoint_id);
-        outcome.response.changed_paths = sandbox_fs.changed_paths_since(&before)?;
-        outcome.response.resource_usage.written_bytes = written_bytes;
-        let completed_at = OffsetDateTime::now_utc();
-        let mut sandbox_fs = LocalSandboxFileSystem::new(layout);
-        persist_command_outputs(
-            &mut sandbox_fs,
-            &SandboxCommandRecord {
+            let command_record = SandboxCommandRecord {
                 sandbox_id: manifest.sandbox_id.clone(),
-                command_id: outcome.response.command_id.clone(),
-                status: SandboxCommandRecordStatus::Completed,
+                command_id: response.command_id.clone(),
+                status: SandboxCommandRecordStatus::ResourceExhausted,
                 workspace_root: manifest.workspace_root.clone(),
                 toolchain_id: manifest.toolchain_id.clone(),
                 argv,
-                cwd: effective_cwd,
+                cwd: effective_cwd.clone(),
                 env: request.env.clone(),
                 started_at,
                 completed_at: Some(completed_at),
-                response: Some(outcome.response.clone()),
-                error: None,
-            },
-            &outcome.stdout,
-            &outcome.stderr,
-        )?;
-        record_local_command_history(
+                response: Some(response),
+                error: Some(error.to_string()),
+            };
+            settle_daemonless_outcome(
+                store,
+                local_execution_lease,
+                &mut local_journal,
+                SandboxLocalExecutionOutcome::Failed {
+                    detail: error.to_string(),
+                },
+                command_record,
+                outcome.stdout.clone(),
+                outcome.stderr.clone(),
+            )?;
+            complete_daemonless_outcome(store, local_execution_lease, &mut local_journal)?;
+            if complete_outcome {
+                cancellation_token.complete();
+            }
+            return Err(error.into());
+        }
+
+        outcome.response.changed_paths = after.changed_paths_since(&before);
+        outcome.response.resource_usage.written_bytes = written_bytes;
+        let completed_at = OffsetDateTime::now_utc();
+        let command_record = SandboxCommandRecord {
+            sandbox_id: manifest.sandbox_id.clone(),
+            command_id: outcome.response.command_id.clone(),
+            status: SandboxCommandRecordStatus::Completed,
+            workspace_root: manifest.workspace_root.clone(),
+            toolchain_id: manifest.toolchain_id.clone(),
+            argv,
+            cwd: effective_cwd,
+            env: request.env.clone(),
+            started_at,
+            completed_at: Some(completed_at),
+            response: Some(outcome.response.clone()),
+            error: None,
+        };
+        settle_daemonless_outcome(
             store,
-            sandbox_id,
-            &outcome.response.command_id,
-            completed_at,
+            local_execution_lease,
+            &mut local_journal,
+            SandboxLocalExecutionOutcome::Succeeded,
+            command_record,
+            outcome.stdout.clone(),
+            outcome.stderr.clone(),
         )?;
+        complete_daemonless_outcome(store, local_execution_lease, &mut local_journal)?;
+        if complete_outcome {
+            cancellation_token.complete();
+        }
         Ok(outcome)
     }
 
@@ -606,6 +844,8 @@ impl SandboxWasixModuleCommandRunner {
         cancellation_token: SandboxCancellationToken,
     ) -> Result<SandboxProcessPlanOutcome, SandboxCommandExecutionError> {
         validate_sandbox_process_plan(plan)?;
+        let local_execution_lease = try_acquire_sandbox_local_execution_lease(store, sandbox_id)?;
+        recover_pending_daemonless_execution(store, &local_execution_lease, sandbox_id)?;
         let (manifest, layout) = store.load(sandbox_id)?;
         let sandbox_fs = LocalSandboxFileSystem::new(layout);
         validate_sandbox_process_plan_working_directories(plan, &sandbox_fs, &manifest.cwd)?;
@@ -626,8 +866,8 @@ impl SandboxWasixModuleCommandRunner {
                 return Err(SandboxWasiError::Cancelled.into());
             }
             let stdin = step.stdin.clone().or_else(|| piped_stdin.take());
-            let outcome = self
-                .run_toolchain_command_with_stdin_policy_output_sink_cwd_and_env_and_cancellation(
+            let outcome = match self
+                .run_toolchain_command_with_stdin_policy_output_sink_cwd_env_cancellation_mode(
                     store,
                     toolchain_store,
                     sandbox_id,
@@ -641,18 +881,28 @@ impl SandboxWasixModuleCommandRunner {
                     step.cwd.clone(),
                     step.env.clone(),
                     cancellation_token.clone(),
-                )?;
+                    false,
+                    Some(&local_execution_lease),
+                ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    return complete_process_outcome(&cancellation_token, Err(error));
+                }
+            };
             if outcome.response.exit_status != 0 {
                 let exit_status = outcome.response.exit_status;
                 let stdout = outcome.stdout.clone();
                 let stderr = outcome.stderr.clone();
                 step_outcomes.push(outcome);
-                return Ok(SandboxProcessPlanOutcome {
-                    step_outcomes,
-                    exit_status,
-                    stdout,
-                    stderr,
-                });
+                return complete_process_outcome(
+                    &cancellation_token,
+                    Ok(SandboxProcessPlanOutcome {
+                        step_outcomes,
+                        exit_status,
+                        stdout,
+                        stderr,
+                    }),
+                );
             }
             if step.pipe_stdout_to_next {
                 piped_stdin = Some(outcome.stdout.clone());
@@ -663,12 +913,15 @@ impl SandboxWasixModuleCommandRunner {
         let last = step_outcomes
             .last()
             .expect("non-empty process plan should produce an outcome");
-        Ok(SandboxProcessPlanOutcome {
-            exit_status: last.response.exit_status,
-            stdout: last.stdout.clone(),
-            stderr: last.stderr.clone(),
-            step_outcomes,
-        })
+        complete_process_outcome(
+            &cancellation_token,
+            Ok(SandboxProcessPlanOutcome {
+                exit_status: last.response.exit_status,
+                stdout: last.stdout.clone(),
+                stderr: last.stderr.clone(),
+                step_outcomes,
+            }),
+        )
     }
 
     pub fn verify_busybox_toolchain_fidelity(
@@ -761,268 +1014,210 @@ impl SandboxWasixModuleCommandRunner {
     }
 }
 
-pub struct SandboxWasixSifsCommandOutcome<T> {
-    pub dfs: NetworkedDfsService<T>,
-    pub command: Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError>,
+fn execution_was_cancelled<T>(result: &Result<T, SandboxCommandExecutionError>) -> bool {
+    matches!(
+        result,
+        Err(SandboxCommandExecutionError::Wasi(
+            SandboxWasiError::Cancelled | SandboxWasiError::CancelledCleanupFailed { .. }
+        ))
+    )
 }
 
-pub struct SandboxWasixSifsProcessPlanOutcome<T> {
-    pub dfs: NetworkedDfsService<T>,
-    pub process: Result<SandboxProcessPlanOutcome, SandboxCommandExecutionError>,
+fn transition_after_native_return<T>(
+    cancellation_token: &SandboxCancellationToken,
+    complete_outcome: bool,
+    result: Result<T, SandboxWasiError>,
+) -> Result<T, SandboxWasiError> {
+    if !complete_outcome || matches!(&result, Err(SandboxWasiError::Cancelled)) {
+        return result;
+    }
+    if cancellation_token.begin_completing() {
+        result
+    } else {
+        Err(SandboxWasiError::Cancelled)
+    }
 }
 
-pub struct SandboxWasixSifsCommandRunner {
-    local_runner: SandboxWasixModuleCommandRunner,
-    replica_candidates: Vec<sinomo_core::node::NodeId>,
+fn complete_process_outcome<T>(
+    cancellation_token: &SandboxCancellationToken,
+    result: Result<T, SandboxCommandExecutionError>,
+) -> Result<T, SandboxCommandExecutionError> {
+    if execution_was_cancelled(&result) {
+        return result;
+    }
+    if !cancellation_token.begin_completing() {
+        return Err(SandboxWasiError::Cancelled.into());
+    }
+    cancellation_token.complete();
+    result
 }
 
-impl SandboxWasixSifsCommandRunner {
-    pub fn from_active_module(
-        data_dir_root: impl AsRef<Path>,
-    ) -> Result<Self, SandboxCommandExecutionError> {
-        Ok(Self {
-            local_runner: SandboxWasixModuleCommandRunner::from_active_module(data_dir_root)?,
-            replica_candidates: Vec::new(),
-        })
+fn cancellation_checkpoint(
+    cancellation_token: &SandboxCancellationToken,
+) -> Result<(), SandboxCommandExecutionError> {
+    if cancellation_token.is_cancelled() {
+        Err(SandboxWasiError::Cancelled.into())
+    } else {
+        Ok(())
+    }
+}
+
+fn recover_pending_daemonless_execution(
+    store: &LocalSandboxInstanceStore,
+    lease: &SandboxLocalExecutionLease,
+    sandbox_id: &SandboxId,
+) -> Result<(), SandboxCommandExecutionError> {
+    recover_sandbox_local_execution_journal_with_lease(
+        store,
+        lease,
+        sandbox_id,
+        OffsetDateTime::now_utc(),
+    )?;
+    Ok(())
+}
+
+fn persist_daemonless_journal_audit(
+    store: &LocalSandboxInstanceStore,
+    lease: &SandboxLocalExecutionLease,
+    journal: &SandboxLocalExecutionJournal,
+) -> Result<(), SandboxCommandExecutionError> {
+    persist_sandbox_local_execution_audit(store, lease, journal)?;
+    Ok(())
+}
+
+fn finish_daemonless_journal(
+    store: &LocalSandboxInstanceStore,
+    lease: &SandboxLocalExecutionLease,
+    journal: &mut SandboxLocalExecutionJournal,
+) -> Result<(), SandboxCommandExecutionError> {
+    journal.record_cleanup_failure(
+        SandboxLocalExecutionCleanupStage::MarkerDelete,
+        "terminal cleanup is removing the durable local execution marker",
+        OffsetDateTime::now_utc(),
+    );
+    write_sandbox_local_execution_journal(store, lease, journal)?;
+    remove_sandbox_local_execution_journal(store, lease, &journal.sandbox_id)?;
+    Ok(())
+}
+
+fn settle_daemonless_outcome(
+    store: &LocalSandboxInstanceStore,
+    lease: &SandboxLocalExecutionLease,
+    journal: &mut Option<SandboxLocalExecutionJournal>,
+    outcome: SandboxLocalExecutionOutcome,
+    command_record: SandboxCommandRecord,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+) -> Result<(), SandboxCommandExecutionError> {
+    let Some(journal) = journal.as_mut() else {
+        return Ok(());
+    };
+    settle_sandbox_local_execution_journal(
+        store,
+        lease,
+        journal,
+        outcome,
+        command_record,
+        stdout,
+        stderr,
+        OffsetDateTime::now_utc(),
+    )?;
+    Ok(())
+}
+
+fn complete_daemonless_outcome(
+    store: &LocalSandboxInstanceStore,
+    lease: &SandboxLocalExecutionLease,
+    journal: &mut Option<SandboxLocalExecutionJournal>,
+) -> Result<(), SandboxCommandExecutionError> {
+    let Some(journal) = journal.as_mut() else {
+        return Ok(());
+    };
+    if let Err(error) = persist_daemonless_journal_audit(store, lease, journal) {
+        journal.record_cleanup_failure(
+            SandboxLocalExecutionCleanupStage::AuditRecord,
+            error.to_string(),
+            OffsetDateTime::now_utc(),
+        );
+        write_sandbox_local_execution_journal(store, lease, journal)?;
+        return Err(error);
+    }
+    journal.mark_audit_completed(OffsetDateTime::now_utc());
+    write_sandbox_local_execution_journal(store, lease, journal)?;
+    finish_daemonless_journal(store, lease, journal)
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_remains_structured_for_local_execution() {
+        let outcome: Result<(), SandboxCommandExecutionError> =
+            Err(SandboxWasiError::Cancelled.into());
+        assert!(execution_was_cancelled(&outcome));
     }
 
-    pub fn with_replica_candidates(
-        mut self,
-        replica_candidates: Vec<sinomo_core::node::NodeId>,
-    ) -> Self {
-        self.replica_candidates = replica_candidates;
-        self.replica_candidates.sort();
-        self.replica_candidates.dedup();
-        self
+    #[test]
+    fn process_plan_preserves_cancelled_cleanup_failure_for_caller_recovery() {
+        let token = SandboxCancellationToken::new();
+        token.cancel();
+        let result: Result<(), SandboxCommandExecutionError> =
+            Err(SandboxWasiError::CancelledCleanupFailed {
+                detail: "durable local audit cleanup remains pending".to_string(),
+            }
+            .into());
+
+        let error = complete_process_outcome(&token, result)
+            .expect_err("process plan cancellation remains structured");
+        assert!(matches!(
+            error,
+            SandboxCommandExecutionError::Wasi(SandboxWasiError::CancelledCleanupFailed {
+                detail
+            }) if detail == "durable local audit cleanup remains pending"
+        ));
     }
 
-    fn sifs_instance_store<T: DfsMessageTransport>(
-        &self,
-        dfs: NetworkedDfsService<T>,
-    ) -> SifsSandboxInstanceStore<T> {
-        let store = SifsSandboxInstanceStore::new(dfs);
-        if self.replica_candidates.is_empty() {
-            store
-        } else {
-            store.with_replica_candidates(self.replica_candidates.clone())
-        }
+    #[test]
+    fn two_step_process_keeps_rpc_cancellation_active_until_plan_finalization() {
+        let token = SandboxCancellationToken::new();
+
+        assert_eq!(
+            transition_after_native_return(&token, false, Ok::<_, SandboxWasiError>(1))
+                .expect("first nested step"),
+            1
+        );
+        assert!(!token.is_cancelled());
+        assert!(!token.is_completing_or_completed());
+        assert_eq!(
+            transition_after_native_return(&token, false, Ok::<_, SandboxWasiError>(2))
+                .expect("second nested step"),
+            2
+        );
+        assert_eq!(
+            complete_process_outcome(&token, Ok::<_, SandboxCommandExecutionError>(vec![1, 2]),)
+                .expect("complete process plan"),
+            vec![1, 2]
+        );
+        assert!(token.is_completing_or_completed());
+        assert!(!token.cancel(), "late cancellation must not win");
     }
 
-    fn sifs_toolchain_store<T: DfsMessageTransport>(
-        &self,
-        dfs: NetworkedDfsService<T>,
-    ) -> SifsSandboxToolchainStore<T> {
-        let store = SifsSandboxToolchainStore::new(dfs);
-        if self.replica_candidates.is_empty() {
-            store
-        } else {
-            store.with_replica_candidates(self.replica_candidates.clone())
-        }
-    }
-
-    fn sifs_filesystem<T: DfsMessageTransport>(
-        &self,
-        dfs: NetworkedDfsService<T>,
-        manifest: &SandboxInstanceManifest,
-    ) -> SifsSandboxFileSystem<T> {
-        let fs = SifsSandboxFileSystem::new(dfs, manifest);
-        if self.replica_candidates.is_empty() {
-            fs
-        } else {
-            fs.with_replica_candidates(self.replica_candidates.clone())
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_toolchain_command_with_stdin_policy_and_output_sink<
-        T: DfsMessageTransport + Send + 'static,
-    >(
-        &self,
-        dfs: NetworkedDfsService<T>,
-        local_store: &LocalSandboxInstanceStore,
-        sandbox_id: &SandboxId,
-        command_name: &str,
-        argv: Vec<String>,
-        stdin: Option<Vec<u8>>,
-        timeout_ms: u64,
-        policy: &SandboxPolicy,
-        output_sink: Option<Arc<dyn SandboxOutputSink>>,
-    ) -> Result<SandboxWasixSifsCommandOutcome<T>, SandboxCommandExecutionError> {
-        self.run_toolchain_command_with_stdin_policy_output_sink_and_cancellation(
-            dfs,
-            local_store,
-            sandbox_id,
-            command_name,
-            argv,
-            stdin,
-            timeout_ms,
-            policy,
-            output_sink,
-            SandboxCancellationToken::new(),
+    #[test]
+    fn non_cancel_native_error_enters_finalization_before_audit() {
+        let token = SandboxCancellationToken::new();
+        let error = transition_after_native_return::<()>(
+            &token,
+            true,
+            Err(SandboxWasiError::Runtime {
+                detail: "guest failed".to_string(),
+            }),
         )
-    }
+        .expect_err("native error");
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_toolchain_command_with_stdin_policy_output_sink_and_cancellation<
-        T: DfsMessageTransport + Send + 'static,
-    >(
-        &self,
-        dfs: NetworkedDfsService<T>,
-        local_store: &LocalSandboxInstanceStore,
-        sandbox_id: &SandboxId,
-        command_name: &str,
-        argv: Vec<String>,
-        stdin: Option<Vec<u8>>,
-        timeout_ms: u64,
-        policy: &SandboxPolicy,
-        output_sink: Option<Arc<dyn SandboxOutputSink>>,
-        cancellation_token: SandboxCancellationToken,
-    ) -> Result<SandboxWasixSifsCommandOutcome<T>, SandboxCommandExecutionError> {
-        let (dfs, execution_node_id, _manifest, local_toolchain_store) =
-            self.materialize_sifs_execution(dfs, local_store, sandbox_id)?;
-        let command = self
-            .local_runner
-            .run_toolchain_command_with_stdin_policy_and_output_sink_and_cancellation(
-                local_store,
-                &local_toolchain_store,
-                sandbox_id,
-                command_name,
-                argv,
-                stdin,
-                timeout_ms,
-                &execution_node_id,
-                policy,
-                output_sink,
-                cancellation_token,
-            );
-        let dfs = self.reconcile_sifs_execution(dfs, local_store, sandbox_id)?;
-        Ok(SandboxWasixSifsCommandOutcome { dfs, command })
-    }
-
-    pub fn run_toolchain_process_plan_with_policy_and_output_sink<
-        T: DfsMessageTransport + Send + 'static,
-    >(
-        &self,
-        dfs: NetworkedDfsService<T>,
-        local_store: &LocalSandboxInstanceStore,
-        sandbox_id: &SandboxId,
-        plan: &SandboxProcessPlan,
-        timeout_ms: u64,
-        policy: &SandboxPolicy,
-        output_sink: Option<Arc<dyn SandboxOutputSink>>,
-    ) -> Result<SandboxWasixSifsProcessPlanOutcome<T>, SandboxCommandExecutionError> {
-        self.run_toolchain_process_plan_with_policy_output_sink_and_cancellation(
-            dfs,
-            local_store,
-            sandbox_id,
-            plan,
-            timeout_ms,
-            policy,
-            output_sink,
-            SandboxCancellationToken::new(),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_toolchain_process_plan_with_policy_output_sink_and_cancellation<
-        T: DfsMessageTransport + Send + 'static,
-    >(
-        &self,
-        dfs: NetworkedDfsService<T>,
-        local_store: &LocalSandboxInstanceStore,
-        sandbox_id: &SandboxId,
-        plan: &SandboxProcessPlan,
-        timeout_ms: u64,
-        policy: &SandboxPolicy,
-        output_sink: Option<Arc<dyn SandboxOutputSink>>,
-        cancellation_token: SandboxCancellationToken,
-    ) -> Result<SandboxWasixSifsProcessPlanOutcome<T>, SandboxCommandExecutionError> {
-        let (dfs, execution_node_id, _manifest, local_toolchain_store) =
-            self.materialize_sifs_execution(dfs, local_store, sandbox_id)?;
-        let process = self
-            .local_runner
-            .run_toolchain_process_plan_with_policy_output_sink_and_cancellation(
-                local_store,
-                &local_toolchain_store,
-                sandbox_id,
-                plan,
-                timeout_ms,
-                &execution_node_id,
-                policy,
-                output_sink,
-                cancellation_token,
-            );
-        let dfs = self.reconcile_sifs_execution(dfs, local_store, sandbox_id)?;
-        Ok(SandboxWasixSifsProcessPlanOutcome { dfs, process })
-    }
-
-    fn materialize_sifs_execution<T: DfsMessageTransport + Send + 'static>(
-        &self,
-        dfs: NetworkedDfsService<T>,
-        local_store: &LocalSandboxInstanceStore,
-        sandbox_id: &SandboxId,
-    ) -> Result<
-        (
-            NetworkedDfsService<T>,
-            sinomo_core::node::NodeId,
-            SandboxInstanceManifest,
-            LocalSandboxToolchainStore,
-        ),
-        SandboxCommandExecutionError,
-    > {
-        let mut sifs_store = self.sifs_instance_store(dfs);
-        let execution_node_id = sifs_store.dfs.node_id().clone();
-        let mut manifest = sifs_store.load(sandbox_id)?;
-        manifest.last_placement = Some(sandbox_execution_placement_for_node(
-            &manifest,
-            &execution_node_id,
-        )?);
-        sifs_store.save_manifest(&manifest)?;
-        let mut sifs_fs = self.sifs_filesystem(sifs_store.into_inner(), &manifest);
-        sifs_fs.ensure_workspace()?;
-        ensure_local_instance_from_manifest(local_store, &manifest)?;
-        let (_local_manifest, local_layout) = local_store.load(sandbox_id)?;
-        let mut local_fs = LocalSandboxFileSystem::new(local_layout);
-        sync_sandbox_workspace_roots(&mut sifs_fs, &mut local_fs)?;
-        let dfs = sifs_fs.into_inner();
-
-        let mut sifs_toolchain_store = self.sifs_toolchain_store(dfs);
-        let toolchain = sifs_toolchain_store.load_manifest(&manifest.toolchain_id)?;
-        let toolchain_artifacts = sifs_toolchain_store.load_artifacts(&toolchain)?;
-        let toolchain_commands = toolchain
-            .commands
-            .keys()
-            .map(|command_name| {
-                sifs_toolchain_store
-                    .load_command_module(&toolchain, command_name)
-                    .map(|bytes| (command_name.clone(), bytes))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let dfs = sifs_toolchain_store.into_inner();
-        let local_toolchain_store = local_sifs_toolchain_store(local_store, sandbox_id);
-        write_resolved_toolchain_to_local_store(
-            &local_toolchain_store,
-            &toolchain,
-            &toolchain_artifacts,
-            &toolchain_commands,
-        )?;
-        Ok((dfs, execution_node_id, manifest, local_toolchain_store))
-    }
-
-    fn reconcile_sifs_execution<T: DfsMessageTransport + Send + 'static>(
-        &self,
-        dfs: NetworkedDfsService<T>,
-        local_store: &LocalSandboxInstanceStore,
-        sandbox_id: &SandboxId,
-    ) -> Result<NetworkedDfsService<T>, SandboxCommandExecutionError> {
-        let (local_manifest, local_layout) = local_store.load(sandbox_id)?;
-        let mut local_fs = LocalSandboxFileSystem::new(local_layout);
-        let mut sifs_fs = self.sifs_filesystem(dfs, &local_manifest);
-        sifs_fs.ensure_workspace()?;
-        sync_sandbox_workspace_roots(&mut local_fs, &mut sifs_fs)?;
-        let mut sifs_store = self.sifs_instance_store(sifs_fs.into_inner());
-        sifs_store.save_manifest(&local_manifest)?;
-        Ok(sifs_store.into_inner())
+        assert!(matches!(error, SandboxWasiError::Runtime { .. }));
+        assert!(token.is_completing_or_completed());
+        assert!(!token.cancel(), "error audit finalization owns the token");
     }
 }
 
@@ -1706,65 +1901,6 @@ fn wasix_command_overrides_for_toolchain(
         .collect()
 }
 
-fn ensure_local_instance_from_manifest(
-    local_store: &LocalSandboxInstanceStore,
-    manifest: &SandboxInstanceManifest,
-) -> Result<LocalSandboxInstanceLayout, SandboxCommandExecutionError> {
-    let layout = local_store.layout(&manifest.sandbox_id);
-    for dir in layout.required_dirs() {
-        fs::create_dir_all(dir).map_err(|source| SandboxStoreError::Io {
-            path: dir.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    local_store.save_manifest(manifest).map_err(Into::into)
-}
-
-fn local_sifs_toolchain_store(
-    local_store: &LocalSandboxInstanceStore,
-    sandbox_id: &SandboxId,
-) -> LocalSandboxToolchainStore {
-    let layout = local_store.layout(sandbox_id);
-    LocalSandboxToolchainStore::new(layout.runtime_root.join("sifs-toolchain-cache"))
-}
-
-fn write_resolved_toolchain_to_local_store(
-    store: &LocalSandboxToolchainStore,
-    manifest: &SandboxToolchainManifest,
-    artifacts: &[(String, Vec<u8>)],
-    commands: &[(String, Vec<u8>)],
-) -> Result<(), SandboxCommandExecutionError> {
-    let layout = store.save_manifest(manifest)?;
-    for (command_name, bytes) in commands {
-        validate_toolchain_command_name(command_name)?;
-        let path = layout.command_module(command_name);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|source| SandboxToolchainError::Io {
-                path: parent.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        }
-        fs::write(&path, bytes).map_err(|source| SandboxToolchainError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    for (relative_path, bytes) in artifacts {
-        let path = layout.artifact(relative_path)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|source| SandboxToolchainError::Io {
-                path: parent.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        }
-        fs::write(&path, bytes).map_err(|source| SandboxToolchainError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    Ok(())
-}
-
 fn wasix_native_module_error_to_wasi(error: SandboxWasixNativeModuleError) -> SandboxWasiError {
     SandboxWasiError::Runtime {
         detail: error.to_string(),
@@ -1772,6 +1908,13 @@ fn wasix_native_module_error_to_wasi(error: SandboxWasixNativeModuleError) -> Sa
 }
 
 fn wasix_native_error_to_wasi(error: SandboxWasixNativeErrorResponse) -> SandboxWasiError {
+    if matches!(
+        error.code.as_str(),
+        "run-module" | "run-toolchain" | "run-replay"
+    ) && error.detail == SandboxWasiError::Cancelled.to_string()
+    {
+        return SandboxWasiError::Cancelled;
+    }
     SandboxWasiError::Runtime {
         detail: format!("{}: {}", error.code, error.detail),
     }

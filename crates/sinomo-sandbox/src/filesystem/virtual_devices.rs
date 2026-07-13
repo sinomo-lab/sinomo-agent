@@ -110,6 +110,7 @@ pub(super) fn sandbox_virtual_device_metadata(path: &SandboxPath) -> Option<Sand
         gid: 0,
         inode: virtual_device_inode(path),
         object_identity: None,
+        content_hash: None,
         accessed_at_unix_nanos: 1_000_000_000,
         modified_at_unix_nanos: 1_000_000_000,
         created_at_unix_nanos: 1_000_000_000,

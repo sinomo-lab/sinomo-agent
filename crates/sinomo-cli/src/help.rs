@@ -69,9 +69,17 @@ pub(super) fn print_agent_help() {
         "      Run deterministic local readiness gates for packages, tools, protocol parsing, compaction, resume, and command evidence."
     );
     println!(
-        "  sinomo agent run [--prompt <text>] [--provider <provider>] [--model <model>] [--account <account>]"
+        "  sinomo agent run [--prompt <text>] [--agent <agent-id>] [--provider <provider>] [--model <model>] [--account <account>] [--session <session-id>] [--compact-after] [--json]"
     );
-    println!("      Run one main-agent turn and print the final response.");
+    println!(
+        "      Run one agent turn, optionally resume its durable session, and print the final response."
+    );
+    println!(
+        "      With --compact-after, run real compaction after the turn and persist its context projection."
+    );
+    println!(
+        "      The built-in coding-agent may modify only the explicit workspace directory where this CLI command is run; unsafe roots are rejected."
+    );
     println!("  sinomo agent validate [agent-id|--file <path>] [--json]");
     println!("      Validate an agent package from the catalog or a JSON artifact.");
     println!("  sinomo agent session");
@@ -287,13 +295,16 @@ pub(super) fn print_rollout_help() {
         "      Build the data-directory source repo, stage main and shadow binaries, then verify main health."
     );
     println!(
-        "  sinomo rollout cluster [--repo <path> | --binary <path>] [--target <host:port>] [--remote-build] [--force-source] [--remote-repo <path>] [--skip-local]"
+        "  sinomo rollout cluster [--repo <path> | --binary <path>] [--target <host:port>] [--remote-build] [--force-source] [--remote-repo <path>] [--skip-local] [--skip-native-modules]"
     );
     println!(
         "      Build or use a dev binary for compatible nodes, or ask targets to build from their own source repo, then activate through shadow supervision or the main-only shadow bootstrap path."
     );
     println!(
         "      --force-source stashes local changes in the managed source repo before overwriting it with the rollout source."
+    );
+    println!(
+        "      --skip-native-modules pushes only the locally built binary for supervisor ABI bootstrapping; it cannot be combined with --remote-build or --remote-repo."
     );
     println!(
         "  sinomo rollout module native-dylib <module-id|package|source|cache-key> [--repo <path>] [--target <host:port>] [--skip-local]"
@@ -380,7 +391,9 @@ pub(super) fn print_dfs_help() {
     println!(
         "  sinomo dfs mount <mount-point> [--root <sifs-path>] [--read-only] [--allow-other] [--data-dir <path>]"
     );
-    println!("      Expose SIFS locally through FUSE on Unix or Windows Cloud Files on Windows.");
+    println!(
+        "      Expose SIFS locally through FUSE on Unix or Windows Cloud Files on Windows; the command stays attached while mounted."
+    );
     println!("  sinomo dfs pin list [--filesystem <file_system_id>] [--pin-root <path>] [--json]");
     println!(
         "  sinomo dfs pin add --path <path> [--filesystem <file_system_id>] [--object <object_id>] [--node <node_id>] [--mode metadata|content] [--pin-root <path>] [--json]"

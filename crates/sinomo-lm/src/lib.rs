@@ -72,6 +72,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -2223,13 +2224,36 @@ pub fn complete_configured_model_request_streaming_events_with_account(
     request: &LanguageModelRequest,
     on_event: &mut dyn FnMut(LanguageModelStreamEvent),
 ) -> Result<LanguageModelResponse, LanguageModelError> {
+    let cancellation = LanguageModelCancellation::default();
+    complete_configured_model_request_streaming_events_with_account_and_cancellation(
+        data_dir,
+        provider,
+        model,
+        account,
+        working_dir,
+        request,
+        &cancellation,
+        on_event,
+    )
+}
+
+pub fn complete_configured_model_request_streaming_events_with_account_and_cancellation(
+    data_dir: &SinomoDataDir,
+    provider: &str,
+    model: &str,
+    account: Option<&ProviderAccountConfig>,
+    working_dir: Option<PathBuf>,
+    request: &LanguageModelRequest,
+    cancellation: &LanguageModelCancellation,
+    on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+) -> Result<LanguageModelResponse, LanguageModelError> {
     let request = LanguageModelRequest {
         provider: provider.to_string(),
         model: model.to_string(),
         ..request.clone()
     };
     let provider = configured_model_provider(data_dir, provider, model, account, working_dir)?;
-    provider.complete_streaming_events(&request, on_event)
+    provider.complete_streaming_events_with_cancellation(&request, cancellation, on_event)
 }
 
 fn configured_model_provider(
@@ -2863,6 +2887,7 @@ fn codex_provider_for_model_with_options_and_credentials(
         client_version: config_default.client_version,
         default_model: default_model.clone(),
         credentials_path: credentials_path.or(config_default.credentials_path),
+        transport_health_timeout: config_default.transport_health_timeout,
     };
     CodexProvider::new(
         CodexConfig {
@@ -3203,6 +3228,31 @@ pub enum LanguageModelInvocation {
     InProcess,
 }
 
+/// A cloneable cancellation check that provider transports can poll without
+/// depending on a higher-level runtime's cancellation-token type.
+#[derive(Clone)]
+pub struct LanguageModelCancellation {
+    check: Arc<dyn Fn() -> bool + Send + Sync + 'static>,
+}
+
+impl LanguageModelCancellation {
+    pub fn new(check: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            check: Arc::new(check),
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        (self.check)()
+    }
+}
+
+impl Default for LanguageModelCancellation {
+    fn default() -> Self {
+        Self::new(|| false)
+    }
+}
+
 pub trait LanguageModelProvider {
     fn info(&self) -> LanguageModelProviderInfo;
 
@@ -3248,6 +3298,26 @@ pub trait LanguageModelProvider {
         Ok(response)
     }
 
+    fn complete_streaming_events_with_cancellation(
+        &self,
+        request: &LanguageModelRequest,
+        cancellation: &LanguageModelCancellation,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        if cancellation.is_cancelled() {
+            return Err(cancelled_language_model_error(request, "before request"));
+        }
+        let response = self.complete_streaming_events(request, &mut |event| {
+            if !cancellation.is_cancelled() {
+                on_event(event);
+            }
+        })?;
+        if cancellation.is_cancelled() {
+            return Err(cancelled_language_model_error(request, "during response"));
+        }
+        Ok(response)
+    }
+
     fn complete_streaming(
         &self,
         request: &LanguageModelRequest,
@@ -3258,6 +3328,17 @@ pub trait LanguageModelProvider {
                 on_delta(&delta);
             }
         })
+    }
+}
+
+fn cancelled_language_model_error(
+    request: &LanguageModelRequest,
+    phase: &'static str,
+) -> LanguageModelError {
+    LanguageModelError::ProviderInvocationFailed {
+        provider: request.provider.clone(),
+        model: request.model.clone(),
+        detail: format!("model invocation cancelled {phase}"),
     }
 }
 

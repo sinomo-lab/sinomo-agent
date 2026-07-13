@@ -1,4 +1,5 @@
 use crate::internal::*;
+use std::io::Read;
 
 use super::support::{ensure_host_path_is_within, reject_symlink_chain};
 use super::virtual_devices::*;
@@ -40,6 +41,23 @@ impl LocalSandboxFileSnapshot {
         }
         written
     }
+
+    pub fn changed_paths_since(&self, before: &Self) -> Vec<SandboxPath> {
+        let mut changed = Vec::new();
+        for (path, fingerprint) in &self.entries {
+            if before.entries.get(path) != Some(fingerprint) {
+                changed.push(path.clone());
+            }
+        }
+        for path in before.entries.keys() {
+            if !self.entries.contains_key(path) {
+                changed.push(path.clone());
+            }
+        }
+        changed.sort();
+        changed.dedup();
+        changed
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,25 +92,38 @@ impl LocalSandboxFileSystem {
         Ok(LocalSandboxFileSnapshot { entries })
     }
 
+    /// Capture a content fingerprint with cancellation checkpoints between every
+    /// directory entry and bounded file-read chunk. This keeps large staged trees
+    /// from turning cancellation into an unbounded pre-execution wait.
+    pub fn snapshot_with_checkpoints<F>(
+        &self,
+        mut checkpoint: F,
+    ) -> Result<LocalSandboxFileSnapshot, SandboxCommandExecutionError>
+    where
+        F: FnMut() -> Result<(), SandboxCommandExecutionError>,
+    {
+        let mut entries = BTreeMap::new();
+        for root in [
+            SandboxPath::new("/root").expect("static path"),
+            SandboxPath::new("/home").expect("static path"),
+            SandboxPath::new("/tmp").expect("static path"),
+            SandboxPath::new("/work").expect("static path"),
+            SandboxPath::new("/var").expect("static path"),
+            SandboxPath::new("/logs").expect("static path"),
+            SandboxPath::new("/artifacts").expect("static path"),
+        ] {
+            checkpoint()?;
+            self.collect_snapshot_entry_with_checkpoints(&root, &mut entries, &mut checkpoint)?;
+        }
+        Ok(LocalSandboxFileSnapshot { entries })
+    }
+
     pub fn changed_paths_since(
         &self,
         before: &LocalSandboxFileSnapshot,
     ) -> Result<Vec<SandboxPath>, SandboxFsError> {
         let after = self.snapshot()?;
-        let mut changed = Vec::new();
-        for (path, fingerprint) in &after.entries {
-            if before.entries.get(path) != Some(fingerprint) {
-                changed.push(path.clone());
-            }
-        }
-        for path in before.entries.keys() {
-            if !after.entries.contains_key(path) {
-                changed.push(path.clone());
-            }
-        }
-        changed.sort();
-        changed.dedup();
-        Ok(changed)
+        Ok(after.changed_paths_since(before))
     }
 
     pub fn validate_resource_limits(
@@ -136,6 +167,69 @@ impl LocalSandboxFileSystem {
         if metadata.is_dir {
             for child in self.list(path)? {
                 self.collect_snapshot_entry(&child.path, entries)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_snapshot_entry_with_checkpoints<F>(
+        &self,
+        path: &SandboxPath,
+        entries: &mut BTreeMap<SandboxPath, LocalSandboxFileFingerprint>,
+        checkpoint: &mut F,
+    ) -> Result<(), SandboxCommandExecutionError>
+    where
+        F: FnMut() -> Result<(), SandboxCommandExecutionError>,
+    {
+        const SNAPSHOT_READ_CHUNK_BYTES: usize = 256 * 1024;
+
+        checkpoint()?;
+        let host_path = self.host_path(path)?;
+        let metadata = self.stat(path)?;
+        let content_hash = if metadata.is_dir {
+            None
+        } else if fs::symlink_metadata(&host_path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            let target =
+                fs::read_link(&host_path).map_err(|source| SandboxFsError::Unavailable {
+                    reason: format!("read symlink {}: {source}", path),
+                })?;
+            Some(sandbox_module_hash(target.to_string_lossy().as_bytes()))
+        } else {
+            let mut file =
+                fs::File::open(&host_path).map_err(|source| SandboxFsError::Unavailable {
+                    reason: format!("open {} for snapshot: {source}", path),
+                })?;
+            let mut hasher = SandboxModuleHasher::new();
+            let mut buffer = vec![0_u8; SNAPSHOT_READ_CHUNK_BYTES];
+            loop {
+                checkpoint()?;
+                let read =
+                    file.read(&mut buffer)
+                        .map_err(|source| SandboxFsError::Unavailable {
+                            reason: format!("read {} for snapshot: {source}", path),
+                        })?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            Some(hasher.finalize())
+        };
+        entries.insert(
+            path.clone(),
+            LocalSandboxFileFingerprint {
+                is_dir: metadata.is_dir,
+                len: metadata.len,
+                content_hash,
+            },
+        );
+        if metadata.is_dir {
+            for child in self.list(path)? {
+                checkpoint()?;
+                self.collect_snapshot_entry_with_checkpoints(&child.path, entries, checkpoint)?;
             }
         }
         Ok(())
@@ -231,6 +325,7 @@ impl LocalSandboxFileSystem {
                 .unwrap_or_else(|| metadata_gid(&metadata)),
             inode: metadata_inode(&metadata, path),
             object_identity: None,
+            content_hash: None,
             accessed_at_unix_nanos: self
                 .times
                 .lock()
@@ -292,6 +387,7 @@ impl SandboxFileSystem for LocalSandboxFileSystem {
                 gid: 0,
                 inode: sandbox_inode_for_path(path),
                 object_identity: None,
+                content_hash: None,
                 accessed_at_unix_nanos: 1_000_000_000,
                 modified_at_unix_nanos: 1_000_000_000,
                 created_at_unix_nanos: 1_000_000_000,
