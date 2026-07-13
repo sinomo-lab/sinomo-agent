@@ -453,9 +453,12 @@ fn submit_tui_input<H: TuiAgentRuntimeControl>(
     let sandbox_node_id =
         parse_tui_tool_runtime_state_node_id(state.tool_runtime_node_id.as_deref())?;
     let session = runtime.session().clone();
-    runtime
-        .handler
-        .configure_tui_tool_runtime(data_dir, &session, sandbox_node_id)?;
+    runtime.handler.configure_tui_tool_runtime(
+        data_dir,
+        &session,
+        sandbox_node_id,
+        state.daemon_connected,
+    )?;
 
     let mut render_error = None;
     let result = {
@@ -1086,6 +1089,7 @@ trait TuiAgentRuntimeControl: InteractionEventHandler {
         _data_dir: &SinomoDataDir,
         _session: &InteractionSession,
         _sandbox_node_id: Option<NodeId>,
+        _daemon_connected: bool,
     ) -> Result<(), CliError> {
         Ok(())
     }
@@ -3122,9 +3126,12 @@ fn apply_tui_slash_command<H: TuiAgentRuntimeControl>(
             state.tool_runtime_node_id = None;
             state.tool_runtime_explicit_override = true;
             let session = runtime.session().clone();
-            runtime
-                .handler
-                .configure_tui_tool_runtime(data_dir, &session, None)?;
+            runtime.handler.configure_tui_tool_runtime(
+                data_dir,
+                &session,
+                None,
+                state.daemon_connected,
+            )?;
             Ok(vec![InteractionOutput::Line(
                 "sandbox runtime node: local turn node".to_string(),
             )])
@@ -3132,9 +3139,12 @@ fn apply_tui_slash_command<H: TuiAgentRuntimeControl>(
         TuiSlashCommand::ToolRuntime(TuiToolRuntimeCommand::Node(node_id)) => {
             let parsed_node_id = parse_tui_tool_runtime_node_id(&node_id)?;
             let session = runtime.session().clone();
-            runtime
-                .handler
-                .configure_tui_tool_runtime(data_dir, &session, Some(parsed_node_id))?;
+            runtime.handler.configure_tui_tool_runtime(
+                data_dir,
+                &session,
+                Some(parsed_node_id),
+                state.daemon_connected,
+            )?;
             state.tool_runtime_node_id = Some(node_id.clone());
             state.tool_runtime_explicit_override = true;
             Ok(vec![InteractionOutput::Line(format!(
@@ -6548,6 +6558,7 @@ where
     account: Option<String>,
     reasoning_effort: Option<ProviderReasoningEffort>,
     reasoning_budget_tokens: Option<u32>,
+    workspace_root: PathBuf,
 }
 
 #[cfg(test)]
@@ -6641,6 +6652,7 @@ where
             account: None,
             reasoning_effort: None,
             reasoning_budget_tokens: None,
+            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
     }
 
@@ -6691,34 +6703,12 @@ where
         }
     }
 
-    pub(crate) fn configure_tool_runtime_for_session(
-        &self,
-        data_dir: &SinomoDataDir,
-        session_id: &SessionId,
-        sandbox_node_id: Option<NodeId>,
-    ) -> Result<(), CliError> {
-        let workspace_root = std::env::current_dir().map_err(|source| CliError::Io {
-            path: "current directory".to_string(),
-            detail: source.to_string(),
-        })?;
-        configure_agent_tool_registry_for_workspace(
-            &self.tool_registry,
-            data_dir,
-            &workspace_root,
-            &self.agent_definition,
-            Some(session_id),
-            sandbox_node_id,
-            false,
-        )
-    }
-
     fn build_runtime(&self, model: M, session: AgentSession) -> AgentSessionRuntime<M> {
         let mut session = session;
         session.role = self.agent_definition.role.clone();
-        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let config = sinomo_agent::AgentConfig::new(self.provider.clone(), self.model_name.clone())
             .with_agent_definition(self.agent_definition.clone())
-            .with_workspace_root(workspace_root)
+            .with_workspace_root(self.workspace_root.clone())
             .with_skill_catalog(self.skill_catalog.clone())
             .with_skill_catalog_texts(self.skill_catalog_texts.clone());
         let agent = Agent::new(model, self.provider.clone(), self.model_name.clone())
@@ -7073,6 +7063,137 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
             }
         })
     }
+
+    fn configure_tui_tool_runtime_for_session(
+        &mut self,
+        data_dir: &SinomoDataDir,
+        session: &InteractionSession,
+        sandbox_node_id: Option<NodeId>,
+        daemon_connected: bool,
+    ) -> Result<(), CliError> {
+        // The TUI configures tools before the first model turn, while the
+        // handler may still contain only a pending model. Materialize the
+        // runtime first so the workspace binding is part of the canonical
+        // AgentSession from the beginning.
+        self.ensure_runtime(session)?;
+        let snapshot = self
+            .agent_session_snapshot()?
+            .ok_or_else(|| CliError::Parse {
+                detail: format!(
+                    "agent runtime has no session `{}` to bind",
+                    session.session_id
+                ),
+            })?;
+        let requested_workspace_root = if snapshot.workspace_binding.is_none()
+            && agent_definition_has_coding_authority(&self.agent_definition)
+        {
+            Some(self.workspace_root.clone())
+        } else {
+            None
+        };
+        self.configure_app_tool_runtime_for_session(
+            data_dir,
+            &session.session_id,
+            sandbox_node_id,
+            requested_workspace_root.as_deref(),
+            daemon_connected,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn configure_app_tool_runtime_for_session(
+        &mut self,
+        data_dir: &SinomoDataDir,
+        session_id: &SessionId,
+        sandbox_node_id: Option<NodeId>,
+        requested_workspace_root: Option<&Path>,
+        daemon_connected: bool,
+    ) -> Result<Option<PathBuf>, CliError> {
+        let mut session = self
+            .agent_session_snapshot()?
+            .ok_or_else(|| CliError::Parse {
+                detail: format!("agent runtime has no session `{session_id}` to bind"),
+            })?;
+        if &session.session_id != session_id {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "agent runtime session `{}` does not match workspace request for `{session_id}`",
+                    session.session_id
+                ),
+            });
+        }
+
+        let requested_binding = requested_workspace_root
+            .map(|root| {
+                let metadata = std::fs::metadata(root).map_err(|source| CliError::Io {
+                    path: root.display().to_string(),
+                    detail: format!("workspace directory is unavailable: {source}"),
+                })?;
+                if !metadata.is_dir() {
+                    return Err(CliError::Parse {
+                        detail: format!("workspace path is not a directory: {}", root.display()),
+                    });
+                }
+                if agent_definition_has_coding_authority(&self.agent_definition) {
+                    coding_agent_workspace_binding(data_dir, root)
+                } else {
+                    workspace_ref_for_selected_root(data_dir, root)
+                }
+            })
+            .transpose()?;
+
+        if let (Some(existing), Some(requested)) = (
+            session.workspace_binding.as_ref(),
+            requested_binding.as_ref(),
+        ) {
+            validate_agent_session_workspace_binding(session_id, existing, requested)?;
+        }
+        if session.workspace_binding.is_none() {
+            session.workspace_binding = requested_binding;
+        }
+
+        let selected_root = session
+            .workspace_binding
+            .as_ref()
+            .map(|binding| workspace_binding_root_for_data_dir(data_dir, session_id, binding))
+            .transpose()?;
+        if agent_definition_has_coding_authority(&self.agent_definition) && selected_root.is_none()
+        {
+            return Err(CliError::Parse {
+                detail: "coding-agent needs a workspace directory before it can use coding tools"
+                    .to_string(),
+            });
+        }
+
+        if let Some(runtime) = self.ready_runtime() {
+            runtime.replace_session(session)?;
+        }
+        if let Some(root) = selected_root.as_ref()
+            && &self.workspace_root != root
+        {
+            let previous_root = std::mem::replace(&mut self.workspace_root, root.clone());
+            let selection = TuiModelSelection {
+                provider: self.provider.clone(),
+                model: self.model_name.clone(),
+                account: self.account.clone().unwrap_or_default(),
+            };
+            if let Err(error) = self.switch_to_selection(data_dir, selection, daemon_connected) {
+                self.workspace_root = previous_root;
+                return Err(error);
+            }
+        }
+        let registry_root = selected_root.as_deref().unwrap_or(&self.workspace_root);
+        configure_agent_tool_registry_for_workspace(
+            &self.tool_registry,
+            data_dir,
+            registry_root,
+            &self.agent_definition,
+            Some(session_id),
+            sandbox_node_id,
+            agent_definition_has_coding_authority(&self.agent_definition),
+        )?;
+        Ok(selected_root)
+    }
 }
 
 /// Plain-data view of the active runtime selection, for the GUI app.
@@ -7146,6 +7267,187 @@ pub(crate) fn app_runtime_info(
     (&handler.runtime_info()).into()
 }
 
+#[cfg(test)]
+fn execute_tui_workspace_tool(
+    handler: &RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>,
+    session: &InteractionSession,
+    call_index: usize,
+    tool: &str,
+    input: serde_json::Value,
+) -> sinomo_agent::AgentToolOutcome {
+    handler.tool_registry.execute(
+        session,
+        0,
+        call_index,
+        &sinomo_agent::AgentToolCall {
+            call_id: None,
+            tool: tool.to_string(),
+            input,
+            r#async: false,
+            summary: format!("test {tool}"),
+        },
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn tui_grants_workspace_mutation_only_to_the_builtin_coding_agent() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-tui-coding-authority");
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace).expect("create workspace");
+    let workspace = fs::canonicalize(workspace).expect("canonical workspace");
+    let (mut handler, _) =
+        runtime_main_agent_handler_for_tui_with_data_dir(None, &data_dir).expect("TUI handler");
+    handler.workspace_root = workspace.clone();
+    handler
+        .set_agent_definition(AgentDefinition::coding())
+        .expect("select coding agent");
+    let session = InteractionSession::new(
+        SessionId::generate(),
+        NodeId::from_legacy_named("node_tui_coding_authority").expect("node id"),
+        InteractionSurface::new("test.tui", InteractionSurfaceKind::CommandLine),
+    );
+
+    handler
+        .configure_tui_tool_runtime_for_session(&data_dir, &session, None, false)
+        .expect("configure coding tools");
+    let write = execute_tui_workspace_tool(
+        &handler,
+        &session,
+        0,
+        "write_file",
+        serde_json::json!({ "path": "written.txt", "content": "written\n" }),
+    );
+    let patch = execute_tui_workspace_tool(
+        &handler,
+        &session,
+        1,
+        "apply_patch",
+        serde_json::json!({
+            "patch": "*** Begin Patch\n*** Add File: patched.txt\n+patched\n*** End Patch"
+        }),
+    );
+    let command = execute_tui_workspace_tool(
+        &handler,
+        &session,
+        2,
+        "run_command",
+        serde_json::json!({ "command": "printf shell-ok > shell.txt" }),
+    );
+    assert_eq!(write.status, sinomo_agent::AgentToolStatus::Succeeded);
+    assert_eq!(patch.status, sinomo_agent::AgentToolStatus::Succeeded);
+    assert_eq!(command.status, sinomo_agent::AgentToolStatus::Succeeded);
+    assert_eq!(
+        fs::read_to_string(workspace.join("written.txt")).expect("written file"),
+        "written\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("patched.txt")).expect("patched file"),
+        "patched\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("shell.txt")).expect("shell output"),
+        "shell-ok"
+    );
+    let snapshot = handler
+        .agent_session_snapshot()
+        .expect("session snapshot")
+        .expect("attached session");
+    assert_eq!(
+        snapshot
+            .workspace_binding
+            .as_ref()
+            .and_then(|binding| binding.local_root.as_deref()),
+        Some(workspace.as_path())
+    );
+
+    handler
+        .set_agent_definition(AgentDefinition::main())
+        .expect("select non-coding agent");
+    handler
+        .configure_tui_tool_runtime_for_session(&data_dir, &session, None, false)
+        .expect("configure non-coding tools");
+    for (call_index, tool, input) in [
+        (
+            3,
+            "write_file",
+            serde_json::json!({ "path": "blocked-write.txt", "content": "blocked" }),
+        ),
+        (
+            4,
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: blocked-patch.txt\n+blocked\n*** End Patch"
+            }),
+        ),
+        (
+            5,
+            "run_command",
+            serde_json::json!({ "command": "printf blocked" }),
+        ),
+    ] {
+        let outcome = execute_tui_workspace_tool(&handler, &session, call_index, tool, input);
+        assert_eq!(
+            outcome.status,
+            sinomo_agent::AgentToolStatus::Blocked,
+            "non-coding agent unexpectedly executed {tool}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn tui_resume_uses_the_session_workspace_binding() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-tui-resume-workspace");
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    let original_workspace = root.join("original-workspace");
+    let process_workspace = root.join("different-process-workspace");
+    fs::create_dir_all(&original_workspace).expect("create original workspace");
+    fs::create_dir_all(&process_workspace).expect("create process workspace");
+    let original_workspace =
+        fs::canonicalize(original_workspace).expect("canonical original workspace");
+    let process_workspace =
+        fs::canonicalize(process_workspace).expect("canonical process workspace");
+    let (mut handler, _) =
+        runtime_main_agent_handler_for_tui_with_data_dir(None, &data_dir).expect("TUI handler");
+    handler.workspace_root = process_workspace;
+    handler
+        .set_agent_definition(AgentDefinition::coding())
+        .expect("select coding agent");
+    let interaction_session = InteractionSession::new(
+        SessionId::generate(),
+        NodeId::from_legacy_named("node_tui_resume_workspace").expect("node id"),
+        InteractionSurface::new("test.tui", InteractionSurfaceKind::CommandLine),
+    );
+    let mut agent_session = AgentSession::new(
+        interaction_session.session_id.clone(),
+        AgentRole::Deliberation,
+    );
+    agent_session.workspace_binding = Some(WorkspaceRef::local_path(original_workspace.clone()));
+    handler
+        .replace_full_agent_session(&interaction_session, agent_session)
+        .expect("restore workspace-bound session");
+
+    handler
+        .configure_tui_tool_runtime_for_session(&data_dir, &interaction_session, None, false)
+        .expect("configure resumed coding tools");
+
+    assert_eq!(handler.workspace_root, original_workspace);
+    let write = execute_tui_workspace_tool(
+        &handler,
+        &interaction_session,
+        0,
+        "write_file",
+        serde_json::json!({ "path": "resumed.txt", "content": "resumed\n" }),
+    );
+    assert_eq!(write.status, sinomo_agent::AgentToolStatus::Succeeded);
+    assert_eq!(
+        fs::read_to_string(original_workspace.join("resumed.txt")).expect("resumed write"),
+        "resumed\n"
+    );
+}
+
 impl TuiAgentRuntimeControl for RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
     fn tui_agent_runtime_info(&self) -> TuiAgentRuntimeInfo {
         self.runtime_info()
@@ -7198,8 +7500,14 @@ impl TuiAgentRuntimeControl for RuntimeMainAgentInteractionHandler<DefaultMainAg
         data_dir: &SinomoDataDir,
         session: &InteractionSession,
         sandbox_node_id: Option<NodeId>,
+        daemon_connected: bool,
     ) -> Result<(), CliError> {
-        self.configure_tool_runtime_for_session(data_dir, &session.session_id, sandbox_node_id)
+        self.configure_tui_tool_runtime_for_session(
+            data_dir,
+            session,
+            sandbox_node_id,
+            daemon_connected,
+        )
     }
 
     fn restore_tui_agent_session(

@@ -32,12 +32,12 @@ impl AppRenderMode {
     }
 }
 
-/// Use the same text rendering policy as the SUI widget book. Forced hinting
-/// and stem darkening make adjacent app labels look uneven on some Windows
-/// displays.
+/// Use the same text rendering policy as the SUI widget book. Its bounded
+/// slight hinting keeps small text legible, while disabled stem darkening
+/// avoids uneven adjacent labels on some Windows displays.
 pub fn resolve_render_options(mode: AppRenderMode) -> WindowRenderOptions {
     WindowRenderOptions::new(true, 1.0)
-        .with_text_hinting(WindowTextHinting::None)
+        .with_text_hinting(WindowTextHinting::default())
         .with_stem_darkening(WindowStemDarkening::None)
         .with_color_management_mode(mode.color_management_mode())
 }

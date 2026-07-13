@@ -15174,8 +15174,9 @@ mod tests {
     #[test]
     fn tool_plan_readiness_accepts_local_workspace_visible_executors() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-readiness-local-tools");
-        let registry =
-            AgentToolRegistry::local_workspace_with_config(LocalWorkspaceAgentConfig::new(&root));
+        let registry = AgentToolRegistry::local_workspace_with_config(
+            LocalWorkspaceAgentConfig::new(&root).enabling_git_tools(),
+        );
         let plan = AgentToolPlanner::plan(
             registry.descriptors(),
             &AgentModuleToolProjection::default(),
@@ -16423,7 +16424,8 @@ mod tests {
         let registry = AgentToolRegistry::local_workspace_with_config(
             LocalWorkspaceAgentConfig::new(&root)
                 .using_local_process_commands()
-                .with_git_program(fake_git_program.clone()),
+                .with_git_program(fake_git_program.clone())
+                .enabling_git_tools(),
         );
         let input = agent_input("cancel git status");
         let cancellation_token = AgentCancellationToken::new();

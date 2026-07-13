@@ -25,17 +25,21 @@ use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::node::NodeId;
 use sinomo_runtime::sandbox::{
     LocalSandboxInstanceLayout, LocalSandboxInstanceStore, LocalSandboxToolchainStore,
-    SandboxCommandExecutionError, SandboxId, SandboxInstanceLifecycleStatus,
-    SandboxInstanceManifest, SandboxInstancePortability, SandboxMount, SandboxMountMode,
-    SandboxPath, SandboxPolicy, SandboxRuntimeBinding, SandboxStoreError, SandboxToolchainId,
-    SandboxTrackedProcess, SandboxTrackedProcessStatus, SandboxWasiError,
-    sandbox_execution_placement_for_node,
+    SandboxCancellationToken, SandboxCommandExecutionError, SandboxId,
+    SandboxInstanceLifecycleStatus, SandboxInstanceManifest, SandboxInstancePortability,
+    SandboxLocalExecutionLease, SandboxMount, SandboxMountMode, SandboxPath, SandboxPolicy,
+    SandboxRuntimeBinding, SandboxStoreError, SandboxToolchainId, SandboxTrackedProcess,
+    SandboxTrackedProcessStatus, SandboxWasiError,
+    recover_sandbox_local_execution_journal_with_lease, sandbox_execution_placement_for_node,
+    try_acquire_sandbox_local_execution_lease,
 };
 use sinomo_runtime::sandbox_simple::{SandboxSimpleNativeCommandRunner, SandboxSimpleNativeConfig};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const DEFAULT_LOCAL_MAX_READ_BYTES: usize = 64 * 1024;
@@ -55,11 +59,14 @@ pub struct LocalWorkspaceAgentConfig {
     pub sifs_evidence: Option<LocalWorkspaceSifsEvidenceConfig>,
     pub command_runtime: LocalWorkspaceCommandRuntime,
     pub sandbox_runtime_root: PathBuf,
+    /// Host path where the cluster SIFS root is already mounted. The simple
+    /// sandbox projects declared SIFS mounts from this live filesystem; it is
+    /// never used as a copy-in/copy-back staging directory.
+    pub sandbox_sifs_mount_root: Option<PathBuf>,
     pub sandbox_instance_id: Option<SandboxId>,
     pub sandbox_runtime_node_id: Option<NodeId>,
     pub sandbox_portability: SandboxInstancePortability,
     pub agent_home_sifs_path: Option<String>,
-    pub agent_home_local_root: Option<PathBuf>,
     pub sandbox_allow_unenforced: bool,
     pub allow_shell_commands: bool,
     pub allow_file_writes: bool,
@@ -69,6 +76,7 @@ pub struct LocalWorkspaceAgentConfig {
     pub max_patch_bytes: usize,
     pub max_search_matches: usize,
     pub max_list_entries: usize,
+    pub git_tool_mode: LocalWorkspaceGitToolMode,
     pub git_program: String,
 }
 
@@ -76,6 +84,20 @@ pub struct LocalWorkspaceAgentConfig {
 pub enum LocalWorkspaceCommandRuntime {
     SimpleSandbox,
     LocalProcess,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LocalWorkspaceGitToolMode {
+    /// Register Git helpers only when the workspace has Git metadata and the
+    /// configured Git executable can be found without invoking it.
+    #[default]
+    Auto,
+    /// Register Git helpers even when the workspace is not currently a Git
+    /// worktree. This supports callers that initialize it later or provide a
+    /// custom Git-compatible program.
+    Enabled,
+    /// Never register Git-specific helpers for this workspace.
+    Disabled,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,18 +130,20 @@ impl LocalWorkspaceSifsEvidenceConfig {
 impl LocalWorkspaceAgentConfig {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
-        let agent_home_sifs_path = Some(default_agent_home_sifs_path_for_root(&root));
         Self {
             root,
             evidence_dir: None,
             sifs_evidence: None,
             command_runtime: LocalWorkspaceCommandRuntime::SimpleSandbox,
             sandbox_runtime_root: default_agent_sandbox_runtime_root(),
+            sandbox_sifs_mount_root: None,
             sandbox_instance_id: None,
             sandbox_runtime_node_id: None,
             sandbox_portability: SandboxInstancePortability::NonPortable,
-            agent_home_sifs_path,
-            agent_home_local_root: None,
+            // A SIFS home is enabled only when the caller can also provide a
+            // live host mount. A path label without a mounted filesystem would
+            // falsely imply synchronization.
+            agent_home_sifs_path: None,
             sandbox_allow_unenforced: false,
             allow_shell_commands: false,
             allow_file_writes: false,
@@ -129,6 +153,7 @@ impl LocalWorkspaceAgentConfig {
             max_patch_bytes: DEFAULT_LOCAL_MAX_PATCH_BYTES,
             max_search_matches: DEFAULT_LOCAL_MAX_SEARCH_MATCHES,
             max_list_entries: DEFAULT_LOCAL_MAX_LIST_ENTRIES,
+            git_tool_mode: LocalWorkspaceGitToolMode::Auto,
             git_program: "git".to_string(),
         }
     }
@@ -148,6 +173,16 @@ impl LocalWorkspaceAgentConfig {
 
     pub fn with_sandbox_runtime_root(mut self, sandbox_runtime_root: impl Into<PathBuf>) -> Self {
         self.sandbox_runtime_root = sandbox_runtime_root.into();
+        self
+    }
+
+    pub fn with_sandbox_sifs_mount_root(mut self, mount_root: impl Into<PathBuf>) -> Self {
+        self.sandbox_sifs_mount_root = Some(mount_root.into());
+        self
+    }
+
+    pub fn without_sandbox_sifs_mount_root(mut self) -> Self {
+        self.sandbox_sifs_mount_root = None;
         self
     }
 
@@ -185,16 +220,6 @@ impl LocalWorkspaceAgentConfig {
         self
     }
 
-    pub fn with_agent_home_local_root(mut self, agent_home_local_root: impl Into<PathBuf>) -> Self {
-        self.agent_home_local_root = Some(agent_home_local_root.into());
-        self
-    }
-
-    pub fn without_agent_home_local_root(mut self) -> Self {
-        self.agent_home_local_root = None;
-        self
-    }
-
     pub fn allowing_unenforced_simple_sandbox(mut self, allow_unenforced: bool) -> Self {
         self.sandbox_allow_unenforced = allow_unenforced;
         self
@@ -229,10 +254,36 @@ impl LocalWorkspaceAgentConfig {
         self
     }
 
+    pub fn with_git_tool_mode(mut self, git_tool_mode: LocalWorkspaceGitToolMode) -> Self {
+        self.git_tool_mode = git_tool_mode;
+        self
+    }
+
+    pub fn enabling_git_tools(self) -> Self {
+        self.with_git_tool_mode(LocalWorkspaceGitToolMode::Enabled)
+    }
+
+    pub fn disabling_git_tools(self) -> Self {
+        self.with_git_tool_mode(LocalWorkspaceGitToolMode::Disabled)
+    }
+
+    pub fn detecting_git_tools(self) -> Self {
+        self.with_git_tool_mode(LocalWorkspaceGitToolMode::Auto)
+    }
+
     pub fn with_agent_storage(mut self, paths: &AgentStoragePaths, session_id: &SessionId) -> Self {
         self.evidence_dir = Some(paths.evidence_dir_for_session(session_id));
-        self.agent_home_sifs_path = Some(default_agent_home_sifs_path_for_session(session_id));
         self.sandbox_instance_id = Some(agent_sandbox_id_for_session(&self.root, session_id));
+        self
+    }
+
+    /// Enable the live SIFS-backed home for one agent session.
+    ///
+    /// This is intentionally separate from [`Self::with_agent_storage`]: local
+    /// evidence and stable sandbox identity remain usable on hosts where no
+    /// live SIFS/FUSE mount is available.
+    pub fn with_session_agent_home_sifs_path(mut self, session_id: &SessionId) -> Self {
+        self.agent_home_sifs_path = Some(default_agent_home_sifs_path_for_session(session_id));
         self
     }
 
@@ -243,20 +294,22 @@ impl LocalWorkspaceAgentConfig {
     ) -> Self {
         self = self.with_agent_storage(&AgentStoragePaths::from_data_dir(data_dir), session_id);
         self.sandbox_runtime_root = data_dir.root().join("sandbox").join("agent-tools");
-        self.agent_home_local_root = Some(data_dir.root().join("agents"));
         self
     }
 }
 
 pub fn register_tools(registry: &AgentToolRegistry, config: LocalWorkspaceAgentConfig) {
+    let register_git_tools = should_register_git_tools(&config);
     registry.register(read_file::ReadFileTool::new(config.clone()));
     registry.register(list_files::ListFilesTool::new(config.clone()));
     registry.register(search::SearchFilesTool::new(config.clone()));
     registry.register(edit_file::EditFileTool::new(config.clone()));
     registry.register(write_file::WriteFileTool::new(config.clone()));
     registry.register(apply_patch::ApplyPatchTool::new(config.clone()));
-    registry.register(changed_files::ChangedFilesTool::new(config.clone()));
-    registry.register(git_diff::GitDiffTool::new(config.clone()));
+    if register_git_tools {
+        registry.register(changed_files::ChangedFilesTool::new(config.clone()));
+        registry.register(git_diff::GitDiffTool::new(config.clone()));
+    }
     registry.register(run_command::RunCommandTool::new(config.clone()));
     registry.register(request_user_input::RequestUserInputTool);
 }
@@ -465,6 +518,7 @@ fn run_local_command_with_options(
         &execution.output,
         execution.timed_out,
         execution.cancelled,
+        execution.cleanup_pending,
         execution.duration_ms,
         options.timeout_ms,
         &options.evidence_tool_name,
@@ -480,6 +534,7 @@ struct LocalCommandExecution {
     output: LocalCommandOutput,
     timed_out: bool,
     cancelled: bool,
+    cleanup_pending: bool,
     duration_ms: u64,
 }
 
@@ -629,6 +684,7 @@ fn execute_local_process_command(
         output,
         timed_out,
         cancelled,
+        cleanup_pending: false,
         duration_ms: duration_ms_from_elapsed(started.elapsed()),
     })
 }
@@ -681,7 +737,20 @@ fn execute_simple_sandbox_command(
             )
         })?;
     let store = LocalSandboxInstanceStore::new(&config.sandbox_runtime_root);
-    let agent_home_local = agent_home_local_mirror(config);
+    let local_execution_lease = try_acquire_sandbox_local_execution_lease(&store, &sandbox_id)
+        .map_err(sandbox_store_failure(
+            "acquire simple sandbox execution lease",
+        ))?;
+    recover_sandbox_local_execution_journal_with_lease(
+        &store,
+        &local_execution_lease,
+        &sandbox_id,
+        time::OffsetDateTime::now_utc(),
+    )
+    .map_err(sandbox_store_failure(
+        "recover pending simple sandbox execution",
+    ))?;
+    let agent_home_host_path = agent_home_live_host_path(config);
     let (_manifest, layout) = prepare_agent_sandbox_manifest(
         config,
         &store,
@@ -692,16 +761,20 @@ fn execute_simple_sandbox_command(
         &cwd,
         &prepared.path_prefixes,
         &node_id,
+        Some(&local_execution_lease),
     )?;
     let runner = SandboxSimpleNativeCommandRunner::new(SandboxSimpleNativeConfig {
         allow_unenforced: config.sandbox_allow_unenforced,
+        host_sifs_root: config.sandbox_sifs_mount_root.clone(),
         extra_read_paths: sandbox_extra_read_paths(
             &root,
             &cwd,
             &prepared.path_prefixes,
-            agent_home_local.as_deref(),
+            agent_home_host_path.as_deref(),
         ),
-        extra_write_paths: sandbox_extra_write_paths(&root, agent_home_local.as_deref()),
+        // Shell execution is a generic host capability. Structured file-tool
+        // authorization must not silently turn it into a read-only command.
+        extra_write_paths: sandbox_extra_write_paths(&root, agent_home_host_path.as_deref()),
         extra_execute_paths: sandbox_extra_execute_paths(&prepared.path_prefixes),
     });
     let toolchain_store = LocalSandboxToolchainStore::new(layout.toolchain_runtime_cache_root());
@@ -746,10 +819,17 @@ fn execute_simple_sandbox_command(
         ),
     });
     if cancellation_token.is_cancelled() {
-        mark_agent_sandbox_process_finished(&store, &sandbox_id, &process_id, None)?;
+        let lifecycle_cleanup_failure =
+            mark_agent_sandbox_process_finished(&store, &sandbox_id, &process_id, None)
+                .err()
+                .map(|result| result.summary);
+        let cleanup_pending = lifecycle_cleanup_failure.is_some();
         let output = LocalCommandOutput {
             stdout: Vec::new(),
-            stderr: b"command cancelled before sandbox start".to_vec(),
+            stderr: command_stderr_with_cleanup_failure(
+                b"command cancelled before sandbox start".to_vec(),
+                lifecycle_cleanup_failure.as_deref(),
+            ),
             status_code: None,
             success: false,
         };
@@ -764,7 +844,10 @@ fn execute_simple_sandbox_command(
                 None,
                 false,
                 true,
-                Some("command cancelled before sandbox start".to_string()),
+                Some(
+                    lifecycle_cleanup_failure
+                        .unwrap_or_else(|| "command cancelled before sandbox start".to_string()),
+                ),
                 started.elapsed(),
                 timeout_ms,
                 &output.stdout,
@@ -778,33 +861,48 @@ fn execute_simple_sandbox_command(
             output,
             timed_out: false,
             cancelled: true,
+            cleanup_pending,
             duration_ms: duration_ms_from_elapsed(started.elapsed()),
         });
     }
 
-    let outcome = runner.run_toolchain_command_with_stdin_policy_and_output_sink(
-        &store,
-        &toolchain_store,
-        &sandbox_id,
-        &prepared.command_name,
-        prepared.argv,
-        stdin.map(|bytes| bytes.to_vec()),
-        timeout_ms.unwrap_or(0),
-        &node_id,
-        &policy,
-        None,
-    );
-    let _ = mark_agent_sandbox_process_finished(&store, &sandbox_id, &process_id, None);
+    let (sandbox_cancellation, cancellation_bridge) =
+        bridge_agent_sandbox_cancellation(cancellation_token);
+    let outcome = runner
+        .run_toolchain_command_with_stdin_policy_output_sink_cancellation_and_lease(
+            &store,
+            &toolchain_store,
+            &sandbox_id,
+            &prepared.command_name,
+            prepared.argv,
+            stdin.map(|bytes| bytes.to_vec()),
+            timeout_ms.unwrap_or(0),
+            &node_id,
+            &policy,
+            None,
+            sandbox_cancellation,
+            &local_execution_lease,
+        );
+    drop(cancellation_bridge);
+    let lifecycle_cleanup_failure =
+        mark_agent_sandbox_process_finished(&store, &sandbox_id, &process_id, None)
+            .err()
+            .map(|result| result.summary);
     match outcome {
         Ok(outcome) => {
             let status_code = Some(outcome.response.exit_status);
-            let success = outcome.response.exit_status == 0;
+            let cleanup_pending = lifecycle_cleanup_failure.is_some();
+            let success = outcome.response.exit_status == 0 && !cleanup_pending;
             let status = if success {
                 AgentProcessLifecycleStatus::Completed
             } else {
                 AgentProcessLifecycleStatus::Failed
             };
-            if !outcome.stdout.is_empty() || !outcome.stderr.is_empty() {
+            let stderr = command_stderr_with_cleanup_failure(
+                outcome.stderr,
+                lifecycle_cleanup_failure.as_deref(),
+            );
+            if !outcome.stdout.is_empty() || !stderr.is_empty() {
                 progress_sink.emit(AgentToolProgressEvent::ProcessOutput {
                     process: sandbox_process_snapshot(
                         &process_id,
@@ -816,11 +914,11 @@ fn execute_simple_sandbox_command(
                         status_code,
                         false,
                         false,
-                        None,
+                        lifecycle_cleanup_failure.clone(),
                         started.elapsed(),
                         timeout_ms,
                         &outcome.stdout,
-                        &outcome.stderr,
+                        &stderr,
                         config.max_command_output_bytes,
                     ),
                 });
@@ -836,11 +934,11 @@ fn execute_simple_sandbox_command(
                     status_code,
                     false,
                     false,
-                    None,
+                    lifecycle_cleanup_failure,
                     started.elapsed(),
                     timeout_ms,
                     &outcome.stdout,
-                    &outcome.stderr,
+                    &stderr,
                     config.max_command_output_bytes,
                 ),
             });
@@ -849,17 +947,22 @@ fn execute_simple_sandbox_command(
                 cwd,
                 output: LocalCommandOutput {
                     stdout: outcome.stdout,
-                    stderr: outcome.stderr,
+                    stderr,
                     status_code,
                     success,
                 },
                 timed_out: false,
                 cancelled: false,
+                cleanup_pending,
                 duration_ms: duration_ms_from_elapsed(started.elapsed()),
             })
         }
         Err(SandboxCommandExecutionError::Wasi(SandboxWasiError::TimedOut { timeout_ms })) => {
-            let stderr = format!("sandbox command timed out after {timeout_ms} ms").into_bytes();
+            let cleanup_pending = lifecycle_cleanup_failure.is_some();
+            let stderr = command_stderr_with_cleanup_failure(
+                format!("sandbox command timed out after {timeout_ms} ms").into_bytes(),
+                lifecycle_cleanup_failure.as_deref(),
+            );
             progress_sink.emit(AgentToolProgressEvent::ProcessCompleted {
                 process: sandbox_process_snapshot(
                     &process_id,
@@ -871,7 +974,10 @@ fn execute_simple_sandbox_command(
                     None,
                     true,
                     false,
-                    Some(format!("command timed out after {timeout_ms} ms")),
+                    Some(
+                        lifecycle_cleanup_failure
+                            .unwrap_or_else(|| format!("command timed out after {timeout_ms} ms")),
+                    ),
                     started.elapsed(),
                     Some(timeout_ms),
                     &[],
@@ -890,11 +996,27 @@ fn execute_simple_sandbox_command(
                 },
                 timed_out: true,
                 cancelled: false,
+                cleanup_pending,
                 duration_ms: duration_ms_from_elapsed(started.elapsed()),
             })
         }
-        Err(SandboxCommandExecutionError::Wasi(SandboxWasiError::Cancelled)) => {
-            let stderr = b"sandbox command was cancelled".to_vec();
+        Err(SandboxCommandExecutionError::Wasi(error))
+            if matches!(
+                &error,
+                SandboxWasiError::Cancelled | SandboxWasiError::CancelledCleanupFailed { .. }
+            ) =>
+        {
+            let (runtime_cleanup_pending, detail) = match error {
+                SandboxWasiError::CancelledCleanupFailed { detail } => (true, detail),
+                SandboxWasiError::Cancelled => (false, "sandbox command was cancelled".to_string()),
+                _ => unreachable!("guarded cancellation variant"),
+            };
+            let cleanup_pending = runtime_cleanup_pending || lifecycle_cleanup_failure.is_some();
+            let stderr = command_stderr_with_cleanup_failure(
+                detail.as_bytes().to_vec(),
+                lifecycle_cleanup_failure.as_deref(),
+            );
+            let progress_detail = lifecycle_cleanup_failure.unwrap_or_else(|| detail.clone());
             progress_sink.emit(AgentToolProgressEvent::ProcessCompleted {
                 process: sandbox_process_snapshot(
                     &process_id,
@@ -906,7 +1028,7 @@ fn execute_simple_sandbox_command(
                     None,
                     false,
                     true,
-                    Some("sandbox command was cancelled".to_string()),
+                    Some(progress_detail),
                     started.elapsed(),
                     timeout_ms,
                     &[],
@@ -925,18 +1047,85 @@ fn execute_simple_sandbox_command(
                 },
                 timed_out: false,
                 cancelled: true,
+                cleanup_pending,
                 duration_ms: duration_ms_from_elapsed(started.elapsed()),
             })
         }
-        Err(source) => Err(AgentToolResult::failed(
-            format!("failed to run {program} in simple sandbox: {source}"),
-            serde_json::json!({
-                "error": "simple_sandbox_command_failed",
-                "detail": source.to_string(),
-                "runtime": "simple_sandbox",
-            }),
-        )),
+        Err(source) => {
+            let cleanup_pending = lifecycle_cleanup_failure.is_some();
+            let detail = match lifecycle_cleanup_failure {
+                Some(cleanup) => format!("{source}; process lifecycle cleanup failed: {cleanup}"),
+                None => source.to_string(),
+            };
+            Err(AgentToolResult::failed(
+                format!("failed to run {program} in simple sandbox: {detail}"),
+                serde_json::json!({
+                    "error": "simple_sandbox_command_failed",
+                    "detail": detail,
+                    "runtime": "simple_sandbox",
+                    "cleanup_pending": cleanup_pending,
+                }),
+            ))
+        }
     }
+}
+
+fn command_stderr_with_cleanup_failure(
+    mut stderr: Vec<u8>,
+    cleanup_failure: Option<&str>,
+) -> Vec<u8> {
+    let Some(cleanup_failure) = cleanup_failure else {
+        return stderr;
+    };
+    if !stderr.is_empty() && !stderr.ends_with(b"\n") {
+        stderr.push(b'\n');
+    }
+    stderr.extend_from_slice(b"simple sandbox process lifecycle cleanup remains pending: ");
+    stderr.extend_from_slice(cleanup_failure.as_bytes());
+    stderr
+}
+
+struct AgentSandboxCancellationBridge {
+    done: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for AgentSandboxCancellationBridge {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn bridge_agent_sandbox_cancellation(
+    agent_token: &AgentCancellationToken,
+) -> (SandboxCancellationToken, AgentSandboxCancellationBridge) {
+    let sandbox_token = SandboxCancellationToken::new();
+    if agent_token.is_cancelled() {
+        let _ = sandbox_token.cancel();
+    }
+    let agent_token = agent_token.clone();
+    let monitored_token = sandbox_token.clone();
+    let done = Arc::new(AtomicBool::new(false));
+    let monitor_done = Arc::clone(&done);
+    let join = std::thread::spawn(move || {
+        while !monitor_done.load(Ordering::Acquire) {
+            if agent_token.is_cancelled() {
+                let _ = monitored_token.cancel();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    (
+        sandbox_token,
+        AgentSandboxCancellationBridge {
+            done,
+            join: Some(join),
+        },
+    )
 }
 
 struct PreparedSandboxCommand {
@@ -1008,6 +1197,7 @@ fn prepare_agent_sandbox_manifest(
     cwd: &Path,
     path_prefixes: &[PathBuf],
     node_id: &NodeId,
+    local_execution_lease: Option<&SandboxLocalExecutionLease>,
 ) -> Result<(SandboxInstanceManifest, LocalSandboxInstanceLayout), AgentToolResult> {
     fs::create_dir_all(&config.sandbox_runtime_root).map_err(|source| {
         AgentToolResult::failed(
@@ -1023,17 +1213,35 @@ fn prepare_agent_sandbox_manifest(
         )
     })?;
     let now = time::OffsetDateTime::now_utc();
-    let (mut manifest, _layout) = match store.load(sandbox_id) {
+    let (mut manifest, layout) = match store.load(sandbox_id) {
         Ok(loaded) => loaded,
-        Err(SandboxStoreError::NotFound { .. }) => store
-            .create(sandbox_id.clone(), toolchain_id.clone(), now)
-            .map_err(sandbox_store_failure("create simple sandbox instance"))?,
+        Err(SandboxStoreError::NotFound { .. }) => match local_execution_lease {
+            Some(lease) => store
+                .create_under_local_execution_lease(
+                    lease,
+                    sandbox_id.clone(),
+                    toolchain_id.clone(),
+                    now,
+                )
+                .map_err(sandbox_store_failure("create simple sandbox instance"))?,
+            None => store
+                .create(sandbox_id.clone(), toolchain_id.clone(), now)
+                .map_err(sandbox_store_failure("create simple sandbox instance"))?,
+        },
         Err(source) => {
             return Err(sandbox_store_failure("load simple sandbox instance")(
                 source,
             ));
         }
     };
+    if local_execution_lease.is_some() && !manifest.active_processes.is_empty() {
+        manifest.active_processes.clear();
+        manifest.lifecycle.status = SandboxInstanceLifecycleStatus::Stopped;
+        manifest.lifecycle.stopped_at = Some(now);
+        manifest.lifecycle.last_error = Some(
+            "recovered stale process lifecycle after interrupted sandbox execution".to_string(),
+        );
+    }
     validate_sandbox_runtime_binding(&manifest, node_id, config)?;
     manifest.toolchain_id = toolchain_id.clone();
     manifest.cwd = sandbox_cwd;
@@ -1042,16 +1250,16 @@ fn prepare_agent_sandbox_manifest(
         node_id: node_id.clone(),
         portability: config.sandbox_portability.clone(),
     });
-    let agent_home_local = agent_home_local_mirror(config);
-    if let Some(home) = agent_home_local.as_deref() {
+    let agent_home_host_path = agent_home_live_host_path(config);
+    if let Some(home) = agent_home_host_path.as_deref() {
         fs::create_dir_all(home).map_err(|source| {
             AgentToolResult::failed(
                 format!(
-                    "failed to create sandbox agent home mirror {}: {source}",
+                    "failed to prepare live-mounted sandbox agent home host path {}: {source}",
                     home.display()
                 ),
                 serde_json::json!({
-                    "error": "sandbox_agent_home_mirror_unavailable",
+                    "error": "sandbox_agent_home_live_host_path_unavailable",
                     "detail": source.to_string(),
                     "path": home,
                 }),
@@ -1063,9 +1271,12 @@ fn prepare_agent_sandbox_manifest(
         root,
         cwd,
         path_prefixes,
-        agent_home_local.as_deref(),
+        agent_home_host_path.as_deref(),
     );
-    manifest.mounts = agent_home_mounts(config)?;
+    manifest.mounts = agent_home_mounts(config, &layout)?;
+    // Bound the native process itself, not only the later tool-result preview.
+    // This prevents an unbounded producer from buffering until process exit.
+    manifest.limits.max_output_bytes = config.max_command_output_bytes as u64;
     manifest.last_placement = Some(
         sandbox_execution_placement_for_node(&manifest, node_id).map_err(|source| {
             AgentToolResult::blocked(
@@ -1114,9 +1325,9 @@ fn prepare_agent_sandbox_manifest(
             layout.metadata.join("agent-home-sifs-path.txt"),
             normalize_agent_home_sifs_path(home_sifs_path.clone()),
         );
-        if let Some(home) = agent_home_local.as_deref() {
+        if let Some(home) = agent_home_host_path.as_deref() {
             let _ = fs::write(
-                layout.metadata.join("agent-home-local-path.txt"),
+                layout.metadata.join("agent-home-live-host-path.txt"),
                 home.display().to_string(),
             );
         }
@@ -1250,24 +1461,25 @@ fn sandbox_store_failure(
 
 fn agent_home_mounts(
     config: &LocalWorkspaceAgentConfig,
+    layout: &LocalSandboxInstanceLayout,
 ) -> Result<Vec<SandboxMount>, AgentToolResult> {
     let Some(source_sifs_path) = &config.agent_home_sifs_path else {
         return Ok(Vec::new());
     };
     Ok(vec![SandboxMount {
         source_sifs_path: normalize_agent_home_sifs_path(source_sifs_path.clone()),
-        mount_path: SandboxPath::new("/home").map_err(|source| {
-            AgentToolResult::failed(
-                format!("failed to prepare sandbox home mount: {source}"),
-                serde_json::json!({ "error": "sandbox_home_mount_invalid", "detail": source.to_string() }),
-            )
-        })?,
+        // Keep the generic host filesystem visible as-is. Projecting over
+        // `/home` hid unrelated host paths and could make PATH-resolved host
+        // tools disappear. The instance-owned home is a stable, non-shadowing
+        // guest target; HOME still points directly at the same live FUSE tree.
+        mount_path: sandbox_path_for_host_path(&layout.home)?,
         mode: SandboxMountMode::ReadWrite,
     }])
 }
 
 fn agent_sandbox_policy() -> SandboxPolicy {
     let mut policy = SandboxPolicy::default();
+    policy.allow_read_write_sifs_mounts = true;
     if !policy
         .allowed_mount_prefixes
         .iter()
@@ -1285,9 +1497,15 @@ fn sandbox_environment(
     root: &Path,
     cwd: &Path,
     path_prefixes: &[PathBuf],
-    agent_home_local: Option<&Path>,
+    agent_home_host_path: Option<&Path>,
 ) -> BTreeMap<String, String> {
-    let mut envs = BTreeMap::new();
+    // A simple-native command is a generic host command. Preserve the host
+    // environment by default, then add the sandbox/workspace context that the
+    // runner owns. Environment entries that cannot cross the string-based
+    // sandbox request ABI are omitted.
+    let mut envs = env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .collect::<BTreeMap<_, _>>();
     if let Some(path) = sandbox_path_env(path_prefixes) {
         envs.insert("PATH".to_string(), path);
     }
@@ -1309,38 +1527,11 @@ fn sandbox_environment(
             normalize_agent_home_sifs_path(home_sifs_path.clone()),
         );
     }
-    if let Some(home) = agent_home_local {
+    if let Some(home) = agent_home_host_path {
         let home = home.display().to_string();
         envs.insert("HOME".to_string(), home.clone());
         envs.insert("USERPROFILE".to_string(), home.clone());
-        envs.insert("SINOMO_AGENT_HOME_LOCAL".to_string(), home);
-    }
-    for name in [
-        "CARGO_HOME",
-        "RUSTUP_HOME",
-        "RUSTC",
-        "RUSTDOC",
-        "RUSTC_WRAPPER",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-    ] {
-        if let Ok(value) = env::var(name)
-            && !value.trim().is_empty()
-        {
-            envs.insert(name.to_string(), value);
-        }
-    }
-    if !envs.contains_key("CARGO_HOME")
-        && let Some(path) = user_home_path().map(|home| home.join(".cargo"))
-        && path.exists()
-    {
-        envs.insert("CARGO_HOME".to_string(), path.display().to_string());
-    }
-    if !envs.contains_key("RUSTUP_HOME")
-        && let Some(path) = user_home_path().map(|home| home.join(".rustup"))
-        && path.exists()
-    {
-        envs.insert("RUSTUP_HOME".to_string(), path.display().to_string());
+        envs.insert("SINOMO_AGENT_HOME_HOST_PATH".to_string(), home);
     }
     envs
 }
@@ -1349,21 +1540,20 @@ fn sandbox_extra_read_paths(
     root: &Path,
     cwd: &Path,
     path_prefixes: &[PathBuf],
-    agent_home_local: Option<&Path>,
+    agent_home_host_path: Option<&Path>,
 ) -> Vec<PathBuf> {
     let mut paths = vec![root.to_path_buf(), cwd.to_path_buf()];
     paths.extend(path_prefixes.iter().cloned());
-    if let Some(home) = agent_home_local {
+    if let Some(home) = agent_home_host_path {
         paths.push(home.to_path_buf());
     }
     paths.extend(current_path_dirs());
-    paths.extend(toolchain_home_paths());
     dedup_pathbufs(paths)
 }
 
-fn sandbox_extra_write_paths(root: &Path, agent_home_local: Option<&Path>) -> Vec<PathBuf> {
+fn sandbox_extra_write_paths(root: &Path, agent_home_host_path: Option<&Path>) -> Vec<PathBuf> {
     let mut paths = vec![root.to_path_buf()];
-    if let Some(home) = agent_home_local {
+    if let Some(home) = agent_home_host_path {
         paths.push(home.to_path_buf());
     }
     dedup_pathbufs(paths)
@@ -1373,10 +1563,6 @@ fn sandbox_extra_execute_paths(path_prefixes: &[PathBuf]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     paths.extend(path_prefixes.iter().cloned());
     paths.extend(current_path_dirs());
-    // Rustup installs executable proxies in CARGO_HOME/bin whose symlink targets live under
-    // RUSTUP_HOME. Landlock checks the resolved target, so allowing PATH alone makes an otherwise
-    // valid `cargo` or `rustc` invocation fail with EACCES.
-    paths.extend(toolchain_home_paths());
     dedup_pathbufs(paths)
 }
 
@@ -1396,30 +1582,76 @@ fn current_path_dirs() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-fn toolchain_home_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    for name in ["CARGO_HOME", "RUSTUP_HOME"] {
-        if let Some(path) = env::var_os(name).map(PathBuf::from)
-            && path.exists()
-        {
-            paths.push(path);
+fn should_register_git_tools(config: &LocalWorkspaceAgentConfig) -> bool {
+    match config.git_tool_mode {
+        LocalWorkspaceGitToolMode::Enabled => true,
+        LocalWorkspaceGitToolMode::Disabled => false,
+        LocalWorkspaceGitToolMode::Auto => {
+            workspace_has_git_metadata(&config.root) && program_is_available(&config.git_program)
         }
     }
-    if let Some(home) = user_home_path() {
-        for child in [".cargo", ".rustup"] {
-            let path = home.join(child);
-            if path.exists() {
-                paths.push(path);
-            }
-        }
-    }
-    dedup_pathbufs(paths)
 }
 
-fn user_home_path() -> Option<PathBuf> {
-    env::var_os("USERPROFILE")
-        .or_else(|| env::var_os("HOME"))
-        .map(PathBuf::from)
+fn workspace_has_git_metadata(root: &Path) -> bool {
+    let mut path = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if path.is_file() {
+        path.pop();
+    }
+    loop {
+        if fs::symlink_metadata(path.join(".git")).is_ok() {
+            return true;
+        }
+        if !path.pop() {
+            return false;
+        }
+    }
+}
+
+fn program_is_available(program: &str) -> bool {
+    let program = program.trim();
+    if program.is_empty() {
+        return false;
+    }
+    let path = Path::new(program);
+    if path.is_absolute() || path.components().count() > 1 {
+        return program_path_is_available(path);
+    }
+    current_path_dirs()
+        .into_iter()
+        .any(|directory| program_path_is_available(&directory.join(path)))
+}
+
+fn program_path_is_available(path: &Path) -> bool {
+    if executable_program_file(path) {
+        return true;
+    }
+    #[cfg(windows)]
+    if path.extension().is_none() {
+        let extensions = env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        return extensions.split(';').any(|extension| {
+            let extension = extension.trim().trim_start_matches('.');
+            !extension.is_empty() && executable_program_file(&path.with_extension(extension))
+        });
+    }
+    false
+}
+
+fn executable_program_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn dedup_pathbufs(paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -1467,31 +1699,13 @@ fn default_agent_sandbox_runtime_root() -> PathBuf {
     env::temp_dir().join("sinomo-agent").join("sandbox-runtime")
 }
 
-fn agent_home_local_mirror(config: &LocalWorkspaceAgentConfig) -> Option<PathBuf> {
+fn agent_home_live_host_path(config: &LocalWorkspaceAgentConfig) -> Option<PathBuf> {
+    let mount_root = config.sandbox_sifs_mount_root.as_ref()?;
     let home_sifs_path = config
         .agent_home_sifs_path
         .as_ref()
         .map(|path| normalize_agent_home_sifs_path(path.clone()))?;
-    let agent_id = home_sifs_path
-        .strip_prefix(&format!("{AGENT_HOME_SIFS_ROOT}/"))
-        .and_then(|path| path.strip_suffix("/home"))
-        .map(sanitize_agent_home_id)
-        .unwrap_or_else(|| "custom".to_string());
-    if let Some(root) = &config.agent_home_local_root {
-        return Some(root.join(agent_id).join("home"));
-    }
-    let digest = blake3::hash(home_sifs_path.as_bytes()).to_hex().to_string();
-    config
-        .sandbox_runtime_root
-        .join("agent-homes")
-        .join(format!("{agent_id}-{}", &digest[..16]))
-        .join("home")
-        .into()
-}
-
-fn default_agent_home_sifs_path_for_root(root: &Path) -> String {
-    let id = SandboxId::derived("sinomo-agent-home-root", root.to_string_lossy().as_bytes());
-    agent_home_sifs_path_for_id(&id.to_string())
+    Some(mount_root.join(home_sifs_path.trim_start_matches('/')))
 }
 
 fn default_agent_home_sifs_path_for_session(session_id: &SessionId) -> String {
@@ -1648,6 +1862,7 @@ fn local_command_result_from_output(
     output: &LocalCommandOutput,
     timed_out: bool,
     cancelled: bool,
+    cleanup_pending: bool,
     duration_ms: u64,
     timeout_ms: Option<u64>,
     evidence_tool_name: &str,
@@ -1658,7 +1873,7 @@ fn local_command_result_from_output(
     let stdout = truncate_utf8_lossy(&output.stdout, config.max_command_output_bytes);
     let stderr = truncate_utf8_lossy(&output.stderr, config.max_command_output_bytes);
     let status = output.status_code;
-    let succeeded = !timed_out && !cancelled && output.success;
+    let succeeded = !timed_out && !cancelled && !cleanup_pending && output.success;
     let cwd_display = display_workspace_path(config, &cwd);
     let stdout_ref = if stdout.truncated {
         write_local_evidence(config, evidence_tool_name, "stdout.txt", &output.stdout).map(|uri| {
@@ -1719,6 +1934,7 @@ fn local_command_result_from_output(
         "success": succeeded,
         "timed_out": timed_out,
         "cancelled": cancelled,
+        "cleanup_pending": cleanup_pending,
         "duration_ms": duration_ms,
         "timeout_ms": timeout_ms,
         "stdout": stdout.text,
@@ -1739,6 +1955,7 @@ fn local_command_result_from_output(
             "duration_ms": duration_ms,
             "timed_out": timed_out,
             "cancelled": cancelled,
+            "cleanup_pending": cleanup_pending,
             "timeout_ms": timeout_ms,
             "stdout": String::from_utf8_lossy(&output.stdout),
             "stderr": String::from_utf8_lossy(&output.stderr),
@@ -1756,6 +1973,7 @@ fn local_command_result_from_output(
             "workspace_root": root.display().to_string(),
             "timed_out": timed_out,
             "cancelled": cancelled,
+            "cleanup_pending": cleanup_pending,
             "timeout_ms": timeout_ms,
             "sandbox": local_workspace_sandbox_metadata(config),
         }));
@@ -1800,7 +2018,7 @@ fn local_workspace_sandbox_metadata(config: &LocalWorkspaceAgentConfig) -> serde
             "runtime_node_id": config.sandbox_runtime_node_id,
             "portability": config.sandbox_portability,
             "agent_home_sifs_path": config.agent_home_sifs_path,
-            "agent_home_local_root": config.agent_home_local_root,
+            "sandbox_sifs_mount_root": config.sandbox_sifs_mount_root,
         }),
         LocalWorkspaceCommandRuntime::LocalProcess => serde_json::json!({
             "runtime": "local_process",
@@ -1819,13 +2037,17 @@ fn validate_local_workspace_file_access(
     if config.command_runtime != LocalWorkspaceCommandRuntime::SimpleSandbox {
         return Ok(());
     }
-    let agent_home_local = agent_home_local_mirror(config);
+    let agent_home_host_path = agent_home_live_host_path(config);
     let allowed_paths = match access {
         LocalWorkspaceFileAccess::Read => {
-            sandbox_extra_read_paths(root, root, &[], agent_home_local.as_deref())
+            sandbox_extra_read_paths(root, root, &[], agent_home_host_path.as_deref())
         }
         LocalWorkspaceFileAccess::Write => {
-            sandbox_extra_write_paths(root, agent_home_local.as_deref())
+            if !config.allow_file_writes {
+                Vec::new()
+            } else {
+                sandbox_extra_write_paths(root, agent_home_host_path.as_deref())
+            }
         }
     };
     if sandbox_path_is_allowed(path, &allowed_paths) {
@@ -2152,7 +2374,7 @@ mod tests {
     }
 
     #[test]
-    fn local_workspace_commands_default_to_simple_sandbox_with_agent_home() {
+    fn local_workspace_commands_default_to_simple_sandbox_without_fake_sifs_mount() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-sandbox-default");
         let config = LocalWorkspaceAgentConfig::new(&root);
 
@@ -2160,34 +2382,71 @@ mod tests {
             config.command_runtime,
             LocalWorkspaceCommandRuntime::SimpleSandbox
         );
-        assert!(
-            config
-                .agent_home_sifs_path
-                .as_deref()
-                .is_some_and(|path| path.starts_with("/sinomo/agents/") && path.ends_with("/home"))
+        assert!(config.agent_home_sifs_path.is_none());
+        assert!(config.sandbox_sifs_mount_root.is_none());
+        assert_eq!(config.git_tool_mode, LocalWorkspaceGitToolMode::Auto);
+    }
+
+    #[test]
+    fn generic_non_git_workspace_omits_git_helpers_but_keeps_shell_tool() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-generic-non-git-workspace");
+        fs::write(root.join("notes.txt"), "an arbitrary workspace\n").expect("workspace file");
+
+        let registry = AgentToolRegistry::local_workspace_with_config(
+            LocalWorkspaceAgentConfig::new(&root).allowing_shell_commands(true),
         );
+
+        assert!(registry.contains("run_command"));
+        assert!(!registry.contains("changed_files"));
+        assert!(!registry.contains("git_diff"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_helpers_auto_detect_and_honor_explicit_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-optional-git-tools");
+        fs::create_dir(root.join(".git")).expect("git metadata");
+        let fake_git = root.join("fake-git");
+        fs::write(&fake_git, "#!/bin/sh\nexit 0\n").expect("fake git");
+        let mut permissions = fs::metadata(&fake_git)
+            .expect("fake git metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_git, permissions).expect("make fake git executable");
+        let auto_config =
+            LocalWorkspaceAgentConfig::new(&root).with_git_program(fake_git.display().to_string());
+
+        let automatic = AgentToolRegistry::local_workspace_with_config(auto_config.clone());
+        assert!(automatic.contains("changed_files"));
+        assert!(automatic.contains("git_diff"));
+
+        let disabled = AgentToolRegistry::local_workspace_with_config(
+            auto_config.clone().disabling_git_tools(),
+        );
+        assert!(!disabled.contains("changed_files"));
+        assert!(!disabled.contains("git_diff"));
+
+        fs::remove_dir(root.join(".git")).expect("remove git metadata");
+        let forced =
+            AgentToolRegistry::local_workspace_with_config(auto_config.enabling_git_tools());
+        assert!(forced.contains("changed_files"));
+        assert!(forced.contains("git_diff"));
     }
 
     #[test]
-    fn simple_sandbox_execute_paths_include_toolchain_homes() {
-        let execute_paths = sandbox_extra_execute_paths(&[]);
-        for toolchain_home in toolchain_home_paths() {
-            assert!(
-                execute_paths.contains(&toolchain_home),
-                "toolchain executable target must be Landlock-allowed: {}",
-                toolchain_home.display()
-            );
-        }
-    }
-
-    #[test]
-    fn simple_sandbox_manifest_mounts_agent_home_at_home() {
+    fn simple_sandbox_manifest_mounts_agent_home_without_shadowing_host_home() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-sandbox-home");
         let runtime_root = root.join("sandbox-runtime");
         let workspace = root.join("workspace");
+        let sifs_mount_root = root.join("sifs");
         fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(sifs_mount_root.join("sinomo/agents/test-agent/home"))
+            .expect("mounted SIFS home");
         let config = LocalWorkspaceAgentConfig::new(&workspace)
             .with_sandbox_runtime_root(&runtime_root)
+            .with_sandbox_sifs_mount_root(&sifs_mount_root)
             .with_agent_home_sifs_path("/sinomo/agents/test-agent/home");
         let canonical_workspace = fs::canonicalize(&workspace).expect("canonical workspace");
         let sandbox_id = agent_sandbox_id(&config, &canonical_workspace);
@@ -2208,6 +2467,7 @@ mod tests {
             &canonical_workspace,
             &[],
             &node_id,
+            None,
         )
         .expect("manifest");
         let (manifest, _layout) = store.load(&sandbox_id).expect("load manifest");
@@ -2217,25 +2477,28 @@ mod tests {
             manifest.mounts[0].source_sifs_path,
             "/sinomo/agents/test-agent/home"
         );
-        assert_eq!(manifest.mounts[0].mount_path.as_str(), "/home");
+        assert_eq!(
+            manifest.mounts[0].mount_path.as_str(),
+            layout.home.display().to_string()
+        );
         assert_eq!(manifest.mounts[0].mode, SandboxMountMode::ReadWrite);
         assert!(layout.home.exists());
-        let home_local = agent_home_local_mirror(&config).expect("local home mirror");
-        assert!(home_local.exists());
+        let home_host_path = agent_home_live_host_path(&config).expect("live agent home host path");
+        assert!(home_host_path.exists());
         assert_eq!(
             manifest.env.get("HOME").map(String::as_str),
-            Some(home_local.to_str().expect("utf8 home mirror"))
+            Some(home_host_path.to_str().expect("utf8 live host path"))
         );
         assert_eq!(
             manifest.env.get("USERPROFILE").map(String::as_str),
-            Some(home_local.to_str().expect("utf8 home mirror"))
+            Some(home_host_path.to_str().expect("utf8 live host path"))
         );
         assert_eq!(
             manifest
                 .env
-                .get("SINOMO_AGENT_HOME_LOCAL")
+                .get("SINOMO_AGENT_HOME_HOST_PATH")
                 .map(String::as_str),
-            Some(home_local.to_str().expect("utf8 home mirror"))
+            Some(home_host_path.to_str().expect("utf8 live host path"))
         );
         assert_eq!(
             fs::read_to_string(layout.metadata.join("agent-home-sifs-path.txt"))
@@ -2243,47 +2506,52 @@ mod tests {
             "/sinomo/agents/test-agent/home"
         );
         assert_eq!(
-            fs::read_to_string(layout.metadata.join("agent-home-local-path.txt"))
-                .expect("local home metadata"),
-            home_local.display().to_string()
+            fs::read_to_string(layout.metadata.join("agent-home-live-host-path.txt"))
+                .expect("live agent home host metadata"),
+            home_host_path.display().to_string()
         );
     }
 
     #[test]
-    fn agent_home_local_mirror_roams_by_sifs_home_path() {
+    fn agent_home_path_is_the_same_live_sifs_mount_across_workspaces() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-sandbox-home-roaming");
         let runtime_root = root.join("sandbox-runtime");
         let workspace_a = root.join("workspace-a");
         let workspace_b = root.join("workspace-b");
+        let sifs_mount_root = root.join("sifs");
         fs::create_dir_all(&workspace_a).expect("workspace a");
         fs::create_dir_all(&workspace_b).expect("workspace b");
         let config_a = LocalWorkspaceAgentConfig::new(&workspace_a)
             .with_sandbox_runtime_root(&runtime_root)
+            .with_sandbox_sifs_mount_root(&sifs_mount_root)
             .with_agent_home_sifs_path("/sinomo/agents/test-agent/home");
         let config_b = LocalWorkspaceAgentConfig::new(&workspace_b)
             .with_sandbox_runtime_root(&runtime_root)
+            .with_sandbox_sifs_mount_root(&sifs_mount_root)
             .with_agent_home_sifs_path("/sinomo/agents/test-agent/home");
 
         assert_eq!(
-            agent_home_local_mirror(&config_a),
-            agent_home_local_mirror(&config_b)
+            agent_home_live_host_path(&config_a),
+            agent_home_live_host_path(&config_b)
         );
-        assert!(
-            agent_home_local_mirror(&config_a)
-                .expect("local mirror")
-                .starts_with(runtime_root.join("agent-homes"))
+        assert_eq!(
+            agent_home_live_host_path(&config_a),
+            Some(sifs_mount_root.join("sinomo/agents/test-agent/home"))
         );
     }
 
     #[test]
-    fn agent_home_local_mirror_uses_data_dir_agents_home_root() {
+    fn agent_home_uses_configured_live_sifs_mount_root() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-sandbox-home-data-dir");
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).expect("workspace");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let sifs_mount_root = root.join("sifs");
         let session_id = SessionId::from_legacy_named("sess-agent-home").expect("session");
         let config = LocalWorkspaceAgentConfig::new(&workspace)
-            .with_data_dir_evidence(&data_dir, &session_id);
+            .with_data_dir_evidence(&data_dir, &session_id)
+            .with_sandbox_sifs_mount_root(&sifs_mount_root)
+            .with_session_agent_home_sifs_path(&session_id);
         let agent_id = session_id.to_string();
 
         assert_eq!(
@@ -2291,8 +2559,13 @@ mod tests {
             Some(agent_home_sifs_path_for_id(&agent_id).as_str())
         );
         assert_eq!(
-            agent_home_local_mirror(&config),
-            Some(data_dir.root().join("agents").join(agent_id).join("home"))
+            agent_home_live_host_path(&config),
+            Some(
+                sifs_mount_root
+                    .join("sinomo/agents")
+                    .join(agent_id)
+                    .join("home")
+            )
         );
     }
 
@@ -2313,6 +2586,101 @@ mod tests {
         assert_ne!(
             agent_sandbox_id(&config_a, &canonical_workspace),
             agent_sandbox_id(&config_b, &canonical_workspace)
+        );
+        assert!(config_a.agent_home_sifs_path.is_none());
+        assert!(config_b.agent_home_sifs_path.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_dir_evidence_keeps_simple_shell_usable_without_live_sifs_mount() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-evidence-no-sifs-mount");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let session = test_session("evidence-no-sifs-mount");
+        let config = LocalWorkspaceAgentConfig::new(&workspace)
+            .with_data_dir_evidence(&data_dir, &session.session_id)
+            .allowing_shell_commands(true);
+
+        assert!(config.agent_home_sifs_path.is_none());
+        assert!(config.sandbox_sifs_mount_root.is_none());
+        let registry = AgentToolRegistry::local_workspace_with_config(config);
+        let outcome = registry.execute(
+            &session,
+            0,
+            0,
+            &AgentToolCall {
+                call_id: None,
+                tool: "run_command".to_string(),
+                input: serde_json::json!({
+                    "command": "printf usable",
+                    "timeout_ms": 5_000,
+                }),
+                r#async: false,
+                summary: "verify direct API without live SIFS".to_string(),
+            },
+        );
+
+        assert_eq!(outcome.status, AgentToolStatus::Succeeded, "{outcome:#?}");
+        assert_eq!(
+            outcome
+                .output
+                .get("stdout")
+                .and_then(serde_json::Value::as_str),
+            Some("usable")
+        );
+    }
+
+    #[test]
+    fn lifecycle_cleanup_failure_is_visible_and_prevents_success() {
+        let stderr = command_stderr_with_cleanup_failure(
+            b"command stderr".to_vec(),
+            Some("manifest save failed"),
+        );
+        assert_eq!(
+            String::from_utf8(stderr.clone()).expect("utf8 stderr"),
+            "command stderr\nsimple sandbox process lifecycle cleanup remains pending: manifest save failed"
+        );
+
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-cleanup-pending-result");
+        let config = LocalWorkspaceAgentConfig::new(&root);
+        let result = local_command_result_from_output(
+            &config,
+            root.to_path_buf(),
+            root.to_path_buf(),
+            "true",
+            &[],
+            &LocalCommandOutput {
+                stdout: Vec::new(),
+                stderr,
+                status_code: Some(0),
+                success: true,
+            },
+            false,
+            false,
+            true,
+            1,
+            None,
+            "run_command",
+            "cleanup test",
+            Vec::new(),
+            Some("true".to_string()),
+        );
+        assert_eq!(result.status, AgentToolStatus::Failed);
+        assert_eq!(
+            result
+                .output
+                .get("cleanup_pending")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            result
+                .output
+                .get("success")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
         );
     }
 
@@ -2350,6 +2718,7 @@ mod tests {
             &canonical_workspace,
             &[],
             &node_a,
+            None,
         )
         .expect("first placement");
         let result = prepare_agent_sandbox_manifest(
@@ -2362,6 +2731,7 @@ mod tests {
             &canonical_workspace,
             &[],
             &node_b,
+            None,
         );
 
         let error = result.expect_err("non-portable sandbox should reject node move");
@@ -2400,6 +2770,7 @@ mod tests {
             &canonical_workspace,
             &[],
             &node_id,
+            None,
         )
         .expect("manifest");
 
@@ -2434,59 +2805,80 @@ mod tests {
         assert!(manifest.lifecycle.stopped_at.is_some());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
-    fn simple_sandbox_command_denies_writes_outside_workspace_when_enforced() {
-        if !SandboxSimpleNativeCommandRunner::landlock_supported() {
-            return;
-        }
-        let root = sinomo_testdir::TestDir::new("sinomo-agent-sandbox-deny-write");
+    fn simple_sandbox_shell_writes_are_independent_of_structured_file_permissions() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-generic-host-shell");
         let workspace = root.join("workspace");
         let runtime_root = root.join("sandbox-runtime");
         fs::create_dir_all(&workspace).expect("workspace");
-        let outside = root.join("outside.txt");
+        let workspace_target = workspace.join("shell-write.txt");
+        let host_target = root.join("outside-workspace.txt");
         let config = LocalWorkspaceAgentConfig::new(&workspace)
             .with_sandbox_runtime_root(&runtime_root)
-            .without_agent_home_sifs_path();
-        let program = "tee";
-        let host_program = "/usr/bin/tee";
-        if !Path::new(host_program).exists() {
-            return;
-        }
-        let args = vec![outside.display().to_string()];
-
-        let execution = execute_local_command(
-            &config,
-            &test_session("sandbox-deny-write"),
-            program,
-            &args,
-            Some(b"blocked"),
-            Some(5000),
-            None,
-            &AgentCancellationToken::new(),
-            AgentToolProgressSink::default(),
-        )
-        .expect("sandbox command should start");
-
-        assert!(!execution.output.success);
-        assert!(!outside.exists());
-        assert!(
-            String::from_utf8_lossy(&execution.output.stderr)
-                .to_ascii_lowercase()
-                .contains("permission")
+            .without_agent_home_sifs_path()
+            .allowing_shell_commands(true)
+            .allowing_file_writes(false);
+        let script = format!(
+            "printf workspace >'{}'; printf host >'{}'",
+            workspace_target.display(),
+            host_target.display(),
         );
+
+        let registry = AgentToolRegistry::local_workspace_with_config(config);
+        assert!(registry.contains("run_command"));
+        let outcome = registry.execute(
+            &test_session("generic-host-shell"),
+            0,
+            0,
+            &AgentToolCall {
+                call_id: None,
+                tool: "run_command".to_string(),
+                input: serde_json::json!({ "command": script, "timeout_ms": 5000 }),
+                r#async: false,
+                summary: "run generic host command".to_string(),
+            },
+        );
+
+        assert_eq!(
+            outcome.status,
+            crate::AgentToolStatus::Succeeded,
+            "{outcome:#?}"
+        );
+        assert_eq!(
+            fs::read(&workspace_target).expect("workspace write"),
+            b"workspace"
+        );
+        assert_eq!(fs::read(&host_target).expect("host write"), b"host");
     }
 
     #[test]
-    fn simple_sandbox_policy_allows_roaming_agent_home_prefix() {
+    fn simple_sandbox_policy_admits_live_read_write_agent_home_mount() {
         let policy = agent_sandbox_policy();
+        let node_id = NodeId::from_legacy_named("agent-home-policy-node").expect("node");
+        let mut manifest = SandboxInstanceManifest::new(
+            SandboxId::from_legacy_named("agent-home-policy-sandbox").expect("sandbox"),
+            SandboxToolchainId::from_legacy_named("agent-home-policy-toolchain")
+                .expect("toolchain"),
+            time::OffsetDateTime::UNIX_EPOCH,
+        )
+        .expect("manifest");
+        manifest.mounts.push(SandboxMount {
+            source_sifs_path: "/sinomo/agents/test-agent/home".to_string(),
+            mount_path: SandboxPath::new("/home").expect("mount path"),
+            mode: SandboxMountMode::ReadWrite,
+        });
 
+        assert!(policy.allow_read_write_sifs_mounts);
         assert!(
             policy
                 .allowed_mount_prefixes
                 .iter()
                 .any(|prefix| prefix == "/sinomo/agents")
         );
+        policy
+            .validate_manifest(&manifest, &node_id)
+            .expect("agent home live read-write mount admitted");
     }
 
     #[test]

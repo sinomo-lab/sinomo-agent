@@ -2610,7 +2610,8 @@ fn check_version_control_active_cancellation_smoke() -> AgentReadinessCheck {
     let registry = AgentToolRegistry::local_workspace_with_config(
         LocalWorkspaceAgentConfig::new(&workspace_root)
             .using_local_process_commands()
-            .with_git_program(fake_git_program.clone()),
+            .with_git_program(fake_git_program.clone())
+            .enabling_git_tools(),
     );
     let session = readiness_session();
     let cancellation_token = AgentCancellationToken::new();

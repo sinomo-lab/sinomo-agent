@@ -201,12 +201,17 @@ impl From<tui::AppRuntimeInfo> for ChatRuntimeInfo {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ChatToolRuntimeSelection {
     pub sandbox_node_id: Option<String>,
+    /// Device-local directory used for this chat's tools. The canonical copy
+    /// is persisted in `AgentSession.workspace_binding` so resume is safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<PathBuf>,
 }
 
 impl ChatToolRuntimeSelection {
     fn from_agent_definition(definition: &AgentDefinition) -> Self {
         Self {
             sandbox_node_id: definition.tool_runtime.sandbox_node_id.clone(),
+            workspace_root: None,
         }
     }
 }
@@ -2166,6 +2171,19 @@ impl AgentChat {
             })?;
         match persisted_session {
             Some(mut persisted) => {
+                if !self.tool_runtime_explicit_override {
+                    self.tool_runtime.workspace_root = persisted
+                        .workspace_binding
+                        .as_ref()
+                        .map(|binding| {
+                            crate::workspace_binding_root_for_data_dir(
+                                &self.data_dir,
+                                &persisted.session_id,
+                                binding,
+                            )
+                        })
+                        .transpose()?;
+                }
                 let channel_view = channel.clone();
                 if let Some(participant) = channel.participant_mut(&participant_id) {
                     sync_participant_session(&channel_view, participant, &mut persisted);
@@ -2200,6 +2218,9 @@ impl AgentChat {
             )?,
         }
         self.channel = channel;
+        if self.tool_runtime_explicit_override {
+            self.configure_tool_runtime_for_session(&session.session_id)?;
+        }
         if loaded_existing_channel && self.channel != channel_before_resume {
             self.save_channel()?;
         }
@@ -2228,8 +2249,51 @@ impl AgentChat {
         if let Some(node_id) = &normalized {
             parse_chat_tool_runtime_node_id(node_id)?;
         }
-        self.tool_runtime.sandbox_node_id = normalized;
+        let mut selection = self.tool_runtime.clone();
+        selection.sandbox_node_id = normalized;
+        self.set_tool_runtime(selection)
+    }
+
+    pub fn set_tool_runtime(
+        &mut self,
+        mut selection: ChatToolRuntimeSelection,
+    ) -> Result<ChatToolRuntimeSelection, CliError> {
+        selection.sandbox_node_id = selection
+            .sandbox_node_id
+            .map(|node_id| node_id.trim().to_string())
+            .filter(|node_id| !node_id.is_empty());
+        if let Some(node_id) = selection.sandbox_node_id.as_deref() {
+            parse_chat_tool_runtime_node_id(node_id)?;
+        }
+        if let Some(root) = selection.workspace_root.as_ref() {
+            if root.as_os_str().is_empty() {
+                return Err(CliError::Parse {
+                    detail: "workspace directory cannot be empty".to_string(),
+                });
+            }
+        }
+
+        let session_id = self.runtime.session().session_id.clone();
+        let sandbox_node_id = parse_chat_tool_runtime_selection(&selection)?;
+        let selected_root = self
+            .runtime
+            .handler_mut()
+            .configure_app_tool_runtime_for_session(
+                &self.data_dir,
+                &session_id,
+                sandbox_node_id,
+                selection.workspace_root.as_deref(),
+                self.daemon_connected,
+            )?;
+        selection.workspace_root = selected_root;
+        self.tool_runtime = selection;
         self.tool_runtime_explicit_override = true;
+        let info = self.runtime_info();
+        let participant_id = ensure_primary_participant(&mut self.channel, &info, true);
+        let tool_runtime = self.tool_runtime.clone();
+        set_participant_tool_runtime(&mut self.channel, &participant_id, &tool_runtime);
+        self.save_channel()?;
+        self.persist_primary_session_checkpoint()?;
         Ok(self.tool_runtime())
     }
 
@@ -2238,9 +2302,18 @@ impl AgentChat {
         session_id: &SessionId,
     ) -> Result<(), CliError> {
         let sandbox_node_id = parse_chat_tool_runtime_selection(&self.tool_runtime)?;
-        self.runtime
+        let selected_root = self
+            .runtime
             .handler_mut()
-            .configure_tool_runtime_for_session(&self.data_dir, session_id, sandbox_node_id)
+            .configure_app_tool_runtime_for_session(
+                &self.data_dir,
+                session_id,
+                sandbox_node_id,
+                self.tool_runtime.workspace_root.as_deref(),
+                self.daemon_connected,
+            )?;
+        self.tool_runtime.workspace_root = selected_root;
+        Ok(())
     }
 
     pub fn channel_id(&self) -> String {
@@ -2876,26 +2949,34 @@ impl AgentChannelTurnExecutor for AppAgentChannelExecutor<'_> {
             self.data_dir,
             Some(&participant.agent_session_id.to_string()),
         );
-        let tool_runtime = if self.tool_runtime_explicit_override {
+        let mut tool_runtime = if self.tool_runtime_explicit_override {
             self.tool_runtime.clone()
         } else {
             chat_tool_runtime_from_agent_runtime_definition(&participant.tool_runtime)
         };
+        if tool_runtime.workspace_root.is_none() {
+            tool_runtime.workspace_root = session
+                .workspace_binding
+                .as_ref()
+                .and_then(|binding| binding.local_root.clone());
+        }
         let sandbox_node_id =
             parse_chat_tool_runtime_selection(&tool_runtime).map_err(channel_executor_cli_error)?;
-        self.runtime
-            .handler_mut()
-            .configure_tool_runtime_for_session(
-                self.data_dir,
-                &interaction_session.session_id,
-                sandbox_node_id,
-            )
-            .map_err(channel_executor_cli_error)?;
         self.runtime
             .replace_store_and_session(InMemoryEventStore::new(), interaction_session.clone());
         self.runtime
             .handler_mut()
             .replace_full_agent_session(&interaction_session, session.clone())
+            .map_err(channel_executor_cli_error)?;
+        self.runtime
+            .handler_mut()
+            .configure_app_tool_runtime_for_session(
+                self.data_dir,
+                &interaction_session.session_id,
+                sandbox_node_id,
+                tool_runtime.workspace_root.as_deref(),
+                self.daemon_connected,
+            )
             .map_err(channel_executor_cli_error)?;
 
         let mut streamed_answer = String::new();
@@ -3553,6 +3634,7 @@ fn chat_tool_runtime_from_agent_runtime_definition(
 ) -> ChatToolRuntimeSelection {
     ChatToolRuntimeSelection {
         sandbox_node_id: tool_runtime.sandbox_node_id.clone(),
+        workspace_root: None,
     }
 }
 
@@ -6749,6 +6831,119 @@ mod tests {
             participant.tool_runtime.sandbox_node_id.as_deref(),
             Some("worker-node")
         );
+    }
+
+    #[test]
+    fn app_chat_workspace_selection_is_persisted_in_the_agent_session() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-workspace-binding");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let workspace = root.join("selected-directory");
+        fs::create_dir_all(&workspace).expect("create selected directory");
+        let canonical_workspace = fs::canonicalize(&workspace).expect("canonical workspace");
+
+        let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        chat.set_agent("coding-agent").expect("select coding agent");
+        let selection = chat
+            .set_tool_runtime(ChatToolRuntimeSelection {
+                workspace_root: Some(workspace),
+                ..ChatToolRuntimeSelection::default()
+            })
+            .expect("bind workspace");
+
+        assert_eq!(
+            selection.workspace_root.as_deref(),
+            Some(canonical_workspace.as_path())
+        );
+        let session = chat
+            .runtime
+            .handler()
+            .agent_session_snapshot()
+            .expect("runtime snapshot")
+            .expect("attached session");
+        assert_eq!(
+            session
+                .workspace_binding
+                .as_ref()
+                .and_then(|binding| binding.local_root.as_deref()),
+            Some(canonical_workspace.as_path())
+        );
+        let persisted = FileAgentSessionStore::for_data_dir(&data_dir)
+            .load_session(&session.session_id)
+            .expect("load session")
+            .expect("persisted session");
+        assert_eq!(persisted.workspace_binding, session.workspace_binding);
+    }
+
+    #[test]
+    fn portable_sifs_workspace_binding_remaps_across_device_mounts() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-portable-sifs-workspace");
+        let mount_a = root.join("device-a/data/mounts/sifs");
+        let mount_b = root.join("device-b/data/mounts/sifs");
+        let workspace_a = mount_a.join("teams/shared-workspace");
+        let workspace_b = mount_b.join("teams/shared-workspace");
+        fs::create_dir_all(&workspace_a).expect("create device A workspace");
+        fs::create_dir_all(&workspace_b).expect("create device B workspace");
+
+        let binding_a =
+            crate::workspace_ref_for_root_with_verified_sifs_mount(&workspace_a, Some(&mount_a))
+                .expect("create portable device A binding");
+        let binding_b =
+            crate::workspace_ref_for_root_with_verified_sifs_mount(&workspace_b, Some(&mount_b))
+                .expect("create portable device B binding");
+        assert_eq!(binding_a.local_root, None);
+        assert_eq!(
+            binding_a.sifs_root.as_deref(),
+            Some("/teams/shared-workspace")
+        );
+        assert_eq!(binding_a.write_policy.as_deref(), Some("live-posix"));
+        let session_id = SessionId::generate();
+        crate::validate_agent_session_workspace_binding(&session_id, &binding_a, &binding_b)
+            .expect("same logical SIFS root matches across device-local prefixes");
+
+        let store =
+            FileAgentSessionStore::for_data_dir(&SinomoDataDir::new(root.join("session-store")));
+        let (created, resumed) = crate::load_or_create_agent_run_session(
+            &store,
+            session_id.clone(),
+            AgentRole::Deliberation,
+            Some(&binding_a),
+        )
+        .expect("persist device A logical binding");
+        assert!(!resumed);
+        assert_eq!(created.workspace_binding.as_ref(), Some(&binding_a));
+        let (resumed_session, resumed) = crate::load_or_create_agent_run_session(
+            &store,
+            session_id.clone(),
+            AgentRole::Deliberation,
+            Some(&binding_b),
+        )
+        .expect("resume same logical workspace from device B prefix");
+        assert!(resumed);
+        assert_eq!(resumed_session.workspace_binding.as_ref(), Some(&binding_a));
+
+        let remapped = crate::workspace_binding_root_with_verified_sifs_mount(
+            &session_id,
+            &binding_a,
+            &mount_b,
+        )
+        .expect("remap binding on device B");
+        assert_eq!(
+            remapped,
+            fs::canonicalize(&workspace_b).expect("canonical B workspace")
+        );
+
+        let other_workspace_b = mount_b.join("teams/other-workspace");
+        fs::create_dir_all(&other_workspace_b).expect("create mismatched workspace");
+        let mismatch = crate::workspace_ref_for_root_with_verified_sifs_mount(
+            &other_workspace_b,
+            Some(&mount_b),
+        )
+        .expect("create mismatched binding");
+        let error =
+            crate::validate_agent_session_workspace_binding(&session_id, &binding_a, &mismatch)
+                .expect_err("different logical SIFS roots must not resume as the same workspace");
+        assert!(error.to_string().contains("/teams/shared-workspace"));
+        assert!(error.to_string().contains("/teams/other-workspace"));
     }
 
     #[test]

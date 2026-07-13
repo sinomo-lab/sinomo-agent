@@ -792,7 +792,7 @@ impl AgentDefinition {
             package: AgentPackageDefinition::built_in(),
             id: "coding-agent".to_string(),
             name: "coding-agent".to_string(),
-            description: "workspace coding and verification agent".to_string(),
+            description: "general workspace task and verification agent".to_string(),
             role: AgentRole::Deliberation,
             system_prompt: coding_agent_base_prompt().to_string(),
             tools: default_coding_agent_tools(),
@@ -1578,7 +1578,7 @@ pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
         AgentToolSpec::new(
             AgentToolKind::ListFiles,
             "list_files",
-            "List workspace files and directories with bounded recursion; use this before broad shell commands when discovering repository structure.",
+            "List workspace files and directories with bounded recursion; use this before broad shell commands when discovering workspace structure.",
             false,
         ),
         AgentToolSpec::new(
@@ -1602,7 +1602,7 @@ pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
         AgentToolSpec::new(
             AgentToolKind::RunShellCommand,
             "run_command",
-            "Run a bounded workspace command in the current sandbox. Commands start in the workspace root; omit cwd unless using a workspace subdirectory. If validation fails because dependencies are missing or package installation is blocked, do not loop on environment setup unless the task is dependency setup.",
+            "Run a generic host command through simple-sandbox. Commands start in the workspace root and may access any host path admitted by runtime policy; structured workspace file permissions do not make shell commands read-only. Omit cwd unless using a known workspace subdirectory.",
             true,
         ),
         AgentToolSpec::new(
@@ -1671,35 +1671,52 @@ fn background_agent_base_prompt() -> &'static str {
 }
 
 fn coding_agent_base_prompt() -> &'static str {
-    r#"You are Sinomo's deliberation agent model.
+    r#"You are Sinomo's general workspace agent model.
 
 You operate inside Sinomo's coding-agent loop. The runtime owns tool execution,
-tool-surface availability, sandbox enforcement, event emission, and session
-state. Use tools when evidence or workspace changes are needed, then continue
-after tool_result messages arrive.
+tool-surface availability, policy admission, sandbox lifecycle, event emission,
+and session state. Use tools when evidence or workspace changes are needed,
+then continue after tool_result messages arrive.
 
-Workspace commands start in the repository root. Do not cd to guessed paths
-such as /workspace or /home/user/project; pass a relative cwd only for a known
-workspace subdirectory. Prefer read_file, list_files, and search for focused
-inspection; when shell search is needed, prefer rg or rg --files.
+The workspace may contain source code, documents, datasets, media, arbitrary
+files, or nothing yet. Do not assume it is a Git repository, a Cargo project,
+or even a software project, and do not assume Git, Cargo, or any particular
+toolchain is installed. Infer the task and available tools from workspace
+evidence. Commands start in the configured workspace root. Do not cd to guessed
+paths such as /workspace or /home/user/project; pass a relative cwd only for a
+known workspace subdirectory. Prefer read_file, list_files, and search for
+focused inspection. Use rg or rg --files for shell search only when rg is
+actually available.
+
+run_command is a generic host-command tool executed through simple-sandbox. It
+is not development-specific and is not made read-only by the structured
+file-tool permission flag. The runtime still performs policy admission, limits,
+cancellation, leases, and audit, but simple-sandbox is a best-effort permission
+boundary hint rather than a hard anti-escape security sandbox. Use ambient host
+access intentionally and do not claim stronger containment than the runtime
+provides.
+
+SIFS/DFS paths exposed by the runtime are live POSIX mounts. Reads and writes
+synchronize through the filesystem continuously, independently of checkpoint
+state. Checkpoints track and restore work; they are not command commits, flush
+boundaries, copy-back steps, or synchronization gates.
 
 Command stdout and stderr are returned in the next tool_result. Treat that
 output as the diagnostic and adjust from it instead of repeating the same
 command blindly. If validation is blocked by missing dependencies or host setup,
-inspect the current diff and finish with the blocker rather than looping on
+inspect the current state and finish with the blocker rather than looping on
 environment setup unless the task is dependency setup.
 
-Use edit_file for targeted source edits and write_file only for intentional
-new-file creation or whole-file replacement. Keep edits small and
-source-focused. Do not revert or overwrite user changes you did not make.
-edit_file requires exact old_text/new_text; when old_text matches multiple
-places, provide more surrounding context or explicitly set replace_all.
-write_file refuses to replace existing files unless overwrite=true. Formatting
-commands and generated output may use the normal project tools through
-run_command. If apply_patch is visible in your tool list, you may use it for
-scoped patch edits; otherwise discover provider-specific editing tools through
-tool_search only when the selected model/provider has a reliable native patch
-capability.
+Use edit_file for targeted text edits and write_file only for intentional
+new-file creation or whole-file replacement. Keep edits focused. Do not revert
+or overwrite user changes you did not make. edit_file requires exact
+old_text/new_text; when old_text matches multiple places, provide more
+surrounding context or explicitly set replace_all. write_file refuses to replace
+existing files unless overwrite=true. Formatting commands and generated output
+may use suitable host tools through run_command when those tools exist. If
+apply_patch is visible in your tool list, you may use it for scoped patch edits;
+otherwise discover provider-specific editing tools through tool_search only
+when the selected model/provider has a reliable native patch capability.
 
 When the next step is clear and no more tools are needed, return an empty
 tool_calls array. If a tool fails or is blocked, recover from the model-visible
@@ -2714,6 +2731,39 @@ mod tests {
                 "main prompt still promises unavailable behavior: {removed}"
             );
         }
+    }
+
+    #[test]
+    fn coding_agent_prompt_treats_workspace_and_shell_as_generic() {
+        let definition = AgentDefinition::coding();
+        let prompt = definition.system_prompt;
+        let normalized_prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        for expected in [
+            "general workspace agent",
+            "Do not assume it is a Git repository, a Cargo project",
+            "run_command is a generic host-command tool",
+            "structured file-tool permission flag",
+            "SIFS/DFS paths exposed by the runtime are live POSIX mounts",
+            "independently of checkpoint state",
+        ] {
+            assert!(
+                normalized_prompt.contains(expected),
+                "missing generic guidance: {expected}"
+            );
+        }
+        assert_eq!(
+            definition.description,
+            "general workspace task and verification agent"
+        );
+        let run_command = definition
+            .tools
+            .iter()
+            .find(|tool| tool.name == "run_command")
+            .expect("run command tool");
+        assert!(run_command.description.contains("generic host command"));
+        assert!(!run_command.description.contains("Cargo"));
+        assert!(!run_command.description.contains("Git"));
     }
 
     #[test]

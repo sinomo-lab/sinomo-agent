@@ -10908,38 +10908,27 @@ fn daemon_sandbox_write_to_read_only_mount_emits_denial_events() {
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
     let mut dfs =
         super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("open dfs service");
-    dfs.posix_mkdir_all("/services/sandbox/shared")
+    dfs.posix_mkdir_all("/services/sandbox-shared/shared")
         .expect("shared source");
+    let local_node_id = dfs.node_id().clone();
+    dfs.posix_write_file(
+        "/services/sandbox-shared/shared/existing.txt",
+        b"from mount\n",
+        sinomo_runtime::dfs::DfsWriteOptions::replicated_eventual(vec![local_node_id]),
+    )
+    .expect("seed shared source");
     let mut instance_store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
     let mut manifest = instance_store
         .create(sandbox_id.clone(), toolchain_id, OffsetDateTime::now_utc())
         .expect("create sandbox");
     manifest.mounts.push(sinomo_runtime::sandbox::SandboxMount {
-        source_sifs_path: "/services/sandbox/shared".to_string(),
+        source_sifs_path: "/services/sandbox-shared/shared".to_string(),
         mount_path: sinomo_runtime::sandbox::SandboxPath::new("/host").expect("mount path"),
-        mode: sinomo_runtime::sandbox::SandboxMountMode::ReadWrite,
+        mode: sinomo_runtime::sandbox::SandboxMountMode::ReadOnly,
     });
     instance_store.save_manifest(&manifest).expect("save mount");
     drop(instance_store);
 
-    daemon_handle_daemon_sandbox_write(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxWriteRequest {
-            sandbox_id: sandbox_id.clone(),
-            path: sinomo_runtime::sandbox::SandboxPath::new("/host/existing.txt").expect("path"),
-            bytes: b"from mount\n".to_vec(),
-        },
-    )
-    .expect("rw mount write seeds source");
-    let dfs =
-        super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("reopen dfs service");
-    let mut instance_store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
-    let mut manifest = instance_store.load(&sandbox_id).expect("reload manifest");
-    manifest.mounts[0].mode = sinomo_runtime::sandbox::SandboxMountMode::ReadOnly;
-    instance_store
-        .save_manifest(&manifest)
-        .expect("save ro mount");
-    drop(instance_store);
     let mounted_read = daemon_handle_daemon_sandbox_read(
         &daemon_paths,
         sinomo_runtime::sandbox::SandboxReadRequest {
@@ -10965,7 +10954,7 @@ fn daemon_sandbox_write_to_read_only_mount_emits_denial_events() {
     let dfs =
         super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("reopen dfs service");
     let missing_mount_write = dfs
-        .posix_read_file("/services/sandbox/shared/out.txt")
+        .posix_read_file("/services/sandbox-shared/shared/out.txt")
         .expect_err("denied write must not mutate the read-only mount source");
     assert!(format!("{missing_mount_write:?}").contains("NotFound"));
     let event_store =
@@ -14705,10 +14694,14 @@ fn main_agent_tool_registry_exposes_config_catalog_and_workspace_tools() {
         "skill_update",
         "read_file",
         "search",
-        "changed_files",
-        "git_diff",
     ] {
         assert!(names.iter().any(|name| name == expected), "{expected}");
+    }
+    for vcs_only in ["changed_files", "git_diff"] {
+        assert!(
+            !names.iter().any(|name| name == vcs_only),
+            "{vcs_only} should only be exposed when the selected workspace supports it"
+        );
     }
 
     let session = InteractionSession::new(
@@ -15016,6 +15009,27 @@ fn coding_agent_rejects_unsafe_mutating_workspace_roots() {
         .expect("filesystem root must not become a mutating coding workspace");
         assert!(root_error.to_string().contains("unsafe workspace root"));
     }
+}
+
+#[test]
+fn coding_agent_rejects_plain_directory_that_looks_like_the_live_sifs_mount() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-fake-sifs-workspace");
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    let lookalike = data_dir.root().join("mounts/sifs/projects/selected");
+    fs::create_dir_all(&lookalike).expect("create plain lookalike directory");
+
+    let error = super::agent_tool_registry_for_workspace(
+        &data_dir,
+        &lookalike,
+        &sinomo_agent::AgentDefinition::coding(),
+        Some(&SessionId::generate()),
+        None,
+        true,
+    )
+    .err()
+    .expect("an ordinary directory under mounts/sifs is still Sinomo internal state");
+
+    assert!(error.to_string().contains("unsafe workspace root"));
 }
 
 #[test]

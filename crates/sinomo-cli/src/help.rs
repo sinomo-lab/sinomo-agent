@@ -78,7 +78,7 @@ pub(super) fn print_agent_help() {
         "      With --compact-after, run real compaction after the turn and persist its context projection."
     );
     println!(
-        "      The built-in coding-agent may modify only the explicit project directory where this CLI command is run; unsafe roots are rejected."
+        "      The built-in coding-agent may modify only the explicit workspace directory where this CLI command is run; unsafe roots are rejected."
     );
     println!("  sinomo agent validate [agent-id|--file <path>] [--json]");
     println!("      Validate an agent package from the catalog or a JSON artifact.");

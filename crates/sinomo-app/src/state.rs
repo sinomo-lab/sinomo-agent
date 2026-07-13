@@ -298,9 +298,6 @@ pub struct AppState {
     pub theme_mode: AppThemeMode,
     pub render_mode: AppRenderMode,
     pub data_dir: Arc<SinomoDataDir>,
-    /// Renderer-device bridge for app-owned custom GPU textures. Multimedia
-    /// policy stays in Sinomo; SUI only composes the registered image handle.
-    pub external_texture_registry: sui::WgpuExternalTextureRegistry,
     /// Live status line for the title-bar indicator while connecting.
     pub status: String,
     /// When the current `status` line was set — the loading screen surfaces the
@@ -332,7 +329,6 @@ impl AppState {
             theme_mode,
             render_mode,
             data_dir,
-            external_texture_registry: sui::WgpuExternalTextureRegistry::new(),
             status: "Starting…".to_string(),
             status_since: Some(Instant::now()),
             ready: None,
@@ -355,7 +351,6 @@ impl AppState {
             theme_mode,
             render_mode,
             data_dir,
-            external_texture_registry: sui::WgpuExternalTextureRegistry::new(),
             status: backend.mode_label(),
             status_since: None,
             ready: Some(ReadyState::build(backend)),
@@ -373,10 +368,6 @@ impl AppState {
 
     pub fn render_options(&self) -> WindowRenderOptions {
         resolve_render_options(self.render_mode)
-    }
-
-    pub fn external_texture_registry(&self) -> sui::WgpuExternalTextureRegistry {
-        self.external_texture_registry.clone()
     }
 
     pub fn is_ready(&self) -> bool {
@@ -407,10 +398,6 @@ impl Shared {
 
     pub fn render_options(&self) -> WindowRenderOptions {
         self.0.borrow().render_options()
-    }
-
-    pub fn external_texture_registry(&self) -> sui::WgpuExternalTextureRegistry {
-        self.0.borrow().external_texture_registry()
     }
 
     pub fn render_mode(&self) -> AppRenderMode {

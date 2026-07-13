@@ -126,7 +126,7 @@ pub enum ChatCommand {
         history: Vec<ChatHistoryMessage>,
     },
     SetToolRuntime {
-        sandbox_node_id: Option<String>,
+        selection: ChatToolRuntimeSelection,
     },
     /// Ask sinomo-lm for the provider's available models (fetched off the worker so the
     /// blocking API call never stalls chat turns); the result arrives as [`ChatEvent::Models`].
@@ -835,6 +835,18 @@ fn worker(
                     });
                 } else {
                     set_active_session_id(&active_session_id, &evt_tx, session_id);
+                    let _ = evt_tx.send(ChatEvent::ToolRuntime(chat.tool_runtime()));
+                    match chat.control_state() {
+                        Ok(state) => {
+                            let _ = evt_tx.send(ChatEvent::ControlState(state));
+                        }
+                        Err(error) => {
+                            let _ = evt_tx.send(ChatEvent::Error {
+                                session_id: Some(chat.session_id()),
+                                error: format!("resume control state failed: {error}"),
+                            });
+                        }
+                    }
                 }
             }
             ChatCommand::SetModel {
@@ -882,19 +894,17 @@ fn worker(
                     }
                 }
             }
-            ChatCommand::SetToolRuntime { sandbox_node_id } => {
-                match chat.set_tool_runtime_node(sandbox_node_id) {
-                    Ok(selection) => {
-                        let _ = evt_tx.send(ChatEvent::ToolRuntime(selection));
-                    }
-                    Err(error) => {
-                        let _ = evt_tx.send(ChatEvent::Error {
-                            session_id: Some(chat.session_id()),
-                            error: format!("tool runtime update failed: {error}"),
-                        });
-                    }
+            ChatCommand::SetToolRuntime { selection } => match chat.set_tool_runtime(selection) {
+                Ok(selection) => {
+                    let _ = evt_tx.send(ChatEvent::ToolRuntime(selection));
                 }
-            }
+                Err(error) => {
+                    let _ = evt_tx.send(ChatEvent::Error {
+                        session_id: Some(chat.session_id()),
+                        error: format!("tool runtime update failed: {error}"),
+                    });
+                }
+            },
             ChatCommand::FetchModels { provider } => {
                 // Fetch off-thread: the provider API call blocks, and chat turns must not.
                 let tx = evt_tx.clone();
@@ -1035,6 +1045,22 @@ mod tests {
             )
         })
         .expect("control state after removal");
+
+        handle.send_command(ChatCommand::Resume {
+            session_id: session_id.clone(),
+            history: Vec::new(),
+        });
+        wait_for_event(&handle, |event| {
+            matches!(
+                event,
+                ChatEvent::ControlState(state)
+                    if state.session_id == session_id
+                        && state.runtime_attached
+                        && state.follow_up_count == 1
+                        && state.queued_inputs.len() == 1
+            )
+        })
+        .expect("resume emits authoritative control state");
 
         let new_session_id = SessionId::from_legacy_named("sess_chat_new_session")
             .expect("session id")

@@ -603,6 +603,10 @@ static CLI_RUNTIME_CONFIG: OnceLock<CliRuntimeConfig> = OnceLock::new();
 
 #[cfg(unix)]
 static PROCESS_STDIO_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(all(unix, feature = "dfs-fuse"))]
+static SIMPLE_SANDBOX_SIFS_MOUNTS: OnceLock<
+    Mutex<BTreeMap<PathBuf, sinomo_dfs_fuse::DfsFuseMountHandle>>,
+> = OnceLock::new();
 
 pub type CliConfigRegistryHook = Box<
     dyn Fn(
@@ -4314,38 +4318,149 @@ fn load_or_create_agent_run_session(
     }
 }
 
-fn coding_agent_workspace_binding(
+pub(crate) fn coding_agent_workspace_binding(
     data_dir: &SinomoDataDir,
     workspace_root: &Path,
 ) -> Result<WorkspaceRef, CliError> {
-    validate_mutating_workspace_root(data_dir, workspace_root)?;
-    Ok(WorkspaceRef::local_path(absolute_normalized_path(
+    let verified_sifs_mount = live_sifs_mount_for_selected_root(data_dir, workspace_root)?;
+    validate_mutating_workspace_root_with_live_mount(
+        data_dir,
         workspace_root,
-    )?))
+        verified_sifs_mount.as_deref(),
+    )?;
+    workspace_ref_for_root_with_verified_sifs_mount(workspace_root, verified_sifs_mount.as_deref())
 }
 
-fn validate_agent_session_workspace_binding(
+const LIVE_POSIX_SIFS_WRITE_POLICY: &str = "live-posix";
+
+pub(crate) fn workspace_ref_for_selected_root(
+    data_dir: &SinomoDataDir,
+    workspace_root: &Path,
+) -> Result<WorkspaceRef, CliError> {
+    let verified_sifs_mount = live_sifs_mount_for_selected_root(data_dir, workspace_root)?;
+    workspace_ref_for_root_with_verified_sifs_mount(workspace_root, verified_sifs_mount.as_deref())
+}
+
+pub(crate) fn workspace_ref_for_root_with_verified_sifs_mount(
+    workspace_root: &Path,
+    verified_sifs_mount: Option<&Path>,
+) -> Result<WorkspaceRef, CliError> {
+    let workspace_root = absolute_normalized_path(workspace_root)?;
+    let Some(mount_root) = verified_sifs_mount else {
+        return Ok(WorkspaceRef::local_path(workspace_root));
+    };
+    let mount_root = absolute_normalized_path(mount_root)?;
+    let relative = workspace_root
+        .strip_prefix(&mount_root)
+        .map_err(|_| CliError::Parse {
+            detail: format!(
+                "workspace `{}` is not beneath verified live SIFS mount `{}`",
+                workspace_root.display(),
+                mount_root.display()
+            ),
+        })?;
+    let mut segments = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(segment) => {
+                let segment = segment.to_str().ok_or_else(|| CliError::Parse {
+                    detail: format!(
+                        "SIFS workspace path contains non-Unicode component: {}",
+                        workspace_root.display()
+                    ),
+                })?;
+                segments.push(segment);
+            }
+            std::path::Component::CurDir => {}
+            _ => {
+                return Err(CliError::Parse {
+                    detail: format!("invalid SIFS workspace path: {}", workspace_root.display()),
+                });
+            }
+        }
+    }
+    let sifs_root = if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
+    };
+    Ok(WorkspaceRef::sifs(format!("sifs:{sifs_root}"), sifs_root)
+        .with_write_policy(LIVE_POSIX_SIFS_WRITE_POLICY))
+}
+
+pub(crate) fn validate_agent_session_workspace_binding(
     session_id: &SessionId,
     existing_binding: &WorkspaceRef,
     requested_binding: &WorkspaceRef,
 ) -> Result<(), CliError> {
-    let existing_root = local_workspace_binding_root(session_id, existing_binding)?;
-    let requested_root = local_workspace_binding_root(session_id, requested_binding)?;
-    let existing_root = absolute_normalized_path(existing_root)?;
-    let requested_root = absolute_normalized_path(requested_root)?;
-    if existing_root == requested_root {
-        return Ok(());
+    match (
+        existing_binding.sifs_root.as_deref(),
+        requested_binding.sifs_root.as_deref(),
+    ) {
+        (Some(existing), Some(requested)) => {
+            if normalize_logical_sifs_root(existing)? == normalize_logical_sifs_root(requested)? {
+                return Ok(());
+            }
+        }
+        (None, None) => {
+            let existing_root = local_workspace_binding_root(session_id, existing_binding)?;
+            let requested_root = local_workspace_binding_root(session_id, requested_binding)?;
+            if absolute_normalized_path(existing_root)? == absolute_normalized_path(requested_root)?
+            {
+                return Ok(());
+            }
+        }
+        _ => {}
     }
     Err(CliError::Parse {
         detail: format!(
-            "coding-agent session `{session_id}` is bound to workspace `{}` and cannot be resumed from `{}`; run the command from the original workspace or start a new session without `--session`",
-            existing_root.display(),
-            requested_root.display()
+            "agent session `{session_id}` is bound to workspace `{}` and cannot be resumed from `{}`; choose the original workspace or start a new session",
+            workspace_binding_display(existing_binding),
+            workspace_binding_display(requested_binding)
         ),
     })
 }
 
-fn local_workspace_binding_root<'a>(
+fn workspace_binding_display(binding: &WorkspaceRef) -> String {
+    binding
+        .sifs_root
+        .as_ref()
+        .map(|root| format!("sifs:{root}"))
+        .or_else(|| {
+            binding
+                .local_root
+                .as_ref()
+                .map(|root| root.display().to_string())
+        })
+        .unwrap_or_else(|| binding.id.clone())
+}
+
+fn normalize_logical_sifs_root(root: &str) -> Result<String, CliError> {
+    if !root.starts_with('/') {
+        return Err(CliError::Parse {
+            detail: format!("SIFS workspace root must be absolute: {root}"),
+        });
+    }
+    let mut segments = Vec::new();
+    for segment in root.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                return Err(CliError::Parse {
+                    detail: format!("SIFS workspace root escapes its mount: {root}"),
+                });
+            }
+            segment => segments.push(segment),
+        }
+    }
+    Ok(if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
+    })
+}
+
+pub(crate) fn local_workspace_binding_root<'a>(
     session_id: &SessionId,
     binding: &'a WorkspaceRef,
 ) -> Result<&'a Path, CliError> {
@@ -4354,6 +4469,41 @@ fn local_workspace_binding_root<'a>(
             "coding-agent session `{session_id}` has a non-local workspace binding and cannot be resumed by the local CLI"
         ),
     })
+}
+
+pub(crate) fn workspace_binding_root_for_data_dir(
+    data_dir: &SinomoDataDir,
+    session_id: &SessionId,
+    binding: &WorkspaceRef,
+) -> Result<PathBuf, CliError> {
+    if binding.sifs_root.is_none() {
+        return absolute_normalized_path(local_workspace_binding_root(session_id, binding)?);
+    }
+    let mount_root = ensure_simple_sandbox_sifs_mount(data_dir)?.ok_or_else(|| CliError::Parse {
+        detail: format!(
+            "agent session `{session_id}` uses SIFS workspace `{}`, but this device has no active live SIFS mount",
+            workspace_binding_display(binding)
+        ),
+    })?;
+    workspace_binding_root_with_verified_sifs_mount(session_id, binding, &mount_root)
+}
+
+pub(crate) fn workspace_binding_root_with_verified_sifs_mount(
+    session_id: &SessionId,
+    binding: &WorkspaceRef,
+    verified_sifs_mount: &Path,
+) -> Result<PathBuf, CliError> {
+    let Some(sifs_root) = binding.sifs_root.as_deref() else {
+        return absolute_normalized_path(local_workspace_binding_root(session_id, binding)?);
+    };
+    let sifs_root = normalize_logical_sifs_root(sifs_root)?;
+    let mut local_root = absolute_normalized_path(verified_sifs_mount)?;
+    for segment in sifs_root.trim_start_matches('/').split('/') {
+        if !segment.is_empty() {
+            local_root.push(segment);
+        }
+    }
+    Ok(local_root)
 }
 
 pub(crate) fn main_agent_config_tool_registry(
@@ -4512,6 +4662,22 @@ pub(crate) fn configure_agent_tool_registry_for_workspace(
     if let Some(session_id) = session_id {
         config = config.with_data_dir_evidence(data_dir, session_id);
     }
+    if agent_definition_has_coding_authority(definition) {
+        match ensure_simple_sandbox_sifs_mount(data_dir)? {
+            Some(mount_root) => {
+                config = config.with_sandbox_sifs_mount_root(mount_root);
+                if let Some(session_id) = session_id {
+                    config = config.with_session_agent_home_sifs_path(session_id);
+                }
+            }
+            None => {
+                // A SIFS path label without a live filesystem would falsely
+                // imply synchronization. Keep the generic shell usable when
+                // this platform has no host mount implementation.
+                config = config.without_agent_home_sifs_path();
+            }
+        }
+    }
     if let Some(sandbox_node_id) = sandbox_node_id {
         config = config.with_sandbox_runtime_node_id(sandbox_node_id);
     }
@@ -4529,7 +4695,69 @@ pub(crate) fn configure_agent_tool_registry_for_workspace(
     Ok(())
 }
 
-fn agent_definition_has_coding_authority(definition: &AgentDefinition) -> bool {
+#[cfg(all(unix, feature = "dfs-fuse"))]
+fn ensure_simple_sandbox_sifs_mount(data_dir: &SinomoDataDir) -> Result<Option<PathBuf>, CliError> {
+    if read_cluster_state(&ClusterPaths::new(data_dir)).is_err() {
+        return Ok(None);
+    }
+    let data_root =
+        fs::canonicalize(data_dir.root()).unwrap_or_else(|_| data_dir.root().to_path_buf());
+    let mounts = SIMPLE_SANDBOX_SIFS_MOUNTS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut mounts = mounts.lock().map_err(|_| CliError::Parse {
+        detail: "simple-sandbox SIFS mount registry is unavailable".to_string(),
+    })?;
+    if let Some(existing) = mounts.get(&data_root)
+        && existing.is_active()
+    {
+        return Ok(Some(existing.mount_root().to_path_buf()));
+    }
+    mounts.remove(&data_root);
+    let mount_point = data_dir.root().join("mounts").join("sifs");
+    let mut options = sinomo_dfs_fuse::DfsFuseMountOptions::new(mount_point)
+        .with_data_dir(data_dir.root())
+        .with_root_path("/");
+    // Live sandbox paths must not wait for a command/checkpoint boundary or a
+    // metadata cache interval before observing cluster changes.
+    options.attr_ttl = Duration::ZERO;
+    options.entry_ttl = Duration::ZERO;
+    let handle =
+        sinomo_dfs_fuse::mount_sifs_background(options).map_err(|source| CliError::Parse {
+            detail: format!("mount live SIFS for simple sandbox: {source}"),
+        })?;
+    let mount_root = handle.mount_root().to_path_buf();
+    mounts.insert(data_root, handle);
+    Ok(Some(mount_root))
+}
+
+#[cfg(not(all(unix, feature = "dfs-fuse")))]
+fn ensure_simple_sandbox_sifs_mount(
+    _data_dir: &SinomoDataDir,
+) -> Result<Option<PathBuf>, CliError> {
+    Ok(None)
+}
+
+fn live_sifs_mount_for_selected_root(
+    data_dir: &SinomoDataDir,
+    workspace_root: &Path,
+) -> Result<Option<PathBuf>, CliError> {
+    let workspace_root = absolute_normalized_path(workspace_root)?;
+    let data_root = absolute_normalized_path(&data_dir.root())?;
+    let expected_mount_root = data_root.join("mounts").join("sifs");
+    if !workspace_root.starts_with(&expected_mount_root) {
+        return Ok(None);
+    }
+    let Some(active_mount_root) = ensure_simple_sandbox_sifs_mount(data_dir)? else {
+        return Ok(None);
+    };
+    let active_mount_root = absolute_normalized_path(&active_mount_root)?;
+    if workspace_root.starts_with(&active_mount_root) {
+        Ok(Some(active_mount_root))
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) fn agent_definition_has_coding_authority(definition: &AgentDefinition) -> bool {
     definition.package.provenance.source == AgentPackageSource::BuiltIn
         && definition.key() == "coding-agent"
 }
@@ -4537,6 +4765,19 @@ fn agent_definition_has_coding_authority(definition: &AgentDefinition) -> bool {
 fn validate_mutating_workspace_root(
     data_dir: &SinomoDataDir,
     workspace_root: &Path,
+) -> Result<(), CliError> {
+    let verified_sifs_mount = live_sifs_mount_for_selected_root(data_dir, workspace_root)?;
+    validate_mutating_workspace_root_with_live_mount(
+        data_dir,
+        workspace_root,
+        verified_sifs_mount.as_deref(),
+    )
+}
+
+fn validate_mutating_workspace_root_with_live_mount(
+    data_dir: &SinomoDataDir,
+    workspace_root: &Path,
+    verified_sifs_mount: Option<&Path>,
 ) -> Result<(), CliError> {
     let workspace_root = absolute_normalized_path(workspace_root)?;
     if workspace_root.parent().is_none() {
@@ -4549,13 +4790,19 @@ fn validate_mutating_workspace_root(
         }
     }
     let data_root = absolute_normalized_path(&data_dir.root())?;
-    if workspace_root == data_root || workspace_root.starts_with(&data_root) {
+    let is_live_sifs_workspace = verified_sifs_mount
+        .map(absolute_normalized_path)
+        .transpose()?
+        .is_some_and(|mount_root| workspace_root.starts_with(mount_root));
+    if (workspace_root == data_root || workspace_root.starts_with(&data_root))
+        && !is_live_sifs_workspace
+    {
         return Err(unsafe_coding_workspace_error(&workspace_root));
     }
     Ok(())
 }
 
-fn absolute_normalized_path(path: &Path) -> Result<PathBuf, CliError> {
+pub(crate) fn absolute_normalized_path(path: &Path) -> Result<PathBuf, CliError> {
     if let Ok(canonical) = std::fs::canonicalize(path) {
         return Ok(canonical);
     }
@@ -4573,7 +4820,7 @@ fn absolute_normalized_path(path: &Path) -> Result<PathBuf, CliError> {
 fn unsafe_coding_workspace_error(workspace_root: &Path) -> CliError {
     CliError::Parse {
         detail: format!(
-            "coding-agent mutation is disabled for unsafe workspace root `{}`; run the command from an explicit project directory",
+            "coding-agent mutation is disabled for unsafe workspace root `{}`; run the command from an explicit workspace directory",
             workspace_root.display()
         ),
     }

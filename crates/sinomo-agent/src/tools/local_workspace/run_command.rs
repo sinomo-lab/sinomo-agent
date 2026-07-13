@@ -36,7 +36,7 @@ pub(super) fn descriptor() -> AgentToolDescriptor {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "Shell command to run. Avoid pipelines for verification unless the shell status still reflects the command that matters."
+                    "description": "Shell command to run inside simple-sandbox with generic host command semantics. It may read or write any location permitted to the Sinomo process; workspace file-tool permissions do not restrict shell commands. Avoid pipelines for verification unless the shell status still reflects the command that matters."
                 },
                 "cwd": {
                     "type": "string",

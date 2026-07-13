@@ -374,7 +374,7 @@ impl ChatQuickAction {
     fn prompt(self) -> Option<&'static str> {
         match self {
             Self::PlanChange => Some(
-                "Use the coding tools to inspect this repository, then plan the next code change. Return the safest first step, the files or commands you would check first, likely risks, and a focused verification command.",
+                "Use the coding tools to inspect the selected workspace, then plan the next requested change. Return the safest first step, the files or commands you would check first, likely risks, and a focused verification command.",
             ),
             Self::CheckCluster => {
                 Some("Check the local cluster status and explain anything that needs attention.")
@@ -406,7 +406,7 @@ impl ChatQuickAction {
 
     fn description(self) -> &'static str {
         match self {
-            Self::PlanChange => "Use coding agent to plan repository work",
+            Self::PlanChange => "Use coding agent to plan workspace work",
             Self::CheckCluster => "Use background agent to inspect cluster status",
             Self::DraftDocument => "Prepare a polished Markdown note",
             Self::ReasonImage => "Open attachment controls for file context",
@@ -1225,6 +1225,8 @@ pub struct ChatState {
     pub session_id: String,
     pub info: RuntimeInfo,
     pub tool_runtime: ChatToolRuntimeSelection,
+    workspace_path_input: String,
+    workspace_error: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub input: String,
     pub cursor: usize,
@@ -1455,6 +1457,8 @@ impl ChatState {
             session_id: String::new(),
             info: RuntimeInfo::default(),
             tool_runtime: ChatToolRuntimeSelection::default(),
+            workspace_path_input: String::new(),
+            workspace_error: None,
             messages: Vec::new(),
             input: String::new(),
             cursor: 0,
@@ -1562,7 +1566,7 @@ impl ChatState {
             .account
             .clone()
             .unwrap_or_else(|| "default".to_string());
-        let sandbox_node_id = self.tool_runtime.sandbox_node_id.clone();
+        let tool_runtime = self.tool_runtime.clone();
         let sifs_storage = daemon_address
             .as_deref()
             .map(|address| AgentChatSifsStorage::new(address, backend.app_runtime.handle()));
@@ -1648,8 +1652,9 @@ impl ChatState {
                 account,
             });
         }
-        self.handle
-            .send_command(ChatCommand::SetToolRuntime { sandbox_node_id });
+        self.handle.send_command(ChatCommand::SetToolRuntime {
+            selection: tool_runtime,
+        });
         self.replace_activity(
             "connection",
             "Daemon connection restored; chat runtime rebound to the live endpoint",
@@ -4212,8 +4217,29 @@ impl ChatState {
     }
 
     pub fn set_tool_runtime_node(&mut self, sandbox_node_id: Option<String>) {
+        let mut selection = self.tool_runtime.clone();
+        selection.sandbox_node_id = sandbox_node_id;
         self.handle
-            .send_command(ChatCommand::SetToolRuntime { sandbox_node_id });
+            .send_command(ChatCommand::SetToolRuntime { selection });
+    }
+
+    fn set_workspace_path_input(&mut self, value: String) {
+        self.workspace_path_input = value;
+        self.workspace_error = None;
+    }
+
+    fn apply_workspace_path(&mut self) {
+        let value = self.workspace_path_input.trim();
+        if value.is_empty() {
+            self.workspace_error = Some("Choose a workspace directory.".to_string());
+            return;
+        }
+        let mut selection = self.tool_runtime.clone();
+        selection.workspace_root = Some(PathBuf::from(value));
+        self.workspace_error = None;
+        self.notice = Some("Binding workspace directory…".to_string());
+        self.handle
+            .send_command(ChatCommand::SetToolRuntime { selection });
     }
 
     fn apply_event(&mut self, event: ChatEvent) -> bool {
@@ -4302,7 +4328,10 @@ impl ChatState {
                 }
             }
             ChatEvent::ToolCallCompleted { call, .. } => {
-                self.record_tool_call("tool done", call, "completed", ActivityTone::Good);
+                // This provider event only means the model finished assembling
+                // the request. Execution outcome arrives separately (for
+                // process tools via `ChatEvent::Process`).
+                self.record_tool_call("tool requested", call, "requested", ActivityTone::Neutral);
             }
             ChatEvent::Process { process, .. } => {
                 self.record_process(process);
@@ -4389,7 +4418,13 @@ impl ChatState {
                 self.sync_selection_from_info();
             }
             ChatEvent::ToolRuntime(selection) => {
+                self.workspace_path_input = selection
+                    .workspace_root
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
                 self.tool_runtime = selection;
+                self.workspace_error = None;
             }
             ChatEvent::SessionReset { session_id } => {
                 let acknowledged_pending =
@@ -4441,7 +4476,10 @@ impl ChatState {
                 self.streaming = false;
                 self.control.active_turn = false;
                 self.queued_turn_inputs.clear();
-                if let Some(detail) = connection_problem_summary(&error) {
+                if error.to_ascii_lowercase().contains("workspace") {
+                    self.workspace_error = Some(error.clone());
+                    self.notice = Some("Workspace directory needs attention.".to_string());
+                } else if let Some(detail) = connection_problem_summary(&error) {
                     self.push_activity("chat connection", detail.clone(), ActivityTone::Warn);
                     if !self
                         .notice
@@ -8700,6 +8738,50 @@ fn agents_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         })
 }
 
+fn workspace_selector(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let input_shared = shared.clone();
+    let input = TextInput::new("chat-workspace-directory")
+        .value(shared.chat().workspace_path_input.clone())
+        .placeholder("Workspace directory")
+        .leading_icon(IconGlyph::Folder)
+        .theme_when(clone_reader(reader))
+        .on_change(move |value| {
+            input_shared.chat_mut().set_workspace_path_input(value);
+        });
+    let apply_shared = shared.clone();
+    let apply = sui::Button::new("Use")
+        .min_height(30.0)
+        .theme_when(secondary_button_theme(reader))
+        .enabled_when({
+            let shared = shared.clone();
+            move || !shared.chat().workspace_path_input.trim().is_empty()
+        })
+        .on_press(move || apply_shared.chat_mut().apply_workspace_path());
+    let status = if let Some(error) = shared.chat().workspace_error.clone() {
+        let color_shared = shared.clone();
+        Label::new(compact_line(&error, 72))
+            .font_size(10.0)
+            .color_when(move || palette(&color_shared).bad)
+    } else if let Some(root) = shared.chat().tool_runtime.workspace_root.as_ref() {
+        muted_label(
+            shared,
+            format!("Bound: {}", compact_line(&root.display().to_string(), 44)),
+        )
+    } else {
+        muted_label(shared, "Required before coding tools can write")
+    };
+    Stack::vertical()
+        .spacing(4.0)
+        .alignment(Alignment::Stretch)
+        .with_child(
+            TrailingSlotRow::new(input, apply)
+                .trailing_width(54.0)
+                .trailing_height(30.0)
+                .gap(6.0),
+        )
+        .with_child(status)
+}
+
 /// Build the CHATS ListView: stored chats/channels only. Creation actions live
 /// above the scroll area so the list itself behaves like persistent history.
 fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -9185,6 +9267,20 @@ fn sidebar(
                 )
                 .with_child(SizedBox::new().height(2.0))
                 .with_child(WidgetPadding::horizontal(8.0, agents_list(&s, &r)).fill_child_height())
+                .with_child(SizedBox::new().height(12.0))
+                .with_child(
+                    WidgetPadding::horizontal(18.0, heading(&s, "WORKSPACE")).fill_child_height(),
+                )
+                .with_child(SizedBox::new().height(4.0))
+                .with_child(
+                    WidgetPadding::horizontal(
+                        8.0,
+                        SizedBox::new()
+                            .height(50.0)
+                            .with_child(workspace_selector(&s, &r)),
+                    )
+                    .fill_child_height(),
+                )
                 .with_child(SizedBox::new().height(16.0))
                 .with_child(WidgetPadding::horizontal(18.0, chats_heading(&s)).fill_child_height())
                 .with_child(SizedBox::new().height(6.0))
@@ -9247,6 +9343,8 @@ fn sidebar_signature(
     bool,
     bool,
     bool,
+    String,
+    String,
 ) {
     let chat = shared.chat();
     let active = chat
@@ -9273,6 +9371,12 @@ fn sidebar_signature(
         chat.session_list_loading,
         chat.session_list_slow_notice_shown,
         chat.session_list_details_open,
+        chat.tool_runtime
+            .workspace_root
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        chat.workspace_error.clone().unwrap_or_default(),
     )
 }
 
@@ -10870,17 +10974,14 @@ impl MediaPreviewRegistration {
 struct MediaCameraPreviewWidget {
     shared: Shared,
     registration: Arc<MediaPreviewRegistration>,
-    external_textures: sui::WgpuExternalTextureRegistry,
 }
 
 impl MediaCameraPreviewWidget {
     fn new(shared: Shared) -> Self {
         let registration = shared.chat().media_preview_registration.clone();
-        let external_textures = shared.external_texture_registry();
         Self {
             shared,
             registration,
-            external_textures,
         }
     }
 
@@ -10917,21 +11018,7 @@ impl Widget for MediaCameraPreviewWidget {
             return;
         };
         let handle = self.registration.image_handle(ctx);
-        let external = self.external_textures.upload_rgba8(
-            handle,
-            preview.width,
-            preview.height,
-            preview.rgba.clone(),
-            preview.revision,
-        );
-        if let Ok(descriptor) = external {
-            ctx.register_external_image(handle, descriptor);
-            self.registration
-                .revision
-                .store(preview.revision, Ordering::Release);
-        } else if self.registration.revision() != Some(preview.revision)
-            || !ctx.image_registered(handle)
-        {
+        if self.registration.revision() != Some(preview.revision) || !ctx.image_registered(handle) {
             if let Ok(image) = RegisteredImage::from_rgba8(
                 preview.width,
                 preview.height,
@@ -18414,8 +18501,38 @@ mod tests {
         assert_eq!(state.input, prompt);
         assert_eq!(state.cursor, prompt.len());
         assert!(
-            prompt.contains("Use the coding tools to inspect this repository"),
-            "the coding preset should ask for repository inspection, not generic planning"
+            prompt.contains("Use the coding tools to inspect the selected workspace"),
+            "the coding preset should plan against the selected workspace"
+        );
+    }
+
+    #[test]
+    fn workspace_runtime_events_update_the_selector_and_surface_errors() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let workspace = PathBuf::from("/tmp/sinomo-selected-workspace");
+
+        state.apply_event(ChatEvent::ToolRuntime(ChatToolRuntimeSelection {
+            workspace_root: Some(workspace.clone()),
+            ..ChatToolRuntimeSelection::default()
+        }));
+        assert_eq!(state.tool_runtime.workspace_root.as_ref(), Some(&workspace));
+        assert_eq!(state.workspace_path_input, workspace.display().to_string());
+        assert!(state.workspace_error.is_none());
+
+        state.apply_event(ChatEvent::Error {
+            session_id: Some(state.session_id.clone()),
+            error: "tool runtime update failed: workspace directory is unavailable".to_string(),
+        });
+        assert!(
+            state
+                .workspace_error
+                .as_deref()
+                .is_some_and(|error| error.contains("workspace directory is unavailable"))
+        );
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("Workspace directory needs attention.")
         );
     }
 
@@ -22917,7 +23034,7 @@ mod tests {
     }
 
     #[test]
-    fn built_app_camera_preview_uploads_through_shared_wgpu_registry() -> sui::Result<()> {
+    fn built_app_camera_preview_registers_stable_image_resource() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -22927,19 +23044,7 @@ mod tests {
             publish_test_camera_frame(&chat, 11, 2, 1, [255, 0, 0, 255, 0, 255, 0, 255]);
         }
 
-        let registry = shared.external_texture_registry();
-        let mut renderer =
-            sui::WgpuRenderer::new().with_external_texture_registry(registry.clone());
-        renderer.render(&sui::SceneFrame::new(
-            sui::WindowId::new(90_011),
-            Size::new(16.0, 16.0),
-        ))?;
-
         let app = crate::build_application(shared.clone())?;
-        assert!(
-            app.configured_external_texture_registry().is_some(),
-            "build_application must pass the shared registry into SUI's platform configuration"
-        );
         let mut runtime = app.build()?;
         let window_id = runtime.window_ids()[0];
         runtime.handle_event(
@@ -22954,10 +23059,10 @@ mod tests {
             .handle()
             .expect("preview image handle");
         assert!(
-            registry.contains(handle),
-            "the production app widget should upload its stable preview handle through the shared WGPU registry"
+            output.frame.image_registry.contains(handle),
+            "the production app widget should register its stable preview image in the frame"
         );
-        assert!(output.frame.image_registry.get_external(handle).is_some());
+        let mut renderer = sui::WgpuRenderer::new();
         renderer.render(&output.frame)?;
         Ok(())
     }
@@ -23466,8 +23571,19 @@ mod tests {
             },
         });
         assert_eq!(state.tool_calls.len(), 1);
-        assert_eq!(state.tool_calls[0].status, "completed");
+        assert_eq!(state.tool_calls[0].status, "requested");
         assert_eq!(state.tool_calls[0].tool, "run_command");
+        assert!(state.activity.iter().any(|entry| {
+            entry.title.contains("tool requested") && entry.tone == ActivityTone::Neutral
+        }));
+        assert!(
+            !state
+                .activity
+                .iter()
+                .any(|entry| entry.title.contains("tool requested")
+                    && entry.tone == ActivityTone::Good),
+            "a fully assembled tool request is not evidence that any tool executed successfully"
+        );
     }
 
     #[test]
