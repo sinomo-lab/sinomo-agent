@@ -283,6 +283,29 @@ mod tests {
     }
 
     #[test]
+    fn provider_forms_include_complete_known_model_catalogs() {
+        let (client, _root) = test_client("known-models");
+        add_provider_account(
+            &client,
+            "deepseek",
+            "default",
+            "sk-test",
+            sinomo_lm::DEEPSEEK_DEFAULT_MODEL,
+            "",
+        )
+        .expect("add provider");
+
+        let form = provider_forms(&client).pop().expect("provider form");
+        assert_eq!(
+            form.known_models,
+            vec![
+                sinomo_lm::DEEPSEEK_V4_FLASH_MODEL.to_string(),
+                sinomo_lm::DEEPSEEK_V4_PRO_MODEL.to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn resolved_config_items_include_declared_schema() {
         let (client, _root) = test_client("schema-catalog");
         let items = resolve_items(&client);
@@ -542,6 +565,8 @@ pub struct ProviderForm {
     pub is_default: bool,
     pub enabled: bool,
     pub default_model: String,
+    /// Complete built-in model options available without credential or network discovery.
+    pub known_models: Vec<String>,
     pub api_base_url: String,
     /// The configured reasoning effort (e.g. "high"), or `None` for the provider default.
     pub reasoning_effort: Option<String>,
@@ -610,6 +635,7 @@ pub fn provider_forms(client: &dyn ConfigClient) -> Vec<ProviderForm> {
                 && account_name == default_account,
             enabled: account.enabled,
             supports_reasoning: model_supports_reasoning_effort(&provider, &default_model),
+            known_models: sinomo_lm::provider_known_model_ids(&provider),
             default_model,
             api_base_url: account.api_base_url.clone().unwrap_or_default(),
             reasoning_effort: account

@@ -1836,6 +1836,16 @@ pub fn subscription_usage_provider_ids() -> &'static [&'static str] {
     ]
 }
 
+/// Return a provider's complete built-in model catalog without reading credentials or making a
+/// network request. Providers whose catalog is account- or server-defined return an empty list.
+pub fn provider_known_model_ids(provider: &str) -> Vec<String> {
+    match provider {
+        DeepSeekProvider::PROVIDER_ID => DeepSeekProvider::known_model_ids(),
+        NvidiaProvider::PROVIDER_ID => NvidiaProvider::known_model_ids(),
+        _ => Vec::new(),
+    }
+}
+
 pub fn provider_available_model_ids(provider: &str) -> Result<Vec<String>, LanguageModelError> {
     match provider {
         GitHubCopilotProvider::PROVIDER_ID => {
@@ -4447,6 +4457,22 @@ mod tests {
                 .expect("account catalog"),
             vec!["gpt-5.5-custom".to_string()]
         );
+    }
+
+    #[test]
+    fn known_model_catalogs_do_not_require_credentials_or_network_access() {
+        assert_eq!(
+            provider_known_model_ids(DeepSeekProvider::PROVIDER_ID),
+            vec![
+                DEEPSEEK_V4_FLASH_MODEL.to_string(),
+                DEEPSEEK_V4_PRO_MODEL.to_string()
+            ]
+        );
+        assert!(
+            provider_known_model_ids(NvidiaProvider::PROVIDER_ID)
+                .contains(&NVIDIA_DEFAULT_MODEL.to_string())
+        );
+        assert!(provider_known_model_ids(OpenAiProvider::PROVIDER_ID).is_empty());
     }
 
     #[test]

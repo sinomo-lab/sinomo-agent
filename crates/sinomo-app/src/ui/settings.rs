@@ -30,10 +30,11 @@ use sinomo_cli::app_api::{
 };
 use sui::{
     Alignment, ArrangeCtx, Constraints, DefaultTheme, Event, EventCtx, FieldGroup, FontWeight,
-    FormRow, FormSection, Label, ListItem, ListView, MeasureCtx, PaintCtx, PointerEventKind, Rect,
-    ScrollState, ScrollView, Select, SemanticsCtx, Separator, Size, SizedBox, Stack, Switch,
-    SwitchView, TabBar, TextArea, TextInput, Widget, WidgetPod, WidgetPodMutVisitor,
-    WidgetPodVisitor, WindowEvent,
+    FormRow, FormSection, IconGlyph, Label, ListItem, ListView, MeasureCtx, PaintCtx,
+    PointerEventKind, ProgressBar, Rect, ScrollState, ScrollView, Select, SemanticTone,
+    SemanticsCtx, Separator, Size, SizedBox, Spinner, Stack, StatusBadge, Switch, SwitchView,
+    TabBar, TextArea, TextInput, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    WindowEvent,
 };
 
 use sinomo_runtime::config::{
@@ -3339,6 +3340,11 @@ fn muted_label(shared: &Shared, text: impl Into<String>) -> Label {
     Label::new(text).color_when(move || palette(&s).text_muted)
 }
 
+fn primary_label(shared: &Shared, text: impl Into<String>) -> Label {
+    let s = shared.clone();
+    Label::new(text).color_when(move || palette(&s).text)
+}
+
 fn positive_label(shared: &Shared, text: impl Into<String>) -> Label {
     let s = shared.clone();
     Label::new(text).color_when(move || palette(&s).good)
@@ -4567,7 +4573,7 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         .settings()
         .provider_detail_expanded(&form.provider, &form.account);
 
-    // Enable toggle as the panel's header action.
+    // Keep the operational state and enable control visible without opening details.
     let enable_switch = {
         let s = shared.clone();
         let provider = form.provider.clone();
@@ -4588,63 +4594,73 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
                 );
             })
     };
+    let health_presentation = provider_health_presentation(&health);
+    let health_badge = StatusBadge::new(health_presentation.label)
+        .icon(health_presentation.icon)
+        .tone(health_presentation.tone)
+        .theme_when(clone_reader(reader));
+    let header_actions = Stack::horizontal()
+        .spacing(8.0)
+        .alignment(Alignment::Center)
+        .with_child(health_badge)
+        .with_child(enable_switch);
 
     let mut body = FieldGroup::new().spacing(8.0);
-    body = body.with_child(value_row(
-        shared,
-        reader,
-        "Account",
-        form.account_label.clone(),
-    ));
-    body = body.with_child(value_row(
-        shared,
-        reader,
-        "Authentication",
-        provider_auth_summary(&form),
-    ));
-    body = body.with_child(value_row(
-        shared,
-        reader,
-        "Connection",
-        provider_connection_summary(&health),
-    ));
-    let test_button = {
-        let s = shared.clone();
-        let provider = form.provider.clone();
-        let account = form.account.clone();
-        sui::Button::new(if health.checking {
-            "Testing…"
-        } else {
-            "Test connection"
-        })
-        .icon(sui::IconGlyph::Check)
-        .theme_when(secondary_button_theme(reader))
-        .enabled(form.signed_in && !health.checking)
-        .on_press(move || {
-            queue_settings_operation(
-                &s,
-                SettingsOperationScope::Providers,
-                SettingsOperation::TestProviderConnection {
-                    provider: provider.clone(),
-                    account: account.clone(),
-                },
-            );
-        })
-    };
     body = body.with_child(
         FormRow::new(
-            "Verification",
-            Stack::horizontal()
-                .alignment(Alignment::Start)
-                .with_child(test_button),
+            "Authentication",
+            Stack::horizontal().with_child(
+                StatusBadge::new(provider_auth_summary(&form))
+                    .icon(if form.signed_in {
+                        IconGlyph::Lock
+                    } else {
+                        IconGlyph::Unlock
+                    })
+                    .tone(if form.signed_in {
+                        SemanticTone::Info
+                    } else {
+                        SemanticTone::Warning
+                    })
+                    .theme_when(clone_reader(reader)),
+            ),
         )
         .inline()
         .theme_when(clone_reader(reader)),
     );
+    let test_button = {
+        let s = shared.clone();
+        let provider = form.provider.clone();
+        let account = form.account.clone();
+        sui::Button::new("Test connection")
+            .icon(IconGlyph::Check)
+            .theme_when(clone_reader(reader))
+            .enabled(form.signed_in)
+            .on_press(move || {
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::Providers,
+                    SettingsOperation::TestProviderConnection {
+                        provider: provider.clone(),
+                        account: account.clone(),
+                    },
+                );
+            })
+    };
+    let test_control = SwitchView::new()
+        .selected(usize::from(health.checking))
+        .with_child(test_button)
+        .with_child(
+            Spinner::new(format!(
+                "Testing {} {} connection",
+                form.display_name, form.account_label
+            ))
+            .label("Testing connection…")
+            .theme_when(clone_reader(reader)),
+        );
     body = body.with_child(value_row(
         shared,
         reader,
-        "Last verified",
+        "Verification",
         provider_last_verified_label(&health),
     ));
     if let Some(error) = health.error.clone() {
@@ -4655,9 +4671,12 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         );
     }
     let chat_default_control = if form.is_default {
-        Stack::horizontal()
-            .alignment(Alignment::Center)
-            .with_child(positive_label(shared, "Chat default"))
+        Stack::horizontal().alignment(Alignment::Center).with_child(
+            StatusBadge::new("Chat default")
+                .icon(IconGlyph::Chat)
+                .tone(SemanticTone::Accent)
+                .theme_when(clone_reader(reader)),
+        )
     } else {
         let s = shared.clone();
         let provider = form.provider.clone();
@@ -4700,21 +4719,32 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         );
     }
 
-    if !health.models.is_empty() {
-        let models = health.models.clone();
+    let mut model_options = form.known_models.clone();
+    model_options.extend(health.models.iter().cloned());
+    let has_model_options = !model_options.is_empty();
+    if has_model_options
+        && !form.default_model.is_empty()
+        && !model_options.contains(&form.default_model)
+    {
+        model_options.push(form.default_model.clone());
+    }
+    model_options.sort();
+    model_options.dedup();
+    if has_model_options {
+        let models = model_options;
         let selected_model = form.default_model.clone();
         let model_select = {
             let s = shared.clone();
             let provider = form.provider.clone();
             let account = form.account.clone();
             let options = models.clone();
-            Select::new(format!("provider-{index}-discovered-model"))
+            Select::new(format!("provider-{index}-model-select"))
                 .options(options.clone())
                 .selected_when(move || {
                     options
                         .iter()
                         .position(|model| model == &selected_model)
-                        .or(Some(0))
+                        .or((!options.is_empty()).then_some(0))
                 })
                 .theme_when(clone_reader(reader))
                 .on_change(move |_index, model| {
@@ -4733,16 +4763,19 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
                 })
         };
         body = body.with_child(
-            FormRow::new("Discovered model", model_select)
+            FormRow::new("Model", model_select)
                 .inline()
                 .theme_when(clone_reader(reader)),
         );
-    } else if let Some(error) = health.model_discovery_error.clone() {
-        body = body.with_child(
-            FormRow::new("Model discovery", muted_label(shared, error))
-                .stacked()
-                .theme_when(clone_reader(reader)),
-        );
+    } else {
+        body = body.with_child(provider_model_text_row(shared, reader, index, "Model"));
+        if let Some(error) = health.model_discovery_error.clone() {
+            body = body.with_child(
+                FormRow::new("Model discovery", muted_label(shared, error))
+                    .stacked()
+                    .theme_when(clone_reader(reader)),
+            );
+        }
     }
 
     if let Some(usage) = health.usage.as_ref() {
@@ -4755,52 +4788,14 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         );
     }
 
-    // Default model.
-    let model_key = provider_field_key(&form.provider, &form.account, ProviderField::Model);
-    let model_value = shared
-        .settings()
-        .field_draft_or(&model_key, || form.default_model.clone());
-    body = body.with_child(text_save_row(
-        reader,
-        &format!("provider-{index}-model"),
-        "Default model",
-        model_value,
-        "Provider default",
-        {
-            let s = shared.clone();
-            move |value: String| {
-                s.settings_mut()
-                    .set_provider_field_draft(index, ProviderField::Model, value);
-            }
-        },
-        {
-            let s = shared.clone();
-            move || {
-                let operation = s
-                    .settings()
-                    .provider_field_operation(index, ProviderField::Model);
-                if let Some(operation) = operation {
-                    queue_settings_operation(&s, SettingsOperationScope::Providers, operation);
-                }
-            }
-        },
-        {
-            let s = shared.clone();
-            move || {
-                s.settings()
-                    .domain_pending(SettingsOperationDomain::Providers)
-            }
-        },
-    ));
-
     let detail_button = {
         let s = shared.clone();
         let provider = form.provider.clone();
         let account = form.account.clone();
         sui::Button::new(if expanded {
-            "Hide details"
+            "Hide settings"
         } else {
-            "Show details"
+            "Settings"
         })
         .icon(if expanded {
             sui::IconGlyph::ChevronUp
@@ -4813,12 +4808,27 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         })
     };
     body = body.with_child(
-        FormRow::new("Details", Stack::horizontal().with_child(detail_button))
-            .inline()
-            .theme_when(clone_reader(reader)),
+        FormRow::new(
+            "Actions",
+            Stack::horizontal()
+                .spacing(8.0)
+                .alignment(Alignment::Center)
+                .with_child(test_control)
+                .with_child(detail_button),
+        )
+        .inline()
+        .theme_when(clone_reader(reader)),
     );
 
     if expanded {
+        if has_model_options {
+            body = body.with_child(provider_model_text_row(
+                shared,
+                reader,
+                index,
+                "Custom model",
+            ));
+        }
         // Authentication: device-login (status + button) or an API-key field.
         if form.uses_device_login {
             let sign_in_label = if form.signed_in {
@@ -5104,8 +5114,94 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
     }
 
     FormSection::new(form.display_name.clone(), body)
-        .header_action(enable_switch)
+        .header_action(header_actions)
         .theme_when(clone_reader(reader))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProviderHealthPresentation {
+    label: &'static str,
+    tone: SemanticTone,
+    icon: IconGlyph,
+}
+
+fn provider_health_presentation(health: &ProviderHealthState) -> ProviderHealthPresentation {
+    if health.checking {
+        ProviderHealthPresentation {
+            label: "Testing…",
+            tone: SemanticTone::Accent,
+            icon: IconGlyph::Hourglass,
+        }
+    } else if health.error.is_some() {
+        ProviderHealthPresentation {
+            label: "Connection failed",
+            tone: SemanticTone::Danger,
+            icon: IconGlyph::Alert,
+        }
+    } else if health.last_verified_at_unix.is_some() && health.stale {
+        ProviderHealthPresentation {
+            label: "Needs retest",
+            tone: SemanticTone::Warning,
+            icon: IconGlyph::Alert,
+        }
+    } else if health.last_verified_at_unix.is_some() {
+        ProviderHealthPresentation {
+            label: "Verified",
+            tone: SemanticTone::Success,
+            icon: IconGlyph::Check,
+        }
+    } else {
+        ProviderHealthPresentation {
+            label: "Not verified",
+            tone: SemanticTone::Neutral,
+            icon: IconGlyph::Hourglass,
+        }
+    }
+}
+
+fn provider_model_text_row(
+    shared: &Shared,
+    reader: &ThemeReader,
+    index: usize,
+    label: &str,
+) -> FormRow {
+    let form = shared.settings().provider_forms[index].clone();
+    let model_key = provider_field_key(&form.provider, &form.account, ProviderField::Model);
+    let model_value = shared
+        .settings()
+        .field_draft_or(&model_key, || form.default_model.clone());
+    text_save_row(
+        reader,
+        &format!("provider-{index}-model"),
+        label,
+        model_value,
+        "Provider default",
+        {
+            let s = shared.clone();
+            move |value: String| {
+                s.settings_mut()
+                    .set_provider_field_draft(index, ProviderField::Model, value);
+            }
+        },
+        {
+            let s = shared.clone();
+            move || {
+                if let Some(operation) = s
+                    .settings()
+                    .provider_field_operation(index, ProviderField::Model)
+                {
+                    queue_settings_operation(&s, SettingsOperationScope::Providers, operation);
+                }
+            }
+        },
+        {
+            let s = shared.clone();
+            move || {
+                s.settings()
+                    .domain_pending(SettingsOperationDomain::Providers)
+            }
+        },
+    )
 }
 
 fn provider_auth_summary(form: &ProviderForm) -> &'static str {
@@ -5122,45 +5218,48 @@ fn provider_auth_summary(form: &ProviderForm) -> &'static str {
     }
 }
 
-fn provider_connection_summary(health: &ProviderHealthState) -> String {
-    if health.checking {
-        return "Testing…".to_string();
-    }
-    if health.error.is_some() {
-        return "Connection failed".to_string();
-    }
-    if health.last_verified_at_unix.is_some() {
-        if health.stale {
-            "Verified previously · configuration changed".to_string()
-        } else {
-            "Verified".to_string()
-        }
-    } else {
-        "Not verified".to_string()
-    }
-}
-
 fn provider_last_verified_label(health: &ProviderHealthState) -> String {
     let Some(timestamp) = health.last_verified_at_unix else {
         return "Never".to_string();
     };
-    let value = format_settings_timestamp(timestamp);
+    let value = format_relative_age(timestamp, current_settings_unix_timestamp());
     if health.stale {
-        format!("{value} · stale")
+        format!("{value} · configuration changed")
     } else {
         value
     }
 }
 
-fn format_settings_timestamp(timestamp: i64) -> String {
-    time::OffsetDateTime::from_unix_timestamp(timestamp)
-        .ok()
-        .and_then(|value| {
-            value
-                .format(&time::format_description::well_known::Rfc3339)
-                .ok()
-        })
-        .unwrap_or_else(|| timestamp.to_string())
+fn format_relative_age(timestamp: i64, now: i64) -> String {
+    if timestamp >= now {
+        return "Just now".to_string();
+    }
+    format!("{} ago", format_compact_duration((now - timestamp) as u64))
+}
+
+fn format_compact_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        return "less than a minute".to_string();
+    }
+    if seconds < 3_600 {
+        return format!("{}m", seconds / 60);
+    }
+    if seconds < 86_400 {
+        let hours = seconds / 3_600;
+        let minutes = (seconds % 3_600) / 60;
+        return if minutes == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {minutes}m")
+        };
+    }
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    if hours == 0 {
+        format!("{days}d")
+    } else {
+        format!("{days}d {hours}h")
+    }
 }
 
 fn current_settings_unix_timestamp() -> i64 {
@@ -5184,15 +5283,32 @@ fn provider_usage_row(
     reader: &ThemeReader,
     usage: &sinomo_lm::LanguageModelProviderUsage,
 ) -> FormRow {
-    let mut stack = Stack::vertical().spacing(4.0).alignment(Alignment::Stretch);
+    let mut stack = Stack::vertical().spacing(8.0).alignment(Alignment::Stretch);
+    let mut metadata = Stack::horizontal()
+        .spacing(8.0)
+        .alignment(Alignment::Center);
     if let Some(plan) = usage.plan.as_deref() {
-        stack = stack.with_child(positive_label(shared, format!("Plan: {plan}")));
+        metadata = metadata.with_child(
+            StatusBadge::new(plan)
+                .tone(SemanticTone::Info)
+                .theme_when(clone_reader(reader)),
+        );
     }
+    if let Ok(captured_at) = i64::try_from(usage.captured_at_unix) {
+        metadata = metadata.with_child(muted_label(
+            shared,
+            format!(
+                "Updated {}",
+                format_relative_age(captured_at, current_settings_unix_timestamp()).to_lowercase()
+            ),
+        ));
+    }
+    stack = stack.with_child(metadata);
     if usage.limits.is_empty() {
         stack = stack.with_child(muted_label(shared, "No usage limits reported"));
     } else {
         for limit in &usage.limits {
-            stack = stack.with_child(muted_label(shared, provider_usage_limit_label(limit)));
+            stack = stack.with_child(provider_usage_limit_view(shared, reader, limit));
         }
     }
     if let Some(credits) = usage.credits.as_ref()
@@ -5205,32 +5321,116 @@ fn provider_usage_row(
         .theme_when(clone_reader(reader))
 }
 
-fn provider_usage_limit_label(limit: &sinomo_lm::LanguageModelUsageLimit) -> String {
+fn provider_usage_limit_view(
+    shared: &Shared,
+    reader: &ThemeReader,
+    limit: &sinomo_lm::LanguageModelUsageLimit,
+) -> Stack {
     let name = limit.name.as_deref().unwrap_or(&limit.id);
-    let mut details = Vec::new();
     if limit.unlimited == Some(true) {
-        details.push("unlimited".to_string());
-    } else if let Some(remaining) = limit.remaining {
+        return Stack::horizontal()
+            .spacing(8.0)
+            .alignment(Alignment::Center)
+            .with_child(primary_label(shared, name.to_string()))
+            .with_child(
+                StatusBadge::new("Unlimited")
+                    .icon(IconGlyph::Check)
+                    .tone(SemanticTone::Success)
+                    .theme_when(clone_reader(reader)),
+            );
+    }
+
+    let Some(used_percent) = provider_usage_used_percent(limit) else {
+        return Stack::vertical()
+            .spacing(3.0)
+            .alignment(Alignment::Stretch)
+            .with_child(primary_label(shared, name.to_string()))
+            .with_child(muted_label(
+                shared,
+                provider_usage_limit_detail(limit, current_settings_unix_timestamp()),
+            ));
+    };
+    let tone = provider_usage_tone(limit, used_percent);
+    Stack::vertical()
+        .spacing(4.0)
+        .alignment(Alignment::Stretch)
+        .with_child(primary_label(
+            shared,
+            format!("{name} · {used_percent:.0}% used"),
+        ))
+        .with_child(
+            SizedBox::new().height(8.0).with_child(
+                ProgressBar::new(format!("{name} usage"))
+                    .range(0.0, 100.0)
+                    .value(used_percent)
+                    .tone(tone)
+                    .height(8.0)
+                    .min_width(360.0)
+                    .theme_when(clone_reader(reader)),
+            ),
+        )
+        .with_child(muted_label(
+            shared,
+            provider_usage_limit_detail(limit, current_settings_unix_timestamp()),
+        ))
+}
+
+fn provider_usage_used_percent(limit: &sinomo_lm::LanguageModelUsageLimit) -> Option<f64> {
+    if limit.exhausted == Some(true) {
+        return Some(100.0);
+    }
+    limit
+        .used_percent
+        .or_else(|| limit.remaining_percent.map(|remaining| 100.0 - remaining))
+        .or_else(|| {
+            let entitlement = limit.entitlement?;
+            let remaining = limit.remaining?;
+            (entitlement > 0.0).then_some((entitlement - remaining) / entitlement * 100.0)
+        })
+        .map(|used| used.clamp(0.0, 100.0))
+}
+
+fn provider_usage_tone(
+    limit: &sinomo_lm::LanguageModelUsageLimit,
+    used_percent: f64,
+) -> SemanticTone {
+    if limit.exhausted == Some(true) || used_percent >= 90.0 {
+        SemanticTone::Danger
+    } else if used_percent >= 75.0 {
+        SemanticTone::Warning
+    } else {
+        SemanticTone::Accent
+    }
+}
+
+fn provider_usage_limit_detail(limit: &sinomo_lm::LanguageModelUsageLimit, now: i64) -> String {
+    let mut details = Vec::new();
+    if let Some(remaining) = limit.remaining {
         if let Some(entitlement) = limit.entitlement {
             details.push(format!("{remaining:.0} of {entitlement:.0} remaining"));
         } else {
             details.push(format!("{remaining:.0} remaining"));
         }
     } else if let Some(remaining) = limit.remaining_percent {
-        details.push(format!("{remaining:.0}% remaining"));
-    } else if let Some(used) = limit.used_percent {
-        details.push(format!("{used:.0}% used"));
+        details.push(format!("{:.0}% remaining", remaining.clamp(0.0, 100.0)));
     }
     if limit.exhausted == Some(true) {
-        details.push("exhausted".to_string());
+        details.push("Exhausted".to_string());
     }
     if let Some(reset) = limit.reset_at_unix {
-        details.push(format!("resets {}", format_settings_timestamp(reset)));
+        if reset > now {
+            details.push(format!(
+                "resets in {}",
+                format_compact_duration((reset - now) as u64)
+            ));
+        } else {
+            details.push("reset due".to_string());
+        }
     }
     if details.is_empty() {
-        name.to_string()
+        "Limit details unavailable".to_string()
     } else {
-        format!("{name}: {}", details.join(" · "))
+        details.join(" · ")
     }
 }
 
@@ -9500,7 +9700,7 @@ mod tests {
         assert!(!health.checking);
         assert_eq!(health.last_verified_at_unix, Some(1_750_000_000));
         assert_eq!(health.models, vec!["gpt-5.5".to_string()]);
-        assert_eq!(provider_connection_summary(&health), "Verified");
+        assert_eq!(provider_health_presentation(&health).label, "Verified");
         assert_eq!(
             health.usage.and_then(|usage| usage.plan),
             Some("pro".to_string())
@@ -9525,9 +9725,39 @@ mod tests {
 
         assert_eq!(provider_auth_summary(form), "API key stored");
         assert_eq!(
-            provider_connection_summary(&state.provider_health(&form.provider, &form.account)),
+            provider_health_presentation(&state.provider_health(&form.provider, &form.account))
+                .label,
             "Not verified"
         );
+    }
+
+    #[test]
+    fn provider_usage_normalizes_percentages_and_threshold_tones() {
+        let mut limit = sinomo_lm::LanguageModelUsageLimit {
+            id: "weekly".to_string(),
+            name: Some("Weekly limit".to_string()),
+            scope: None,
+            unlimited: None,
+            allowed: Some(true),
+            exhausted: None,
+            remaining: None,
+            entitlement: None,
+            used_percent: None,
+            remaining_percent: Some(36.0),
+            window_seconds: None,
+            reset_at_unix: None,
+        };
+
+        assert_eq!(provider_usage_used_percent(&limit), Some(64.0));
+        assert_eq!(provider_usage_tone(&limit, 64.0), SemanticTone::Accent);
+        assert_eq!(provider_usage_tone(&limit, 80.0), SemanticTone::Warning);
+        assert_eq!(provider_usage_tone(&limit, 95.0), SemanticTone::Danger);
+
+        limit.exhausted = Some(true);
+        assert_eq!(provider_usage_used_percent(&limit), Some(100.0));
+        assert_eq!(provider_usage_tone(&limit, 10.0), SemanticTone::Danger);
+        assert_eq!(format_compact_duration(8_040), "2h 14m");
+        assert_eq!(format_relative_age(1_000, 1_120), "2m ago");
     }
 
     #[test]
@@ -10183,6 +10413,136 @@ mod tests {
     }
 
     #[test]
+    fn provider_card_renders_health_badge_usage_meter_and_discovered_model() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let now = current_settings_unix_timestamp();
+        {
+            let config = shared.settings().config.clone();
+            add_provider_account(config.as_ref(), "openai", "work", "sk-work", "gpt-5", "")
+                .expect("add provider account");
+        }
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            let settings = &mut app.ready.as_mut().expect("ready state").settings;
+            reload_config_state(settings);
+            settings.provider_health.insert(
+                provider_account_key("openai", "work"),
+                ProviderHealthState {
+                    checking: false,
+                    last_verified_at_unix: Some(now - 720),
+                    last_checked_at_unix: Some(now - 720),
+                    error: None,
+                    models: vec!["gpt-5".to_string(), "gpt-5-mini".to_string()],
+                    model_discovery_error: None,
+                    usage: Some(sinomo_lm::LanguageModelProviderUsage {
+                        provider: "openai".to_string(),
+                        plan: Some("Pro".to_string()),
+                        captured_at_unix: now as u64,
+                        limits: vec![sinomo_lm::LanguageModelUsageLimit {
+                            id: "five-hour".to_string(),
+                            name: Some("Five-hour limit".to_string()),
+                            scope: None,
+                            unlimited: None,
+                            allowed: Some(true),
+                            exhausted: Some(false),
+                            remaining: None,
+                            entitlement: None,
+                            used_percent: Some(64.0),
+                            remaining_percent: Some(36.0),
+                            window_seconds: Some(18_000),
+                            reset_at_unix: Some(now + 8_040),
+                        }],
+                        credits: None,
+                    }),
+                    usage_error: None,
+                    stale: false,
+                },
+            );
+            settings.open(SettingsSection::Providers);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings provider usage")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert!(window.get_by_text("Verified").count()? >= 1);
+        assert!(window.get_by_text("Five-hour limit · 64% used").count()? >= 1);
+        window
+            .get_by_role(sui::SemanticsRole::ProgressBar)
+            .with_name("Five-hour limit usage")
+            .expect()
+            .to_have_value("64")?;
+        window
+            .get_by_role(sui::SemanticsRole::ComboBox)
+            .with_name("provider-0-model-select")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("provider-0-model")
+            .expect()
+            .to_be_hidden()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn provider_card_uses_dropdown_for_known_catalog_before_connection_test() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let config = shared.settings().config.clone();
+            add_provider_account(
+                config.as_ref(),
+                "deepseek",
+                "default",
+                "sk-test",
+                sinomo_lm::DEEPSEEK_DEFAULT_MODEL,
+                "",
+            )
+            .expect("add provider account");
+        }
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            let settings = &mut app.ready.as_mut().expect("ready state").settings;
+            reload_config_state(settings);
+            settings.open(SettingsSection::Providers);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings known provider models")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::ComboBox)
+            .with_name("provider-0-model-select")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("provider-0-model")
+            .expect()
+            .to_be_hidden()?;
+
+        Ok(())
+    }
+
+    #[test]
     fn provider_card_can_set_chat_default_from_card_action() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
@@ -10300,7 +10660,7 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Show details")
+            .with_name("Settings")
             .click()?;
 
         assert_ne!(
@@ -10310,7 +10670,7 @@ mod tests {
         );
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Hide details")
+            .with_name("Hide settings")
             .expect()
             .to_be_visible()?;
         window
