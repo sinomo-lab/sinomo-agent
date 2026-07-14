@@ -21684,6 +21684,54 @@ fn sifs_recursive_clear_survives_metadata_backend_reopen() {
 }
 
 #[test]
+fn posix_conditional_replace_rejects_a_stale_editor_snapshot() {
+    let root = temp_root("posix-conditional-replace-stale-editor");
+    let node_id = NodeId::from_legacy_named("node_conditional_replace").expect("node");
+    let path = "/documents/notes.txt";
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.posix_mkdir_all("/documents").expect("mkdir");
+    let options = DfsWriteOptions::replicated_eventual(vec![node_id]);
+    let opened = dfs
+        .posix_write_file(path, b"opened", options.clone())
+        .expect("create file");
+
+    dfs.posix_write_file(path, b"newer", options.clone())
+        .expect("concurrent write");
+    let error = dfs
+        .posix_replace_file_if_version(
+            path,
+            &opened.object_id,
+            &opened.version,
+            b"stale editor contents",
+            options.clone(),
+        )
+        .expect_err("stale editor save must fail");
+    assert!(matches!(error, DfsPosixError::Conflict { .. }));
+    assert_eq!(
+        dfs.posix_read_file(path).expect("read newer version"),
+        b"newer"
+    );
+
+    let current = dfs.posix_stat(path).expect("current stat");
+    let saved = dfs
+        .posix_replace_file_if_version(
+            path,
+            &current.object_id,
+            &current.version,
+            b"saved safely",
+            options,
+        )
+        .expect("matching conditional save");
+    assert_ne!(saved.version, current.version);
+    assert_eq!(
+        dfs.posix_read_file(path).expect("read saved version"),
+        b"saved safely"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn sifs_recursive_clear_bounded_job_resumes_after_reopen() {
     let root = temp_root("sifs-recursive-clear-bounded-job");
     let node_id = NodeId::from_legacy_named("node_sifs_clear_job").expect("node");

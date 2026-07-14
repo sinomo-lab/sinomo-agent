@@ -14,7 +14,13 @@ ring = "application"
 [features]
 default = ["desktop", "native-devices"]
 gui = ["dep:sui"]
-desktop = ["gui", "sui/desktop", "sinomo-cli/sandbox", "sinomo-cli/dfs-fuse"]
+desktop = [
+    "gui",
+    "dep:rfd",
+    "sui/desktop",
+    "sinomo-cli/sandbox",
+    "sinomo-cli/dfs-fuse",
+]
 mobile = ["gui", "sui/mobile"]
 native-devices = [
     "sinomo-audio/native-devices",
@@ -30,10 +36,12 @@ required-features = ["desktop"]
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+blake3 = { workspace = true }
 time = { workspace = true, features = ["formatting", "parsing", "serde", "serde-well-known"] }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 pulldown-cmark = { workspace = true }
+rfd = { workspace = true, optional = true }
 syntect = { workspace = true }
 
 # Graphical toolkit (separate workspace, referenced by path). Keep this behind

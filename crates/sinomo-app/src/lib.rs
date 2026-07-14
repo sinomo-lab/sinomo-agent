@@ -7,6 +7,7 @@
 //! desktop app surface so it stays daemon-backed during bootstrap.
 
 pub mod backend;
+mod native_picker;
 pub mod rendering;
 pub mod state;
 pub mod theme;

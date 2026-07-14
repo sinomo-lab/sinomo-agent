@@ -261,6 +261,24 @@ impl SifsFileManagerBackend {
         )
     }
 
+    /// Best-effort post-commit maintenance for a conditional editor save.
+    /// Unlike the legacy mutation helper, this preserves a warning for the UI
+    /// instead of printing and discarding publication failures.
+    fn publish_metadata_after_conditional_mutation_warning(&self) -> Option<String> {
+        if let Err(error) = self.prepare_metadata_after_mutation(None) {
+            return Some(format!(
+                "follow-up DFS maintenance preparation failed: {error}"
+            ));
+        }
+        if request_sifs_daemon_maintenance_refresh(&self.data_dir, SIFS_MAINTENANCE_REFRESH_TIMEOUT)
+        {
+            return None;
+        }
+        publish_sifs_metadata_journal_from_data_dir(&self.data_dir, &self.rpc_runtime, None)
+            .err()
+            .map(|error| format!("SIFS metadata publication failed: {error}"))
+    }
+
     pub(crate) fn publish_metadata_after_mutation_report(
         &self,
     ) -> Result<DfsMetadataJournalReplicationReport, String> {
@@ -323,6 +341,26 @@ impl SifsFileManagerBackend {
         service
             .posix_read_file_distributed(&path)
             .map_err(|error| format!("cannot read SIFS file {path}: {error}"))
+    }
+
+    pub(crate) fn read_object_version(
+        &self,
+        object_id: &str,
+        version: &str,
+        content_hash: &str,
+        size_bytes: u64,
+    ) -> Result<Vec<u8>, String> {
+        let object_id = sinomo_runtime::dfs::DfsObjectId::new(object_id)
+            .map_err(|error| format!("invalid SIFS object id: {error}"))?;
+        let version = sinomo_runtime::dfs::DfsVersion::new(version)
+            .map_err(|error| format!("invalid SIFS version: {error}"))?;
+        let mut service = self.lock_service()?;
+        self.refresh_service_peer_targets(&mut service);
+        service
+            .read_object_version_content(&object_id, &version, content_hash, Some(size_bytes))
+            .map_err(|error| {
+                format!("cannot read SIFS object {object_id} at version {version}: {error}")
+            })
     }
 
     pub(crate) fn dfs_stat(&self, path: &str) -> Result<DfsStat, String> {
@@ -448,6 +486,58 @@ impl SifsFileManagerBackend {
 
     pub(crate) fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
         self.write_file_with_options(path, bytes, false, false, true, None)
+    }
+
+    pub(crate) fn replace_file_if_version(
+        &self,
+        path: &str,
+        expected_object_id: &str,
+        expected_version: &str,
+        bytes: &[u8],
+    ) -> Result<sinomo_runtime::api::DaemonDfsBrowserReplaceFileIfVersionOutcome, String> {
+        use sinomo_runtime::api::DaemonDfsBrowserReplaceFileIfVersionOutcome as Outcome;
+
+        let path = match normalize_sifs_path(path) {
+            Ok(path) => path,
+            Err(detail) => return Ok(Outcome::Rejected { detail }),
+        };
+        let object_id = match sinomo_runtime::dfs::DfsObjectId::new(expected_object_id) {
+            Ok(object_id) => object_id,
+            Err(error) => {
+                return Ok(Outcome::Rejected {
+                    detail: format!("invalid expected SIFS object id: {error}"),
+                });
+            }
+        };
+        let version = match sinomo_runtime::dfs::DfsVersion::new(expected_version) {
+            Ok(version) => version,
+            Err(error) => {
+                return Ok(Outcome::Rejected {
+                    detail: format!("invalid expected SIFS version: {error}"),
+                });
+            }
+        };
+        let mut service = self.lock_service()?;
+        self.refresh_service_peer_targets(&mut service);
+        let options = sifs_write_options(&service, &self.replica_candidates);
+        let stat = match service
+            .posix_replace_file_if_version(&path, &object_id, &version, bytes, options)
+        {
+            Ok(stat) => stat,
+            Err(error) => return Ok(sifs_conditional_write_error(error)),
+        };
+        drop(service);
+        let maintenance_warning = self
+            .publish_metadata_after_conditional_mutation_warning()
+            .map(|error| {
+                format!(
+                    "the file version committed, but follow-up DFS maintenance needs retry: {error}"
+                )
+            });
+        Ok(Outcome::Committed {
+            receipt: sifs_write_receipt(&stat),
+            maintenance_warning,
+        })
     }
 
     pub(crate) fn write_file_with_deadline(
@@ -2019,6 +2109,33 @@ fn sifs_write_options(
     sifs_write_options_for_candidates(candidates)
 }
 
+fn sifs_write_receipt(stat: &DfsStat) -> sinomo_runtime::api::DaemonDfsBrowserWriteReceipt {
+    sinomo_runtime::api::DaemonDfsBrowserWriteReceipt {
+        object_id: stat.object_id.to_string(),
+        version: stat.version.to_string(),
+        content_hash: stat.content_hash.clone(),
+        size_bytes: stat.size_bytes,
+    }
+}
+
+fn sifs_conditional_write_error(
+    error: DfsPosixError,
+) -> sinomo_runtime::api::DaemonDfsBrowserReplaceFileIfVersionOutcome {
+    use sinomo_runtime::api::DaemonDfsBrowserReplaceFileIfVersionOutcome as Outcome;
+
+    match error {
+        DfsPosixError::Conflict { path, reason } => Outcome::Conflict {
+            detail: format!("write conflicted at {path}: {reason}"),
+        },
+        DfsPosixError::NotFound { path } => Outcome::NotFound {
+            detail: format!("not found: {path}"),
+        },
+        error => Outcome::Rejected {
+            detail: error.to_string(),
+        },
+    }
+}
+
 fn sifs_deferred_publish_write_options(
     service: &NetworkedDfsService<DfsNodeTransport>,
     replica_candidates: &[NodeId],
@@ -2176,6 +2293,29 @@ mod tests {
     use super::*;
     use crate::file_manager::FileManagerState;
     use std::sync::Arc;
+
+    #[test]
+    fn conditional_write_expected_failures_remain_typed() {
+        assert!(matches!(
+            sifs_conditional_write_error(DfsPosixError::Conflict {
+                path: "/notes.txt".to_string(),
+                reason: "stale base".to_string(),
+            }),
+            sinomo_runtime::api::DaemonDfsBrowserReplaceFileIfVersionOutcome::Conflict { .. }
+        ));
+        assert!(matches!(
+            sifs_conditional_write_error(DfsPosixError::NotFound {
+                path: "/notes.txt".to_string(),
+            }),
+            sinomo_runtime::api::DaemonDfsBrowserReplaceFileIfVersionOutcome::NotFound { .. }
+        ));
+        assert!(matches!(
+            sifs_conditional_write_error(DfsPosixError::IsDirectory {
+                path: "/notes.txt".to_string(),
+            }),
+            sinomo_runtime::api::DaemonDfsBrowserReplaceFileIfVersionOutcome::Rejected { .. }
+        ));
+    }
 
     #[test]
     fn normalize_sifs_paths() {

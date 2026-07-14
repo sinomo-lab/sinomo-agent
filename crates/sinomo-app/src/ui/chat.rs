@@ -38,10 +38,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -49,20 +49,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sui::{
     ActionTilePaint, Alignment, ArrangeCtx, CalloutPaint, CodePanelPaint, CodeTextLine,
     CodeTextPaint, CodeTextSpan, Color, Constraints, ContextMenu, ControlSize, CustomEvent,
-    DefaultTheme, Dock, EmptyState, Event, EventCtx, FieldAppearance, FixedPaneSplit, Flex,
-    FlexItem, FlexWrap, FontWeight, FramedField, Icon, IconButton, IconGlyph, ImageHandle,
-    ImageSource, Insets, KeyState, Label, ListItem, ListView, MeasureCtx, MeasuredBottomDock,
-    MenuItem, PaintCtx, Path, Point, PointerButton, PointerEventKind, RebuildOnChange,
-    RebuildOnConstraints, Rect, RegisteredImage, RichText, RichTextSourceMap, ScrollBar,
-    ScrollDelta, ScrollState, ScrollView, SectionLabel, SegmentedControl, SegmentedControlItem,
-    SelectionScope, SemanticRegion, SemanticTone, SemanticsAction, SemanticsCtx, SemanticsNode,
-    SemanticsRole, SemanticsValue, Separator, SideSheet, SideSheetPlacement, SignalMeter, Size,
-    SizedBox, Stack, StackHostOptions, StatusBadge, Surface, SurfaceAppearance, SurfaceBorder,
-    SurfaceRole, SwitchView, TextArea, TextBlockPaint, TextCellPaint, TextCommand, TextDocument,
-    TextInput, TextLayout, TextLayoutRequest, TextParagraph, TextParagraphStyle, TextSpan,
-    TextStyle, TextWrap, TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    containers::Padding as WidgetPadding, draw_glyph, paint_action_tile, paint_callout,
-    paint_code_lines, paint_code_panel, paint_rounded_panel, paint_rounded_rect,
+    DefaultTheme, Dock, EmptyState, Event, EventCtx, FieldAppearance, Flex, FlexItem, FlexWrap,
+    FontWeight, FramedField, Icon, IconButton, IconGlyph, ImageHandle, ImageSource, Insets,
+    KeyState, Label, ListItem, ListView, MeasureCtx, MeasuredBottomDock, MenuItem, PaintCtx, Path,
+    Point, PointerButton, PointerEventKind, RebuildOnChange, Rect, RegisteredImage, RichText,
+    RichTextSourceMap, ScrollBar, ScrollDelta, ScrollState, ScrollView, SectionLabel,
+    SegmentedControl, SegmentedControlItem, SelectionScope, SemanticRegion, SemanticTone,
+    SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Separator,
+    SideSheet, SideSheetPlacement, SignalMeter, Size, SizedBox, SplitView, Stack, StackHostOptions,
+    StatusBadge, Surface, SurfaceAppearance, SurfaceBorder, SurfaceRole, SwitchView, TextArea,
+    TextBlockPaint, TextCellPaint, TextCommand, TextDocument, TextInput, TextLayout,
+    TextLayoutRequest, TextParagraph, TextParagraphStyle, TextSpan, TextStyle, TextWrap, Tooltip,
+    TooltipAlignment, TooltipPlacement, TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, containers::Padding as WidgetPadding, draw_glyph, paint_action_tile,
+    paint_callout, paint_code_lines, paint_code_panel, paint_rounded_panel, paint_rounded_rect,
     paint_section_label_detail, paint_text_block, paint_text_cell, wrap_text_lines,
 };
 
@@ -75,8 +75,9 @@ use sinomo_agent::{
 use sinomo_cli::app_api::{
     AgentChannelMessagePage, AgentChannelMessageReconciliation, AgentChannelTimelineOverview,
     AgentChannelTimelineSegment, AgentChatSifsStorage, AgentSummary, ChatAttachmentInput,
-    ChatContextSnapshot, ChatHistoryMessage, ChatProcessSnapshot, ChatQueuedTurnInput,
-    ChatQueuedTurnInputKind, ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection,
+    ChatAttachmentSource, ChatContextSnapshot, ChatHistoryMessage, ChatLocalAttachmentProvenance,
+    ChatProcessSnapshot, ChatQueuedTurnInput, ChatQueuedTurnInputKind,
+    ChatSifsAttachmentProvenance, ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection,
     ChatUsageSnapshot, ProviderSummary, SifsAgentChannelStore, agent_summaries,
     agent_summaries_with_error, built_in_agent_summaries, reasoning_efforts,
 };
@@ -87,6 +88,9 @@ use crate::backend::chat_engine::{
     ChatCommand, ChatEvent, ChatEventWake, ChatHandle, ChatRole, RuntimeInfo,
 };
 use crate::backend::sifs::SifsDaemonAccess;
+use crate::native_picker::{
+    NativePickerKind, NativePickerLane, NativePickerOutcome, NativePickerResult,
+};
 use crate::state::{Shared, Tab};
 use crate::theme::{AppTextScale, Palette};
 use crate::ui::chat_render::{
@@ -103,7 +107,9 @@ use crate::ui::widgets;
 
 /// Below this content width the sidebar collapses away (transcript + composer only).
 const WIDE_THRESHOLD: f32 = 620.0;
-const SIDEBAR_W: f32 = 250.0;
+const SIDEBAR_INITIAL_RATIO: f32 = 0.20;
+const SIDEBAR_MIN_W: f32 = 220.0;
+const CHAT_PANE_MIN_W: f32 = 320.0;
 const COMPACT_HEADER_H: f32 = 54.0;
 // Small media instruments preserve the useful 16:9 preview without consuming transcript space.
 const MEDIA_CALL_H: f32 = 352.0;
@@ -135,11 +141,11 @@ const COMPOSER_BAR_GAP: f32 = 4.0;
 const COMPOSER_GHOST_BUTTON_SIZE: f32 = 28.0;
 const SEND_BUTTON_SIZE: f32 = 32.0;
 const COMPOSER_INPUT_MIN_LINES: usize = 2;
+/// Keep empty-state actions below the title, guidance, and optional detail line.
+const EMPTY_ACTION_OFFSET_Y: f32 = 112.0;
 /// The docked composer input grows to 160px, then scrolls (Mesh layout spec).
 const COMPOSER_INPUT_MAX_H: f32 = 160.0;
 const COMPOSER_INPUT_PAD_Y: f32 = 14.0;
-/// Below this composer width the keyboard hint in the action bar folds away.
-const COMPOSER_HINT_MIN_W: f32 = 560.0;
 const SESSION_LIST_UI_TIMEOUT: Duration = Duration::from_secs(8);
 const TRANSCRIPT_LOAD_UI_TIMEOUT: Duration = Duration::from_secs(8);
 /// Poll SIFS for remote-device catalog and timeline changes. SIFS remains the
@@ -999,9 +1005,87 @@ enum ChannelAgentsStoreStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingChatAttachment {
-    path: PathBuf,
+    source: ChatAttachmentSource,
     file_name: String,
     size_bytes: u64,
+}
+
+impl PendingChatAttachment {
+    fn input(&self) -> ChatAttachmentInput {
+        ChatAttachmentInput {
+            file_name: self.file_name.clone(),
+            source: self.source.clone(),
+        }
+    }
+
+    fn has_source(&self, source: &ChatAttachmentSource) -> bool {
+        match (&self.source, source) {
+            (ChatAttachmentSource::LocalPath(left), ChatAttachmentSource::LocalPath(right)) => {
+                left == right
+            }
+            (
+                ChatAttachmentSource::LocalSnapshot {
+                    provenance: left, ..
+                },
+                ChatAttachmentSource::LocalSnapshot {
+                    provenance: right, ..
+                },
+            ) => left.source_path() == right.source_path(),
+            (
+                ChatAttachmentSource::SifsSnapshot {
+                    provenance: left, ..
+                },
+                ChatAttachmentSource::SifsSnapshot {
+                    provenance: right, ..
+                },
+            ) => left.path == right.path,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingAttachmentPicker {
+    request_id: u64,
+    session_id: String,
+    draft_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalAttachmentIngress {
+    NativePicker,
+    ManualPath,
+    OsDrop,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingLocalAttachmentValidation {
+    request_id: u64,
+    session_id: String,
+    draft_generation: u64,
+    ingress: LocalAttachmentIngress,
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LocalAttachmentValidationOutcome {
+    Ready {
+        path: PathBuf,
+        file_name: String,
+        size_bytes: u64,
+    },
+    Failed {
+        path: PathBuf,
+        detail: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalAttachmentValidationResult {
+    request_id: u64,
+    session_id: String,
+    draft_generation: u64,
+    outcomes: Vec<LocalAttachmentValidationOutcome>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1248,8 +1332,18 @@ pub struct ChatState {
     pub input: String,
     pub cursor: usize,
     draft_revision: u64,
+    attachment_draft_generation: u64,
     attachment_path_input: String,
+    attachment_manual_path_open: bool,
     attachment_controls_open: bool,
+    attachment_picker: NativePickerLane,
+    pending_attachment_picker: Option<PendingAttachmentPicker>,
+    next_attachment_validation_request_id: u64,
+    pending_attachment_validations: Vec<PendingLocalAttachmentValidation>,
+    attachment_validation_tx: Sender<LocalAttachmentValidationResult>,
+    attachment_validation_rx: Receiver<LocalAttachmentValidationResult>,
+    attachment_picker_error: Option<String>,
+    attachment_drop_hovered: bool,
     attachments: Vec<PendingChatAttachment>,
     /// Steering/follow-up messages queued into the active turn from this
     /// composer and not yet consumed by the runtime (pending chips).
@@ -1285,6 +1379,10 @@ pub struct ChatState {
     pub sessions: Vec<SessionRef>,
     session_filter: String,
     session_kind_filter: SessionKindFilter,
+    /// Current first-pane ratio for the desktop conversation sidebar. The SUI
+    /// split view owns the active drag; retaining the ratio here preserves the
+    /// user's width when the responsive tree is rebuilt for theme scaling.
+    sidebar_ratio: f32,
     pending_session_reset: Option<String>,
     session_edit_id: Option<String>,
     session_edit_details_open: bool,
@@ -1464,6 +1562,7 @@ impl ChatState {
         } else {
             list_conversations_with_error(&backend.data_dir, None)
         };
+        let (attachment_validation_tx, attachment_validation_rx) = mpsc::channel();
 
         let mut state = Self {
             data_dir: backend.data_dir.clone(),
@@ -1480,8 +1579,18 @@ impl ChatState {
             input: String::new(),
             cursor: 0,
             draft_revision: 0,
+            attachment_draft_generation: 0,
             attachment_path_input: String::new(),
+            attachment_manual_path_open: false,
             attachment_controls_open: false,
+            attachment_picker: NativePickerLane::new(),
+            pending_attachment_picker: None,
+            next_attachment_validation_request_id: 0,
+            pending_attachment_validations: Vec::new(),
+            attachment_validation_tx,
+            attachment_validation_rx,
+            attachment_picker_error: None,
+            attachment_drop_hovered: false,
             attachments: Vec::new(),
             queued_turn_inputs: Vec::new(),
             streaming: false,
@@ -1514,6 +1623,7 @@ impl ChatState {
             sessions,
             session_filter: String::new(),
             session_kind_filter: SessionKindFilter::All,
+            sidebar_ratio: SIDEBAR_INITIAL_RATIO,
             pending_session_reset: None,
             session_edit_id: None,
             session_edit_details_open: false,
@@ -1917,6 +2027,7 @@ impl ChatState {
     }
 
     pub fn pump_worker_events(&mut self) -> bool {
+        let attachment_picker_changed = self.pump_attachment_lanes();
         let rename_changed = self.pump_session_rename();
         let channel_config_changed = self.pump_channel_config();
         let events = self.handle.drain();
@@ -1924,7 +2035,7 @@ impl ChatState {
         for event in events {
             self.apply_event(event);
         }
-        changed || rename_changed || channel_config_changed
+        changed || rename_changed || channel_config_changed || attachment_picker_changed
     }
 
     fn apply_session_list_result(&mut self, result: SessionListWorkerResult) {
@@ -2386,7 +2497,9 @@ impl ChatState {
         {
             let had_path = !self.attachment_path_input.trim().is_empty();
             self.attachment_path_input.clear();
+            self.attachment_manual_path_open = false;
             self.attachment_controls_open = false;
+            self.attachment_picker_error = None;
             if had_path {
                 self.draft_revision = self.draft_revision.wrapping_add(1);
             }
@@ -2736,8 +2849,11 @@ impl ChatState {
         self.messages.clear();
         self.input.clear();
         self.cursor = 0;
+        self.advance_attachment_draft_generation();
         self.attachment_path_input.clear();
+        self.attachment_manual_path_open = false;
         self.attachment_controls_open = false;
+        self.attachments.clear();
         self.streaming = false;
         self.queued_turn_inputs.clear();
         self.notice = preserved_notice;
@@ -3005,6 +3121,10 @@ impl ChatState {
 
     fn set_session_kind_filter(&mut self, filter: SessionKindFilter) {
         self.session_kind_filter = filter;
+    }
+
+    fn set_sidebar_ratio(&mut self, ratio: f32) {
+        self.sidebar_ratio = ratio.clamp(0.0, 1.0);
     }
 
     fn set_compact_drawer_open(&mut self, open: bool) {
@@ -3425,6 +3545,10 @@ impl ChatState {
             return;
         };
         self.compact_drawer_open = false;
+        // A native picker belongs to the visible chat/draft that opened it. The text and any
+        // already-queued attachments intentionally remain available while navigating stored
+        // chats, but a late OS-dialog result must not leak into the newly visible chat.
+        self.advance_attachment_draft_generation();
         self.session_id = session.id.clone();
         self.messages = vec![transcript_loading_message(&session)];
         self.timeline = ConversationTimelineState::default();
@@ -4240,25 +4364,6 @@ impl ChatState {
             .send_command(ChatCommand::SetToolRuntime { selection });
     }
 
-    fn set_workspace_path_input(&mut self, value: String) {
-        self.workspace_path_input = value;
-        self.workspace_error = None;
-    }
-
-    fn apply_workspace_path(&mut self) {
-        let value = self.workspace_path_input.trim();
-        if value.is_empty() {
-            self.workspace_error = Some("Choose a workspace directory.".to_string());
-            return;
-        }
-        let mut selection = self.tool_runtime.clone();
-        selection.workspace_root = Some(PathBuf::from(value));
-        self.workspace_error = None;
-        self.notice = Some("Binding workspace directory…".to_string());
-        self.handle
-            .send_command(ChatCommand::SetToolRuntime { selection });
-    }
-
     fn apply_event(&mut self, event: ChatEvent) -> bool {
         if let Some(session_id) = event.session_id().map(str::to_string) {
             if self.session_id.is_empty() {
@@ -4565,6 +4670,10 @@ impl ChatState {
     fn submit(&mut self) {
         let text = self.input.trim().to_string();
         let attachments = self.attachment_inputs();
+        if self.attachment_operation_pending() {
+            self.notice = Some("wait for selected files to finish attaching".to_string());
+            return;
+        }
         if text.is_empty() && attachments.is_empty() {
             return;
         }
@@ -4600,7 +4709,9 @@ impl ChatState {
             self.messages.push(ChatMessage::user(text));
             self.input.clear();
             self.cursor = 0;
+            self.advance_attachment_draft_generation();
             self.attachment_path_input.clear();
+            self.attachment_manual_path_open = false;
             self.attachment_controls_open = false;
             if self.composer_popup == Some(ComposerPopup::Attachments) {
                 self.composer_popup = None;
@@ -4633,7 +4744,9 @@ impl ChatState {
         self.control.active_turn = true;
         self.input.clear();
         self.cursor = 0;
+        self.advance_attachment_draft_generation();
         self.attachment_path_input.clear();
+        self.attachment_manual_path_open = false;
         self.attachment_controls_open = false;
         if self.composer_popup == Some(ComposerPopup::Attachments) {
             self.composer_popup = None;
@@ -4725,6 +4838,7 @@ impl ChatState {
         (!self.input.trim().is_empty() || !self.attachments.is_empty())
             && !self.providers.is_empty()
             && !self.initial_transcript_load_pending()
+            && !self.attachment_operation_pending()
     }
 
     fn latest_reusable_answer(&self) -> Option<&str> {
@@ -4743,6 +4857,7 @@ impl ChatState {
             && self.input.trim().is_empty()
             && self.attachments.is_empty()
             && self.attachment_path_input.trim().is_empty()
+            && !self.attachment_operation_pending()
             && self.latest_reusable_answer().is_some()
     }
 
@@ -4752,7 +4867,9 @@ impl ChatState {
         };
         self.input = answer;
         self.cursor = self.input.len();
+        self.advance_attachment_draft_generation();
         self.attachment_path_input.clear();
+        self.attachment_manual_path_open = false;
         self.attachment_controls_open = false;
         self.attachments.clear();
         self.draft_revision = self.draft_revision.wrapping_add(1);
@@ -4974,12 +5091,15 @@ impl ChatState {
         if self.input.is_empty()
             && self.attachments.is_empty()
             && self.attachment_path_input.is_empty()
+            && !self.attachment_operation_pending()
         {
             return;
         }
         self.input.clear();
         self.cursor = 0;
+        self.advance_attachment_draft_generation();
         self.attachment_path_input.clear();
+        self.attachment_manual_path_open = false;
         self.attachment_controls_open = false;
         if self.composer_popup == Some(ComposerPopup::Attachments) {
             self.composer_popup = None;
@@ -4988,20 +5108,234 @@ impl ChatState {
         self.draft_revision = self.draft_revision.wrapping_add(1);
     }
 
-    fn toggle_attachment_controls(&mut self) {
-        if self.attachment_controls_open {
-            self.set_composer_popup(None);
-        } else {
-            self.set_composer_popup(Some(ComposerPopup::Attachments));
-        }
-    }
-
     fn attachment_controls_visible(&self) -> bool {
         self.attachment_controls_open
     }
 
+    fn attachment_picker_pending(&self) -> bool {
+        self.pending_attachment_picker.is_some()
+    }
+
+    fn attachment_picker_lane_pending(&self) -> bool {
+        self.attachment_picker.is_pending()
+    }
+
+    fn attachment_operation_pending(&self) -> bool {
+        self.attachment_picker_pending() || !self.pending_attachment_validations.is_empty()
+    }
+
+    fn advance_attachment_draft_generation(&mut self) {
+        self.attachment_draft_generation = self.attachment_draft_generation.wrapping_add(1);
+        self.pending_attachment_picker = None;
+        self.pending_attachment_validations.clear();
+        self.attachment_picker_error = None;
+        self.attachment_drop_hovered = false;
+    }
+
+    fn request_attachment_picker(&mut self) {
+        self.attachment_picker_error = None;
+        let session_id = self.session_id.clone();
+        let draft_generation = self.attachment_draft_generation;
+        match self.attachment_picker.request(
+            NativePickerKind::MultipleFiles,
+            "Choose files to attach",
+            draft_generation,
+            self.ui_waker.clone(),
+        ) {
+            Ok(request_id) => {
+                self.pending_attachment_picker = Some(PendingAttachmentPicker {
+                    request_id,
+                    session_id,
+                    draft_generation,
+                });
+            }
+            Err(error) => {
+                self.attachment_picker_error = Some(error);
+            }
+        }
+        self.draft_revision = self.draft_revision.wrapping_add(1);
+    }
+
+    /// Drain native-picker and path-validation completions without blocking the UI thread.
+    /// Shell may call this after an external wake; `pump_worker_events` also calls it so Chat owns
+    /// the lane when it is visible.
+    pub(crate) fn pump_attachment_lanes(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(result) = self.attachment_picker.poll() {
+            self.apply_attachment_picker_result(result);
+            changed = true;
+        }
+        loop {
+            match self.attachment_validation_rx.try_recv() {
+                Ok(result) => {
+                    self.apply_attachment_validation_result(result);
+                    changed = true;
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+        changed
+    }
+
+    fn apply_attachment_picker_result(&mut self, result: NativePickerResult) {
+        let Some(pending) = self.pending_attachment_picker.take() else {
+            // The visible session or draft was reset while the OS dialog was open.
+            return;
+        };
+        if pending.request_id != result.request_id
+            || pending.session_id != self.session_id
+            || pending.draft_generation != self.attachment_draft_generation
+            || result.context_generation != self.attachment_draft_generation
+        {
+            return;
+        }
+
+        match result.outcome {
+            NativePickerOutcome::Selected(paths) => {
+                if let Err(error) = self.request_local_attachment_validation(
+                    paths,
+                    LocalAttachmentIngress::NativePicker,
+                ) {
+                    self.attachment_picker_error = Some(error);
+                }
+            }
+            NativePickerOutcome::Cancelled => {
+                self.attachment_picker_error = None;
+            }
+            NativePickerOutcome::Failed(error) => {
+                self.attachment_picker_error = Some(error);
+            }
+        }
+        self.draft_revision = self.draft_revision.wrapping_add(1);
+    }
+
+    fn apply_attachment_validation_result(&mut self, result: LocalAttachmentValidationResult) {
+        let Some(index) = self
+            .pending_attachment_validations
+            .iter()
+            .position(|pending| pending.request_id == result.request_id)
+        else {
+            // The session/draft was reset while the validation worker was in flight.
+            return;
+        };
+        let pending = self.pending_attachment_validations.remove(index);
+        if pending.session_id != self.session_id
+            || pending.session_id != result.session_id
+            || pending.draft_generation != self.attachment_draft_generation
+            || pending.draft_generation != result.draft_generation
+        {
+            return;
+        }
+
+        let mut errors = Vec::new();
+        for outcome in result.outcomes {
+            match outcome {
+                LocalAttachmentValidationOutcome::Ready {
+                    path,
+                    file_name,
+                    size_bytes,
+                } => {
+                    let source = ChatAttachmentSource::LocalPath(path);
+                    if !self
+                        .attachments
+                        .iter()
+                        .any(|attachment| attachment.has_source(&source))
+                    {
+                        self.attachments.push(PendingChatAttachment {
+                            source,
+                            file_name,
+                            size_bytes,
+                        });
+                    }
+                }
+                LocalAttachmentValidationOutcome::Failed { path, detail } => {
+                    errors.push(format!("{}: {detail}", path.display()));
+                }
+            }
+        }
+        self.attachment_picker_error = if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join(" "))
+        };
+        self.draft_revision = self.draft_revision.wrapping_add(1);
+    }
+
+    fn request_local_attachment_validation(
+        &mut self,
+        paths: Vec<PathBuf>,
+        ingress: LocalAttachmentIngress,
+    ) -> Result<u64, String> {
+        let mut paths: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|path| !path.as_os_str().is_empty())
+            .collect();
+        paths.dedup();
+        if paths.is_empty() {
+            let detail = "choose at least one file to attach".to_string();
+            self.attachment_picker_error = Some(detail.clone());
+            return Err(detail);
+        }
+
+        self.next_attachment_validation_request_id = self
+            .next_attachment_validation_request_id
+            .wrapping_add(1)
+            .max(1);
+        let request_id = self.next_attachment_validation_request_id;
+        let session_id = self.session_id.clone();
+        let draft_generation = self.attachment_draft_generation;
+        let worker_paths = paths.clone();
+        let worker_session_id = session_id.clone();
+        let sender = self.attachment_validation_tx.clone();
+        let waker = self.ui_waker.clone();
+        let spawn = thread::Builder::new()
+            .name(format!("sinomo-chat-attachment-{request_id}"))
+            .spawn(move || {
+                let outcomes = worker_paths
+                    .into_iter()
+                    .map(validate_local_attachment_path)
+                    .collect();
+                let _ = sender.send(LocalAttachmentValidationResult {
+                    request_id,
+                    session_id: worker_session_id,
+                    draft_generation,
+                    outcomes,
+                });
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            });
+        if let Err(error) = spawn {
+            let detail = format!("could not inspect the selected files: {error}");
+            self.attachment_picker_error = Some(detail.clone());
+            return Err(detail);
+        }
+
+        self.pending_attachment_validations
+            .push(PendingLocalAttachmentValidation {
+                request_id,
+                session_id,
+                draft_generation,
+                ingress,
+                paths,
+            });
+        self.attachment_picker_error = None;
+        self.draft_revision = self.draft_revision.wrapping_add(1);
+        Ok(request_id)
+    }
+
+    fn toggle_manual_attachment_path(&mut self) {
+        self.attachment_manual_path_open = !self.attachment_manual_path_open;
+        if !self.attachment_manual_path_open {
+            self.attachment_path_input.clear();
+        }
+        self.attachment_picker_error = None;
+        self.draft_revision = self.draft_revision.wrapping_add(1);
+    }
+
     fn set_attachment_path_input(&mut self, value: String) {
         self.attachment_path_input = value;
+        self.attachment_picker_error = None;
     }
 
     fn add_attachment_from_path_input(&mut self) {
@@ -5009,43 +5343,198 @@ impl ChatState {
         match self.queue_attachment_path(&value) {
             Ok(()) => {
                 self.attachment_path_input.clear();
-                self.draft_revision = self.draft_revision.wrapping_add(1);
             }
             Err(error) => {
-                self.notice = Some(error);
+                self.attachment_picker_error = Some(error);
             }
         }
     }
 
     fn queue_attachment_path(&mut self, value: &str) -> Result<(), String> {
         let normalized = normalize_attachment_path(value)
-            .ok_or_else(|| "paste a file path before attaching".to_string())?;
-        let path = PathBuf::from(normalized);
-        let metadata =
-            std::fs::metadata(&path).map_err(|error| format!("attachment unavailable: {error}"))?;
-        if !metadata.is_file() {
-            return Err("attachment must be a file".to_string());
+            .ok_or_else(|| "enter a file path before attaching".to_string())?;
+        self.queue_local_attachment_path(PathBuf::from(normalized))
+    }
+
+    /// Queue a host file for background validation. This does no filesystem I/O on the caller's
+    /// thread, so native-picker, pasted-path, and OS-drop entry points share the same safe lane.
+    ///
+    /// The path remains the source until the chat worker accepts the turn, preserving the existing
+    /// local-file behavior while giving shell integration one typed entry point.
+    pub(crate) fn queue_local_attachment_path(
+        &mut self,
+        path: impl Into<PathBuf>,
+    ) -> Result<(), String> {
+        self.request_local_attachment_validation(
+            vec![path.into()],
+            LocalAttachmentIngress::ManualPath,
+        )
+        .map(|_| ())
+    }
+
+    /// Queue files received from SUI's root drag/drop event and open the attachment surface.
+    pub(crate) fn queue_dropped_local_attachment_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+    ) -> Result<(), String> {
+        self.attachment_drop_hovered = false;
+        self.open_attachment_surface();
+        self.request_local_attachment_validation(paths, LocalAttachmentIngress::OsDrop)
+            .map(|_| ())
+    }
+
+    pub(crate) fn queue_dropped_local_attachment_path(
+        &mut self,
+        path: PathBuf,
+    ) -> Result<(), String> {
+        self.queue_dropped_local_attachment_paths(vec![path])
+    }
+
+    /// Reveal the attachment panel while a host-file drag is over the window.
+    pub(crate) fn begin_external_attachment_hover(&mut self) {
+        if self.attachment_drop_hovered {
+            return;
         }
-        let path = std::fs::canonicalize(&path).unwrap_or(path);
-        if self
-            .attachments
-            .iter()
-            .any(|attachment| attachment.path == path)
-        {
-            return Ok(());
+        self.attachment_drop_hovered = true;
+        self.open_attachment_surface();
+        self.draft_revision = self.draft_revision.wrapping_add(1);
+    }
+
+    /// Clear the transient drag target when the pointer leaves or the host cancels the drag.
+    pub(crate) fn cancel_external_attachment_hover(&mut self) {
+        if self.attachment_drop_hovered {
+            self.attachment_drop_hovered = false;
+            self.draft_revision = self.draft_revision.wrapping_add(1);
         }
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "attachment".to_string());
-        self.attachments.push(PendingChatAttachment {
-            path,
+    }
+
+    pub(crate) fn open_attachment_surface(&mut self) {
+        self.set_composer_popup(Some(ComposerPopup::Attachments));
+    }
+
+    /// Queue the exact local bytes already displayed by Files. Unlike picker/drop paths, this
+    /// snapshot is never reopened after the user chooses "Attach to current chat".
+    #[cfg(test)]
+    pub(crate) fn queue_local_attachment_snapshot(
+        &mut self,
+        file_name: impl Into<String>,
+        source_path: impl Into<String>,
+        bytes: impl Into<Arc<[u8]>>,
+    ) -> Result<(), String> {
+        self.queue_local_attachment_snapshot_with_provenance(
             file_name,
-            size_bytes: metadata.len(),
-        });
+            ChatLocalAttachmentProvenance::new(source_path),
+            bytes,
+        )
+    }
+
+    pub(crate) fn queue_local_attachment_snapshot_with_provenance(
+        &mut self,
+        file_name: impl Into<String>,
+        provenance: ChatLocalAttachmentProvenance,
+        bytes: impl Into<Arc<[u8]>>,
+    ) -> Result<(), String> {
+        if provenance.source_path().trim().is_empty() {
+            let detail = "local attachment source is missing".to_string();
+            self.attachment_picker_error = Some(detail.clone());
+            return Err(detail);
+        }
+        let bytes = bytes.into();
+        let file_name = file_name.into();
+        let file_name = if file_name.trim().is_empty() {
+            FsPath::new(provenance.source_path())
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or("attachment")
+                .to_string()
+        } else {
+            file_name.trim().to_string()
+        };
+        let source = ChatAttachmentSource::LocalSnapshot {
+            provenance,
+            bytes: bytes.clone(),
+        };
+        let pending = PendingChatAttachment {
+            source: source.clone(),
+            file_name,
+            size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        };
+        if let Some(existing) = self
+            .attachments
+            .iter_mut()
+            .find(|attachment| attachment.has_source(&source))
+        {
+            *existing = pending;
+        } else {
+            self.attachments.push(pending);
+        }
+        self.open_attachment_surface();
+        self.attachment_picker_error = None;
+        self.draft_revision = self.draft_revision.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Queue an immutable SIFS viewer snapshot without staging it through a local temporary file.
+    /// The SIFS path is retained as provenance when the chat worker stores the attachment.
+    #[cfg(test)]
+    pub(crate) fn queue_sifs_attachment_snapshot(
+        &mut self,
+        file_name: impl Into<String>,
+        sifs_path: impl Into<String>,
+        bytes: impl Into<Arc<[u8]>>,
+    ) -> Result<(), String> {
+        self.queue_sifs_attachment_snapshot_with_provenance(
+            file_name,
+            ChatSifsAttachmentProvenance::new(sifs_path),
+            bytes,
+        )
+    }
+
+    pub(crate) fn queue_sifs_attachment_snapshot_with_provenance(
+        &mut self,
+        file_name: impl Into<String>,
+        provenance: ChatSifsAttachmentProvenance,
+        bytes: impl Into<Arc<[u8]>>,
+    ) -> Result<(), String> {
+        if provenance.path.trim().is_empty() {
+            let detail = "SIFS attachment path is missing".to_string();
+            self.attachment_picker_error = Some(detail.clone());
+            return Err(detail);
+        }
+        let bytes = bytes.into();
+        let file_name = file_name.into();
+        let file_name = if file_name.trim().is_empty() {
+            FsPath::new(&provenance.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or("attachment")
+                .to_string()
+        } else {
+            file_name.trim().to_string()
+        };
+        let source = ChatAttachmentSource::SifsSnapshot {
+            provenance,
+            bytes: bytes.clone(),
+        };
+        let pending = PendingChatAttachment {
+            source: source.clone(),
+            file_name,
+            size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        };
+        if let Some(existing) = self
+            .attachments
+            .iter_mut()
+            .find(|attachment| attachment.has_source(&source))
+        {
+            *existing = pending;
+        } else {
+            self.attachments.push(pending);
+        }
+        self.open_attachment_surface();
+        self.attachment_picker_error = None;
+        self.draft_revision = self.draft_revision.wrapping_add(1);
         Ok(())
     }
 
@@ -5060,9 +5549,7 @@ impl ChatState {
     fn attachment_inputs(&self) -> Vec<ChatAttachmentInput> {
         self.attachments
             .iter()
-            .map(|attachment| ChatAttachmentInput {
-                path: attachment.path.clone(),
-            })
+            .map(PendingChatAttachment::input)
             .collect()
     }
 
@@ -5082,7 +5569,7 @@ impl ChatState {
         self.input = prompt.to_string();
         self.cursor = self.input.len();
         if action.opens_attachment_controls() {
-            self.attachment_controls_open = true;
+            self.open_attachment_surface();
         }
         self.draft_revision = self.draft_revision.wrapping_add(1);
     }
@@ -6332,6 +6819,37 @@ fn normalize_attachment_path(value: &str) -> Option<String> {
         None
     } else {
         Some(path)
+    }
+}
+
+fn validate_local_attachment_path(path: PathBuf) -> LocalAttachmentValidationOutcome {
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return LocalAttachmentValidationOutcome::Failed {
+                path,
+                detail: format!("attachment unavailable: {error}"),
+            };
+        }
+    };
+    if !metadata.is_file() {
+        return LocalAttachmentValidationOutcome::Failed {
+            path,
+            detail: "attachment must be a file".to_string(),
+        };
+    }
+    let path = std::fs::canonicalize(&path).unwrap_or(path);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "attachment".to_string());
+    LocalAttachmentValidationOutcome::Ready {
+        path,
+        file_name,
+        size_bytes: metadata.len(),
     }
 }
 
@@ -8197,7 +8715,6 @@ fn activity_button_label(chat: &ChatState) -> &'static str {
     }
 }
 
-#[cfg(test)]
 fn activity_button_description(chat: &ChatState) -> String {
     let health = chat.runtime_health();
     let status = activity_status_summary(&health.detail);
@@ -8668,50 +9185,6 @@ fn agents_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         })
 }
 
-fn workspace_selector(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let input_shared = shared.clone();
-    let input = TextInput::new("chat-workspace-directory")
-        .value(shared.chat().workspace_path_input.clone())
-        .placeholder("Workspace directory")
-        .leading_icon(IconGlyph::Folder)
-        .theme_when(clone_reader(reader))
-        .on_change(move |value| {
-            input_shared.chat_mut().set_workspace_path_input(value);
-        });
-    let apply_shared = shared.clone();
-    let apply = sui::Button::new("Use")
-        .min_height(30.0)
-        .theme_when(secondary_button_theme(reader))
-        .enabled_when({
-            let shared = shared.clone();
-            move || !shared.chat().workspace_path_input.trim().is_empty()
-        })
-        .on_press(move || apply_shared.chat_mut().apply_workspace_path());
-    let status = if let Some(error) = shared.chat().workspace_error.clone() {
-        let color_shared = shared.clone();
-        Label::new(compact_line(&error, 72))
-            .font_size(10.0)
-            .color_when(move || palette(&color_shared).bad)
-    } else if let Some(root) = shared.chat().tool_runtime.workspace_root.as_ref() {
-        muted_label(
-            shared,
-            format!("Bound: {}", compact_line(&root.display().to_string(), 44)),
-        )
-    } else {
-        muted_label(shared, "Required before coding tools can write")
-    };
-    Stack::vertical()
-        .spacing(4.0)
-        .alignment(Alignment::Stretch)
-        .with_child(
-            TrailingSlotRow::new(input, apply)
-                .trailing_width(54.0)
-                .trailing_height(30.0)
-                .gap(6.0),
-        )
-        .with_child(status)
-}
-
 /// Build the CHATS ListView: stored chats/channels only. Creation actions live
 /// above the scroll area so the list itself behaves like persistent history.
 fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -8827,11 +9300,11 @@ fn session_create_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget 
             })
     };
 
-    Flex::vertical()
+    Flex::horizontal()
         .main_gap(6.0)
-        .align_items(Alignment::Stretch)
-        .with_child(new_chat)
-        .with_child(new_channel)
+        .align_items(Alignment::Center)
+        .with_item(new_chat, FlexItem::flex(1.0).min_width(0.0))
+        .with_item(new_channel, FlexItem::flex(1.0).min_width(0.0))
 }
 
 fn request_chat_window_relayout(ctx: &mut EventCtx) {
@@ -9043,7 +9516,7 @@ fn session_row_content(
         .gap(SIDEBAR_ROW_EDIT_GAP)
 }
 
-/// The sidebar column: AGENTS heading + list, then CHATS heading + list. Wrapped in a
+/// The sidebar column: AGENTS heading + list, then conversations. Wrapped in a
 /// [`RebuildOnChange`] keyed on the agent/chat signature so it rebuilds when those lists change
 /// (e.g. a new chat is persisted) but not on every token.
 fn sidebar(
@@ -9069,20 +9542,6 @@ fn sidebar(
                 )
                 .with_child(SizedBox::new().height(2.0))
                 .with_child(WidgetPadding::horizontal(8.0, agents_list(&s, &r)).fill_child_height())
-                .with_child(SizedBox::new().height(12.0))
-                .with_child(
-                    WidgetPadding::horizontal(18.0, heading(&s, "WORKSPACE")).fill_child_height(),
-                )
-                .with_child(SizedBox::new().height(4.0))
-                .with_child(
-                    WidgetPadding::horizontal(
-                        8.0,
-                        SizedBox::new()
-                            .height(50.0)
-                            .with_child(workspace_selector(&s, &r)),
-                    )
-                    .fill_child_height(),
-                )
                 .with_child(SizedBox::new().height(16.0))
                 .with_child(WidgetPadding::horizontal(18.0, chats_heading(&s)).fill_child_height())
                 .with_child(SizedBox::new().height(6.0))
@@ -9097,18 +9556,11 @@ fn sidebar(
                 )
                 .with_child(SizedBox::new().height(6.0))
                 .with_child(
-                    WidgetPadding::horizontal(
-                        8.0,
-                        SizedBox::new()
-                            .height(30.0)
-                            .with_child(session_filter_input(&s, &r)),
-                    )
-                    .fill_child_height(),
+                    WidgetPadding::horizontal(8.0, session_filter_input(&s, &r)).fill_child_width(),
                 )
                 .with_child(SizedBox::new().height(6.0))
                 .with_child(
-                    WidgetPadding::horizontal(8.0, session_create_actions(&s, &r))
-                        .fill_child_height(),
+                    WidgetPadding::horizontal(8.0, session_create_actions(&s, &r)).fill_child(),
                 )
                 .with_child(SizedBox::new().height(8.0))
                 .with_item(
@@ -9145,8 +9597,6 @@ fn sidebar_signature(
     bool,
     bool,
     bool,
-    String,
-    String,
 ) {
     let chat = shared.chat();
     let active = chat
@@ -9173,12 +9623,6 @@ fn sidebar_signature(
         chat.session_list_loading,
         chat.session_list_slow_notice_shown,
         chat.session_list_details_open,
-        chat.tool_runtime
-            .workspace_root
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_default(),
-        chat.workspace_error.clone().unwrap_or_default(),
     )
 }
 
@@ -12020,7 +12464,7 @@ impl TranscriptView {
             let mut x = area.x() + (area.width() - row_w) * 0.5;
             let lower = area.y() + PAD;
             let upper = (area.max_y() - PAD - button_h).max(lower);
-            let y = (cy + 62.0).clamp(lower, upper);
+            let y = (cy + EMPTY_ACTION_OFFSET_Y).clamp(lower, upper);
             return actions
                 .into_iter()
                 .zip(widths)
@@ -12046,7 +12490,7 @@ impl TranscriptView {
             let x0 = area.x() + (area.width() - grid_w) * 0.5;
             let lower = area.y() + PAD;
             let upper = (area.max_y() - PAD - grid_h).max(lower);
-            let y0 = (cy + 62.0).clamp(lower, upper);
+            let y0 = (cy + EMPTY_ACTION_OFFSET_Y).clamp(lower, upper);
             return actions
                 .iter()
                 .enumerate()
@@ -12072,7 +12516,7 @@ impl TranscriptView {
         let x = area.x() + (area.width() - width) * 0.5;
         let lower = area.y() + PAD;
         let upper = (area.max_y() - PAD - stack_h).max(lower);
-        let y0 = (cy + 58.0).clamp(lower, upper);
+        let y0 = (cy + EMPTY_ACTION_OFFSET_Y).clamp(lower, upper);
         actions
             .iter()
             .enumerate()
@@ -14683,12 +15127,19 @@ fn open_provider_setup(shared: &Shared) {
     }
 }
 
-fn attachment_signature(shared: &Shared) -> (u64, usize, bool) {
+fn attachment_signature(
+    shared: &Shared,
+) -> (u64, usize, bool, bool, bool, bool, bool, Option<String>) {
     let chat = shared.chat();
     (
         chat.draft_revision,
         chat.attachments.len(),
         chat.attachment_controls_visible(),
+        chat.attachment_manual_path_open,
+        chat.attachment_operation_pending(),
+        chat.attachment_picker_lane_pending(),
+        chat.attachment_drop_hovered,
+        chat.attachment_picker_error.clone(),
     )
 }
 
@@ -14740,135 +15191,183 @@ fn attachment_drawer_chip(
 }
 
 fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    let controls_visible = shared.chat().attachment_controls_visible();
-    let chip_limit = if controls_visible { usize::MAX } else { 3 };
     let mut chips = Flex::horizontal()
         .wrap(FlexWrap::Wrap)
         .gap(6.0)
         .align_items(Alignment::Center);
-    for (index, attachment) in shared
-        .chat()
-        .attachments
-        .iter()
-        .take(chip_limit)
-        .enumerate()
-    {
+    for (index, attachment) in shared.chat().attachments.iter().enumerate() {
         chips = chips.with_child(attachment_drawer_chip(shared, reader, index, attachment));
     }
-    if !controls_visible && shared.chat().attachments.len() > 3 {
-        let extra = shared.chat().attachments.len() - 3;
-        let s = shared.clone();
-        chips = chips.with_child(SizedBox::new().height(ATTACHMENT_CHIPS_H).with_child(
-            small_label(shared, format!("+{extra}")).color_when(move || palette(&s).text_faint),
-        ));
-    }
 
-    if !controls_visible {
-        let attach = {
-            let s = shared.clone();
-            sui::Button::new("Attach file")
-                .icon(IconGlyph::File)
-                .min_height(ATTACHMENT_ENTRY_H)
-                .min_width(112.0)
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Tonal)
-                .tone(SemanticTone::Neutral)
-                .on_press(move || {
-                    s.chat_mut().toggle_attachment_controls();
-                })
-        };
-        let empty_summary = {
-            let s = shared.clone();
-            small_label(shared, "No files attached").color_when(move || palette(&s).text_faint)
-        };
-        let summary = SwitchView::new()
-            .selected(if shared.chat().attachments.is_empty() {
-                0
-            } else {
-                1
-            })
-            .with_child(empty_summary)
-            .with_child(chips);
-        let entry = TrailingSlotRow::new(
-            summary,
-            Flex::horizontal()
-                .align_items(Alignment::Center)
-                .spacer()
-                .with_child(attach),
+    let picker_pending = shared.chat().attachment_picker_pending();
+    let picker_lane_pending = shared.chat().attachment_picker_lane_pending();
+    let choose = {
+        let s = shared.clone();
+        sui::Button::new(if picker_pending {
+            "Choosing files…"
+        } else if picker_lane_pending {
+            "Close previous picker…"
+        } else {
+            "Choose files"
+        })
+        .icon(IconGlyph::Attach)
+        .min_height(ATTACHMENT_ENTRY_H)
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Filled)
+        .tone(SemanticTone::Accent)
+        .enabled_when({
+            let s = s.clone();
+            move || !s.chat().attachment_picker_lane_pending()
+        })
+        .on_press_with_ctx(move |ctx| {
+            s.chat_mut().request_attachment_picker();
+            request_chat_window_relayout(ctx);
+        })
+    };
+    let manual_path_open = shared.chat().attachment_manual_path_open;
+    let manual = {
+        let s = shared.clone();
+        sui::Button::new(if manual_path_open {
+            "Hide path entry"
+        } else {
+            "Enter path manually"
+        })
+        .icon(IconGlyph::File)
+        .min_height(ATTACHMENT_ENTRY_H)
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
+        .on_press_with_ctx(move |ctx| {
+            s.chat_mut().toggle_manual_attachment_path();
+            request_chat_window_relayout(ctx);
+        })
+    };
+    let actions = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(8.0)
+        .align_items(Alignment::Center)
+        .with_child(choose)
+        .with_child(manual);
+
+    let hint = {
+        let s = shared.clone();
+        small_label(
+            shared,
+            "Choose one or more files with the system picker. Manual paths are a fallback.",
         )
-        .trailing_width(120.0)
-        .trailing_height(ATTACHMENT_ENTRY_H)
-        .gap(8.0);
-        return WidgetPod::new(
-            Stack::vertical()
-                .spacing(4.0)
-                .alignment(Alignment::Stretch)
-                .with_child(SizedBox::new().height(ATTACHMENT_ENTRY_H).with_child(entry))
-                .with_child(SizedBox::new().height(ATTACHMENT_CHIPS_H)),
+        .color_when(move || palette(&s).text_muted)
+    };
+    let mut body = Stack::vertical()
+        .spacing(8.0)
+        .alignment(Alignment::Stretch)
+        .with_child(actions)
+        .with_child(hint);
+
+    if shared.chat().attachment_drop_hovered {
+        body = body.with_child(
+            Stack::horizontal().with_child(
+                StatusBadge::new("Drop files to attach")
+                    .icon(IconGlyph::Attach)
+                    .tone(SemanticTone::Info)
+                    .theme_when(clone_reader(reader)),
+            ),
         );
     }
 
-    let path_input = {
+    let pending_validations = shared.chat().pending_attachment_validations.clone();
+    if !pending_validations.is_empty() {
+        let mut pending_chips = Flex::horizontal()
+            .wrap(FlexWrap::Wrap)
+            .gap(6.0)
+            .align_items(Alignment::Center);
+        for pending in pending_validations {
+            let ingress = match pending.ingress {
+                LocalAttachmentIngress::NativePicker => "Checking",
+                LocalAttachmentIngress::ManualPath => "Checking path",
+                LocalAttachmentIngress::OsDrop => "Checking drop",
+            };
+            for path in pending.paths {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or("file");
+                pending_chips = pending_chips.with_child(
+                    StatusBadge::new(format!("{ingress} {}…", compact_line(name, 24)))
+                        .icon(IconGlyph::File)
+                        .tone(SemanticTone::Info)
+                        .theme_when(clone_reader(reader)),
+                );
+            }
+        }
+        body = body.with_child(pending_chips);
+    }
+
+    if manual_path_open {
+        let path_input = {
+            let s = shared.clone();
+            TextInput::new("chat-attachment-path")
+                .value(shared.chat().attachment_path_input.clone())
+                .placeholder("Enter a file path")
+                .leading_icon(IconGlyph::File)
+                .theme_when(composer_control_reader(reader))
+                .on_change(move |value| {
+                    s.chat_mut().set_attachment_path_input(value);
+                })
+        };
+        let add = {
+            let s = shared.clone();
+            sui::Button::new("Add path")
+                .icon(IconGlyph::Add)
+                .min_height(ATTACHMENT_ENTRY_H)
+                .min_width(96.0)
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
+                .enabled_when({
+                    let s = s.clone();
+                    move || !s.chat().attachment_path_input.trim().is_empty()
+                })
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().add_attachment_from_path_input();
+                    request_chat_window_relayout(ctx);
+                })
+        };
+        body = body.with_child(
+            Flex::horizontal()
+                .wrap(FlexWrap::Wrap)
+                .gap(8.0)
+                .align_items(Alignment::Center)
+                .with_item(path_input, FlexItem::flex(1.0).min_width(180.0))
+                .with_child(add),
+        );
+    }
+
+    if let Some(error) = shared.chat().attachment_picker_error.clone() {
         let s = shared.clone();
-        TextInput::new("chat-attachment-path")
-            .value(shared.chat().attachment_path_input.clone())
-            .placeholder("Paste file path")
-            .leading_icon(IconGlyph::File)
-            .theme_when(composer_control_reader(reader))
-            .on_change(move |value| {
-                s.chat_mut().set_attachment_path_input(value);
-            })
-    };
+        body = body.with_child(
+            Flex::horizontal()
+                .wrap(FlexWrap::Wrap)
+                .gap(8.0)
+                .align_items(Alignment::Center)
+                .with_child(
+                    StatusBadge::new("Couldn’t attach")
+                        .icon(IconGlyph::Alert)
+                        .tone(SemanticTone::Danger)
+                        .theme_when(clone_reader(reader)),
+                )
+                .with_item(
+                    small_label(shared, error).color_when(move || palette(&s).danger_text),
+                    FlexItem::flex(1.0).min_width(140.0),
+                ),
+        );
+    }
 
-    let hide = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::Close, "Hide attachment field")
-            .size(ATTACHMENT_ENTRY_H)
-            .icon_size(13.0)
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Tonal)
-            .tone(SemanticTone::Neutral)
-            .on_press(move || {
-                s.chat_mut().toggle_attachment_controls();
-            })
-    };
+    if !shared.chat().attachments.is_empty() {
+        body = body.with_child(chips);
+    }
 
-    let add = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::Add, "Attach file")
-            .size(ATTACHMENT_ENTRY_H)
-            .icon_size(15.0)
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || !s.chat().attachment_path_input.trim().is_empty()
-            })
-            .on_press(move || {
-                s.chat_mut().add_attachment_from_path_input();
-            })
-    };
-
-    let action_width = ATTACHMENT_ENTRY_H * 2.0 + 6.0;
-    let entry = TrailingSlotRow::new(
-        path_input,
-        Flex::horizontal()
-            .main_gap(6.0)
-            .align_items(Alignment::Center)
-            .spacer()
-            .with_child(hide)
-            .with_child(add),
-    )
-    .trailing_width(action_width)
-    .trailing_height(ATTACHMENT_ENTRY_H)
-    .gap(8.0);
-
-    WidgetPod::new(
-        Stack::vertical()
-            .spacing(4.0)
-            .alignment(Alignment::Stretch)
-            .with_child(SizedBox::new().height(ATTACHMENT_ENTRY_H).with_child(entry))
-            .with_child(chips),
-    )
+    WidgetPod::new(body)
 }
 
 fn model_button_label(chat: &ChatState) -> String {
@@ -15104,7 +15603,11 @@ fn composer_attachments_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPo
             "Attachments",
             "Close attachments",
         ))
-        .with_child(controls);
+        .with_child(
+            SizedBox::new()
+                .height(COMPOSER_POPUP_H - 34.0)
+                .with_child(ScrollView::vertical(controls).viewport_width_hint(true)),
+        );
     WidgetPod::new(
         Surface::new(
             SurfaceRole::Titlebar,
@@ -15392,10 +15895,10 @@ fn composer_context_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     composer_chip_row(row, "Attached context")
 }
 
-/// The composer action bar (`.sm-composer-bar`): quiet controls on the left
-/// (attach, voice, model/context/activity), the keyboard hint, and the one
-/// primary action — Send, which becomes Stop while a response streams.
-fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> WidgetPod {
+/// The composer action bar (`.sm-composer-bar`): compact ghost controls on the
+/// left and Send on the right. Detailed state and the keyboard shortcut live in
+/// hover tooltips instead of consuming the writing surface.
+fn composer_bar(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let (streaming, media_active, hint, can_reuse) = {
         let chat = shared.chat();
         (
@@ -15450,48 +15953,67 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
         })
     };
 
-    // Mesh accent discipline: Send is the composer's one primary action, so
-    // the model/context/activity pickers ride the quiet neutral treatment.
+    // Model/context/activity match the icon-sized attachment and voice affordances.
+    // Their current state remains available to pointer users via tooltips and to
+    // assistive technology through the IconButton semantic name.
     let model = {
         let s = shared.clone();
-        sui::Button::new(model_button_label(&shared.chat()))
-            .icon(IconGlyph::Sparkles)
-            .min_height(COMPOSER_GHOST_BUTTON_SIZE)
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Tonal)
-            .tone(SemanticTone::Neutral)
-            .on_press_with_ctx(move |ctx| {
-                s.chat_mut().toggle_composer_popup(ComposerPopup::Model);
-                request_chat_window_relayout(ctx);
-            })
+        let label = model_button_label(&shared.chat());
+        Tooltip::new(
+            label.clone(),
+            IconButton::new(IconGlyph::Sparkles, label)
+                .size(COMPOSER_GHOST_BUTTON_SIZE)
+                .icon_size(14.0)
+                .theme_when(composer_control_reader(reader))
+                .appearance(sui::ButtonAppearance::Ghost)
+                .tone(SemanticTone::Neutral)
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().toggle_composer_popup(ComposerPopup::Model);
+                    request_chat_window_relayout(ctx);
+                }),
+        )
+        .placement(TooltipPlacement::Above)
+        .theme(reader())
     };
 
     let context = {
         let s = shared.clone();
-        sui::Button::new(context_overview_summary(&shared.chat()))
-            .icon(IconGlyph::History)
-            .min_height(COMPOSER_GHOST_BUTTON_SIZE)
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Tonal)
-            .tone(SemanticTone::Neutral)
-            .on_press_with_ctx(move |ctx| {
-                s.chat_mut().toggle_composer_popup(ComposerPopup::Context);
-                request_chat_window_relayout(ctx);
-            })
+        let label = context_overview_summary(&shared.chat());
+        Tooltip::new(
+            label.clone(),
+            IconButton::new(IconGlyph::History, label)
+                .size(COMPOSER_GHOST_BUTTON_SIZE)
+                .icon_size(14.0)
+                .theme_when(composer_control_reader(reader))
+                .appearance(sui::ButtonAppearance::Ghost)
+                .tone(SemanticTone::Neutral)
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().toggle_composer_popup(ComposerPopup::Context);
+                    request_chat_window_relayout(ctx);
+                }),
+        )
+        .placement(TooltipPlacement::Above)
+        .theme(reader())
     };
 
     let activity = {
         let s = shared.clone();
-        sui::Button::new(activity_button_label(&shared.chat()))
-            .icon(IconGlyph::History)
-            .min_height(COMPOSER_GHOST_BUTTON_SIZE)
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Tonal)
-            .tone(SemanticTone::Neutral)
-            .on_press_with_ctx(move |ctx| {
-                s.chat_mut().toggle_activity_panel();
-                request_chat_window_relayout(ctx);
-            })
+        let label = activity_button_label(&shared.chat()).to_string();
+        Tooltip::new(
+            activity_button_description(&shared.chat()),
+            IconButton::new(IconGlyph::Hourglass, label)
+                .size(COMPOSER_GHOST_BUTTON_SIZE)
+                .icon_size(14.0)
+                .theme_when(composer_control_reader(reader))
+                .appearance(sui::ButtonAppearance::Ghost)
+                .tone(SemanticTone::Neutral)
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().toggle_activity_panel();
+                    request_chat_window_relayout(ctx);
+                }),
+        )
+        .placement(TooltipPlacement::Above)
+        .theme(reader())
     };
 
     let mut row = Flex::horizontal()
@@ -15508,35 +16030,10 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
     }
 
     row = row
-        .with_item(
-            model,
-            FlexItem::new()
-                .basis(132.0)
-                .min_width(100.0)
-                .min_height(COMPOSER_GHOST_BUTTON_SIZE),
-        )
-        .with_item(
-            context,
-            FlexItem::flex(1.0)
-                .basis(260.0)
-                .min_width(160.0)
-                .min_height(COMPOSER_GHOST_BUTTON_SIZE),
-        )
-        .with_item(
-            activity,
-            FlexItem::new()
-                .basis(88.0)
-                .min_width(72.0)
-                .min_height(COMPOSER_GHOST_BUTTON_SIZE),
-        );
-
-    if show_hint {
-        let s = shared.clone();
-        row = row.with_child(
-            small_label(shared, "Enter sends · Shift+Enter newline")
-                .color_when(move || palette(&s).text_faint),
-        );
-    }
+        .with_child(model)
+        .with_child(context)
+        .with_child(activity)
+        .spacer();
 
     if can_reuse && !streaming {
         let s = shared.clone();
@@ -15545,7 +16042,7 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
                 .icon(IconGlyph::Redo)
                 .min_height(COMPOSER_GHOST_BUTTON_SIZE)
                 .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Tonal)
+                .appearance(sui::ButtonAppearance::Ghost)
                 .tone(SemanticTone::Neutral)
                 .on_press(move || {
                     s.chat_mut().use_latest_answer_as_draft();
@@ -15554,34 +16051,45 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
     }
 
     // Interruption is first-class: the send button becomes stop mid-stream.
-    let action = if streaming {
+    let (action, action_tooltip) = if streaming {
         let s = shared.clone();
-        IconButton::new(IconGlyph::Stop, "Stop generation")
-            .size(SEND_BUTTON_SIZE)
-            .icon_size(13.0)
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Filled)
-            .tone(SemanticTone::Accent)
-            .on_press(move || {
-                s.chat_mut().interrupt_turn();
-            })
+        (
+            IconButton::new(IconGlyph::Stop, "Stop generation")
+                .size(SEND_BUTTON_SIZE)
+                .icon_size(13.0)
+                .theme_when(composer_control_reader(reader))
+                .appearance(sui::ButtonAppearance::Ghost)
+                .tone(SemanticTone::Accent)
+                .on_press(move || {
+                    s.chat_mut().interrupt_turn();
+                }),
+            "Stop the current response",
+        )
     } else {
         let s = shared.clone();
-        IconButton::new(IconGlyph::ArrowUp, "Send message")
-            .size(SEND_BUTTON_SIZE)
-            .icon_size(16.0)
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Filled)
-            .tone(SemanticTone::Accent)
-            .enabled_when({
-                let s = s.clone();
-                move || s.chat().can_send()
-            })
-            .on_press(move || {
-                s.chat_mut().submit();
-            })
+        (
+            IconButton::new(IconGlyph::ArrowUp, "Send message")
+                .size(SEND_BUTTON_SIZE)
+                .icon_size(16.0)
+                .theme_when(composer_control_reader(reader))
+                .appearance(sui::ButtonAppearance::Ghost)
+                .tone(SemanticTone::Accent)
+                .enabled_when({
+                    let s = s.clone();
+                    move || s.chat().can_send()
+                })
+                .on_press(move || {
+                    s.chat_mut().submit();
+                }),
+            "Enter sends · Shift+Enter newline",
+        )
     };
-    row = row.with_child(action);
+    row = row.with_child(
+        Tooltip::new(action_tooltip, action)
+            .placement(TooltipPlacement::Above)
+            .alignment(TooltipAlignment::End)
+            .theme(reader()),
+    );
 
     WidgetPod::new(WidgetPadding::new(
         Insets {
@@ -15779,22 +16287,7 @@ fn composer_field(
                 let s = s.clone();
                 move || composer_bar_signature(&s)
             },
-            move |_sig| {
-                let build_s = s.clone();
-                let build_r = Rc::clone(&r);
-                WidgetPod::new(RebuildOnConstraints::new(
-                    true,
-                    move |constraints| {
-                        let width = if constraints.max.width.is_finite() {
-                            constraints.max.width
-                        } else {
-                            constraints.min.width.max(360.0)
-                        };
-                        width >= COMPOSER_HINT_MIN_W
-                    },
-                    move |show_hint| composer_bar(&build_s, &build_r, *show_hint),
-                ))
-            },
+            move |_sig| composer_bar(&s, &r),
         )
     };
 
@@ -16049,13 +16542,15 @@ fn wide_pod(
     selection: &SelectionScope,
 ) -> WidgetPod {
     let work_area = chat_work_area(shared, reader, selection);
-    let row = FixedPaneSplit::horizontal(
-        sidebar(shared, reader, sessions_scroll_state),
-        Separator::vertical().theme_when(clone_reader(reader)),
-        work_area,
-    )
-    .fixed_first(SIDEBAR_W)
-    .divider_extent(1.0);
+    let ratio = shared.chat().sidebar_ratio;
+    let ratio_shared = shared.clone();
+    let row = SplitView::horizontal(sidebar(shared, reader, sessions_scroll_state), work_area)
+        .name("Conversation sidebar")
+        .ratio(ratio)
+        .min_first(SIDEBAR_MIN_W)
+        .min_second(CHAT_PANE_MIN_W)
+        .theme(reader())
+        .on_change(move |ratio| ratio_shared.chat_mut().set_sidebar_ratio(ratio));
     let dialog_host = ChatDialogHost::new(row, shared.clone(), Rc::clone(reader));
     WidgetPod::new(
         Surface::window(dialog_host)
@@ -16283,6 +16778,12 @@ fn view_signature(shared: &Shared) -> u64 {
     chat.draft_revision.hash(&mut h);
     chat.attachments.len().hash(&mut h);
     chat.attachment_path_input.is_empty().hash(&mut h);
+    chat.attachment_manual_path_open.hash(&mut h);
+    chat.attachment_operation_pending().hash(&mut h);
+    chat.attachment_picker_lane_pending().hash(&mut h);
+    chat.pending_attachment_validations.len().hash(&mut h);
+    chat.attachment_drop_hovered.hash(&mut h);
+    chat.attachment_picker_error.hash(&mut h);
     chat.queued_turn_inputs.len().hash(&mut h);
     for queued in &chat.queued_turn_inputs {
         (queued.kind == QueuedTurnKind::Steer).hash(&mut h);
@@ -16886,7 +17387,7 @@ mod tests {
 
     fn pending_attachment(file_name: &str, size_bytes: u64) -> PendingChatAttachment {
         PendingChatAttachment {
-            path: PathBuf::from(format!("C:\\tmp\\{file_name}")),
+            source: ChatAttachmentSource::LocalPath(PathBuf::from(format!("C:\\tmp\\{file_name}"))),
             file_name: file_name.to_string(),
             size_bytes,
         }
@@ -20400,7 +20901,7 @@ mod tests {
             .align_items(Alignment::Stretch)
             .with_item(
                 sidebar(&shared, &theme_reader, &scroll_state),
-                FlexItem::fixed(SIDEBAR_W),
+                FlexItem::fixed(SIDEBAR_MIN_W),
             )
             .with_item(shrink, FlexItem::fixed(120.0));
 
@@ -20444,6 +20945,197 @@ mod tests {
             after_offset > 0.0,
             "shrinking the chat list should not reset scroll to the top while content still overflows"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_sidebar_is_resizable_and_search_fills_available_width() -> sui::Result<()> {
+        use sui::{PointerButtons, PointerEvent};
+
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.models_loading = false;
+            chat.session_kind_filter = SessionKindFilter::Channels;
+            chat.sessions.clear();
+        }
+        let viewport = Size::new(1_200.0, 720.0);
+        let window = test_window(
+            "Resizable conversation sidebar",
+            view(shared.clone()),
+            viewport,
+        )?;
+
+        assert_eq!(window.get_by_text("WORKSPACE").count()?, 0);
+        let before = window.snapshot()?;
+        let search_before =
+            named_node_bounds(&before, SemanticsRole::TextInput, "chat-session-filter");
+        let new_chat = named_node_bounds(&before, SemanticsRole::Button, "New chat");
+        let new_channel = before
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Button
+                    && node.name.as_deref() == Some("New channel")
+                    && node.description.as_deref() != Some("Create a shared channel")
+            })
+            .expect("sidebar New channel button")
+            .bounds;
+        assert!(
+            (new_chat.y() - new_channel.y()).abs() < 1.0,
+            "creation actions should share one compact row: {new_chat:?}, {new_channel:?}"
+        );
+        assert_non_overlapping("sidebar creation actions", new_chat, new_channel);
+        assert_eq!(
+            before
+                .accessibility
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.role == SemanticsRole::Splitter
+                        && node.name.as_deref() == Some("Conversation sidebar")
+                })
+                .count(),
+            1,
+            "desktop Chat should expose the native resizable splitter"
+        );
+
+        let theme = shared.theme();
+        let divider = theme.metrics.split_view_divider_thickness.max(1.0);
+        let initial_ratio = shared.chat().sidebar_ratio;
+        let divider_x = (viewport.width - divider) * initial_ratio + divider * 0.5;
+        let divider_point = Point::new(divider_x, 240.0);
+        let drag_point = Point::new(380.0, 240.0);
+        let root = window.root();
+        root.dispatch_event(Event::Pointer(PointerEvent::new(
+            PointerEventKind::Move,
+            divider_point,
+        )))?;
+        let mut down = PointerEvent::new(PointerEventKind::Down, divider_point);
+        down.pointer_id = 1;
+        down.button = Some(PointerButton::Primary);
+        down.buttons = PointerButtons::new(1);
+        root.dispatch_event(Event::Pointer(down))?;
+        let mut moved = PointerEvent::new(PointerEventKind::Move, drag_point);
+        moved.pointer_id = 1;
+        moved.buttons = PointerButtons::new(1);
+        root.dispatch_event(Event::Pointer(moved))?;
+        let mut up = PointerEvent::new(PointerEventKind::Up, drag_point);
+        up.pointer_id = 1;
+        up.button = Some(PointerButton::Primary);
+        root.dispatch_event(Event::Pointer(up))?;
+        window.run_until_idle()?;
+
+        assert!(
+            shared.chat().sidebar_ratio > initial_ratio + 0.08,
+            "dragging the divider should retain the wider sidebar ratio"
+        );
+        let after = window.capture_artifacts()?;
+        write_visual_debug_artifacts("chat-layout-polish", &after)?;
+        let search_after = named_node_bounds(
+            &after.snapshot,
+            SemanticsRole::TextInput,
+            "chat-session-filter",
+        );
+        assert!(
+            search_after.width() > search_before.width() + 100.0,
+            "search should expand with the resized sidebar: before={search_before:?}, after={search_after:?}"
+        );
+
+        let main_new_channel = after
+            .snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Button
+                    && node.name.as_deref() == Some("New channel")
+                    && node.description.as_deref() == Some("Create a shared channel")
+            })
+            .expect("main-pane New channel action")
+            .bounds;
+        let empty_copy_bottom = after
+            .snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.role == SemanticsRole::Text
+                    && matches!(
+                        node.name.as_deref(),
+                        Some("No channels yet")
+                            | Some(
+                                "Create a channel to coordinate multiple agents around one shared timeline."
+                            )
+                            | Some("Use New channel to choose agents and edit the title.")
+                    )
+            })
+            .map(|node| node.bounds.max_y())
+            .fold(0.0, f32::max);
+        assert!(
+            main_new_channel.y() >= empty_copy_bottom + 12.0,
+            "main New channel action should sit below empty-state copy: copy_bottom={empty_copy_bottom}, action={main_new_channel:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_composer_uses_compact_controls_and_send_shortcut_tooltip() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.models_loading = false;
+            chat.messages = vec![
+                ChatMessage::user("Keep the composer compact."),
+                ChatMessage::model("Ready."),
+            ];
+            chat.set_draft("Send this message".to_string());
+        }
+        let window = test_window(
+            "Compact composer controls",
+            view(shared.clone()),
+            Size::new(1_000.0, 680.0),
+        )?;
+
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Tooltip)
+                .with_name("Enter sends · Shift+Enter newline")
+                .count()?,
+            0,
+            "keyboard guidance should not consume persistent composer space"
+        );
+        let snapshot = window.snapshot()?;
+        for name in ["gpt-5", "Context will refresh on the next send", "Activity"] {
+            let bounds = named_node_bounds(&snapshot, SemanticsRole::Button, name);
+            assert!(
+                bounds.width() <= COMPOSER_GHOST_BUTTON_SIZE + 1.0
+                    && bounds.height() <= COMPOSER_GHOST_BUTTON_SIZE + 1.0,
+                "{name} should use the compact icon-button footprint, got {bounds:?}"
+            );
+        }
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Send message")
+            .hover()?;
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Tooltip)
+                .with_name("Enter sends · Shift+Enter newline")
+                .count()?,
+            1,
+            "the send button should reveal the keyboard guidance on hover"
+        );
+        window.advance_time(1.0)?;
+        window.pump_frames(2)?;
+        let artifacts = window.capture_artifacts()?;
+        write_visual_debug_artifacts("chat-composer-polish", &artifacts)?;
 
         Ok(())
     }
@@ -24475,6 +25167,13 @@ mod tests {
         state
             .queue_attachment_path(&format!("\"{}\"", attachment.path.display()))
             .expect("queue attachment");
+        assert!(
+            state.attachment_operation_pending(),
+            "path validation stays off the UI thread"
+        );
+        wait_for(&mut state, Duration::from_secs(2), |state| {
+            !state.attachment_operation_pending()
+        });
         assert_eq!(state.attachments.len(), 1);
         assert_eq!(state.attachments[0].file_name, "report.txt");
         assert!(!state.can_send(), "provider setup is still required");
@@ -24506,6 +25205,9 @@ mod tests {
         state
             .queue_attachment_path(attachment.path.to_str().expect("utf8 path"))
             .expect("queue attachment");
+        wait_for(&mut state, Duration::from_secs(2), |state| {
+            !state.attachment_operation_pending()
+        });
 
         state.submit();
 
@@ -24517,21 +25219,233 @@ mod tests {
     }
 
     #[test]
-    fn attachment_drawer_hides_unqueued_path_input() {
+    fn manual_attachment_path_is_explicit_fallback_and_clears_when_hidden() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
 
         assert!(!state.attachment_controls_visible());
-        state.toggle_attachment_controls();
+        state.open_attachment_surface();
         assert!(state.attachment_controls_visible());
+        assert!(!state.attachment_manual_path_open);
+        state.toggle_manual_attachment_path();
+        assert!(state.attachment_manual_path_open);
         state.set_attachment_path_input("C:\\tmp\\draft.txt".to_string());
 
-        state.toggle_attachment_controls();
-        assert!(!state.attachment_controls_visible());
+        state.toggle_manual_attachment_path();
+        assert!(!state.attachment_manual_path_open);
         assert!(
             state.attachment_path_input.is_empty(),
-            "closing the drawer must not leave a hidden unsent path draft"
+            "hiding the fallback must not leave an invisible unsent path draft"
         );
+    }
+
+    #[test]
+    fn native_picker_attachment_selection_uses_background_validation_lane() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let first = temp_attachment_file("picker-first", "first.txt", b"first");
+        let second = temp_attachment_file("picker-second", "second.rs", b"second");
+        state.session_id = "visible-chat".to_string();
+        state.pending_attachment_picker = Some(PendingAttachmentPicker {
+            request_id: 41,
+            session_id: state.session_id.clone(),
+            draft_generation: state.attachment_draft_generation,
+        });
+
+        state.apply_attachment_picker_result(NativePickerResult {
+            request_id: 41,
+            context_generation: state.attachment_draft_generation,
+            outcome: NativePickerOutcome::Selected(vec![first.path.clone(), second.path.clone()]),
+        });
+
+        assert!(state.attachments.is_empty());
+        assert_eq!(state.pending_attachment_validations.len(), 1);
+        wait_for(&mut state, Duration::from_secs(2), |state| {
+            !state.attachment_operation_pending()
+        });
+        assert_eq!(state.attachments.len(), 2);
+        assert_eq!(state.attachments[0].file_name, "first.txt");
+        assert_eq!(state.attachments[1].file_name, "second.rs");
+        assert!(state.attachment_picker_error.is_none());
+    }
+
+    #[test]
+    fn attachment_validation_failure_is_recoverable_and_blocks_early_send() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        state.set_draft("Review this file".to_string());
+        let missing = std::env::temp_dir().join(format!(
+            "sinomo-missing-attachment-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+
+        state
+            .queue_local_attachment_path(missing)
+            .expect("queue background validation");
+        assert!(!state.can_send(), "pending attachment disables send");
+        state.submit();
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("wait for selected files to finish attaching")
+        );
+
+        wait_for(&mut state, Duration::from_secs(2), |state| {
+            !state.attachment_operation_pending()
+        });
+        assert!(state.attachments.is_empty());
+        assert!(
+            state
+                .attachment_picker_error
+                .as_deref()
+                .is_some_and(|error| error.contains("attachment unavailable"))
+        );
+        assert!(
+            state.can_send(),
+            "the text draft can be sent after recovering from the failed attachment"
+        );
+    }
+
+    #[test]
+    fn late_native_attachment_picker_result_is_rejected_after_visible_session_changes() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.session_id = "first-chat".to_string();
+        state.pending_attachment_picker = Some(PendingAttachmentPicker {
+            request_id: 7,
+            session_id: state.session_id.clone(),
+            draft_generation: state.attachment_draft_generation,
+        });
+        state.session_id = "second-chat".to_string();
+
+        state.apply_attachment_picker_result(NativePickerResult {
+            request_id: 7,
+            context_generation: state.attachment_draft_generation,
+            outcome: NativePickerOutcome::Selected(vec![PathBuf::from("stale.txt")]),
+        });
+
+        assert!(state.pending_attachment_validations.is_empty());
+        assert!(state.attachments.is_empty());
+    }
+
+    #[test]
+    fn resetting_attachment_draft_rejects_late_local_validation_result() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.session_id = "old-chat".to_string();
+        let old_generation = state.attachment_draft_generation;
+        state
+            .pending_attachment_validations
+            .push(PendingLocalAttachmentValidation {
+                request_id: 9,
+                session_id: state.session_id.clone(),
+                draft_generation: old_generation,
+                ingress: LocalAttachmentIngress::OsDrop,
+                paths: vec![PathBuf::from("stale.txt")],
+            });
+
+        state.reset_visible_session("new-chat".to_string());
+        state.apply_attachment_validation_result(LocalAttachmentValidationResult {
+            request_id: 9,
+            session_id: "old-chat".to_string(),
+            draft_generation: old_generation,
+            outcomes: vec![LocalAttachmentValidationOutcome::Ready {
+                path: PathBuf::from("stale.txt"),
+                file_name: "stale.txt".to_string(),
+                size_bytes: 5,
+            }],
+        });
+
+        assert!(state.pending_attachment_validations.is_empty());
+        assert!(state.attachments.is_empty());
+    }
+
+    #[test]
+    fn sifs_attachment_snapshot_is_queued_in_memory_with_path_provenance() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state
+            .queue_sifs_attachment_snapshot(
+                "main.rs",
+                "/workspace/src/main.rs",
+                b"fn main() {}".to_vec(),
+            )
+            .expect("queue SIFS snapshot");
+
+        let inputs = state.attachment_inputs();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].file_name, "main.rs");
+        match &inputs[0].source {
+            ChatAttachmentSource::SifsSnapshot { provenance, bytes } => {
+                assert_eq!(provenance.path, "/workspace/src/main.rs");
+                assert_eq!(bytes.as_ref(), b"fn main() {}");
+            }
+            source => panic!("expected SIFS snapshot, got {source:?}"),
+        }
+
+        state
+            .queue_sifs_attachment_snapshot_with_provenance(
+                "main.rs",
+                ChatSifsAttachmentProvenance {
+                    path: "/workspace/src/main.rs".to_string(),
+                    object_id: Some("object-main".to_string()),
+                    version: Some("version-2".to_string()),
+                    content_hash: Some("sha256:new".to_string()),
+                    policy: Some("editable".to_string()),
+                    unsaved_editor_buffer: true,
+                },
+                b"fn main() { println!(\"new\"); }".to_vec(),
+            )
+            .expect("replace SIFS snapshot");
+        assert_eq!(state.attachments.len(), 1, "same SIFS path is refreshed");
+        match &state.attachment_inputs()[0].source {
+            ChatAttachmentSource::SifsSnapshot { provenance, bytes } => {
+                assert!(bytes.as_ref().windows(3).any(|window| window == b"new"));
+                assert_eq!(provenance.object_id.as_deref(), Some("object-main"));
+                assert_eq!(provenance.version.as_deref(), Some("version-2"));
+                assert!(provenance.unsaved_editor_buffer);
+            }
+            source => panic!("expected SIFS snapshot, got {source:?}"),
+        }
+    }
+
+    #[test]
+    fn local_attachment_viewer_snapshot_keeps_exact_displayed_bytes() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state
+            .queue_local_attachment_snapshot(
+                "notes.txt",
+                "C:\\workspace\\notes.txt",
+                b"viewer snapshot".to_vec(),
+            )
+            .expect("queue local viewer snapshot");
+
+        match &state.attachment_inputs()[0].source {
+            ChatAttachmentSource::LocalSnapshot { provenance, bytes } => {
+                assert_eq!(provenance.original_path, "C:\\workspace\\notes.txt");
+                assert_eq!(provenance.canonical_path, None);
+                assert_eq!(bytes.as_ref(), b"viewer snapshot");
+            }
+            source => panic!("expected local snapshot, got {source:?}"),
+        }
+    }
+
+    #[test]
+    fn external_drag_opens_and_clears_attachment_drop_target() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+
+        state.begin_external_attachment_hover();
+        assert!(state.attachment_drop_hovered);
+        assert_eq!(state.composer_popup(), Some(ComposerPopup::Attachments));
+
+        state.cancel_external_attachment_hover();
+        assert!(!state.attachment_drop_hovered);
     }
 
     fn test_window<W: Widget + 'static>(
@@ -24844,10 +25758,12 @@ mod tests {
     fn rendered_attachment_controls_are_collapsed_until_opened() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
+        let narrow_error = "C:\\very\\deep\\workspace\\that\\does\\not\\fit\\on\\one\\line\\missing-file.rs: attachment unavailable; choose another file";
         {
             let mut chat = shared.chat_mut();
             seed_default_provider(&mut chat);
             chat.models_loading = false;
+            chat.attachment_picker_error = Some(narrow_error.to_string());
         }
 
         let runtime = sui::Application::new()
@@ -24859,18 +25775,24 @@ mod tests {
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
+        window
+            .root()
+            .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                420.0, 720.0,
+            ))))?;
+        window.run_until_idle()?;
 
         assert!(!shared.chat().attachment_controls_visible());
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("Hide attachment field")
+                .with_name("Choose files")
                 .count()?,
             0
         );
 
-        // The bar's attach button opens the attachments popup with the path
-        // entry visible.
+        // The bar opens the attachment popup with the native picker as the primary path. Manual
+        // entry stays explicit and collapsed until requested.
         window
             .get_by_role(SemanticsRole::Button)
             .with_name("Attach files")
@@ -24879,23 +25801,63 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("Hide attachment field")
+                .with_name("Choose files")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Enter path manually")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Add path")
+                .count()?,
+            0,
+            "manual path entry must not be the primary interaction"
+        );
+        let snapshot = window.snapshot()?;
+        let viewport = Rect::new(0.0, 0.0, 420.0, 720.0);
+        for (name, bounds) in [
+            (
+                "Couldn’t attach",
+                named_node_bounds(&snapshot, SemanticsRole::Text, "Couldn’t attach"),
+            ),
+            (
+                narrow_error,
+                named_node_bounds(&snapshot, SemanticsRole::Text, narrow_error),
+            ),
+        ] {
+            assert!(
+                bounds.width() > 0.0
+                    && bounds.max_x() <= viewport.max_x() + 0.5
+                    && bounds.max_y() <= viewport.max_y() + 0.5,
+                "narrow attachment error {name:?} should remain readable inside {viewport:?}, got {bounds:?}"
+            );
+        }
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Enter path manually")
+            .click()?;
+        assert!(shared.chat().attachment_manual_path_open);
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Add path")
                 .count()?,
             1
         );
 
         window
             .get_by_role(SemanticsRole::Button)
-            .with_name("Hide attachment field")
+            .with_name("Close attachments")
             .click()?;
         assert!(!shared.chat().attachment_controls_visible());
-        assert_eq!(
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("Hide attachment field")
-                .count()?,
-            0
-        );
 
         Ok(())
     }
@@ -25342,6 +26304,7 @@ mod tests {
             state.pump_session_rename();
             state.pump_channel_config();
             state.pump_delete();
+            state.pump_attachment_lanes();
             if predicate(state) {
                 return;
             }

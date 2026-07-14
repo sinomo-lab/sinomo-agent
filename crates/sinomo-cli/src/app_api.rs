@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use sinomo_runtime::cluster;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -349,10 +350,144 @@ pub struct ChatHistoryMessage {
     pub text: String,
 }
 
-/// A local file selected by the GUI for upload into the chat/channel attachment store.
-#[derive(Clone, Debug)]
+/// The source snapshot selected by the GUI for upload into the chat/channel attachment store.
+///
+/// Picker/drop files stay path-backed until the chat worker accepts the turn. Files already read
+/// by the Files viewer carry their immutable bytes directly so the app never has to reopen a
+/// mutable source or make a temporary staging file an accidental source of authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChatAttachmentSource {
+    LocalPath(PathBuf),
+    LocalSnapshot {
+        provenance: ChatLocalAttachmentProvenance,
+        bytes: Arc<[u8]>,
+    },
+    SifsSnapshot {
+        provenance: ChatSifsAttachmentProvenance,
+        bytes: Arc<[u8]>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChatLocalAttachmentProvenance {
+    pub original_path: String,
+    pub canonical_path: Option<String>,
+    pub modified_at_unix_nanos: Option<u64>,
+    pub unsaved_editor_buffer: bool,
+}
+
+impl ChatLocalAttachmentProvenance {
+    pub fn new(path: impl Into<String>) -> Self {
+        Self {
+            original_path: path.into(),
+            canonical_path: None,
+            modified_at_unix_nanos: None,
+            unsaved_editor_buffer: false,
+        }
+    }
+
+    pub fn source_path(&self) -> &str {
+        self.canonical_path
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+            .unwrap_or(&self.original_path)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChatSifsAttachmentProvenance {
+    pub path: String,
+    pub object_id: Option<String>,
+    pub version: Option<String>,
+    pub content_hash: Option<String>,
+    pub policy: Option<String>,
+    pub unsaved_editor_buffer: bool,
+}
+
+impl ChatSifsAttachmentProvenance {
+    pub fn new(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            object_id: None,
+            version: None,
+            content_hash: None,
+            policy: None,
+            unsaved_editor_buffer: false,
+        }
+    }
+}
+
+/// A file selected by the GUI for upload into the chat/channel attachment store.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChatAttachmentInput {
-    pub path: PathBuf,
+    pub file_name: String,
+    pub source: ChatAttachmentSource,
+}
+
+impl ChatAttachmentInput {
+    pub fn local(path: PathBuf) -> Self {
+        let file_name = attachment_file_name(&path);
+        Self {
+            file_name,
+            source: ChatAttachmentSource::LocalPath(path),
+        }
+    }
+
+    pub fn sifs_snapshot(
+        file_name: impl Into<String>,
+        path: impl Into<String>,
+        bytes: impl Into<Arc<[u8]>>,
+    ) -> Self {
+        Self {
+            file_name: file_name.into(),
+            source: ChatAttachmentSource::SifsSnapshot {
+                provenance: ChatSifsAttachmentProvenance::new(path),
+                bytes: bytes.into(),
+            },
+        }
+    }
+
+    pub fn local_snapshot(
+        file_name: impl Into<String>,
+        path: impl Into<String>,
+        bytes: impl Into<Arc<[u8]>>,
+    ) -> Self {
+        Self {
+            file_name: file_name.into(),
+            source: ChatAttachmentSource::LocalSnapshot {
+                provenance: ChatLocalAttachmentProvenance::new(path),
+                bytes: bytes.into(),
+            },
+        }
+    }
+
+    pub fn local_snapshot_with_provenance(
+        file_name: impl Into<String>,
+        provenance: ChatLocalAttachmentProvenance,
+        bytes: impl Into<Arc<[u8]>>,
+    ) -> Self {
+        Self {
+            file_name: file_name.into(),
+            source: ChatAttachmentSource::LocalSnapshot {
+                provenance,
+                bytes: bytes.into(),
+            },
+        }
+    }
+
+    pub fn sifs_snapshot_with_provenance(
+        file_name: impl Into<String>,
+        provenance: ChatSifsAttachmentProvenance,
+        bytes: impl Into<Arc<[u8]>>,
+    ) -> Self {
+        Self {
+            file_name: file_name.into(),
+            source: ChatAttachmentSource::SifsSnapshot {
+                provenance,
+                bytes: bytes.into(),
+            },
+        }
+    }
 }
 
 /// Outcome of a live chat-runtime control operation.
@@ -2885,51 +3020,96 @@ impl AgentChat {
     ) -> Result<Vec<AgentChannelAttachment>, CliError> {
         let mut stored = Vec::new();
         for attachment in attachments {
-            let path = attachment.path.as_path();
-            let metadata = fs::metadata(path).map_err(|source| CliError::Io {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-            if !metadata.is_file() {
-                return Err(CliError::Parse {
-                    detail: format!("attachment is not a file: {}", path.display()),
-                });
+            match &attachment.source {
+                ChatAttachmentSource::LocalPath(path) => {
+                    let metadata = fs::metadata(path).map_err(|source| CliError::Io {
+                        path: path.display().to_string(),
+                        detail: source.to_string(),
+                    })?;
+                    if !metadata.is_file() {
+                        return Err(CliError::Parse {
+                            detail: format!("attachment is not a file: {}", path.display()),
+                        });
+                    }
+                    let bytes = fs::read(path).map_err(|source| CliError::Io {
+                        path: path.display().to_string(),
+                        detail: source.to_string(),
+                    })?;
+                    stored.push(self.store_chat_attachment_bytes(
+                        &attachment_file_name(path),
+                        &path.display().to_string(),
+                        "local-file",
+                        &bytes,
+                        None,
+                    )?);
+                }
+                ChatAttachmentSource::LocalSnapshot { provenance, bytes } => {
+                    stored.push(self.store_chat_attachment_bytes(
+                        &attachment.file_name,
+                        provenance.source_path(),
+                        "local-snapshot",
+                        bytes.as_ref(),
+                        Some(serde_json::json!(provenance)),
+                    )?);
+                }
+                ChatAttachmentSource::SifsSnapshot { provenance, bytes } => {
+                    stored.push(self.store_chat_attachment_bytes(
+                        &attachment.file_name,
+                        &provenance.path,
+                        "sifs-snapshot",
+                        bytes.as_ref(),
+                        Some(serde_json::json!(provenance)),
+                    )?);
+                }
             }
-            let bytes = fs::read(path).map_err(|source| CliError::Io {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-            let file_name = attachment_file_name(path);
-            let content_type = detect_attachment_content_type(path, &bytes);
-            let model_visible =
-                model_visible_attachment_projection(&file_name, &bytes, content_type.as_deref());
-            let attachment_id = TaskId::generate();
-            let stored_path = self
-                .channel_store
-                .save_attachment(&self.channel.channel_id, &attachment_id, &file_name, &bytes)
-                .map_err(|source| CliError::Parse {
-                    detail: format!("save attachment failed: {source}"),
-                })?;
-            stored.push(AgentChannelAttachment {
-                attachment_id,
-                file_name,
-                original_path: path.display().to_string(),
-                stored_path,
-                size_bytes: metadata.len(),
-                content_type: content_type.clone(),
-                created_at: time::OffsetDateTime::now_utc(),
-                source: app_channel_source(
-                    self.runtime.session(),
-                    Some(serde_json::json!({
-                        "ingress": "local-file",
-                        "original_path": path.display().to_string(),
-                        "content_type": content_type,
-                        "model_visible": model_visible
-                    })),
-                ),
-            });
         }
         Ok(stored)
+    }
+
+    fn store_chat_attachment_bytes(
+        &self,
+        file_name: &str,
+        original_path: &str,
+        ingress: &str,
+        bytes: &[u8],
+        snapshot_provenance: Option<serde_json::Value>,
+    ) -> Result<AgentChannelAttachment, CliError> {
+        let file_name = if file_name.trim().is_empty() {
+            attachment_file_name(Path::new(original_path))
+        } else {
+            file_name.trim().to_string()
+        };
+        let content_type = detect_attachment_content_type(Path::new(original_path), bytes);
+        let model_visible =
+            model_visible_attachment_projection(&file_name, bytes, content_type.as_deref());
+        let attachment_id = TaskId::generate();
+        let stored_path = self
+            .channel_store
+            .save_attachment(&self.channel.channel_id, &attachment_id, &file_name, bytes)
+            .map_err(|source| CliError::Parse {
+                detail: format!("save attachment failed: {source}"),
+            })?;
+        Ok(AgentChannelAttachment {
+            attachment_id,
+            file_name,
+            original_path: original_path.to_string(),
+            stored_path,
+            size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            content_type: content_type.clone(),
+            created_at: time::OffsetDateTime::now_utc(),
+            source: app_channel_source(self.runtime.session(), {
+                let mut metadata = serde_json::json!({
+                    "ingress": ingress,
+                    "original_path": original_path,
+                    "content_type": content_type,
+                    "model_visible": model_visible
+                });
+                if let Some(snapshot_provenance) = snapshot_provenance {
+                    metadata["snapshot_provenance"] = snapshot_provenance;
+                }
+                Some(metadata)
+            }),
+        })
     }
 
     /// Switch the active provider/model/account; returns the new selection.
@@ -5296,6 +5476,13 @@ pub struct SifsFileRead {
     pub truncated: bool,
 }
 
+/// Exact visible version returned by a safe SIFS editor save.
+pub type SifsWriteReceipt = sinomo_runtime::api::DaemonDfsBrowserWriteReceipt;
+
+/// Typed result of a fail-closed SIFS compare-and-swap replacement.
+pub type SifsReplaceFileIfVersionOutcome =
+    sinomo_runtime::api::DaemonDfsBrowserReplaceFileIfVersionOutcome;
+
 /// A handle to browse SIFS (the distributed filesystem).
 pub struct SifsBrowser {
     backend: SifsBrowserBackend,
@@ -5471,6 +5658,24 @@ impl SifsBrowser {
         }
     }
 
+    /// Read the exact immutable object version described by a prior stat.
+    pub fn read_object_version(
+        &self,
+        object_id: &str,
+        version: &str,
+        content_hash: &str,
+        size_bytes: u64,
+    ) -> Result<Vec<u8>, String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => {
+                backend.read_object_version(object_id, version, content_hash, size_bytes)
+            }
+            SifsBrowserBackend::Remote(remote) => {
+                remote.read_object_version(object_id, version, content_hash, size_bytes)
+            }
+        }
+    }
+
     pub fn read_file_prefix(&self, path: &str, max_bytes: u64) -> Result<SifsFileRead, String> {
         match &self.backend {
             SifsBrowserBackend::Local(backend) => {
@@ -5501,6 +5706,25 @@ impl SifsBrowser {
         match &self.backend {
             SifsBrowserBackend::Local(backend) => backend.write_file(path, bytes),
             SifsBrowserBackend::Remote(remote) => remote.write_file(path, bytes),
+        }
+    }
+
+    /// Replace a file only if both its identity and version still match a
+    /// previously loaded snapshot.
+    pub fn replace_file_if_version(
+        &self,
+        path: &str,
+        expected_object_id: &str,
+        expected_version: &str,
+        bytes: &[u8],
+    ) -> Result<SifsReplaceFileIfVersionOutcome, String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => {
+                backend.replace_file_if_version(path, expected_object_id, expected_version, bytes)
+            }
+            SifsBrowserBackend::Remote(remote) => {
+                remote.replace_file_if_version(path, expected_object_id, expected_version, bytes)
+            }
         }
     }
 
@@ -5719,6 +5943,25 @@ impl RemoteSifsBrowser {
         Ok(response.bytes)
     }
 
+    fn read_object_version(
+        &self,
+        object_id: &str,
+        version: &str,
+        content_hash: &str,
+        size_bytes: u64,
+    ) -> Result<Vec<u8>, String> {
+        let response: sinomo_runtime::api::DaemonDfsBrowserReadObjectVersionResponse = self.rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserReadObjectVersionRequest {
+                object_id: object_id.to_string(),
+                version: version.to_string(),
+                content_hash: content_hash.to_string(),
+                size_bytes: Some(size_bytes),
+            },
+        )?;
+        Ok(response.bytes)
+    }
+
     fn read_file_prefix(&self, path: &str, max_bytes: u64) -> Result<SifsFileRead, String> {
         let response: sinomo_runtime::api::DaemonDfsBrowserReadFilePrefixResponse = self.rpc(
             sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
@@ -5766,6 +6009,104 @@ impl RemoteSifsBrowser {
             },
         )?;
         Ok(())
+    }
+
+    fn replace_file_if_version(
+        &self,
+        path: &str,
+        expected_object_id: &str,
+        expected_version: &str,
+        bytes: &[u8],
+    ) -> Result<SifsReplaceFileIfVersionOutcome, String> {
+        let request = ObjectRpcRequest::encode_body(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE,
+            sinomo_runtime::api::DAEMON_RPC_CATEGORY,
+            &sinomo_runtime::api::DaemonDfsBrowserReplaceFileIfVersionRequest {
+                path: path.to_string(),
+                bytes: bytes.to_vec(),
+                expected_object_id: expected_object_id.to_string(),
+                expected_version: expected_version.to_string(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let response = if let Some(runtime) = &self.runtime {
+            runtime.block_on(sinomo_runtime::api::send_daemon_rpc_async(
+                &self.address,
+                &request,
+                sinomo_runtime::network::DaemonRpcTimeouts::connect_and_idle(self.timeout),
+                runtime,
+            ))
+        } else {
+            sinomo_runtime::api::send_daemon_rpc(&self.address, &request, self.timeout)
+        };
+        match response {
+            Ok(response) => {
+                response.error_detail().map_err(|error| error.to_string())?;
+                match response.decode_body::<
+                    sinomo_runtime::api::DaemonDfsBrowserReplaceFileIfVersionResponse,
+                >() {
+                    Ok(response) => Ok(response.outcome),
+                    Err(error) => self.reconcile_ambiguous_conditional_replace(
+                        path,
+                        bytes,
+                        &format!("the daemon returned an unreadable success response: {error}"),
+                    ),
+                }
+            }
+            Err(error)
+                if error.delivery_state()
+                    == Some(sinomo_runtime::network::NetworkDeliveryState::PossiblyApplied) =>
+            {
+                self.reconcile_ambiguous_conditional_replace(path, bytes, &error.to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn reconcile_ambiguous_conditional_replace(
+        &self,
+        path: &str,
+        requested_bytes: &[u8],
+        original_error: &str,
+    ) -> Result<SifsReplaceFileIfVersionOutcome, String> {
+        let details = self.stat(path).map_err(|reconcile_error| {
+            format!(
+                "conditional SIFS save outcome is unknown: {original_error}; reconciliation stat failed: {reconcile_error}"
+            )
+        })?;
+        let content_hash = details.content_hash.as_deref().ok_or_else(|| {
+            format!(
+                "conditional SIFS save outcome is unknown: {original_error}; the current version has no content hash"
+            )
+        })?;
+        let size_bytes = details.size_bytes.ok_or_else(|| {
+            format!(
+                "conditional SIFS save outcome is unknown: {original_error}; the current version has no size"
+            )
+        })?;
+        let current_bytes = self
+            .read_object_version(
+                &details.object_id,
+                &details.version,
+                content_hash,
+                size_bytes,
+            )
+            .map_err(|reconcile_error| {
+                format!(
+                    "conditional SIFS save outcome is unknown: {original_error}; exact-version reconciliation failed: {reconcile_error}"
+                )
+            })?;
+        reconcile_conditional_replace_bytes(
+            sinomo_runtime::api::DaemonDfsBrowserWriteReceipt {
+                object_id: details.object_id,
+                version: details.version,
+                content_hash: details.content_hash,
+                size_bytes: details.size_bytes,
+            },
+            &current_bytes,
+            requested_bytes,
+            original_error,
+        )
     }
 
     fn create_dir_all(&self, path: &str) -> Result<(), String> {
@@ -5862,6 +6203,27 @@ impl RemoteSifsBrowser {
         )?;
         Ok(sifs_metadata_primary_transfer_from_rpc(response))
     }
+}
+
+fn reconcile_conditional_replace_bytes(
+    receipt: SifsWriteReceipt,
+    current_bytes: &[u8],
+    requested_bytes: &[u8],
+    original_error: &str,
+) -> Result<SifsReplaceFileIfVersionOutcome, String> {
+    use sinomo_runtime::api::DaemonDfsBrowserReplaceFileIfVersionOutcome as Outcome;
+
+    if current_bytes != requested_bytes {
+        return Err(format!(
+            "conditional SIFS save outcome is unknown: {original_error}; the current immutable version differs from the requested contents"
+        ));
+    }
+    Ok(Outcome::Committed {
+        receipt,
+        maintenance_warning: Some(format!(
+            "the daemon response was not received, but the current immutable SIFS version was verified byte-for-byte: {original_error}"
+        )),
+    })
 }
 
 fn sifs_entry_from_file_manager(entry: crate::file_manager::FileManagerEntry) -> SifsEntry {
@@ -6268,6 +6630,35 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
 
+    #[test]
+    fn ambiguous_conditional_replace_only_commits_after_exact_byte_verification() {
+        let receipt = SifsWriteReceipt {
+            object_id: "object-current".to_string(),
+            version: "version-current".to_string(),
+            content_hash: Some("hash-current".to_string()),
+            size_bytes: Some(5),
+        };
+        let outcome = reconcile_conditional_replace_bytes(
+            receipt.clone(),
+            b"saved",
+            b"saved",
+            "response timed out",
+        )
+        .expect("identical immutable bytes reconcile the save");
+        assert!(matches!(
+            outcome,
+            SifsReplaceFileIfVersionOutcome::Committed {
+                receipt: committed,
+                maintenance_warning: Some(_),
+            } if committed == receipt
+        ));
+
+        let error =
+            reconcile_conditional_replace_bytes(receipt, b"other", b"saved", "response timed out")
+                .expect_err("different bytes must preserve an unknown outcome");
+        assert!(error.contains("differs from the requested contents"));
+    }
+
     fn json_lines<T: Serialize>(values: &[T]) -> Vec<u8> {
         let mut bytes = Vec::new();
         for value in values {
@@ -6458,6 +6849,129 @@ mod tests {
             .expect("excerpt");
         assert!(excerpt.starts_with("heading"));
         assert!(!excerpt.contains("TAIL"));
+    }
+
+    #[test]
+    fn chat_attachment_snapshot_inputs_preserve_bytes_and_provenance() {
+        let local = ChatAttachmentInput::local_snapshot(
+            "local.txt",
+            "C:\\workspace\\local.txt",
+            b"local snapshot".to_vec(),
+        );
+        assert_eq!(local.file_name, "local.txt");
+        match local.source {
+            ChatAttachmentSource::LocalSnapshot { provenance, bytes } => {
+                assert_eq!(provenance.original_path, "C:\\workspace\\local.txt");
+                assert_eq!(provenance.canonical_path, None);
+                assert!(!provenance.unsaved_editor_buffer);
+                assert_eq!(bytes.as_ref(), b"local snapshot");
+            }
+            source => panic!("expected local snapshot, got {source:?}"),
+        }
+
+        let sifs = ChatAttachmentInput::sifs_snapshot(
+            "remote.rs",
+            "/workspace/remote.rs",
+            b"remote snapshot".to_vec(),
+        );
+        match sifs.source {
+            ChatAttachmentSource::SifsSnapshot { provenance, bytes } => {
+                assert_eq!(provenance.path, "/workspace/remote.rs");
+                assert_eq!(provenance.object_id, None);
+                assert!(!provenance.unsaved_editor_buffer);
+                assert_eq!(bytes.as_ref(), b"remote snapshot");
+            }
+            source => panic!("expected SIFS snapshot, got {source:?}"),
+        }
+    }
+
+    #[test]
+    fn chat_attachment_store_writes_snapshot_bytes_without_reopening_source() {
+        let root = sinomo_testdir::TestDir::new("sinomo-chat-attachment-snapshot");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        let snapshot = b"exact bytes already displayed by Files".to_vec();
+        let sifs_snapshot = b"exact SIFS editor bytes".to_vec();
+
+        let stored = chat
+            .store_chat_attachments(&[
+                ChatAttachmentInput::local_snapshot_with_provenance(
+                    "displayed.txt",
+                    ChatLocalAttachmentProvenance {
+                        original_path: "C:\\missing-now\\displayed.txt".to_string(),
+                        canonical_path: Some("C:\\workspace\\displayed.txt".to_string()),
+                        modified_at_unix_nanos: Some(42),
+                        unsaved_editor_buffer: true,
+                    },
+                    snapshot.clone(),
+                ),
+                ChatAttachmentInput::sifs_snapshot_with_provenance(
+                    "remote.rs",
+                    ChatSifsAttachmentProvenance {
+                        path: "/workspace/remote.rs".to_string(),
+                        object_id: Some("object-remote".to_string()),
+                        version: Some("version-7".to_string()),
+                        content_hash: Some("sha256:remote".to_string()),
+                        policy: Some("editable".to_string()),
+                        unsaved_editor_buffer: false,
+                    },
+                    sifs_snapshot.clone(),
+                ),
+            ])
+            .expect("store immutable snapshot");
+
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].original_path, "C:\\workspace\\displayed.txt");
+        assert_eq!(stored[0].size_bytes, snapshot.len() as u64);
+        assert_eq!(
+            stored[0].source.metadata["ingress"].as_str(),
+            Some("local-snapshot")
+        );
+        assert_eq!(
+            stored[0].source.metadata["snapshot_provenance"]["original_path"].as_str(),
+            Some("C:\\missing-now\\displayed.txt")
+        );
+        assert_eq!(
+            stored[0].source.metadata["snapshot_provenance"]["canonical_path"].as_str(),
+            Some("C:\\workspace\\displayed.txt")
+        );
+        assert_eq!(
+            stored[0].source.metadata["snapshot_provenance"]["modified_at_unix_nanos"].as_u64(),
+            Some(42)
+        );
+        assert_eq!(
+            stored[0].source.metadata["snapshot_provenance"]["unsaved_editor_buffer"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            stored[1].source.metadata["snapshot_provenance"]["object_id"].as_str(),
+            Some("object-remote")
+        );
+        assert_eq!(
+            stored[1].source.metadata["snapshot_provenance"]["version"].as_str(),
+            Some("version-7")
+        );
+        assert_eq!(
+            stored[1].source.metadata["snapshot_provenance"]["content_hash"].as_str(),
+            Some("sha256:remote")
+        );
+        assert_eq!(
+            stored[1].source.metadata["snapshot_provenance"]["policy"].as_str(),
+            Some("editable")
+        );
+        let browser = SifsBrowser::open(&data_dir).expect("open attachment store");
+        assert_eq!(
+            browser
+                .read_file(&stored[0].stored_path)
+                .expect("read stored attachment"),
+            snapshot
+        );
+        assert_eq!(
+            browser
+                .read_file(&stored[1].stored_path)
+                .expect("read stored SIFS snapshot attachment"),
+            sifs_snapshot
+        );
     }
 
     #[test]

@@ -37,6 +37,10 @@ impl From<sinomo_api::DaemonApiError> for DaemonError {
             sinomo_api::DaemonApiError::Network { address, detail } => {
                 Self::Network { address, detail }
             }
+            sinomo_api::DaemonApiError::NetworkDelivery { detail, .. } => Self::Network {
+                address: "daemon RPC".to_string(),
+                detail,
+            },
             sinomo_api::DaemonApiError::ForwardNetwork { detail, .. } => Self::Network {
                 address: "daemon object RPC forward".to_string(),
                 detail,

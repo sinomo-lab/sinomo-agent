@@ -100,6 +100,7 @@ serde_bytes = "0.11"
 fs2 = "0.4"
 local-ip-address = "0.6"
 pulldown-cmark = { version = "0.13.4", default-features = false }
+rfd = "0.17.2"
 serde_json = "1.0"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 tar = "0.4"

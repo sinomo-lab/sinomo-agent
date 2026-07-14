@@ -605,6 +605,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    /// Replace an existing file only while its stable identity and visible
+    /// version still match the caller's snapshot.
+    ///
+    /// Unlike [`Self::posix_write_file`], this operation deliberately performs
+    /// a single write attempt.  A stale base is returned as a conflict instead
+    /// of being refreshed and retried against a newer version, which makes it
+    /// suitable for editors and other compare-and-swap callers.
+    pub fn posix_replace_file_if_version(
+        &mut self,
+        path: &str,
+        expected_object_id: &DfsObjectId,
+        expected_version: &DfsVersion,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
+        self.posix_write_file_bytes_checked_parent_once(
+            path,
+            bytes,
+            options,
+            true,
+            false,
+            true,
+            None,
+            false,
+            false,
+            Some((expected_object_id, expected_version)),
+        )
+    }
+
     pub fn posix_write_file_with_create_attrs(
         &mut self,
         path: &str,
@@ -1081,6 +1110,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 create_attrs,
                 exclusive_create,
                 follow_final_for_exclusive_create,
+                None,
             ) {
                 Ok(stat) => return Ok(stat),
                 Err(error)
@@ -1112,6 +1142,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         create_attrs: Option<DfsPosixCreateAttrs>,
         exclusive_create: bool,
         follow_final_for_exclusive_create: bool,
+        expected_existing: Option<(&DfsObjectId, &DfsVersion)>,
     ) -> Result<DfsStat> {
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
         let path = self.resolve_posix_path_distributed(
@@ -1145,6 +1176,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Some(object) if object.kind == DfsObjectKind::Hardlink => {
                 self.resolve_hardlink_target(&object)?
             }
+            Some(object)
+                if object.kind == DfsObjectKind::Tombstone && expected_existing.is_some() =>
+            {
+                return Err(DfsPosixError::NotFound { path });
+            }
             Some(object) if object.kind == DfsObjectKind::Tombstone => {
                 let mut object =
                     recreated_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
@@ -1156,6 +1192,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 object
             }
             Some(object) => object,
+            None if expected_existing.is_some() => {
+                return Err(DfsPosixError::NotFound { path });
+            }
             None => {
                 let mut object =
                     new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
@@ -1167,6 +1206,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 object
             }
         };
+        if let Some((expected_object_id, expected_version)) = expected_existing {
+            if &object.object_id != expected_object_id {
+                return Err(DfsPosixError::Conflict {
+                    path,
+                    reason: format!(
+                        "file identity changed: expected {expected_object_id}, found {}",
+                        object.object_id
+                    ),
+                });
+            }
+            if &object.version != expected_version {
+                return Err(DfsPosixError::Conflict {
+                    path,
+                    reason: format!(
+                        "file changed since it was opened: expected version {expected_version}, found {}",
+                        object.version
+                    ),
+                });
+            }
+        }
         let target_version = next_version(&object.version);
         let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
         let committed_locations = candidates.clone();

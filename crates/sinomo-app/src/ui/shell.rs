@@ -220,6 +220,117 @@ impl Shell {
         self.health_center = WidgetPod::new(HealthCenter::new(self.shared.clone(), compact));
     }
 
+    /// Route operating-system file drags delivered at the window root to the
+    /// visible workflow. SUI emits one event per path, so both Chat's
+    /// validation lane and Files' import lane accept paths incrementally.
+    fn handle_external_file_window_event(&self, event: &WindowEvent) -> bool {
+        if !self.shared.is_ready() {
+            return false;
+        }
+        match event {
+            WindowEvent::ExternalFileHovered(path) => match self.shared.active_tab() {
+                Tab::Sinomo => {
+                    self.shared.files_mut().cancel_external_file_hover();
+                    self.shared.chat_mut().begin_external_attachment_hover();
+                    true
+                }
+                Tab::Files => {
+                    self.shared.chat_mut().cancel_external_attachment_hover();
+                    self.shared
+                        .files_mut()
+                        .begin_external_file_hover(path.clone());
+                    true
+                }
+                _ => false,
+            },
+            WindowEvent::ExternalFileHoverCancelled => {
+                self.shared.chat_mut().cancel_external_attachment_hover();
+                self.shared.files_mut().cancel_external_file_hover();
+                true
+            }
+            WindowEvent::ExternalFileDropped(path) => {
+                self.shared.chat_mut().cancel_external_attachment_hover();
+                self.shared.files_mut().cancel_external_file_hover();
+                match self.shared.active_tab() {
+                    Tab::Sinomo => {
+                        let _ = self
+                            .shared
+                            .chat_mut()
+                            .queue_dropped_local_attachment_path(path.clone());
+                        true
+                    }
+                    Tab::Files => {
+                        let waker = { self.shared.borrow().waker.clone() };
+                        self.shared
+                            .files_mut()
+                            .accept_external_file_drop(path.clone(), waker);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Move a verified Files snapshot into the current Chat draft. The Files
+    /// worker owns all reads; this bridge only transfers already-validated
+    /// bytes and switches surfaces after the intent is ready.
+    fn drain_files_chat_attachment(&self) -> bool {
+        let Some(intent) = self.shared.files_mut().take_ready_attachment_intent() else {
+            return false;
+        };
+        let files::FilesAttachmentIntent {
+            file_name,
+            bytes,
+            provenance,
+            is_unsaved_editor_buffer,
+        } = intent;
+        {
+            let mut chat = self.shared.chat_mut();
+            let _ = match provenance {
+                files::FilesAttachmentProvenance::Local {
+                    path,
+                    canonical_path,
+                    modified_at_unix_nanos,
+                } => {
+                    let provenance = sinomo_cli::app_api::ChatLocalAttachmentProvenance {
+                        original_path: path,
+                        canonical_path: (!canonical_path.trim().is_empty())
+                            .then_some(canonical_path),
+                        modified_at_unix_nanos,
+                        unsaved_editor_buffer: is_unsaved_editor_buffer,
+                    };
+                    chat.queue_local_attachment_snapshot_with_provenance(
+                        file_name, provenance, bytes,
+                    )
+                }
+                files::FilesAttachmentProvenance::Sifs {
+                    path,
+                    object_id,
+                    version,
+                    content_hash,
+                    policy,
+                } => {
+                    let provenance = sinomo_cli::app_api::ChatSifsAttachmentProvenance {
+                        path,
+                        object_id: (!object_id.trim().is_empty()).then_some(object_id),
+                        version: (!version.trim().is_empty()).then_some(version),
+                        content_hash,
+                        policy: (!policy.trim().is_empty()).then_some(policy),
+                        unsaved_editor_buffer: is_unsaved_editor_buffer,
+                    };
+                    chat.queue_sifs_attachment_snapshot_with_provenance(
+                        file_name, provenance, bytes,
+                    )
+                }
+            };
+            chat.open_attachment_surface();
+        }
+        self.shared.borrow_mut().active_tab = Tab::Sinomo;
+        true
+    }
+
     fn sync_active_tab(&mut self, ctx: &mut EventCtx) {
         let current = self.shared.active_tab();
         if current == self.last_tab.get() {
@@ -543,6 +654,16 @@ impl Widget for Shell {
         if ctx.phase() != EventPhase::Target {
             return;
         }
+        if let Event::Window(window_event) = event
+            && self.handle_external_file_window_event(window_event)
+        {
+            ctx.request_measure();
+            ctx.request_arrange();
+            ctx.request_semantics();
+            ctx.request_paint();
+            ctx.set_handled();
+            return;
+        }
         if let Event::Wake(sui::WakeEvent::Timer { token, .. }) = event
             && self.chat_session_timer.get() == Some(*token)
         {
@@ -635,6 +756,8 @@ impl Widget for Shell {
                 } else {
                     false
                 };
+                let files_attachment_changed =
+                    self.shared.is_ready() && self.drain_files_chat_attachment();
                 let connection_changed = self.shared.pump_connection_probe();
                 let cluster_changed = self.pump_cluster_refresh();
                 let chat_visible = self.shared.active_tab() == Tab::Sinomo;
@@ -669,6 +792,7 @@ impl Widget for Shell {
                 self.schedule_chat_session_timer(ctx);
                 if device_changed
                     || files_changed
+                    || files_attachment_changed
                     || connection_changed
                     || cluster_changed
                     || chat_layout_changed
@@ -690,6 +814,7 @@ impl Widget for Shell {
                     || settings_operations_changed
                     || evolution_changed
                     || files_changed
+                    || files_attachment_changed
                     || cluster_changed
                     || chat_changed
                 {
