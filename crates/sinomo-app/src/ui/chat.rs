@@ -49,20 +49,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sui::{
     ActionTilePaint, Alignment, ArrangeCtx, CalloutPaint, CodePanelPaint, CodeTextLine,
     CodeTextPaint, CodeTextSpan, Color, Constraints, ContextMenu, ControlSize, CustomEvent,
-    DefaultTheme, Dock, EmptyState, Event, EventCtx, FieldAppearance, FixedPaneSplit, Flex,
-    FlexItem, FlexWrap, FontWeight, FramedField, Icon, IconButton, IconGlyph, ImageHandle,
-    ImageSource, Insets, KeyState, Label, ListItem, ListView, MeasureCtx, MeasuredBottomDock,
-    MenuItem, PaintCtx, Path, Point, PointerButton, PointerEventKind, RebuildOnChange,
-    RebuildOnConstraints, Rect, RegisteredImage, RichText, RichTextSourceMap, ScrollBar,
-    ScrollDelta, ScrollState, ScrollView, SectionLabel, SegmentedControl, SegmentedControlItem,
-    SelectionScope, SemanticRegion, SemanticTone, SemanticsAction, SemanticsCtx, SemanticsNode,
-    SemanticsRole, SemanticsValue, Separator, SideSheet, SideSheetPlacement, SignalMeter, Size,
-    SizedBox, Stack, StackHostOptions, StatusBadge, Surface, SurfaceAppearance, SurfaceBorder,
-    SurfaceRole, SwitchView, TextArea, TextBlockPaint, TextCellPaint, TextCommand, TextDocument,
-    TextInput, TextLayout, TextLayoutRequest, TextParagraph, TextParagraphStyle, TextSpan,
-    TextStyle, TextWrap, TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    containers::Padding as WidgetPadding, draw_glyph, paint_action_tile, paint_callout,
-    paint_code_lines, paint_code_panel, paint_rounded_panel, paint_rounded_rect,
+    DefaultTheme, Dock, EmptyState, Event, EventCtx, FieldAppearance, Flex, FlexItem, FlexWrap,
+    FontWeight, FramedField, Icon, IconButton, IconGlyph, ImageHandle, ImageSource, Insets,
+    KeyState, Label, ListItem, ListView, MeasureCtx, MeasuredBottomDock, MenuItem, PaintCtx, Path,
+    Point, PointerButton, PointerEventKind, RebuildOnChange, Rect, RegisteredImage, RichText,
+    RichTextSourceMap, ScrollBar, ScrollDelta, ScrollState, ScrollView, SectionLabel,
+    SegmentedControl, SegmentedControlItem, SelectionScope, SemanticRegion, SemanticTone,
+    SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Separator,
+    SideSheet, SideSheetPlacement, SignalMeter, Size, SizedBox, SplitView, Stack, StackHostOptions,
+    StatusBadge, Surface, SurfaceAppearance, SurfaceBorder, SurfaceRole, SwitchView, TextArea,
+    TextBlockPaint, TextCellPaint, TextCommand, TextDocument, TextInput, TextLayout,
+    TextLayoutRequest, TextParagraph, TextParagraphStyle, TextSpan, TextStyle, TextWrap, Tooltip,
+    TooltipAlignment, TooltipPlacement, TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, containers::Padding as WidgetPadding, draw_glyph, paint_action_tile,
+    paint_callout, paint_code_lines, paint_code_panel, paint_rounded_panel, paint_rounded_rect,
     paint_section_label_detail, paint_text_block, paint_text_cell, wrap_text_lines,
 };
 
@@ -107,7 +107,9 @@ use crate::ui::widgets;
 
 /// Below this content width the sidebar collapses away (transcript + composer only).
 const WIDE_THRESHOLD: f32 = 620.0;
-const SIDEBAR_W: f32 = 250.0;
+const SIDEBAR_INITIAL_RATIO: f32 = 0.20;
+const SIDEBAR_MIN_W: f32 = 220.0;
+const CHAT_PANE_MIN_W: f32 = 320.0;
 const COMPACT_HEADER_H: f32 = 54.0;
 // Small media instruments preserve the useful 16:9 preview without consuming transcript space.
 const MEDIA_CALL_H: f32 = 352.0;
@@ -139,11 +141,11 @@ const COMPOSER_BAR_GAP: f32 = 4.0;
 const COMPOSER_GHOST_BUTTON_SIZE: f32 = 28.0;
 const SEND_BUTTON_SIZE: f32 = 32.0;
 const COMPOSER_INPUT_MIN_LINES: usize = 2;
+/// Keep empty-state actions below the title, guidance, and optional detail line.
+const EMPTY_ACTION_OFFSET_Y: f32 = 112.0;
 /// The docked composer input grows to 160px, then scrolls (Mesh layout spec).
 const COMPOSER_INPUT_MAX_H: f32 = 160.0;
 const COMPOSER_INPUT_PAD_Y: f32 = 14.0;
-/// Below this composer width the keyboard hint in the action bar folds away.
-const COMPOSER_HINT_MIN_W: f32 = 560.0;
 const SESSION_LIST_UI_TIMEOUT: Duration = Duration::from_secs(8);
 const TRANSCRIPT_LOAD_UI_TIMEOUT: Duration = Duration::from_secs(8);
 /// Poll SIFS for remote-device catalog and timeline changes. SIFS remains the
@@ -1377,6 +1379,10 @@ pub struct ChatState {
     pub sessions: Vec<SessionRef>,
     session_filter: String,
     session_kind_filter: SessionKindFilter,
+    /// Current first-pane ratio for the desktop conversation sidebar. The SUI
+    /// split view owns the active drag; retaining the ratio here preserves the
+    /// user's width when the responsive tree is rebuilt for theme scaling.
+    sidebar_ratio: f32,
     pending_session_reset: Option<String>,
     session_edit_id: Option<String>,
     session_edit_details_open: bool,
@@ -1617,6 +1623,7 @@ impl ChatState {
             sessions,
             session_filter: String::new(),
             session_kind_filter: SessionKindFilter::All,
+            sidebar_ratio: SIDEBAR_INITIAL_RATIO,
             pending_session_reset: None,
             session_edit_id: None,
             session_edit_details_open: false,
@@ -3116,6 +3123,10 @@ impl ChatState {
         self.session_kind_filter = filter;
     }
 
+    fn set_sidebar_ratio(&mut self, ratio: f32) {
+        self.sidebar_ratio = ratio.clamp(0.0, 1.0);
+    }
+
     fn set_compact_drawer_open(&mut self, open: bool) {
         self.compact_drawer_open = open;
         if open {
@@ -4349,25 +4360,6 @@ impl ChatState {
     pub fn set_tool_runtime_node(&mut self, sandbox_node_id: Option<String>) {
         let mut selection = self.tool_runtime.clone();
         selection.sandbox_node_id = sandbox_node_id;
-        self.handle
-            .send_command(ChatCommand::SetToolRuntime { selection });
-    }
-
-    fn set_workspace_path_input(&mut self, value: String) {
-        self.workspace_path_input = value;
-        self.workspace_error = None;
-    }
-
-    fn apply_workspace_path(&mut self) {
-        let value = self.workspace_path_input.trim();
-        if value.is_empty() {
-            self.workspace_error = Some("Choose a workspace directory.".to_string());
-            return;
-        }
-        let mut selection = self.tool_runtime.clone();
-        selection.workspace_root = Some(PathBuf::from(value));
-        self.workspace_error = None;
-        self.notice = Some("Binding workspace directory…".to_string());
         self.handle
             .send_command(ChatCommand::SetToolRuntime { selection });
     }
@@ -8723,7 +8715,6 @@ fn activity_button_label(chat: &ChatState) -> &'static str {
     }
 }
 
-#[cfg(test)]
 fn activity_button_description(chat: &ChatState) -> String {
     let health = chat.runtime_health();
     let status = activity_status_summary(&health.detail);
@@ -9194,52 +9185,6 @@ fn agents_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         })
 }
 
-fn workspace_selector(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let input_shared = shared.clone();
-    let input = TextInput::new("chat-workspace-directory")
-        .value(shared.chat().workspace_path_input.clone())
-        .placeholder("Workspace directory")
-        .leading_icon(IconGlyph::Folder)
-        .theme_when(clone_reader(reader))
-        .on_change(move |value| {
-            input_shared.chat_mut().set_workspace_path_input(value);
-        });
-    let apply_shared = shared.clone();
-    let apply = sui::Button::new("Use")
-        .min_height(30.0)
-        .theme_when(clone_reader(reader))
-        .appearance(sui::ButtonAppearance::Tonal)
-        .tone(SemanticTone::Neutral)
-        .enabled_when({
-            let shared = shared.clone();
-            move || !shared.chat().workspace_path_input.trim().is_empty()
-        })
-        .on_press(move || apply_shared.chat_mut().apply_workspace_path());
-    let status = if let Some(error) = shared.chat().workspace_error.clone() {
-        let color_shared = shared.clone();
-        Label::new(compact_line(&error, 72))
-            .font_size(10.0)
-            .color_when(move || palette(&color_shared).bad)
-    } else if let Some(root) = shared.chat().tool_runtime.workspace_root.as_ref() {
-        muted_label(
-            shared,
-            format!("Bound: {}", compact_line(&root.display().to_string(), 44)),
-        )
-    } else {
-        muted_label(shared, "Required before coding tools can write")
-    };
-    Stack::vertical()
-        .spacing(4.0)
-        .alignment(Alignment::Stretch)
-        .with_child(
-            TrailingSlotRow::new(input, apply)
-                .trailing_width(54.0)
-                .trailing_height(30.0)
-                .gap(6.0),
-        )
-        .with_child(status)
-}
-
 /// Build the CHATS ListView: stored chats/channels only. Creation actions live
 /// above the scroll area so the list itself behaves like persistent history.
 fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -9355,11 +9300,11 @@ fn session_create_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget 
             })
     };
 
-    Flex::vertical()
+    Flex::horizontal()
         .main_gap(6.0)
-        .align_items(Alignment::Stretch)
-        .with_child(new_chat)
-        .with_child(new_channel)
+        .align_items(Alignment::Center)
+        .with_item(new_chat, FlexItem::flex(1.0).min_width(0.0))
+        .with_item(new_channel, FlexItem::flex(1.0).min_width(0.0))
 }
 
 fn request_chat_window_relayout(ctx: &mut EventCtx) {
@@ -9571,7 +9516,7 @@ fn session_row_content(
         .gap(SIDEBAR_ROW_EDIT_GAP)
 }
 
-/// The sidebar column: AGENTS heading + list, then CHATS heading + list. Wrapped in a
+/// The sidebar column: AGENTS heading + list, then conversations. Wrapped in a
 /// [`RebuildOnChange`] keyed on the agent/chat signature so it rebuilds when those lists change
 /// (e.g. a new chat is persisted) but not on every token.
 fn sidebar(
@@ -9597,20 +9542,6 @@ fn sidebar(
                 )
                 .with_child(SizedBox::new().height(2.0))
                 .with_child(WidgetPadding::horizontal(8.0, agents_list(&s, &r)).fill_child_height())
-                .with_child(SizedBox::new().height(12.0))
-                .with_child(
-                    WidgetPadding::horizontal(18.0, heading(&s, "WORKSPACE")).fill_child_height(),
-                )
-                .with_child(SizedBox::new().height(4.0))
-                .with_child(
-                    WidgetPadding::horizontal(
-                        8.0,
-                        SizedBox::new()
-                            .height(50.0)
-                            .with_child(workspace_selector(&s, &r)),
-                    )
-                    .fill_child_height(),
-                )
                 .with_child(SizedBox::new().height(16.0))
                 .with_child(WidgetPadding::horizontal(18.0, chats_heading(&s)).fill_child_height())
                 .with_child(SizedBox::new().height(6.0))
@@ -9625,18 +9556,11 @@ fn sidebar(
                 )
                 .with_child(SizedBox::new().height(6.0))
                 .with_child(
-                    WidgetPadding::horizontal(
-                        8.0,
-                        SizedBox::new()
-                            .height(30.0)
-                            .with_child(session_filter_input(&s, &r)),
-                    )
-                    .fill_child_height(),
+                    WidgetPadding::horizontal(8.0, session_filter_input(&s, &r)).fill_child_width(),
                 )
                 .with_child(SizedBox::new().height(6.0))
                 .with_child(
-                    WidgetPadding::horizontal(8.0, session_create_actions(&s, &r))
-                        .fill_child_height(),
+                    WidgetPadding::horizontal(8.0, session_create_actions(&s, &r)).fill_child(),
                 )
                 .with_child(SizedBox::new().height(8.0))
                 .with_item(
@@ -9673,8 +9597,6 @@ fn sidebar_signature(
     bool,
     bool,
     bool,
-    String,
-    String,
 ) {
     let chat = shared.chat();
     let active = chat
@@ -9701,12 +9623,6 @@ fn sidebar_signature(
         chat.session_list_loading,
         chat.session_list_slow_notice_shown,
         chat.session_list_details_open,
-        chat.tool_runtime
-            .workspace_root
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_default(),
-        chat.workspace_error.clone().unwrap_or_default(),
     )
 }
 
@@ -12548,7 +12464,7 @@ impl TranscriptView {
             let mut x = area.x() + (area.width() - row_w) * 0.5;
             let lower = area.y() + PAD;
             let upper = (area.max_y() - PAD - button_h).max(lower);
-            let y = (cy + 62.0).clamp(lower, upper);
+            let y = (cy + EMPTY_ACTION_OFFSET_Y).clamp(lower, upper);
             return actions
                 .into_iter()
                 .zip(widths)
@@ -12574,7 +12490,7 @@ impl TranscriptView {
             let x0 = area.x() + (area.width() - grid_w) * 0.5;
             let lower = area.y() + PAD;
             let upper = (area.max_y() - PAD - grid_h).max(lower);
-            let y0 = (cy + 62.0).clamp(lower, upper);
+            let y0 = (cy + EMPTY_ACTION_OFFSET_Y).clamp(lower, upper);
             return actions
                 .iter()
                 .enumerate()
@@ -12600,7 +12516,7 @@ impl TranscriptView {
         let x = area.x() + (area.width() - width) * 0.5;
         let lower = area.y() + PAD;
         let upper = (area.max_y() - PAD - stack_h).max(lower);
-        let y0 = (cy + 58.0).clamp(lower, upper);
+        let y0 = (cy + EMPTY_ACTION_OFFSET_Y).clamp(lower, upper);
         actions
             .iter()
             .enumerate()
@@ -15979,10 +15895,10 @@ fn composer_context_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     composer_chip_row(row, "Attached context")
 }
 
-/// The composer action bar (`.sm-composer-bar`): quiet controls on the left
-/// (attach, voice, model/context/activity), the keyboard hint, and the one
-/// primary action — Send, which becomes Stop while a response streams.
-fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> WidgetPod {
+/// The composer action bar (`.sm-composer-bar`): compact ghost controls on the
+/// left and Send on the right. Detailed state and the keyboard shortcut live in
+/// hover tooltips instead of consuming the writing surface.
+fn composer_bar(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let (streaming, media_active, hint, can_reuse) = {
         let chat = shared.chat();
         (
@@ -16037,48 +15953,67 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
         })
     };
 
-    // Mesh accent discipline: Send is the composer's one primary action, so
-    // the model/context/activity pickers ride the quiet neutral treatment.
+    // Model/context/activity match the icon-sized attachment and voice affordances.
+    // Their current state remains available to pointer users via tooltips and to
+    // assistive technology through the IconButton semantic name.
     let model = {
         let s = shared.clone();
-        sui::Button::new(model_button_label(&shared.chat()))
-            .icon(IconGlyph::Sparkles)
-            .min_height(COMPOSER_GHOST_BUTTON_SIZE)
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Tonal)
-            .tone(SemanticTone::Neutral)
-            .on_press_with_ctx(move |ctx| {
-                s.chat_mut().toggle_composer_popup(ComposerPopup::Model);
-                request_chat_window_relayout(ctx);
-            })
+        let label = model_button_label(&shared.chat());
+        Tooltip::new(
+            label.clone(),
+            IconButton::new(IconGlyph::Sparkles, label)
+                .size(COMPOSER_GHOST_BUTTON_SIZE)
+                .icon_size(14.0)
+                .theme_when(composer_control_reader(reader))
+                .appearance(sui::ButtonAppearance::Ghost)
+                .tone(SemanticTone::Neutral)
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().toggle_composer_popup(ComposerPopup::Model);
+                    request_chat_window_relayout(ctx);
+                }),
+        )
+        .placement(TooltipPlacement::Above)
+        .theme(reader())
     };
 
     let context = {
         let s = shared.clone();
-        sui::Button::new(context_overview_summary(&shared.chat()))
-            .icon(IconGlyph::History)
-            .min_height(COMPOSER_GHOST_BUTTON_SIZE)
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Tonal)
-            .tone(SemanticTone::Neutral)
-            .on_press_with_ctx(move |ctx| {
-                s.chat_mut().toggle_composer_popup(ComposerPopup::Context);
-                request_chat_window_relayout(ctx);
-            })
+        let label = context_overview_summary(&shared.chat());
+        Tooltip::new(
+            label.clone(),
+            IconButton::new(IconGlyph::History, label)
+                .size(COMPOSER_GHOST_BUTTON_SIZE)
+                .icon_size(14.0)
+                .theme_when(composer_control_reader(reader))
+                .appearance(sui::ButtonAppearance::Ghost)
+                .tone(SemanticTone::Neutral)
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().toggle_composer_popup(ComposerPopup::Context);
+                    request_chat_window_relayout(ctx);
+                }),
+        )
+        .placement(TooltipPlacement::Above)
+        .theme(reader())
     };
 
     let activity = {
         let s = shared.clone();
-        sui::Button::new(activity_button_label(&shared.chat()))
-            .icon(IconGlyph::History)
-            .min_height(COMPOSER_GHOST_BUTTON_SIZE)
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Tonal)
-            .tone(SemanticTone::Neutral)
-            .on_press_with_ctx(move |ctx| {
-                s.chat_mut().toggle_activity_panel();
-                request_chat_window_relayout(ctx);
-            })
+        let label = activity_button_label(&shared.chat()).to_string();
+        Tooltip::new(
+            activity_button_description(&shared.chat()),
+            IconButton::new(IconGlyph::Hourglass, label)
+                .size(COMPOSER_GHOST_BUTTON_SIZE)
+                .icon_size(14.0)
+                .theme_when(composer_control_reader(reader))
+                .appearance(sui::ButtonAppearance::Ghost)
+                .tone(SemanticTone::Neutral)
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().toggle_activity_panel();
+                    request_chat_window_relayout(ctx);
+                }),
+        )
+        .placement(TooltipPlacement::Above)
+        .theme(reader())
     };
 
     let mut row = Flex::horizontal()
@@ -16095,35 +16030,10 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
     }
 
     row = row
-        .with_item(
-            model,
-            FlexItem::new()
-                .basis(132.0)
-                .min_width(100.0)
-                .min_height(COMPOSER_GHOST_BUTTON_SIZE),
-        )
-        .with_item(
-            context,
-            FlexItem::flex(1.0)
-                .basis(260.0)
-                .min_width(160.0)
-                .min_height(COMPOSER_GHOST_BUTTON_SIZE),
-        )
-        .with_item(
-            activity,
-            FlexItem::new()
-                .basis(88.0)
-                .min_width(72.0)
-                .min_height(COMPOSER_GHOST_BUTTON_SIZE),
-        );
-
-    if show_hint {
-        let s = shared.clone();
-        row = row.with_child(
-            small_label(shared, "Enter sends · Shift+Enter newline")
-                .color_when(move || palette(&s).text_faint),
-        );
-    }
+        .with_child(model)
+        .with_child(context)
+        .with_child(activity)
+        .spacer();
 
     if can_reuse && !streaming {
         let s = shared.clone();
@@ -16132,7 +16042,7 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
                 .icon(IconGlyph::Redo)
                 .min_height(COMPOSER_GHOST_BUTTON_SIZE)
                 .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Tonal)
+                .appearance(sui::ButtonAppearance::Ghost)
                 .tone(SemanticTone::Neutral)
                 .on_press(move || {
                     s.chat_mut().use_latest_answer_as_draft();
@@ -16141,34 +16051,45 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> Widge
     }
 
     // Interruption is first-class: the send button becomes stop mid-stream.
-    let action = if streaming {
+    let (action, action_tooltip) = if streaming {
         let s = shared.clone();
-        IconButton::new(IconGlyph::Stop, "Stop generation")
-            .size(SEND_BUTTON_SIZE)
-            .icon_size(13.0)
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Filled)
-            .tone(SemanticTone::Accent)
-            .on_press(move || {
-                s.chat_mut().interrupt_turn();
-            })
+        (
+            IconButton::new(IconGlyph::Stop, "Stop generation")
+                .size(SEND_BUTTON_SIZE)
+                .icon_size(13.0)
+                .theme_when(composer_control_reader(reader))
+                .appearance(sui::ButtonAppearance::Ghost)
+                .tone(SemanticTone::Accent)
+                .on_press(move || {
+                    s.chat_mut().interrupt_turn();
+                }),
+            "Stop the current response",
+        )
     } else {
         let s = shared.clone();
-        IconButton::new(IconGlyph::ArrowUp, "Send message")
-            .size(SEND_BUTTON_SIZE)
-            .icon_size(16.0)
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Filled)
-            .tone(SemanticTone::Accent)
-            .enabled_when({
-                let s = s.clone();
-                move || s.chat().can_send()
-            })
-            .on_press(move || {
-                s.chat_mut().submit();
-            })
+        (
+            IconButton::new(IconGlyph::ArrowUp, "Send message")
+                .size(SEND_BUTTON_SIZE)
+                .icon_size(16.0)
+                .theme_when(composer_control_reader(reader))
+                .appearance(sui::ButtonAppearance::Ghost)
+                .tone(SemanticTone::Accent)
+                .enabled_when({
+                    let s = s.clone();
+                    move || s.chat().can_send()
+                })
+                .on_press(move || {
+                    s.chat_mut().submit();
+                }),
+            "Enter sends · Shift+Enter newline",
+        )
     };
-    row = row.with_child(action);
+    row = row.with_child(
+        Tooltip::new(action_tooltip, action)
+            .placement(TooltipPlacement::Above)
+            .alignment(TooltipAlignment::End)
+            .theme(reader()),
+    );
 
     WidgetPod::new(WidgetPadding::new(
         Insets {
@@ -16366,22 +16287,7 @@ fn composer_field(
                 let s = s.clone();
                 move || composer_bar_signature(&s)
             },
-            move |_sig| {
-                let build_s = s.clone();
-                let build_r = Rc::clone(&r);
-                WidgetPod::new(RebuildOnConstraints::new(
-                    true,
-                    move |constraints| {
-                        let width = if constraints.max.width.is_finite() {
-                            constraints.max.width
-                        } else {
-                            constraints.min.width.max(360.0)
-                        };
-                        width >= COMPOSER_HINT_MIN_W
-                    },
-                    move |show_hint| composer_bar(&build_s, &build_r, *show_hint),
-                ))
-            },
+            move |_sig| composer_bar(&s, &r),
         )
     };
 
@@ -16636,13 +16542,15 @@ fn wide_pod(
     selection: &SelectionScope,
 ) -> WidgetPod {
     let work_area = chat_work_area(shared, reader, selection);
-    let row = FixedPaneSplit::horizontal(
-        sidebar(shared, reader, sessions_scroll_state),
-        Separator::vertical().theme_when(clone_reader(reader)),
-        work_area,
-    )
-    .fixed_first(SIDEBAR_W)
-    .divider_extent(1.0);
+    let ratio = shared.chat().sidebar_ratio;
+    let ratio_shared = shared.clone();
+    let row = SplitView::horizontal(sidebar(shared, reader, sessions_scroll_state), work_area)
+        .name("Conversation sidebar")
+        .ratio(ratio)
+        .min_first(SIDEBAR_MIN_W)
+        .min_second(CHAT_PANE_MIN_W)
+        .theme(reader())
+        .on_change(move |ratio| ratio_shared.chat_mut().set_sidebar_ratio(ratio));
     let dialog_host = ChatDialogHost::new(row, shared.clone(), Rc::clone(reader));
     WidgetPod::new(
         Surface::window(dialog_host)
@@ -20993,7 +20901,7 @@ mod tests {
             .align_items(Alignment::Stretch)
             .with_item(
                 sidebar(&shared, &theme_reader, &scroll_state),
-                FlexItem::fixed(SIDEBAR_W),
+                FlexItem::fixed(SIDEBAR_MIN_W),
             )
             .with_item(shrink, FlexItem::fixed(120.0));
 
@@ -21037,6 +20945,197 @@ mod tests {
             after_offset > 0.0,
             "shrinking the chat list should not reset scroll to the top while content still overflows"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_sidebar_is_resizable_and_search_fills_available_width() -> sui::Result<()> {
+        use sui::{PointerButtons, PointerEvent};
+
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.models_loading = false;
+            chat.session_kind_filter = SessionKindFilter::Channels;
+            chat.sessions.clear();
+        }
+        let viewport = Size::new(1_200.0, 720.0);
+        let window = test_window(
+            "Resizable conversation sidebar",
+            view(shared.clone()),
+            viewport,
+        )?;
+
+        assert_eq!(window.get_by_text("WORKSPACE").count()?, 0);
+        let before = window.snapshot()?;
+        let search_before =
+            named_node_bounds(&before, SemanticsRole::TextInput, "chat-session-filter");
+        let new_chat = named_node_bounds(&before, SemanticsRole::Button, "New chat");
+        let new_channel = before
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Button
+                    && node.name.as_deref() == Some("New channel")
+                    && node.description.as_deref() != Some("Create a shared channel")
+            })
+            .expect("sidebar New channel button")
+            .bounds;
+        assert!(
+            (new_chat.y() - new_channel.y()).abs() < 1.0,
+            "creation actions should share one compact row: {new_chat:?}, {new_channel:?}"
+        );
+        assert_non_overlapping("sidebar creation actions", new_chat, new_channel);
+        assert_eq!(
+            before
+                .accessibility
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.role == SemanticsRole::Splitter
+                        && node.name.as_deref() == Some("Conversation sidebar")
+                })
+                .count(),
+            1,
+            "desktop Chat should expose the native resizable splitter"
+        );
+
+        let theme = shared.theme();
+        let divider = theme.metrics.split_view_divider_thickness.max(1.0);
+        let initial_ratio = shared.chat().sidebar_ratio;
+        let divider_x = (viewport.width - divider) * initial_ratio + divider * 0.5;
+        let divider_point = Point::new(divider_x, 240.0);
+        let drag_point = Point::new(380.0, 240.0);
+        let root = window.root();
+        root.dispatch_event(Event::Pointer(PointerEvent::new(
+            PointerEventKind::Move,
+            divider_point,
+        )))?;
+        let mut down = PointerEvent::new(PointerEventKind::Down, divider_point);
+        down.pointer_id = 1;
+        down.button = Some(PointerButton::Primary);
+        down.buttons = PointerButtons::new(1);
+        root.dispatch_event(Event::Pointer(down))?;
+        let mut moved = PointerEvent::new(PointerEventKind::Move, drag_point);
+        moved.pointer_id = 1;
+        moved.buttons = PointerButtons::new(1);
+        root.dispatch_event(Event::Pointer(moved))?;
+        let mut up = PointerEvent::new(PointerEventKind::Up, drag_point);
+        up.pointer_id = 1;
+        up.button = Some(PointerButton::Primary);
+        root.dispatch_event(Event::Pointer(up))?;
+        window.run_until_idle()?;
+
+        assert!(
+            shared.chat().sidebar_ratio > initial_ratio + 0.08,
+            "dragging the divider should retain the wider sidebar ratio"
+        );
+        let after = window.capture_artifacts()?;
+        write_visual_debug_artifacts("chat-layout-polish", &after)?;
+        let search_after = named_node_bounds(
+            &after.snapshot,
+            SemanticsRole::TextInput,
+            "chat-session-filter",
+        );
+        assert!(
+            search_after.width() > search_before.width() + 100.0,
+            "search should expand with the resized sidebar: before={search_before:?}, after={search_after:?}"
+        );
+
+        let main_new_channel = after
+            .snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Button
+                    && node.name.as_deref() == Some("New channel")
+                    && node.description.as_deref() == Some("Create a shared channel")
+            })
+            .expect("main-pane New channel action")
+            .bounds;
+        let empty_copy_bottom = after
+            .snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.role == SemanticsRole::Text
+                    && matches!(
+                        node.name.as_deref(),
+                        Some("No channels yet")
+                            | Some(
+                                "Create a channel to coordinate multiple agents around one shared timeline."
+                            )
+                            | Some("Use New channel to choose agents and edit the title.")
+                    )
+            })
+            .map(|node| node.bounds.max_y())
+            .fold(0.0, f32::max);
+        assert!(
+            main_new_channel.y() >= empty_copy_bottom + 12.0,
+            "main New channel action should sit below empty-state copy: copy_bottom={empty_copy_bottom}, action={main_new_channel:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_composer_uses_compact_controls_and_send_shortcut_tooltip() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.models_loading = false;
+            chat.messages = vec![
+                ChatMessage::user("Keep the composer compact."),
+                ChatMessage::model("Ready."),
+            ];
+            chat.set_draft("Send this message".to_string());
+        }
+        let window = test_window(
+            "Compact composer controls",
+            view(shared.clone()),
+            Size::new(1_000.0, 680.0),
+        )?;
+
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Tooltip)
+                .with_name("Enter sends · Shift+Enter newline")
+                .count()?,
+            0,
+            "keyboard guidance should not consume persistent composer space"
+        );
+        let snapshot = window.snapshot()?;
+        for name in ["gpt-5", "Context will refresh on the next send", "Activity"] {
+            let bounds = named_node_bounds(&snapshot, SemanticsRole::Button, name);
+            assert!(
+                bounds.width() <= COMPOSER_GHOST_BUTTON_SIZE + 1.0
+                    && bounds.height() <= COMPOSER_GHOST_BUTTON_SIZE + 1.0,
+                "{name} should use the compact icon-button footprint, got {bounds:?}"
+            );
+        }
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Send message")
+            .hover()?;
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Tooltip)
+                .with_name("Enter sends · Shift+Enter newline")
+                .count()?,
+            1,
+            "the send button should reveal the keyboard guidance on hover"
+        );
+        window.advance_time(1.0)?;
+        window.pump_frames(2)?;
+        let artifacts = window.capture_artifacts()?;
+        write_visual_debug_artifacts("chat-composer-polish", &artifacts)?;
 
         Ok(())
     }
