@@ -455,12 +455,16 @@ fn rollout_build_process_error(command: String, build: &std::process::Output) ->
     }
 }
 
-struct RolloutBuildSourceGuards {
+/// Restores temporary rollout workspace/lockfile preparation when dropped.
+///
+/// Cluster build hosts use this guard around the compiler executor while
+/// keeping artifact construction and caching outside the rollout path.
+pub struct RolloutBuildSourceGuards {
     _workspace_manifest: RolloutBuildWorkspaceManifest,
     _lockfile: RolloutBuildLockfileGuard,
 }
 
-fn prepare_rollout_build_source(repo: &Path) -> Result<RolloutBuildSourceGuards, RolloutError> {
+pub fn prepare_rollout_build_source(repo: &Path) -> Result<RolloutBuildSourceGuards, RolloutError> {
     let lockfile = RolloutBuildLockfileGuard::capture(repo)?;
     let workspace_manifest = prepare_rollout_build_workspace_manifest(repo)?;
     Ok(RolloutBuildSourceGuards {

@@ -2,6 +2,9 @@ use crate::{DaemonError, DaemonPaths};
 #[cfg(test)]
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::signature::{ED25519, UnparsedPublicKey};
+use sinomo_build::{
+    BUILD_ARTIFACT_ROUTE, BUILD_CAPABILITIES_ROUTE, BUILD_STATUS_ROUTE, BUILD_SUBMIT_ROUTE,
+};
 use sinomo_config::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_SEARCH_ROUTE, CONFIG_SET_ROUTE,
 };
@@ -421,6 +424,19 @@ pub fn authorize_authenticated_daemon_command(
                 || route == ROLLOUT_BUILD_ROUTE =>
         {
             authenticated.signer.can_run_admin_command()
+        }
+        route if route == BUILD_SUBMIT_ROUTE => authenticated.signer.can_run_admin_command(),
+        route
+            if route == BUILD_CAPABILITIES_ROUTE
+                || route == BUILD_STATUS_ROUTE
+                || route == BUILD_ARTIFACT_ROUTE =>
+        {
+            matches!(
+                authenticated.signer,
+                DaemonSignerAuthority::Local
+                    | DaemonSignerAuthority::Voter
+                    | DaemonSignerAuthority::Member
+            )
         }
         route if route == sinomo_core::network::CLUSTER_RELAY_ROUTE => {
             // A relay envelope is forwarded on behalf of another node by any authenticated
@@ -1818,6 +1834,51 @@ mod tests {
             for signer in [
                 DaemonSignerAuthority::Member,
                 DaemonSignerAuthority::JoinCandidate,
+            ] {
+                let authenticated = authenticated_command(route.to_string(), signer);
+                assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn build_submit_authorizes_admin_signers() {
+        for route in [BUILD_SUBMIT_ROUTE] {
+            for signer in [DaemonSignerAuthority::Local, DaemonSignerAuthority::Voter] {
+                let authenticated = authenticated_command(route.to_string(), signer);
+                authorize_authenticated_daemon_command(&authenticated)
+                    .expect("build service routes require admin signers");
+            }
+            for signer in [
+                DaemonSignerAuthority::Member,
+                DaemonSignerAuthority::JoinCandidate,
+                DaemonSignerAuthority::StatusProbe,
+            ] {
+                let authenticated = authenticated_command(route.to_string(), signer);
+                assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn build_read_routes_authorize_cluster_members() {
+        for route in [
+            BUILD_CAPABILITIES_ROUTE,
+            BUILD_STATUS_ROUTE,
+            BUILD_ARTIFACT_ROUTE,
+        ] {
+            for signer in [
+                DaemonSignerAuthority::Local,
+                DaemonSignerAuthority::Voter,
+                DaemonSignerAuthority::Member,
+            ] {
+                let authenticated = authenticated_command(route.to_string(), signer);
+                authorize_authenticated_daemon_command(&authenticated)
+                    .expect("build read routes authorize cluster members");
+            }
+            for signer in [
+                DaemonSignerAuthority::JoinCandidate,
+                DaemonSignerAuthority::StatusProbe,
             ] {
                 let authenticated = authenticated_command(route.to_string(), signer);
                 assert!(authorize_authenticated_daemon_command(&authenticated).is_err());

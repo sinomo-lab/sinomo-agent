@@ -151,6 +151,8 @@ The cluster KV is a compact, strongly ordered authority for:
 - service registrations;
 - compact DFS configuration and shard placement;
 - shared policy and rollout desired state;
+- compact queued build state and artifact references;
+- expiring build-worker capability and resource advertisements;
 - short-lived coordination leases.
 
 It does not contain raw media, file bytes, build artifacts, model weights,
@@ -214,6 +216,26 @@ Service discovery uses durable registration and current health to select a
 target. Selection does not bypass network route validation or the target
 service's own authorization.
 
+Cluster build workers use the same discovery boundary with stricter placement
+evidence. Durable registration identifies a possible worker; a fresh expiring
+advertisement states its supported target identities and toolchains, available
+slots, resource headroom, queue pressure, and cache locality. The build
+scheduler hard-filters for compatibility, policy, liveness, route health, and
+capacity, then ranks eligible workers by estimated time to a usable artifact.
+A short-lived lease reserves the selected slot before dispatch.
+
+Rollout targets are grouped by compatible artifact target and resolved from
+verified caches before compilation is scheduled. Worker or route loss causes
+re-ranking and retry, not relaxed compatibility. Service registration,
+membership, or a descriptive device role alone is never liveness or build
+eligibility evidence. See
+[build service architecture](build-service-architecture.md).
+
+The initial build-service delivery queries these capabilities live from each
+reachable daemon and keeps queue/cache state node-local. Durable cluster-wide
+advertisements and slot leases are the intended coordination layer, not a
+claim about the initial wire implementation.
+
 See [DFS architecture](dfs-architecture.md) and
 [service responsibilities in the overview](architecture.md#distributed-foundation).
 
@@ -226,6 +248,8 @@ See [DFS architecture](dfs-architecture.md) and
 | Node restart | The node restores durable identity and consensus state, then catches up before claiming freshness. |
 | Route loss | Routing tries bounded alternate endpoints without changing membership or trust. |
 | Intermittent observer | Local work may continue within cached-state policy; authoritative writes wait or fail explicitly. |
+| Build worker loss | Its lease expires and the queued job is retried on another compatible worker; partial output is never eligible for rollout. |
+| No compatible builder | The job remains visibly queued or fails with an explicit capability blocker; rollout does not substitute an incompatible artifact. |
 | Lost quorum | The cluster becomes read-only for authority-dependent work; supervision and repair endpoints remain available. |
 | Disaster recovery | Recovery requires an explicit operator or policy-authorized transition; the runtime must not silently create a replacement cluster identity. |
 

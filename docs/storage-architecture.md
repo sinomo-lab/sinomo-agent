@@ -66,11 +66,37 @@ ownership rules:
 | DFS metadata and content | Owned dynamic subtrees registered by DFS. |
 | Workspaces and exposed files | Reasoned escape paths because contents are intentionally arbitrary. |
 | Evolution jobs and review artifacts | Higher-ring subtrees intended for operator and agent inspection. |
-| Installed binaries and managed source | Install and rollout-owned paths with explicit lifecycle rules. |
+| Build inputs, workspaces, caches, and job evidence | Build-service-owned paths with isolated workspace and immutable cache rules. |
+| Installed or staged binaries and managed source | Install and rollout-owned paths with explicit activation lifecycle rules. |
 
 Cluster-wide configuration belongs in cluster KV or a shared configuration
 document according to the owning subsystem. A local file must not quietly become
 an alternate source of authority for distributed settings.
+
+## Build, Artifact, and Activation Storage
+
+Build storage and activation storage have different owners. The build service
+owns isolated per-job workspaces, fetched source and dependency material,
+compiler caches, build logs, and locally retained immutable outputs. Rollout and
+the module loader own staged candidates, installed binaries, active module
+references, and recovery state. A build workspace or cache path is never an
+activation path.
+
+Immutable source bundles, binary and module artifacts, and manifests are
+content addressed when cached. The initial build service publishes them to a
+verified node-local cache and streams requested artifacts to rollout. A shared
+registry or DFS content source may later serve the same immutable identity; it
+must not rewrite bytes under an existing identity. Rollout, not the builder,
+copies a selected artifact into target staging and installed locations.
+
+The initial queue, job status, and artifact cache are node-local under
+`$SINOMO_DATA_DIR/build/`; live RPCs provide scheduling evidence. When
+cluster-wide advertisements, leases, or artifact references are added, cluster
+KV stores only that compact coordination. It never stores source trees,
+dependency archives, artifact bytes, full build logs, or compiler caches.
+Temporary workspaces are recoverable or safely disposable after a worker
+failure; durable job state and published artifacts remain independently
+inspectable.
 
 ## Verification
 
@@ -100,6 +126,11 @@ owning subsystem performs those checks.
 6. Unregistered files are reported, never silently adopted or deleted.
 7. Local storage cannot override cluster authority without an explicit
    subsystem rule.
+8. Build workspaces and caches cannot serve as installed or active locations.
+9. Immutable build inputs and artifacts are never overwritten under an existing
+   content identity.
+10. Cluster coordination stores references to build content, not the content
+    itself.
 
 The [architecture overview](architecture.md#state-and-data) explains how local
 storage relates to cluster KV, events, memory, and DFS. The

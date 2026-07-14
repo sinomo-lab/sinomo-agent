@@ -24,6 +24,7 @@ subsystem document relevant to the change:
 | Area | Document |
 |---|---|
 | Agent sessions, context, tools, and cancellation | [Agent system](agent-system-architecture.md) |
+| Cluster build scheduling, artifact caching, and rollout handoff | [Build service](build-service-architecture.md) |
 | Cluster identity, membership, consensus, and failure | [Clustering](clustering-architecture.md) |
 | Routing, endpoint selection, and transports | [Network](network-architecture.md) |
 | Distributed metadata, content, and consistency | [DFS](dfs-architecture.md) |

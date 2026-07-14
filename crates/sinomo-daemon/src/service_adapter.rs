@@ -3444,6 +3444,14 @@ fn daemon_service_registry(
             runtime: service_runtime.cloned(),
             event_hub,
         });
+    // Main and shadow share the data-dir build root. Only the main daemon may
+    // own its durable queue, worker, and cache; the shadow keeps rollout
+    // recovery services but must neither serve nor advertise build routes.
+    let builder = if crate::daemon_paths_are_shadow(paths) {
+        builder
+    } else {
+        builder.register(crate::build_service::DaemonBuildService::new(paths))
+    };
     let builder = if let Some(runtime) = service_runtime {
         sinomo_dfs::register_data_plane_services(
             builder,
@@ -6624,6 +6632,50 @@ mod tests {
                 }
             );
         }
+        let build_module_routes = sinomo_build::build_module_surfaces()
+            .object_rpc_route_descriptors()
+            .expect("build module surfaces")
+            .into_iter()
+            .map(|descriptor| (descriptor.route.clone(), descriptor))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for route in sinomo_build::BUILD_OBJECT_RPC_ROUTES {
+            let service_route = route_metadata
+                .iter()
+                .find(|metadata| metadata.route == *route)
+                .unwrap_or_else(|| panic!("build service route metadata for {route}"));
+            let module_route = build_module_routes
+                .get(*route)
+                .unwrap_or_else(|| panic!("build module route metadata for {route}"));
+            assert_eq!(service_route.category, module_route.category);
+            assert_eq!(
+                service_route.auth_scope.as_deref(),
+                Some(module_route.auth_scope.as_str())
+            );
+            assert_eq!(
+                service_route.required_capabilities,
+                module_route
+                    .required_capabilities
+                    .iter()
+                    .map(|capability| capability.as_str().to_string())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                service_route.request_body_mode,
+                if *route == sinomo_build::BUILD_SUBMIT_ROUTE {
+                    ServiceBodyMode::Optional
+                } else {
+                    ServiceBodyMode::None
+                }
+            );
+            assert_eq!(
+                service_route.response_body_mode,
+                if *route == sinomo_build::BUILD_ARTIFACT_ROUTE {
+                    ServiceBodyMode::Required
+                } else {
+                    ServiceBodyMode::None
+                }
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -6855,5 +6907,59 @@ mod tests {
 
         outer_server.await.expect("outer server");
         target_server.await.expect("target server");
+    }
+
+    #[test]
+    fn only_main_registry_hosts_build_routes_while_shadow_keeps_rollout_routes() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-main-shadow-build-routes");
+        let data_dir = SinomoDataDir::new(&root);
+        let main_paths = DaemonPaths::new(&data_dir);
+        let shadow_paths = DaemonPaths::for_shadow(&data_dir);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let main_registry = daemon_service_registry(&main_paths, Some(runtime.handle()), &[]);
+        let shadow_registry = daemon_service_registry(&shadow_paths, Some(runtime.handle()), &[]);
+
+        for route in sinomo_build::BUILD_OBJECT_RPC_ROUTES {
+            assert!(
+                main_registry.owns(route),
+                "main registry should own {route}"
+            );
+            assert!(
+                !shadow_registry.owns(route),
+                "shadow registry must not own {route}"
+            );
+        }
+        for route in [
+            sinomo_rollout::ROLLOUT_DIAGNOSTICS_ROUTE,
+            sinomo_rollout::ROLLOUT_BINARY_ROUTE,
+            sinomo_rollout::ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
+            sinomo_rollout::ROLLOUT_BUILD_ROUTE,
+        ] {
+            assert!(
+                shadow_registry.owns(route),
+                "shadow registry should retain rollout recovery route {route}"
+            );
+        }
+
+        let main_host =
+            DaemonServiceRegistryHost::from_registry_for_paths(main_registry, &main_paths)
+                .expect("main registry host");
+        let shadow_host =
+            DaemonServiceRegistryHost::from_registry_for_paths(shadow_registry, &shadow_paths)
+                .expect("shadow registry host");
+        for route in sinomo_build::BUILD_OBJECT_RPC_ROUTES {
+            assert!(
+                main_host.object_rpc_route_descriptor(route).is_some(),
+                "main host should advertise {route}"
+            );
+            assert!(
+                shadow_host.object_rpc_route_descriptor(route).is_none(),
+                "shadow host must not advertise {route}"
+            );
+        }
     }
 }

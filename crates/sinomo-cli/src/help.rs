@@ -298,7 +298,13 @@ pub(super) fn print_rollout_help() {
         "  sinomo rollout cluster [--repo <path> | --binary <path>] [--target <host:port>] [--remote-build] [--force-source] [--remote-repo <path>] [--skip-local] [--skip-native-modules]"
     );
     println!(
-        "      Build or use a dev binary for compatible nodes, or ask targets to build from their own source repo, then activate through shadow supervision or the main-only shadow bootstrap path."
+        "      Resolve one cached or cluster-built binary/module set per target OS and architecture, distribute it to compatible nodes, then activate through shadow supervision or the main-only bootstrap path."
+    );
+    println!(
+        "      Build servers are filtered by target support and ranked by exact cache hit, queue pressure, available slots, CPU, memory, and transfer locality."
+    );
+    println!(
+        "      --remote-build keeps the legacy per-target source build path for mixed-version recovery; it bypasses cluster build scheduling and may be slow on constrained targets."
     );
     println!(
         "      --force-source stashes local changes in the managed source repo before overwriting it with the rollout source."
@@ -310,7 +316,7 @@ pub(super) fn print_rollout_help() {
         "  sinomo rollout module native-dylib <module-id|package|source|cache-key> [--repo <path>] [--target <host:port>] [--skip-local]"
     );
     println!(
-        "      Build one native-dylib module artifact, install it on rollout targets, and refresh the daemon through shadow supervision."
+        "      Resolve one cluster-built native-dylib artifact per target OS and architecture, install it on compatible targets, and refresh the daemon through shadow supervision."
     );
     println!(
         "  sinomo rollout advance [--node <node-id>] [--scorecard <path> | --module-replay-report <path> | --shadow-telemetry [--shadow-telemetry-limit <n>]] [--incident <event-id>] [--user-corrections <n>] [--rollback-trigger <trigger>] [--evidence <ref>]"

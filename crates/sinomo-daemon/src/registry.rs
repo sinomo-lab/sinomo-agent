@@ -78,6 +78,11 @@ pub struct InternalModuleTable {
 
 const INTERNAL_NATIVE_RUST_MODULE_BINDINGS: &[NativeRustModuleBinding] = &[
     NativeRustModuleBinding {
+        registration_key: sinomo_build::SINOMO_BUILD_NATIVE_REGISTRATION_KEY,
+        register_services: None,
+        register_storage_paths: Some(sinomo_build::register_storage_paths),
+    },
+    NativeRustModuleBinding {
         registration_key: sinomo_dfs::SINOMO_DFS_NATIVE_REGISTRATION_KEY,
         register_services: Some(sinomo_dfs::register_services),
         register_storage_paths: Some(sinomo_dfs::register_storage_paths),
@@ -109,6 +114,7 @@ pub fn internal_module_table() -> Result<InternalModuleTable, ModuleRegistryErro
 
 pub fn internal_module_registry() -> Result<ModuleRegistry, ModuleRegistryError> {
     let registry = sinomo_module::ModuleRegistry::builder()
+        .register(sinomo_build::build_module_registration())?
         .register(sinomo_dfs::dfs_module_registration())?
         .register(network_module_registration())?
         .register(sinomo_rollout::rollout_module_registration())?
@@ -622,6 +628,24 @@ fn load_daemon_network_module_from_loader_state(
 mod tests {
     use super::*;
     use sinomo_core::{FileSystemAccess, ModuleKind, NetworkAccess, TrustRing};
+
+    #[test]
+    fn build_module_is_registered_with_daemon_storage_binding() {
+        let table = internal_module_table().expect("internal module table");
+        let registration = table
+            .registry
+            .get(&sinomo_build::build_module_id())
+            .expect("build module registration");
+        let binding =
+            native_rust_binding_for_registration(registration).expect("build native-rust binding");
+
+        assert_eq!(
+            binding.registration_key,
+            sinomo_build::SINOMO_BUILD_NATIVE_REGISTRATION_KEY
+        );
+        assert!(binding.register_services.is_none());
+        assert!(binding.register_storage_paths.is_some());
+    }
 
     #[test]
     fn network_registers_as_r1_native_rust_module() {

@@ -20,6 +20,7 @@ cluster-test-support = ["sinomo-core/cluster-test-support"]
 
 [dependencies]
 sinomo-api = { path = "../sinomo-api" }
+sinomo-build = { path = "../sinomo-build" }
 sinomo-cli-registry = { path = "../sinomo-cli-registry" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-core = { path = "../sinomo-core" }

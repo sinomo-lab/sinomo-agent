@@ -68,6 +68,7 @@ emit them. This gives live execution, replay, and audit a common substrate.
 | Service | Discoverable runtime capability hosted by one or more nodes. |
 | Event | Typed, timestamped statement with provenance, evidence, and routing policy. |
 | Workspace object | Versioned file or artifact governed by a DFS placement policy. |
+| Build job | Cluster-scheduled conversion of authorized inputs into an immutable target-compatible artifact. |
 | Module artifact | Versioned behavior that can be evaluated, activated, and rolled back. |
 
 Chats and channels are user-facing. A model session is an internal execution
@@ -150,6 +151,27 @@ they do not create conflicting visible histories.
 
 See [DFS architecture](dfs-architecture.md) and the [SIFS layout](sifs.md).
 
+### Build and Artifact Distribution
+
+Binary and module compilation is a cluster service, not a step that every
+rollout target must perform. Rollout groups targets by explicit compatibility
+requirements and asks the build service to resolve an immutable artifact for
+each group. The service reuses verified artifacts first, coalesces matching
+jobs, and otherwise schedules a compatible worker using fresh capability,
+resource, queue, route, and cache-locality evidence.
+
+Builders publish content-addressed artifacts and provenance. They do not choose
+rollout lanes, change desired state, or activate their output. Rollout remains
+the only cluster authority for distribution intent, staging, activation,
+promotion, and rollback, and each target performs final authorization and
+compatibility checks. See
+[build service architecture](build-service-architecture.md).
+
+The current first slice queries build capabilities directly from reachable
+daemons, retains artifacts in each builder's local cache, and streams selected
+bytes through the rollout client. Shared registry/DFS lookup and cluster-wide
+leases remain follow-on coordination work.
+
 ## State and Data
 
 State is separated by authority, durability, and replication cost:
@@ -162,7 +184,9 @@ State is separated by authority, durability, and replication cost:
 | Long-horizon memory | Versioned source/overlay files plus rebuildable indexes | Source and overlay files follow scope policy; derived indexes replicate by usefulness. |
 | Workspace metadata | DFS metadata authority | Sharded and replicated by filesystem policy. |
 | Workspace content | Node-local content stores | Copied or cached according to object policy. |
-| Module and rollout state | Trusted registry and rollout services | Distributed to affected nodes as desired state. |
+| Build requests and job coordination | Cluster build service with compact control-plane records | Queued, coalesced, leased, and observed by build identity. |
+| Built binary and module artifacts | Trusted registry, DFS, and authorized caches | Immutable content distributed by target compatibility and demand. |
+| Module and rollout desired state | Trusted rollout services | Distributed to affected nodes and applied only after local verification. |
 
 The base runtime must not require PostgreSQL, a message broker, a distributed
 cache, a vector database, or external object storage. Deployments may add those
@@ -225,7 +249,7 @@ Trust rings constrain both dependency direction and mutation risk:
 |---|---|---|
 | R0 | Minimal cluster foundation: base contracts, object format, local storage, node/events, network, KV, cluster, and service discovery. | R0 crates depend only on R0 crates. |
 | R0 boundary | `sinomo-core`, the facade over the complete R0 set. | Aggregates R0 without adding service behavior. |
-| R1 | Trusted runtime: daemon, DFS, policy, modules, registry, rollout, observation, config, evaluation, sandboxes, and support APIs. | Crosses into R0 through `sinomo-core`. |
+| R1 | Trusted runtime: daemon, DFS, build, policy, modules, registry, rollout, observation, config, evaluation, sandboxes, and support APIs. | Crosses into R0 through `sinomo-core`. |
 | R1 boundary | `sinomo-runtime`, the facade over R0 and R1. | Aggregates trusted runtime surfaces without owning application behavior. |
 | R2 | Agent, memory, models, perception, action, and evolution services. | Depends on the foundation through `sinomo-runtime`. |
 | Application | CLI, GUI, mounts, and test applications. | May depend on R2 services directly; accesses R0 and R1 through `sinomo-runtime`. |
@@ -260,6 +284,12 @@ Candidate changes move through isolated workspaces, tests and replay,
 machine-readable scorecards, trusted policy, immutable artifact registration,
 shadow or canary execution, and rollback. Candidate code cannot approve itself,
 change trust policy, bypass the sandbox host, or replace recovery logic.
+
+Build services turn approved source inputs into immutable, target-compatible
+binary and module artifacts. They are supply services, not rollout authorities:
+an artifact is preferably built once per build identity and compatible target
+group, cached, and distributed to eligible nodes. Producing an artifact cannot
+make it desired state or authorize activation.
 
 Each node independently verifies compatibility, signature, capability grants,
 resource limits, and local policy before activation. A disconnected node keeps
@@ -298,7 +328,9 @@ forwarding, storage commits, policy checks, or cancellation.
 At minimum, operators and developers need visibility into ingestion lag,
 response latency, routing attempts, quorum and replication state, DFS repair,
 tool and action outcomes, policy blocks, model usage, rollout state, and
-artifact provenance. See [observability architecture](observability-architecture.md).
+artifact provenance. Cluster builds additionally expose queue pressure, cache
+resolution, worker selection evidence, resource snapshots, retries, and build
+outcomes. See [observability architecture](observability-architecture.md).
 
 ## Architectural Invariants
 
@@ -315,8 +347,10 @@ Changes to the runtime must preserve these properties:
 6. Normal quorum-backed DFS operation has one authoritative visible history.
 7. Memory retrieval is scoped, attributable, and bounded by context assembly.
 8. Candidate code cannot approve, authorize, or make itself unrecoverable.
-9. Lower trust rings never depend on higher-ring services.
-10. External backends remain replaceable and cannot become undeclared sources
+9. Producing a binary or module artifact never grants authority to activate,
+   promote, or roll it out.
+10. Lower trust rings never depend on higher-ring services.
+11. External backends remain replaceable and cannot become undeclared sources
     of authority.
 
 Detailed contracts belong in the subsystem documents linked from the

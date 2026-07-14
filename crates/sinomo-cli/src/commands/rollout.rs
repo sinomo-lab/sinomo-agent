@@ -1,4 +1,12 @@
 use super::*;
+use sinomo_runtime::build::{
+    BuildArtifactKind, BuildArtifactRequest, BuildArtifactResponse, BuildArtifactSetManifest,
+    BuildCandidate, BuildCapabilitiesRequest, BuildCapabilitiesResponse, BuildJobState,
+    BuildKeyInput, BuildOutputRequest, BuildPlan, BuildSource, BuildStatusRequest,
+    BuildStatusResponse, BuildSubmitRequest, BuildSubmitResponse, BuildTarget,
+    BuildTargetCapability, NativeModuleSelection, build_content_hash,
+    discover_native_dylib_outputs, rank_build_candidates,
+};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum RolloutCliCommand {
@@ -664,58 +672,103 @@ pub(crate) fn rollout_module_native_dylib(
             detail: "no module rollout targets found; pass --target <host:port> or start a clustered local daemon".to_string(),
         });
     }
-    let paths = rollout_paths_from_defaults()?;
-    ensure_rollout_layout(&paths)?;
-    let repo = rollout_source_repo_from_options(&options.rollout)?;
+    let mut outcomes = ClusterRolloutOutcomeSummary::default();
+    let groups = collect_cluster_build_target_groups(targets, &mut outcomes);
+    if groups.is_empty() {
+        return outcomes.finish();
+    }
+    if block_cluster_build_groups_after_discovery_failure(&mut outcomes, &groups, "module") {
+        return outcomes.finish();
+    }
+    let source = prepare_cluster_build_source_input(&options.rollout)?;
+    let contacts = cluster_build_contacts(&options.rollout, &groups);
+    let selection = ClusterBuildOutputSelection::NativeDylibModule(options.module_selector.clone());
+    let mut resolved = Vec::new();
+    let mut resolution_failed = false;
+    for group in groups {
+        println!(
+            "resolving module {} for {} / {} ({} rollout target(s))",
+            options.module_selector,
+            group.target.os,
+            group.target.arch,
+            group.rollout_targets.len()
+        );
+        match resolve_cluster_build_group(&source, group.clone(), &contacts, &selection) {
+            Ok(group) => resolved.push(group),
+            Err(error) => {
+                resolution_failed = true;
+                record_cluster_build_group_failure(&mut outcomes, &group, &error);
+            }
+        }
+    }
+    if resolution_failed {
+        for group in &resolved {
+            for target in &group.group.rollout_targets {
+                let detail = "another target platform failed module build resolution; no module was activated"
+                    .to_string();
+                println!("{}: blocked: {detail}", target.label());
+                outcomes.record_failure(target.label(), "blocked", detail);
+            }
+        }
+        return outcomes.finish();
+    }
+
     let requested_at = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string());
-    let artifact = rollout_build_dev_native_dylib_module(
-        &repo,
-        &paths.plan().build_log,
-        &options.module_selector,
-    )?;
-    println!(
-        "module rollout artifact: {}",
-        artifact.built_library.display()
-    );
-    println!("  module: {}", artifact.module_id);
-    println!("  interface: {}", artifact.interface_version);
-    println!("  source: {}", artifact.source);
-    let request = prepare_cluster_rollout_native_dylib_module_request(
-        artifact.source.clone(),
-        &artifact,
-        options.rollout.host.clone(),
-        options.rollout.port,
-        options.rollout.shadow_port,
-        requested_at,
-    )?;
-
-    for target in targets {
-        let target_status = match read_rollout_target_status(&target) {
-            Ok(status) => status,
-            Err(error) => {
-                println!("{}: failed: {error}", target.label());
-                continue;
-            }
-        };
-        if let Err(error) =
-            ensure_rollout_target_platform_from_status(target.label(), &target_status)
-        {
-            println!("{}: skipped: {error}", target.label());
-            continue;
-        }
-        match send_daemon_rollout_native_dylib_module(&target, &request) {
-            Ok(response) => {
-                println!("{}: {}", target.label(), response.status);
-                if !response.detail.is_empty() {
-                    println!("  {}", response.detail);
+    let prepared = resolved
+        .into_iter()
+        .map(|group| {
+            let [artifact] = group.artifacts.native_dylib_modules.as_slice() else {
+                return Err(CliError::Parse {
+                    detail: format!(
+                        "module build {} did not resolve exactly one artifact",
+                        group.builder.plan.key
+                    ),
+                });
+            };
+            println!(
+                "module rollout artifact: {}",
+                artifact.built_library.display()
+            );
+            println!("  module: {}", artifact.module_id);
+            println!("  interface: {}", artifact.interface_version);
+            println!("  source: {}", artifact.source);
+            let request = prepare_cluster_rollout_native_dylib_module_request(
+                artifact.source.clone(),
+                artifact,
+                options.rollout.host.clone(),
+                options.rollout.port,
+                options.rollout.shadow_port,
+                requested_at.clone(),
+            )?;
+            Ok((group.group, request))
+        })
+        .collect::<Result<Vec<_>, CliError>>()?;
+    for (group, request) in prepared {
+        for target in &group.rollout_targets {
+            match send_daemon_rollout_native_dylib_module(target, &request) {
+                Ok(response) => {
+                    println!("{}: {}", target.label(), response.status);
+                    if response.status != "accepted" {
+                        outcomes.record_failure(
+                            target.label(),
+                            &response.status,
+                            response.detail.clone(),
+                        );
+                    }
+                    if !response.detail.is_empty() {
+                        println!("  {}", response.detail);
+                    }
+                }
+                Err(error) => {
+                    println!("{}: failed: {error}", target.label());
+                    outcomes.record_failure(target.label(), "failed", error.to_string());
                 }
             }
-            Err(error) => println!("{}: failed: {error}", target.label()),
         }
     }
-    Ok(())
+    outcomes.finish()
 }
 
 pub(crate) fn rollout_init_source(options: RolloutOptions) -> Result<(), CliError> {
@@ -1334,6 +1387,1155 @@ pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
 }
 
 pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
+    if options.remote_build
+        || options.binary.is_some()
+        || options.remote_repo.is_some()
+        || options.skip_native_modules
+        || options.force_source_overwrite
+    {
+        return rollout_cluster_legacy(options);
+    }
+    rollout_cluster_via_build_service(options)
+}
+
+#[derive(Clone, Debug)]
+struct ClusterBuildTargetGroup {
+    target: BuildTarget,
+    rollout_targets: Vec<RolloutTarget>,
+}
+
+#[derive(Clone, Debug)]
+struct ClusterBuildSourceInput {
+    source: BuildSource,
+    source_repo: PathBuf,
+    source_bundle: PathBuf,
+    lockfile_hash: String,
+}
+
+#[derive(Clone, Debug)]
+struct ClusterBuilderPlan {
+    contact: RolloutTarget,
+    capabilities: BuildCapabilitiesResponse,
+    plan: BuildPlan,
+    cache_hit: bool,
+    transfer_cost: u32,
+}
+
+#[derive(Clone, Debug)]
+enum ClusterBuildOutputSelection {
+    FullRollout,
+    NativeDylibModule(String),
+}
+
+#[derive(Clone, Debug, Default)]
+struct DownloadedClusterBuildArtifacts {
+    binary: Option<PathBuf>,
+    native_dylib_modules: Vec<LocalRolloutNativeDylibModuleArtifact>,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedClusterBuildGroup {
+    group: ClusterBuildTargetGroup,
+    builder: ClusterBuilderPlan,
+    artifacts: DownloadedClusterBuildArtifacts,
+}
+
+fn build_target_from_daemon_status(
+    address: &str,
+    status: &DaemonStatus,
+) -> Result<BuildTarget, CliError> {
+    let target_os = status.target_os.as_deref().ok_or_else(|| CliError::Parse {
+        detail: format!(
+            "rollout target {address} did not report its operating system; target-aware build selection is unavailable"
+        ),
+    })?;
+    let target_arch = status
+        .target_arch
+        .as_deref()
+        .ok_or_else(|| CliError::Parse {
+            detail: format!(
+                "rollout target {address} did not report its architecture; target-aware build selection is unavailable"
+            ),
+        })?;
+    BuildTarget::new(target_os, target_arch).map_err(build_service_cli_error)
+}
+
+fn collect_cluster_build_target_groups(
+    targets: Vec<RolloutTarget>,
+    outcomes: &mut ClusterRolloutOutcomeSummary,
+) -> Vec<ClusterBuildTargetGroup> {
+    let mut classified = Vec::new();
+    let mut seen_nodes = BTreeSet::new();
+    for target in targets {
+        if target
+            .rollout_node_id()
+            .is_some_and(|node_id| !seen_nodes.insert(node_id.clone()))
+        {
+            continue;
+        }
+        outcomes.begin_target();
+        let status = match read_rollout_target_status(&target) {
+            Ok(status) => status,
+            Err(error) => {
+                println!("{}: failed: {error}", target.label());
+                outcomes.record_failure(target.label(), "failed", error.to_string());
+                continue;
+            }
+        };
+        let build_target = match build_target_from_daemon_status(target.label(), &status) {
+            Ok(build_target) => build_target,
+            Err(error) => {
+                println!("{}: skipped: {error}", target.label());
+                outcomes.record_failure(target.label(), "skipped", error.to_string());
+                continue;
+            }
+        };
+        classified.push((build_target, target));
+    }
+    group_cluster_build_targets(classified)
+}
+
+fn group_cluster_build_targets(
+    targets: impl IntoIterator<Item = (BuildTarget, RolloutTarget)>,
+) -> Vec<ClusterBuildTargetGroup> {
+    let mut groups = BTreeMap::<BuildTarget, Vec<RolloutTarget>>::new();
+    for (target, rollout_target) in targets {
+        groups.entry(target).or_default().push(rollout_target);
+    }
+    groups
+        .into_iter()
+        .map(|(target, rollout_targets)| ClusterBuildTargetGroup {
+            target,
+            rollout_targets,
+        })
+        .collect()
+}
+
+fn cluster_build_contacts(
+    options: &RolloutOptions,
+    rollout_groups: &[ClusterBuildTargetGroup],
+) -> Vec<RolloutTarget> {
+    let mut contacts = Vec::new();
+    let mut discovery = options.clone();
+    discovery.targets.clear();
+    discovery.skip_local = false;
+    if let Ok(discovered) = rollout_cluster_targets(&discovery) {
+        for target in discovered {
+            push_unique_rollout_target(&mut contacts, target);
+        }
+    }
+    for target in rollout_groups
+        .iter()
+        .flat_map(|group| group.rollout_targets.iter())
+    {
+        push_unique_rollout_target(&mut contacts, target.clone());
+    }
+    contacts
+}
+
+fn send_daemon_build_capabilities_for_target(
+    target: &RolloutTarget,
+    request: &BuildCapabilitiesRequest,
+) -> Result<BuildCapabilitiesResponse, CliError> {
+    if let Some(node_id) = target.rollout_node_id() {
+        sinomo_runtime::daemon::send_daemon_build_capabilities_to_target(node_id, request)
+            .map_err(Into::into)
+    } else if let Some(endpoint) = &target.endpoint {
+        sinomo_runtime::daemon::send_daemon_build_capabilities_to_endpoint(endpoint, request)
+            .map_err(Into::into)
+    } else {
+        sinomo_runtime::daemon::send_daemon_build_capabilities(&target.address, request)
+            .map_err(Into::into)
+    }
+}
+
+fn send_daemon_build_submit_for_target(
+    target: &RolloutTarget,
+    request: &BuildSubmitRequest,
+    source_bundle: Option<&Path>,
+) -> Result<BuildSubmitResponse, CliError> {
+    if let Some(node_id) = target.rollout_node_id() {
+        sinomo_runtime::daemon::send_daemon_build_submit_to_target(node_id, request, source_bundle)
+            .map_err(Into::into)
+    } else if let Some(endpoint) = &target.endpoint {
+        sinomo_runtime::daemon::send_daemon_build_submit_to_endpoint(
+            endpoint,
+            request,
+            source_bundle,
+        )
+        .map_err(Into::into)
+    } else {
+        sinomo_runtime::daemon::send_daemon_build_submit(&target.address, request, source_bundle)
+            .map_err(Into::into)
+    }
+}
+
+fn send_daemon_build_status_for_target(
+    target: &RolloutTarget,
+    request: &BuildStatusRequest,
+) -> Result<BuildStatusResponse, CliError> {
+    if let Some(node_id) = target.rollout_node_id() {
+        sinomo_runtime::daemon::send_daemon_build_status_to_target(node_id, request)
+            .map_err(Into::into)
+    } else if let Some(endpoint) = &target.endpoint {
+        sinomo_runtime::daemon::send_daemon_build_status_to_endpoint(endpoint, request)
+            .map_err(Into::into)
+    } else {
+        sinomo_runtime::daemon::send_daemon_build_status(&target.address, request)
+            .map_err(Into::into)
+    }
+}
+
+fn send_daemon_build_artifact_for_target(
+    target: &RolloutTarget,
+    request: &BuildArtifactRequest,
+    destination: &Path,
+) -> Result<BuildArtifactResponse, CliError> {
+    if let Some(node_id) = target.rollout_node_id() {
+        sinomo_runtime::daemon::send_daemon_build_artifact_to_target(node_id, request, destination)
+            .map_err(Into::into)
+    } else if let Some(endpoint) = &target.endpoint {
+        sinomo_runtime::daemon::send_daemon_build_artifact_to_endpoint(
+            endpoint,
+            request,
+            destination,
+        )
+        .map_err(Into::into)
+    } else {
+        sinomo_runtime::daemon::send_daemon_build_artifact(&target.address, request, destination)
+            .map_err(Into::into)
+    }
+}
+
+fn supporting_build_capability(
+    response: &BuildCapabilitiesResponse,
+    target: &BuildTarget,
+    kinds: &[BuildArtifactKind],
+) -> Option<BuildTargetCapability> {
+    let mut matches = response
+        .capabilities
+        .targets
+        .iter()
+        .filter(|capability| capability.supports(target, kinds))
+        .cloned()
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        left.target
+            .cmp(&right.target)
+            .then_with(|| left.toolchain_fingerprint.cmp(&right.toolchain_fingerprint))
+    });
+    matches.into_iter().next()
+}
+
+fn build_plan_for_capability(
+    source: &ClusterBuildSourceInput,
+    capability: &BuildTargetCapability,
+    features: &[String],
+    outputs: &[BuildOutputRequest],
+) -> Result<BuildPlan, CliError> {
+    BuildPlan::new(
+        source.source.clone(),
+        BuildKeyInput {
+            source_hash: source.source.bundle_hash.clone(),
+            source_revision: source.source.revision.clone(),
+            lockfile_hash: source.lockfile_hash.clone(),
+            target: capability.target.clone(),
+            profile: "dev".to_string(),
+            features: features.to_vec(),
+            toolchain_fingerprint: capability.toolchain_fingerprint.clone(),
+            outputs: outputs.to_vec(),
+        },
+    )
+    .map_err(build_service_cli_error)
+}
+
+fn cluster_build_outputs_for_target(
+    source_repo: &Path,
+    target: &BuildTarget,
+    selection: &ClusterBuildOutputSelection,
+) -> Result<Vec<BuildOutputRequest>, CliError> {
+    let (module_selection, include_binary) = match selection {
+        ClusterBuildOutputSelection::FullRollout => (NativeModuleSelection::Default, true),
+        ClusterBuildOutputSelection::NativeDylibModule(_) => (NativeModuleSelection::All, false),
+    };
+    // A standalone Sinomo source checkout may not have the optional sibling
+    // GUI workspace. Plan against the same temporary workspace view used by
+    // the remote Cargo executor so output discovery cannot diverge by host.
+    let _source_guards = sinomo_runtime::rollout::prepare_rollout_build_source(source_repo)
+        .map_err(CliError::from)?;
+    let mut modules =
+        discover_native_dylib_outputs(Path::new("cargo"), source_repo, target, module_selection)
+            .map_err(build_service_cli_error)?;
+    if let ClusterBuildOutputSelection::NativeDylibModule(selector) = selection {
+        modules.retain(|output| cluster_build_output_matches_selector(output, selector));
+        match modules.len() {
+            1 => {}
+            0 => {
+                return Err(CliError::Parse {
+                    detail: format!(
+                        "no native-dylib module matches `{selector}` for target {}",
+                        target.path_key()
+                    ),
+                });
+            }
+            _ => {
+                return Err(CliError::Parse {
+                    detail: format!(
+                        "native-dylib module selector `{selector}` matched multiple modules for target {}: {}",
+                        target.path_key(),
+                        modules
+                            .iter()
+                            .map(|output| output.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                });
+            }
+        }
+    }
+    if include_binary {
+        modules.push(BuildOutputRequest::binary("sinomo", "sinomo"));
+    }
+    modules.sort();
+    modules.dedup();
+    Ok(modules)
+}
+
+fn cluster_build_output_matches_selector(output: &BuildOutputRequest, selector: &str) -> bool {
+    let selector_module_id = sinomo_runtime::module::ModuleId::new(selector.to_string())
+        .or_else(|_| sinomo_runtime::module::ModuleId::from_legacy_named(selector))
+        .ok();
+    output.name == selector
+        || output.package == selector
+        || output.native_dylib.as_ref().is_some_and(|metadata| {
+            Some(&metadata.module_id) == selector_module_id.as_ref()
+                || metadata.cache_key == selector
+                || metadata.source == selector
+        })
+}
+
+fn prepare_cluster_build_source_input(
+    options: &RolloutOptions,
+) -> Result<ClusterBuildSourceInput, CliError> {
+    let repo = rollout_source_repo_from_options(options)?;
+    let rollout_paths = rollout_paths_from_defaults()?;
+    ensure_rollout_layout(&rollout_paths)?;
+    let (source_bundle, source_head) = rollout_source_bundle(options)?;
+    let source_hash = build_content_hash(&source_bundle);
+    let source_key = source_hash
+        .strip_prefix("blake3:")
+        .unwrap_or(source_hash.as_str());
+    let source_dir = rollout_paths.root.join("staged").join("build-sources");
+    fs::create_dir_all(&source_dir).map_err(|source| CliError::Io {
+        path: source_dir.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let source_bundle_path = source_dir.join(format!("{source_key}.bundle"));
+    let existing_matches = fs::read(&source_bundle_path)
+        .map(|existing| {
+            existing.len() == source_bundle.len() && build_content_hash(&existing) == source_hash
+        })
+        .unwrap_or(false);
+    if !existing_matches {
+        fs::write(&source_bundle_path, &source_bundle).map_err(|source| CliError::Io {
+            path: source_bundle_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let lockfile_path = repo.join("Cargo.lock");
+    let lockfile = fs::read(&lockfile_path).map_err(|source| CliError::Io {
+        path: lockfile_path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(ClusterBuildSourceInput {
+        source: BuildSource {
+            label: repo.display().to_string(),
+            revision: Some(source_head),
+            bundle_hash: source_hash,
+            bundle_bytes: source_bundle.len() as u64,
+        },
+        source_repo: repo,
+        source_bundle: source_bundle_path,
+        lockfile_hash: build_content_hash(&lockfile),
+    })
+}
+
+fn rank_cluster_builder_plans(
+    requested_target: &BuildTarget,
+    artifact_kinds: &[BuildArtifactKind],
+    mut plans: Vec<ClusterBuilderPlan>,
+) -> Vec<ClusterBuilderPlan> {
+    let ranked = rank_build_candidates(
+        requested_target,
+        artifact_kinds,
+        plans.iter().map(|plan| BuildCandidate {
+            capabilities: plan.capabilities.capabilities.clone(),
+            cache_hit: plan.cache_hit,
+            transfer_cost: plan.transfer_cost,
+        }),
+    );
+    let mut ordered = Vec::with_capacity(ranked.len());
+    for ranked_candidate in ranked {
+        let node_id = &ranked_candidate.candidate.capabilities.node_id;
+        if let Some(index) = plans.iter().position(|plan| {
+            plan.capabilities.capabilities.node_id == *node_id
+                && plan.cache_hit == ranked_candidate.candidate.cache_hit
+        }) {
+            ordered.push(plans.remove(index));
+        }
+    }
+    ordered
+}
+
+fn discover_cluster_builder_plans(
+    source: &ClusterBuildSourceInput,
+    group: &ClusterBuildTargetGroup,
+    contacts: &[RolloutTarget],
+    source_repo: &Path,
+    selection: &ClusterBuildOutputSelection,
+) -> Result<Vec<ClusterBuilderPlan>, CliError> {
+    let artifact_kinds = match selection {
+        ClusterBuildOutputSelection::FullRollout => vec![
+            BuildArtifactKind::Binary,
+            BuildArtifactKind::NativeDylibModule,
+        ],
+        ClusterBuildOutputSelection::NativeDylibModule(_) => {
+            vec![BuildArtifactKind::NativeDylibModule]
+        }
+    };
+    let group_node_ids = group
+        .rollout_targets
+        .iter()
+        .filter_map(|target| target.rollout_node_id().cloned())
+        .collect::<BTreeSet<_>>();
+    let mut plans = Vec::new();
+    let mut unavailable = Vec::new();
+    for contact in contacts {
+        let initial_request = BuildCapabilitiesRequest {
+            target: Some(group.target.clone()),
+            build_key: None,
+            artifact_kinds: artifact_kinds.clone(),
+        };
+        let initial = match send_daemon_build_capabilities_for_target(contact, &initial_request) {
+            Ok(response) => response,
+            Err(error) => {
+                unavailable.push(format!("{}: {error}", contact.label()));
+                continue;
+            }
+        };
+        let Some(capability) =
+            supporting_build_capability(&initial, &group.target, &artifact_kinds)
+        else {
+            continue;
+        };
+        let outputs =
+            match cluster_build_outputs_for_target(source_repo, &capability.target, selection) {
+                Ok(outputs) => outputs,
+                Err(error) => {
+                    unavailable.push(format!("{}: {error}", contact.label()));
+                    continue;
+                }
+            };
+        let exact_kinds = outputs
+            .iter()
+            .map(|output| output.kind)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let plan = build_plan_for_capability(source, &capability, &[], &outputs)?;
+        let exact_request = BuildCapabilitiesRequest {
+            target: Some(capability.target.clone()),
+            build_key: Some(plan.key.clone()),
+            artifact_kinds: exact_kinds,
+        };
+        let exact = match send_daemon_build_capabilities_for_target(contact, &exact_request) {
+            Ok(response) => response,
+            Err(error) => {
+                unavailable.push(format!("{}: {error}", contact.label()));
+                continue;
+            }
+        };
+        if exact.supports_requested_target == Some(false) {
+            continue;
+        }
+        let cache_hit = exact.cache_hit.unwrap_or(false);
+        let transfer_cost = if group_node_ids.contains(&exact.capabilities.node_id)
+            || group
+                .rollout_targets
+                .iter()
+                .any(|target| target.label() == contact.label())
+        {
+            0
+        } else {
+            1
+        };
+        plans.push(ClusterBuilderPlan {
+            contact: contact.clone(),
+            capabilities: exact,
+            plan,
+            cache_hit,
+            transfer_cost,
+        });
+    }
+    let plans = rank_cluster_builder_plans(&group.target, &artifact_kinds, plans);
+    if plans.is_empty() {
+        let detail = if unavailable.is_empty() {
+            format!(
+                "no build server advertises support for {} / {} and artifact kinds {:?}",
+                group.target.os, group.target.arch, artifact_kinds
+            )
+        } else {
+            format!(
+                "no compatible build server was reachable for {} / {} ({})",
+                group.target.os,
+                group.target.arch,
+                unavailable.join("; ")
+            )
+        };
+        return Err(CliError::ExternalCommand {
+            command: "cluster build discovery".to_string(),
+            detail,
+        });
+    }
+    Ok(plans)
+}
+
+fn submit_cluster_build_and_wait(
+    builder: &ClusterBuilderPlan,
+    source_bundle: &Path,
+) -> Result<BuildArtifactSetManifest, CliError> {
+    println!(
+        "build server: {} ({}, {})",
+        builder.contact.label(),
+        builder.capabilities.capabilities.node_id,
+        if builder.cache_hit {
+            "exact cache hit"
+        } else {
+            "cache miss"
+        }
+    );
+    println!(
+        "  capacity: {} CPU threads, {} available slot(s), {} queued",
+        builder.capabilities.capabilities.resources.cpu_threads,
+        builder
+            .capabilities
+            .capabilities
+            .resources
+            .available_slots(),
+        builder.capabilities.capabilities.resources.queue_depth
+    );
+    let request = BuildSubmitRequest {
+        plan: builder.plan.clone(),
+    };
+    let first_bundle = (!builder.cache_hit).then_some(source_bundle);
+    let submit = match send_daemon_build_submit_for_target(&builder.contact, &request, first_bundle)
+    {
+        Ok(response) => response,
+        Err(_) if builder.cache_hit => {
+            send_daemon_build_submit_for_target(&builder.contact, &request, Some(source_bundle))?
+        }
+        Err(error) => return Err(error),
+    };
+    println!("  job: {} ({:?})", submit.job_id, submit.state);
+    let status_request = BuildStatusRequest {
+        job_id: submit.job_id,
+    };
+    let mut last_state = None;
+    loop {
+        let response = send_daemon_build_status_for_target(&builder.contact, &status_request)?;
+        let status = response.status;
+        if status.key != builder.plan.key {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "build server {} returned key {} for requested job {}",
+                    builder.contact.label(),
+                    status.key,
+                    builder.plan.key
+                ),
+            });
+        }
+        if last_state != Some(status.state) {
+            let queue = status
+                .queue_position
+                .map(|position| format!(", queue position {position}"))
+                .unwrap_or_default();
+            println!("  build: {:?}{queue} - {}", status.state, status.detail);
+            last_state = Some(status.state);
+        }
+        match status.state {
+            BuildJobState::Succeeded => {
+                let artifact_set = status.artifact_set.ok_or_else(|| CliError::Parse {
+                    detail: format!(
+                        "successful build job {} returned no artifact manifest",
+                        status.job_id
+                    ),
+                })?;
+                artifact_set.validate().map_err(build_service_cli_error)?;
+                if artifact_set.provenance.build_key != builder.plan.key {
+                    return Err(CliError::Parse {
+                        detail: format!(
+                            "build artifact key {} does not match requested key {}",
+                            artifact_set.provenance.build_key, builder.plan.key
+                        ),
+                    });
+                }
+                return Ok(artifact_set);
+            }
+            BuildJobState::Failed | BuildJobState::Cancelled => {
+                return Err(CliError::ExternalCommand {
+                    command: format!("cluster build job {}", status.job_id),
+                    detail: status.detail,
+                });
+            }
+            BuildJobState::Queued | BuildJobState::Running => {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+}
+
+fn download_cluster_build_artifacts(
+    builder: &ClusterBuilderPlan,
+    manifest: &BuildArtifactSetManifest,
+) -> Result<DownloadedClusterBuildArtifacts, CliError> {
+    let rollout_paths = rollout_paths_from_defaults()?;
+    let destination_root = rollout_paths
+        .root
+        .join("staged")
+        .join("build-artifacts")
+        .join(builder.plan.key.path_key());
+    fs::create_dir_all(&destination_root).map_err(|source| CliError::Io {
+        path: destination_root.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let mut downloaded = DownloadedClusterBuildArtifacts::default();
+    for artifact in &manifest.artifacts {
+        let file_name = Path::new(&artifact.relative_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| CliError::Parse {
+                detail: format!(
+                    "build artifact {} has no portable file name",
+                    artifact.artifact_id
+                ),
+            })?;
+        let destination = destination_root.join(format!("{}-{file_name}", artifact.artifact_id));
+        let request = BuildArtifactRequest {
+            build_key: builder.plan.key.clone(),
+            artifact_id: artifact.artifact_id.clone(),
+        };
+        let response =
+            send_daemon_build_artifact_for_target(&builder.contact, &request, &destination)?;
+        if response.artifact != *artifact {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "build server {} returned a different manifest for artifact {}",
+                    builder.contact.label(),
+                    artifact.artifact_id
+                ),
+            });
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&destination, fs::Permissions::from_mode(artifact.mode)).map_err(
+                |source| CliError::Io {
+                    path: destination.display().to_string(),
+                    detail: source.to_string(),
+                },
+            )?;
+        }
+        match artifact.kind {
+            BuildArtifactKind::Binary => {
+                if downloaded.binary.replace(destination).is_some() {
+                    return Err(CliError::Parse {
+                        detail: "build returned more than one binary artifact".to_string(),
+                    });
+                }
+            }
+            BuildArtifactKind::NativeDylibModule => {
+                let metadata = artifact
+                    .native_dylib
+                    .as_ref()
+                    .ok_or_else(|| CliError::Parse {
+                        detail: format!(
+                            "native module artifact {} has no loader metadata",
+                            artifact.artifact_id
+                        ),
+                    })?;
+                downloaded
+                    .native_dylib_modules
+                    .push(LocalRolloutNativeDylibModuleArtifact {
+                        module_id: metadata.module_id.to_string(),
+                        interface_version: metadata.interface_version.clone(),
+                        cache_key: metadata.cache_key.clone(),
+                        library_name: metadata.library_name.clone(),
+                        built_library: destination,
+                        source: metadata.source.clone(),
+                    });
+            }
+        }
+    }
+    downloaded
+        .native_dylib_modules
+        .sort_by(|left, right| left.module_id.cmp(&right.module_id));
+    Ok(downloaded)
+}
+
+fn validate_cluster_build_artifact_set(
+    builder: &ClusterBuilderPlan,
+    manifest: &BuildArtifactSetManifest,
+    downloaded: &DownloadedClusterBuildArtifacts,
+) -> Result<(), CliError> {
+    if manifest.provenance.input.target != builder.plan.input.target {
+        return Err(CliError::Parse {
+            detail: format!(
+                "build artifact target {} differs from planned target {}",
+                manifest.provenance.input.target.path_key(),
+                builder.plan.input.target.path_key()
+            ),
+        });
+    }
+    let mut expected = builder
+        .plan
+        .input
+        .outputs
+        .iter()
+        .map(|output| {
+            (
+                output.kind,
+                output.name.clone(),
+                output.native_dylib.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut actual = manifest
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            (
+                artifact.kind,
+                artifact.name.clone(),
+                artifact.native_dylib.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    expected.sort();
+    actual.sort();
+    if actual != expected {
+        return Err(CliError::Parse {
+            detail: format!(
+                "build artifact set does not match the requested outputs: expected {expected:?}, got {actual:?}"
+            ),
+        });
+    }
+    let expected_binary_count = builder
+        .plan
+        .input
+        .outputs
+        .iter()
+        .filter(|output| output.kind == BuildArtifactKind::Binary)
+        .count();
+    if usize::from(downloaded.binary.is_some()) != expected_binary_count {
+        return Err(CliError::Parse {
+            detail: format!(
+                "downloaded build contained {} binary artifact(s), expected {expected_binary_count}",
+                usize::from(downloaded.binary.is_some())
+            ),
+        });
+    }
+    let expected_module_count = builder
+        .plan
+        .input
+        .outputs
+        .iter()
+        .filter(|output| output.kind == BuildArtifactKind::NativeDylibModule)
+        .count();
+    if downloaded.native_dylib_modules.len() != expected_module_count {
+        return Err(CliError::Parse {
+            detail: format!(
+                "downloaded build contained {} native module artifact(s), expected {expected_module_count}",
+                downloaded.native_dylib_modules.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn cluster_builder_error_allows_retry(error: &CliError) -> bool {
+    matches!(error, CliError::Network { .. } | CliError::Io { .. })
+}
+
+fn resolve_cluster_build_group(
+    source: &ClusterBuildSourceInput,
+    group: ClusterBuildTargetGroup,
+    contacts: &[RolloutTarget],
+    selection: &ClusterBuildOutputSelection,
+) -> Result<ResolvedClusterBuildGroup, CliError> {
+    let plans =
+        discover_cluster_builder_plans(source, &group, contacts, &source.source_repo, selection)?;
+    let mut retry_failures = Vec::new();
+    for builder in plans {
+        let result =
+            submit_cluster_build_and_wait(&builder, &source.source_bundle).and_then(|manifest| {
+                let artifacts = download_cluster_build_artifacts(&builder, &manifest)?;
+                validate_cluster_build_artifact_set(&builder, &manifest, &artifacts)?;
+                Ok(ResolvedClusterBuildGroup {
+                    group: group.clone(),
+                    builder: builder.clone(),
+                    artifacts,
+                })
+            });
+        match result {
+            Ok(resolved) => return Ok(resolved),
+            Err(error) if cluster_builder_error_allows_retry(&error) => {
+                eprintln!(
+                    "warning: build server {} became unavailable: {error}; trying the next compatible server",
+                    builder.contact.label()
+                );
+                retry_failures.push(format!("{}: {error}", builder.contact.label()));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(CliError::ExternalCommand {
+        command: "cluster build resolution".to_string(),
+        detail: format!(
+            "every compatible build server became unavailable ({})",
+            retry_failures.join("; ")
+        ),
+    })
+}
+
+fn record_cluster_build_group_failure(
+    outcomes: &mut ClusterRolloutOutcomeSummary,
+    group: &ClusterBuildTargetGroup,
+    error: &CliError,
+) {
+    for target in &group.rollout_targets {
+        println!("{}: build resolution failed: {error}", target.label());
+        outcomes.record_failure(target.label(), "build-failed", error.to_string());
+    }
+}
+
+fn block_cluster_build_groups_after_discovery_failure(
+    outcomes: &mut ClusterRolloutOutcomeSummary,
+    groups: &[ClusterBuildTargetGroup],
+    operation: &str,
+) -> bool {
+    if !outcomes.has_failures() {
+        return false;
+    }
+    for group in groups {
+        for target in &group.rollout_targets {
+            let detail = format!(
+                "another requested target could not report its build platform; no {operation} build was submitted and no target was activated"
+            );
+            println!("{}: blocked: {detail}", target.label());
+            outcomes.record_failure(target.label(), "blocked", detail);
+        }
+    }
+    true
+}
+
+fn build_service_cli_error(error: impl std::fmt::Display) -> CliError {
+    CliError::ExternalCommand {
+        command: "cluster build service".to_string(),
+        detail: error.to_string(),
+    }
+}
+
+fn rollout_cluster_via_build_service(options: RolloutOptions) -> Result<(), CliError> {
+    validate_cluster_native_module_skip(&options)?;
+    let targets = rollout_cluster_targets(&options)?;
+    if targets.is_empty() {
+        return Err(CliError::Parse {
+            detail: "no rollout targets found; pass --target <host:port> or start a clustered local daemon"
+                .to_string(),
+        });
+    }
+    let mut outcomes = ClusterRolloutOutcomeSummary::default();
+    let groups = collect_cluster_build_target_groups(targets, &mut outcomes);
+    if groups.is_empty() {
+        return outcomes.finish();
+    }
+    if block_cluster_build_groups_after_discovery_failure(&mut outcomes, &groups, "rollout") {
+        return outcomes.finish();
+    }
+    let source = prepare_cluster_build_source_input(&options)?;
+    let contacts = cluster_build_contacts(&options, &groups);
+    let selection = ClusterBuildOutputSelection::FullRollout;
+    let mut resolved = Vec::new();
+    let mut resolution_failed = false;
+    for group in groups {
+        println!(
+            "resolving build for {} / {} ({} rollout target(s))",
+            group.target.os,
+            group.target.arch,
+            group.rollout_targets.len()
+        );
+        match resolve_cluster_build_group(&source, group.clone(), &contacts, &selection) {
+            Ok(group) => {
+                println!("  resolved: {}", group.builder.plan.key);
+                resolved.push(group);
+            }
+            Err(error) => {
+                resolution_failed = true;
+                record_cluster_build_group_failure(&mut outcomes, &group, &error);
+            }
+        }
+    }
+    if resolution_failed {
+        for group in &resolved {
+            for target in &group.group.rollout_targets {
+                let detail = "another target platform failed build resolution; no rollout target was activated"
+                    .to_string();
+                println!("{}: blocked: {detail}", target.label());
+                outcomes.record_failure(target.label(), "blocked", detail);
+            }
+        }
+        return outcomes.finish();
+    }
+
+    let requested_at = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string());
+    let prepared = resolved
+        .into_iter()
+        .map(|group| {
+            let binary = group
+                .artifacts
+                .binary
+                .as_deref()
+                .ok_or_else(|| CliError::Parse {
+                    detail: format!(
+                        "resolved build {} contained no Sinomo binary",
+                        group.builder.plan.key
+                    ),
+                })?;
+            let prepared = prepare_cluster_binary_rollout_for_target(
+                source.source.label.clone(),
+                binary,
+                &group.artifacts.native_dylib_modules,
+                false,
+                group.builder.plan.input.target.os.clone(),
+                group.builder.plan.input.target.arch.clone(),
+                options.host.clone(),
+                options.port,
+                options.shadow_port,
+                requested_at.clone(),
+            )?;
+            Ok((group.group, prepared))
+        })
+        .collect::<Result<Vec<_>, CliError>>()?;
+    for (group, prepared) in prepared {
+        for target in &group.rollout_targets {
+            match send_prepared_daemon_rollout_binary(target, &prepared) {
+                Ok(response) => {
+                    println!("{}: {}", target.label(), response.status);
+                    if response.status != "accepted" {
+                        outcomes.record_failure(
+                            target.label(),
+                            &response.status,
+                            response.detail.clone(),
+                        );
+                    }
+                    if !response.detail.is_empty() {
+                        println!("  {}", response.detail);
+                    }
+                }
+                Err(error) => {
+                    println!("{}: failed: {error}", target.label());
+                    outcomes.record_failure(target.label(), "failed", error.to_string());
+                }
+            }
+        }
+    }
+    outcomes.finish()
+}
+
+#[cfg(test)]
+mod cluster_build_service_tests {
+    use super::*;
+    use sinomo_runtime::build::{
+        BUILD_PROTOCOL, BuildResourceSnapshot, BuildServiceCapabilities,
+        NativeDylibArtifactMetadata,
+    };
+
+    fn exact_linux_target() -> BuildTarget {
+        BuildTarget::new("linux", "aarch64")
+            .expect("target")
+            .with_family("unix")
+            .expect("family")
+            .with_rust_target("aarch64-unknown-linux-gnu")
+            .expect("triple")
+    }
+
+    fn builder_plan(
+        name: &str,
+        cpu_threads: u16,
+        active_jobs: u16,
+        queue_depth: u32,
+    ) -> ClusterBuilderPlan {
+        let target = exact_linux_target();
+        let toolchain_fingerprint = "test-toolchain".to_string();
+        let source_hash = build_content_hash(b"source");
+        let plan = BuildPlan::new(
+            BuildSource {
+                label: "test-source".to_string(),
+                revision: None,
+                bundle_hash: source_hash.clone(),
+                bundle_bytes: 6,
+            },
+            BuildKeyInput {
+                source_hash,
+                source_revision: None,
+                lockfile_hash: build_content_hash(b"lockfile"),
+                target: target.clone(),
+                profile: "dev".to_string(),
+                features: Vec::new(),
+                toolchain_fingerprint: toolchain_fingerprint.clone(),
+                outputs: vec![BuildOutputRequest::binary("sinomo", "sinomo")],
+            },
+        )
+        .expect("plan");
+        let capabilities = BuildServiceCapabilities {
+            node_id: NodeId::from_legacy_named(name).expect("node id"),
+            protocol: BUILD_PROTOCOL.to_string(),
+            targets: vec![BuildTargetCapability {
+                target,
+                artifact_kinds: vec![BuildArtifactKind::Binary],
+                toolchain_fingerprint,
+            }],
+            resources: BuildResourceSnapshot {
+                cpu_threads,
+                memory_total_mb: Some(u64::from(cpu_threads) * 2_048),
+                memory_available_mb: Some(u64::from(cpu_threads) * 1_024),
+                cpu_load_milli: Some(0),
+                active_jobs,
+                max_jobs: 1,
+                queue_depth,
+            },
+        };
+        ClusterBuilderPlan {
+            contact: RolloutTarget::address(format!("{name}:21353")),
+            capabilities: BuildCapabilitiesResponse {
+                capabilities,
+                supports_requested_target: Some(true),
+                cache_hit: Some(false),
+            },
+            plan,
+            cache_hit: false,
+            transfer_cost: 1,
+        }
+    }
+
+    #[test]
+    fn target_grouping_reuses_one_build_for_matching_os_and_arch() {
+        let linux = BuildTarget::new("linux", "aarch64").expect("linux target");
+        let windows = BuildTarget::new("windows", "x86_64").expect("windows target");
+        let groups = group_cluster_build_targets([
+            (
+                linux.clone(),
+                RolloutTarget::address("pi-a:21353".to_string()),
+            ),
+            (
+                windows.clone(),
+                RolloutTarget::address("win:21353".to_string()),
+            ),
+            (
+                linux.clone(),
+                RolloutTarget::address("pi-b:21353".to_string()),
+            ),
+        ]);
+
+        assert_eq!(groups.len(), 2);
+        let linux_group = groups
+            .iter()
+            .find(|group| group.target == linux)
+            .expect("linux group");
+        assert_eq!(
+            linux_group
+                .rollout_targets
+                .iter()
+                .map(RolloutTarget::label)
+                .collect::<Vec<_>>(),
+            ["pi-a:21353", "pi-b:21353"]
+        );
+        assert!(groups.iter().any(|group| group.target == windows));
+    }
+
+    #[test]
+    fn cli_ranking_keeps_busy_powerful_server_ahead_of_idle_pi() {
+        let requested = BuildTarget::new("linux", "aarch64").expect("requested target");
+        let ranked = rank_cluster_builder_plans(
+            &requested,
+            &[BuildArtifactKind::Binary],
+            vec![
+                builder_plan("idle-pi", 4, 0, 0),
+                builder_plan("busy-server", 64, 1, 1),
+            ],
+        );
+
+        assert_eq!(ranked[0].contact.label(), "busy-server:21353");
+    }
+
+    #[test]
+    fn legacy_named_module_selector_matches_canonical_module_id() {
+        let module_id = sinomo_runtime::module::ModuleId::from_legacy_named("module.network-iroh")
+            .expect("module id");
+        let output = BuildOutputRequest::native_dylib_module(
+            module_id.to_string(),
+            "sinomo-network-iroh-module",
+            "sinomo_network_iroh_module",
+            NativeDylibArtifactMetadata::new(
+                module_id,
+                "v1",
+                "module/network/iroh",
+                "libsinomo_network_iroh_module.so",
+                "rollout:modules/network/iroh",
+            ),
+        );
+
+        assert!(cluster_build_output_matches_selector(
+            &output,
+            "module.network-iroh"
+        ));
+        assert!(cluster_build_output_matches_selector(
+            &output,
+            "sinomo-network-iroh-module"
+        ));
+    }
+
+    #[test]
+    fn target_discovery_failure_blocks_every_group_before_build_submission() {
+        let groups = group_cluster_build_targets([(
+            BuildTarget::new("linux", "x86_64").expect("target"),
+            RolloutTarget::address("healthy:21353".to_string()),
+        )]);
+        let mut outcomes = ClusterRolloutOutcomeSummary::default();
+        outcomes.begin_target();
+        outcomes.record_failure(
+            "unreachable:21353",
+            "failed",
+            "status unavailable".to_string(),
+        );
+        outcomes.begin_target();
+
+        assert!(block_cluster_build_groups_after_discovery_failure(
+            &mut outcomes,
+            &groups,
+            "rollout"
+        ));
+        assert_eq!(outcomes.failures.len(), 2);
+        assert!(
+            outcomes.failures[1]
+                .contains("no rollout build was submitted and no target was activated")
+        );
+    }
+}
+
+fn rollout_cluster_legacy(options: RolloutOptions) -> Result<(), CliError> {
     validate_cluster_native_module_skip(&options)?;
     let targets = rollout_cluster_targets(&options)?;
     if targets.is_empty() {
@@ -1525,6 +2727,10 @@ struct ClusterRolloutOutcomeSummary {
 impl ClusterRolloutOutcomeSummary {
     fn begin_target(&mut self) {
         self.attempted += 1;
+    }
+
+    fn has_failures(&self) -> bool {
+        !self.failures.is_empty()
     }
 
     fn record_failure(&mut self, target: &str, outcome: &str, detail: String) {
@@ -2405,15 +3611,44 @@ pub(crate) fn prepare_cluster_binary_rollout(
     shadow_port: u16,
     requested_at: String,
 ) -> Result<PreparedClusterBinaryRollout, CliError> {
+    prepare_cluster_binary_rollout_for_target(
+        source,
+        binary,
+        native_dylib_modules,
+        skip_native_modules,
+        std::env::consts::OS.to_string(),
+        std::env::consts::ARCH.to_string(),
+        host,
+        port,
+        shadow_port,
+        requested_at,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_cluster_binary_rollout_for_target(
+    source: String,
+    binary: &Path,
+    native_dylib_modules: &[LocalRolloutNativeDylibModuleArtifact],
+    skip_native_modules: bool,
+    target_os: String,
+    target_arch: String,
+    host: String,
+    port: u16,
+    shadow_port: u16,
+    requested_at: String,
+) -> Result<PreparedClusterBinaryRollout, CliError> {
     let native_dylib_modules = if skip_native_modules {
         &[]
     } else {
         native_dylib_modules
     };
-    let manifest = prepare_cluster_rollout_binary_manifest(
+    let manifest = prepare_cluster_rollout_binary_manifest_for_target(
         source,
         binary,
         native_dylib_modules,
+        target_os,
+        target_arch,
         host,
         port,
         shadow_port,

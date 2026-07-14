@@ -2,6 +2,12 @@ use crate::{
     DaemonError, DaemonPaths, DaemonStatus, daemon_rpc_body_sha256,
     sign_daemon_rpc_request_digest_for_local_node, sign_daemon_rpc_request_for_local_node,
 };
+use sinomo_build::{
+    BUILD_ARTIFACT_ROUTE, BUILD_CAPABILITIES_ROUTE, BUILD_RPC_CATEGORY, BUILD_STATUS_ROUTE,
+    BUILD_SUBMIT_ROUTE, BuildArtifactRequest, BuildArtifactResponse, BuildCapabilitiesRequest,
+    BuildCapabilitiesResponse, BuildStatusRequest, BuildStatusResponse, BuildSubmitRequest,
+    BuildSubmitResponse,
+};
 use sinomo_config::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_RPC_CATEGORY, CONFIG_SET_ROUTE,
     ConfigCatalogRequest, ConfigCatalogResponse, ConfigClient, ConfigDefinition, ConfigError,
@@ -30,6 +36,7 @@ use sinomo_rollout::{
 };
 use std::path::Path;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 fn object_rpc_request_from_kv_payload(
     payload: sinomo_core::kv::ClusterKvRpcPayload,
@@ -1844,6 +1851,516 @@ pub(crate) async fn send_cluster_member_publish_async(
         |response| response.decode_body(),
     )
     .await
+}
+
+pub fn send_daemon_build_capabilities(
+    address: &str,
+    request: &BuildCapabilitiesRequest,
+) -> Result<BuildCapabilitiesResponse, DaemonError> {
+    send_daemon_rpc_body(
+        address,
+        BUILD_CAPABILITIES_ROUTE,
+        BUILD_RPC_CATEGORY,
+        request,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    )
+}
+
+pub fn send_daemon_build_capabilities_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    request: &BuildCapabilitiesRequest,
+) -> Result<BuildCapabilitiesResponse, DaemonError> {
+    send_daemon_rpc_body_to_endpoint(
+        endpoint,
+        BUILD_CAPABILITIES_ROUTE,
+        BUILD_RPC_CATEGORY,
+        request,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    )
+}
+
+pub fn send_daemon_build_capabilities_to_target(
+    target_node_id: &NodeId,
+    request: &BuildCapabilitiesRequest,
+) -> Result<BuildCapabilitiesResponse, DaemonError> {
+    send_daemon_build_head_to_target(BUILD_CAPABILITIES_ROUTE, request, target_node_id)
+}
+
+pub fn send_daemon_build_status(
+    address: &str,
+    request: &BuildStatusRequest,
+) -> Result<BuildStatusResponse, DaemonError> {
+    send_daemon_rpc_body(
+        address,
+        BUILD_STATUS_ROUTE,
+        BUILD_RPC_CATEGORY,
+        request,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    )
+}
+
+pub fn send_daemon_build_status_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    request: &BuildStatusRequest,
+) -> Result<BuildStatusResponse, DaemonError> {
+    send_daemon_rpc_body_to_endpoint(
+        endpoint,
+        BUILD_STATUS_ROUTE,
+        BUILD_RPC_CATEGORY,
+        request,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    )
+}
+
+pub fn send_daemon_build_status_to_target(
+    target_node_id: &NodeId,
+    request: &BuildStatusRequest,
+) -> Result<BuildStatusResponse, DaemonError> {
+    send_daemon_build_head_to_target(BUILD_STATUS_ROUTE, request, target_node_id)
+}
+
+fn send_daemon_build_head_to_target<Req, Resp>(
+    route: &str,
+    request: &Req,
+    target_node_id: &NodeId,
+) -> Result<Resp, DaemonError>
+where
+    Req: serde::Serialize + ?Sized,
+    Resp: serde::de::DeserializeOwned,
+{
+    let request = ObjectRpcRequest::encode_body(route, BUILD_RPC_CATEGORY, request)?;
+    let response = send_object_rpc_to_target(
+        target_node_id,
+        &request,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        true,
+    )?;
+    response.decode_body().map_err(Into::into)
+}
+
+pub fn send_daemon_build_submit(
+    address: &str,
+    request: &BuildSubmitRequest,
+    source_bundle: Option<&Path>,
+) -> Result<BuildSubmitResponse, DaemonError> {
+    let data_dir = local_session_data_dir()?;
+    let address = address.to_string();
+    let request = request.clone();
+    let source_bundle = source_bundle.map(Path::to_path_buf);
+    block_on_rollout_session(async move {
+        let runtime = tokio::runtime::Handle::current();
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        let mut host =
+            DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+        let call = build_submit_session_call(&request, source_bundle.as_deref())?;
+        let result = if sinomo_core::network::is_loopback_connect_address(&address) {
+            let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
+            client
+                .call_loopback_session(
+                    &data_dir,
+                    &address,
+                    call,
+                    sinomo_core::network::ClusterObjectRpcOptions::default(),
+                )
+                .await?
+        } else {
+            let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+            let endpoint = local_session_endpoint_for_address(&state, &address)?;
+            let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(
+                &mut host,
+                &runtime,
+                &cluster_paths,
+            );
+            client
+                .call_endpoint_session(
+                    &state,
+                    &endpoint,
+                    call,
+                    sinomo_core::network::ClusterObjectRpcOptions::default(),
+                )
+                .await?
+        };
+        decode_build_submit_session_result(result)
+    })
+}
+
+pub fn send_daemon_build_submit_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    request: &BuildSubmitRequest,
+    source_bundle: Option<&Path>,
+) -> Result<BuildSubmitResponse, DaemonError> {
+    let data_dir = local_session_data_dir()?;
+    let endpoint = endpoint.clone();
+    let request = request.clone();
+    let source_bundle = source_bundle.map(Path::to_path_buf);
+    block_on_rollout_session(async move {
+        let runtime = tokio::runtime::Handle::current();
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        let mut host =
+            DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+        let call = build_submit_session_call(&request, source_bundle.as_deref())?;
+        let result = if sinomo_core::network::is_loopback_connect_address(&endpoint.address) {
+            let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
+            client
+                .call_loopback_session(
+                    &data_dir,
+                    &endpoint.address,
+                    call,
+                    sinomo_core::network::ClusterObjectRpcOptions::default(),
+                )
+                .await?
+        } else {
+            let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+            let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(
+                &mut host,
+                &runtime,
+                &cluster_paths,
+            );
+            client
+                .call_endpoint_session(
+                    &state,
+                    &endpoint,
+                    call,
+                    sinomo_core::network::ClusterObjectRpcOptions::default(),
+                )
+                .await?
+        };
+        decode_build_submit_session_result(result)
+    })
+}
+
+pub fn send_daemon_build_submit_to_target(
+    target_node_id: &NodeId,
+    request: &BuildSubmitRequest,
+    source_bundle: Option<&Path>,
+) -> Result<BuildSubmitResponse, DaemonError> {
+    let (cluster_paths, state) = local_session_cluster_state()?;
+    let target_node_id = target_node_id.clone();
+    let request = request.clone();
+    let source_bundle = source_bundle.map(Path::to_path_buf);
+    block_on_rollout_session(async move {
+        let runtime = tokio::runtime::Handle::current();
+        let mut host =
+            DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+        let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(
+            &mut host,
+            &runtime,
+            &cluster_paths,
+        );
+        let result = client
+            .call_target_session(
+                &state,
+                &target_node_id,
+                build_submit_session_call(&request, source_bundle.as_deref())?,
+                sinomo_core::network::ClusterObjectRpcOptions::default(),
+            )
+            .await?;
+        decode_build_submit_session_result(result)
+    })
+}
+
+fn build_submit_session_call(
+    request: &BuildSubmitRequest,
+    source_bundle: Option<&Path>,
+) -> Result<ObjectRpcSessionCall, DaemonError> {
+    let body = match source_bundle {
+        Some(path) => {
+            let body = sinomo_core::network::ObjectRpcBodySource::file(path.to_path_buf())?;
+            if body.total_bytes() != Some(request.plan.source.bundle_bytes) {
+                return Err(DaemonError::Io {
+                    path: path.display().to_string(),
+                    detail: format!(
+                        "build source bundle size changed after planning: expected {}, found {}",
+                        request.plan.source.bundle_bytes,
+                        body.total_bytes().unwrap_or_default()
+                    ),
+                });
+            }
+            body
+        }
+        None => sinomo_core::network::ObjectRpcBodySource::default(),
+    };
+    let head = ObjectRpcRequest::encode_body(BUILD_SUBMIT_ROUTE, BUILD_RPC_CATEGORY, request)?
+        .with_operation_id(format!("build-submit:{}", request.plan.key.path_key()))
+        .with_response_retry_safe();
+    Ok(ObjectRpcSessionCall::new(head, body))
+}
+
+fn decode_build_submit_session_result(
+    result: ObjectRpcSessionResult,
+) -> Result<BuildSubmitResponse, DaemonError> {
+    if !result.body.is_empty() {
+        return Err(DaemonError::Parse {
+            detail: "build submit response unexpectedly contained a body attachment".to_string(),
+        });
+    }
+    result.response.decode_body().map_err(Into::into)
+}
+
+pub fn send_daemon_build_artifact(
+    address: &str,
+    request: &BuildArtifactRequest,
+    destination_path: &Path,
+) -> Result<BuildArtifactResponse, DaemonError> {
+    let data_dir = local_session_data_dir()?;
+    let address = address.to_string();
+    let request = request.clone();
+    let destination_path = destination_path.to_path_buf();
+    block_on_rollout_session(async move {
+        let runtime = tokio::runtime::Handle::current();
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        let mut host =
+            DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+        let call = build_artifact_session_call(&request)?;
+        let result = if sinomo_core::network::is_loopback_connect_address(&address) {
+            let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
+            client
+                .call_loopback_session(
+                    &data_dir,
+                    &address,
+                    call,
+                    sinomo_core::network::ClusterObjectRpcOptions::default(),
+                )
+                .await?
+        } else {
+            let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+            let endpoint = local_session_endpoint_for_address(&state, &address)?;
+            let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(
+                &mut host,
+                &runtime,
+                &cluster_paths,
+            );
+            client
+                .call_endpoint_session(
+                    &state,
+                    &endpoint,
+                    call,
+                    sinomo_core::network::ClusterObjectRpcOptions::default(),
+                )
+                .await?
+        };
+        receive_build_artifact_session_result(result, &request, &destination_path).await
+    })
+}
+
+pub fn send_daemon_build_artifact_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    request: &BuildArtifactRequest,
+    destination_path: &Path,
+) -> Result<BuildArtifactResponse, DaemonError> {
+    let data_dir = local_session_data_dir()?;
+    let endpoint = endpoint.clone();
+    let request = request.clone();
+    let destination_path = destination_path.to_path_buf();
+    block_on_rollout_session(async move {
+        let runtime = tokio::runtime::Handle::current();
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        let mut host =
+            DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+        let call = build_artifact_session_call(&request)?;
+        let result = if sinomo_core::network::is_loopback_connect_address(&endpoint.address) {
+            let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
+            client
+                .call_loopback_session(
+                    &data_dir,
+                    &endpoint.address,
+                    call,
+                    sinomo_core::network::ClusterObjectRpcOptions::default(),
+                )
+                .await?
+        } else {
+            let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+            let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(
+                &mut host,
+                &runtime,
+                &cluster_paths,
+            );
+            client
+                .call_endpoint_session(
+                    &state,
+                    &endpoint,
+                    call,
+                    sinomo_core::network::ClusterObjectRpcOptions::default(),
+                )
+                .await?
+        };
+        receive_build_artifact_session_result(result, &request, &destination_path).await
+    })
+}
+
+pub fn send_daemon_build_artifact_to_target(
+    target_node_id: &NodeId,
+    request: &BuildArtifactRequest,
+    destination_path: &Path,
+) -> Result<BuildArtifactResponse, DaemonError> {
+    let (cluster_paths, state) = local_session_cluster_state()?;
+    let target_node_id = target_node_id.clone();
+    let request = request.clone();
+    let destination_path = destination_path.to_path_buf();
+    block_on_rollout_session(async move {
+        let runtime = tokio::runtime::Handle::current();
+        let mut host =
+            DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+        let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(
+            &mut host,
+            &runtime,
+            &cluster_paths,
+        );
+        let result = client
+            .call_target_session(
+                &state,
+                &target_node_id,
+                build_artifact_session_call(&request)?,
+                sinomo_core::network::ClusterObjectRpcOptions::default(),
+            )
+            .await?;
+        receive_build_artifact_session_result(result, &request, &destination_path).await
+    })
+}
+
+fn build_artifact_session_call(
+    request: &BuildArtifactRequest,
+) -> Result<ObjectRpcSessionCall, DaemonError> {
+    let head = ObjectRpcRequest::encode_body(BUILD_ARTIFACT_ROUTE, BUILD_RPC_CATEGORY, request)?
+        .with_operation_id(format!(
+            "build-artifact:{}:{}",
+            request.build_key.path_key(),
+            request.artifact_id
+        ))
+        .with_response_retry_safe();
+    Ok(ObjectRpcSessionCall::new(
+        head,
+        sinomo_core::network::ObjectRpcBodySource::default(),
+    ))
+}
+
+async fn receive_build_artifact_session_result(
+    mut result: ObjectRpcSessionResult,
+    request: &BuildArtifactRequest,
+    destination_path: &Path,
+) -> Result<BuildArtifactResponse, DaemonError> {
+    let response: BuildArtifactResponse = result.response.decode_body()?;
+    if response.artifact.artifact_id != request.artifact_id {
+        return Err(DaemonError::Parse {
+            detail: format!(
+                "build artifact response id {} does not match requested {}",
+                response.artifact.artifact_id, request.artifact_id
+            ),
+        });
+    }
+    if response.artifact.provenance.build_key != request.build_key {
+        return Err(DaemonError::Parse {
+            detail: format!(
+                "build artifact response key {} does not match requested {}",
+                response.artifact.provenance.build_key, request.build_key
+            ),
+        });
+    }
+    let parent = destination_path.parent().ok_or_else(|| DaemonError::Io {
+        path: destination_path.display().to_string(),
+        detail: "artifact destination has no parent directory".to_string(),
+    })?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|source| DaemonError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    let partial = destination_path.with_extension(format!(
+        "partial-{}-{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    ));
+    let mut output = tokio::fs::File::create(&partial)
+        .await
+        .map_err(|source| DaemonError::Io {
+            path: partial.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    let mut received = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let count = result
+            .body
+            .read(&mut buffer)
+            .await
+            .map_err(|source| DaemonError::Io {
+                path: partial.display().to_string(),
+                detail: format!("receive build artifact body: {source}"),
+            })?;
+        if count == 0 {
+            break;
+        }
+        received = received.saturating_add(count as u64);
+        if received > response.artifact.size_bytes {
+            let _ = tokio::fs::remove_file(&partial).await;
+            return Err(DaemonError::Parse {
+                detail: format!(
+                    "build artifact {} exceeded declared size {}",
+                    response.artifact.artifact_id, response.artifact.size_bytes
+                ),
+            });
+        }
+        if let Err(source) = output.write_all(&buffer[..count]).await {
+            let _ = tokio::fs::remove_file(&partial).await;
+            return Err(DaemonError::Io {
+                path: partial.display().to_string(),
+                detail: source.to_string(),
+            });
+        }
+    }
+    if let Err(source) = output.flush().await {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(DaemonError::Io {
+            path: partial.display().to_string(),
+            detail: source.to_string(),
+        });
+    }
+    if let Err(source) = output.sync_all().await {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(DaemonError::Io {
+            path: partial.display().to_string(),
+            detail: source.to_string(),
+        });
+    }
+    drop(output);
+    if let Err(error) = sinomo_build::verify_artifact_file(&response.artifact, &partial) {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(DaemonError::Parse {
+            detail: error.to_string(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(source) = tokio::fs::set_permissions(
+            &partial,
+            std::fs::Permissions::from_mode(response.artifact.mode),
+        )
+        .await
+        {
+            let _ = tokio::fs::remove_file(&partial).await;
+            return Err(DaemonError::Io {
+                path: partial.display().to_string(),
+                detail: source.to_string(),
+            });
+        }
+    }
+    if destination_path.exists() {
+        tokio::fs::remove_file(destination_path)
+            .await
+            .map_err(|source| DaemonError::Io {
+                path: destination_path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+    }
+    tokio::fs::rename(&partial, destination_path)
+        .await
+        .map_err(|source| DaemonError::Io {
+            path: format!("{} -> {}", partial.display(), destination_path.display()),
+            detail: source.to_string(),
+        })?;
+    Ok(response)
 }
 
 pub fn send_daemon_rollout_binary(

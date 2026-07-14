@@ -153,6 +153,36 @@ pub fn prepare_cluster_rollout_binary_manifest(
     shadow_port: u16,
     requested_at: impl Into<String>,
 ) -> Result<ClusterRolloutBinaryManifest, RolloutError> {
+    prepare_cluster_rollout_binary_manifest_for_target(
+        source,
+        binary,
+        native_dylib_modules,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        host,
+        port,
+        shadow_port,
+        requested_at,
+    )
+}
+
+/// Prepares a rollout manifest for artifacts built for an explicit target.
+///
+/// Cluster builders may run on a different machine than the rollout
+/// orchestrator, so target metadata must come from the build result rather
+/// than the orchestrator process.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_cluster_rollout_binary_manifest_for_target(
+    source: impl Into<String>,
+    binary: &Path,
+    native_dylib_modules: &[LocalRolloutNativeDylibModuleArtifact],
+    target_os: impl Into<String>,
+    target_arch: impl Into<String>,
+    host: impl Into<String>,
+    port: u16,
+    shadow_port: u16,
+    requested_at: impl Into<String>,
+) -> Result<ClusterRolloutBinaryManifest, RolloutError> {
     let binary = rollout_upload_artifact_spec("binary", binary)?;
     let native_dylib_modules = native_dylib_modules
         .iter()
@@ -178,8 +208,8 @@ pub fn prepare_cluster_rollout_binary_manifest(
             time::OffsetDateTime::now_utc().unix_timestamp_nanos()
         ),
         source: source.into(),
-        target_os: std::env::consts::OS.to_string(),
-        target_arch: std::env::consts::ARCH.to_string(),
+        target_os: target_os.into(),
+        target_arch: target_arch.into(),
         host: host.into(),
         port,
         shadow_port,
@@ -372,6 +402,29 @@ mod tests {
         assert!(!manifest.target_os.is_empty());
         assert!(!manifest.target_arch.is_empty());
         assert_eq!(manifest.total_bytes(), Some(12));
+    }
+
+    #[test]
+    fn cluster_build_manifest_preserves_the_builder_target() {
+        let root = temp_root("cluster-builder-target");
+        let binary = root.join("sinomo.exe");
+        std::fs::write(&binary, b"cross-built-binary").expect("binary");
+
+        let manifest = prepare_cluster_rollout_binary_manifest_for_target(
+            "source",
+            &binary,
+            &[],
+            "windows",
+            "aarch64",
+            "127.0.0.1",
+            21353,
+            21354,
+            "now",
+        )
+        .expect("manifest");
+
+        assert_eq!(manifest.target_os, "windows");
+        assert_eq!(manifest.target_arch, "aarch64");
     }
 
     #[test]

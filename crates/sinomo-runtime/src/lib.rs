@@ -29,6 +29,7 @@ pub mod r0 {
 /// but R1 crates must not depend back on R2 service crates.
 pub mod r1 {
     pub use sinomo_api as api;
+    pub use sinomo_build as build;
     pub use sinomo_cli_registry as cli_registry;
     pub use sinomo_config as config;
     pub use sinomo_daemon as daemon;
@@ -99,9 +100,9 @@ pub use r0::{core, object};
 #[cfg(feature = "sandbox")]
 pub use r1::sandbox_wasix_host;
 pub use r1::{
-    api, cli_registry, config, daemon, device, dfs, dfs_cloud_files_api, eval, events, kv, local,
-    module, module_api, modules, network, network_module, node, observe, policy, registry, rollout,
-    sandbox, sandbox_simple, sandbox_wasix_api, service, storage, supervision, test, vfs,
+    api, build, cli_registry, config, daemon, device, dfs, dfs_cloud_files_api, eval, events, kv,
+    local, module, module_api, modules, network, network_module, node, observe, policy, registry,
+    rollout, sandbox, sandbox_simple, sandbox_wasix_api, service, storage, supervision, test, vfs,
 };
 
 #[cfg(test)]
@@ -112,7 +113,9 @@ mod tests {
         module_registry_object_rpc_route_descriptors, native_rust_binding_for_registration,
     };
     use super::storage::{StorageCoverage, StoragePathOwner, sinomo_data_dir_layout};
-    use super::{core, daemon, dfs, module, network, network_module, observe, rollout, service};
+    use super::{
+        build, core, daemon, dfs, module, network, network_module, observe, rollout, service,
+    };
 
     #[test]
     fn runtime_storage_layout_is_composed_from_owner_crates() {
@@ -252,6 +255,24 @@ mod tests {
                 .any(|route| route.route == dfs::DFS_STATUS_ROUTE
                     && route.category == dfs::DFS_RPC_CATEGORY
                     && route.auth == module::ModuleRouteAuth::LocalOrClusterMember)
+        );
+    }
+
+    #[test]
+    fn runtime_internal_module_registry_includes_build() {
+        let registry = internal_module_registry().expect("module registry");
+        let registration = registry
+            .get(&build::build_module_id())
+            .expect("build module registration");
+
+        assert_eq!(registration.manifest.kind, core::ModuleKind::NativeRust);
+        assert_eq!(
+            registration.manifest.owner,
+            build::SINOMO_BUILD_MODULE_OWNER
+        );
+        assert_eq!(
+            registration.surfaces.object_rpc_routes.len(),
+            build::BUILD_OBJECT_RPC_ROUTES.len()
         );
     }
 
@@ -658,7 +679,7 @@ mod tests {
             binding.registration_key,
             dfs::SINOMO_DFS_NATIVE_REGISTRATION_KEY
         );
-        assert_eq!(table.native_rust_bindings.len(), 4);
+        assert_eq!(table.native_rust_bindings.len(), 5);
         assert!(binding.register_services.is_some());
         assert!(binding.register_storage_paths.is_some());
 

@@ -29,6 +29,7 @@ serde.workspace = true
 serde_bytes.workspace = true
 serde_json.workspace = true
 sinomo-api = { path = "../sinomo-api" }
+sinomo-build = { path = "../sinomo-build" }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-dfs = { path = "../sinomo-dfs" }

@@ -1,7 +1,10 @@
 # Rollout Operations
 
-This guide is for operators and developers updating installed Sinomo daemons.
-For the supervision and artifact model, see the
+This guide is for operators and developers updating installed Sinomo daemons
+and modules. Building produces immutable artifacts; rollout distributes,
+activates, observes, and, when necessary, rolls them back. For the service
+boundary, see the [build service architecture](../build-service-architecture.md)
+and the
 [architecture overview](../architecture.md#modules-and-controlled-evolution).
 
 Command syntax can change with the installed binary. Use
@@ -11,31 +14,41 @@ Command syntax can change with the installed binary. Use
 
 | Goal | Workflow |
 |---|---|
-| Update a mixed-platform cluster from source | Remote build |
+| Update a mixed-platform cluster from source | Cluster build and rollout |
 | Update only the current machine from managed source | Local apply |
-| Update compatible development nodes quickly | Binary rollout |
+| Update compatible nodes from an existing artifact | Prebuilt artifact rollout |
 | Refresh installation and boot integration | Install |
 
 Before rollout, commit or otherwise preserve the intended source, run the
 relevant tests, and confirm the current cluster is healthy.
 
-## Remote Build
+## Cluster Build and Rollout
 
-Remote build is the normal cluster workflow. Each target builds from its own
-managed source checkout, so nodes may use different operating systems or CPU
-architectures.
+Cluster build and rollout is the normal source-based workflow. Rollout discovers
+the selected nodes' explicit target requirements, groups compatible targets,
+and asks the cluster build service for one verified artifact per group. A cache
+hit is distributed immediately. Otherwise the service queues one build for
+matching requests and selects a live compatible worker using toolchain support,
+available CPU and memory, queue pressure, and transfer locality.
+
+The selected worker need not be the rollout target. For example, a server with
+the correct cross-toolchain should build a Raspberry Pi artifact when it can
+finish and deliver it substantially sooner. The client verifies the streamed
+artifact against its BLAKE3 digest and build manifest, and every target checks
+the rollout manifest's operating system and architecture before activation.
+Build resolution for a rollout wave completes before that wave starts staging.
 
 Without `--target`, `sinomo rollout cluster` selects the local daemon and the
 authorized remote members discoverable from cluster state. Treat it as a
 cluster-wide operation. Use explicit `--target` values and `--skip-local` when
 the change should reach only selected nodes.
 
-Import the reviewed checkout into the local managed source, then request a
-remote build:
+Import the reviewed checkout into managed source, then request cluster build
+resolution and rollout:
 
 ```sh
 sinomo rollout import-source --repo "$PWD"
-sinomo rollout cluster --remote-build
+sinomo rollout cluster
 sinomo cluster health
 ```
 
@@ -43,20 +56,28 @@ To update one target and skip the local daemon:
 
 ```sh
 sinomo rollout cluster \
-  --remote-build \
   --skip-local \
   --target 192.168.1.154:21353
 ```
 
-If a target uses a non-default source location, `--remote-repo` is interpreted
-on that target:
+The default command uses the cluster build service. `--remote-build` is the
+explicit mixed-version recovery path: it retains the older behavior in which
+each target builds its own managed checkout. That path bypasses scheduling and
+may be very slow on constrained targets. `--remote-repo` and `--force-source`
+belong to this legacy path.
+
+Each build server advertises its installed host target automatically. To let a
+server build for additional installed Rust targets, set a comma-separated list
+before starting its daemon, for example:
 
 ```sh
-sinomo rollout cluster \
-  --remote-build \
-  --target 192.168.1.154:21353 \
-  --remote-repo 'D:\src\sinomo'
+SINOMO_BUILD_TARGETS=aarch64-unknown-linux-gnu,x86_64-unknown-linux-musl \
+  sinomo daemon run
 ```
+
+Every listed target must already be installed and have the required linker or
+cross-toolchain. An invalid configured target makes that server's build
+capability unavailable instead of advertising a target it cannot compile.
 
 ## Local Apply
 
@@ -65,6 +86,10 @@ Build and activate the current machine's managed source:
 ```sh
 sinomo rollout apply
 ```
+
+Local apply remains a bootstrap and development convenience and still builds
+locally. A clustered shared update should use the cluster workflow so other
+compatible nodes can reuse the same build result.
 
 Import an external checkout and apply it in one step:
 
@@ -79,16 +104,18 @@ boot entries, daemon bind settings, and managed source together:
 cargo run -p sinomo -- install
 ```
 
-## Binary Rollout
+## Prebuilt Artifact Rollout
 
-Binary rollout is appropriate only when the target platform matches the build
-platform. Let the CLI build and select the binary:
+Prebuilt rollout is the fastest path when a verified compatible binary or
+module already exists. Compatibility is determined by the artifact manifest
+and the target contract, not by which node performed the build. Let the CLI
+resolve the matching cached artifact or schedule it if missing:
 
 ```sh
 sinomo rollout cluster --target 192.168.1.154:21353
 ```
 
-Or provide one explicitly:
+Or provide a binary explicitly:
 
 ```sh
 cargo build -p sinomo
@@ -97,15 +124,33 @@ sinomo rollout cluster \
   --target 192.168.1.154:21353
 ```
 
-Use remote build when the target reports a different or unknown operating
-system or architecture.
+An explicitly supplied artifact is hashed into the rollout manifest and is
+restricted to targets reporting the local operating system and architecture.
+Unknown or mismatched target information blocks activation; it does not
+silently trigger use of the wrong binary.
+
+## Queueing and Fallback
+
+Matching build requests on one server share one durable queued or running job.
+If a selected builder becomes unreachable before resolution completes, the CLI
+tries the next ranked compatible server. If no worker advertises the required
+target and artifact support, the command fails before activating any rollout
+target.
+
+The rollout target is only a build candidate when it advertises the required
+capability. It receives no local-first preference, so a much faster compatible
+server normally wins a cache miss. The command does not silently fall back to
+the old per-target build path; use `--remote-build` only when that tradeoff is
+intentional.
 
 ## Activation Safety
 
-The target stages candidate files before stopping the main daemon. When a
-shadow daemon is available, it starts the candidate, waits for health, and
-restores the previous main binary if activation fails. A main-only installation
-can complete a staged self-restart, but it has less recovery coverage.
+Producing or publishing an artifact never activates it. Rollout authority
+selects the target set and lane, and the target stages candidate files before
+stopping the main daemon. When a shadow daemon is available, it starts the
+candidate, waits for health, and restores the previous main binary if activation
+fails. A main-only installation can complete a staged self-restart, but it has
+less recovery coverage.
 
 The main daemon remains the normal rollout endpoint. The shadow endpoint is a
 repair surface for cases where the main control path is unavailable.
@@ -126,7 +171,10 @@ For a remote target:
 sinomo rollout diagnostics --target 192.168.1.154:21353
 ```
 
-Diagnostics include rollout state, the build log, and candidate output tails.
+Diagnostics include rollout state, the legacy/local build log, and candidate
+output tails. Cluster-build job records, source bundles, logs, workspaces, and
+verified cache entries live under `$SINOMO_DATA_DIR/build/` on each build
+server.
 The main local artifacts are under `$SINOMO_DATA_DIR/rollout/`; use the
 diagnostics command before inspecting those files directly.
 
@@ -176,7 +224,9 @@ This clears the recorded status; it does not delete pending candidate files.
 
 The managed source checkout lives under `$SINOMO_DATA_DIR/source/sinomo`. Import
 merges reviewed external changes into that checkout and removes external remotes
-so later builds do not depend on a public forge.
+so later builds do not depend on a public forge. Cluster builds identify an
+immutable source input from this reviewed state; workers materialize that input
+instead of depending on an independently mutable checkout on every target.
 
 To bring self-evolution changes back to an external checkout:
 

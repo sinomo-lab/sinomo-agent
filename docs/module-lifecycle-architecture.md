@@ -23,6 +23,8 @@ same execution technology.
 - Immutable content and mutable runtime state must stay separate.
 - Registry state describes what exists; loader state describes what a node has
   applied; rollout state describes cluster coordination.
+- Build state describes artifact production only; a builder cannot create
+  loader or rollout authority by publishing output.
 - Rollout is a cluster concept. Local activation can exist without a cluster,
   but it is not rollout.
 - Once a node is clustered, cluster-owned module desired state is authoritative
@@ -386,15 +388,41 @@ Rollout policy decides promotion and rollback using evidence: scorecards,
 telemetry, replay results, shadow/canary metrics, incidents, user corrections,
 and operator approvals.
 
+## Build And Artifact Supply
+
+Binary and compiled-module production is supplied by the cluster build service.
+A build request identifies reviewed source, dependency state, profile and
+features, toolchain, artifact kind, and explicit target compatibility. Workers
+publish immutable artifacts and provenance. The initial implementation records
+them in a verified builder-local cache; the trusted registry is the future
+cluster-wide catalog of what exists.
+
+The build service resolves a matching verified artifact from its local cache
+before scheduling compilation; shared cache lookup can extend that resolution
+without changing artifact identity. When compilation is needed, it coalesces
+identical requests and chooses a live compatible worker using resource and
+queue evidence. Target-independent modules may be reused across platforms.
+The current rollout groups nodes by their reported operating system and
+architecture, then resolves that request to a builder's concrete Rust target
+triple and toolchain; richer node ABI reporting can tighten the grouping
+contract later.
+
+Artifact production is not a lifecycle transition. The builder cannot select a
+candidate, change cluster desired state, write loader state, or approve its own
+evidence. See [build service architecture](build-service-architecture.md) for
+the scheduling, cache, and distribution contract.
+
 ## Rollout And Local Activation
 
 Local activation is a node-local operation. It is useful for development,
 bootstrap, pre-cluster configuration, and local-only features. It can select a
 local artifact or declarative payload and write applied loader state.
 
-Rollout is cluster coordination. It requires cluster authority, distribution of
-immutable content, desired state, node sets, lane selection, telemetry
-aggregation, and rollback policy. Without a cluster, there is no rollout.
+Rollout is cluster coordination. It consumes verified prebuilt artifacts by
+default and requires cluster authority, distribution of immutable content,
+desired state, node sets, lane selection, telemetry aggregation, and rollback
+policy. Without a cluster, there is no rollout. A build result becomes eligible
+input to rollout; it does not become desired or applied state by itself.
 
 When a node is clustered, cluster desired state wins for shared modules. The
 node loader materializes and applies that desired state locally, but it should
@@ -423,11 +451,12 @@ some state resident.
 
 ## State Ownership
 
-The architecture separates five state classes:
+The architecture separates six state classes:
 
 | State | Owner | Mutability |
 |---|---|---|
 | Module manifest or capsule | Registry / module catalog | Immutable after registration. |
+| Build request, queue, and lease state | Cluster build service | Mutable compact coordination state. |
 | Artifact or payload bytes | Registry / DFS / local cache | Immutable and content addressed. |
 | Cluster desired module state | Cluster control plane / rollout | Mutable by rollout authority. |
 | Node-local loader state | Local loader | Mutable applied state. |
@@ -480,6 +509,9 @@ The crate boundary follows the trust-ring architecture:
   `sinomo-runtime` re-exports that machinery as
   `sinomo_runtime::{modules, storage}` without adding behavior.
 - `sinomo-policy` owns policy decisions and policy vocabulary interpretation.
+- `sinomo-build` owns build identity, cache resolution, queued job coordination,
+  worker selection, compilation, packaging, and publication. It does not own
+  rollout admission or activation state.
 - `sinomo-registry` owns immutable artifact, capsule, provenance, evidence, and
   signer records.
 - `sinomo-rollout` owns cluster rollout transitions, rollout telemetry gates,
@@ -508,12 +540,16 @@ R2 and application crates cross into these foundations through
 4. Node-local loader state is applied state, not cluster authority.
 5. Cluster rollout state overrides local shared module configuration once a node
    is clustered.
-6. Routing decisions must be deterministic for stable inputs and state.
-7. Native dynamic libraries are trusted code and do not provide containment.
-8. Unload is best effort for resource reclamation and authoritative for future
+6. Building or publishing a module cannot activate, promote, or select it for
+   rollout.
+7. Compiled artifacts declare explicit target compatibility; operating system
+   and architecture labels alone are not assumed sufficient.
+8. Routing decisions must be deterministic for stable inputs and state.
+9. Native dynamic libraries are trusted code and do not provide containment.
+10. Unload is best effort for resource reclamation and authoritative for future
    routing only after loader state changes.
-9. Wasm remains optional and backend-specific.
-10. Self-evolution targets modules only when the behavior has a natural,
+11. Wasm remains optional and backend-specific.
+12. Self-evolution targets modules only when the behavior has a natural,
     evaluable boundary.
-11. Module catalog data must not contain executable bindings; native runtime
+13. Module catalog data must not contain executable bindings; native runtime
     binding is deterministic host assembly keyed by catalog entries.

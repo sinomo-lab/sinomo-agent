@@ -233,14 +233,13 @@ use sinomo_runtime::rollout::{
     acquire_rollout_activation_guard, clear_rollout_status, ensure_rollout_layout,
     ensure_rollout_source_repo_with_options,
     install_local_rollout_native_dylib_modules as rollout_install_local_rollout_native_dylib_modules,
-    managed_source_status, prepare_cluster_rollout_binary_manifest,
+    managed_source_status, prepare_cluster_rollout_binary_manifest_for_target,
     prepare_cluster_rollout_build_request, prepare_cluster_rollout_native_dylib_module_request,
     prepare_local_rollout_artifacts_with_options, prepare_rollout_dev_artifacts,
     prepare_rollout_source_bundle, read_rollout_runtime_state, read_rollout_telemetry_gate_config,
     reconcile_rollout_native_dylib_platforms, restore_native_dylib_loader_state_for_activation,
-    rollout_build_dev_native_dylib_module, rollout_source_head, rollout_status_view,
-    shadow_telemetry_scorecard_from_event_store, source_heads_match,
-    stage_native_dylib_loader_state_rollback, sync_external_repo_from_managed,
+    rollout_source_head, rollout_status_view, shadow_telemetry_scorecard_from_event_store,
+    source_heads_match, stage_native_dylib_loader_state_rollback, sync_external_repo_from_managed,
     unique_rollout_targets, write_rollout_telemetry_gate_config,
 };
 use sinomo_runtime::rollout::{
