@@ -90,7 +90,6 @@ pub struct Shell {
     compact_tabs: Cell<bool>,
     last_render_options: Cell<Option<WindowRenderOptions>>,
     tab_strip_rect: Rect,
-    chat_session_timer: Cell<Option<TimerToken>>,
     /// Repaint driver for the loading screen: keeps the per-step elapsed time live
     /// while the backend connection resolves, so a stalled launch step is visible.
     connect_status_timer: Cell<Option<TimerToken>>,
@@ -129,7 +128,6 @@ impl Shell {
             compact_tabs: Cell::new(false),
             last_render_options: Cell::new(None),
             tab_strip_rect: Rect::ZERO,
-            chat_session_timer: Cell::new(None),
             connect_status_timer: Cell::new(None),
             health_probe_timer: Cell::new(None),
             body_rect: Rect::ZERO,
@@ -157,29 +155,6 @@ impl Shell {
                 move || shared.active_tab().index()
             });
         self.content = Some(WidgetPod::new(content));
-    }
-
-    fn schedule_chat_session_timer(&self, ctx: &mut EventCtx) {
-        if self.chat_session_timer.get().is_some()
-            || !self.shared.is_ready()
-            || self.shared.borrow().waker.is_none()
-        {
-            return;
-        }
-        let token = ctx.schedule_timer_after(chat::MULTI_DEVICE_SYNC_INTERVAL_SECS);
-        self.chat_session_timer.set(Some(token));
-    }
-
-    fn drain_chat_session_timer(&self, ctx: &mut EventCtx) -> bool {
-        if !self.shared.is_ready() {
-            return false;
-        }
-        let mut chat = self.shared.chat_mut();
-        chat.begin_multi_device_sync();
-        let changed = chat.pump_session_list() || chat.pump_transcript_load();
-        drop(chat);
-        self.schedule_chat_session_timer(ctx);
-        changed
     }
 
     fn schedule_connect_status_timer(&self, ctx: &mut EventCtx) {
@@ -664,18 +639,6 @@ impl Widget for Shell {
             ctx.set_handled();
             return;
         }
-        if let Event::Wake(sui::WakeEvent::Timer { token, .. }) = event
-            && self.chat_session_timer.get() == Some(*token)
-        {
-            self.chat_session_timer.set(None);
-            if self.drain_chat_session_timer(ctx) {
-                ctx.request_measure();
-                ctx.request_arrange();
-                ctx.request_semantics();
-                ctx.request_paint();
-            }
-            return;
-        }
         // Loading-screen heartbeat: repaint once a second while connecting so the
         // per-step elapsed time stays live (and a stalled step becomes obvious).
         if let Event::Wake(sui::WakeEvent::Timer { token, .. }) = event
@@ -723,7 +686,6 @@ impl Widget for Shell {
                         chat.start_agent_list_load(backend.data_dir.clone(), waker.clone());
                         chat.start_session_list_load(waker);
                     }
-                    self.schedule_chat_session_timer(ctx);
                     self.schedule_health_probe_timer(ctx);
                     self.start_cluster_refresh_if_active();
                     ctx.request_measure();
@@ -789,7 +751,6 @@ impl Widget for Shell {
                     } else {
                         (false, false, false)
                     };
-                self.schedule_chat_session_timer(ctx);
                 if device_changed
                     || files_changed
                     || files_attachment_changed
@@ -874,7 +835,6 @@ impl Widget for Shell {
             } else {
                 false
             };
-            self.schedule_chat_session_timer(ctx);
             if connection_changed
                 || cluster_changed
                 || chat_layout_changed

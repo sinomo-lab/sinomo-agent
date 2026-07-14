@@ -278,7 +278,8 @@ pub fn authorize_authenticated_daemon_command(
         route
             if route == crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE
                 || route == crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE
-                || route == crate::DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE =>
+                || route == crate::DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE
+                || route == crate::DAEMON_EVENT_SUBSCRIBE_ROUTE =>
         {
             authenticated.signer.can_run_local_command()
         }
@@ -1765,6 +1766,25 @@ mod tests {
             }
             let authenticated =
                 authenticated_command(route.to_string(), DaemonSignerAuthority::JoinCandidate);
+            assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+        }
+    }
+
+    #[test]
+    fn daemon_event_subscriptions_are_local_only() {
+        authorize_authenticated_daemon_command(&authenticated_command(
+            crate::DAEMON_EVENT_SUBSCRIBE_ROUTE.to_string(),
+            DaemonSignerAuthority::Local,
+        ))
+        .expect("local app clients may subscribe to daemon events");
+
+        for signer in [
+            DaemonSignerAuthority::Voter,
+            DaemonSignerAuthority::Member,
+            DaemonSignerAuthority::JoinCandidate,
+        ] {
+            let authenticated =
+                authenticated_command(crate::DAEMON_EVENT_SUBSCRIBE_ROUTE.to_string(), signer);
             assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
         }
     }

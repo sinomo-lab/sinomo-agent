@@ -159,7 +159,7 @@ State is separated by authority, durability, and replication cost:
 | Hot interaction state | Owning process or node | Local, with bounded handoff summaries. |
 | Cluster configuration | Raft-backed cluster KV | Replicated to control-plane participants. |
 | Events and traces | Append-oriented durable stores | Routed by scope, privacy, and retention policy. |
-| Long-horizon memory | Immutable records plus rebuildable indexes | Replicated by memory scope and usefulness. |
+| Long-horizon memory | Versioned source/overlay files plus rebuildable indexes | Source and overlay files follow scope policy; derived indexes replicate by usefulness. |
 | Workspace metadata | DFS metadata authority | Sharded and replicated by filesystem policy. |
 | Workspace content | Node-local content stores | Copied or cached according to object policy. |
 | Module and rollout state | Trusted registry and rollout services | Distributed to affected nodes as desired state. |
@@ -171,8 +171,8 @@ of authority for base-runtime behavior.
 
 The [storage architecture](storage-architecture.md) defines ownership and
 inspection of files in the local Sinomo data directory. The
-[memory architecture](memory-architecture.md) defines durable records,
-retrieval, consolidation, and multi-agent scope.
+[memory architecture](memory-architecture.md) defines indexed-file memory,
+automatic maintenance, retrieval, overlays, and multi-agent scope.
 
 ## Event Contract
 
@@ -208,10 +208,11 @@ describe desired behavior but cannot grant filesystem, process, network,
 device, secret, or rollout capabilities. Tool results retain durable evidence
 even when the model-facing projection is compacted or redacted.
 
-Memory is explicit context, not invisible mutable model state. Immutable source
-records preserve evidence and scope. Derived indexes and summaries are
-rebuildable. Retrieval records why each block was selected and context assembly
-applies a bounded budget for the current turn.
+Memory is explicit context, not invisible mutable model state. Versioned source
+files and append-only overlay files preserve evidence and scope. Derived
+indexes and summaries are rebuildable. Retrieval records why each evidence
+block was selected and context assembly applies a bounded budget for the
+current turn.
 
 See [agent system architecture](agent-system-architecture.md) and
 [memory architecture](memory-architecture.md).

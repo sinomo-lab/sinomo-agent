@@ -15,7 +15,8 @@ pub use client::{
     DAEMON_API_CLUSTER_CONTROL_TIMEOUT, DAEMON_API_PROBE_TIMEOUT, DaemonApiClient,
     DaemonDfsPeerTransport, RemoteConfigClient, send_daemon_rpc, send_daemon_rpc_async,
     send_daemon_rpc_on_runtime, send_daemon_rpc_raw, send_daemon_rpc_raw_with_timeouts,
-    send_daemon_rpc_stream, send_daemon_rpc_stream_async, send_daemon_rpc_with_timeouts,
+    send_daemon_rpc_stream, send_daemon_rpc_stream_async,
+    send_daemon_rpc_stream_from_data_dir_async, send_daemon_rpc_with_timeouts,
 };
 pub use error::DaemonApiError;
 pub use idle_stats::IdleStatsSnapshot;
@@ -41,6 +42,8 @@ pub const DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE: &str =
     "/daemon/cluster/local-connectivity-reload";
 pub const DAEMON_OBJECT_RPC_FORWARD_ROUTE: &str = "/daemon/object-rpc/forward";
 pub const DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE: &str = "/daemon/dfs/object-rpc/forward";
+pub const DAEMON_EVENT_SUBSCRIBE_ROUTE: &str = "/daemon/events/subscribe";
+pub const DFS_NAMESPACE_CHANGED_EVENT_KIND: &str = "dfs.namespace.changed";
 pub const DAEMON_DFS_BROWSER_STATUS_ROUTE: &str = "/daemon/dfs/browser/status";
 pub const DAEMON_DFS_BROWSER_STAT_ROUTE: &str = "/daemon/dfs/browser/stat";
 pub const DAEMON_DFS_BROWSER_LIST_ROUTE: &str = "/daemon/dfs/browser/list";
@@ -80,6 +83,47 @@ pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
     DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
 ];
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonEventSubscribeRequest {
+    /// Event-kind prefixes to receive. An empty list subscribes to every kind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_kind_prefixes: Vec<String>,
+    /// DFS namespace path prefixes to receive. An empty list accepts events
+    /// without path metadata as well as namespace events for every path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_prefixes: Vec<String>,
+}
+
+impl DaemonEventSubscribeRequest {
+    pub fn for_path_prefix(path_prefix: impl Into<String>) -> Self {
+        Self {
+            event_kind_prefixes: vec![DFS_NAMESPACE_CHANGED_EVENT_KIND.to_string()],
+            path_prefixes: vec![path_prefix.into()],
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonEventSubscribeResponse {
+    pub subscription_id: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DaemonEventStreamItem {
+    Ready {
+        subscription_id: String,
+    },
+    Event {
+        event: sinomo_core::EventEnvelope,
+    },
+    /// The subscriber fell behind the daemon's bounded live buffer. Consumers
+    /// must reload their durable source of truth before processing later events.
+    Lagged {
+        skipped: u64,
+    },
+}
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonObjectRpcForwardRequest {
