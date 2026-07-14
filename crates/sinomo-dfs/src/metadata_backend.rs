@@ -692,6 +692,45 @@ impl LocalSobjMetadataBackend {
         })
     }
 
+    /// Open the last durable table image without replaying an unreadable
+    /// journal. Callers may use this only for a non-primary mirror so the
+    /// service can reject the next conflicting batch and complete the normal
+    /// authenticated snapshot-repair handshake.
+    pub(crate) fn open_for_replica_repair(
+        shard_id: DfsMetadataShardId,
+        root: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let root = root.into();
+        create_dir_all(root.join("records"))?;
+        create_dir_all(root.join("journal").join("segments"))?;
+        let _lock = metadata_write_lock(
+            root.clone(),
+            metadata_cursor::journal_write_lock_path(&root),
+        )?;
+        let state = read_metadata_table_state_lenient(&root)?;
+        let materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
+        let mut backend = Self {
+            shard_id,
+            root,
+            // Ignore the unreadable journal suffix until the primary either
+            // sends a clean continuation or replaces it with a snapshot.
+            next_sequence: materialized_through_sequence.saturating_add(1).max(1),
+            tables: state.tables,
+            table_log_offset: state.table_log_offset,
+            materialized_through_sequence,
+            prefix_proof: state.prefix_proof,
+            instance_authority_epoch: None,
+            table_snapshot_fingerprint: state.snapshot_fingerprint,
+            read_snapshot_cache: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
+        };
+        backend.ensure_local_materialization_cursor()?;
+        backend.reconcile_local_materialization_cursor(materialized_through_sequence)?;
+        backend.ensure_metadata_prefix_proof_checkpoint_unlocked()?;
+        Ok(backend)
+    }
+
     /// Metadata shard owned by this local backend handle.
     pub fn shard_id(&self) -> &DfsMetadataShardId {
         &self.shard_id
@@ -916,6 +955,54 @@ impl LocalSobjMetadataBackend {
         snapshot: DfsMetadataTableSnapshot,
     ) -> Result<bool> {
         let _lock = self.begin_metadata_write()?;
+        self.replace_with_replicated_snapshot_unlocked(
+            source_shard_id,
+            replayed_through_sequence,
+            snapshot,
+        )
+    }
+
+    /// Install an authoritative snapshot when ordinary backend open/replay is
+    /// impossible. This path deliberately takes only the shard write lock;
+    /// snapshot validation and durable acknowledgement floors still run before
+    /// the unreadable state is archived and replaced.
+    pub(crate) fn replace_unreadable_with_replicated_snapshot(
+        shard_id: DfsMetadataShardId,
+        root: impl Into<PathBuf>,
+        source_shard_id: DfsMetadataShardId,
+        replayed_through_sequence: u64,
+        snapshot: DfsMetadataTableSnapshot,
+    ) -> Result<(Self, bool)> {
+        let mut backend = Self {
+            shard_id,
+            root: root.into(),
+            next_sequence: 1,
+            tables: DfsMetadataTables::default(),
+            table_log_offset: 0,
+            materialized_through_sequence: 0,
+            prefix_proof: None,
+            instance_authority_epoch: None,
+            table_snapshot_fingerprint: None,
+            read_snapshot_cache: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
+        };
+        let lock = backend.metadata_write_lock()?;
+        let archived_existing = backend.replace_with_replicated_snapshot_unlocked(
+            source_shard_id,
+            replayed_through_sequence,
+            snapshot,
+        )?;
+        drop(lock);
+        Ok((backend, archived_existing))
+    }
+
+    fn replace_with_replicated_snapshot_unlocked(
+        &mut self,
+        source_shard_id: DfsMetadataShardId,
+        replayed_through_sequence: u64,
+        snapshot: DfsMetadataTableSnapshot,
+    ) -> Result<bool> {
         if snapshot.materialized_through_sequence != Some(replayed_through_sequence) {
             return Err(MetadataBackendError::Serde(format!(
                 "replicated metadata snapshot embedded sequence {:?} does not match install sequence {replayed_through_sequence}",
@@ -11433,6 +11520,75 @@ mod tests {
 
         cleanup(&leader_root);
         cleanup(&follower_root);
+    }
+
+    #[test]
+    fn unreadable_replica_can_install_authoritative_snapshot() {
+        let leader_root = temp_root("unreadable_snapshot_repair_leader");
+        let replica_root = temp_root("unreadable_snapshot_repair_replica");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut leader =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &leader_root).expect("leader");
+        let file_system = file_system();
+        leader.put_file_system(&file_system).expect("filesystem");
+        let genesis_snapshot = leader.export_table_snapshot();
+        let genesis_sequence = leader.journal_last_sequence();
+        let object = object(version("authoritative-v1"));
+        let object_entry = leader.put_object(&object).expect("object");
+        let authoritative_sequence = leader.journal_last_sequence();
+        let authoritative_snapshot = leader.export_table_snapshot();
+
+        let mut replica =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &replica_root).expect("replica");
+        replica
+            .replace_with_replicated_snapshot(shard_id.clone(), genesis_sequence, genesis_snapshot)
+            .expect("install genesis checkpoint");
+        append_segmented_journal_entry(&replica_root, &object_entry)
+            .expect("append authoritative entry");
+        let mut conflicting_entry = object_entry.clone();
+        conflicting_entry.created_at += time::Duration::nanoseconds(1);
+        append_segmented_journal_entry(&replica_root, &conflicting_entry)
+            .expect("append conflicting duplicate sequence");
+        write_sobj_atomic(
+            &replica_root.join("journal").join("head.sobj"),
+            &DfsMetadataJournalHead {
+                next_sequence: authoritative_sequence.saturating_add(1),
+            },
+        )
+        .expect("journal head");
+        drop(replica);
+
+        let open_error = LocalSobjMetadataBackend::new(shard_id.clone(), &replica_root)
+            .expect_err("conflicting duplicate must make ordinary replay fail");
+        assert!(open_error.to_string().contains("cannot extend prefix"));
+
+        let (repaired, archived) =
+            LocalSobjMetadataBackend::replace_unreadable_with_replicated_snapshot(
+                shard_id.clone(),
+                &replica_root,
+                shard_id.clone(),
+                authoritative_sequence,
+                authoritative_snapshot,
+            )
+            .expect("repair unreadable replica");
+        assert!(archived);
+        assert_eq!(
+            repaired.get_object(&object.object_id).expect("object"),
+            Some(object.clone())
+        );
+        drop(repaired);
+
+        let reopened = LocalSobjMetadataBackend::new(shard_id, &replica_root)
+            .expect("reopen repaired replica");
+        assert_eq!(
+            reopened
+                .get_object(&object.object_id)
+                .expect("reopened object"),
+            Some(object)
+        );
+
+        cleanup(&leader_root);
+        cleanup(&replica_root);
     }
 
     #[test]

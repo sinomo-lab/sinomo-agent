@@ -17,8 +17,9 @@ use sinomo_runtime::dfs::{
     DfsPinAddRequest, DfsPinMode, DfsPosixCreateAttrs, DfsPosixError, DfsStat, DfsWriteOptions,
     LocalContentStore, NetworkedDfsService, cluster_dfs_peer_node_ids, content_services_prefix,
     default_dfs_metadata_root, default_dfs_metadata_shards_root, default_dfs_pin_root,
-    fallback_dfs_node_id, metadata_shards_prefix, open_local_sharded_metadata_backend,
-    open_root_local_metadata_backend, publish_cluster_dfs_metadata_journal_with_peer_transport,
+    fallback_dfs_node_id, metadata_shards_prefix,
+    open_local_sharded_metadata_backend_for_replica_repair, open_root_local_metadata_backend,
+    publish_cluster_dfs_metadata_journal_with_peer_transport,
     refresh_cluster_dfs_kv_snapshot_with_peer_transport, sifs_file_system_id,
 };
 use sinomo_runtime::kv::{KvError, KvOp, KvTxn, KvTxnResponse};
@@ -1673,9 +1674,15 @@ fn open_sifs_sharded_metadata_backend(
     if shards.is_empty() {
         return Ok(None);
     }
-    open_local_sharded_metadata_backend(default_dfs_metadata_shards_root(data_dir), shards)
-        .map(Some)
-        .map_err(|error| format!("cannot open DFS metadata shards: {error}"))
+    let state = cluster::read_cluster_state_without_kv(cluster_paths)
+        .map_err(|error| format!("cannot read local cluster state: {error}"))?;
+    open_local_sharded_metadata_backend_for_replica_repair(
+        default_dfs_metadata_shards_root(data_dir),
+        shards,
+        &state.local_node_id,
+    )
+    .map(Some)
+    .map_err(|error| format!("cannot open DFS metadata shards: {error}"))
 }
 
 fn sifs_replica_candidates(data_dir: &SinomoDataDir, local_node_id: &NodeId) -> Vec<NodeId> {

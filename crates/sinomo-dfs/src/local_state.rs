@@ -203,6 +203,14 @@ pub fn open_local_sharded_metadata_backend(
     LocalShardedMetadataBackend::new(root, shards)
 }
 
+pub fn open_local_sharded_metadata_backend_for_replica_repair(
+    root: impl Into<PathBuf>,
+    shards: Vec<DfsMetadataShardConfig>,
+    local_node_id: &NodeId,
+) -> Result<LocalShardedMetadataBackend, MetadataBackendError> {
+    LocalShardedMetadataBackend::new_with_replica_repair(root, shards, local_node_id)
+}
+
 pub fn open_local_sharded_metadata_backend_for_inspection(
     root: impl Into<PathBuf>,
     shards: Vec<DfsMetadataShardConfig>,
@@ -298,9 +306,15 @@ pub fn open_cluster_sharded_dfs_metadata_backend(
     if shards.is_empty() {
         return Ok(None);
     }
-    open_local_sharded_metadata_backend(default_dfs_metadata_shards_root(data_dir), shards)
-        .map(Some)
-        .map_err(Into::into)
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
+        .map_err(DfsError::from_network)?;
+    open_local_sharded_metadata_backend_for_replica_repair(
+        default_dfs_metadata_shards_root(data_dir),
+        shards,
+        &state.local_node_id,
+    )
+    .map(Some)
+    .map_err(Into::into)
 }
 
 pub fn open_cluster_sharded_dfs_metadata_backend_for_inspection(

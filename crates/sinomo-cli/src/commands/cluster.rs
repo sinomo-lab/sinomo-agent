@@ -987,11 +987,7 @@ pub(crate) fn cluster_invite(options: ClusterInviteOptions) -> Result<(), CliErr
     })?;
     let uri = response.invite;
     let invite = decode_cluster_join_invite(&uri)?;
-    if invite
-        .introducers
-        .iter()
-        .all(|endpoint| !is_remote_usable_invite_endpoint(endpoint))
-    {
+    if !cluster_invite_has_remote_usable_introducer(&invite) {
         println!(
             "warning: invite only contains local-only introducers; remote machines cannot use it until the daemon advertises a LAN-reachable address"
         );
@@ -1113,11 +1109,7 @@ pub(crate) fn cluster_invite_with_paths(
     }
     let now = OffsetDateTime::now_utc();
     let invite = build_cluster_invite(&state, &options, paths, now)?;
-    if invite
-        .introducers
-        .iter()
-        .all(|endpoint| !is_remote_usable_invite_endpoint(endpoint))
-    {
+    if !cluster_invite_has_remote_usable_introducer(&invite) {
         println!(
             "warning: invite only contains local-only introducers; remote machines should use `sinomo cluster invite --introducer <host-lan-ip>:21353`"
         );
@@ -1226,6 +1218,15 @@ pub(crate) fn build_cluster_invite(
         now,
     )
     .map_err(Into::into)
+}
+
+pub(crate) fn cluster_invite_has_remote_usable_introducer(invite: &ClusterJoinInvite) -> bool {
+    invite
+        .communication_channels
+        .iter()
+        .map(|channel| &channel.endpoint)
+        .chain(invite.introducers.iter())
+        .any(is_remote_usable_invite_endpoint)
 }
 
 pub(crate) fn default_invite_introducers(

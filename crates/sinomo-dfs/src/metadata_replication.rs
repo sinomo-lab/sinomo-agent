@@ -2840,12 +2840,47 @@ pub fn process_cluster_dfs_metadata_snapshot_install(
             message: source.to_string(),
         })?;
     let context = cluster_dfs_metadata_replica_shard_context(cluster_paths, &command.shard_id)?;
-    let mut backend = open_local_metadata_shard_backend(data_dir, command.shard_id.clone())?;
-    Ok(process_dfs_metadata_snapshot_install(
-        &mut backend,
-        context.as_ref(),
-        command,
-    ))
+    if let Some(response) =
+        validate_dfs_metadata_snapshot_install_source(context.as_ref(), &command)
+    {
+        return Ok(response);
+    }
+    match open_local_metadata_shard_backend(data_dir, command.shard_id.clone()) {
+        Ok(mut backend) => Ok(process_dfs_metadata_snapshot_install(
+            &mut backend,
+            context.as_ref(),
+            command,
+        )),
+        Err(open_error) => {
+            let request_id = command.request_id.clone();
+            let shard_id = command.shard_id.clone();
+            let next_after_sequence = command.next_after_sequence;
+            let root = local_dfs_metadata_shard_path(data_dir, &shard_id);
+            let result = LocalSobjMetadataBackend::replace_unreadable_with_replicated_snapshot(
+                shard_id.clone(),
+                root,
+                command.shard_id,
+                command.next_after_sequence,
+                command.snapshot,
+            );
+            let result = match result {
+                Ok((_backend, archived_existing)) => {
+                    DfsMetadataSnapshotInstallResult::Installed { archived_existing }
+                }
+                Err(repair_error) => DfsMetadataSnapshotInstallResult::Rejected {
+                    reason: format!(
+                        "cannot open metadata shard for snapshot install: {open_error}; unreadable-shard snapshot replacement failed: {repair_error}"
+                    ),
+                },
+            };
+            Ok(DfsMetadataSnapshotInstallResponse {
+                request_id,
+                shard_id,
+                next_after_sequence,
+                result,
+            })
+        }
+    }
 }
 
 pub fn materialize_default_sifs_metadata(
@@ -3506,6 +3541,13 @@ pub(crate) fn metadata_journal_rejection_allows_snapshot_repair(reason: &str) ->
         && reason.contains("already exists with a different entry"))
         || reason.contains("failed to decode segmented journal entry")
         || (reason.contains("metadata journal prefix probe") && reason.contains("state mismatch"))
+        || ((reason.contains("metadata journal batch")
+            || reason.contains("metadata authority batch"))
+            && reason.contains("starts unseen history")
+            && reason.contains("durable replay requires"))
+        || (reason.contains("metadata shard")
+            && reason.contains("cannot extend prefix")
+            && reason.contains("with journal entry"))
 }
 
 pub(crate) fn metadata_replication_rejection_is_topology_mismatch(reason: &str) -> bool {
@@ -3627,6 +3669,22 @@ pub(crate) fn dfs_metadata_snapshot_install_sender_from_peer_transport(
 #[cfg(test)]
 mod cursor_update_tests {
     use super::*;
+
+    #[test]
+    fn journal_discontinuity_rejection_allows_snapshot_repair() {
+        assert!(metadata_journal_rejection_allows_snapshot_repair(
+            "metadata serialization error: metadata journal batch for shard services starts unseen history at sequence 7722 but durable replay requires 1"
+        ));
+        assert!(metadata_journal_rejection_allows_snapshot_repair(
+            "metadata authority batch for shard root starts unseen history at sequence 9 but durable replay requires sequence 2"
+        ));
+        assert!(metadata_journal_rejection_allows_snapshot_repair(
+            "metadata serialization error: metadata shard root cannot extend prefix 2216 with journal entry root:2216"
+        ));
+        assert!(!metadata_journal_rejection_allows_snapshot_repair(
+            "metadata journal batch for shard services contains entry from shard root"
+        ));
+    }
 
     #[test]
     fn async_cursor_commit_does_not_open_materialized_tables() {

@@ -25,8 +25,9 @@ use super::{
     build_cluster_raft_append_request_from_next_index, cli_command_is_help,
     cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
     cli_invocation_force_local_mode, cluster_has_local_quorum, cluster_init_with_paths,
-    cluster_invite_with_paths, cluster_join_with_paths, cluster_kv_state_authority_id,
-    cluster_leave, cluster_leave_with_paths, cluster_migration_plan_with_paths,
+    cluster_invite_has_remote_usable_introducer, cluster_invite_with_paths,
+    cluster_join_with_paths, cluster_kv_state_authority_id, cluster_leave,
+    cluster_leave_with_paths, cluster_migration_plan_with_paths,
     cluster_node_status_from_daemon_status, cluster_peer_members, cluster_rename,
     daemon_advertised_endpoints_for_state, daemon_endpoint_advertisement_config_file,
     daemon_handle_daemon_sandbox_http_fetch, daemon_package_version,
@@ -9489,6 +9490,7 @@ fn cluster_invite_generates_portable_join_payload() {
     assert!(!parsed.cluster_public_key.trim().is_empty());
     assert!(!parsed.invitation_secret.trim().is_empty());
     assert_eq!(parsed.communication_channels.len(), 1);
+    assert!(cluster_invite_has_remote_usable_introducer(&parsed));
     assert_eq!(
         parsed.communication_channels[0].endpoint.address,
         "192.168.1.10:21353"
@@ -9576,6 +9578,9 @@ fn join_registration_skips_loopback_when_remote_invite_channels_exist() {
     .expect("cluster invite");
     let channels = invite_channels_for_join_registration(&rendered.invite);
 
+    assert!(cluster_invite_has_remote_usable_introducer(
+        &rendered.invite
+    ));
     assert_eq!(channels.len(), 1);
     assert_eq!(channels[0].endpoint.address, "192.168.1.10:21353");
 }
@@ -9607,6 +9612,9 @@ fn join_registration_keeps_loopback_when_it_is_the_only_invite_channel() {
     .expect("cluster invite");
     let channels = invite_channels_for_join_registration(&rendered.invite);
 
+    assert!(!cluster_invite_has_remote_usable_introducer(
+        &rendered.invite
+    ));
     assert_eq!(channels.len(), 1);
     assert_eq!(channels[0].endpoint.address, "127.0.0.1:21353");
 }

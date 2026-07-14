@@ -83,7 +83,19 @@ impl LocalShardedMetadataBackend {
     /// shard backend.
     pub fn new(root: impl Into<PathBuf>, shards: Vec<DfsMetadataShardConfig>) -> Result<Self> {
         let root = root.into();
-        Self::open_with(root, shards, true)
+        Self::open_with(root, shards, true, None)
+    }
+
+    /// Open configured shards while allowing unreadable non-primary mirrors
+    /// to enter the snapshot-repair handshake. A shard primary always retains
+    /// strict open/replay semantics.
+    pub fn new_with_replica_repair(
+        root: impl Into<PathBuf>,
+        shards: Vec<DfsMetadataShardConfig>,
+        local_node_id: &NodeId,
+    ) -> Result<Self> {
+        let root = root.into();
+        Self::open_with(root, shards, true, Some(local_node_id))
     }
 
     /// Open a sharded backend for read-only inspection/status.
@@ -95,13 +107,14 @@ impl LocalShardedMetadataBackend {
         shards: Vec<DfsMetadataShardConfig>,
     ) -> Result<Self> {
         let root = root.into();
-        Self::open_with(root, shards, false)
+        Self::open_with(root, shards, false, None)
     }
 
     fn open_with(
         root: PathBuf,
         shards: Vec<DfsMetadataShardConfig>,
         initialize_layout: bool,
+        replica_repair_local_node_id: Option<&NodeId>,
     ) -> Result<Self> {
         if shards.is_empty() {
             return Err(MetadataBackendError::Serde(
@@ -126,7 +139,25 @@ impl LocalShardedMetadataBackend {
             }
             let shard_root = root.join(key_segment(&shard_id.0));
             let backend = if initialize_layout {
-                LocalSobjMetadataBackend::new(shard_id.clone(), shard_root)?
+                match LocalSobjMetadataBackend::new(shard_id.clone(), shard_root.clone()) {
+                    Ok(backend) => backend,
+                    Err(open_error)
+                        if replica_repair_local_node_id
+                            .is_some_and(|local_node_id| shard.primary_node_id != *local_node_id) =>
+                    {
+                        LocalSobjMetadataBackend::open_for_replica_repair(
+                            shard_id.clone(),
+                            shard_root,
+                        )
+                        .map_err(|repair_error| {
+                            MetadataBackendError::Serde(format!(
+                                "cannot open replica metadata shard {}: {open_error}; repair-only open failed: {repair_error}",
+                                shard.shard_id
+                            ))
+                        })?
+                    }
+                    Err(error) => return Err(error),
+                }
             } else {
                 LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), shard_root)?
             };

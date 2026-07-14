@@ -116,6 +116,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         next_after_sequence: u64,
         reason: String,
     ) -> Result<(), DfsError> {
+        // Older primaries already recognize the sequence-conflict rejection
+        // family as snapshot-repairable. Preserve that wire-level signal when
+        // a newer mirror detects another exact-prefix discontinuity so a
+        // mixed-version cluster can still complete repair.
+        let reason = format!(
+            "metadata journal sequence discontinuity already exists with a different entry; routed mirror snapshot repair requested after: {reason}"
+        );
         let request_id = format!(
             "dfs_meta_snapshot_request_{}_{}_{}",
             self.node_id, shard_id.0, next_after_sequence
