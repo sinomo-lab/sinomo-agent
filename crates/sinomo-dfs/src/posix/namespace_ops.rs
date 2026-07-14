@@ -13,8 +13,10 @@ use crate::posix_path::{
 };
 use crate::{
     DfsMessageTransport, DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNamespaceTransaction,
-    DfsObjectId, DfsObjectKind, DfsObjectMetadata, NetworkedDfsService, sifs_file_system_id,
+    DfsObjectId, DfsObjectKind, DfsObjectMetadata, NetworkedDfsService,
+    namespace_transaction_id_for_batch, object_version_record, sifs_file_system_id,
 };
+use time::OffsetDateTime;
 
 fn ensure_same_atomic_namespace_shard(
     from_shard_id: Option<&str>,
@@ -89,8 +91,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return self.unlink_canonical_with_hardlinks(object, &path);
         }
         object = self.tombstone_path_object(object);
-        self.add_object_metadata(object.clone())?;
-        self.touch_parent_directory_modified(&path)?;
+        let mut objects = vec![object.clone()];
+        if let Some(parent_path) = parent_posix_path(&path) {
+            objects.push(self.directory_modified_metadata(&parent_path)?);
+        }
+        let versions = objects
+            .iter()
+            .map(|object| object_version_record(object, object.content_size_bytes))
+            .collect::<Vec<_>>();
+        self.apply_namespace_transaction(DfsNamespaceTransaction {
+            transaction_id: namespace_transaction_id_for_batch(
+                "unlink",
+                &object.file_system_id,
+                &objects,
+                &versions,
+            ),
+            file_system_id: object.file_system_id.clone(),
+            objects,
+            versions,
+            advisory_lock_states: Vec::new(),
+            created_at: OffsetDateTime::now_utc(),
+        })?;
         self.stat_object(&object)
     }
 
@@ -143,8 +164,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_rename(&mut self, from: &str, to: &str) -> Result<DfsStat> {
         let normalized_from = normalize_posix_path(from)?;
         let normalized_to = normalize_posix_path(to)?;
-        let from_primary = self.routed_namespace_primary_for_path(&normalized_from)?;
-        let to_primary = self.routed_namespace_primary_for_path(&normalized_to)?;
+        let mut primaries = self
+            .routed_namespace_primaries_for_paths_fresh([
+                normalized_from.as_str(),
+                normalized_to.as_str(),
+            ])?
+            .into_iter();
+        let from_primary = primaries.next().unwrap_or(None);
+        let to_primary = primaries.next().unwrap_or(None);
         match (from_primary, to_primary) {
             (None, None) => self.posix_rename_local(from, to),
             (None, Some(_)) => {

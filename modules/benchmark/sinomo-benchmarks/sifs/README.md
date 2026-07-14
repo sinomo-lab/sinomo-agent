@@ -33,6 +33,9 @@ Set the root once for the commands below:
 
 ```bash
 export SINOMO_SIFS_FUSE_BENCH_ROOT=/sinomo/agents/<agent-id>/home
+# Optional catalog-plan gates; zero/unset leaves each gate disabled.
+export SINOMO_SIFS_FUSE_MIN_SEQUENTIAL_READ_MIB_S=0
+export SINOMO_SIFS_FUSE_MIN_PARALLEL_CREATE_SPEEDUP=0
 ```
 
 ## Repeatable suites
@@ -74,8 +77,12 @@ target/release/sinomo-sifs-fuse-bench \
 - `--json-out <PATH>` writes the machine-readable report, creating parent directories as needed.
 - `SINOMO_DATA_DIR` selects the local Sinomo data directory and daemon connection state.
 - `SINOMO_SIFS_FUSE_BENCH_ROOT` is a convenience used by the catalog plan; passing `--root` remains explicit at the runner boundary.
+- `--min-sequential-read-mib-s` fails a run whose hot sequential FUSE read is below the configured throughput floor. The catalog plan sources it from `SINOMO_SIFS_FUSE_MIN_SEQUENTIAL_READ_MIB_S`.
+- `--min-parallel-create-speedup` fails a run whose parallel-create throughput divided by the sequential baseline is below the configured scaling floor. The catalog plan sources it from `SINOMO_SIFS_FUSE_MIN_PARALLEL_CREATE_SPEEDUP`.
 
 Use `--help` to list workload sizing, concurrency, cache, and performance-threshold options supported by the current runner. Performance thresholds are opt-in: an unconfigured performance run records measurements but does not impose machine-specific latency or throughput gates. The host-filesystem comparison is a page-cache baseline; it is not a durable-storage benchmark.
+
+Sequential-write reports deliberately expose both timing boundaries. `*.sequential_write` measures create through close for end-to-end application cost, while `*.sequential_write_open_fd` measures data writes and flush on an already-open file. `--min-sequential-write-mib-s` gates the open-file metric so namespace latency is not misreported as transport throughput.
 
 A completed run exits successfully when every selected correctness probe and configured performance threshold passes. Unavailable FUSE support is an ordinary skip unless `--require-fuse` is supplied. Product, cleanup, or configured-threshold failures return 1; invalid arguments or harness errors return 2; a required missing FUSE capability returns 3. `--report-only` returns zero for product and threshold failures while preserving `"status": "failed"` in JSON. The runner still attempts to write the report on failed runs so partial evidence remains inspectable.
 

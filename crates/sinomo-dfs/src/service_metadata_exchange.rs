@@ -15,6 +15,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         source_node_id: NodeId,
         response: DfsMetadataJournalBatchResponse,
     ) -> Result<Option<NetworkedDfsServiceEvent>, DfsError> {
+        if let Some(pending) = self
+            .pending_metadata_authority_probes
+            .remove(&response.request_id)
+        {
+            let accepted = pending.target_node_id == source_node_id
+                && response.shard_id.0 == pending.expected_shard.shard_id
+                && response.verified_authority_probe_id.as_deref()
+                    == Some(pending.probe_id.as_str())
+                && matches!(response.result, DfsMetadataJournalBatchResult::Applied);
+            self.metadata_authority_probe_results
+                .insert(response.request_id, accepted);
+            return Ok(None);
+        }
         let pending = self
             .pending_metadata_replications
             .remove(&response.request_id);
@@ -342,17 +355,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )));
         }
         if command.next_after_sequence == watermark.journal_sequence {
-            let fingerprint =
-                crate::metadata_records::dfs_metadata_table_snapshot_state_fingerprint(
-                    &command.snapshot,
-                )
-                .map_err(|source| DfsError::Serialization {
-                    message: format!(
-                        "encode metadata snapshot watermark check for {}: {source}",
-                        command.shard_id.0
-                    ),
-                })?;
-            if fingerprint != watermark.state_fingerprint {
+            let matches = crate::metadata_records::dfs_metadata_table_snapshot_matches_checkpoint(
+                &command.snapshot,
+                command.next_after_sequence,
+                &watermark.state_fingerprint,
+            )
+            .map_err(|source| DfsError::Serialization {
+                message: format!(
+                    "encode metadata snapshot watermark check for {}: {source}",
+                    command.shard_id.0
+                ),
+            })?;
+            if !matches {
                 return Ok(Some(format!(
                     "metadata snapshot state does not match durable watermark for shard {} sequence {}",
                     command.shard_id.0, command.next_after_sequence
@@ -433,6 +447,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shard_id: &DfsMetadataShardId,
         after_sequence: u64,
     ) -> Result<Option<DfsMetadataJournalBatch>, DfsError> {
+        self.metadata_journal_batch_for_shard_since_limited(
+            shard_id,
+            after_sequence,
+            DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+            DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+        )
+    }
+
+    pub(crate) fn metadata_journal_batch_for_shard_since_limited(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after_sequence: u64,
+        max_entries: usize,
+        max_encoded_bytes: usize,
+    ) -> Result<Option<DfsMetadataJournalBatch>, DfsError> {
         let Some(backend) = self.metadata_backend.as_ref() else {
             return Ok(None);
         };
@@ -440,8 +469,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .journal_batch_for_shard_since_limited(
                 shard_id,
                 after_sequence,
-                DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
-                DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+                max_entries,
+                max_encoded_bytes,
             )
             .map_err(Into::into)
     }
@@ -491,6 +520,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 reason,
             });
         }
+
         if self.metadata_backend.is_none() {
             let reason = "local DFS metadata backend is not configured".to_string();
             self.send_metadata_journal_batch_rejection(
@@ -532,6 +562,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     next_after_sequence,
                     applied_entries: 0,
                     verified_prefix_only: true,
+                    verified_authority_probe_id: None,
                     result: DfsMetadataJournalBatchResult::Applied,
                 }),
             )?;
@@ -552,6 +583,44 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
         match backend.apply_journal_batch(&command.batch) {
             Ok(applied_entries) => {
+                let verified_authority_probe_id =
+                    if let Some(probe) = command.authority_probe.as_ref() {
+                        let verification =
+                            crate::service_replica::verify_persisted_metadata_authority_operation(
+                                backend.as_ref(),
+                                &probe.expected_shard,
+                                &probe.operation,
+                            )
+                            .and_then(|_| {
+                                backend
+                                    .put_metadata_authority_ack_floor(
+                                        &crate::DfsMetadataAuthorityAckFloor {
+                                            shard_id: shard_id.clone(),
+                                            journal_sequence: next_after_sequence,
+                                        },
+                                    )
+                                    .map_err(DfsError::from)
+                            });
+                        if let Err(error) = verification {
+                            let reason = error.to_string();
+                            self.send_metadata_journal_batch_rejection(
+                                &source_node_id,
+                                &command.request_id,
+                                &shard_id,
+                                next_after_sequence,
+                                &reason,
+                            )?;
+                            return Ok(NetworkedDfsServiceEvent::MetadataJournalBatchRejected {
+                                request_id: command.request_id,
+                                source_node_id,
+                                shard_id,
+                                reason,
+                            });
+                        }
+                        Some(probe.probe_id.clone())
+                    } else {
+                        None
+                    };
                 self.apply_metadata_journal_batch_to_service_state(&command.batch)?;
                 let _ = self.send_dfs_message_if_routable(
                     &source_node_id,
@@ -562,6 +631,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             next_after_sequence,
                             applied_entries,
                             verified_prefix_only: false,
+                            verified_authority_probe_id,
                             result: DfsMetadataJournalBatchResult::Applied,
                         },
                     ),
@@ -595,7 +665,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn verify_metadata_journal_prefix_probe(
-        &self,
+        &mut self,
         command: &DfsMetadataJournalBatchCommand,
     ) -> Result<Option<String>, DfsError> {
         let batch = &command.batch;
@@ -623,7 +693,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let backend = self
             .metadata_backend
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| DfsError::Metadata {
                 message: "metadata prefix proof requires a durable metadata backend".to_string(),
             })?;
@@ -633,6 +703,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             probe.journal_sequence,
         );
         if local_fingerprint.as_ref() == Ok(&probe.state_fingerprint) {
+            backend.put_metadata_prefix_ack_floor(&crate::DfsMetadataPrefixAckFloor {
+                shard_id: probe.shard_id.clone(),
+                journal_sequence: probe.journal_sequence,
+                state_fingerprint: probe.state_fingerprint.clone(),
+            })?;
             return Ok(None);
         }
         Ok(Some(format!(
@@ -657,6 +732,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 next_after_sequence,
                 applied_entries: 0,
                 verified_prefix_only: false,
+                verified_authority_probe_id: None,
                 result: DfsMetadataJournalBatchResult::Rejected {
                     reason: reason.to_string(),
                 },
@@ -672,14 +748,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<Option<String>, DfsError> {
         let batch = &command.batch;
         let Some(control_plane) = self.control_plane.as_mut() else {
-            return Ok(None);
+            return Ok(command.authority_probe.as_ref().map(|_| {
+                "metadata authority probe requires a committed control-plane shard view".to_string()
+            }));
         };
-        let file_system_id = metadata_journal_batch_file_system_id(batch).or_else(|| {
-            command
-                .prefix_probe
-                .as_ref()
-                .and_then(|probe| probe.file_system_id.clone())
-        });
+        let file_system_id = metadata_journal_batch_file_system_id(batch)
+            .or_else(|| {
+                command
+                    .prefix_probe
+                    .as_ref()
+                    .and_then(|probe| probe.file_system_id.clone())
+            })
+            .or_else(|| {
+                command
+                    .authority_probe
+                    .as_ref()
+                    .map(|probe| probe.expected_shard.file_system_id.clone())
+            });
         let Some(file_system_id) = file_system_id else {
             return Ok(None);
         };
@@ -696,6 +781,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 "metadata journal source {source_node_id} is not shard {} primary {}",
                 shard.shard_id, shard.primary_node_id
             )));
+        }
+        if let Some(probe) = command.authority_probe.as_ref() {
+            if command.verify_prefix_only
+                || command.prefix_probe.is_some()
+                || batch.entries.is_empty()
+                || probe.probe_id.is_empty()
+                || probe.expected_shard != shard
+                || !crate::service_replica::metadata_authority_operation_is_well_formed_for_shard(
+                    &probe.operation,
+                    &shard,
+                )
+                || crate::service_replica::metadata_authority_operation_prepare_sequence(
+                    &probe.operation,
+                ) != batch.next_after_sequence
+            {
+                return Ok(Some(format!(
+                    "metadata authority probe does not match the exact committed assignment for shard {} epoch {}",
+                    shard.shard_id, shard.epoch
+                )));
+            }
+            if !shard.replica_node_ids.contains(&self.node_id) {
+                return Ok(Some(format!(
+                    "local node {} is not a configured replica for metadata shard {}",
+                    self.node_id, shard.shard_id
+                )));
+            }
         }
         if command.verify_prefix_only
             && command

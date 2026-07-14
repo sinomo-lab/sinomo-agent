@@ -23,13 +23,15 @@ use crate::{
     AsyncDfsMessageTransport, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES,
     DfsDirectReadClientBodyResponse, DfsDirectReadClientBodyResult, DfsDirectReadRequest, DfsError,
     DfsMessageCommand, DfsMessageProcessResult, DfsMessageResponse, DfsMessageTransport,
-    DfsMessageTransportFuture, DfsNetworkMessage, DfsOutboundBody, DfsReadData, DfsReadResponse,
-    DfsReadResult, DfsRoutedMessage, DfsTransportIdentity, DistributedRepairJob,
-    NetworkedDfsService, NetworkedDfsServiceEvent, decode_dfs_message_rpc_response,
-    dfs_direct_read_request_from_read_request, dfs_direct_read_response_from_rpc_session_result,
-    dfs_direct_read_rpc_request, dfs_message_is_read_only_request, dfs_message_rpc_request,
-    dfs_network_message_allows_write_repair_progress, dfs_perf_trace, dfs_perf_trace_enabled,
-    retained_networked_dfs_service_events,
+    DfsMessageTransportFuture, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
+    DfsNetworkMessage, DfsOutboundBody, DfsReadData, DfsReadResponse, DfsReadResult,
+    DfsRoutedMessage, DfsTransportIdentity, DistributedRepairJob, NetworkedDfsService,
+    NetworkedDfsServiceEvent, decode_dfs_message_rpc_response,
+    decode_dfs_metadata_journal_batch_rpc_response, dfs_direct_read_request_from_read_request,
+    dfs_direct_read_response_from_rpc_session_result, dfs_direct_read_rpc_request,
+    dfs_message_is_read_only_request, dfs_message_rpc_request,
+    dfs_metadata_journal_batch_rpc_request, dfs_network_message_allows_write_repair_progress,
+    dfs_perf_trace, dfs_perf_trace_enabled, retained_networked_dfs_service_events,
 };
 #[cfg(test)]
 use crate::{
@@ -283,6 +285,7 @@ pub(crate) fn async_dfs_message_sender_from_peer_transport(
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
             let call = if let Some((head, descriptor, bytes)) =
                 crate::body_rpc::split_dfs_message_request_body(command)
+                    .map_err(|source| DfsPeerTransportError::new(source.to_string()))?
             {
                 let request = crate::body_rpc::encode_dfs_body_message_rpc_request(
                     &request, head, descriptor,
@@ -415,6 +418,7 @@ pub(crate) fn dfs_message_sender_from_peer_transport(
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
         let call = if let Some((head, descriptor, bytes)) =
             crate::body_rpc::split_dfs_message_request_body(command)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?
         {
             let request =
                 crate::body_rpc::encode_dfs_body_message_rpc_request(&request, head, descriptor)
@@ -530,6 +534,21 @@ impl std::fmt::Debug for DfsNodeTransport {
 }
 
 impl DfsNodeTransport {
+    /// Fork the transport state for one independent read-only request.
+    ///
+    /// Sender and peer-transport handles are intentionally shared: they are
+    /// thread-safe connection/routing capabilities. Per-service response
+    /// queues, detached sends, and operation deadlines must not be shared or
+    /// copied into the fork, otherwise an opened-file read could consume a
+    /// response owned by the mutable mounted service (or vice versa).
+    pub(crate) fn fork_read_only_request(&self) -> Self {
+        let mut fork = self.clone();
+        fork.incoming_messages.clear();
+        fork.detached_sends = Arc::new(std::sync::Mutex::new(Vec::new()));
+        fork.operation_deadline = None;
+        fork
+    }
+
     #[cfg(test)]
     pub(crate) fn new(
         local_node_id: NodeId,
@@ -1573,6 +1592,115 @@ impl DfsMessageTransport for DfsNodeTransport {
         self.send_routed_message_to_peer_detached(target_node_id, message, true)
     }
 
+    fn send_metadata_journal_batch_direct(
+        &mut self,
+        target_node_id: &NodeId,
+        command: &DfsMetadataJournalBatchCommand,
+    ) -> Result<Option<DfsMetadataJournalBatchResponse>, NetworkError> {
+        if target_node_id == &self.local_node_id
+            || !self.known_remote_nodes.contains(target_node_id)
+        {
+            return Err(NetworkError::UnknownNode {
+                node_id: target_node_id.clone(),
+            });
+        }
+        let Some(peer_transport) = self.peer_transport.as_ref().cloned() else {
+            return Ok(None);
+        };
+        let request = dfs_metadata_journal_batch_rpc_request(command)?;
+        let options = self.current_send_options(format!(
+            "send direct DFS metadata journal batch to {target_node_id}"
+        ))?;
+        let response = peer_transport
+            .call_object_rpc(target_node_id, &request, options)
+            .map_err(|source| NetworkError::Io {
+                operation: format!("send direct DFS metadata journal batch to {target_node_id}"),
+                detail: source.to_string(),
+            })?;
+        let response = decode_dfs_metadata_journal_batch_rpc_response(&response)?;
+        if response.request_id != command.request_id
+            || response.shard_id != command.batch.shard_id
+            || response.next_after_sequence != command.batch.next_after_sequence
+        {
+            return Err(NetworkError::Serialization {
+                detail: format!(
+                    "{target_node_id} returned mismatched direct metadata journal response"
+                ),
+            });
+        }
+        Ok(Some(response))
+    }
+
+    fn send_metadata_journal_batches_direct(
+        &mut self,
+        requests: &[(NodeId, DfsMetadataJournalBatchCommand)],
+    ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
+        let Some(peer_transport) = self.peer_transport.as_ref().cloned() else {
+            return Ok(None);
+        };
+        let mut prepared = Vec::with_capacity(requests.len());
+        for (target_node_id, command) in requests {
+            if target_node_id == &self.local_node_id
+                || !self.known_remote_nodes.contains(target_node_id)
+            {
+                return Err(NetworkError::UnknownNode {
+                    node_id: target_node_id.clone(),
+                });
+            }
+            prepared.push((
+                target_node_id.clone(),
+                command.request_id.clone(),
+                command.batch.shard_id.clone(),
+                command.batch.next_after_sequence,
+                dfs_metadata_journal_batch_rpc_request(command)?,
+                self.current_send_options(format!(
+                    "send direct DFS metadata journal batch to {target_node_id}"
+                ))?,
+            ));
+        }
+        let responses = std::thread::scope(|scope| {
+            let handles = prepared
+                .into_iter()
+                .map(|(target_node_id, request_id, shard_id, sequence, request, options)| {
+                    let peer_transport = Arc::clone(&peer_transport);
+                    scope.spawn(move || {
+                        let rpc_response = peer_transport
+                            .call_object_rpc(&target_node_id, &request, options)
+                            .map_err(|source| NetworkError::Io {
+                                operation: format!(
+                                    "send direct DFS metadata journal batch to {target_node_id}"
+                                ),
+                                detail: source.to_string(),
+                            })?;
+                        let response =
+                            decode_dfs_metadata_journal_batch_rpc_response(&rpc_response)?;
+                        if response.request_id != request_id
+                            || response.shard_id != shard_id
+                            || response.next_after_sequence != sequence
+                        {
+                            return Err(NetworkError::Serialization {
+                                detail: format!(
+                                    "{target_node_id} returned mismatched direct metadata journal response"
+                                ),
+                            });
+                        }
+                        Ok((target_node_id, response))
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut responses = Vec::with_capacity(handles.len());
+            for handle in handles {
+                let response = handle.join().map_err(|_| NetworkError::Io {
+                    operation: "join direct DFS metadata authority fan-out".to_string(),
+                    detail: "metadata authority worker panicked".to_string(),
+                })??;
+                responses.push(response);
+            }
+            Ok::<_, NetworkError>(responses)
+        })?;
+        Ok(Some(responses))
+    }
+
     fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
         Ok(self.incoming_messages.drain(..).collect())
     }
@@ -2049,10 +2177,12 @@ impl DfsNodeServedMessageTransport {
         peer_transport: Arc<dyn DfsPeerTransport>,
         connect_timeout: Duration,
     ) -> Self {
+        let message_peer_transport = Arc::clone(&peer_transport);
         Self::new_with_message_sender_for_nodes(
             local_node_id,
             peer_node_ids,
-            dfs_message_sender_from_peer_transport(peer_transport),
+            dfs_message_sender_from_peer_transport(message_peer_transport),
+            Some(peer_transport),
             connect_timeout,
         )
     }
@@ -2068,6 +2198,7 @@ impl DfsNodeServedMessageTransport {
             local_node_id,
             peer_node_ids,
             sender,
+            None,
             connect_timeout,
         )
     }
@@ -2076,6 +2207,7 @@ impl DfsNodeServedMessageTransport {
         local_node_id: NodeId,
         peer_node_ids: impl IntoIterator<Item = NodeId>,
         sender: DfsMessageSender,
+        peer_transport: Option<Arc<dyn DfsPeerTransport>>,
         connect_timeout: Duration,
     ) -> Self {
         let node_transport = DfsNodeTransport::with_senders_for_nodes(
@@ -2087,7 +2219,7 @@ impl DfsNodeServedMessageTransport {
             None,
             None,
             None,
-            None,
+            peer_transport,
             None,
         );
         Self {
@@ -2199,6 +2331,23 @@ impl DfsMessageTransport for DfsNodeServedMessageTransport {
         }
         self.node_transport
             .send_routed_message_body_to_peer(target_node_id, message, body, true)
+    }
+
+    fn send_metadata_journal_batch_direct(
+        &mut self,
+        target_node_id: &NodeId,
+        command: &DfsMetadataJournalBatchCommand,
+    ) -> Result<Option<DfsMetadataJournalBatchResponse>, NetworkError> {
+        self.node_transport
+            .send_metadata_journal_batch_direct(target_node_id, command)
+    }
+
+    fn send_metadata_journal_batches_direct(
+        &mut self,
+        requests: &[(NodeId, DfsMetadataJournalBatchCommand)],
+    ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
+        self.node_transport
+            .send_metadata_journal_batches_direct(requests)
     }
 
     fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {

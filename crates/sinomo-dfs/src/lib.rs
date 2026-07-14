@@ -80,6 +80,7 @@ mod service_namespace_coordination;
 mod service_outbound;
 mod service_ownership;
 mod service_posix_coordination;
+mod service_prepare_recovery;
 mod service_protocol;
 mod service_read;
 mod service_read_transfer;
@@ -123,9 +124,11 @@ pub use content_store::{
 pub use control_plane::{
     AsyncDfsControlPlaneKvClient, DfsControlPlaneAsyncStore, DfsControlPlaneKvClient,
     DfsControlPlaneKvFuture, DfsControlPlaneStore, DfsFileSystemConfig, DfsMetadataShardAssignment,
-    DfsMetadataShardConfig, DfsMetadataShardHeadWatermark, SharedDfsControlPlaneKvClient,
-    file_system_config_key, metadata_shard_authority_barrier_key,
-    metadata_shard_head_watermark_key, metadata_shard_key, metadata_shards_prefix,
+    DfsMetadataShardConfig, DfsMetadataShardHeadWatermark, DfsMetadataShardMembershipHandoff,
+    DfsMetadataShardMembershipHandoffFence, DfsMetadataShardMembershipHandoffProof,
+    SharedDfsControlPlaneKvClient, file_system_config_key, metadata_shard_authority_barrier_key,
+    metadata_shard_head_watermark_key, metadata_shard_key, metadata_shard_membership_handoff_key,
+    metadata_shard_membership_handoff_proof_key, metadata_shards_prefix,
 };
 #[cfg(test)]
 pub(crate) use default_cluster::run_default_cluster_dfs_smoke;
@@ -238,7 +241,7 @@ pub use message_transport::{
     AsyncDfsMessageTransport, DfsMessageTransport, DfsMessageTransportFuture, DfsOutboundBody,
     DfsTransportIdentity,
 };
-pub use metadata_api::DfsMetadataBackend;
+pub use metadata_api::{DfsMetadataBackend, DfsMetadataShardWriteFreeze};
 pub use metadata_backend::LocalSobjMetadataBackend;
 pub use metadata_error::MetadataBackendError;
 pub use metadata_limits::{
@@ -248,17 +251,19 @@ pub use metadata_records::{
     DfsConflictPage, DfsConflictPageCursor, DfsConflictRecord, DfsConflictScanCursor,
     DfsConflictScanPage, DfsConflictStatus, DfsDentryPageCursor, DfsDirFragmentId,
     DfsDirFragmentRecord, DfsDirectoryPage, DfsDirectoryPageCursor, DfsInodeId, DfsInodeRecord,
-    DfsMetadataJournalBatch, DfsMetadataJournalEntry, DfsMetadataMutation,
-    DfsMetadataPrefixAckFloor, DfsMetadataReplayCursorStatus, DfsMetadataReplicaLagStatus,
-    DfsMetadataShardId, DfsMetadataShardMigrationReport, DfsMetadataShardStatus,
-    DfsMetadataSubscription, DfsMetadataSummary, DfsMetadataTableSnapshot, DfsNamespaceJobFrame,
-    DfsNamespaceJobKind, DfsNamespaceJobPage, DfsNamespaceJobPageCursor, DfsNamespaceJobRecord,
-    DfsNamespaceJobStatus, DfsNamespaceTransaction, DfsObjectPage, DfsObjectPageCursor,
-    DfsObjectVersionPage, DfsObjectVersionPageCursor, DfsObjectVersionRecord,
-    DfsObjectVersionScanCursor, DfsObjectVersionScanPage, DfsPathRecord, DfsReplicaReceiptPage,
-    DfsReplicaReceiptPageCursor, DfsReplicaReceiptRecord, DfsReplicaReceiptScanCursor,
-    DfsReplicaReceiptScanPage, DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport,
-    DfsWriteIntentPage, DfsWriteIntentPageCursor, DfsWriteIntentRecord, DfsWriteIntentScanCursor,
+    DfsMetadataAuthorityAckFloor, DfsMetadataJournalBatch, DfsMetadataJournalEntry,
+    DfsMetadataMutation, DfsMetadataPrefixAckFloor, DfsMetadataReplayCursorStatus,
+    DfsMetadataReplicaLagStatus, DfsMetadataShardId, DfsMetadataShardMigrationReport,
+    DfsMetadataShardStatus, DfsMetadataSubscription, DfsMetadataSummary, DfsMetadataTableSnapshot,
+    DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobPage, DfsNamespaceJobPageCursor,
+    DfsNamespaceJobRecord, DfsNamespaceJobStatus, DfsNamespaceObjectVersionExpectation,
+    DfsNamespacePathOccupantExpectation, DfsNamespacePrepareRecord, DfsNamespacePrepareStatus,
+    DfsNamespaceTransaction, DfsObjectPage, DfsObjectPageCursor, DfsObjectVersionPage,
+    DfsObjectVersionPageCursor, DfsObjectVersionRecord, DfsObjectVersionScanCursor,
+    DfsObjectVersionScanPage, DfsPathRecord, DfsReplicaReceiptPage, DfsReplicaReceiptPageCursor,
+    DfsReplicaReceiptRecord, DfsReplicaReceiptScanCursor, DfsReplicaReceiptScanPage,
+    DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport, DfsWriteIntentPage,
+    DfsWriteIntentPageCursor, DfsWriteIntentRecord, DfsWriteIntentScanCursor,
     DfsWriteIntentScanPage, DfsWriteIntentStatus,
 };
 pub(crate) use metadata_records::{
@@ -332,9 +337,9 @@ pub use module_surface::{
     dfs_module_id, dfs_module_registration, dfs_module_surfaces, register_storage_paths,
 };
 pub use mounted_sifs::{
-    MountedSifsService, OpenedMountedSifsService, discover_mounted_sifs_content_replica_candidates,
-    open_mounted_sifs_service, open_mounted_sifs_service_with_cancellation,
-    open_mounted_sifs_service_with_peer_transports,
+    MountedSifsContentReadContext, MountedSifsService, OpenedMountedSifsService,
+    discover_mounted_sifs_content_replica_candidates, open_mounted_sifs_service,
+    open_mounted_sifs_service_with_cancellation, open_mounted_sifs_service_with_peer_transports,
     open_mounted_sifs_service_with_peer_transports_and_default_control_plane,
 };
 pub use namespace::{
@@ -380,17 +385,19 @@ pub use posix_model::{
 };
 pub use protocol::{
     DfsBlobTransferResult, DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest,
-    DfsBulkReadResponse, DfsCommitVersionCommand, DfsCommitVersionResponse, DfsDirectReadRequest,
-    DfsDistributedWriteCommand, DfsDistributedWriteResponse, DfsDistributedWriteResult,
-    DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResult, DfsMessageCommand,
-    DfsMessageResponse, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
-    DfsMetadataJournalBatchResult, DfsMetadataPrefixProbe, DfsMetadataSnapshotInstallCommand,
-    DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult, DfsNamespaceCommand,
-    DfsNamespaceOperation, DfsNamespacePosixError, DfsNamespaceResponse, DfsNamespaceResult,
-    DfsNamespaceShardCursor, DfsNetworkMessage, DfsPosixCoordinationResult, DfsReadData,
-    DfsReadRangeData, DfsReadRequest, DfsReadResponse, DfsReadResult, DfsRepairReplicaCommand,
-    DfsRepairReplicaResponse, DfsRoutedMessage, DfsStageBlobCommand, DfsStageBlobResponse,
-    DfsStagePatchCommand, DfsWriteCommand, DfsWriteResponse, DfsWriteResult,
+    DfsBulkReadResponse, DfsCanonicalAuthorization, DfsCommitVersionCommand,
+    DfsCommitVersionResponse, DfsDirectReadRequest, DfsDistributedWriteCommand,
+    DfsDistributedWriteResponse, DfsDistributedWriteResult, DfsFetchBlobCommand,
+    DfsFetchBlobResponse, DfsFetchBlobResult, DfsMessageCommand, DfsMessageResponse,
+    DfsMetadataAuthorityOperation, DfsMetadataAuthorityProbe, DfsMetadataJournalBatchCommand,
+    DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataPrefixProbe,
+    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
+    DfsMetadataSnapshotInstallResult, DfsNamespaceCommand, DfsNamespaceOperation,
+    DfsNamespacePosixError, DfsNamespaceResponse, DfsNamespaceResult, DfsNamespaceShardCursor,
+    DfsNetworkMessage, DfsPosixCoordinationResult, DfsReadData, DfsReadRangeData, DfsReadRequest,
+    DfsReadResponse, DfsReadResult, DfsRepairReplicaCommand, DfsRepairReplicaResponse,
+    DfsRoutedMessage, DfsStageBlobCommand, DfsStageBlobResponse, DfsStagePatchCommand,
+    DfsWriteCommand, DfsWriteResponse, DfsWriteResult,
 };
 pub use renewable_lease::{
     DEFAULT_DFS_RENEWABLE_LEASE_RELEASE_TIMEOUT, DfsRenewableExclusiveLease,
@@ -453,18 +460,19 @@ pub use service::{
     DfsDataPlaneService, DfsService, register_data_plane_services, register_services,
 };
 pub(crate) use service_state::{
-    ActiveReplicaStage, CachedSifsMetadataShards, DFS_BLOB_INLINE_LIMIT_BYTES,
-    DFS_CONFLICT_SCAN_PAGE_SIZE, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES,
-    DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT, DFS_MAX_NESTED_NAMESPACE_COORDINATION_DEPTH,
-    DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE, DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
-    DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE, DFS_METADATA_OBJECT_VERSION_PAGE_SIZE,
-    DFS_REMOTE_READ_RETRY_DELAY, DFS_ROUTED_NAMESPACE_IDLE_WAIT,
-    DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT, DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
+    ActiveReplicaStage, DFS_BLOB_INLINE_LIMIT_BYTES, DFS_CONFLICT_SCAN_PAGE_SIZE,
+    DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES, DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT,
+    DFS_MAX_NESTED_NAMESPACE_COORDINATION_DEPTH, DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE,
+    DFS_METADATA_OBJECT_INTENT_PAGE_SIZE, DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
+    DFS_METADATA_OBJECT_VERSION_PAGE_SIZE, DFS_REMOTE_READ_RETRY_DELAY,
+    DFS_ROUTED_NAMESPACE_IDLE_WAIT, DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT,
+    DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BYTE_LIMIT,
+    DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_ENTRY_LIMIT, DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
     DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT, DFS_ROUTED_WRITE_RESPONSE_JOURNAL_BATCH_LIMIT,
     NetworkedDfsRangeReadStream, NetworkedDfsRangeReadStreamOutcome, NetworkedDfsReadStream,
-    NetworkedDfsReadStreamOutcome, PendingMetadataReplication, PendingRemoteWriteResponse,
-    PendingRoutedNamespaceOp, PendingRoutedNamespaceResult, PendingRoutedWrite,
-    StageBlobSendOutcome, retained_networked_dfs_service_events,
+    NetworkedDfsReadStreamOutcome, PendingMetadataAuthorityProbe, PendingMetadataReplication,
+    PendingRemoteWriteResponse, PendingRoutedNamespaceOp, PendingRoutedNamespaceResult,
+    PendingRoutedWrite, StageBlobSendOutcome, retained_networked_dfs_service_events,
 };
 pub use service_state::{
     DFS_ROUTED_NAMESPACE_OP_TIMEOUT, DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT, DfsCancellationFlag,

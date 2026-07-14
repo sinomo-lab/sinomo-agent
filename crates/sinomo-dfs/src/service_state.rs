@@ -56,6 +56,14 @@ pub(crate) const DFS_ROUTED_WRITE_RESPONSE_JOURNAL_BATCH_LIMIT: usize = 1;
 /// additional journal batches with bounded SyncPath rounds, so keep the first
 /// response small enough to return promptly on deep real-cluster journals.
 pub const DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT: usize = 1;
+/// Maximum journal entries packed into one foreground namespace response
+/// batch. Namespace catch-up is latency-sensitive and benefits from denser
+/// packing than ordinary replication, while the encoded-byte cap below keeps
+/// the response bounded.
+pub(crate) const DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_ENTRY_LIMIT: usize = 2048;
+/// Maximum encoded bytes in one foreground namespace response journal batch.
+pub(crate) const DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BYTE_LIMIT: usize =
+    crate::DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT;
 pub(crate) const DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT: usize = 3;
 pub(crate) const DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT: u64 = DFS_BLOB_INLINE_LIMIT_BYTES as u64;
 pub(crate) const DFS_ROUTED_NAMESPACE_IDLE_WAIT: Duration = Duration::from_millis(10);
@@ -70,21 +78,37 @@ pub(crate) const DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES: usize = 64;
 /// service's distributed wait/retry loops observe the flag and return
 /// [`DfsError::Cancelled`] instead of running out their full network timeouts.
 #[derive(Clone, Debug, Default)]
-pub struct DfsCancellationFlag(Arc<AtomicBool>);
+pub struct DfsCancellationFlag {
+    local: Arc<AtomicBool>,
+    inherited: Arc<[DfsCancellationFlag]>,
+}
 
 impl DfsCancellationFlag {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Create a cancellation source which also observes every supplied source.
+    ///
+    /// The returned handle retains its own independently cancellable bit. This
+    /// lets a mount add lifecycle cancellation without discarding a caller's
+    /// pre-existing operation cancellation source.
+    pub fn linked(inherited: impl IntoIterator<Item = DfsCancellationFlag>) -> DfsCancellationFlag {
+        Self {
+            local: Arc::new(AtomicBool::new(false)),
+            inherited: inherited.into_iter().collect::<Vec<_>>().into(),
+        }
+    }
+
     /// Request cancellation. Idempotent; already-running local work finishes,
     /// distributed waits and retries stop at their next flag check.
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.local.store(true, Ordering::Release);
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.local.load(Ordering::Acquire)
+            || self.inherited.iter().any(DfsCancellationFlag::is_cancelled)
     }
 }
 
@@ -99,7 +123,6 @@ pub struct NetworkedDfsService<T> {
     pub(crate) content: LocalContentStore,
     pub(crate) coordinator: DistributedEventualCoordinator,
     pub(crate) control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
-    pub(crate) cached_sifs_metadata_shards: Option<CachedSifsMetadataShards>,
     pub(crate) metadata_backend: Option<Box<dyn DfsMetadataBackend>>,
     pub(crate) metadata_lookup_cache:
         Mutex<BTreeMap<(DfsFileSystemId, String), Option<DfsObjectMetadata>>>,
@@ -115,6 +138,8 @@ pub struct NetworkedDfsService<T> {
     pub(crate) recent_namespace_freshness_syncs:
         BTreeMap<(DfsFileSystemId, DfsMetadataShardId, NodeId), Instant>,
     pub(crate) pending_metadata_replications: BTreeMap<String, PendingMetadataReplication>,
+    pub(crate) pending_metadata_authority_probes: BTreeMap<String, PendingMetadataAuthorityProbe>,
+    pub(crate) metadata_authority_probe_results: BTreeMap<String, bool>,
     pub(crate) pending_routed_writes: BTreeMap<String, PendingRoutedWrite>,
     pub(crate) pending_remote_write_responses: BTreeMap<String, PendingRemoteWriteResponse>,
     pub(crate) deferred_routed_create_parent_touches: BTreeSet<String>,
@@ -367,6 +392,13 @@ pub(crate) struct PendingMetadataReplication {
     pub(crate) next_after_sequence: u64,
     pub(crate) verify_prefix_only: bool,
     pub(crate) created_at: Instant,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PendingMetadataAuthorityProbe {
+    pub(crate) target_node_id: NodeId,
+    pub(crate) probe_id: String,
+    pub(crate) expected_shard: DfsMetadataShardConfig,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -643,10 +675,4 @@ pub(crate) struct ActiveReplicaStage {
     pub(crate) version: DfsVersion,
     pub(crate) content_hash: String,
     pub(crate) requester_node_id: NodeId,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct CachedSifsMetadataShards {
-    pub(crate) recorded_at: Instant,
-    pub(crate) shards: Vec<DfsMetadataShardConfig>,
 }

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
+use crate::{DfsFileSystemId, DfsMetadataShardId, DfsObjectId, DfsVersion};
 
 /// Error returned by DFS metadata backends and metadata helper modules.
 #[derive(Debug, Error)]
@@ -23,6 +23,11 @@ pub enum MetadataBackendError {
     UnknownObject { object_id: DfsObjectId },
     #[error("invalid advisory-lock transition: {0}")]
     AdvisoryLock(String),
+    #[error("metadata shard {shard_id:?} is frozen for pending membership handoff {handoff_id}")]
+    MembershipHandoffFrozen {
+        shard_id: DfsMetadataShardId,
+        handoff_id: String,
+    },
     #[error(
         "metadata transaction conflict for object {object_id}: expected {expected}, current {current}"
     )]

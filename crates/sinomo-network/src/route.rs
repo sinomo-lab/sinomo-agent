@@ -17,6 +17,8 @@ use crate::{
     NetworkTimeoutPhase, ObjectRpcBodySource, ObjectRpcRequest, ObjectRpcResponse,
     ObjectRpcSessionCall, ObjectRpcSessionResult,
 };
+#[cfg(all(feature = "test-support", not(test)))]
+use sinomo_local::SinomoDataDir;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
@@ -438,6 +440,17 @@ pub struct RelayEnvelope {
     /// The original signed request to deliver at the target, re-injected through its
     /// normal auth + dispatch path (its own signature/invite-proof is carried within).
     pub(crate) inner: DaemonControlRequest,
+}
+
+/// Exact encoded sizes of the first signed object-RPC session control frame.
+///
+/// This is test support for callers that maintain an inline request-body
+/// budget below the transport's control-frame limit.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignedObjectRpcRequestHeadEncodedLengths {
+    pub direct: usize,
+    pub relayed: usize,
 }
 
 impl RelayEnvelope {
@@ -4484,6 +4497,59 @@ fn relay_request_for_signed_rpc_with_max_hop_timeout(
     }
     envelope.max_hop_timeout_ms = max_hop_timeout.map(duration_millis_u64);
     envelope.into_request()
+}
+
+/// Measures the production direct and relay request-head encodings without
+/// opening a transport. The relay measurement follows the same inner-sign,
+/// wrap, outer-prepare, and outer-sign sequence as cluster delivery.
+#[cfg(any(test, feature = "test-support"))]
+pub fn signed_object_rpc_request_head_encoded_lengths_for_test(
+    local_data_dir: &SinomoDataDir,
+    request: &ObjectRpcRequest,
+    cluster_id: &ClusterId,
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+    planned_path: &[NodeId],
+    target_endpoints: &[ClusterEndpointRecord],
+) -> Result<SignedObjectRpcRequestHeadEncodedLengths, NetworkError> {
+    let prepared_direct = ObjectRpcSessionCall::buffered(request.clone()).prepare_for_signing()?;
+    let direct_auth = crate::daemon_auth::sign_daemon_rpc_request_from_data_dir(
+        local_data_dir,
+        &prepared_direct.request,
+    )?;
+    let direct = crate::session::encoded_signed_request_head_len_for_test(
+        prepared_direct,
+        direct_auth,
+        local_data_dir,
+    )?;
+
+    let prepared_inner = ObjectRpcSessionCall::buffered(request.clone()).prepare_for_signing()?;
+    let inner_auth = crate::daemon_auth::sign_daemon_rpc_request_from_data_dir(
+        local_data_dir,
+        &prepared_inner.request,
+    )?;
+    let outer = relay_request_for_signed_rpc_with_max_hop_timeout(
+        cluster_id,
+        target_node_id,
+        &prepared_inner.request,
+        inner_auth,
+        std::iter::once(local_node_id.clone()),
+        planned_path,
+        target_endpoints,
+        Some(Duration::from_millis(u64::MAX)),
+    )?;
+    let prepared_outer = ObjectRpcSessionCall::buffered(outer).prepare_for_signing()?;
+    let outer_auth = crate::daemon_auth::sign_daemon_rpc_request_from_data_dir(
+        local_data_dir,
+        &prepared_outer.request,
+    )?;
+    let relayed = crate::session::encoded_signed_request_head_len_for_test(
+        prepared_outer,
+        outer_auth,
+        local_data_dir,
+    )?;
+
+    Ok(SignedObjectRpcRequestHeadEncodedLengths { direct, relayed })
 }
 
 fn duration_millis_u64(duration: Duration) -> u64 {

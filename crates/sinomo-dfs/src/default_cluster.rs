@@ -258,6 +258,22 @@ impl DfsControlPlaneDefaultClusterBootstrapHost {
                 }),
             };
         }
+        if let Some(current) = current.as_ref() {
+            let pending = control.begin_metadata_shard_membership_handoff(current, desired)?;
+            return Err(DfsError::Distributed {
+                message: if pending.is_some() {
+                    format!(
+                        "metadata shard {} membership change from epoch {} to {} is fenced and parked pending exact DFS catch-up of every retiring and desired member",
+                        desired.shard_id, current.epoch, desired.epoch
+                    )
+                } else {
+                    format!(
+                        "metadata shard {} changed concurrently while beginning its membership handoff; retry",
+                        desired.shard_id
+                    )
+                },
+            });
+        }
         if !control.compare_and_put_metadata_shard(current.as_ref(), desired)? {
             return Err(DfsError::Distributed {
                 message: format!(
@@ -351,6 +367,24 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
                     ),
                 }),
             };
+        }
+        if let Some(current) = current.as_ref() {
+            let pending = DfsControlPlaneAsyncStore::new(self.control_plane.as_mut())
+                .begin_metadata_shard_membership_handoff(current, desired)
+                .await?;
+            return Err(DfsError::Distributed {
+                message: if pending.is_some() {
+                    format!(
+                        "metadata shard {} membership change from epoch {} to {} is fenced and parked pending exact DFS catch-up of every retiring and desired member",
+                        desired.shard_id, current.epoch, desired.epoch
+                    )
+                } else {
+                    format!(
+                        "metadata shard {} changed concurrently while beginning its membership handoff; retry",
+                        desired.shard_id
+                    )
+                },
+            });
         }
         if !DfsControlPlaneAsyncStore::new(self.control_plane.as_mut())
             .compare_and_put_metadata_shard(current.as_ref(), desired)
@@ -1708,12 +1742,71 @@ mod tests {
             epoch: 2,
             ..same_epoch_overwrite
         };
-        host.put_metadata_shard(&next_epoch)
-            .expect("next epoch CAS");
+        assert!(matches!(
+            host.put_metadata_shard(&next_epoch),
+            Err(DfsError::Distributed { message })
+                if message.contains("current operation-bound DFS prefix fence")
+                    && message.contains("latest healthy full-shard write")
+        ));
         assert_eq!(
             host.current_metadata_shard(&file_system_id, "root")
                 .expect("read shard"),
-            Some(next_epoch)
+            Some(initial)
+        );
+    }
+
+    #[test]
+    fn control_plane_bootstrap_parks_same_primary_membership_until_dfs_handoff() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-bootstrap-membership-handoff");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let owner =
+            NodeId::from_legacy_named("node_dfs_bootstrap_membership_owner").expect("owner node");
+        let old_replica =
+            NodeId::from_legacy_named("node_dfs_bootstrap_membership_old").expect("old replica");
+        let new_replica =
+            NodeId::from_legacy_named("node_dfs_bootstrap_membership_new").expect("new replica");
+        let file_system_id =
+            DfsFileSystemId::from_legacy_named("bootstrap-membership-fs").expect("filesystem id");
+        let initial = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: vec![old_replica],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let desired = DfsMetadataShardConfig {
+            replica_node_ids: vec![new_replica],
+            epoch: 2,
+            ..initial.clone()
+        };
+        let mut host = DfsControlPlaneDefaultClusterBootstrapHost::new(
+            data_dir,
+            cluster_paths,
+            owner,
+            Box::new(sinomo_core::kv::InProcessKvStore::new()),
+        );
+        host.put_metadata_shard(&initial).expect("create shard");
+
+        assert!(matches!(
+            host.put_metadata_shard(&desired),
+            Err(DfsError::Distributed { message })
+                if message.contains("membership change")
+                    && message.contains("fenced and parked")
+                    && message.contains("exact DFS catch-up")
+        ));
+        assert_eq!(
+            host.current_metadata_shard(&file_system_id, "root")
+                .expect("read retiring shard"),
+            Some(initial)
+        );
+        assert!(
+            DfsControlPlaneStore::new(host.control_plane.as_mut())
+                .get_metadata_shard_membership_handoff(&file_system_id, "root")
+                .expect("read parked handoff")
+                .is_some()
         );
     }
 
@@ -1746,6 +1839,15 @@ mod tests {
         host.put_metadata_shard_async(initial.clone())
             .await
             .expect("create shard");
+        let same_epoch_overwrite = DfsMetadataShardConfig {
+            primary_node_id: replacement.clone(),
+            ..initial.clone()
+        };
+        assert!(matches!(
+            host.put_metadata_shard_async(same_epoch_overwrite).await,
+            Err(DfsError::Distributed { message })
+                if message.contains("stale metadata-shard bootstrap transition")
+        ));
         assert!(
             DfsControlPlaneAsyncStore::new(host.control_plane.as_mut())
                 .publish_metadata_shard_head_watermark(
@@ -1767,16 +1869,19 @@ mod tests {
             primary_node_id: replacement,
             replica_node_ids: vec![owner],
             epoch: 2,
-            ..initial
+            ..initial.clone()
         };
-        host.put_metadata_shard_async(next_epoch.clone())
-            .await
-            .expect("next epoch CAS");
+        assert!(matches!(
+            host.put_metadata_shard_async(next_epoch).await,
+            Err(DfsError::Distributed { message })
+                if message.contains("current operation-bound DFS prefix fence")
+                    && message.contains("latest healthy full-shard write")
+        ));
         assert_eq!(
             host.current_metadata_shard_async(file_system_id, "root".to_string())
                 .await
                 .expect("read shard"),
-            Some(next_epoch)
+            Some(initial)
         );
     }
 

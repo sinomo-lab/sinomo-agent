@@ -1210,6 +1210,15 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
     metadata_transport: &mut dyn DfsMetadataJournalReplicationTransport,
     options: DfsMaintenanceTickOptions,
 ) -> Result<DfsMaintenanceTickReport, DfsError> {
+    // A durable pending membership freeze deliberately rejects every
+    // authoritative metadata mutation. Reconcile it before namespace,
+    // conflict, intent, or lifecycle maintenance so a marker surviving restart
+    // cannot prevent the only production path that activates or rebinds its
+    // authority generation.
+    service.reconcile_pending_metadata_shard_membership_handoffs(
+        &metadata_shards,
+        options.metadata_replication.target_timeout,
+    )?;
     let namespace_jobs = service
         .posix_resume_namespace_jobs_bounded(
             options.namespace_job_max_jobs,
@@ -1237,12 +1246,11 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
     let metadata_replication = publish_dfs_metadata_journal_with_host(
         file_system_id,
         local_node_id,
-        metadata_shards,
+        metadata_shards.clone(),
         metadata_publisher_host,
         metadata_transport,
         options.metadata_replication,
     )?;
-
     Ok(DfsMaintenanceTickReport {
         namespace_jobs,
         conflicts,
@@ -1270,6 +1278,12 @@ pub async fn run_dfs_maintenance_tick_with_async_host<T>(
 where
     T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
 {
+    // Keep the async tick's safety ordering identical to the synchronous tick:
+    // handoff activation/rebind must precede every freeze-sensitive mutation.
+    service.reconcile_pending_metadata_shard_membership_handoffs(
+        &metadata_shards,
+        options.metadata_replication.target_timeout,
+    )?;
     let namespace_jobs = service
         .posix_resume_namespace_jobs_bounded(
             options.namespace_job_max_jobs,
@@ -1299,14 +1313,13 @@ where
     let metadata_replication = publish_dfs_metadata_journal_with_async_host(
         file_system_id,
         local_node_id,
-        metadata_shards,
+        metadata_shards.clone(),
         data_dir,
         metadata_publisher_host,
         metadata_transport,
         options.metadata_replication,
     )
     .await?;
-
     Ok(DfsMaintenanceTickReport {
         namespace_jobs,
         conflicts,

@@ -10,13 +10,14 @@ use sinomo_dfs::{
     DfsFileSystemId, DfsMessageTransport, DfsMetadataBackend, DfsMetadataMutation,
     DfsMetadataReplicationOutcome, DfsMetadataShardAssignment, DfsMetadataShardConfig,
     DfsMetadataShardHeadWatermark, DfsMetadataShardId, DfsNetworkMessage, DfsNodeAdvertisement,
-    DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsObjectVersionRecord, DfsOwnerHandoffOutcome,
-    DfsReadData, DfsReadResponse, DfsReadResult, DfsRepairReplicaCommand, DfsRepairReplicaResponse,
+    DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsObjectVersionRecord, DfsReadData,
+    DfsReadResponse, DfsReadResult, DfsRepairReplicaCommand, DfsRepairReplicaResponse,
     DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsRoutedMessage, DfsStageBlobCommand,
     DfsStageBlobResponse, DfsVersion, DfsWriteIntentState, DfsWriteIntentStatus,
     LocalSobjMetadataBackend, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
     NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
-    SharedDfsControlPlaneKvClient, file_system_config_key, sifs_node_files_path,
+    SharedDfsControlPlaneKvClient, file_system_config_key, metadata_shard_key,
+    sifs_node_files_path,
 };
 use std::fs;
 use std::io::{Read, Result as IoResult};
@@ -2195,15 +2196,41 @@ fn networked_dfs_uses_kv_only_for_control_plane_file_system_config() {
     let root = temp_root("networked_control_plane_config");
     let network = InProcessNetwork::new();
     let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: owner.clone(),
+        replica_node_ids: Vec::new(),
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    control_plane.with_client(|kv| {
+        DfsControlPlaneStore::new(kv)
+            .put_metadata_shard(&shard)
+            .expect("metadata shard config");
+    });
+    let owner_metadata =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("owner-metadata"))
+            .expect("owner metadata backend");
+    let replica_metadata = LocalSobjMetadataBackend::new(
+        DfsMetadataShardId::new("root"),
+        root.join("replica-metadata"),
+    )
+    .expect("replica metadata backend");
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
     )
-    .with_control_plane(control_plane.clone());
+    .with_control_plane(control_plane.clone())
+    .with_metadata_backend(owner_metadata)
+    .expect("owner metadata-backed service");
     let mut replica_dfs = NetworkedDfsService::new(
         network.add_node(replica.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
-    );
+    )
+    .with_metadata_backend(replica_metadata)
+    .expect("replica metadata-backed service");
     let file_system = DfsFileSystem {
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
@@ -2213,7 +2240,7 @@ fn networked_dfs_uses_kv_only_for_control_plane_file_system_config() {
     let metadata = DfsObjectMetadata {
         object_id: object_id.clone(),
         file_system_id: file_system_id.clone(),
-        path: "artifact.bin".to_string(),
+        path: "/artifact.bin".to_string(),
         kind: DfsObjectKind::Artifact,
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone()],
@@ -2287,7 +2314,13 @@ fn networked_dfs_uses_kv_only_for_control_plane_file_system_config() {
             .into_iter()
             .map(|entry| entry.key)
             .collect();
-        assert_eq!(dfs_keys, vec![file_system_config_key(&file_system_id)]);
+        assert_eq!(
+            dfs_keys,
+            vec![
+                file_system_config_key(&file_system_id),
+                metadata_shard_key(&file_system_id, "root"),
+            ]
+        );
     });
 
     cleanup(&root);
@@ -2299,6 +2332,25 @@ fn distributed_sifs_bootstrap_exposes_cluster_root_users_and_services_in_metadat
     let root = temp_root("distributed_sifs_bootstrap");
     let network = InProcessNetwork::new();
     let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    let file_system = sinomo_dfs::distributed_sifs(owner.clone());
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: owner.clone(),
+        replica_node_ids: Vec::new(),
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    control_plane.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&sinomo_dfs::DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        control
+            .put_metadata_shard(&shard)
+            .expect("metadata shard config");
+    });
     let backend =
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
             .expect("metadata backend");
@@ -2740,16 +2792,22 @@ fn networked_dfs_routes_non_primary_write_to_metadata_shard_primary() {
         root.join("primary-meta"),
     )
     .expect("primary metadata backend");
+    let writer_backend = LocalSobjMetadataBackend::new(
+        DfsMetadataShardId::new("services"),
+        root.join("writer-meta"),
+    )
+    .expect("writer metadata backend");
     let mut writer_dfs = NetworkedDfsService::new(
         network.add_node(writer.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("writer-content")).expect("writer content"),
     )
-    .with_control_plane(control_plane.clone());
+    .with_metadata_backend(writer_backend)
+    .expect("writer metadata backend");
     let mut primary_dfs = NetworkedDfsService::new(
         network.add_node(primary.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("primary-content")).expect("primary content"),
     )
-    .with_control_plane(control_plane)
+    .with_control_plane(control_plane.clone())
     .with_metadata_backend(primary_backend)
     .expect("primary metadata backend");
     let file_system = DfsFileSystem {
@@ -2789,6 +2847,7 @@ fn networked_dfs_routes_non_primary_write_to_metadata_shard_primary() {
     writer_dfs
         .add_object_metadata(object)
         .expect("writer object metadata");
+    writer_dfs = writer_dfs.with_control_plane(control_plane);
 
     let routed = writer_dfs
         .write_distributed_eventual(
@@ -2887,16 +2946,22 @@ fn networked_dfs_strict_routed_write_completion_resolves_remote_intent_alias() {
         root.join("primary-meta"),
     )
     .expect("primary metadata backend");
+    let writer_backend = LocalSobjMetadataBackend::new(
+        DfsMetadataShardId::new("services"),
+        root.join("writer-meta"),
+    )
+    .expect("writer metadata backend");
     let mut writer_dfs = NetworkedDfsService::new(
         network.add_node(writer.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("writer-content")).expect("writer content"),
     )
-    .with_control_plane(control_plane.clone());
+    .with_metadata_backend(writer_backend)
+    .expect("writer metadata backend");
     let mut primary_dfs = NetworkedDfsService::new(
         network.add_node(primary.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("primary-content")).expect("primary content"),
     )
-    .with_control_plane(control_plane)
+    .with_control_plane(control_plane.clone())
     .with_metadata_backend(primary_backend)
     .expect("primary metadata backend");
     let file_system = DfsFileSystem {
@@ -2936,6 +3001,7 @@ fn networked_dfs_strict_routed_write_completion_resolves_remote_intent_alias() {
     writer_dfs
         .add_object_metadata(object)
         .expect("writer object metadata");
+    writer_dfs = writer_dfs.with_control_plane(control_plane);
 
     let routed = writer_dfs
         .write_distributed_eventual(
@@ -3034,11 +3100,17 @@ fn routed_write_response_does_not_fail_when_requester_becomes_metadata_primary()
         root.join("primary-meta"),
     )
     .expect("primary metadata backend");
+    let writer_backend = LocalSobjMetadataBackend::new(
+        DfsMetadataShardId::new("services"),
+        root.join("writer-meta"),
+    )
+    .expect("writer metadata backend");
     let mut writer_dfs = NetworkedDfsService::new(
         network.add_node(writer.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("writer-content")).expect("writer content"),
     )
-    .with_control_plane(control_plane.clone());
+    .with_metadata_backend(writer_backend)
+    .expect("writer metadata backend");
     let mut primary_dfs = NetworkedDfsService::new(
         network.add_node(primary.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("primary-content")).expect("primary content"),
@@ -3083,6 +3155,7 @@ fn routed_write_response_does_not_fail_when_requester_becomes_metadata_primary()
     writer_dfs
         .add_object_metadata(object)
         .expect("writer object metadata");
+    writer_dfs = writer_dfs.with_control_plane(control_plane.clone());
 
     let routed = writer_dfs
         .write_distributed_eventual(
@@ -3197,16 +3270,22 @@ fn networked_dfs_routes_reader_write_to_metadata_primary_via_fetch() {
         root.join("primary-meta"),
     )
     .expect("primary metadata backend");
+    let writer_backend = LocalSobjMetadataBackend::new(
+        DfsMetadataShardId::new("services"),
+        root.join("writer-meta"),
+    )
+    .expect("writer metadata backend");
     let mut writer_dfs = NetworkedDfsService::new(
         network.add_node(writer.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("writer-content")).expect("writer content"),
     )
-    .with_control_plane(control_plane.clone());
+    .with_metadata_backend(writer_backend)
+    .expect("writer metadata backend");
     let mut primary_dfs = NetworkedDfsService::new(
         network.add_node(primary.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("primary-content")).expect("primary content"),
     )
-    .with_control_plane(control_plane)
+    .with_control_plane(control_plane.clone())
     .with_metadata_backend(primary_backend)
     .expect("primary metadata backend");
     let file_system = DfsFileSystem {
@@ -3246,6 +3325,7 @@ fn networked_dfs_routes_reader_write_to_metadata_primary_via_fetch() {
     writer_dfs
         .add_object_metadata(object)
         .expect("writer object metadata");
+    writer_dfs = writer_dfs.with_control_plane(control_plane);
 
     let byte_count = 65 * 1024 + 17;
     let routed = writer_dfs
@@ -3544,27 +3624,6 @@ fn networked_dfs_replicates_configured_metadata_shard_to_replicas() {
             .expect("metadata shard config");
     });
 
-    let owner_backend =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("owner-meta"))
-            .expect("owner metadata");
-    let replica_backend =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("replica-meta"))
-            .expect("replica metadata");
-    let mut owner_dfs = NetworkedDfsService::new(
-        network.add_node(owner.clone()),
-        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
-    )
-    .with_control_plane(control_plane.clone())
-    .with_metadata_backend(owner_backend)
-    .expect("owner metadata backend");
-    let mut replica_dfs = NetworkedDfsService::new(
-        network.add_node(replica.clone()),
-        sinomo_dfs::LocalContentStore::new(root.join("replica-content")).expect("replica content"),
-    )
-    .with_control_plane(control_plane)
-    .with_metadata_backend(replica_backend)
-    .expect("replica metadata backend");
-
     let file_system = DfsFileSystem {
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
@@ -3588,17 +3647,51 @@ fn networked_dfs_replicates_configured_metadata_shard_to_replicas() {
         modified_at_unix_nanos: 0,
         created_at_unix_nanos: 0,
         changed_at_unix_nanos: 0,
-        version,
+        version: version.clone(),
         policy: DfsObjectPolicy::ReplicatedEventual,
         created_by_event_id: None,
         last_modified_by_event_id: None,
     };
-    owner_dfs
-        .add_file_system(file_system)
+    // Seed the durable primary before attaching cluster authority. Otherwise
+    // each fixture mutation correctly performs healthy-path exact-shard
+    // replication and this explicit replication test observes those frames.
+    let mut owner_backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("owner-meta"))
+            .expect("owner metadata");
+    owner_backend
+        .put_file_system(&file_system)
         .expect("owner filesystem");
-    owner_dfs
-        .add_object_metadata(metadata.clone())
-        .expect("owner metadata");
+    owner_backend.put_object(&metadata).expect("owner metadata");
+    owner_backend
+        .put_version(&DfsObjectVersionRecord {
+            file_system_id: file_system_id.clone(),
+            object_id: object_id.clone(),
+            version,
+            content_hash: metadata.content_hash.clone(),
+            size_bytes: metadata.content_size_bytes,
+            locations: metadata.current_locations.clone(),
+            created_by_event_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            visible: true,
+        })
+        .expect("owner version");
+    let replica_backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("replica-meta"))
+            .expect("replica metadata");
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_control_plane(control_plane.clone())
+    .with_metadata_backend(owner_backend)
+    .expect("owner metadata backend");
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("replica-content")).expect("replica content"),
+    )
+    .with_control_plane(control_plane)
+    .with_metadata_backend(replica_backend)
+    .expect("replica metadata backend");
 
     let outcomes = owner_dfs
         .replicate_configured_metadata_shards(&file_system_id)
@@ -3613,16 +3706,19 @@ fn networked_dfs_replicates_configured_metadata_shard_to_replicas() {
         }]
     );
     let events = replica_dfs.process_incoming().expect("replica incoming");
-    assert!(events.iter().any(|event| {
-        matches!(
-            event,
-            NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
-                source_node_id,
-                applied_entries: 3,
-                ..
-            } if source_node_id == &owner
-        )
-    }));
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
+                    source_node_id,
+                    applied_entries: 3,
+                    ..
+                } if source_node_id == &owner
+            )
+        }),
+        "configured metadata replica events: {events:?}"
+    );
     assert_eq!(
         replica_dfs
             .metadata_backend()
@@ -10565,7 +10661,6 @@ fn networked_dfs_owner_handoff_requires_latest_content_and_routes_old_owner() {
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
     let object_id = DfsObjectId::from_legacy_named("obj_artifact").expect("object");
     let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
-    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let root = temp_root("networked_owner_handoff");
     let network = InProcessNetwork::new();
     let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
@@ -10587,12 +10682,23 @@ fn networked_dfs_owner_handoff_requires_latest_content_and_routes_old_owner() {
         network.add_node(owner.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
     )
-    .with_control_plane(control_plane.clone());
+    .with_metadata_backend(
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("owner-metadata"))
+            .expect("owner metadata backend"),
+    )
+    .expect("owner metadata-backed service");
     let mut candidate_dfs = NetworkedDfsService::new(
         network.add_node(candidate.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("candidate")).expect("candidate store"),
     )
-    .with_control_plane(control_plane.clone());
+    .with_metadata_backend(
+        LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            root.join("candidate-metadata"),
+        )
+        .expect("candidate metadata backend"),
+    )
+    .expect("candidate metadata-backed service");
     let file_system = DfsFileSystem {
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
@@ -10602,7 +10708,7 @@ fn networked_dfs_owner_handoff_requires_latest_content_and_routes_old_owner() {
     let metadata = DfsObjectMetadata {
         object_id: object_id.clone(),
         file_system_id: file_system_id.clone(),
-        path: "artifact.bin".to_string(),
+        path: "/artifact.bin".to_string(),
         kind: DfsObjectKind::Artifact,
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone(), candidate.clone()],
@@ -10633,6 +10739,11 @@ fn networked_dfs_owner_handoff_requires_latest_content_and_routes_old_owner() {
     candidate_dfs
         .put_local_object_version(metadata, b"handoff bytes")
         .expect("candidate content");
+    // The fixture models an already durable object joining a configured
+    // cluster. Once the control plane is attached, every new publication must
+    // use the canonical distributed write path.
+    owner_dfs = owner_dfs.with_control_plane(control_plane.clone());
+    candidate_dfs = candidate_dfs.with_control_plane(control_plane.clone());
     control_plane.with_client(|kv| {
         assert!(
             DfsControlPlaneStore::new(kv)
@@ -10652,29 +10763,22 @@ fn networked_dfs_owner_handoff_requires_latest_content_and_routes_old_owner() {
         );
     });
 
-    let handoff = candidate_dfs
+    let handoff_error = candidate_dfs
         .handoff_object_owner(&object_id, "root", 7)
-        .expect("handoff");
+        .expect_err("KV-only owner handoff must fail closed");
     assert!(
-        matches!(
-            &handoff,
-            DfsOwnerHandoffOutcome::Transferred {
-                previous_owner_node_id,
-                new_owner_node_id,
-                previous_epoch: 7,
-                new_epoch: 8,
-                ..
-            } if previous_owner_node_id == &owner && new_owner_node_id == &candidate
-        ),
-        "unexpected owner handoff outcome: {handoff:?}"
+        handoff_error
+            .to_string()
+            .contains("operation-bound DFS prefix fence"),
+        "unexpected owner handoff error: {handoff_error}"
     );
     control_plane.with_client(|kv| {
         let shard = DfsControlPlaneStore::new(kv)
             .get_metadata_shard(&file_system_id, "root")
             .expect("shard")
             .expect("shard");
-        assert_eq!(shard.primary_node_id, candidate);
-        assert_eq!(shard.epoch, 8);
+        assert_eq!(shard.primary_node_id, owner);
+        assert_eq!(shard.epoch, 7);
     });
     assert_eq!(
         candidate_dfs
@@ -10682,55 +10786,16 @@ fn networked_dfs_owner_handoff_requires_latest_content_and_routes_old_owner() {
             .object(&object_id)
             .expect("candidate object")
             .owner_node_id,
-        candidate
+        owner
     );
-
-    assert!(matches!(
+    assert_eq!(
         owner_dfs
-            .write_distributed_eventual(
-                DfsWriteRequest {
-                    file_system_id,
-                    object_id: object_id.clone(),
-                    target_version: version_2,
-                    requesting_node_id: owner.clone(),
-                },
-                b"routed after handoff bytes".to_vec(),
-                vec![candidate.clone()],
-                DfsReplicationPolicy::new(1, 1).expect("policy"),
-            )
-            .expect("old owner routed write"),
-        NetworkedDfsWriteOutcome::Pending { .. }
-    ));
-    let candidate_events = candidate_dfs
-        .process_incoming()
-        .expect("candidate routed write");
-    assert!(candidate_events.iter().any(|event| {
-        matches!(
-            event,
-            NetworkedDfsServiceEvent::RemoteWriteServed {
-                requester_node_id,
-                result:
-                    DfsDistributedWriteResult::Outcome {
-                        outcome: NetworkedDfsWriteOutcome::Committed { .. },
-                    },
-                ..
-            } if requester_node_id == &owner
-        )
-    }));
-    let owner_events = owner_dfs.process_incoming().expect("owner routed response");
-    assert!(owner_events.iter().any(|event| {
-        matches!(
-            event,
-            NetworkedDfsServiceEvent::RemoteWriteCompleted {
-                primary_node_id,
-                result:
-                    DfsDistributedWriteResult::Outcome {
-                        outcome: NetworkedDfsWriteOutcome::Committed { .. },
-                    },
-                ..
-            } if primary_node_id == &candidate
-        )
-    }));
+            .metadata()
+            .object(&object_id)
+            .expect("owner object")
+            .owner_node_id,
+        owner
+    );
 
     cleanup(&root);
 }
@@ -10763,14 +10828,12 @@ fn networked_dfs_owner_handoff_uses_backend_current_metadata() {
             .expect("shard");
     });
     let backend_path = root.join("candidate-meta");
-    let backend =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("candidate-shard"), &backend_path)
-            .expect("candidate metadata backend");
+    let backend = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &backend_path)
+        .expect("candidate metadata backend");
     let mut candidate_dfs = NetworkedDfsService::new(
         network.add_node(candidate.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("candidate")).expect("candidate store"),
     )
-    .with_control_plane(control_plane.clone())
     .with_metadata_backend(backend)
     .expect("candidate metadata backend");
     candidate_dfs
@@ -10785,7 +10848,7 @@ fn networked_dfs_owner_handoff_uses_backend_current_metadata() {
         .add_object_metadata(DfsObjectMetadata {
             object_id: object_id.clone(),
             file_system_id: file_system_id.clone(),
-            path: "artifact.bin".to_string(),
+            path: "/artifact.bin".to_string(),
             kind: DfsObjectKind::Artifact,
             owner_node_id: owner.clone(),
             current_locations: vec![owner.clone()],
@@ -10799,7 +10862,7 @@ fn networked_dfs_owner_handoff_uses_backend_current_metadata() {
             modified_at_unix_nanos: 0,
             created_at_unix_nanos: 0,
             changed_at_unix_nanos: 0,
-            version: version_1,
+            version: version_1.clone(),
             policy: DfsObjectPolicy::ReplicatedEventual,
             created_by_event_id: None,
             last_modified_by_event_id: None,
@@ -10811,13 +10874,13 @@ fn networked_dfs_owner_handoff_uses_backend_current_metadata() {
         .expect("candidate latest content");
 
     let mut backend_writer =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("candidate-shard"), &backend_path)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &backend_path)
             .expect("backend writer");
     backend_writer
         .put_object(&DfsObjectMetadata {
             object_id: object_id.clone(),
             file_system_id: file_system_id.clone(),
-            path: "artifact.bin".to_string(),
+            path: "/artifact.bin".to_string(),
             kind: DfsObjectKind::Artifact,
             owner_node_id: owner.clone(),
             current_locations: vec![owner.clone(), candidate.clone()],
@@ -10837,6 +10900,7 @@ fn networked_dfs_owner_handoff_uses_backend_current_metadata() {
             last_modified_by_event_id: None,
         })
         .expect("backend current object");
+    candidate_dfs = candidate_dfs.with_control_plane(control_plane.clone());
     control_plane.with_client(|kv| {
         assert!(
             DfsControlPlaneStore::new(kv)
@@ -10857,33 +10921,44 @@ fn networked_dfs_owner_handoff_uses_backend_current_metadata() {
         );
     });
 
-    let handoff = candidate_dfs
+    let handoff_error = candidate_dfs
         .handoff_object_owner(&object_id, "root", 11)
-        .expect("handoff");
+        .expect_err("KV-only owner handoff must fail closed");
     assert!(
-        matches!(
-            &handoff,
-            DfsOwnerHandoffOutcome::Transferred {
-                previous_owner_node_id,
-                new_owner_node_id,
-                previous_epoch: 11,
-                new_epoch: 12,
-                ..
-            } if previous_owner_node_id == &owner && new_owner_node_id == &candidate
-        ),
-        "unexpected backend-current owner handoff outcome: {handoff:?}"
+        handoff_error
+            .to_string()
+            .contains("operation-bound DFS prefix fence"),
+        "unexpected backend-current owner handoff error: {handoff_error}"
     );
+    control_plane.with_client(|kv| {
+        let shard = DfsControlPlaneStore::new(kv)
+            .get_metadata_shard(&file_system_id, "root")
+            .expect("shard")
+            .expect("shard");
+        assert_eq!(shard.primary_node_id, owner);
+        assert_eq!(shard.epoch, 11);
+    });
+    let backend_object = candidate_dfs
+        .metadata_backend()
+        .expect("candidate backend")
+        .get_object(&object_id)
+        .expect("backend object")
+        .expect("backend object");
+    assert_eq!(backend_object.version, version_2);
+    assert_eq!(backend_object.content_hash.as_deref(), Some(hash.as_str()));
+    assert_eq!(backend_object.owner_node_id, owner);
+    assert!(backend_object.current_locations.contains(&candidate));
+
+    // A rejected transfer does not publish the backend view into the in-memory
+    // namespace. Reaching the prefix-fence rejection above (rather than a
+    // missing-manifest rejection for version_1) proves the handoff validated
+    // the backend-current version_2 record.
     let candidate_object = candidate_dfs
         .metadata()
         .object(&object_id)
         .expect("candidate memory object");
-    assert_eq!(candidate_object.version, version_2);
-    assert_eq!(
-        candidate_object.content_hash.as_deref(),
-        Some(hash.as_str())
-    );
-    assert_eq!(candidate_object.owner_node_id, candidate);
-    assert!(candidate_object.current_locations.contains(&candidate));
+    assert_eq!(candidate_object.version, version_1);
+    assert_eq!(candidate_object.owner_node_id, owner);
 
     cleanup(&root);
 }

@@ -51,8 +51,54 @@ selection and other service-level policy checks remain separate inputs.
 ## Consistency Invariants
 
 Normal cluster operation has one authoritative visible history per object.
-When KV quorum and the responsible owner or metadata-shard primary are
-available, all visible writes serialize through that authority.
+All visible writes serialize through the responsible owner or metadata-shard
+primary. Ordinary DFS metadata and content stay off cluster KV: a healthy
+primary first journals a hidden operation prepare in DFS metadata, then proves
+the current assignment with a fresh acknowledgement from every configured
+metadata-shard replica that durably applied and verified that exact prepare.
+The prepare carries the pending intent and `W` receipts and, for namespace
+changes, the complete transaction without making it visible. If the complete
+shard cannot acknowledge, only an operation-bound cluster-quorum certificate
+for that assignment and epoch may replace the full-shard proof. This prevents a
+partition with only the content receipt threshold `W` from creating a second
+visible history while allowing the quorum side to change membership safely.
+
+Membership commitment is not itself authority activation. A direct shard
+membership CAS must retain the current primary, advance exactly one epoch, and
+compare the bounded quorum-operation floor. The resulting pending handoff is
+not itself a retiring-primary fence because an isolated primary may not have
+observed it and may still complete a valid write. Once the retiring primary
+reconnects, it takes the same publication guard used by canonical commits,
+installs a durable shard-local backend write freeze, and acknowledges the exact
+journal head and fingerprint captured under that guard. A pending freeze
+survives process restart and blocks every authoritative metadata-table mutation
+while still permitting replay, snapshot inspection, and handoff transfer.
+
+Activation transfers that immutable fenced prefix to the union of the retiring
+and desired metadata assignments and requires an exact acknowledgement from
+every member of the union. The completion proof must equal the retiring
+primary's fence; a watermark taken only when the quorum side created the
+pending record is insufficient. Only then does the desired assignment become
+active. The local marker advances to that activated epoch and remains durable;
+the completing backend instance is explicitly rebound, while independently
+opened instances stay fenced until they separately prove and observe the exact
+active generation. Moving the primary additionally requires the promoted
+replica to acknowledge that same exact prefix. Thus the
+quorum side may record replacement replicas while the old shard is isolated,
+but it cannot activate a replacement writer until the retiring primary has
+handed off every write completed before its local fence. Healthy full-shard
+writes remain off Raft; exceptional quorum-authorized prepares advance only one
+bounded per-shard transfer floor in KV.
+
+A replica counts toward the healthy proof only after it has replayed a
+contiguous journal prefix through the prepare, re-read the exact hidden
+operation from its DFS metadata tables, and durably recorded a monotonic local
+authority-acknowledgement floor before echoing the request nonce. A batch that
+skips unseen history is rejected rather than advancing the replay cursor.
+Snapshot repair must advance strictly beyond an ordinary authority floor, so
+an older in-flight snapshot cannot erase an acknowledged prepare. These floors
+are small replica-local DFS coordination records; they are not file metadata in
+cluster KV and do not require Raft.
 
 The commit path must preserve these properties:
 
@@ -60,9 +106,13 @@ The commit path must preserve these properties:
 2. The authority validates its epoch, policy, and base version.
 3. Content is durable on the nodes required by policy.
 4. Matching receipts exist before the visible version advances.
-5. The metadata commit compares the current version and write intent
+5. The exact hidden intent/receipt/namespace prepare is durable on every
+   configured metadata-shard replica, or the exceptional quorum fallback has
+   authorized that same operation.
+6. The metadata commit revalidates the typed authorization and compares the
+   current version, path occupants, and write intent
    atomically.
-6. Replicas and caches may lag, but they cannot become write authorities.
+7. Replicas and caches may lag, but they cannot become write authorities.
 
 A stale-base writer retries or fails. A write that cannot reach authority stays
 pending or fails according to policy; it does not create a second visible
@@ -166,10 +216,15 @@ Replicated-eventual and replicated-confirmed writes use this logical sequence:
 3. Stage bytes and verify their content hash.
 4. Place content on eligible nodes according to policy.
 5. Record durable receipts that match the intent and hash.
-6. Atomically compare the authority epoch, base version, intent state, and
+6. Journal the hidden intent/receipt prepare in DFS metadata, including the
+   namespace transaction when this is first publication.
+7. Replicate and verify that exact prepare on every configured metadata-shard
+   replica; if any is unavailable or stale, obtain the operation-bound
+   cluster-quorum fallback certificate instead.
+8. Atomically compare the authority epoch, base version, intent state, and
    receipt threshold.
-7. Advance the visible version and schedule any remaining repair.
-8. Publish metadata progress to caches and interested sessions.
+9. Advance the visible version and schedule any remaining repair.
+10. Publish metadata progress to caches and interested sessions.
 
 The durable write intent lets retry and recovery determine whether work is still
 open, committed, pending repair, or aborted without inferring state from an
@@ -305,12 +360,15 @@ validated source for committed content, and fair recovery scheduling.
 The Rust DFS now implements the first bounded refinement of the advisory-lock
 and sync slices. Whole-file `F_GETLK`, `F_SETLK`, and `F_SETLKW` route to the
 stable object's metadata primary; lock aggregates are journaled, replicated to
-metadata quorum, epoch-fenced, leased, renewed by mounted clients, and moved
-atomically with a cross-shard object adoption. Blocking waits run outside the
-FUSE dispatch lane, and exact close/cancel transitions plus finite leases keep
-abandoned waiters from becoming protocol deadlocks. Partial byte ranges remain
-unsupported, and a conflicting blocking shared-to-exclusive conversion returns
-`EDEADLK` instead of creating a conversion cycle.
+every committed shard member on the healthy path, epoch-fenced, leased,
+renewed by mounted clients, and moved atomically with a cross-shard object
+adoption. A partial metadata recovery quorum may complete only after publishing
+an exact operation-bound head watermark through the cluster-quorum fallback.
+Blocking waits run outside the FUSE dispatch lane, and exact close/cancel
+transitions plus finite leases keep abandoned waiters from becoming protocol
+deadlocks. Partial byte ranges remain unsupported, and a conflicting blocking
+shared-to-exclusive conversion returns `EDEADLK` instead of creating a
+conversion cycle.
 
 Lock sessions and request ids are scoped to the authenticated requesting node;
 one node cannot close or cancel another node's grant by replaying an observed
@@ -345,9 +403,12 @@ full-file barriers respectively. File `fsync`, file `fdatasync`, and directory
 targets and route distinct operations to the metadata authority. A successful
 file result validates the exact version/hash on every desired content replica,
 collects a fresh acknowledgement of the complete canonical materialized
-metadata checkpoint at the exact journal head from a metadata majority,
-intersects that recovery set with the content holders, publishes an epoch-bound
-durable metadata-head watermark through cluster Raft, and only then returns.
+metadata checkpoint at the exact journal head, and intersects that recovery set
+with the content holders. When every committed shard member acknowledges, the
+barrier returns without a KV transaction. If a member is unavailable but the
+existing metadata-recovery quorum and content intersection are satisfied, the
+exceptional path publishes one epoch- and fingerprint-bound metadata-head
+watermark through cluster Raft before returning.
 The checkpoint probe has a restart-unique identity and carries an empty journal
 batch, so a delayed reply cannot satisfy another attempt and a rolling-upgrade
 peer cannot skip its replay cursor. A persisted replication cursor alone is
@@ -358,17 +419,20 @@ different state. The current `fdatasync` physical barrier is
 deliberately as strong as `fsync` because essential and ancillary file metadata
 share one journal transaction.
 
-This is not yet a full refinement of the combined partition model. Rust takes
-the conservative path when quorum is unavailable: new grants, renewals, and
-sync completion fail or wait rather than using the model's complete-holder
-permit. Explicit caller-selected durable sync ids, byte-range locks,
+This is not yet a full refinement of the combined partition model. Rust can
+continue when the complete committed metadata shard acknowledges even if Raft
+is unavailable; when neither that full-shard proof nor the cluster-quorum
+fallback is available, new grants, renewals, and sync completion fail or wait
+rather than using the model's complete-holder permit. Explicit caller-selected durable sync ids, byte-range locks,
 application-level wait-cycle detection, open-unlinked lifetime, and directory
 open-handle identity remain target hardening. FUSE data I/O now targets the
 stable object id and fails closed if the pathname has been replaced; it does
-not yet retain an unlinked inode after the last name disappears. The initial exact
-metadata-checkpoint proof also hashes the complete shard snapshot on each
-participant; replacing this bounded correctness-first path with a cached
-incremental or Merkle commitment is future scale hardening.
+not yet retain an unlinked inode after the last name disappears. Each shard
+persists an incremental hash-chain prefix proof, so healthy exact-head probes
+compare sequence and digest in O(1) work. A legacy shard hashes its materialized
+snapshot once to seed the chain; a genuine sequence/digest mismatch still uses
+an authoritative full snapshot repair. Bounded journal catch-up before that
+snapshot is future scale hardening.
 
 ## Opt-in Local-first Degraded Operation
 

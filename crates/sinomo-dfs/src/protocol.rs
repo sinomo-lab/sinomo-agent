@@ -695,6 +695,12 @@ pub struct DfsMetadataJournalBatchCommand {
     pub verify_prefix_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_probe: Option<DfsMetadataPrefixProbe>,
+    /// Verify only that the receiver is reachable and observes this exact
+    /// committed shard assignment. The batch must be empty so older peers
+    /// safely process it as a no-op; because they cannot echo `probe_id`, they
+    /// cannot accidentally satisfy the new authority fast path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_probe: Option<DfsMetadataAuthorityProbe>,
     pub batch: DfsMetadataJournalBatch,
 }
 
@@ -713,6 +719,67 @@ pub struct DfsMetadataPrefixProbe {
     pub state_fingerprint: String,
 }
 
+/// Fresh, request-bound identity for an ordinary-write authority probe.
+/// Unlike a prefix probe, this does not fingerprint or persist metadata state.
+/// The operation identity prevents a reachability acknowledgement from being
+/// replayed as authority for a different write or namespace transition.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataAuthorityProbe {
+    pub probe_id: String,
+    pub expected_shard: DfsMetadataShardConfig,
+    pub operation: DfsMetadataAuthorityOperation,
+}
+
+/// Exact canonical mutation covered by a metadata-shard authority probe.
+///
+/// Content writes name the same intent/base/target tuple consumed by the
+/// atomic visible-commit CAS. Namespace operations bind the complete encoded
+/// operation or transaction through `payload_digest`.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", tag = "kind")]
+pub enum DfsMetadataAuthorityOperation {
+    WriteIntent {
+        intent_id: String,
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_version: Option<DfsVersion>,
+        target_version: DfsVersion,
+        owner_epoch: u64,
+        content_hash: String,
+        receipt_node_ids: Vec<NodeId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace_prepare_operation_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace_prepare_digest: Option<String>,
+        prepare_sequence: u64,
+        payload_digest: String,
+    },
+    NamespaceMutation {
+        operation_id: String,
+        file_system_id: DfsFileSystemId,
+        prepare_sequence: u64,
+        payload_digest: String,
+    },
+}
+
+/// Typed evidence consumed by one canonical metadata publication.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", tag = "kind")]
+pub enum DfsCanonicalAuthorization {
+    FullShard {
+        operation_digest: String,
+        expected_shard: DfsMetadataShardConfig,
+        acknowledged_node_ids: Vec<NodeId>,
+        prepare_sequence: u64,
+    },
+    ClusterQuorum {
+        operation_digest: String,
+        expected_shard: DfsMetadataShardConfig,
+        permit_id: String,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsMetadataJournalBatchResponse {
     pub request_id: String,
@@ -724,6 +791,10 @@ pub struct DfsMetadataJournalBatchResponse {
     /// accidentally satisfying the stronger durability certificate.
     #[serde(default)]
     pub verified_prefix_only: bool,
+    /// Echoed only after the receiver validates the exact authority probe.
+    /// Missing on older peers, which forces the sender onto the quorum path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_authority_probe_id: Option<String>,
     pub result: DfsMetadataJournalBatchResult,
 }
 

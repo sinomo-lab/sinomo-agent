@@ -73,6 +73,19 @@ pub struct DfsMetadataPrefixAckFloor {
     pub state_fingerprint: String,
 }
 
+/// Replica-local durable floor established before acknowledging an ordinary
+/// metadata authority probe.
+///
+/// Unlike an exact prefix checkpoint, this floor deliberately carries no
+/// whole-shard fingerprint: the receiver has already re-read and verified the
+/// exact hidden operation named by the probe. Snapshot repair must therefore
+/// advance strictly past this sequence before it may replace local state.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataAuthorityAckFloor {
+    pub shard_id: DfsMetadataShardId,
+    pub journal_sequence: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsMetadataShardMigrationReport {
     pub file_system_id: DfsFileSystemId,
@@ -285,6 +298,89 @@ pub struct DfsMetadataJournalEntry {
     pub mutation: DfsMetadataMutation,
 }
 
+/// Versioned, content-addressed identity of one exact contiguous metadata
+/// journal prefix.
+///
+/// This is deliberately DFS-owned state. It never enters cluster KV: the
+/// materialized metadata table log carries the checkpoint alongside the table
+/// mutations that made the prefix durable.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataPrefixProof {
+    pub version: u16,
+    pub journal_sequence: u64,
+    pub digest: String,
+}
+
+pub(crate) const DFS_METADATA_PREFIX_PROOF_VERSION: u16 = 1;
+const DFS_METADATA_PREFIX_PROOF_DIGEST_PREFIX: &str = "dfs-metadata-prefix-v1:blake3:";
+
+impl DfsMetadataPrefixProof {
+    pub(crate) fn is_well_formed(&self) -> bool {
+        self.version == DFS_METADATA_PREFIX_PROOF_VERSION
+            && self
+                .digest
+                .strip_prefix(DFS_METADATA_PREFIX_PROOF_DIGEST_PREFIX)
+                .is_some_and(|digest| {
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+    }
+}
+
+fn metadata_prefix_digest(parts: &[&[u8]]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo-dfs-metadata-prefix-proof\0v1\0");
+    for part in parts {
+        hasher.update(&(part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    format!(
+        "{DFS_METADATA_PREFIX_PROOF_DIGEST_PREFIX}{}",
+        hasher.finalize().to_hex()
+    )
+}
+
+/// Establish an exact chain checkpoint from a complete semantic shard image.
+/// This is the one-time compatibility path for metadata created before prefix
+/// proofs existed; normal writes extend the checkpoint with O(1) work.
+pub(crate) fn dfs_metadata_prefix_proof_seed(
+    shard_id: &DfsMetadataShardId,
+    journal_sequence: u64,
+    semantic_state_fingerprint: &str,
+) -> DfsMetadataPrefixProof {
+    let sequence = journal_sequence.to_be_bytes();
+    DfsMetadataPrefixProof {
+        version: DFS_METADATA_PREFIX_PROOF_VERSION,
+        journal_sequence,
+        digest: metadata_prefix_digest(&[
+            b"semantic-checkpoint",
+            shard_id.0.as_bytes(),
+            &sequence,
+            semantic_state_fingerprint.as_bytes(),
+        ]),
+    }
+}
+
+/// Extend a validated contiguous prefix with one payload-complete journal
+/// entry. Replicas hash the exact entry received from the authority, so equal
+/// proofs imply equal journal payloads rather than merely equal sequence IDs.
+pub(crate) fn dfs_metadata_prefix_proof_after(
+    previous: &DfsMetadataPrefixProof,
+    entry: &DfsMetadataJournalEntry,
+) -> Result<DfsMetadataPrefixProof, serde_json::Error> {
+    let encoded_entry = serde_json::to_vec(entry)?;
+    let sequence = entry.sequence.to_be_bytes();
+    Ok(DfsMetadataPrefixProof {
+        version: DFS_METADATA_PREFIX_PROOF_VERSION,
+        journal_sequence: entry.sequence,
+        digest: metadata_prefix_digest(&[
+            b"journal-entry",
+            previous.digest.as_bytes(),
+            &sequence,
+            &encoded_entry,
+        ]),
+    })
+}
+
 /// Mutation payload stored in the metadata journal.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -362,6 +458,13 @@ pub enum DfsMetadataMutation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transaction: Option<DfsNamespaceTransaction>,
     },
+    PutNamespacePrepare {
+        file_system_id: DfsFileSystemId,
+        operation_id: String,
+        status: DfsNamespacePrepareStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prepare: Option<DfsNamespacePrepareRecord>,
+    },
     PutNamespaceJob {
         file_system_id: DfsFileSystemId,
         job_id: String,
@@ -411,6 +514,25 @@ impl DfsMetadataMutation {
             Self::ApplyNamespaceTransaction {
                 transaction: None, ..
             } => {}
+            Self::PutNamespacePrepare {
+                prepare: Some(prepare),
+                ..
+            } => {
+                object_ids.extend(
+                    prepare
+                        .expected_object_versions
+                        .iter()
+                        .map(|expected| expected.object_id.clone()),
+                );
+                object_ids.extend(
+                    prepare
+                        .transaction
+                        .objects
+                        .iter()
+                        .map(|object| object.object_id.clone()),
+                );
+            }
+            Self::PutNamespacePrepare { prepare: None, .. } => {}
         }
         object_ids
     }
@@ -476,6 +598,15 @@ impl DfsMetadataMutation {
         }
     }
 
+    pub(crate) fn put_namespace_prepare(prepare: &DfsNamespacePrepareRecord) -> Self {
+        Self::PutNamespacePrepare {
+            file_system_id: prepare.file_system_id.clone(),
+            operation_id: prepare.operation_id.clone(),
+            status: prepare.status.clone(),
+            prepare: Some(prepare.clone()),
+        }
+    }
+
     pub(crate) fn commit_visible_version(commit: &DfsVisibleVersionCommitRecord) -> Self {
         Self::CommitVisibleVersion {
             file_system_id: commit.committed_object.file_system_id.clone(),
@@ -524,6 +655,58 @@ pub struct DfsNamespaceTransaction {
     pub advisory_lock_states: Vec<DfsAdvisoryLockStateRecord>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+}
+
+/// Expected visible version for one object in a hidden namespace prepare.
+///
+/// `None` means the object must not exist when the prepare is installed and
+/// again when it is committed.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
+pub struct DfsNamespaceObjectVersionExpectation {
+    pub object_id: DfsObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<DfsVersion>,
+}
+
+/// Expected occupant for one normalized path in a hidden namespace prepare.
+///
+/// `None` means no live object or durable tombstone may occupy the path.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
+pub struct DfsNamespacePathOccupantExpectation {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_object_id: Option<DfsObjectId>,
+}
+
+/// Lifecycle of a durable namespace prepare.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsNamespacePrepareStatus {
+    Prepared,
+    Committed,
+    Aborted,
+}
+
+/// Durable, hidden namespace transaction prepared on one metadata shard.
+///
+/// A prepared record reserves its object/path footprint without changing the
+/// visible namespace. Committing revalidates these exact expectations under
+/// the metadata write lock and atomically materializes `transaction` together
+/// with the `Committed` status.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespacePrepareRecord {
+    pub operation_id: String,
+    pub file_system_id: DfsFileSystemId,
+    pub shard_id: DfsMetadataShardId,
+    #[serde(default)]
+    pub owner_epoch: u64,
+    pub operation_digest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_object_versions: Vec<DfsNamespaceObjectVersionExpectation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_path_occupants: Vec<DfsNamespacePathOccupantExpectation>,
+    pub transaction: DfsNamespaceTransaction,
+    pub status: DfsNamespacePrepareStatus,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -972,6 +1155,13 @@ pub struct DfsMetadataTableSnapshot {
     pub(crate) tables: Option<DfsMetadataTableSnapshotTables>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) ops: Vec<DfsMetadataTableOp>,
+    /// Exact semantic identity of the snapshot payload, excluding these proof
+    /// fields. Snapshot install validates it before adopting `prefix_proof`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) semantic_state_fingerprint: Option<String>,
+    /// Journal-chain head carried across table compaction and snapshot repair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) prefix_proof: Option<DfsMetadataPrefixProof>,
 }
 
 /// Return a content-addressed identity for one complete materialized shard
@@ -981,8 +1171,49 @@ pub struct DfsMetadataTableSnapshot {
 pub(crate) fn dfs_metadata_table_snapshot_state_fingerprint(
     snapshot: &DfsMetadataTableSnapshot,
 ) -> Result<String, serde_json::Error> {
-    let encoded = serde_json::to_vec(snapshot)?;
+    #[cfg(test)]
+    DFS_METADATA_FULL_SNAPSHOT_FINGERPRINT_CALLS.set(
+        DFS_METADATA_FULL_SNAPSHOT_FINGERPRINT_CALLS
+            .get()
+            .saturating_add(1),
+    );
+    // Keep the historical snapshot encoding stable and avoid a circular hash:
+    // proof/checksum fields never contribute to the semantic state digest.
+    let mut semantic_snapshot = snapshot.clone();
+    semantic_snapshot.semantic_state_fingerprint = None;
+    semantic_snapshot.prefix_proof = None;
+    let encoded = serde_json::to_vec(&semantic_snapshot)?;
     Ok(format!("blake3:{}", blake3::hash(&encoded).to_hex()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static DFS_METADATA_FULL_SNAPSHOT_FINGERPRINT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_dfs_metadata_full_snapshot_fingerprint_calls() {
+    DFS_METADATA_FULL_SNAPSHOT_FINGERPRINT_CALLS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn dfs_metadata_full_snapshot_fingerprint_calls() -> usize {
+    DFS_METADATA_FULL_SNAPSHOT_FINGERPRINT_CALLS.get()
+}
+
+pub(crate) fn dfs_metadata_table_snapshot_matches_checkpoint(
+    snapshot: &DfsMetadataTableSnapshot,
+    journal_sequence: u64,
+    expected_fingerprint: &str,
+) -> Result<bool, serde_json::Error> {
+    if expected_fingerprint.starts_with(DFS_METADATA_PREFIX_PROOF_DIGEST_PREFIX) {
+        return Ok(snapshot.prefix_proof.as_ref().is_some_and(|proof| {
+            proof.is_well_formed()
+                && proof.journal_sequence == journal_sequence
+                && proof.digest == expected_fingerprint
+        }));
+    }
+    Ok(dfs_metadata_table_snapshot_state_fingerprint(snapshot)? == expected_fingerprint)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -1020,6 +1251,8 @@ pub(crate) struct DfsMetadataTableSnapshotTables {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) namespace_transactions: Vec<DfsNamespaceTransaction>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) namespace_prepares: Vec<DfsNamespacePrepareRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) namespace_jobs: Vec<DfsNamespaceJobRecord>,
 }
 
@@ -1041,6 +1274,8 @@ pub(crate) struct DfsVisibleCommitSnapshotRecord {
 pub(crate) struct DfsMetadataTableBatch {
     pub(crate) sequence: u64,
     pub(crate) ops: Vec<DfsMetadataTableOp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) prefix_proof: Option<DfsMetadataPrefixProof>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1135,6 +1370,9 @@ pub(crate) enum DfsMetadataTableOp {
     PutNamespaceTransaction {
         transaction: DfsNamespaceTransaction,
     },
+    PutNamespacePrepare {
+        prepare: DfsNamespacePrepareRecord,
+    },
     PutNamespaceJob {
         job: DfsNamespaceJobRecord,
     },
@@ -1209,6 +1447,7 @@ pub(crate) fn metadata_journal_batch_file_system_id(
             | DfsMetadataMutation::PutConflict { file_system_id, .. }
             | DfsMetadataMutation::PutAdvisoryLockState { file_system_id, .. }
             | DfsMetadataMutation::ApplyNamespaceTransaction { file_system_id, .. }
+            | DfsMetadataMutation::PutNamespacePrepare { file_system_id, .. }
             | DfsMetadataMutation::PutNamespaceJob { file_system_id, .. } => {
                 Some(file_system_id.clone())
             }
@@ -1277,6 +1516,19 @@ pub(crate) fn normalized_namespace_transaction(
         state.authority_rebind_required = true;
     }
     transaction
+}
+
+pub(crate) fn normalized_namespace_prepare(
+    prepare: &DfsNamespacePrepareRecord,
+) -> DfsNamespacePrepareRecord {
+    let mut prepare = prepare.clone();
+    prepare.transaction = normalized_namespace_transaction(&prepare.transaction);
+    for expected in &mut prepare.expected_path_occupants {
+        expected.path = crate::metadata_keys::normalize_path(&expected.path);
+    }
+    prepare.expected_object_versions.sort();
+    prepare.expected_path_occupants.sort();
+    prepare
 }
 
 pub(crate) fn put_visible_version_record_if_changed(

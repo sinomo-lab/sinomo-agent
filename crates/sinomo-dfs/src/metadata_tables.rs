@@ -17,9 +17,9 @@ use crate::metadata_keys::{
 };
 use crate::metadata_records::{
     DfsConflictRecord, DfsDirFragmentId, DfsDirFragmentRecord, DfsInodeId, DfsInodeRecord,
-    DfsMetadataTableOp, DfsNamespaceJobRecord, DfsNamespaceTransaction, DfsObjectVersionRecord,
-    DfsPathRecord, DfsReplicaReceiptRecord, DfsVisibleVersionCommitRecord, DfsWriteIntentRecord,
-    normalized_object_metadata,
+    DfsMetadataPrefixProof, DfsMetadataTableOp, DfsNamespaceJobRecord, DfsNamespacePrepareRecord,
+    DfsNamespaceTransaction, DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptRecord,
+    DfsVisibleVersionCommitRecord, DfsWriteIntentRecord, normalized_object_metadata,
 };
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
@@ -47,6 +47,7 @@ pub(crate) struct DfsMetadataTables {
     pub(crate) advisory_lock_states: BTreeMap<DfsObjectId, DfsAdvisoryLockStateRecord>,
     pub(crate) visible_commits: BTreeMap<(DfsObjectId, DfsVersion), DfsVisibleVersionCommitRecord>,
     pub(crate) namespace_transactions: BTreeMap<String, DfsNamespaceTransaction>,
+    pub(crate) namespace_prepares: BTreeMap<String, DfsNamespacePrepareRecord>,
     pub(crate) namespace_jobs: BTreeMap<String, DfsNamespaceJobRecord>,
 }
 
@@ -57,6 +58,7 @@ pub(crate) struct DfsMetadataTableState {
     pub(crate) materialized_through_sequence: Option<u64>,
     pub(crate) snapshot_format_version: Option<u16>,
     pub(crate) snapshot_fingerprint: Option<MetadataTableSnapshotFingerprint>,
+    pub(crate) prefix_proof: Option<DfsMetadataPrefixProof>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,10 +90,11 @@ impl Deref for DfsMetadataTablesSnapshot<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MetadataTableReplay {
     pub(crate) offset: u64,
     pub(crate) materialized_through_sequence: Option<u64>,
+    pub(crate) prefix_proof: Option<DfsMetadataPrefixProof>,
 }
 
 pub(crate) fn max_optional_sequence(left: Option<u64>, right: Option<u64>) -> Option<u64> {
@@ -115,6 +118,7 @@ impl DfsMetadataTables {
             || !self.namespace_jobs.is_empty()
             || !self.compacted_tombstones.is_empty()
             || !self.visible_commits.is_empty()
+            || !self.namespace_prepares.is_empty()
     }
 
     fn put_intent_indexed(&mut self, intent: DfsWriteIntentRecord) {
@@ -285,6 +289,10 @@ impl DfsMetadataTables {
                 self.namespace_transactions
                     .insert(transaction.transaction_id.clone(), transaction);
             }
+            DfsMetadataTableOp::PutNamespacePrepare { prepare } => {
+                self.namespace_prepares
+                    .insert(prepare.operation_id.clone(), prepare);
+            }
             DfsMetadataTableOp::PutNamespaceJob { job } => {
                 self.namespace_jobs.insert(job.job_id.clone(), job);
             }
@@ -447,6 +455,7 @@ pub(crate) struct DfsMetadataTableRollback {
     advisory_lock_states: BTreeMap<DfsObjectId, Option<DfsAdvisoryLockStateRecord>>,
     visible_commits: BTreeMap<(DfsObjectId, DfsVersion), Option<DfsVisibleVersionCommitRecord>>,
     namespace_transactions: BTreeMap<String, Option<DfsNamespaceTransaction>>,
+    namespace_prepares: BTreeMap<String, Option<DfsNamespacePrepareRecord>>,
     namespace_jobs: BTreeMap<String, Option<DfsNamespaceJobRecord>>,
 }
 
@@ -608,6 +617,11 @@ impl DfsMetadataTableRollback {
                 &tables.namespace_transactions,
                 transaction.transaction_id.clone(),
             ),
+            DfsMetadataTableOp::PutNamespacePrepare { prepare } => record_rollback_value(
+                &mut self.namespace_prepares,
+                &tables.namespace_prepares,
+                prepare.operation_id.clone(),
+            ),
             DfsMetadataTableOp::PutNamespaceJob { job } => record_rollback_value(
                 &mut self.namespace_jobs,
                 &tables.namespace_jobs,
@@ -642,6 +656,7 @@ impl DfsMetadataTableRollback {
             &mut tables.namespace_transactions,
             self.namespace_transactions,
         );
+        rollback_map(&mut tables.namespace_prepares, self.namespace_prepares);
         rollback_map(&mut tables.namespace_jobs, self.namespace_jobs);
     }
 }

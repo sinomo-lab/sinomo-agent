@@ -54,7 +54,8 @@ The model inventory is split by subsystem:
   `contracts/system/guarantees.qnt` defines the layered guarantee predicates,
   and `scenarios/system/smoke.qnt` composes them for randomized whole-system
   exploration.
-- `models/dfs/` contains the DFS slices: metadata authority, authority routing,
+- `models/dfs/` contains the DFS slices: metadata authority, ordinary canonical
+  write eligibility across partitions and shard reconfiguration, authority routing,
   read freshness, routed namespace freshness, POSIX namespace/link/cross-shard
   behavior, whole-file advisory locks, file and directory sync barriers,
   lock-holding operation recovery across partitions, opt-in local-first file
@@ -399,6 +400,55 @@ abstract committed KV fact. It does not re-open Raft, membership, or networking.
 Stale intents may remain after a primary handoff, but `commitVisibleVersion`
 requires current primary and epoch, so stale intents must be retried or aborted
 rather than becoming visible writes.
+
+The `dfs_canonical_write_eligibility_safety.safety` invariant refines the
+ordinary, non-local-first canonical write gate:
+
+- content durability is a DFS concern: a publish needs `W` exact-operation
+  receipts from desired content replicas, not a per-file KV entry;
+- the pending intent must still match the current metadata primary, fenced
+  epoch, exact shard-assignment/config revisions, base, and next target;
+- the ordinary fast path publishes after every replica in the current metadata
+  shard assignment durably applies the hidden DFS prepare and returns a fresh
+  acknowledgement for that exact operation; the production prepare contains
+  intent/receipt metadata and any namespace transaction, never visible file
+  metadata in KV;
+- the exceptional partition path may instead use a permit bound to the same
+  operation and current control-plane revisions, issued by a quorum of the
+  committed cluster voter configuration;
+- a component with `W` content receipts but neither complete fresh shard
+  acknowledgements nor a matching quorum permit cannot publish;
+- acknowledgements or permits from a stale operation, shard assignment, epoch,
+  or cluster configuration cannot satisfy the gate; and
+- a quorum-side membership update retains the current primary and does not
+  activate a replacement writer. It first records a bounded pending handoff;
+  that control-plane commit is not itself a retiring-primary write fence;
+- after the retained primary observes the pending handoff, it acquires the
+  same publication guard as canonical commits, installs a durable shard-local
+  backend write freeze, and acknowledges the exact frozen journal head and
+  fingerprint. The freeze survives restart and rejects all authoritative
+  metadata-table mutations while still allowing replay and handoff transfer;
+- activation copies that exact fenced prefix to the union of the retiring and
+  desired metadata assignments, requires exact acknowledgements from every
+  member of that union, and accepts only a completion proof equal to the
+  immutable retiring-primary fence. This carries writes which finished after
+  the quorum-side pending decision but before the retiring primary observed it;
+- only after the union proof succeeds does the desired assignment become the
+  active writer. The durable local marker advances to the activated epoch;
+  only an instance rebound after observing that exact generation may write,
+  so independently opened stale instances remain fenced. A proof-carrying
+  primary promotion additionally requires the promoted replica's exact-state
+  watermark through the retiring-primary fence; and
+- visible versions form one dense history and canonical operation creates no
+  conflict records.
+
+This is a current-behavior refinement of the canonical publication decision,
+not a model of storing file metadata in KV. Cluster KV supplies only committed
+DFS configuration facts and the quorum authority fallback used when the exact
+metadata shard cannot all acknowledge the operation. The bounded partition
+cases deliberately set `W=1`, below cluster quorum, so the unsafe minority-side
+case remains reachable. POSIX fsync/lock and all local-first models are kept
+unchanged and outside this slice.
 
 The `dfs_authority_routing_safety.safety` invariant combines these properties:
 

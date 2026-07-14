@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::metadata_error::{MetadataBackendError, Result};
+use crate::metadata_records::DfsMetadataPrefixProof;
 use crate::metadata_table_store::{
     metadata_table_path, metadata_table_snapshot_fingerprint, read_metadata_table_state,
     read_metadata_table_state_lenient, replay_metadata_table_batches_from,
@@ -25,12 +26,15 @@ pub(crate) fn refresh_metadata_tables(
     table_log_offset: &mut u64,
     materialized_through_sequence: &mut u64,
     table_snapshot_fingerprint: &mut Option<MetadataTableSnapshotFingerprint>,
+    prefix_proof: &mut Option<DfsMetadataPrefixProof>,
 ) -> Result<()> {
     reload_metadata_tables_if_snapshot_changed(
         root,
         tables,
         table_log_offset,
+        materialized_through_sequence,
         table_snapshot_fingerprint,
+        prefix_proof,
     )?;
     let path = metadata_table_path(root);
     if !path.is_file() {
@@ -48,12 +52,16 @@ pub(crate) fn refresh_metadata_tables(
         *table_log_offset = state.table_log_offset;
         *materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
         *table_snapshot_fingerprint = state.snapshot_fingerprint;
+        *prefix_proof = state.prefix_proof;
         return Ok(());
     }
     let replay = replay_metadata_table_batches_from(&path, *table_log_offset, tables)?;
     *table_log_offset = replay.offset;
     if let Some(sequence) = replay.materialized_through_sequence {
         *materialized_through_sequence = (*materialized_through_sequence).max(sequence);
+    }
+    if replay.prefix_proof.is_some() {
+        *prefix_proof = replay.prefix_proof;
     }
     Ok(())
 }
@@ -103,6 +111,7 @@ pub(crate) fn current_tables_snapshot<'a>(
                     ),
                     snapshot_format_version: None,
                     snapshot_fingerprint: current_snapshot_fingerprint,
+                    prefix_proof: replay.prefix_proof,
                 };
                 return Ok(snapshot_from_state(read_snapshot_cache, state));
             }
@@ -154,7 +163,9 @@ fn reload_metadata_tables_if_snapshot_changed(
     root: &Path,
     tables: &mut DfsMetadataTables,
     table_log_offset: &mut u64,
+    materialized_through_sequence: &mut u64,
     table_snapshot_fingerprint: &mut Option<MetadataTableSnapshotFingerprint>,
+    prefix_proof: &mut Option<DfsMetadataPrefixProof>,
 ) -> Result<()> {
     let current = metadata_table_snapshot_fingerprint(root)?;
     if current == *table_snapshot_fingerprint {
@@ -163,6 +174,8 @@ fn reload_metadata_tables_if_snapshot_changed(
     let state = read_metadata_table_state(root)?;
     *tables = state.tables;
     *table_log_offset = state.table_log_offset;
+    *materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
     *table_snapshot_fingerprint = state.snapshot_fingerprint;
+    *prefix_proof = state.prefix_proof;
     Ok(())
 }

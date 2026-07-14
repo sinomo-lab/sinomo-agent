@@ -15,7 +15,7 @@ use crate::*;
 // fenced merely because its renewal waits behind its own durability barrier.
 pub const DEFAULT_DFS_ADVISORY_LOCK_LEASE: Duration = Duration::from_secs(120);
 
-/// Network budget for one lock-manager round trip, including metadata-quorum
+/// Network budget for one lock-manager round trip, including exact metadata
 /// replication of any state transition.
 pub const DEFAULT_DFS_ADVISORY_LOCK_RPC_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -30,9 +30,11 @@ const POSIX_LOCK_REMOTE_RESPONSE_MARGIN: Duration = Duration::from_secs(1);
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Apply one idempotent advisory-lock command to the stable object visible
-    /// at `path`. The current metadata primary certifies its authority through
-    /// cluster quorum and replicates the resulting lock journal prefix to a
-    /// metadata majority before a grant or unlock is acknowledged.
+    /// at `path`. The current metadata primary replicates the resulting lock
+    /// journal prefix to every reachable committed shard member. A healthy
+    /// full-shard acknowledgement avoids Raft; a partial recovery quorum must
+    /// obtain an operation-bound cluster-quorum fence before any outcome is
+    /// exposed.
     pub fn posix_advisory_lock(
         &mut self,
         path: &str,
@@ -184,10 +186,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.ensure_resolved_path_not_in_cross_shard_flight(&object.path)?;
         }
 
-        // This is a quorum-backed compare plus fresh barrier write when the
-        // shard is clustered. It prevents an isolated old primary from
-        // granting a lock merely because its local KV snapshot is stale.
-        let authority_epoch = self.local_metadata_owner_epoch_for_object(&object)?;
+        // Capture the committed epoch without a Raft write. The exact-prefix
+        // barrier below is the authorization point: every shard member must
+        // acknowledge the operation, or the partial-replica path must obtain
+        // an operation-bound cluster-quorum floor.
+        let authority_epoch = self.local_metadata_owner_epoch_hint_for_object(&object)?;
         let context = DfsAdvisoryLockTransitionContext {
             authority_epoch,
             now_unix_nanos: dfs_now_unix_nanos(),
@@ -214,28 +217,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 command,
             )?;
 
-        let outcome_requires_confirmed_prefix = matches!(
-            &applied.outcome,
-            DfsAdvisoryLockOutcome::Acquired { .. }
-                | DfsAdvisoryLockOutcome::Renewed { .. }
-                | DfsAdvisoryLockOutcome::Converted { .. }
-                | DfsAdvisoryLockOutcome::Unlocked
-                | DfsAdvisoryLockOutcome::Closed { .. }
-                | DfsAdvisoryLockOutcome::Cancelled { .. }
-        );
-        if applied.journal_entry.is_none() && !outcome_requires_confirmed_prefix {
-            // An unchanged waiter poll/query has already crossed the
-            // quorum-backed authority barrier above. Avoid publishing another
-            // identical metadata-head watermark until the state actually
-            // changes or a success capability is exposed.
-            let mut outcome = applied.outcome;
-            observe_advisory_lock_outcome_at(&mut outcome, dfs_now_unix_nanos());
-            return Ok(outcome);
-        }
-
-        // Replicate the journal prefix containing the transition before
-        // exposing its outcome. This includes idempotent retries: the original
-        // response may have been lost before the client observed quorum.
+        // Replicate and freshly verify the journal prefix containing the
+        // transition before exposing its outcome. This also covers unchanged
+        // queries and idempotent retries: they must not trust a stale isolated
+        // primary merely because no new journal entry was appended.
         let metadata_target = self.capture_metadata_quorum_sync_target(&object)?;
         if metadata_target.shard_id != applied.shard_id
             || metadata_target.journal_sequence < applied.durable_through_sequence
@@ -446,10 +431,188 @@ pub(crate) fn advisory_lock_command_belongs_to_node(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeSet, VecDeque};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use sinomo_core::kv::{InProcessKvStore, KvEntry, KvError, KvRevision, KvTxn, KvTxnResponse};
+    use sinomo_core::network::NetworkError;
+
     use super::*;
+
+    #[derive(Debug)]
+    struct LockAckTransport {
+        local_node_id: sinomo_core::node::NodeId,
+        acknowledged_nodes: BTreeSet<sinomo_core::node::NodeId>,
+        incoming: VecDeque<DfsRoutedMessage>,
+        next_frame_id: u64,
+    }
+
+    impl DfsTransportIdentity for LockAckTransport {
+        fn local_node_id(&self) -> &sinomo_core::node::NodeId {
+            &self.local_node_id
+        }
+    }
+
+    impl DfsMessageTransport for LockAckTransport {
+        fn send_routed_message(
+            &mut self,
+            target_node_id: &sinomo_core::node::NodeId,
+            message: DfsRoutedMessage,
+        ) -> std::result::Result<(), NetworkError> {
+            if !self.acknowledged_nodes.contains(target_node_id) {
+                return Ok(());
+            }
+            let frame_id = self.next_frame_id;
+            self.next_frame_id = self.next_frame_id.saturating_add(1);
+            let response = match message.message {
+                DfsNetworkMessage::MetadataJournalBatch(command) => {
+                    DfsNetworkMessage::MetadataJournalBatchResponse(
+                        DfsMetadataJournalBatchResponse {
+                            request_id: command.request_id,
+                            shard_id: command.batch.shard_id,
+                            next_after_sequence: command.batch.next_after_sequence,
+                            applied_entries: command.batch.entries.len(),
+                            verified_prefix_only: command.verify_prefix_only,
+                            verified_authority_probe_id: None,
+                            result: DfsMetadataJournalBatchResult::Applied,
+                        },
+                    )
+                }
+                DfsNetworkMessage::MetadataSnapshotInstall(command) => {
+                    DfsNetworkMessage::MetadataSnapshotInstallResponse(
+                        DfsMetadataSnapshotInstallResponse {
+                            request_id: command.request_id,
+                            shard_id: command.shard_id,
+                            next_after_sequence: command.next_after_sequence,
+                            result: DfsMetadataSnapshotInstallResult::Installed {
+                                archived_existing: false,
+                            },
+                        },
+                    )
+                }
+                _ => return Ok(()),
+            };
+            self.incoming.push_back(build_dfs_routed_message(
+                target_node_id,
+                &self.local_node_id,
+                frame_id,
+                frame_id,
+                response,
+            ));
+            Ok(())
+        }
+
+        fn drain_incoming_messages(
+            &mut self,
+        ) -> std::result::Result<Vec<DfsRoutedMessage>, NetworkError> {
+            Ok(self.incoming.drain(..).collect())
+        }
+
+        fn pending_incoming_count(&self) -> std::result::Result<Option<usize>, NetworkError> {
+            Ok(Some(self.incoming.len()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct LockCountingControlPlane {
+        inner: InProcessKvStore,
+        txn_calls: Arc<AtomicUsize>,
+    }
+
+    impl DfsControlPlaneKvClient for LockCountingControlPlane {
+        fn get(&self, key: &str) -> std::result::Result<Option<KvEntry>, KvError> {
+            DfsControlPlaneKvClient::get(&self.inner, key)
+        }
+
+        fn range_prefix(&self, prefix: &str) -> std::result::Result<Vec<KvEntry>, KvError> {
+            DfsControlPlaneKvClient::range_prefix(&self.inner, prefix)
+        }
+
+        fn put(&mut self, key: String, value: Vec<u8>) -> std::result::Result<KvRevision, KvError> {
+            DfsControlPlaneKvClient::put(&mut self.inner, key, value)
+        }
+
+        fn txn(&mut self, txn: KvTxn) -> std::result::Result<KvTxnResponse, KvError> {
+            self.txn_calls.fetch_add(1, Ordering::SeqCst);
+            DfsControlPlaneKvClient::txn(&mut self.inner, txn)
+        }
+    }
 
     fn node(name: &str) -> sinomo_core::node::NodeId {
         sinomo_core::node::NodeId::from_legacy_named(name).expect("test node")
+    }
+
+    fn clustered_lock_fixture(
+        replica_node_ids: Vec<sinomo_core::node::NodeId>,
+        acknowledged_nodes: Vec<sinomo_core::node::NodeId>,
+    ) -> (
+        NetworkedDfsService<LockAckTransport>,
+        DfsObjectMetadata,
+        Arc<AtomicUsize>,
+    ) {
+        let root = sinomo_testdir::TestDir::new("dfs-posix-lock-authority").keep();
+        let primary = node("node_lock_authority_primary");
+        let shard = DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: primary.clone(),
+            replica_node_ids,
+            epoch: 7,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut inner = InProcessKvStore::new();
+        DfsControlPlaneStore::new(&mut inner)
+            .put_metadata_shard(&shard)
+            .expect("metadata shard config");
+        let txn_calls = Arc::new(AtomicUsize::new(0));
+        let control_plane = LockCountingControlPlane {
+            inner,
+            txn_calls: Arc::clone(&txn_calls),
+        };
+        let object = DfsObjectMetadata {
+            object_id: DfsObjectId::from_legacy_named("object_lock_authority").expect("object"),
+            file_system_id: sifs_file_system_id(),
+            path: "/lock-authority.txt".to_string(),
+            kind: DfsObjectKind::File,
+            owner_node_id: primary.clone(),
+            current_locations: vec![primary.clone()],
+            content_hash: Some("blake3:lock-authority".to_string()),
+            content_size_bytes: Some(1),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 1,
+            modified_at_unix_nanos: 1,
+            created_at_unix_nanos: 1,
+            changed_at_unix_nanos: 1,
+            version: DfsVersion::from_legacy_named("version_lock_authority").expect("version"),
+            policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        let mut backend =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+                .expect("metadata backend");
+        backend
+            .put_file_system(&DfsFileSystem::sifs(primary.clone()))
+            .expect("filesystem");
+        backend.put_object(&object).expect("object metadata");
+        let service = NetworkedDfsService::new(
+            LockAckTransport {
+                local_node_id: primary,
+                acknowledged_nodes: acknowledged_nodes.into_iter().collect(),
+                incoming: VecDeque::new(),
+                next_frame_id: 1,
+            },
+            LocalContentStore::new(root.join("content")).expect("content store"),
+        )
+        .with_control_plane(control_plane)
+        .with_metadata_backend(backend)
+        .expect("metadata-backed service");
+        (service, object, txn_calls)
     }
 
     #[test]
@@ -477,5 +640,59 @@ mod tests {
             },
             &owner,
         ));
+    }
+
+    #[test]
+    fn clustered_lock_full_shard_path_uses_no_control_plane_transaction() {
+        let replica_a = node("node_lock_authority_replica_a");
+        let replica_b = node("node_lock_authority_replica_b");
+        let (mut service, object, txn_calls) = clustered_lock_fixture(
+            vec![replica_a.clone(), replica_b.clone()],
+            vec![replica_a, replica_b],
+        );
+
+        let outcome = service
+            .posix_apply_advisory_lock_local(
+                &object.path,
+                &object.object_id,
+                &DfsAdvisoryLockCommand::Acquire {
+                    request_id: DfsAdvisoryLockRequestId::new("full-shard-acquire"),
+                    session_id: DfsAdvisoryLockSessionId::new("full-shard-session"),
+                    mode: DfsAdvisoryLockMode::Exclusive,
+                    blocking: false,
+                    process_id: Some(7),
+                },
+                Duration::ZERO,
+            )
+            .expect("full-shard lock grant");
+
+        assert!(matches!(outcome, DfsAdvisoryLockOutcome::Acquired { .. }));
+        assert_eq!(txn_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn clustered_lock_partial_shard_uses_operation_bound_quorum_fallback() {
+        let replica_a = node("node_lock_fallback_replica_a");
+        let replica_b = node("node_lock_fallback_replica_b");
+        let (mut service, object, txn_calls) =
+            clustered_lock_fixture(vec![replica_a.clone(), replica_b], vec![replica_a]);
+
+        let outcome = service
+            .posix_apply_advisory_lock_local(
+                &object.path,
+                &object.object_id,
+                &DfsAdvisoryLockCommand::Acquire {
+                    request_id: DfsAdvisoryLockRequestId::new("fallback-acquire"),
+                    session_id: DfsAdvisoryLockSessionId::new("fallback-session"),
+                    mode: DfsAdvisoryLockMode::Exclusive,
+                    blocking: false,
+                    process_id: Some(8),
+                },
+                Duration::ZERO,
+            )
+            .expect("operation-bound fallback lock grant");
+
+        assert!(matches!(outcome, DfsAdvisoryLockOutcome::Acquired { .. }));
+        assert_eq!(txn_calls.load(Ordering::SeqCst), 1);
     }
 }

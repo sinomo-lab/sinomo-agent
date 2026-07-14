@@ -14,9 +14,10 @@ use crate::{
 };
 
 impl<T> NetworkedDfsService<T> {
-    pub fn invalidate_sifs_metadata_shard_cache(&mut self) {
-        self.cached_sifs_metadata_shards = None;
-    }
+    /// Retained for callers that react to control-plane updates. Shard-config
+    /// snapshots are operation-scoped now, so there is no cross-operation
+    /// cache to invalidate.
+    pub fn invalidate_sifs_metadata_shard_cache(&mut self) {}
 
     pub(crate) fn next_dfs_routed_message(
         &mut self,
@@ -50,7 +51,6 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             content,
             coordinator: DistributedEventualCoordinator::new(),
             control_plane: None,
-            cached_sifs_metadata_shards: None,
             metadata_backend: None,
             metadata_lookup_cache: std::sync::Mutex::new(BTreeMap::new()),
             metadata_lookup_cache_depth: std::sync::Mutex::new(0),
@@ -63,6 +63,8 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             metadata_replication_cursors: BTreeMap::new(),
             recent_namespace_freshness_syncs: BTreeMap::new(),
             pending_metadata_replications: BTreeMap::new(),
+            pending_metadata_authority_probes: BTreeMap::new(),
+            metadata_authority_probe_results: BTreeMap::new(),
             pending_routed_writes: BTreeMap::new(),
             pending_remote_write_responses: BTreeMap::new(),
             deferred_routed_create_parent_touches: BTreeSet::new(),
@@ -164,6 +166,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.cancellation = cancellation;
     }
 
+    /// Add a cancellation source without replacing one already installed by
+    /// the caller which opened the service.
+    pub fn add_cancellation(&mut self, cancellation: DfsCancellationFlag) {
+        self.cancellation = Some(match self.cancellation.take() {
+            Some(existing) => DfsCancellationFlag::linked([existing, cancellation]),
+            None => cancellation,
+        });
+    }
+
     pub(crate) fn check_cancelled(&self, operation: &'static str) -> Result<(), DfsError> {
         if self
             .cancellation
@@ -177,13 +188,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn with_control_plane(mut self, kv: impl DfsControlPlaneKvClient + Send + 'static) -> Self {
         self.control_plane = Some(Box::new(kv));
-        self.cached_sifs_metadata_shards = None;
         self
     }
 
     pub fn with_boxed_control_plane(mut self, kv: Box<dyn DfsControlPlaneKvClient>) -> Self {
         self.control_plane = Some(kv);
-        self.cached_sifs_metadata_shards = None;
         self
     }
 
@@ -192,7 +201,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(());
         };
         control_plane.refresh_latest().map_err(DfsError::from)?;
-        self.cached_sifs_metadata_shards = None;
         Ok(())
     }
 

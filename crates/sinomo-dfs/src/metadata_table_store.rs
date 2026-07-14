@@ -22,10 +22,11 @@ use crate::metadata_io::{
 use crate::metadata_keys::path_record_for_object;
 use crate::metadata_records::{
     DfsConflictRecord, DfsDirFragmentRecord, DfsHardlinkIndexSnapshotRecord, DfsInodeRecord,
-    DfsMetadataTableBatch, DfsMetadataTableOp, DfsMetadataTableSnapshot,
+    DfsMetadataPrefixProof, DfsMetadataTableBatch, DfsMetadataTableOp, DfsMetadataTableSnapshot,
     DfsMetadataTableSnapshotTables, DfsNamespaceTransaction, DfsObjectVersionRecord, DfsPathRecord,
     DfsReplicaReceiptRecord, DfsVisibleCommitSnapshotRecord, DfsVisibleVersionCommitRecord,
-    DfsWriteIntentRecord, normalized_object_metadata, normalized_version_record,
+    DfsWriteIntentRecord, dfs_metadata_table_snapshot_state_fingerprint,
+    normalized_object_metadata, normalized_version_record,
 };
 use crate::metadata_tables::{
     DfsMetadataTableState, DfsMetadataTables, MetadataTableReplay,
@@ -55,7 +56,12 @@ pub(crate) fn load_or_migrate_metadata_tables(root: &Path) -> Result<DfsMetadata
     if state.snapshot_format_version.is_some_and(|version| {
         version < METADATA_TABLE_SNAPSHOT_FORMAT_VERSION && state.tables.has_materialized_state()
     }) {
-        persist_metadata_table_snapshot(root, &state.tables, state.materialized_through_sequence)?;
+        persist_metadata_table_snapshot(
+            root,
+            &state.tables,
+            state.materialized_through_sequence,
+            state.prefix_proof.as_ref(),
+        )?;
         state.table_log_offset = 0;
         state.snapshot_format_version = Some(METADATA_TABLE_SNAPSHOT_FORMAT_VERSION);
         state.snapshot_fingerprint = metadata_table_snapshot_fingerprint(root)?;
@@ -66,7 +72,12 @@ pub(crate) fn load_or_migrate_metadata_tables(root: &Path) -> Result<DfsMetadata
     }
     state.tables = load_legacy_metadata_tables(root)?;
     if state.tables.has_materialized_state() {
-        persist_metadata_table_snapshot(root, &state.tables, state.materialized_through_sequence)?;
+        persist_metadata_table_snapshot(
+            root,
+            &state.tables,
+            state.materialized_through_sequence,
+            state.prefix_proof.as_ref(),
+        )?;
         state.table_log_offset = 0;
         state.snapshot_format_version = Some(METADATA_TABLE_SNAPSHOT_FORMAT_VERSION);
         state.snapshot_fingerprint = metadata_table_snapshot_fingerprint(root)?;
@@ -95,6 +106,9 @@ fn read_metadata_table_state_with_tail_policy(
             state.materialized_through_sequence,
             replay.materialized_through_sequence,
         );
+        if replay.prefix_proof.is_some() {
+            state.prefix_proof = replay.prefix_proof;
+        }
         if truncate_torn_tail {
             truncate_torn_metadata_table_log_tail(&table_path, state.table_log_offset)?;
         }
@@ -133,6 +147,31 @@ fn read_metadata_table_snapshot(root: &Path) -> Result<DfsMetadataTableState> {
     let snapshot: DfsMetadataTableSnapshot = read_sobj(&path)?;
     let format_version = snapshot.format_version;
     let materialized_through_sequence = snapshot.materialized_through_sequence;
+    let prefix_proof = snapshot.prefix_proof.clone();
+    if let Some(expected) = snapshot.semantic_state_fingerprint.as_ref() {
+        let actual =
+            dfs_metadata_table_snapshot_state_fingerprint(&snapshot).map_err(|source| {
+                MetadataBackendError::Serde(format!(
+                    "encode DFS metadata table snapshot semantic checksum at {}: {source}",
+                    path.display()
+                ))
+            })?;
+        if &actual != expected {
+            return Err(MetadataBackendError::Serde(format!(
+                "DFS metadata table snapshot semantic checksum mismatch at {}",
+                path.display()
+            )));
+        }
+    }
+    if let Some(proof) = prefix_proof.as_ref()
+        && (!proof.is_well_formed()
+            || Some(proof.journal_sequence) != materialized_through_sequence)
+    {
+        return Err(MetadataBackendError::Serde(format!(
+            "DFS metadata table snapshot has an invalid prefix proof at {}",
+            path.display()
+        )));
+    }
     let tables = metadata_tables_from_table_snapshot(
         snapshot,
         &format!("DFS metadata table snapshot at {}", path.display()),
@@ -143,6 +182,7 @@ fn read_metadata_table_snapshot(root: &Path) -> Result<DfsMetadataTableState> {
         materialized_through_sequence,
         snapshot_format_version: Some(format_version),
         snapshot_fingerprint: metadata_table_snapshot_fingerprint(root)?,
+        prefix_proof,
     })
 }
 
@@ -237,6 +277,7 @@ fn replay_metadata_table_batches(
             source,
         })?;
     let mut materialized_through_sequence = None;
+    let mut prefix_proof = None;
     loop {
         let Some(record) = durable_file::read_length_prefixed_record(
             file,
@@ -266,6 +307,16 @@ fn replay_metadata_table_batches(
         };
         materialized_through_sequence =
             max_optional_sequence(materialized_through_sequence, Some(batch.sequence));
+        if let Some(proof) = batch.prefix_proof.as_ref() {
+            if !proof.is_well_formed() || proof.journal_sequence != batch.sequence {
+                return Err(MetadataBackendError::Serde(format!(
+                    "metadata table batch {} has an invalid prefix proof at {}",
+                    batch.sequence,
+                    path.display()
+                )));
+            }
+            prefix_proof = Some(proof.clone());
+        }
         for op in batch.ops {
             tables.apply(op);
         }
@@ -276,6 +327,7 @@ fn replay_metadata_table_batches(
     Ok(MetadataTableReplay {
         offset,
         materialized_through_sequence,
+        prefix_proof,
     })
 }
 
@@ -341,16 +393,30 @@ pub(crate) fn persist_metadata_table_snapshot(
     root: &Path,
     tables: &DfsMetadataTables,
     materialized_through_sequence: Option<u64>,
+    prefix_proof: Option<&DfsMetadataPrefixProof>,
 ) -> Result<()> {
-    write_sobj_atomic(
-        &metadata_table_snapshot_path(root),
-        &DfsMetadataTableSnapshot {
-            format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
-            materialized_through_sequence,
-            tables: Some(metadata_tables_snapshot(tables)),
-            ops: Vec::new(),
-        },
-    )?;
+    if let Some(proof) = prefix_proof
+        && (!proof.is_well_formed()
+            || Some(proof.journal_sequence) != materialized_through_sequence)
+    {
+        return Err(MetadataBackendError::Serde(format!(
+            "cannot persist metadata snapshot sequence {materialized_through_sequence:?} with prefix proof sequence {}",
+            proof.journal_sequence
+        )));
+    }
+    let mut snapshot = DfsMetadataTableSnapshot {
+        format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+        materialized_through_sequence,
+        tables: Some(metadata_tables_snapshot(tables)),
+        ops: Vec::new(),
+        semantic_state_fingerprint: None,
+        prefix_proof: prefix_proof.cloned(),
+    };
+    snapshot.semantic_state_fingerprint = Some(
+        dfs_metadata_table_snapshot_state_fingerprint(&snapshot)
+            .map_err(|source| MetadataBackendError::Serde(source.to_string()))?,
+    );
+    write_sobj_atomic(&metadata_table_snapshot_path(root), &snapshot)?;
     truncate_metadata_table_log(root)?;
     Ok(())
 }
@@ -395,6 +461,7 @@ pub(crate) fn metadata_tables_snapshot(
             )
             .collect(),
         namespace_transactions: tables.namespace_transactions.values().cloned().collect(),
+        namespace_prepares: tables.namespace_prepares.values().cloned().collect(),
         namespace_jobs: tables.namespace_jobs.values().cloned().collect(),
     }
 }
@@ -456,6 +523,9 @@ fn metadata_tables_from_snapshot(snapshot: DfsMetadataTableSnapshotTables) -> Df
     }
     for transaction in snapshot.namespace_transactions {
         tables.apply(DfsMetadataTableOp::PutNamespaceTransaction { transaction });
+    }
+    for prepare in snapshot.namespace_prepares {
+        tables.apply(DfsMetadataTableOp::PutNamespacePrepare { prepare });
     }
     for job in snapshot.namespace_jobs {
         tables.apply(DfsMetadataTableOp::PutNamespaceJob { job });
@@ -627,6 +697,13 @@ pub(crate) fn metadata_table_snapshot_ops(tables: &DfsMetadataTables) -> Vec<Dfs
             .values()
             .cloned()
             .map(|transaction| DfsMetadataTableOp::PutNamespaceTransaction { transaction }),
+    );
+    ops.extend(
+        tables
+            .namespace_prepares
+            .values()
+            .cloned()
+            .map(|prepare| DfsMetadataTableOp::PutNamespacePrepare { prepare }),
     );
     ops.extend(
         tables

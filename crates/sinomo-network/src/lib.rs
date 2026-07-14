@@ -224,6 +224,11 @@ pub use route::{
     handle_cluster_relay_async_with_host, relay_request_inner_route,
     relay_response_is_routing_error,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use route::{
+    SignedObjectRpcRequestHeadEncodedLengths,
+    signed_object_rpc_request_head_encoded_lengths_for_test,
+};
 pub use rpc::{
     CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_HEALTH_RPC_ROUTE_METADATA,
     CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_CHALLENGE_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE,

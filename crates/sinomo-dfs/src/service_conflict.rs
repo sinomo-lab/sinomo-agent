@@ -431,27 +431,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    pub(crate) fn add_backend_conflict_pages_to_memory(
-        &mut self,
-        object_id: &DfsObjectId,
-    ) -> Result<(), DfsError> {
-        let Some(backend) = self.metadata_backend.as_ref() else {
-            return Ok(());
-        };
-        let conflicts = collect_metadata_pages(|cursor| {
-            let page = backend.conflicts_for_object_page(
-                object_id,
-                cursor,
-                DFS_CONFLICT_SCAN_PAGE_SIZE,
-            )?;
-            Ok((page.conflicts, page.next_cursor))
-        })?;
-        for conflict in conflicts {
-            self.metadata.add_conflict(conflict);
-        }
-        Ok(())
-    }
-
     fn collect_conflict_records_for_object<I, F>(
         &self,
         object_id: &DfsObjectId,

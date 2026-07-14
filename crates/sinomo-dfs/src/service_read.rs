@@ -17,11 +17,22 @@ use crate::transfer::{PendingNetworkedRead, range_transfer_size_bytes};
 use crate::*;
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    fn ensure_standalone_local_object_publication(&self) -> Result<(), DfsError> {
+        if self.control_plane.is_some() {
+            return Err(DfsError::Distributed {
+                message: "local object-version publication is standalone-only; clustered DFS metadata must be published through the canonical distributed write path"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn put_local_object_version(
         &mut self,
         object: DfsObjectMetadata,
         bytes: &[u8],
     ) -> Result<String, DfsError> {
+        self.ensure_standalone_local_object_publication()?;
         let manifest = self.content.put_object_version(
             object.object_id.as_str(),
             object.version.as_str(),
@@ -35,6 +46,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object: DfsObjectMetadata,
         reader: R,
     ) -> Result<String, DfsError> {
+        self.ensure_standalone_local_object_publication()?;
         let manifest = self.content.put_object_version_from_reader(
             object.object_id.as_str(),
             object.version.as_str(),
@@ -757,6 +769,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ));
         }
 
+        if let (Some(expected_hash), Some(expected_size)) =
+            (object.content_hash.as_ref(), object.content_size_bytes)
+            && let Ok(Some((manifest, reader))) = self.content.open_object_content_range_stream(
+                object.object_id.as_str(),
+                expected_hash,
+                expected_size,
+                offset,
+                max_bytes,
+            )
+        {
+            let range_offset = offset.min(manifest.size_bytes);
+            let range_size_bytes =
+                range_transfer_size_bytes(manifest.size_bytes, offset, max_bytes);
+            return Ok(NetworkedDfsRangeReadStreamOutcome::Found(
+                NetworkedDfsRangeReadStream {
+                    data: DfsReadRangeData {
+                        object_id: object.object_id.clone(),
+                        version: object.version.clone(),
+                        content_hash: Some(expected_hash.clone()),
+                        offset: range_offset,
+                        total_size_bytes: manifest.size_bytes,
+                        bytes: Vec::new(),
+                    },
+                    range_size_bytes,
+                    reader,
+                },
+            ));
+        }
+
         if object.content_hash.is_some() {
             Ok(NetworkedDfsRangeReadStreamOutcome::PendingReplication)
         } else {
@@ -839,6 +880,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     content_hash: Some(expected_hash.clone()),
                     offset: range_offset,
                     total_size_bytes,
+                    bytes,
+                },
+                freshness: NetworkedDfsReadFreshness::Current,
+            });
+        }
+
+        if let (Some(expected_hash), Some(expected_size)) =
+            (object.content_hash.as_ref(), object.content_size_bytes)
+            && let Ok(Some((manifest, bytes))) = self.content.read_object_content_range(
+                object.object_id.as_str(),
+                expected_hash,
+                expected_size,
+                offset,
+                max_bytes,
+            )
+        {
+            return Ok(NetworkedDfsRangeReadOutcome::Found {
+                data: DfsReadRangeData {
+                    object_id: object.object_id.clone(),
+                    version: object.version.clone(),
+                    content_hash: Some(expected_hash.clone()),
+                    offset: offset.min(manifest.size_bytes),
+                    total_size_bytes: manifest.size_bytes,
                     bytes,
                 },
                 freshness: NetworkedDfsReadFreshness::Current,

@@ -2909,6 +2909,33 @@ pub(crate) struct PreparedSessionCall {
     response_proof_session_id: TransferId,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn encoded_signed_request_head_len_for_test(
+    mut prepared: PreparedSessionCall,
+    request_auth: Vec<u8>,
+    local_data_dir: &SinomoDataDir,
+) -> Result<usize, NetworkError> {
+    if request_auth.is_empty() || prepared.request.auth.is_some() {
+        return Err(NetworkError::Serialization {
+            detail: "object RPC session requires one freshly produced request signature"
+                .to_string(),
+        });
+    }
+    prepared.request.auth = Some(request_auth);
+    let session_id = prepared.descriptor.session_id.clone();
+    let writer = SessionFrameWriter::new(
+        tokio::io::sink(),
+        local_data_dir.clone(),
+        session_id,
+        SessionFrameDirection::InitiatorToResponder,
+        NetworkCallPolicy::default(),
+    )?;
+    writer.encoded_control_len(SessionWirePayload::RequestHead {
+        request: prepared.request,
+        descriptor: prepared.descriptor,
+    })
+}
+
 fn session_descriptor_from_request(
     request: &crate::ObjectRpcRequest,
 ) -> Result<ObjectRpcSessionDescriptor, NetworkError> {

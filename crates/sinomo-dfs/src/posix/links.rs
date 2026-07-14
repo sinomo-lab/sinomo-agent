@@ -156,8 +156,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_hardlink(&mut self, existing_path: &str, link_path: &str) -> Result<DfsStat> {
         let normalized_existing = normalize_posix_path(existing_path)?;
         let normalized_link = normalize_posix_path(link_path)?;
-        let existing_primary = self.routed_namespace_primary_for_path(&normalized_existing)?;
-        let link_primary = self.routed_namespace_primary_for_path(&normalized_link)?;
+        let mut primaries = self
+            .routed_namespace_primaries_for_paths_fresh([
+                normalized_existing.as_str(),
+                normalized_link.as_str(),
+            ])?
+            .into_iter();
+        let existing_primary = primaries.next().unwrap_or(None);
+        let link_primary = primaries.next().unwrap_or(None);
         match (existing_primary, link_primary) {
             (None, None) => self.posix_hardlink_local(existing_path, link_path),
             (None, Some(_)) => {

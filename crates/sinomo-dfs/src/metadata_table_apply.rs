@@ -9,7 +9,7 @@ use std::io;
 use std::path::Path;
 
 use crate::metadata_error::{MetadataBackendError, Result};
-use crate::metadata_records::{DfsMetadataTableBatch, DfsMetadataTableOp};
+use crate::metadata_records::{DfsMetadataPrefixProof, DfsMetadataTableBatch, DfsMetadataTableOp};
 use crate::metadata_table_store::{
     append_metadata_table_batch, metadata_table_path, metadata_table_snapshot_fingerprint,
     persist_metadata_table_snapshot,
@@ -23,6 +23,7 @@ pub(crate) struct TableMaterializationState<'a> {
     pub(crate) table_log_offset: &'a mut u64,
     pub(crate) materialized_through_sequence: &'a mut u64,
     pub(crate) table_snapshot_fingerprint: &'a mut Option<MetadataTableSnapshotFingerprint>,
+    pub(crate) prefix_proof: &'a mut Option<DfsMetadataPrefixProof>,
 }
 
 pub(crate) fn append_and_apply_table_ops(
@@ -69,6 +70,7 @@ pub(crate) fn compact_metadata_table_log_if_needed(
         root,
         state.tables,
         Some(*state.materialized_through_sequence),
+        state.prefix_proof.as_ref(),
     )?;
     *state.table_snapshot_fingerprint = metadata_table_snapshot_fingerprint(root)?;
     *state.table_log_offset = fs::metadata(&path)
@@ -85,8 +87,16 @@ fn append_table_batch(
     max_log_bytes: u64,
     rollback: Option<DfsMetadataTableRollback>,
 ) -> Result<()> {
-    if ops.is_empty() {
-        return Ok(());
+    let prefix_proof = state.prefix_proof.as_ref().ok_or_else(|| {
+        MetadataBackendError::Serde(format!(
+            "metadata table batch {sequence} cannot commit without an exact journal-prefix proof"
+        ))
+    })?;
+    if !prefix_proof.is_well_formed() || prefix_proof.journal_sequence != sequence {
+        return Err(MetadataBackendError::Serde(format!(
+            "metadata table batch {sequence} prefix proof names sequence {}",
+            prefix_proof.journal_sequence
+        )));
     }
     let apply_after_append = rollback.is_none();
     let written = match append_metadata_table_batch(
@@ -94,6 +104,7 @@ fn append_table_batch(
         &DfsMetadataTableBatch {
             sequence,
             ops: ops.clone(),
+            prefix_proof: Some(prefix_proof.clone()),
         },
     ) {
         Ok(written) => written,

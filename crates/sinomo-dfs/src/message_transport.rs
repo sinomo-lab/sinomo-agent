@@ -13,7 +13,10 @@ use sinomo_core::node::NodeId;
 
 use crate::protocol::DfsRoutedMessage;
 use crate::routes::{dfs_routed_message_from_object_rpc_request, dfs_routed_message_rpc_request};
-use crate::{DfsRpcBodyDescriptor, ObjectVersionReader};
+use crate::{
+    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsRpcBodyDescriptor,
+    ObjectVersionReader,
+};
 
 #[derive(Debug)]
 pub struct DfsOutboundBody {
@@ -107,6 +110,41 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         message: DfsRoutedMessage,
     ) -> Result<(), NetworkError> {
         self.send_routed_message(target_node_id, message)
+    }
+
+    /// Send a metadata journal batch over the canonical metadata object-RPC
+    /// route when this transport retains a direct peer transport.
+    ///
+    /// In-process and message-only test transports deliberately return
+    /// `None`. Callers must treat that as absence of the stronger direct
+    /// authority acknowledgement and use their fail-closed fallback.
+    fn send_metadata_journal_batch_direct(
+        &mut self,
+        _target_node_id: &NodeId,
+        _command: &DfsMetadataJournalBatchCommand,
+    ) -> Result<Option<DfsMetadataJournalBatchResponse>, NetworkError> {
+        Ok(None)
+    }
+
+    /// Send one prepared metadata batch to several replicas. Production node
+    /// transports override this with concurrent fan-out so healthy authority
+    /// latency is bounded by the slowest shard replica rather than the sum of
+    /// replica RTTs. Message-only transports retain the compatible sequential
+    /// fallback.
+    fn send_metadata_journal_batches_direct(
+        &mut self,
+        requests: &[(NodeId, DfsMetadataJournalBatchCommand)],
+    ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
+        let mut responses = Vec::with_capacity(requests.len());
+        for (target_node_id, command) in requests {
+            let Some(response) =
+                self.send_metadata_journal_batch_direct(target_node_id, command)?
+            else {
+                return Ok(None);
+            };
+            responses.push((target_node_id.clone(), response));
+        }
+        Ok(Some(responses))
     }
 
     fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError>;

@@ -6,7 +6,8 @@
 //! large byte vectors out of its wire representation.
 
 use crate::{
-    DfsMessageCommand, DfsMessageResponse, DfsNetworkMessage, DfsReadResult, content_hash,
+    DfsMessageCommand, DfsMessageResponse, DfsMetadataTableSnapshot, DfsNetworkMessage,
+    DfsReadResult, content_hash,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse, SinomoObjectCodec};
@@ -35,7 +36,7 @@ pub struct DfsBodyMessageResponse {
 
 pub(crate) fn split_dfs_message_request_body(
     command: &DfsMessageCommand,
-) -> Option<(DfsMessageCommand, DfsRpcBodyDescriptor, Vec<u8>)> {
+) -> Result<Option<(DfsMessageCommand, DfsRpcBodyDescriptor, Vec<u8>)>, NetworkError> {
     let mut head = command.clone();
     let (bytes, declared_hash) = match &mut head.routed_message.message {
         DfsNetworkMessage::WriteRequest(command) => {
@@ -67,16 +68,34 @@ pub(crate) fn split_dfs_message_request_body(
             std::mem::take(&mut command.bytes),
             command.content_hash.clone(),
         ),
-        _ => return None,
+        DfsNetworkMessage::MetadataSnapshotInstall(command) => {
+            let snapshot = std::mem::replace(
+                &mut command.snapshot,
+                DfsMetadataTableSnapshot {
+                    // Invalid as a standalone snapshot. The request-body
+                    // decoder replaces this sentinel before DFS dispatch.
+                    format_version: 0,
+                    materialized_through_sequence: None,
+                    tables: None,
+                    ops: Vec::new(),
+                    semantic_state_fingerprint: None,
+                    prefix_proof: None,
+                },
+            );
+            let bytes = SinomoObjectCodec::network_frame().encode(&snapshot)?;
+            let digest = content_hash(&bytes);
+            (bytes, digest)
+        }
+        _ => return Ok(None),
     };
     if bytes.is_empty() {
-        return None;
+        return Ok(None);
     }
     let descriptor = DfsRpcBodyDescriptor {
         total_size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         content_hash: Some(declared_hash),
     };
-    Some((head, descriptor, bytes))
+    Ok(Some((head, descriptor, bytes)))
 }
 
 pub(crate) fn encode_dfs_body_message_rpc_request(
@@ -112,6 +131,9 @@ pub(crate) fn attach_dfs_message_request_body(
         DfsNetworkMessage::StageBlob(command) => command.bytes = bytes,
         DfsNetworkMessage::StagePatch(command) => command.bytes = bytes,
         DfsNetworkMessage::RepairReplica(command) => command.bytes = bytes,
+        DfsNetworkMessage::MetadataSnapshotInstall(command) => {
+            command.snapshot = SinomoObjectCodec::network_frame().decode(&bytes)?;
+        }
         DfsNetworkMessage::FetchBlobResponse(response) => match &mut response.result {
             crate::DfsFetchBlobResult::Found {
                 content_hash,
@@ -302,9 +324,11 @@ fn serialization_error(detail: impl Into<String>) -> NetworkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata_records::DfsMetadataTableOp;
     use crate::{
-        DfsDistributedWriteCommand, DfsFileSystemId, DfsObjectId, DfsReplicationPolicy,
-        DfsRoutedMessage, DfsStageBlobCommand, DfsVersion,
+        DfsDistributedWriteCommand, DfsFileSystemId, DfsMetadataShardId,
+        DfsMetadataSnapshotInstallCommand, DfsObjectId, DfsReplicationPolicy, DfsRoutedMessage,
+        DfsStageBlobCommand, DfsVersion,
     };
     use sinomo_core::DfsWriteRequest;
     use sinomo_core::node::NodeId;
@@ -338,8 +362,9 @@ mod tests {
     #[test]
     fn request_body_split_and_attach_round_trip() {
         let command = stage_blob_command((0..4097).map(|index| (index % 251) as u8).collect());
-        let (head, descriptor, bytes) =
-            split_dfs_message_request_body(&command).expect("split body");
+        let (head, descriptor, bytes) = split_dfs_message_request_body(&command)
+            .expect("encode body")
+            .expect("split body");
         assert_eq!(descriptor.total_size_bytes, bytes.len() as u64);
         assert_eq!(
             descriptor.content_hash.as_deref(),
@@ -358,6 +383,81 @@ mod tests {
             bytes,
         )
         .expect("attach body");
+        assert_eq!(attached, command);
+    }
+
+    #[test]
+    fn large_metadata_snapshot_install_streams_outside_the_message_head() {
+        let source = NodeId::from_legacy_named("snapshot-body-source").expect("source id");
+        let target = NodeId::from_legacy_named("snapshot-body-target").expect("target id");
+        let file_system_id =
+            DfsFileSystemId::from_legacy_named("snapshot-body-fs").expect("filesystem id");
+        let snapshot = DfsMetadataTableSnapshot {
+            format_version: crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+            materialized_through_sequence: Some(41),
+            tables: None,
+            ops: (0..1024)
+                .map(|index| DfsMetadataTableOp::RemovePath {
+                    file_system_id: file_system_id.clone(),
+                    path: format!("/streamed-snapshot/{index:04}/{}", "x".repeat(128)),
+                })
+                .collect(),
+            semantic_state_fingerprint: None,
+            prefix_proof: None,
+        };
+        let command = DfsMessageCommand {
+            request_id: "snapshot-body-request".to_string(),
+            routed_message: DfsRoutedMessage {
+                source_node_id: source.clone(),
+                target_node_id: target,
+                frame_id: 19,
+                message_id: 23,
+                message: DfsNetworkMessage::MetadataSnapshotInstall(
+                    DfsMetadataSnapshotInstallCommand {
+                        request_id: "snapshot-install".to_string(),
+                        source_node_id: source,
+                        file_system_id: Some(file_system_id),
+                        authority_epoch: Some(7),
+                        shard_id: DfsMetadataShardId("snapshot-shard".to_string()),
+                        next_after_sequence: 41,
+                        snapshot,
+                        reason: "repair a compacted metadata prefix".to_string(),
+                    },
+                ),
+            },
+        };
+
+        let (head, descriptor, body) = split_dfs_message_request_body(&command)
+            .expect("encode snapshot body")
+            .expect("split snapshot body");
+        assert!(
+            body.len() > 64 * 1024,
+            "fixture must exceed message frame cap"
+        );
+        assert_eq!(descriptor.total_size_bytes, body.len() as u64);
+        assert!(
+            SinomoObjectCodec::network_frame()
+                .encode(&head)
+                .expect("encode snapshot head")
+                .len()
+                < 64 * 1024,
+            "streaming must keep the message head under the daemon frame cap"
+        );
+        let DfsNetworkMessage::MetadataSnapshotInstall(head_command) = &head.routed_message.message
+        else {
+            panic!("expected snapshot install head");
+        };
+        assert_eq!(head_command.snapshot.format_version, 0);
+        assert!(head_command.snapshot.ops.is_empty());
+
+        let attached = attach_dfs_message_request_body(
+            DfsBodyMessageCommand {
+                command: head,
+                body: descriptor,
+            },
+            body,
+        )
+        .expect("attach snapshot body");
         assert_eq!(attached, command);
     }
 
@@ -399,8 +499,9 @@ mod tests {
             },
         };
 
-        let (head, descriptor, body) =
-            split_dfs_message_request_body(&command).expect("split body");
+        let (head, descriptor, body) = split_dfs_message_request_body(&command)
+            .expect("encode body")
+            .expect("split body");
         let DfsNetworkMessage::DistributedWriteRequest(head_write) = &head.routed_message.message
         else {
             panic!("expected distributed write head");
@@ -427,8 +528,9 @@ mod tests {
     #[test]
     fn request_body_attach_rejects_hash_mismatch() {
         let command = stage_blob_command(vec![1, 2, 3, 4]);
-        let (head, descriptor, mut bytes) =
-            split_dfs_message_request_body(&command).expect("split body");
+        let (head, descriptor, mut bytes) = split_dfs_message_request_body(&command)
+            .expect("encode body")
+            .expect("split body");
         bytes[0] ^= 0xff;
         let error = attach_dfs_message_request_body(
             DfsBodyMessageCommand {

@@ -21,7 +21,6 @@ use crate::{
 use sinomo_core::node::NodeId;
 use std::time::{Duration, Instant};
 
-const POSIX_SIFS_METADATA_SHARD_CACHE_TTL: Duration = Duration::from_secs(1);
 /// Routed-operation attempts when authority rejections redirect to the
 /// current shard primary (a stale local shard view names a former primary).
 const POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT: usize = 3;
@@ -59,17 +58,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })
     }
 
-    fn routed_namespace_shard_for_path_cached(
-        &mut self,
-        path: &str,
-    ) -> Result<Option<DfsMetadataShardConfig>> {
-        let shard = self.select_sifs_metadata_shard_for_path_cached(path)?;
-        Ok(match shard {
-            Some(shard) if shard.primary_node_id != self.node_id => Some(shard),
-            _ => None,
-        })
-    }
-
     fn select_sifs_metadata_shard_for_path_fresh(
         &mut self,
         path: &str,
@@ -95,10 +83,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .list_metadata_shards(&sifs_file_system_id())
                 .map_err(DfsError::from)?
         };
-        self.cached_sifs_metadata_shards = Some(crate::CachedSifsMetadataShards {
-            recorded_at: Instant::now(),
-            shards: shards.clone(),
-        });
         Ok(Some(shards))
     }
 
@@ -166,42 +150,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
-    fn select_sifs_metadata_shard_for_path_cached(
-        &mut self,
+    fn routed_namespace_shard_for_path_from_snapshot(
+        &self,
         path: &str,
+        shards: &[DfsMetadataShardConfig],
     ) -> Result<Option<DfsMetadataShardConfig>> {
-        if self.control_plane.is_none() {
-            return Ok(None);
-        }
-        let now = Instant::now();
-        let shards = if let Some(cache) = self.cached_sifs_metadata_shards.as_ref()
-            && now.duration_since(cache.recorded_at) < POSIX_SIFS_METADATA_SHARD_CACHE_TTL
-        {
-            cache.shards.clone()
-        } else {
-            let shards = {
-                let kv = self
-                    .control_plane
-                    .as_mut()
-                    .expect("control plane checked before metadata shard cache refresh");
-                DfsControlPlaneStore::new(kv.as_mut())
-                    .list_metadata_shards(&sifs_file_system_id())
-                    .map_err(DfsError::from)?
-            };
-            self.cached_sifs_metadata_shards = Some(crate::CachedSifsMetadataShards {
-                recorded_at: now,
-                shards: shards.clone(),
-            });
-            shards
-        };
         Ok(
-            crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
-                &sifs_file_system_id(),
-                &shards,
-                path,
-            )
-            .map_err(DfsError::from)?,
+            match self.select_sifs_metadata_shard_for_path_from_snapshot(path, shards)? {
+                Some(shard) if shard.primary_node_id != self.node_id => Some(shard),
+                _ => None,
+            },
         )
+    }
+
+    /// Resolve every path in one compound namespace decision from the same
+    /// freshly loaded shard-config snapshot. A rename or hardlink must not pay
+    /// one full control-plane prefix scan per side, and mixing revisions while
+    /// classifying the two sides can produce a routing decision that never
+    /// existed in the committed configuration.
+    pub(crate) fn routed_namespace_primaries_for_paths_fresh<'a>(
+        &mut self,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<Option<NodeId>>> {
+        let paths = paths.into_iter().collect::<Vec<_>>();
+        let Some(shards) = self.refresh_sifs_metadata_shards()? else {
+            return Ok(vec![None; paths.len()]);
+        };
+        paths
+            .into_iter()
+            .map(|path| self.routed_namespace_primary_for_path_from_snapshot(path, &shards))
+            .collect()
     }
 
     fn should_attempt_read_freshness_sync(&mut self, shard: &DfsMetadataShardConfig) -> bool {
@@ -237,8 +215,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// The local journal cursor of the shard owning `path`, used to detect
     /// whether a sync round actually advanced the local mirror.
-    fn metadata_shard_cursor_for_path(&mut self, path: &str) -> Result<u64> {
-        let Some(shard) = self.select_sifs_metadata_shard_for_path_cached(path)? else {
+    fn metadata_shard_cursor_for_path_from_snapshot(
+        &self,
+        path: &str,
+        shards: &[DfsMetadataShardConfig],
+    ) -> Result<u64> {
+        let Some(shard) = self.select_sifs_metadata_shard_for_path_from_snapshot(path, shards)?
+        else {
             return Ok(0);
         };
         let shard_id = DfsMetadataShardId::new(shard.shard_id);
@@ -262,9 +245,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         follow_final: bool,
     ) -> Result<(String, Option<DfsObjectMetadata>)> {
         let mut resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
+        let shard_snapshot = self.refresh_sifs_metadata_shards()?;
         for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
             let local_object = self.lookup_sifs_path(&resolved)?;
-            let Some(shard) = self.routed_namespace_shard_for_path_cached(&resolved)? else {
+            let Some(shard) = shard_snapshot
+                .as_deref()
+                .map(|shards| self.routed_namespace_shard_for_path_from_snapshot(&resolved, shards))
+                .transpose()?
+                .flatten()
+            else {
                 if let Some(object) = local_object
                     && object.kind != DfsObjectKind::Tombstone
                 {
@@ -310,7 +299,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if !self.should_attempt_read_freshness_sync(&shard) {
                 break;
             }
-            let cursor_before = self.metadata_shard_cursor_for_path(&resolved)?;
+            let cursor_before = self.metadata_shard_cursor_for_path_from_snapshot(
+                &resolved,
+                shard_snapshot.as_deref().unwrap_or_default(),
+            )?;
             if self
                 .route_namespace_operation_to_metadata_primary_with_timeout(
                     sifs_file_system_id(),
@@ -324,7 +316,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             {
                 break;
             }
-            if self.metadata_shard_cursor_for_path(&resolved)? <= cursor_before {
+            if self.metadata_shard_cursor_for_path_from_snapshot(
+                &resolved,
+                shard_snapshot.as_deref().unwrap_or_default(),
+            )? <= cursor_before
+            {
                 break;
             }
             resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
@@ -546,7 +542,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation: &DfsNamespaceOperation,
         primary: &mut NodeId,
     ) -> Result<RoutedNamespaceNetworkRecovery> {
-        self.cached_sifs_metadata_shards = None;
         let Some(path) = namespace_operation_routing_path(operation) else {
             return Ok(RoutedNamespaceNetworkRecovery::Unchanged);
         };

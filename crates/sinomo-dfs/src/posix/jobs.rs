@@ -209,9 +209,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // destination owned by another metadata primary must go through the
         // routed `posix_rename`, whose coordinator journals each half on its
         // own authority.
-        if self.routed_namespace_primary_for_path(&from)?.is_some()
-            || self.routed_namespace_primary_for_path(&to)?.is_some()
-        {
+        let primaries =
+            self.routed_namespace_primaries_for_paths_fresh([from.as_str(), to.as_str()])?;
+        if primaries.into_iter().any(|primary| primary.is_some()) {
             return Err(DfsPosixError::InvalidPath {
                 path: format!("{from} -> {to} crosses metadata shard primaries; use posix_rename"),
             });
@@ -246,8 +246,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsNamespaceJobRecord> {
         let normalized_from = normalize_posix_path(from)?;
         let normalized_to = normalize_posix_path(to)?;
-        let from_primary = self.routed_namespace_primary_for_path(&normalized_from)?;
-        let to_primary = self.routed_namespace_primary_for_path(&normalized_to)?;
+        let mut primaries = self
+            .routed_namespace_primaries_for_paths_fresh([
+                normalized_from.as_str(),
+                normalized_to.as_str(),
+            ])?
+            .into_iter();
+        let from_primary = primaries.next().unwrap_or(None);
+        let to_primary = primaries.next().unwrap_or(None);
         match (from_primary, to_primary) {
             (None, None) => {
                 self.posix_rename_directory_bounded(&normalized_from, &normalized_to, max_steps)

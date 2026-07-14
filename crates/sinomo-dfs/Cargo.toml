@@ -26,6 +26,7 @@ sinomo-config = { path = "../sinomo-config" }
 sinomo-module = { path = "../sinomo-module" }
 
 [dev-dependencies]
+sinomo-core = { path = "../sinomo-core", features = ["network-test-support"] }
 sinomo-testdir = { path = "../sinomo-testdir" }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 tracing-subscriber.workspace = true

@@ -254,21 +254,96 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn bootstrap_distributed_sifs(&mut self) -> Result<()> {
         let fallback_file_system = crate::namespace::distributed_sifs(self.node_id.clone());
         let file_system_id = fallback_file_system.file_system_id.clone();
-        let file_system = if let Some(kv) = self.control_plane.as_mut() {
-            DfsControlPlaneStore::new(kv.as_mut())
+        let (file_system, configured_shards) = if let Some(kv) = self.control_plane.as_mut() {
+            let store = DfsControlPlaneStore::new(kv.as_mut());
+            let file_system = store
                 .get_file_system_config(&file_system_id)
                 .map_err(DfsError::from)?
                 .map(DfsFileSystem::from)
-                .unwrap_or(fallback_file_system)
+                .unwrap_or(fallback_file_system);
+            let shards = store
+                .list_metadata_shards(&file_system_id)
+                .map_err(DfsError::from)?;
+            (file_system, Some(shards))
         } else {
-            fallback_file_system
+            (fallback_file_system, None)
         };
         let bootstrap_owner_node_id = file_system.owner_node_id.clone();
-        self.add_file_system(file_system)?;
+        if configured_shards.is_some() {
+            // Cluster KV is the source of filesystem configuration. Register
+            // it in memory for path resolution, but do not journal it across
+            // every locally opened shard. Each exact shard primary persists
+            // the record on that shard when it prepares its first canonical
+            // namespace mutation; replicas learn it through that journal.
+            self.clear_metadata_lookup_cache();
+            self.metadata.add_file_system(file_system);
+            self.clear_metadata_lookup_cache();
+        } else {
+            self.add_file_system(file_system)?;
+        }
         for object in
             crate::namespace::distributed_sifs_bootstrap_objects(bootstrap_owner_node_id.clone())
         {
-            match self.lookup_metadata_path(&object.file_system_id, &object.path)? {
+            if let Some(shards) = configured_shards.as_deref() {
+                // Bootstrap is an authority-local maintenance action. A
+                // client/replica must not manufacture root metadata when the
+                // configured primary is elsewhere, and an incomplete default
+                // split must fail closed for that anchor without preventing
+                // the service from opening. The responsible primary will
+                // create or repair its own fixed bootstrap objects.
+                let Ok(Some(shard)) =
+                    crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                        &file_system_id,
+                        shards,
+                        &object.path,
+                    )
+                else {
+                    continue;
+                };
+                if shard.primary_node_id != self.node_id {
+                    continue;
+                }
+                // A shard-primary bootstrap can start from journal genesis.
+                // Seed the configured filesystem on this exact shard before
+                // the first lookup: backend lookup intentionally rejects an
+                // unknown filesystem, and using the broad sharded ensure here
+                // would author the same entry on sibling replica shards.
+                let backend = self.metadata_backend.as_mut().ok_or_else(|| {
+                    DfsPosixError::Dfs(DfsError::Metadata {
+                        message: format!(
+                            "clustered SIFS bootstrap for shard {} requires a durable metadata backend",
+                            shard.shard_id
+                        ),
+                    })
+                })?;
+                backend.ensure_file_system_on_shard(
+                    &crate::DfsMetadataShardId::new(shard.shard_id),
+                    self.metadata
+                        .filesystems
+                        .get(&file_system_id)
+                        .ok_or_else(|| {
+                            DfsPosixError::Dfs(DfsError::Metadata {
+                                message: "clustered SIFS bootstrap lost its configured filesystem"
+                                    .to_string(),
+                            })
+                        })?,
+                )?;
+            }
+            // Clustered bootstrap objects are shard anchors. Their parent can
+            // legitimately live on a shard that is not opened locally (or,
+            // during a partial rollout, is not configured yet), so the
+            // ordinary tombstone-ancestor walk would route `/_anchor` through
+            // `/` and turn an exact local-shard bootstrap into
+            // `UnknownFileSystem`. The anchor itself is still checked on its
+            // selected shard; a tombstoned anchor is therefore not
+            // resurrected. Standalone bootstrap retains the full ancestor
+            // check.
+            let existing = if configured_shards.is_some() {
+                self.lookup_metadata_path_raw(&object.file_system_id, &object.path)?
+            } else {
+                self.lookup_metadata_path(&object.file_system_id, &object.path)?
+            };
+            match existing {
                 None => self.add_object_metadata(object)?,
                 // Early SIFS metadata predates persisted POSIX modes. A zero
                 // mode on a runtime-owned bootstrap directory makes the

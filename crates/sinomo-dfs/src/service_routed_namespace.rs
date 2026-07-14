@@ -391,6 +391,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .cloned();
                     let execute_started = Instant::now();
                     let outcome = match (&foreign_shard, &command.operation) {
+                        (None, DfsNamespaceOperation::ApplyTransaction { transaction }) => {
+                            if !transaction.advisory_lock_states.is_empty() {
+                                Err(posix_model::DfsPosixError::Dfs(DfsError::Distributed {
+                                    message: "generic namespace transactions may not install advisory-lock state; use the typed migration protocol"
+                                        .to_string(),
+                                }))
+                            } else if self.control_plane.is_some() && shards.len() != 1 {
+                                let shard_ids = shards
+                                    .iter()
+                                    .map(|shard| shard.shard_id.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                Err(posix_model::DfsPosixError::Dfs(DfsError::Distributed {
+                                    message: format!(
+                                        "clustered namespace transaction {} must resolve to exactly one metadata shard, found [{}]",
+                                        transaction.transaction_id, shard_ids
+                                    ),
+                                }))
+                            } else {
+                                self.apply_namespace_transaction_with_selected_shard(
+                                    transaction.clone(),
+                                    shards.first().cloned(),
+                                )
+                                .map(|()| None)
+                                .map_err(posix_model::DfsPosixError::from)
+                            }
+                        }
                         (None, _) => {
                             self.execute_posix_coordination_operation_local(&command.operation)
                         }
@@ -469,6 +496,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     shard_id,
                     after_sequence,
                     DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT,
+                    DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_ENTRY_LIMIT,
+                    DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BYTE_LIMIT,
                 )?);
             }
             batches
@@ -866,7 +895,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         attempted_primary: &NodeId,
         redirected_primary: NodeId,
     ) -> Result<NodeId, DfsError> {
-        self.cached_sifs_metadata_shards = None;
+        self.refresh_control_plane_latest()?;
         Ok(
             match self
                 .refreshed_single_primary_for_namespace_operation(file_system_id, operation)?
@@ -955,13 +984,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         ) {
             Ok(sent) => sent,
             Err(error @ DfsError::Network { .. }) => {
-                self.cached_sifs_metadata_shards = None;
                 return Err(error);
             }
             Err(error) => return Err(error),
         };
         if !sent {
-            self.cached_sifs_metadata_shards = None;
             return Err(DfsError::Network {
                 message: format!(
                     "metadata primary {primary_node_id} is not routable for namespace operation"
@@ -972,7 +999,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .checked_duration_since(Instant::now())
             .filter(|duration| !duration.is_zero())
         else {
-            self.cached_sifs_metadata_shards = None;
             return Err(DfsError::Network {
                 message: format!(
                     "routed namespace operation {request_id} timed out before response settle"
@@ -1034,7 +1060,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let elapsed = started_at.elapsed();
             if elapsed >= timeout {
                 self.pending_routed_namespace_ops.remove(request_id);
-                self.cached_sifs_metadata_shards = None;
                 return Err(DfsError::Network {
                     message: format!(
                         "routed namespace operation {request_id} timed out waiting for the metadata primary"
