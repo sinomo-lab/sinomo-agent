@@ -4,6 +4,7 @@ set -euo pipefail
 args=("$@")
 has_profile=0
 profile_name=""
+target_dir="${CARGO_TARGET_DIR:-/workspace/target}"
 
 for ((i = 0; i < ${#args[@]}; i++)); do
   case "${args[$i]}" in
@@ -28,7 +29,7 @@ if [[ "${has_profile}" -eq 0 ]]; then
 fi
 
 if [[ "${profile_name}" == "android-debug-small" ]]; then
-  debug_keystore="${CARGO_APK_ANDROID_DEBUG_SMALL_KEYSTORE:-/workspace/target/android-debug.keystore}"
+  debug_keystore="${CARGO_APK_ANDROID_DEBUG_SMALL_KEYSTORE:-${target_dir}/android-debug.keystore}"
   debug_keystore_password="${CARGO_APK_ANDROID_DEBUG_SMALL_KEYSTORE_PASSWORD:-android}"
 
   if [[ ! -f "${debug_keystore}" ]]; then
@@ -54,12 +55,13 @@ cargo apk build -p sinomo-app-android "${args[@]}" || status=$?
 
 if [[ -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
   chown -R "${HOST_UID}:${HOST_GID}" \
-    /workspace/target/android-debug.keystore \
-    /workspace/target/android-debug-small/apk \
-    /workspace/target/debug/apk \
-    /workspace/target/release/apk \
-    /workspace/target/aarch64-linux-android \
-    /workspace/target/x86_64-linux-android \
+    "${target_dir}/android-debug.keystore" \
+    "${target_dir}/android-debug-small/apk" \
+    "${target_dir}/debug/apk" \
+    "${target_dir}/release/apk" \
+    "${target_dir}/aarch64-linux-android" \
+    "${target_dir}/x86_64-linux-android" \
+    "${target_dir}/cargo-apk-temp-extra-link-libraries" \
     2>/dev/null || true
 fi
 

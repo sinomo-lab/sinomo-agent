@@ -178,6 +178,22 @@ HOST_UID="$(id -u)" HOST_GID="$(id -g)" \
 The builder uses the `android-debug-small` profile and produces an aarch64 APK
 by default.
 
+For development on a connected ARM64 phone, install your distribution's Android
+udev rules, authorize the computer for USB debugging, and use the host helper:
+
+```bash
+scripts/android-dev.sh doctor
+scripts/android-dev.sh run
+scripts/android-dev.sh logs
+scripts/android-dev.sh debug
+```
+
+`run` builds a debuggable APK, installs it, and launches the NativeActivity.
+`debug` rebuilds when needed and attaches the NDK LLDB frontend with Rust/native
+line tables. Set `ANDROID_SERIAL` if more than one device is connected. The
+smaller container artifact remains useful for normal testing where debugger
+symbols are unnecessary.
+
 ## Repository layout
 
 | Path | Purpose |
