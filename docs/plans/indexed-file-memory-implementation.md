@@ -92,8 +92,20 @@ ModuleInterfaceExport {
   export_id,
   interface_id,
   interface_version,
-  operations,
-  descriptor_sobj,
+  operations: [
+    {
+      logical_operation,
+      target,                 # native invoke, object-RPC route/op, sandbox entry
+      request_schema_id,
+      response_schema_id,
+      max_request_bytes,
+      max_response_bytes,
+      max_facts_per_batch,
+      supports_cancellation,
+      continuation_schema_id?,
+    }
+  ],
+  descriptor_sobj,            # compact and hard-bounded
 }
 ```
 
@@ -101,8 +113,11 @@ Add a defaulted `interface_exports` field to `ModuleSurfaces` and
 `NativeModuleSurfaces`, with compatibility tests for older manifests and native
 descriptors. Memory interface ids include:
 
+- `sinomo.memory.source-connector/v1`;
 - `sinomo.memory.workspace-detector/v1`;
+- `sinomo.memory.format-detector/v1`;
 - `sinomo.memory.content-extractor/v1`;
+- `sinomo.memory.relation-extractor/v1`;
 - `sinomo.memory.embedding-provider/v1`;
 - `sinomo.memory.anchor-lineage/v1`;
 - `sinomo.memory.query-adapter/v1`;
@@ -116,6 +131,18 @@ facts, relations, vector/artifact references, diagnostics, and
 `DerivedFactBatch`. Re-export it through
 `sinomo_runtime::memory_extension_api`; R2 memory code must use the facade.
 The crate owns no scheduler, storage, retrieval, or policy behavior.
+
+The active identity includes module/export/interface version, artifact id and
+content hash, descriptor hash, and invocation lane; all enter the pipeline
+fingerprint. Registration validates every operation target against exported
+native/object-RPC/sandbox routes and enforces hard payload, batch,
+continuation, deadline, and cancellation contracts.
+
+Adding the R1 ABI crate also requires updating the workspace membership/default
+member declarations and `workspace_ring_boundaries.rs`, including
+`ABI_OBJECT_EXEMPT` only if the narrow object-codec exception is actually
+needed. Prefer crossing R0 through `sinomo-core` when the ABI can do so without
+compromising its boundary.
 
 Native dylibs reuse `NativeModuleRequest::Invoke` and SOBJ payloads. Static R2
 implementations use memory-owned trait adapters. Object-RPC and sandbox/Wasm
@@ -133,7 +160,8 @@ than the permanent discovery contract.
 Introduce the logical types before replacing storage:
 
 - `IndexRoot`, `MemoryFileRef`, `MemoryFileVersionRef`, source descriptor, and
-  coverage/freshness state;
+  coverage/freshness state, including `native-versioned`, `snapshot-capable`,
+  and `current-only` retention capabilities;
 - typed `MemoryAnchor` with whole-file, byte/text, structured, code, document,
   image, media-time, 3D-scene, and event/session selector envelopes;
 - `IndexFact`, extraction provenance, pipeline fingerprint, generation
@@ -142,7 +170,8 @@ Introduce the logical types before replacing storage:
   observed time, disputes, and supersession;
 - overlay operation and validation-state vocabulary;
 - structured `MemoryQuery`, retrieval plan/feature trace, and
-  `MemoryEvidenceBundle`;
+  `MemoryEvidenceBundle`, including pinned query-snapshot and
+  complete/approximate/budget-truncated coverage contracts;
 - paged/cursor-based source, index, overlay, and trace interfaces.
 
 Implement a read-only legacy connector that exposes each `MemoryRecord` as a
@@ -170,12 +199,15 @@ Build the smallest useful serving path before graph or model work:
 1. Register explicit local/VFS index roots.
 2. Catalog stable source identity, path, version/hash, media type, scope, and
    policy in paged source partitions.
-3. Implement verified immutable local snapshot handles and bounded range reads.
+3. Implement bounded verified local snapshot leases. Treat them as current-only
+   across mutation/restart unless policy explicitly pins bytes into versioned
+   content storage.
 4. Add deterministic plain-text/Markdown and JSON/YAML/TOML detectors and
    extractors.
 5. Publish metadata and lexical facts to immutable partition segments through
    an atomic manifest.
-6. Query metadata and lexical postings without replaying source facts.
+6. Build a versioned term/range-to-partition router and query metadata and
+   lexical postings without replaying source facts.
 7. Return exact text/structured anchors in a `MemoryEvidenceBundle`.
 8. Adapt the existing `MemoryContextProvider` and context assembler to consume
    evidence bundles while retaining a legacy record projection.
@@ -190,6 +222,11 @@ Verification gates:
 - querying does not write the catalog or serving index;
 - one file update rewrites no global corpus snapshot;
 - all returned text is pinned to a verified source version and bounded anchor;
+- a current-only source cannot serve old bytes after change unless an
+  authorized snapshot was retained;
+- an unconstrained exact lexical query either searches every routed partition
+  in its pinned snapshot or returns an honest continuation/truncation state;
+- compaction/publication during a query cannot mix partition generations;
 - a large synthetic root is processed with bounded memory and cursor-based
   enumeration;
 - legacy record retrieval and existing context tests continue to pass.
@@ -209,7 +246,8 @@ Add a durable maintenance service owned by `sinomo-memory`:
 - local watcher hints plus periodic bounded reconciliation;
 - an R1 read-only `DfsCatalog`/`DfsChangeFeed` facade, re-exported through
   `sinomo_runtime::dfs`, with paged logical objects, opaque per-shard/generation
-  checkpoints, bounded logical changes, and exact revision range reads;
+  checkpoints, stable scan tokens, bounded logical changes, and exact revision
+  range reads;
 - SIFS indexing through that logical facade, including visible-version,
   namespace, tombstone, policy, and placement changes;
 - atomic policy/deletion fences independent of background cleanup;
@@ -224,6 +262,13 @@ backend subscription as the memory correctness contract. Host-exposed
 local-owned files still need a scoped native/VFS watcher plus reconciliation.
 Checkpoint advancement must be durably coupled to catalog application or
 idempotent job enqueue so a crash cannot acknowledge and lose a change.
+
+`begin_scan` must return one catalog generation, a stable paged-scan token, and
+per-shard feed watermarks. Changes after those watermarks remain replayable
+until the completed scan and feed checkpoints commit together. A connector
+without a stable snapshot starts/buffers its watcher before scanning and repeats
+reconciliation until convergence; a single racy walk cannot mark coverage
+current.
 
 Generated memory partitions, staging output, traces, and exported snapshots
 must be excluded from source roots so maintenance cannot recursively index its
@@ -270,7 +315,11 @@ Add event/session and evolution-lesson source adapters so episodic task history
 and the existing file-oriented evolution lesson memory participate through the
 same source/anchor contracts rather than remaining separate retrieval silos.
 
-Add authoritative overlay operation files and materialized overlay partitions.
+Add authoritative immutable one-operation objects or independently fenced
+per-writer overlay streams, deterministic operation ids, idempotent merge, and
+materialized overlay partitions. Do not require multi-writer append to one SIFS
+file. A proposed dispute/supersession may rank or explain a conflict but cannot
+suppress an automatic fact.
 Expose bounded `memory_search`, `memory_explain`, `memory_read`,
 `memory_annotate`, `memory_link`, `memory_dispute`, and `memory_reindex` tools.
 Model writes default to proposed and cannot hide base facts globally.
@@ -297,7 +346,8 @@ relations work without making the graph or model an authority.
 Separate embedding generation from vector serving. A named vector-space
 descriptor records modality, model, dimensions, normalization, metric, version,
 and policy. Lexical and graph retrieval continue to work with no vector
-provider.
+provider. A coarse vector-to-partition router reports approximate coverage;
+only a completed exhaustive paged search reports complete vector coverage.
 
 Add extensions incrementally:
 
@@ -331,7 +381,11 @@ Implement:
   privacy inputs;
 - placement projections updated independently from content extraction;
 - bounded local-first federated query and stable result fusion;
+- pinned federated query snapshots/manifest leases, coverage states, and
+  continuations across remote partitions;
 - remote reauthorization and evidence handles;
+- policy epochs plus expiring offline authorization leases for shared cached
+  indexes, with fail-closed behavior after expiry;
 - raw-content-local result modes;
 - content-addressed partition snapshot export/import with schema and pipeline
   compatibility checks;
@@ -339,8 +393,9 @@ Implement:
   and overlay replication.
 
 Verification gates cover duplicate indexers, offline nodes, stale placement,
-policy changes during query, unavailable remote evidence, deterministic merge,
-and no dependence on cluster KV for high-cardinality state.
+policy changes during query, expired/offline authorization, unavailable remote
+evidence, deterministic merge, honest incomplete coverage, and no dependence
+on cluster KV for high-cardinality state.
 
 Expected outcome: a single node remains the base case, while a cluster can
 index and retrieve near data without centralizing raw files.
@@ -352,9 +407,17 @@ managed memory documents or overlay operations. Preserve full session/tool
 evidence in its owning files; do not reduce every turn to a mandatory warm
 summary.
 
-During a bounded compatibility window the agent may dual-write a managed file
-and legacy record. Add migration inspection, resumable conversion, comparison,
-and rollback tools. Do not delete legacy storage automatically.
+During a bounded compatibility window, commit the managed file/overlay as the
+only authority and project a legacy record through a durable idempotent outbox.
+Use a canonical conversion id, deterministic legacy record id, projection
+watermark, replay, and dual-read deduplication with the file representation
+winning. Reconciliation must recreate an outbox item after a crash between the
+source commit and enqueue. Add migration inspection, resumable conversion,
+comparison, and rollback-boundary tools.
+
+Do not delete, move, or rename legacy storage automatically. Existing
+`memory/records/...` and `memory/index.sobj` remain readable in place for old
+binaries and migration tools.
 
 Retire legacy serving only after:
 
@@ -364,7 +427,9 @@ Retire legacy serving only after:
 - operator tools can explain converted and unconverted records;
 - old binaries either remain compatible or the storage-version transition is
   explicit;
-- storage registry and data-dir migration tests cover both layouts.
+- storage registry and data-dir migration tests cover both layouts;
+- crash matrices cover every source-commit/outbox/projection/watermark boundary
+  without duplicate context blocks or divergent authority.
 
 Expected outcome: legacy records remain importable history, while all new
 memory is file-first.
@@ -376,7 +441,8 @@ Markdown/text only:
 
 ```text
 register root
-  -> catalog immutable file version
+  -> catalog current file version and retention capability
+  -> acquire verified snapshot lease
   -> extract text anchors
   -> publish lexical partition generation
   -> query evidence bundle

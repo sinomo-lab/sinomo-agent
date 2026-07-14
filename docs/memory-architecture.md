@@ -35,7 +35,7 @@ The architecture separates five kinds of state:
 
 | State | Source of truth | Mutability |
 |---|---|---|
-| File content and file metadata | The owning local filesystem, VFS, or DFS metadata/content authority | New immutable versions; namespace metadata changes through its owner |
+| File content and file metadata | The owning local filesystem, VFS, or DFS metadata/content authority | Source-native versions or verified current-only leases; namespace changes through its owner |
 | Agent-managed memory documents | Versioned files under the policy-appropriate local or SIFS scope | Normal file versioning |
 | Model-authored annotations and relations | Append-only overlay operation files | Corrections and supersession are new operations |
 | Automatic and serving indexes | Rebuildable partition generations | Replaced or compacted atomically |
@@ -127,6 +127,21 @@ streaming. If a platform cannot prove that a rename preserved identity, the
 connector must tombstone the old object and create a new one instead of
 inventing continuity.
 
+Every connector declares a version-retention capability:
+
+- `native-versioned`: the source can reopen an exact historical version;
+- `snapshot-capable`: Sinomo may selectively pin authorized bytes into a
+  content-addressed or managed versioned file;
+- `current-only`: a verified handle is stable only for the current extraction
+  lease and old bytes may disappear after mutation or deletion.
+
+A normal local file handle is not described as durable across restart. For a
+current-only source, extraction results can remain historical provenance after
+change, but retrieval cannot materialize the old content unless it was pinned.
+Scopes that require durable episodic or historical evidence must use a
+native-versioned source or explicitly retain a snapshot. Retention is selective
+and policy-governed; cataloging a huge root does not copy all of its bytes.
+
 Hardlinks retain separate namespace aliases but share extraction of the exact
 target content identity; alias path, scope, and policy projections remain
 separate. Symlinks are indexed as links and are followed only when the root and
@@ -135,9 +150,9 @@ reachable.
 
 File-like connectors may expose durable objects that are not ordinary mounted
 paths, including event-log segments, session journals, mailbox exports, or
-content-addressed artifacts. They must still implement immutable snapshot,
-bounded range-read, stable identity, version, policy, and change-cursor
-semantics.
+content-addressed artifacts. They must still implement stable identity,
+version, policy, bounded snapshot-lease/range-read behavior, change cursors,
+and an explicit retention capability.
 
 ### Source Descriptor
 
@@ -253,8 +268,18 @@ project, scientific corpus, or other workspace type.
 ### Partitions
 
 The serving unit is an `IndexPartition`, normally derived from root, policy
-domain, and a stable shard key. A large root can have many partitions; a query
-catalog maps scope and workspace selectors to a bounded set of partitions.
+domain, and a stable shard key. A large root can have many partitions. Scope,
+workspace, time, and explicit source selectors often choose a small set
+directly, but an unconstrained corpus query requires a scalable routing index;
+it cannot assume a fixed bounded subset without admitting lost recall.
+
+Routing is itself derived, versioned, disk-backed index state. Lexical routing
+maps terms to partition ids, metadata/time routing uses ordered ranges, graph
+routing maps stable endpoint ids, and vector routing may use coarse centroids
+or another explicitly approximate scheme. Routing state stays outside cluster
+KV and can be sharded and paged. If no complete router exists, exhaustive
+search walks eligible partitions in bounded pages and returns a continuation
+rather than claiming complete results.
 
 Partition rules are load-bearing:
 
@@ -268,6 +293,9 @@ Partition rules are load-bearing:
 - term dictionaries, postings, metadata columns, and graph adjacency are
   stored in query-oriented forms rather than reconstructed for every query;
 - vector indexes are optional partition capabilities, not the catalog.
+- exact, approximate, and budget-truncated query coverage are distinguished;
+  bounded work is achieved through paging and continuations, not silent
+  partition omission.
 
 ## Automatic Index Model
 
@@ -277,7 +305,8 @@ Automatic facts are published as immutable generations. A generation key
 includes:
 
 - source file version;
-- extractor or pipeline id and version;
+- extractor or pipeline id and version, plus module artifact id/content hash
+  when supplied by a module;
 - configuration hash;
 - model, prompt, decoding, and embedding-space identity when model-derived;
 - input dependency hashes;
@@ -430,7 +459,9 @@ the evidence.
 
 Automatic generations are read-only to models. A model changes the logical
 index through a `MemoryOverlay`, whose authoritative operations are themselves
-stored in append-only, versioned files.
+stored as immutable one-operation objects or per-writer operation streams with
+deterministic operation ids. No correctness path assumes that multiple writers
+can append safely to one shared DFS file.
 
 Overlay operations include:
 
@@ -441,10 +472,13 @@ Overlay operations include:
 - pin evidence or add a bounded relevance hint within a scope;
 - request re-extraction or revalidation.
 
-An overlay cannot delete or rewrite an automatic fact. A scoped supersession
-changes the default composite query view while the base fact and the operation
-remain inspectable. Rank hints are bounded features, not arbitrary final
-scores.
+An overlay cannot delete or rewrite an automatic fact. A proposed dispute or
+supersession cannot suppress an automatic fact; it adds a conflicting
+interpretation and ranking evidence. An authorized approved overlay may change
+the default interpretation in its scope, but the automatic fact and evidence
+remain inspectable. Overlay supersession normally replaces another overlay
+assertion, not extractor output. Rank hints are bounded features, not arbitrary
+final scores.
 
 Each operation carries author identity, scope, evidence, model/tool provenance,
 time, confidence, and one of `proposed`, `corroborated`, `approved`, `disputed`,
@@ -469,8 +503,10 @@ the most restrictive evidence source. An overlay cannot grant access, alter
 DFS placement authority, change policy, or turn a proposed relation into an
 executable capability.
 
-Append-only is a logical overlay invariant. Storage may use immutable operation
-segments and normal DFS version commits; it does not depend on the reserved DFS
+Append-only is a logical overlay invariant. Writers use immutable operation
+objects or independently fenced per-writer streams; a materializer merges them
+idempotently by operation id into a deterministic scope view. Storage uses
+normal DFS namespace/version commits and does not depend on the reserved DFS
 append-only object policy being implemented.
 
 ## Automatic Maintenance
@@ -495,6 +531,15 @@ emits an upsert or delete. A sequence gap, snapshot replacement, or unknown
 checkpoint requires a bounded full reconciliation; the memory service does not
 guess across the gap.
 
+Initial enumeration has an atomic scan/feed handoff. `begin_scan` returns a
+catalog generation, a stable paged-scan token, and per-shard change watermarks.
+The feed retains or can replay logical changes after those watermarks until the
+scan commits. The memory service publishes the completed scan and installs the
+post-watermark feed checkpoints together. If a connector cannot provide a
+stable scan, it must start/buffer its watcher or feed before enumeration and
+repeat reconciliation until it proves convergence; it cannot mark the root
+current after one racy walk.
+
 Local filesystem watchers are hints because operating systems may coalesce or
 drop events, and host-exposed local-owned DFS files may bypass metadata
 journals. Every root therefore also has a bounded, cursor-based reconciliation
@@ -513,7 +558,8 @@ Indexing follows this logical sequence:
 3. Resolve the current source descriptor and affected workspace memberships.
 4. Plan applicable format detectors, extractors, and pipeline fingerprints.
 5. Create idempotent jobs keyed by source version and pipeline fingerprint.
-6. Open an immutable SIFS version or a verified local snapshot handle.
+6. Open an immutable SIFS version or a verified local snapshot lease; pin a
+   retained version only when the root's history policy requires it.
 7. Run cheap deterministic detectors and extractors first, reusing unchanged
    content chunks when the extractor supports it.
 8. Schedule optional model, embedding, and media enrichment under separate
@@ -547,7 +593,7 @@ generation is never partially visible.
 
 | Change | Required behavior |
 |---|---|
-| Content version | Publish new source-version generations; retain or compact historical generations by policy |
+| Content version | Publish new source-version generations; retain historical generations only when the source or an authorized pin retains their bytes |
 | Rename with stable identity | Update locator/path facets and workspace membership; reuse content generations when inputs are unchanged |
 | Delete or tombstone | Fence the current view immediately, cancel obsolete jobs, and retain only policy-allowed historical evidence |
 | Policy or scope restriction | Fence candidates immediately; asynchronous index cleanup is not the security boundary |
@@ -566,6 +612,8 @@ Every candidate and evidence bundle reports one of these source/index states:
 - `catalog-only`: no requested content index exists;
 - `pending` or `failed`: an applicable job is outstanding or failed;
 - `deleted`: the source is not in the current namespace view;
+- `source-unretained`: an exact older version is known but its source bytes
+  were not retained;
 - `unavailable` or `policy-blocked`: bytes cannot currently be served.
 
 A query selects an explicit freshness policy. The normal policy may use stale
@@ -574,9 +622,11 @@ strict-current query may wait to a deadline, request bounded on-demand
 indexing, fall back to direct source inspection, or fail explicitly. It never
 pretends stale evidence is current.
 
-Historical queries may select retained older file versions deliberately.
-Current-view queries exclude tombstoned versions even if an old partition
-segment still contains their postings.
+Historical queries may select deliberately retained older file versions.
+Unretained versions may leave non-sensitive audit tombstones and provenance
+references, but not serving facts, source quotations, regions, or media
+handles. Current-view queries exclude tombstoned versions even if an old
+partition segment still contains their postings.
 
 ## Extension Architecture
 
@@ -601,6 +651,28 @@ types, probe limits, output schemas, relation and anchor schemas, incremental
 capabilities, determinism, required models and hardware, capability grants,
 resource ceilings, invocation route, and compatibility range.
 
+Each logical operation has a validated binding, not only a string name:
+
+```text
+MemoryExtensionOperationBinding {
+  logical_operation,
+  target,                 # native invoke, object-RPC route/op, or sandbox entry
+  request_schema_id,
+  response_schema_id,
+  max_request_bytes,
+  max_response_bytes,
+  max_facts_per_batch,
+  supports_cancellation,
+  continuation_schema_id?,
+}
+```
+
+The active extension identity includes module id, interface export/version,
+artifact id and content hash, descriptor hash, and invocation lane. Those
+values enter the pipeline fingerprint. Registry validation rejects an operation
+whose target is not exported/routable or whose schemas and hard bounds are not
+compatible with the host.
+
 ### Module Integration
 
 Trusted built-ins can register Rust implementations directly with
@@ -623,8 +695,9 @@ validation, policy, storage, and retrieval behavior remains in R2
 An out-of-process extractor receives an authorized VFS/SIFS snapshot handle or
 bounded range stream, never an ambient host path. The host enforces read scope,
 network class, device/model access, secrets, deadlines, cancellation, output
-bounds, and temporary storage. Results are untrusted until the memory service
-validates the envelope, anchors, schemas, and policy derivation.
+bounds, continuation budgets, and temporary storage. Results are untrusted
+until the memory service validates the envelope, source lease/version, anchors,
+schemas, batch counts, and policy derivation.
 
 Module activation creates a new pipeline fingerprint and a controlled backfill.
 Deactivation stops new jobs and leaves already published generations readable
@@ -651,13 +724,15 @@ The local data directory has this logical ownership shape:
 ```text
 memory/
   catalog/                 # root, source, workspace, and partition catalogs
+  routing/                 # versioned term/range/endpoint routing indexes
   jobs/                    # durable change cursors and indexing job state
   partitions/<id>/
     manifest.sobj          # atomic serving view
     generations/<id>/      # immutable fact/index segments
     staging/<job_id>/      # unpublished bounded job output
   traces/                  # append-oriented retrieval and maintenance audit
-  legacy/                  # record-store compatibility during migration
+  records/...              # existing legacy record paths remain in place
+  index.sobj               # existing legacy global index remains readable
 ```
 
 Exact paths and schemas are registered by `sinomo-memory` through the storage
@@ -705,9 +780,11 @@ scope-owned SIFS files.
 A federated query proceeds through normal service discovery and typed object
 RPC:
 
-1. Resolve eligible partitions using scope, workspace, modality, freshness,
-   capability, locality, and policy summaries.
-2. Query a bounded local-first set of memory services.
+1. Pin eligible routing/catalog generations and resolve partitions using scope,
+   workspace, modality, freshness, capability, locality, policy, and the
+   requested completeness mode.
+2. Query a bounded local-first page of memory services, continuing or reporting
+   truncation when more eligible partitions remain.
 3. Reauthorize at each serving node before it returns candidate metadata.
 4. Merge stable candidate ids and score features at the coordinator.
 5. Materialize bounded evidence from eligible source locations.
@@ -719,9 +796,12 @@ the final policy decision.
 
 Index loss does not lose memory. A node can rebuild from authorized source and
 overlay files, import a compatible snapshot, or forward queries to another
-eligible service. A disconnected node can search its local current and labeled
-stale partitions according to cached policy; it does not gain access to remote
-content or invent cluster authority.
+eligible service. A disconnected node may search a local source governed by
+local authority. Shared or remotely governed data requires a still-valid
+offline authorization lease carrying a policy epoch and expiry; after expiry,
+or when the cached policy never allowed offline use, search fails closed. An
+offline node cannot promise instantaneous knowledge of a revocation, so policy
+defines the maximum lease lifetime and reconnect invalidates older epochs.
 
 ## Retrieval Architecture
 
@@ -742,6 +822,23 @@ carry:
 
 The query planner uses registered partition and extension capabilities. It does
 not invoke every provider for every query.
+
+### Query Snapshot and Completeness
+
+Planning creates a query snapshot that pins the authorized catalog/router
+generation, partition manifests, overlay watermarks, and policy epochs used by
+the query. Local compaction retains referenced segments until the bounded query
+lease ends. Federated services return equivalent manifest/lease tokens. A
+source change observed during evidence materialization is reported as stale or
+causes a bounded replan; providers from different generations are not silently
+mixed into one result.
+
+Every result reports coverage as `complete`, `approximate`, or
+`budget-truncated`, with searched/omitted partition counts and a continuation
+when more eligible partitions remain. Lexical or metadata search may be exact
+when its routing generation is complete. Coarse vector routing is approximate
+unless an exhaustive paged search completes. A timeout or fanout budget cannot
+be represented as “no matching memory.”
 
 ### Retrieval Stages
 
@@ -779,6 +876,7 @@ The retrieval result is not an unstructured bag of chunks:
 MemoryEvidenceBundle {
   bundle_id,
   query_plan_id,
+  query_snapshot_id,
   files,
   anchors,
   projections,
@@ -786,10 +884,12 @@ MemoryEvidenceBundle {
   summaries,
   score_features,
   freshness,
+  coverage,
   retrieval_modes_used,
   provenance,
   omitted_due_to_budget,
   policy_omissions,
+  continuation?,
 }
 ```
 
@@ -922,8 +1022,10 @@ Rules:
 3. A derived fact, embedding, caption, entity label, relation, or score inherits
    at least the most restrictive policy of all evidence inputs. Relations can
    leak content even when their source snippet is hidden.
-4. Policy restriction and deletion fence serving synchronously; physical index
-   cleanup may be asynchronous.
+4. A service that observes a newer policy epoch or deletion fences serving
+   synchronously; physical index cleanup may be asynchronous. Disconnected
+   shared-data access is limited by the explicit offline authorization lease
+   and fails closed when it expires.
 5. Privacy-preserving deletion removes derived payloads and overlay evidence as
    required by source policy while retaining only a non-sensitive audit
    tombstone when allowed.
@@ -983,6 +1085,7 @@ behind these boundaries. `sinomo-agent` must not depend on their internals.
 | R0 files/events/storage contracts through `sinomo-runtime` | Base ids, event envelopes, VFS primitives, and local storage ownership vocabulary |
 | `sinomo-dfs` (R1) | SIFS object/version authority, paged logical catalog/change-feed and exact revision-read facade, content reads, placement, replication, and policy enforcement |
 | `sinomo-module` and daemon registry (R1) | Generic lifecycle, opaque extension descriptors, routes, capabilities, activation, and runtime binding; no memory semantics |
+| Memory extension data/ABI package (R1) | Versioned descriptors, operation bindings, source leases, and normalized SOBJ request/result values; no memory behavior |
 | `sinomo-policy` and sandbox crates (R1) | Authorization decisions and contained extension execution |
 | `sinomo-memory` (R2) | Memory domain types, root/source catalogs, schedulers, partitions, overlays, retrieval, traces, and built-in extractors |
 | `sinomo-agent` (R2) | Query focus, context assembly, memory tools, agent-written managed documents, and curator orchestration |
@@ -999,8 +1102,9 @@ memory behavior into a lower trust ring.
 Evaluation has four layers:
 
 1. **Deterministic correctness**: identity, version pinning, anchor bounds,
-   idempotency, atomic generation publication, tombstones, cursor recovery,
-   scope/policy intersection, overlay replay, and deterministic packing.
+   retention capability, scan/feed handoff, idempotency, atomic generation
+   publication, query-snapshot pinning, tombstones, cursor recovery,
+   scope/policy intersection, overlay merge/replay, and deterministic packing.
 2. **Scale and operations**: catalog and query behavior on large synthetic
    trees, bounded memory, incremental update amplification, startup work,
    compaction, backpressure, crash recovery, and partition fanout.
@@ -1036,11 +1140,26 @@ whole-record anchor. Existing mappings are:
 | Consolidation summary | Derived summary generation or managed memory document when deliberately promoted |
 | Retrieval result | Compatibility record projection from a `MemoryEvidenceBundle` |
 
-New data is file-first. The agent can dual-read and, for a bounded transition,
-dual-write a managed memory document plus a compatibility record. Migration is
-complete only after restart/rebuild, scope, retrieval, and context tests pass
-from files and overlays alone. Lower-ring legacy types are not expanded into
-the new R2 index schema.
+New data is file-first. Compatibility is an outbox projection, not two equal
+authoritative writes:
+
+1. Commit the managed file or overlay operation with a durable canonical write
+   or conversion id.
+2. Durably enqueue (or make reconstructable from that source version) an
+   idempotent legacy-projection outbox item.
+3. Derive the legacy `MemoryRecord` id deterministically from the canonical
+   source/conversion id and record a projection watermark.
+4. On replay, retry missing projections and deduplicate dual-read results by the
+   canonical id; the file/overlay representation wins.
+
+A legacy-write failure never rolls back or contradicts the authoritative file.
+Reconciliation can recreate an outbox item after a crash between the first two
+steps. Existing `memory/records/...` and `memory/index.sobj` files remain
+readable in place; migration does not move them into a new directory.
+
+Migration is complete only after restart/rebuild, scope, retrieval, context,
+outbox replay, and comparison tests pass from files and overlays alone.
+Lower-ring legacy types are not expanded into the new R2 index schema.
 
 ## Failure Modes
 
@@ -1049,10 +1168,16 @@ The implementation must explicitly defend against:
 - full-log replay or full-index rewrite on ordinary query/write paths;
 - watcher loss, duplicate events, rename ambiguity, and indexing the wrong
   local snapshot;
+- a racy initial scan missing changes before its feed checkpoint is installed;
+- treating a current-only local handle as retained historical evidence;
 - a partially published generation or stale job replacing a newer version;
+- an incomplete router silently dropping partitions or one query mixing
+  incompatible manifest generations;
 - unbounded root scans, graph expansion, remote fanout, media decode, model
   enrichment, or context packing;
 - stale policy caches leaking candidates or relation structure;
+- disconnected shared-data search continuing after its authorization lease or
+  policy epoch is no longer valid;
 - embeddings, captions, relations, or summaries surviving source deletion
   beyond policy;
 - high-level model assertions being mistaken for source facts or authority;
@@ -1062,6 +1187,8 @@ The implementation must explicitly defend against:
 - relation/entity explosion and low-value agent-generated index pollution;
 - raw media transfer when a derived local result would satisfy the query;
 - provider loss making authoritative memory unreadable;
+- a compatibility projection failure creating a second authority or duplicate
+  context result;
 - multi-agent contradiction collapse or one agent silently suppressing another.
 
 ## Architectural Invariants
@@ -1093,6 +1220,12 @@ The implementation must explicitly defend against:
     the same substrate, not competing sources of truth.
 16. Optional databases, vector stores, graph engines, and hosted models remain
     replaceable and cannot become undeclared authorities.
+17. Historical content is retrievable only when its source connector retains
+    that version or policy authorized a durable pin.
+18. Retrieval pins a coherent query snapshot and reports incomplete or
+    approximate corpus coverage explicitly.
+19. Legacy records are idempotent compatibility projections; file/overlay
+    writes remain authoritative during migration.
 
 ## Non-Goals
 
