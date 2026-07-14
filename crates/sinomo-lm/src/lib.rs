@@ -63,6 +63,9 @@ pub use realtime_audio::{
 pub use test_cases::register_lm_test_cases;
 
 use serde::{Deserialize, Serialize};
+use sinomo_runtime::config::{
+    ConfigNumberRange, ConfigSchema, ConfigSchemaChoice, ConfigSchemaField, ConfigSchemaValue,
+};
 use sinomo_runtime::kv::{KvEntry, KvSnapshot, KvTxn, decode_kv_value};
 use sinomo_runtime::local::SinomoDataDir;
 use std::collections::BTreeMap;
@@ -1200,6 +1203,477 @@ pub fn load_model_config(paths: &ModelPaths) -> Result<ModelConfig, LanguageMode
     })
 }
 
+fn closed_config_object(fields: Vec<ConfigSchemaField>) -> ConfigSchemaValue {
+    ConfigSchemaValue::object(fields).without_unknown_fields()
+}
+
+fn optional_config_field(
+    name: impl Into<String>,
+    label: impl Into<String>,
+    description: impl Into<String>,
+    value: ConfigSchemaValue,
+) -> ConfigSchemaField {
+    ConfigSchemaField::new(name, label, description, value).optional()
+}
+
+fn reasoning_effort_schema() -> ConfigSchemaValue {
+    ConfigSchemaValue::string_choices(vec![
+        ConfigSchemaChoice::new("none", "None"),
+        ConfigSchemaChoice::new("minimal", "Minimal"),
+        ConfigSchemaChoice::new("low", "Low"),
+        ConfigSchemaChoice::new("medium", "Medium"),
+        ConfigSchemaChoice::new("high", "High"),
+        ConfigSchemaChoice::new("xhigh", "Extra high"),
+        ConfigSchemaChoice::new("max", "Maximum"),
+    ])
+}
+
+fn text_verbosity_schema() -> ConfigSchemaValue {
+    ConfigSchemaValue::string_choices(vec![
+        ConfigSchemaChoice::new("low", "Low"),
+        ConfigSchemaChoice::new("medium", "Medium"),
+        ConfigSchemaChoice::new("high", "High"),
+    ])
+}
+
+fn provider_options_schema() -> ConfigSchemaValue {
+    closed_config_object(vec![
+        optional_config_field(
+            "reasoning_effort",
+            "Reasoning effort",
+            "Preferred reasoning effort when the provider and model support it.",
+            reasoning_effort_schema(),
+        ),
+        optional_config_field(
+            "reasoning_budget_tokens",
+            "Reasoning token budget",
+            "Explicit reasoning token budget for providers that expose one.",
+            ConfigSchemaValue::u64(Some(ConfigNumberRange {
+                min: Some(0.0),
+                max: Some(u32::MAX as f64),
+            })),
+        ),
+        optional_config_field(
+            "text_verbosity",
+            "Text verbosity",
+            "Preferred response verbosity when the provider supports it.",
+            text_verbosity_schema(),
+        ),
+        optional_config_field(
+            "vendor_options",
+            "Vendor options",
+            "Provider-specific string options keyed by the vendor option name.",
+            ConfigSchemaValue::map(ConfigSchemaValue::string()),
+        ),
+    ])
+}
+
+fn provider_account_schema() -> ConfigSchemaValue {
+    closed_config_object(vec![
+        ConfigSchemaField::new(
+            "provider",
+            "Provider",
+            "Stable provider id, such as openai, anthropic, codex, or deepseek.",
+            ConfigSchemaValue::string(),
+        ),
+        optional_config_field(
+            "account",
+            "Account",
+            "Account name within this provider; omitted legacy values resolve to default.",
+            ConfigSchemaValue::string(),
+        )
+        .with_default_value(serde_json::Value::String(default_provider_account_name())),
+        optional_config_field(
+            "default_model",
+            "Default model",
+            "Model selected for this account when no model is requested explicitly.",
+            ConfigSchemaValue::string(),
+        ),
+        optional_config_field(
+            "api_base_url",
+            "API base URL",
+            "Optional provider API endpoint override.",
+            ConfigSchemaValue::string(),
+        ),
+        optional_config_field(
+            "api_key",
+            "API key",
+            "Secret API credential for this provider account.",
+            ConfigSchemaValue::secret_string(),
+        ),
+        optional_config_field(
+            "enabled",
+            "Enabled",
+            "Whether this account may be selected for model requests.",
+            ConfigSchemaValue::bool(),
+        )
+        .with_default_value(serde_json::Value::Bool(provider_account_enabled_default())),
+        optional_config_field(
+            "options",
+            "Provider options",
+            "Default reasoning, verbosity, and vendor-specific options for this account.",
+            provider_options_schema(),
+        ),
+        optional_config_field(
+            "model_options",
+            "Model overrides",
+            "Per-model option overrides applied after the account defaults.",
+            ConfigSchemaValue::list(closed_config_object(vec![
+                ConfigSchemaField::new(
+                    "model",
+                    "Model",
+                    "Model id to which these overrides apply.",
+                    ConfigSchemaValue::string(),
+                ),
+                optional_config_field(
+                    "options",
+                    "Options",
+                    "Reasoning, verbosity, and vendor-specific overrides for this model.",
+                    provider_options_schema(),
+                ),
+            ])),
+        ),
+    ])
+}
+
+pub fn model_config_schema() -> ConfigSchema {
+    ConfigSchema::object(
+        "ModelConfig",
+        "Language-model provider accounts, defaults, credentials, and per-model options.",
+        vec![
+            optional_config_field(
+                "default_provider",
+                "Default provider",
+                "Provider selected when a request does not name one.",
+                ConfigSchemaValue::string(),
+            ),
+            optional_config_field(
+                "default_account",
+                "Default account",
+                "Account selected within the default provider.",
+                ConfigSchemaValue::string(),
+            ),
+            optional_config_field(
+                "default_model",
+                "Default model",
+                "Model selected when a request does not name one.",
+                ConfigSchemaValue::string(),
+            ),
+            optional_config_field(
+                "accounts",
+                "Provider accounts",
+                "Configured provider accounts and their model-specific behavior.",
+                ConfigSchemaValue::list(provider_account_schema()),
+            ),
+        ],
+    )
+}
+
+pub fn model_runtime_config_schema() -> ConfigSchema {
+    ConfigSchema::object(
+        "ModelRuntimeConfig",
+        "Runtime locations and execution controls for native and bridged language models.",
+        vec![
+            optional_config_field(
+                "native_models_cache_dir",
+                "Native model cache",
+                "Optional directory containing cached native model assets.",
+                ConfigSchemaValue::string(),
+            ),
+            optional_config_field(
+                "minicpm_v46",
+                "MiniCPM v4.6",
+                "Local MiniCPM model location and token limits.",
+                closed_config_object(vec![
+                    optional_config_field(
+                        "model_dir",
+                        "Model directory",
+                        "Directory containing the MiniCPM model files.",
+                        ConfigSchemaValue::string(),
+                    ),
+                    optional_config_field(
+                        "max_input_tokens",
+                        "Maximum input tokens",
+                        "Optional upper bound for one MiniCPM request's input tokens.",
+                        ConfigSchemaValue::u64(Some(ConfigNumberRange {
+                            min: Some(1.0),
+                            max: None,
+                        })),
+                    ),
+                    optional_config_field(
+                        "max_output_tokens",
+                        "Maximum output tokens",
+                        "Optional upper bound for one MiniCPM response's output tokens.",
+                        ConfigSchemaValue::u64(Some(ConfigNumberRange {
+                            min: Some(1.0),
+                            max: None,
+                        })),
+                    ),
+                ]),
+            ),
+            optional_config_field(
+                "pytorch_bridge",
+                "PyTorch bridge",
+                "Endpoint and local process controls for the PyTorch model bridge.",
+                closed_config_object(vec![
+                    optional_config_field(
+                        "endpoint",
+                        "Endpoint",
+                        "HTTP or socket endpoint exposed by the PyTorch bridge.",
+                        ConfigSchemaValue::string(),
+                    ),
+                    optional_config_field(
+                        "python",
+                        "Python executable",
+                        "Python interpreter used when starting a local bridge.",
+                        ConfigSchemaValue::string(),
+                    ),
+                    optional_config_field(
+                        "device",
+                        "Device",
+                        "PyTorch device selector, such as cpu, cuda, or mps.",
+                        ConfigSchemaValue::string(),
+                    ),
+                    optional_config_field(
+                        "timeout_seconds",
+                        "Timeout",
+                        "Maximum number of seconds to wait for a bridge operation.",
+                        ConfigSchemaValue::u64(Some(ConfigNumberRange {
+                            min: Some(1.0),
+                            max: None,
+                        })),
+                    ),
+                    optional_config_field(
+                        "mock",
+                        "Mock bridge",
+                        "Use the deterministic mock bridge instead of a live model runtime.",
+                        ConfigSchemaValue::bool(),
+                    ),
+                ]),
+            ),
+        ],
+    )
+}
+
+fn usage_limit_schema() -> ConfigSchemaValue {
+    closed_config_object(vec![
+        ConfigSchemaField::new(
+            "id",
+            "Limit id",
+            "Provider-defined stable id for this usage limit.",
+            ConfigSchemaValue::string(),
+        ),
+        optional_config_field(
+            "name",
+            "Name",
+            "Human-readable limit name.",
+            ConfigSchemaValue::string(),
+        ),
+        optional_config_field(
+            "scope",
+            "Scope",
+            "Provider-defined scope to which this limit applies.",
+            ConfigSchemaValue::string(),
+        ),
+        optional_config_field(
+            "unlimited",
+            "Unlimited",
+            "Whether this limit is unbounded.",
+            ConfigSchemaValue::bool(),
+        ),
+        optional_config_field(
+            "allowed",
+            "Allowed",
+            "Whether the account is currently allowed to consume this resource.",
+            ConfigSchemaValue::bool(),
+        ),
+        optional_config_field(
+            "exhausted",
+            "Exhausted",
+            "Whether the current allowance is exhausted.",
+            ConfigSchemaValue::bool(),
+        ),
+        optional_config_field(
+            "remaining",
+            "Remaining",
+            "Provider-reported remaining quantity.",
+            ConfigSchemaValue::f64(None),
+        ),
+        optional_config_field(
+            "entitlement",
+            "Entitlement",
+            "Provider-reported total entitlement for the window.",
+            ConfigSchemaValue::f64(None),
+        ),
+        optional_config_field(
+            "used_percent",
+            "Used percent",
+            "Percentage of the allowance consumed.",
+            ConfigSchemaValue::f64(None),
+        ),
+        optional_config_field(
+            "remaining_percent",
+            "Remaining percent",
+            "Percentage of the allowance remaining.",
+            ConfigSchemaValue::f64(None),
+        ),
+        optional_config_field(
+            "window_seconds",
+            "Window seconds",
+            "Length of the accounting window in seconds.",
+            ConfigSchemaValue::u64(None),
+        ),
+        optional_config_field(
+            "reset_at_unix",
+            "Reset time",
+            "Unix timestamp at which the allowance resets.",
+            ConfigSchemaValue::i64(None),
+        ),
+    ])
+}
+
+fn credit_usage_schema() -> ConfigSchemaValue {
+    closed_config_object(vec![
+        optional_config_field(
+            "has_credits",
+            "Has credits",
+            "Whether the provider reports a usable credit balance.",
+            ConfigSchemaValue::bool(),
+        ),
+        optional_config_field(
+            "unlimited",
+            "Unlimited credits",
+            "Whether credit-backed usage is unbounded.",
+            ConfigSchemaValue::bool(),
+        ),
+        optional_config_field(
+            "balance",
+            "Balance",
+            "Provider-formatted remaining credit balance.",
+            ConfigSchemaValue::string(),
+        ),
+    ])
+}
+
+fn provider_usage_schema() -> ConfigSchemaValue {
+    closed_config_object(vec![
+        ConfigSchemaField::new(
+            "provider",
+            "Provider",
+            "Provider that reported this usage snapshot.",
+            ConfigSchemaValue::string(),
+        ),
+        optional_config_field(
+            "plan",
+            "Plan",
+            "Provider-reported subscription or billing plan.",
+            ConfigSchemaValue::string(),
+        ),
+        ConfigSchemaField::new(
+            "captured_at_unix",
+            "Captured at",
+            "Unix timestamp when usage was captured.",
+            ConfigSchemaValue::u64(None),
+        ),
+        optional_config_field(
+            "limits",
+            "Usage limits",
+            "Provider-reported quota and rate-limit windows.",
+            ConfigSchemaValue::list(usage_limit_schema()),
+        ),
+        optional_config_field(
+            "credits",
+            "Credits",
+            "Provider-reported credit availability and balance.",
+            credit_usage_schema(),
+        ),
+    ])
+}
+
+fn provider_health_snapshot_schema() -> ConfigSchemaValue {
+    closed_config_object(vec![
+        ConfigSchemaField::new(
+            "provider",
+            "Provider",
+            "Provider id associated with this health snapshot.",
+            ConfigSchemaValue::string(),
+        ),
+        ConfigSchemaField::new(
+            "account",
+            "Account",
+            "Provider account associated with this health snapshot.",
+            ConfigSchemaValue::string(),
+        ),
+        ConfigSchemaField::new(
+            "checked_at_unix",
+            "Checked at",
+            "Unix timestamp of the most recent health check attempt.",
+            ConfigSchemaValue::i64(None),
+        ),
+        optional_config_field(
+            "last_verified_at_unix",
+            "Last verified at",
+            "Unix timestamp of the most recent successful verification.",
+            ConfigSchemaValue::i64(None),
+        ),
+        ConfigSchemaField::new(
+            "healthy",
+            "Healthy",
+            "Whether the most recent provider verification succeeded.",
+            ConfigSchemaValue::bool(),
+        ),
+        optional_config_field(
+            "error",
+            "Verification error",
+            "Error reported by the most recent provider verification.",
+            ConfigSchemaValue::string(),
+        ),
+        optional_config_field(
+            "models",
+            "Discovered models",
+            "Model ids discovered for this provider account.",
+            ConfigSchemaValue::StringList,
+        ),
+        optional_config_field(
+            "model_discovery_error",
+            "Model discovery error",
+            "Error encountered while discovering models.",
+            ConfigSchemaValue::string(),
+        ),
+        optional_config_field(
+            "usage",
+            "Usage",
+            "Provider usage, quota, and credit snapshot.",
+            provider_usage_schema(),
+        ),
+        optional_config_field(
+            "usage_error",
+            "Usage error",
+            "Error encountered while reading provider usage.",
+            ConfigSchemaValue::string(),
+        ),
+        optional_config_field(
+            "stale",
+            "Stale",
+            "Whether this snapshot should be refreshed before it is trusted.",
+            ConfigSchemaValue::bool(),
+        ),
+    ])
+}
+
+pub fn provider_health_config_schema() -> ConfigSchema {
+    ConfigSchema::object(
+        "LanguageModelProviderHealthConfig",
+        "Read-only provider verification, model discovery, quota, and credit snapshots.",
+        vec![optional_config_field(
+            "accounts",
+            "Account health",
+            "Health snapshots keyed by normalized provider and account id.",
+            ConfigSchemaValue::map(provider_health_snapshot_schema()),
+        )],
+    )
+}
+
 pub fn model_config_definition()
 -> Result<sinomo_runtime::config::ConfigDefinition, LanguageModelError> {
     let definition = sinomo_runtime::config::ConfigDefinition::new(
@@ -1213,6 +1687,8 @@ pub fn model_config_definition()
     )
     .map_err(map_lm_config_error)?
     .with_default(&ModelConfig::default())
+    .map_err(map_lm_config_error)?
+    .with_schema(model_config_schema())
     .map_err(map_lm_config_error)?
     .with_local_legacy_path("config/models.json");
     debug_assert_eq!(definition.cluster_key(), LM_PROVIDER_CONFIG_KV_KEY);
@@ -1233,6 +1709,8 @@ pub fn model_runtime_config_definition()
     .map_err(map_lm_config_error)?
     .with_default(&ModelRuntimeConfig::default())
     .map_err(map_lm_config_error)?
+    .with_schema(model_runtime_config_schema())
+    .map_err(map_lm_config_error)?
     .with_local_legacy_path("config/models-runtime.json");
     debug_assert_eq!(definition.cluster_key(), LM_RUNTIME_CONFIG_KV_KEY);
     Ok(definition)
@@ -1251,7 +1729,10 @@ pub fn provider_health_config_definition()
     )
     .map_err(map_lm_config_error)?
     .with_default(&LanguageModelProviderHealthConfig::default())
-    .map_err(map_lm_config_error)?;
+    .map_err(map_lm_config_error)?
+    .with_schema(provider_health_config_schema())
+    .map_err(map_lm_config_error)?
+    .read_only();
     debug_assert_eq!(definition.cluster_key(), LM_PROVIDER_HEALTH_CONFIG_KV_KEY);
     Ok(definition)
 }
@@ -4005,6 +4486,166 @@ mod tests {
         );
     }
 
+    fn schema_contains_json_fallback(value: &ConfigSchemaValue) -> bool {
+        match value {
+            ConfigSchemaValue::Json => true,
+            ConfigSchemaValue::Object { fields, .. } => fields
+                .iter()
+                .any(|field| schema_contains_json_fallback(&field.value)),
+            ConfigSchemaValue::Map { value } | ConfigSchemaValue::List { value } => {
+                schema_contains_json_fallback(value)
+            }
+            ConfigSchemaValue::Bool
+            | ConfigSchemaValue::I64 { .. }
+            | ConfigSchemaValue::U64 { .. }
+            | ConfigSchemaValue::F64 { .. }
+            | ConfigSchemaValue::String { .. }
+            | ConfigSchemaValue::StringList => false,
+        }
+    }
+
+    #[test]
+    fn lm_config_definitions_attach_structured_schemas_that_validate_defaults() {
+        for definition in [
+            model_config_definition().expect("provider definition"),
+            model_runtime_config_definition().expect("runtime definition"),
+            provider_health_config_definition().expect("health definition"),
+        ] {
+            let schema = definition.schema.as_ref().expect("detailed schema");
+            assert!(
+                !schema_contains_json_fallback(&schema.value),
+                "{} must describe every field without an arbitrary JSON fallback",
+                definition.key
+            );
+            let default_value = definition.default_value.as_ref().expect("default value");
+            definition
+                .validate_value(default_value)
+                .unwrap_or_else(|error| {
+                    panic!("{} default must match schema: {error}", definition.key)
+                });
+        }
+    }
+
+    #[test]
+    fn model_config_schema_validates_nested_account_and_model_options() {
+        let definition = model_config_definition().expect("provider definition");
+        let config = ModelConfig {
+            default_provider: Some("openai".to_string()),
+            default_account: Some("work".to_string()),
+            default_model: Some("gpt-5.5".to_string()),
+            accounts: vec![ProviderAccountConfig {
+                provider: "openai".to_string(),
+                account: "work".to_string(),
+                default_model: Some("gpt-5.5".to_string()),
+                api_base_url: Some("https://api.example.test/v1".to_string()),
+                api_key: Some("sk-test".to_string()),
+                enabled: true,
+                options: LanguageModelProviderOptions {
+                    reasoning_effort: Some(ProviderReasoningEffort::High),
+                    reasoning_budget_tokens: Some(8_192),
+                    text_verbosity: Some(ProviderTextVerbosity::Medium),
+                    vendor_options: BTreeMap::from([(
+                        "service_tier".to_string(),
+                        "priority".to_string(),
+                    )]),
+                },
+                model_options: vec![LanguageModelModelOptions {
+                    model: "gpt-5.5-mini".to_string(),
+                    options: LanguageModelProviderOptions {
+                        reasoning_effort: Some(ProviderReasoningEffort::Low),
+                        text_verbosity: Some(ProviderTextVerbosity::Low),
+                        ..LanguageModelProviderOptions::default()
+                    },
+                }],
+            }],
+        };
+        let mut value = serde_json::to_value(config).expect("provider config value");
+        definition
+            .validate_value(&value)
+            .expect("nested provider config matches schema");
+
+        value["accounts"][0]["model_options"][0]["options"]["reasoning_effort"] =
+            serde_json::Value::String("impossibly-high".to_string());
+        let error = definition
+            .validate_value(&value)
+            .expect_err("unknown reasoning choice must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("$.accounts[0].model_options[0].options.reasoning_effort"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn runtime_and_health_schemas_validate_all_nested_fields() {
+        let runtime = ModelRuntimeConfig {
+            native_models_cache_dir: Some("/srv/sinomo/models".to_string()),
+            minicpm_v46: MiniCpmV46RuntimeConfig {
+                model_dir: Some("/srv/sinomo/models/minicpm-v4.6".to_string()),
+                max_input_tokens: Some(32_768),
+                max_output_tokens: Some(8_192),
+            },
+            pytorch_bridge: PytorchBridgeRuntimeConfig {
+                endpoint: Some("http://127.0.0.1:32154".to_string()),
+                python: Some("python3".to_string()),
+                device: Some("cuda".to_string()),
+                timeout_seconds: Some(120),
+                mock: Some(false),
+            },
+        };
+        model_runtime_config_definition()
+            .expect("runtime definition")
+            .validate_value(&serde_json::to_value(runtime).expect("runtime config value"))
+            .expect("runtime config matches schema");
+
+        let health = LanguageModelProviderHealthConfig {
+            accounts: BTreeMap::from([(
+                "openai:work".to_string(),
+                LanguageModelProviderHealthSnapshot {
+                    provider: "openai".to_string(),
+                    account: "work".to_string(),
+                    checked_at_unix: 10,
+                    last_verified_at_unix: Some(9),
+                    healthy: true,
+                    error: None,
+                    models: vec!["gpt-5.5".to_string()],
+                    model_discovery_error: None,
+                    usage: Some(LanguageModelProviderUsage {
+                        provider: "openai".to_string(),
+                        plan: Some("team".to_string()),
+                        captured_at_unix: 10,
+                        limits: vec![LanguageModelUsageLimit {
+                            id: "tokens".to_string(),
+                            name: Some("Tokens".to_string()),
+                            scope: Some("monthly".to_string()),
+                            unlimited: Some(false),
+                            allowed: Some(true),
+                            exhausted: Some(false),
+                            remaining: Some(750_000.0),
+                            entitlement: Some(1_000_000.0),
+                            used_percent: Some(25.0),
+                            remaining_percent: Some(75.0),
+                            window_seconds: Some(2_592_000),
+                            reset_at_unix: Some(2_600_000),
+                        }],
+                        credits: Some(LanguageModelCreditUsage {
+                            has_credits: Some(true),
+                            unlimited: Some(false),
+                            balance: Some("42.00".to_string()),
+                        }),
+                    }),
+                    usage_error: None,
+                    stale: false,
+                },
+            )]),
+        };
+        provider_health_config_definition()
+            .expect("health definition")
+            .validate_value(&serde_json::to_value(health).expect("health config value"))
+            .expect("health and usage snapshot match schema");
+    }
+
     #[test]
     fn provider_health_config_is_cluster_authoritative() {
         let definition = provider_health_config_definition().expect("health definition");
@@ -4015,6 +4656,7 @@ mod tests {
             definition.cluster_mode,
             sinomo_runtime::config::ConfigClusterMode::ClusterOverrideLocal
         );
+        assert!(definition.read_only);
     }
 
     #[test]

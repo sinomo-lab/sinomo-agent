@@ -719,6 +719,70 @@ pub fn rollout_telemetry_gate_legacy_config_path(paths: &SelfRolloutPaths) -> Pa
     paths.root.join("telemetry-gates.sobj")
 }
 
+pub fn rollout_telemetry_gate_config_schema() -> sinomo_config::ConfigSchema {
+    use sinomo_config::{ConfigNumberRange, ConfigSchema, ConfigSchemaField, ConfigSchemaValue};
+
+    let positive_integer = || {
+        Some(ConfigNumberRange {
+            min: Some(1.0),
+            max: None,
+        })
+    };
+
+    ConfigSchema::object(
+        "RolloutTelemetryGateConfig",
+        "Telemetry thresholds that govern automatic rollout promotion.",
+        vec![
+            ConfigSchemaField::new(
+                "automatic_promotion_enabled",
+                "Automatic promotion",
+                "Allow qualifying shadow or canary rollouts to advance automatically.",
+                ConfigSchemaValue::bool(),
+            )
+            .optional()
+            .with_default_value(serde_json::json!(default_automatic_promotion_enabled())),
+            ConfigSchemaField::new(
+                "event_limit",
+                "Telemetry event limit",
+                "Maximum recent telemetry events evaluated for one rollout decision.",
+                ConfigSchemaValue::u64(positive_integer()),
+            )
+            .optional()
+            .with_default_value(serde_json::json!(default_rollout_telemetry_event_limit())),
+            ConfigSchemaField::new(
+                "minimum_event_count",
+                "Minimum event count",
+                "Minimum observations required before automatic promotion is considered.",
+                ConfigSchemaValue::u64(positive_integer()),
+            )
+            .optional()
+            .with_default_value(serde_json::json!(
+                default_rollout_telemetry_minimum_event_count()
+            )),
+            ConfigSchemaField::new(
+                "maximum_automatic_weight_bps",
+                "Maximum automatic weight",
+                "Optional upper traffic weight, in basis points, that automation may assign.",
+                ConfigSchemaValue::u64(Some(ConfigNumberRange {
+                    min: Some(0.0),
+                    max: Some(10_000.0),
+                })),
+            )
+            .optional()
+            .with_default_value(serde_json::json!(
+                default_maximum_automatic_weight_bps().expect("rollout automatic weight default")
+            )),
+            ConfigSchemaField::new(
+                "maximum_candidate_latency_p95_ms",
+                "Maximum candidate p95 latency",
+                "Optional maximum accepted candidate p95 latency in milliseconds.",
+                ConfigSchemaValue::u64(None),
+            )
+            .optional(),
+        ],
+    )
+}
+
 pub fn rollout_telemetry_gate_config_definition() -> Result<ConfigDefinition, RolloutError> {
     ConfigDefinition::new(
         ROLLOUT_TELEMETRY_GATE_CONFIG_KEY,
@@ -731,6 +795,10 @@ pub fn rollout_telemetry_gate_config_definition() -> Result<ConfigDefinition, Ro
     )
     .map_err(map_rollout_config_error)?
     .with_default(&RolloutTelemetryGateConfig::default())
+    .map_err(map_rollout_config_error)?
+    .with_schema(rollout_telemetry_gate_config_schema())
+    .map_err(map_rollout_config_error)?
+    .with_module_id(crate::rollout_module_id().to_string())
     .map_err(map_rollout_config_error)
 }
 
@@ -1494,6 +1562,75 @@ const ROLLOUT_OBJECT_VERSION: u16 = 1;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_fully_typed_schema(value: &sinomo_config::ConfigSchemaValue) {
+        use sinomo_config::ConfigSchemaValue;
+
+        match value {
+            ConfigSchemaValue::Object { fields, .. } => {
+                assert!(
+                    !fields.is_empty(),
+                    "object schemas must declare their fields"
+                );
+                for field in fields {
+                    assert_fully_typed_schema(&field.value);
+                }
+            }
+            ConfigSchemaValue::Map { value } | ConfigSchemaValue::List { value } => {
+                assert_fully_typed_schema(value);
+            }
+            ConfigSchemaValue::Json => panic!("config schema must not use an untyped JSON value"),
+            ConfigSchemaValue::Bool
+            | ConfigSchemaValue::I64 { .. }
+            | ConfigSchemaValue::U64 { .. }
+            | ConfigSchemaValue::F64 { .. }
+            | ConfigSchemaValue::String { .. }
+            | ConfigSchemaValue::StringList => {}
+        }
+    }
+
+    #[test]
+    fn rollout_telemetry_gate_schema_is_recursive_and_validates_default() {
+        let definition =
+            rollout_telemetry_gate_config_definition().expect("rollout telemetry definition");
+        let default = definition
+            .default_value
+            .as_ref()
+            .expect("rollout telemetry default");
+        definition
+            .validate_value(default)
+            .expect("rollout telemetry default must satisfy its schema");
+
+        let schema = definition
+            .schema
+            .as_ref()
+            .expect("rollout telemetry schema");
+        assert_fully_typed_schema(&schema.value);
+        let sinomo_config::ConfigSchemaValue::Object { fields, .. } = &schema.value else {
+            panic!("rollout telemetry schema must be an object")
+        };
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "automatic_promotion_enabled",
+                "event_limit",
+                "minimum_event_count",
+                "maximum_automatic_weight_bps",
+                "maximum_candidate_latency_p95_ms",
+            ]
+        );
+
+        let sparse = serde_json::json!({});
+        definition
+            .validate_value(&sparse)
+            .expect("legacy omitted rollout defaults must satisfy the schema");
+        let decoded: RolloutTelemetryGateConfig =
+            serde_json::from_value(sparse).expect("decode legacy sparse rollout config");
+        assert_eq!(decoded, RolloutTelemetryGateConfig::default());
+    }
 
     #[test]
     fn read_tail_lossy_limits_bytes_and_handles_missing_file() {

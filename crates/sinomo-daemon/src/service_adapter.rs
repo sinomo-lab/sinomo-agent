@@ -3399,7 +3399,7 @@ fn daemon_service_registry(
     if observe_module_should_register(paths) {
         builder = sinomo_observe::register_services(builder);
     }
-    let config_registry = daemon_config_registry(service_hooks);
+    let config_registry = daemon_config_registry(paths, service_hooks);
     let builder = register_config_services(builder, config_registry);
     let builder = register_rollout_services(builder)
         .register(DaemonControlService {
@@ -3663,7 +3663,10 @@ fn observe_module_should_register(paths: &DaemonPaths) -> bool {
         .unwrap_or(true)
 }
 
-fn daemon_config_registry(service_hooks: &[crate::DaemonServiceRegistryHook]) -> ConfigRegistry {
+fn daemon_config_registry(
+    paths: &DaemonPaths,
+    service_hooks: &[crate::DaemonServiceRegistryHook],
+) -> ConfigRegistry {
     let mut builder = register_daemon_config_definitions(ConfigRegistry::builder())
         .expect("daemon config definitions must be valid");
     for hook in service_hooks {
@@ -3671,6 +3674,7 @@ fn daemon_config_registry(service_hooks: &[crate::DaemonServiceRegistryHook]) ->
             .register_config_definitions(builder)
             .expect("daemon config hook definitions must be valid");
     }
+    builder = register_daemon_dynamic_module_config_definitions(paths, builder);
     builder.build()
 }
 
@@ -3678,12 +3682,83 @@ fn register_daemon_config_definitions(
     builder: ConfigRegistryBuilder,
 ) -> Result<ConfigRegistryBuilder, String> {
     let builder =
-        sinomo_dfs::register_dfs_config_definitions(builder).map_err(|error| error.to_string())?;
-    let builder =
         sinomo_module::register_config_definitions(builder).map_err(|error| error.to_string())?;
-    let builder =
-        sinomo_rollout::register_config_definitions(builder).map_err(|error| error.to_string())?;
-    sinomo_sandbox::register_config_definitions(builder).map_err(|error| error.to_string())
+    let mut builder =
+        sinomo_sandbox::register_config_definitions(builder).map_err(|error| error.to_string())?;
+    for registration in [
+        sinomo_dfs::dfs_module_registration(),
+        sinomo_rollout::rollout_module_registration(),
+    ] {
+        builder = registration
+            .surfaces
+            .register_config_definitions(builder)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(builder)
+}
+
+fn register_daemon_dynamic_module_config_definitions(
+    paths: &DaemonPaths,
+    mut builder: ConfigRegistryBuilder,
+) -> ConfigRegistryBuilder {
+    let data_dir_root = match daemon_data_dir_path(paths) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!("daemon dynamic module settings unavailable: {error}");
+            return builder;
+        }
+    };
+    let modules = match daemon_internal_module_registry(
+        &data_dir_root,
+        observe_module_should_register(paths),
+    ) {
+        Ok(modules) => modules,
+        Err(error) => {
+            // Active native-dylib descriptors are external state. The host's
+            // module-registry startup path will report the hard failure; the
+            // config catalog must not panic before that diagnostic is returned.
+            tracing::warn!("daemon dynamic module settings unavailable: {error}");
+            return builder;
+        }
+    };
+    let dfs_module_id = sinomo_dfs::dfs_module_id();
+    let rollout_module_id = sinomo_rollout::rollout_module_id();
+    for registration in modules.registrations() {
+        if registration.module_id() == &dfs_module_id
+            || registration.module_id() == &rollout_module_id
+        {
+            continue;
+        }
+        builder = register_module_surface_config_definitions(
+            builder,
+            registration.module_id(),
+            &registration.surfaces,
+        );
+    }
+    builder
+}
+
+fn register_module_surface_config_definitions(
+    mut builder: ConfigRegistryBuilder,
+    module_id: &sinomo_module::ModuleId,
+    surfaces: &sinomo_module::ModuleSurfaces,
+) -> ConfigRegistryBuilder {
+    let definitions = match surfaces.config_definitions() {
+        Ok(definitions) => definitions,
+        Err(error) => {
+            tracing::warn!("daemon module {module_id} settings skipped: {error}");
+            return builder;
+        }
+    };
+    for definition in definitions {
+        match builder.clone().register(definition) {
+            Ok(next) => builder = next,
+            Err(error) => tracing::warn!(
+                "daemon module {module_id} settings skipped after static catalog registration: {error}"
+            ),
+        }
+    }
+    builder
 }
 
 /// Captures the exactly-once service response for the network session adapter.
@@ -6068,13 +6143,103 @@ mod tests {
                     .map_err(|error| error.to_string())
             });
 
-        let registry = daemon_config_registry(&[hook]);
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-config-hook");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let registry = daemon_config_registry(&paths, &[hook]);
         let definition = registry
             .get("test.config")
             .expect("hooked config definition");
 
         assert_eq!(definition.owner, "test");
         assert_eq!(definition.description, "test hook config");
+    }
+
+    #[test]
+    fn daemon_config_registry_composes_settings_from_module_surfaces() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-module-config-surfaces");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let registry = daemon_config_registry(&paths, &[]);
+
+        let dfs = registry
+            .get(sinomo_dfs::DFS_EXPOSE_CONFIG_KEY)
+            .expect("DFS module settings");
+        assert_eq!(
+            dfs.module_id.as_deref(),
+            Some(sinomo_dfs::dfs_module_id().as_str())
+        );
+        assert!(dfs.schema.is_some());
+
+        let rollout = registry
+            .get(sinomo_rollout::ROLLOUT_TELEMETRY_GATE_CONFIG_KEY)
+            .expect("rollout module settings");
+        assert_eq!(
+            rollout.module_id.as_deref(),
+            Some(sinomo_rollout::rollout_module_id().as_str())
+        );
+        assert!(rollout.schema.is_some());
+
+        let sandbox = registry
+            .get(sinomo_sandbox::SANDBOX_POLICY_CONFIG_KEY)
+            .expect("sandbox settings");
+        assert!(sandbox.schema.is_some());
+    }
+
+    #[test]
+    fn static_config_catalog_wins_over_dynamic_module_key_collisions() {
+        let static_definition = sinomo_config::ConfigDefinition::new(
+            "test.config-collision",
+            "application-hook",
+            sinomo_config::ConfigValueType::String {
+                choices: Vec::new(),
+            },
+            "application-owned config",
+            sinomo_config::ConfigClusterMode::LocalOnly,
+        )
+        .expect("static definition");
+        let builder = sinomo_config::ConfigRegistry::builder()
+            .register(static_definition)
+            .expect("static definition registration");
+
+        let module_id = sinomo_module::ModuleId::from_legacy_named("module.dynamic-collision")
+            .expect("module id");
+        let dynamic_definition = sinomo_config::ConfigDefinition::new(
+            "test.config-collision",
+            "dynamic-module",
+            sinomo_config::ConfigValueType::Object {
+                schema_name: "DynamicCollisionConfig".to_string(),
+            },
+            "dynamic module config",
+            sinomo_config::ConfigClusterMode::LocalOnly,
+        )
+        .expect("dynamic definition")
+        .with_schema(sinomo_config::ConfigSchema::object(
+            "DynamicCollisionConfig",
+            "Dynamic module collision test settings.",
+            vec![sinomo_config::ConfigSchemaField::new(
+                "enabled",
+                "Enabled",
+                "Whether the test behavior is enabled.",
+                sinomo_config::ConfigSchemaValue::bool(),
+            )],
+        ))
+        .expect("dynamic schema")
+        .with_module_id(module_id.to_string())
+        .expect("dynamic ownership");
+        let surfaces = sinomo_module::ModuleSurfaces::default()
+            .with_config_definition(dynamic_definition)
+            .expect("dynamic settings surface");
+
+        let registry =
+            register_module_surface_config_definitions(builder, &module_id, &surfaces).build();
+        assert_eq!(
+            registry
+                .get("test.config-collision")
+                .expect("static definition remains")
+                .owner,
+            "application-hook"
+        );
     }
 
     #[test]

@@ -2,9 +2,11 @@
 //!
 //! Owner crates declare config definitions. The config layer resolves whether a value
 //! is local, cluster-backed, synchronized, or defaulted, and hides the storage details
-//! from callers. Local values are human-readable JSON documents under
-//! `$SINOMO_DATA_DIR/configs/`; cluster values are typed Sinomo-object values in
-//! `sinomo-kv` under `/config/...`.
+//! from callers. SOBJ is the native module, object-RPC, and cluster-KV format.
+//! Local values are projected as human-readable JSON documents under
+//! `$SINOMO_DATA_DIR/configs/`; the JSON-shaped [`serde_json::Value`] tree is an
+//! interface representation, not a second distributed wire contract. Cluster
+//! values are typed Sinomo-object values in `sinomo-kv` under `/config/...`.
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -131,6 +133,17 @@ impl ConfigSchema {
     pub fn validate(&self, key: &ConfigKey, value: &Value) -> Result<(), ConfigError> {
         validate_schema_value(key, &self.value, value, "$")
     }
+
+    /// Validate the schema declaration itself, independently from any one
+    /// configured value. Schemas are part of the SOBJ config contract, so an
+    /// invalid declaration must be rejected when the registry is assembled
+    /// rather than discovered by a settings client later.
+    pub fn validate_declaration(&self, key: &ConfigKey) -> Result<(), ConfigError> {
+        if self.name.trim().is_empty() {
+            return invalid_schema_declaration(key, "$", "schema name cannot be empty");
+        }
+        validate_schema_value_declaration(key, &self.value, "$")
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -141,6 +154,12 @@ pub struct ConfigSchemaField {
     pub value: ConfigSchemaValue,
     #[serde(default = "default_schema_field_required")]
     pub required: bool,
+    /// Field-level default used by schema clients when materializing new
+    /// objects or collection entries. The owning typed config remains the
+    /// authority for applying defaults at read time; use `optional()` as well
+    /// when its deserializer accepts omission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<Value>,
 }
 
 impl ConfigSchemaField {
@@ -156,11 +175,17 @@ impl ConfigSchemaField {
             description: description.into(),
             value,
             required: true,
+            default_value: None,
         }
     }
 
     pub fn optional(mut self) -> Self {
         self.required = false;
+        self
+    }
+
+    pub fn with_default_value(mut self, value: Value) -> Self {
+        self.default_value = Some(value);
         self
     }
 }
@@ -310,9 +335,18 @@ impl ConfigSchemaChoice {
 pub struct ConfigDefinition {
     pub key: ConfigKey,
     pub owner: String,
+    /// Module lifecycle identity that owns this user-facing setting. This is
+    /// explicit catalog metadata; clients must not infer it from crate names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_id: Option<String>,
     pub value_type: ConfigValueType,
     pub description: String,
     pub cluster_mode: ConfigClusterMode,
+    /// Operational documents can share the config transport without being
+    /// presented as editable user settings. Writes by their owning service are
+    /// still permitted; this flag is UI/catalog intent, not an authority grant.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<ConfigSchema>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -334,9 +368,11 @@ impl ConfigDefinition {
         Ok(Self {
             key: ConfigKey::new(key)?,
             owner: owner.into(),
+            module_id: None,
             value_type,
             description: description.into(),
             cluster_mode,
+            read_only: false,
             schema: None,
             default_value: None,
             local_legacy_paths: Vec::new(),
@@ -365,11 +401,42 @@ impl ConfigDefinition {
     }
 
     pub fn with_schema(mut self, schema: ConfigSchema) -> Result<Self, ConfigError> {
+        schema.validate_declaration(&self.key)?;
+        validate_schema_root_type(&self.key, &self.value_type, &schema)?;
         if let Some(default_value) = &self.default_value {
             schema.validate(&self.key, default_value)?;
         }
         self.schema = Some(schema);
+        if self.module_id.is_some() {
+            self.validate_contract()?;
+        }
         Ok(self)
+    }
+
+    pub fn with_module_id(mut self, module_id: impl Into<String>) -> Result<Self, ConfigError> {
+        let module_id = module_id.into();
+        if module_id.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                key: self.key.to_string(),
+                detail: "module id cannot be empty".to_string(),
+            });
+        }
+        let module_id = sinomo_core::Id::new(module_id.clone())
+            .or_else(|_| sinomo_core::Id::from_legacy_named(module_id))
+            .map_err(|error| ConfigError::InvalidValue {
+                key: self.key.to_string(),
+                detail: format!("invalid module id: {error}"),
+            })?;
+        self.module_id = Some(module_id.to_string());
+        if self.schema.is_some() {
+            self.validate_contract()?;
+        }
+        Ok(self)
+    }
+
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
     }
 
     pub fn cluster_key(&self) -> String {
@@ -384,6 +451,48 @@ impl ConfigDefinition {
         validate_value_type(&self.key, &self.value_type, value)?;
         if let Some(schema) = &self.schema {
             schema.validate(&self.key, value)?;
+        }
+        Ok(())
+    }
+
+    pub fn validate_contract(&self) -> Result<(), ConfigError> {
+        if self.owner.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                key: self.key.to_string(),
+                detail: "config owner cannot be empty".to_string(),
+            });
+        }
+        if let Some(module_id) = &self.module_id {
+            sinomo_core::Id::new(module_id.clone()).map_err(|error| ConfigError::InvalidValue {
+                key: self.key.to_string(),
+                detail: format!("module id must use its canonical value: {error}"),
+            })?;
+        }
+        if self.module_id.is_some() && self.schema.is_none() {
+            return Err(ConfigError::InvalidValue {
+                key: self.key.to_string(),
+                detail: "module-owned settings require a detailed schema".to_string(),
+            });
+        }
+        if let Some(schema) = &self.schema {
+            schema.validate_declaration(&self.key)?;
+            validate_schema_root_type(&self.key, &self.value_type, schema)?;
+            if self.module_id.is_some() {
+                if schema.description.trim().is_empty() {
+                    return invalid_schema_declaration(
+                        &self.key,
+                        "$",
+                        "module settings schema description cannot be empty",
+                    );
+                }
+                validate_module_schema_value(&self.key, &schema.value, "$")?;
+            }
+        }
+        if let Some(default_value) = &self.default_value {
+            self.validate_value(default_value)?;
+            if let Some(schema) = &self.schema {
+                validate_no_secret_defaults(&self.key, &schema.value, default_value, "$")?;
+            }
         }
         Ok(())
     }
@@ -437,6 +546,7 @@ pub struct ConfigRegistryBuilder {
 
 impl ConfigRegistryBuilder {
     pub fn register(mut self, definition: ConfigDefinition) -> Result<Self, ConfigError> {
+        definition.validate_contract()?;
         if self
             .definitions
             .insert(definition.key.clone(), definition.clone())
@@ -456,6 +566,8 @@ impl ConfigRegistryBuilder {
     }
 }
 
+/// Logical configuration document. It is SOBJ-encoded on RPC/KV paths and
+/// JSON-encoded only by the human-facing local storage adapter.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ConfigDocument {
     pub key: ConfigKey,
@@ -1286,6 +1398,372 @@ fn validate_value_type(
     }
 }
 
+fn validate_schema_root_type(
+    key: &ConfigKey,
+    value_type: &ConfigValueType,
+    schema: &ConfigSchema,
+) -> Result<(), ConfigError> {
+    let compatible = match (value_type, &schema.value) {
+        (ConfigValueType::Bool, ConfigSchemaValue::Bool)
+        | (ConfigValueType::I64 { .. }, ConfigSchemaValue::I64 { .. })
+        | (ConfigValueType::U64 { .. }, ConfigSchemaValue::U64 { .. })
+        | (ConfigValueType::F64 { .. }, ConfigSchemaValue::F64 { .. })
+        | (ConfigValueType::String { .. }, ConfigSchemaValue::String { .. })
+        | (ConfigValueType::StringList, ConfigSchemaValue::StringList)
+        | (ConfigValueType::Object { .. }, ConfigSchemaValue::Object { .. })
+        | (ConfigValueType::Object { .. }, ConfigSchemaValue::Map { .. })
+        | (ConfigValueType::Json, _) => true,
+        (ConfigValueType::StringList, ConfigSchemaValue::List { value }) => {
+            matches!(value.as_ref(), ConfigSchemaValue::String { .. })
+        }
+        _ => false,
+    };
+    if compatible {
+        if let ConfigValueType::Object { schema_name } = value_type
+            && schema_name != &schema.name
+        {
+            return Err(ConfigError::InvalidValue {
+                key: key.to_string(),
+                detail: format!(
+                    "object value type names schema `{schema_name}` but definition supplies `{}`",
+                    schema.name
+                ),
+            });
+        }
+        match (value_type, &schema.value) {
+            (
+                ConfigValueType::I64 { range: value_range },
+                ConfigSchemaValue::I64 {
+                    range: schema_range,
+                },
+            )
+            | (
+                ConfigValueType::U64 { range: value_range },
+                ConfigSchemaValue::U64 {
+                    range: schema_range,
+                },
+            )
+            | (
+                ConfigValueType::F64 { range: value_range },
+                ConfigSchemaValue::F64 {
+                    range: schema_range,
+                },
+            ) => validate_schema_range_within_value_type(
+                key,
+                value_range.as_ref(),
+                schema_range.as_ref(),
+            )?,
+            (
+                ConfigValueType::String {
+                    choices: value_choices,
+                },
+                ConfigSchemaValue::String {
+                    choices: schema_choices,
+                    ..
+                },
+            ) if !value_choices.is_empty()
+                && (schema_choices.is_empty()
+                    || schema_choices
+                        .iter()
+                        .any(|choice| !value_choices.contains(&choice.value))) =>
+            {
+                return Err(ConfigError::InvalidValue {
+                    key: key.to_string(),
+                    detail: "schema string choices must be a non-empty subset of the declared value-type choices"
+                        .to_string(),
+                });
+            }
+            _ => {}
+        }
+        Ok(())
+    } else {
+        Err(ConfigError::InvalidValue {
+            key: key.to_string(),
+            detail: format!("schema root kind does not match declared value type {value_type:?}"),
+        })
+    }
+}
+
+fn validate_schema_range_within_value_type(
+    key: &ConfigKey,
+    value_range: Option<&ConfigNumberRange>,
+    schema_range: Option<&ConfigNumberRange>,
+) -> Result<(), ConfigError> {
+    let value_min = value_range.and_then(|range| range.min);
+    let value_max = value_range.and_then(|range| range.max);
+    let schema_min = schema_range.and_then(|range| range.min);
+    let schema_max = schema_range.and_then(|range| range.max);
+    let widens_min =
+        value_min.is_some_and(|minimum| schema_min.is_none_or(|value| value < minimum));
+    let widens_max =
+        value_max.is_some_and(|maximum| schema_max.is_none_or(|value| value > maximum));
+    if widens_min || widens_max {
+        return Err(ConfigError::InvalidValue {
+            key: key.to_string(),
+            detail: "schema number range must stay within the declared value-type range"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_schema_value_declaration(
+    key: &ConfigKey,
+    schema: &ConfigSchemaValue,
+    path: &str,
+) -> Result<(), ConfigError> {
+    match schema {
+        ConfigSchemaValue::I64 { range }
+        | ConfigSchemaValue::U64 { range }
+        | ConfigSchemaValue::F64 { range } => {
+            validate_schema_range_declaration(key, path, range.as_ref())
+        }
+        ConfigSchemaValue::String { choices, secret } => {
+            if *secret && !choices.is_empty() {
+                return invalid_schema_declaration(
+                    key,
+                    path,
+                    "secret strings cannot declare choices",
+                );
+            }
+            let mut values = BTreeMap::<&str, ()>::new();
+            let mut labels = BTreeMap::<&str, ()>::new();
+            for choice in choices {
+                if choice.value.trim().is_empty() {
+                    return invalid_schema_declaration(key, path, "choice value cannot be empty");
+                }
+                if choice.label.trim().is_empty() {
+                    return invalid_schema_declaration(
+                        key,
+                        path,
+                        format!("choice `{}` label cannot be empty", choice.value),
+                    );
+                }
+                if values.insert(choice.value.as_str(), ()).is_some() {
+                    return invalid_schema_declaration(
+                        key,
+                        path,
+                        format!("duplicate choice value `{}`", choice.value),
+                    );
+                }
+                if labels.insert(choice.label.as_str(), ()).is_some() {
+                    return invalid_schema_declaration(
+                        key,
+                        path,
+                        format!("duplicate choice label `{}`", choice.label),
+                    );
+                }
+            }
+            Ok(())
+        }
+        ConfigSchemaValue::Object { fields, .. } => {
+            let mut names = BTreeMap::<&str, ()>::new();
+            for field in fields {
+                let field_path = schema_child_path(path, &field.name);
+                if field.name.trim().is_empty() {
+                    return invalid_schema_declaration(key, path, "field name cannot be empty");
+                }
+                if field.label.trim().is_empty() {
+                    return invalid_schema_declaration(
+                        key,
+                        &field_path,
+                        "field label cannot be empty",
+                    );
+                }
+                if names.insert(field.name.as_str(), ()).is_some() {
+                    return invalid_schema_declaration(
+                        key,
+                        path,
+                        format!("duplicate field `{}`", field.name),
+                    );
+                }
+                validate_schema_value_declaration(key, &field.value, &field_path)?;
+                if let Some(default_value) = &field.default_value {
+                    if matches!(&field.value, ConfigSchemaValue::String { secret: true, .. }) {
+                        return invalid_schema_declaration(
+                            key,
+                            &field_path,
+                            "secret fields cannot publish a default value",
+                        );
+                    }
+                    validate_schema_value(key, &field.value, default_value, &field_path)?;
+                    validate_no_secret_defaults(key, &field.value, default_value, &field_path)?;
+                }
+            }
+            Ok(())
+        }
+        ConfigSchemaValue::Map { value } => {
+            validate_schema_value_declaration(key, value, &format!("{path}.*"))
+        }
+        ConfigSchemaValue::List { value } => {
+            validate_schema_value_declaration(key, value, &format!("{path}[]"))
+        }
+        ConfigSchemaValue::Bool | ConfigSchemaValue::StringList | ConfigSchemaValue::Json => Ok(()),
+    }
+}
+
+fn validate_no_secret_defaults(
+    key: &ConfigKey,
+    schema: &ConfigSchemaValue,
+    value: &Value,
+    path: &str,
+) -> Result<(), ConfigError> {
+    match schema {
+        ConfigSchemaValue::String { secret: true, .. } => {
+            if value.as_str().is_some_and(|value| !value.is_empty()) {
+                return Err(ConfigError::InvalidValue {
+                    key: key.to_string(),
+                    detail: format!(
+                        "{path}: config defaults cannot publish a secret value through the schema catalog"
+                    ),
+                });
+            }
+        }
+        ConfigSchemaValue::Object { fields, .. } => {
+            if let Some(values) = value.as_object() {
+                for field in fields {
+                    if let Some(value) = values.get(&field.name) {
+                        validate_no_secret_defaults(
+                            key,
+                            &field.value,
+                            value,
+                            &schema_child_path(path, &field.name),
+                        )?;
+                    }
+                }
+            }
+        }
+        ConfigSchemaValue::Map { value: item_schema } => {
+            if let Some(values) = value.as_object() {
+                for (entry, value) in values {
+                    validate_no_secret_defaults(
+                        key,
+                        item_schema,
+                        value,
+                        &schema_child_path(path, entry),
+                    )?;
+                }
+            }
+        }
+        ConfigSchemaValue::List { value: item_schema } => {
+            if let Some(values) = value.as_array() {
+                for (index, value) in values.iter().enumerate() {
+                    validate_no_secret_defaults(
+                        key,
+                        item_schema,
+                        value,
+                        &format!("{path}[{index}]"),
+                    )?;
+                }
+            }
+        }
+        ConfigSchemaValue::Bool
+        | ConfigSchemaValue::I64 { .. }
+        | ConfigSchemaValue::U64 { .. }
+        | ConfigSchemaValue::F64 { .. }
+        | ConfigSchemaValue::String { .. }
+        | ConfigSchemaValue::StringList
+        | ConfigSchemaValue::Json => {}
+    }
+    Ok(())
+}
+
+fn validate_module_schema_value(
+    key: &ConfigKey,
+    schema: &ConfigSchemaValue,
+    path: &str,
+) -> Result<(), ConfigError> {
+    match schema {
+        ConfigSchemaValue::Json => invalid_schema_declaration(
+            key,
+            path,
+            "module settings must describe this value instead of using raw JSON",
+        ),
+        ConfigSchemaValue::Object {
+            fields,
+            allow_unknown_fields,
+        } => {
+            if fields.is_empty() {
+                return invalid_schema_declaration(
+                    key,
+                    path,
+                    "module settings objects must declare at least one field",
+                );
+            }
+            if *allow_unknown_fields {
+                return invalid_schema_declaration(
+                    key,
+                    path,
+                    "module settings objects must be field-complete; use a typed map for dynamic keys",
+                );
+            }
+            for field in fields {
+                if field.description.trim().is_empty() {
+                    return invalid_schema_declaration(
+                        key,
+                        &schema_child_path(path, &field.name),
+                        "module settings field description cannot be empty",
+                    );
+                }
+                validate_module_schema_value(
+                    key,
+                    &field.value,
+                    &schema_child_path(path, &field.name),
+                )?;
+            }
+            Ok(())
+        }
+        ConfigSchemaValue::Map { value } => {
+            validate_module_schema_value(key, value, &format!("{path}.*"))
+        }
+        ConfigSchemaValue::List { value } => {
+            validate_module_schema_value(key, value, &format!("{path}[]"))
+        }
+        ConfigSchemaValue::Bool
+        | ConfigSchemaValue::I64 { .. }
+        | ConfigSchemaValue::U64 { .. }
+        | ConfigSchemaValue::F64 { .. }
+        | ConfigSchemaValue::String { .. }
+        | ConfigSchemaValue::StringList => Ok(()),
+    }
+}
+
+fn validate_schema_range_declaration(
+    key: &ConfigKey,
+    path: &str,
+    range: Option<&ConfigNumberRange>,
+) -> Result<(), ConfigError> {
+    let Some(range) = range else {
+        return Ok(());
+    };
+    if range.min.is_some_and(|value| !value.is_finite())
+        || range.max.is_some_and(|value| !value.is_finite())
+    {
+        return invalid_schema_declaration(key, path, "number range must be finite");
+    }
+    if let (Some(min), Some(max)) = (range.min, range.max)
+        && min > max
+    {
+        return invalid_schema_declaration(
+            key,
+            path,
+            format!("number range minimum {min} exceeds maximum {max}"),
+        );
+    }
+    Ok(())
+}
+
+fn invalid_schema_declaration<T>(
+    key: &ConfigKey,
+    path: &str,
+    detail: impl Into<String>,
+) -> Result<T, ConfigError> {
+    Err(ConfigError::InvalidValue {
+        key: key.to_string(),
+        detail: format!("{path}: invalid schema declaration: {}", detail.into()),
+    })
+}
+
 fn validate_schema_value(
     key: &ConfigKey,
     schema: &ConfigSchemaValue,
@@ -1572,17 +2050,22 @@ mod tests {
                 "Modules",
                 "Module enablement keyed by module id.",
                 ConfigSchemaValue::map(
-                    ConfigSchemaValue::object(vec![ConfigSchemaField::new(
-                        "enabled",
-                        "Enabled",
-                        "Whether this module should run.",
-                        ConfigSchemaValue::bool(),
-                    )])
+                    ConfigSchemaValue::object(vec![
+                        ConfigSchemaField::new(
+                            "enabled",
+                            "Enabled",
+                            "Whether this module should run.",
+                            ConfigSchemaValue::bool(),
+                        )
+                        .with_default_value(Value::Bool(false)),
+                    ])
                     .without_unknown_fields(),
                 ),
             )],
         ))
         .expect("schema")
+        .with_module_id("module.test")
+        .expect("module id")
     }
 
     fn registry() -> ConfigRegistry {
@@ -1590,6 +2073,514 @@ mod tests {
             .register(bool_definition())
             .expect("register")
             .build()
+    }
+
+    #[test]
+    fn config_catalog_object_rpc_preserves_nested_schema() {
+        let definition = module_like_definition().read_only();
+        let response = ConfigCatalogResponse {
+            definitions: vec![definition.clone()],
+        };
+        let frame = ObjectRpcResponse::encode_body(CONFIG_CATALOG_ROUTE, &response)
+            .expect("encode config catalog response");
+
+        let decoded: ConfigCatalogResponse =
+            frame.decode_body().expect("decode config catalog response");
+        let expected_module_id =
+            sinomo_core::Id::from_legacy_named("module.test").expect("module id");
+
+        assert_eq!(decoded.definitions, vec![definition]);
+        assert_eq!(
+            decoded.definitions[0].module_id.as_deref(),
+            Some(expected_module_id.as_str())
+        );
+        assert!(decoded.definitions[0].read_only);
+        assert!(matches!(
+            &decoded.definitions[0].schema,
+            Some(ConfigSchema {
+                value: ConfigSchemaValue::Object { fields, .. },
+                ..
+            }) if matches!(
+                fields.as_slice(),
+                [ConfigSchemaField {
+                    value: ConfigSchemaValue::Map { value },
+                    ..
+                }] if matches!(
+                    value.as_ref(),
+                    ConfigSchemaValue::Object { fields, .. }
+                        if matches!(
+                            fields.as_slice(),
+                            [ConfigSchemaField {
+                                value: ConfigSchemaValue::Bool,
+                                ..
+                            }]
+                        )
+                )
+            )
+        ));
+    }
+
+    #[derive(Serialize)]
+    struct LegacyConfigDefinitionWithoutSchema {
+        key: ConfigKey,
+        owner: String,
+        value_type: ConfigValueType,
+        description: String,
+        cluster_mode: ConfigClusterMode,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyConfigCatalogResponseWithoutSchema {
+        definitions: Vec<LegacyConfigDefinitionWithoutSchema>,
+    }
+
+    #[test]
+    fn config_catalog_object_rpc_decodes_schema_less_definition_for_fallback() {
+        let legacy = LegacyConfigCatalogResponseWithoutSchema {
+            definitions: vec![LegacyConfigDefinitionWithoutSchema {
+                key: ConfigKey::new("test.legacy-object").expect("legacy config key"),
+                owner: "legacy-module".to_string(),
+                value_type: ConfigValueType::Object {
+                    schema_name: "LegacyObject".to_string(),
+                },
+                description: "legacy object without a field schema".to_string(),
+                cluster_mode: ConfigClusterMode::LocalOnly,
+            }],
+        };
+        let frame = ObjectRpcResponse::encode_body(CONFIG_CATALOG_ROUTE, &legacy)
+            .expect("encode legacy config catalog response");
+
+        let decoded: ConfigCatalogResponse = frame
+            .decode_body()
+            .expect("decode legacy config catalog response");
+
+        assert_eq!(decoded.definitions.len(), 1);
+        let definition = &decoded.definitions[0];
+        assert_eq!(definition.key.as_str(), "test.legacy-object");
+        assert_eq!(definition.owner, "legacy-module");
+        assert_eq!(definition.module_id, None);
+        assert!(!definition.read_only);
+        assert_eq!(definition.schema, None);
+        assert_eq!(definition.default_value, None);
+        assert!(definition.local_legacy_paths.is_empty());
+        assert!(definition.cluster_legacy_keys.is_empty());
+    }
+
+    #[test]
+    fn registry_rejects_module_settings_without_a_schema() {
+        let definition = ConfigDefinition::new(
+            "test.missing-schema",
+            "test",
+            ConfigValueType::Object {
+                schema_name: "MissingSchema".to_string(),
+            },
+            "invalid module settings",
+            ConfigClusterMode::LocalOnly,
+        )
+        .expect("definition")
+        .with_module_id("module.test")
+        .expect("module id");
+
+        let error = ConfigRegistry::builder()
+            .register(definition)
+            .expect_err("module settings must have a detailed schema");
+        assert!(
+            error.to_string().contains("require a detailed schema"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn registry_rejects_untyped_or_open_module_schema_nodes() {
+        let open_error = ConfigDefinition::new(
+            "test.open-schema",
+            "test",
+            ConfigValueType::Object {
+                schema_name: "OpenSchema".to_string(),
+            },
+            "invalid open module settings",
+            ConfigClusterMode::LocalOnly,
+        )
+        .expect("definition")
+        .with_schema(ConfigSchema::new(
+            "OpenSchema",
+            "open object",
+            ConfigSchemaValue::object(vec![ConfigSchemaField::new(
+                "known",
+                "Known",
+                "Known field.",
+                ConfigSchemaValue::bool(),
+            )]),
+        ))
+        .expect("schema declaration")
+        .with_module_id("module.test")
+        .expect_err("module object schemas must be field-complete");
+        assert!(
+            open_error.to_string().contains("field-complete"),
+            "{open_error}"
+        );
+
+        let json_error = ConfigDefinition::new(
+            "test.raw-json-schema",
+            "test",
+            ConfigValueType::Object {
+                schema_name: "RawJsonSchema".to_string(),
+            },
+            "invalid raw JSON module settings",
+            ConfigClusterMode::LocalOnly,
+        )
+        .expect("definition")
+        .with_schema(ConfigSchema::object(
+            "RawJsonSchema",
+            "raw child",
+            vec![ConfigSchemaField::new(
+                "payload",
+                "Payload",
+                "Untyped payload.",
+                ConfigSchemaValue::Json,
+            )],
+        ))
+        .expect("schema declaration")
+        .with_module_id("module.test")
+        .expect_err("module schemas must not fall back to raw JSON");
+        assert!(json_error.to_string().contains("raw JSON"), "{json_error}");
+    }
+
+    #[test]
+    fn schema_declaration_rejects_duplicate_fields_and_invalid_ranges() {
+        let default_error = ConfigDefinition::new(
+            "test.invalid-field-default",
+            "test",
+            ConfigValueType::Object {
+                schema_name: "InvalidFieldDefault".to_string(),
+            },
+            "invalid field default",
+            ConfigClusterMode::LocalOnly,
+        )
+        .expect("definition")
+        .with_schema(ConfigSchema::object(
+            "InvalidFieldDefault",
+            "invalid field default",
+            vec![
+                ConfigSchemaField::new(
+                    "enabled",
+                    "Enabled",
+                    "Whether this value is enabled.",
+                    ConfigSchemaValue::bool(),
+                )
+                .with_default_value(Value::String("yes".to_string())),
+            ],
+        ))
+        .expect_err("field defaults must satisfy their schema");
+        assert!(default_error.to_string().contains("expected bool"));
+
+        let secret_default_error = ConfigDefinition::new(
+            "test.secret-field-default",
+            "test",
+            ConfigValueType::Object {
+                schema_name: "SecretFieldDefault".to_string(),
+            },
+            "secret field default",
+            ConfigClusterMode::LocalOnly,
+        )
+        .expect("definition")
+        .with_schema(ConfigSchema::object(
+            "SecretFieldDefault",
+            "secret field default",
+            vec![
+                ConfigSchemaField::new(
+                    "token",
+                    "Token",
+                    "Secret token.",
+                    ConfigSchemaValue::secret_string(),
+                )
+                .with_default_value(Value::String("do-not-publish".to_string())),
+            ],
+        ))
+        .expect_err("secret defaults must not be published in schemas");
+        assert!(
+            secret_default_error
+                .to_string()
+                .contains("secret fields cannot publish a default value")
+        );
+
+        let nested_secret_field_default_error = ConfigDefinition::new(
+            "test.nested-secret-field-default",
+            "test",
+            ConfigValueType::Object {
+                schema_name: "NestedSecretFieldDefault".to_string(),
+            },
+            "nested secret field default",
+            ConfigClusterMode::LocalOnly,
+        )
+        .expect("definition")
+        .with_schema(ConfigSchema::object(
+            "NestedSecretFieldDefault",
+            "nested secret field default",
+            vec![
+                ConfigSchemaField::new(
+                    "auth",
+                    "Authentication",
+                    "Authentication settings.",
+                    ConfigSchemaValue::object(vec![ConfigSchemaField::new(
+                        "token",
+                        "Token",
+                        "Secret token.",
+                        ConfigSchemaValue::secret_string(),
+                    )])
+                    .without_unknown_fields(),
+                )
+                .with_default_value(serde_json::json!({
+                    "token": "do-not-publish"
+                })),
+            ],
+        ))
+        .expect_err("nested schema defaults must not publish credentials");
+        assert!(
+            nested_secret_field_default_error
+                .to_string()
+                .contains("$.auth.token: config defaults cannot publish a secret value")
+        );
+
+        let secret_choices_error = ConfigDefinition::new(
+            "test.secret-choices",
+            "test",
+            ConfigValueType::String {
+                choices: vec!["token-a".to_string()],
+            },
+            "secret choices",
+            ConfigClusterMode::LocalOnly,
+        )
+        .expect("definition")
+        .with_schema(ConfigSchema::new(
+            "SecretChoices",
+            "secret choices",
+            ConfigSchemaValue::String {
+                choices: vec![ConfigSchemaChoice::new("token-a", "Token A")],
+                secret: true,
+            },
+        ))
+        .expect_err("secret strings must not publish choices");
+        assert!(
+            secret_choices_error
+                .to_string()
+                .contains("secret strings cannot declare choices")
+        );
+
+        let secret_document_error = ConfigDefinition::new(
+            "test.secret-document-default",
+            "test",
+            ConfigValueType::Object {
+                schema_name: "SecretDocumentDefault".to_string(),
+            },
+            "secret document default",
+            ConfigClusterMode::LocalOnly,
+        )
+        .expect("definition")
+        .with_default(&serde_json::json!({
+            "auth": { "token": "do-not-publish" }
+        }))
+        .expect("untyped default")
+        .with_schema(ConfigSchema::object(
+            "SecretDocumentDefault",
+            "secret document default",
+            vec![ConfigSchemaField::new(
+                "auth",
+                "Authentication",
+                "Authentication settings.",
+                ConfigSchemaValue::object(vec![ConfigSchemaField::new(
+                    "token",
+                    "Token",
+                    "Secret token.",
+                    ConfigSchemaValue::secret_string(),
+                )])
+                .without_unknown_fields(),
+            )],
+        ))
+        .expect("typed schema")
+        .with_module_id("module.test")
+        .expect_err("module defaults must not publish nested credentials");
+        assert!(
+            secret_document_error
+                .to_string()
+                .contains("$.auth.token: config defaults cannot publish a secret value")
+        );
+
+        let name_error = ConfigDefinition::new(
+            "test.schema-name-mismatch",
+            "test",
+            ConfigValueType::Object {
+                schema_name: "ExpectedSchema".to_string(),
+            },
+            "mismatched schema name",
+            ConfigClusterMode::LocalOnly,
+        )
+        .expect("definition")
+        .with_schema(ConfigSchema::object(
+            "OtherSchema",
+            "mismatched schema",
+            vec![ConfigSchemaField::new(
+                "value",
+                "Value",
+                "Typed value.",
+                ConfigSchemaValue::bool(),
+            )],
+        ))
+        .expect_err("object schema names must match their declared value type");
+        assert!(name_error.to_string().contains("ExpectedSchema"));
+
+        let duplicate_error = ConfigDefinition::new(
+            "test.duplicate-fields",
+            "test",
+            ConfigValueType::Object {
+                schema_name: "DuplicateFields".to_string(),
+            },
+            "duplicate fields",
+            ConfigClusterMode::LocalOnly,
+        )
+        .expect("definition")
+        .with_schema(ConfigSchema::object(
+            "DuplicateFields",
+            "duplicate fields",
+            vec![
+                ConfigSchemaField::new("value", "Value", "First.", ConfigSchemaValue::bool()),
+                ConfigSchemaField::new("value", "Value", "Second.", ConfigSchemaValue::bool()),
+            ],
+        ))
+        .expect_err("duplicate schema fields must be rejected");
+        assert!(
+            duplicate_error
+                .to_string()
+                .contains("duplicate field `value`")
+        );
+
+        let range_error = ConfigDefinition::new(
+            "test.invalid-range",
+            "test",
+            ConfigValueType::I64 { range: None },
+            "invalid range",
+            ConfigClusterMode::LocalOnly,
+        )
+        .expect("definition")
+        .with_schema(ConfigSchema::new(
+            "InvalidRange",
+            "invalid range",
+            ConfigSchemaValue::i64(Some(ConfigNumberRange {
+                min: Some(10.0),
+                max: Some(1.0),
+            })),
+        ))
+        .expect_err("inverted schema ranges must be rejected");
+        assert!(
+            range_error
+                .to_string()
+                .contains("minimum 10 exceeds maximum 1")
+        );
+
+        let wider_range_error = ConfigDefinition::new(
+            "test.wider-schema-range",
+            "test",
+            ConfigValueType::I64 {
+                range: Some(ConfigNumberRange {
+                    min: Some(0.0),
+                    max: Some(10.0),
+                }),
+            },
+            "wider schema range",
+            ConfigClusterMode::LocalOnly,
+        )
+        .expect("definition")
+        .with_schema(ConfigSchema::new(
+            "WiderSchemaRange",
+            "wider schema range",
+            ConfigSchemaValue::i64(Some(ConfigNumberRange {
+                min: Some(-1.0),
+                max: Some(10.0),
+            })),
+        ))
+        .expect_err("UI ranges must not allow values rejected by the value type");
+        assert!(
+            wider_range_error
+                .to_string()
+                .contains("schema number range must stay within")
+        );
+
+        let choice_mismatch_error = ConfigDefinition::new(
+            "test.schema-choice-mismatch",
+            "test",
+            ConfigValueType::String {
+                choices: vec!["stable".to_string()],
+            },
+            "mismatched choices",
+            ConfigClusterMode::LocalOnly,
+        )
+        .expect("definition")
+        .with_schema(ConfigSchema::new(
+            "SchemaChoiceMismatch",
+            "mismatched choices",
+            ConfigSchemaValue::string_choices(vec![ConfigSchemaChoice::new(
+                "experimental",
+                "Experimental",
+            )]),
+        ))
+        .expect_err("UI choices must be accepted by the value type");
+        assert!(
+            choice_mismatch_error
+                .to_string()
+                .contains("schema string choices must be a non-empty subset")
+        );
+
+        let list_item_error = ConfigDefinition::new(
+            "test.string-list-schema-item",
+            "test",
+            ConfigValueType::StringList,
+            "invalid string list item schema",
+            ConfigClusterMode::LocalOnly,
+        )
+        .expect("definition")
+        .with_schema(ConfigSchema::new(
+            "StringListSchemaItem",
+            "invalid string list item schema",
+            ConfigSchemaValue::list(ConfigSchemaValue::bool()),
+        ))
+        .expect_err("string-list UI items must also be strings");
+        assert!(list_item_error.to_string().contains("root kind"));
+    }
+
+    #[test]
+    fn schema_field_default_does_not_relax_a_required_field() {
+        let key = ConfigKey::new("test.schema-field-default").expect("config key");
+        let schema = ConfigSchema::object(
+            "SchemaFieldDefault",
+            "field default behavior",
+            vec![
+                ConfigSchemaField::new(
+                    "enabled",
+                    "Enabled",
+                    "Whether the feature is enabled.",
+                    ConfigSchemaValue::bool(),
+                )
+                .with_default_value(Value::Bool(false)),
+                ConfigSchemaField::new(
+                    "name",
+                    "Name",
+                    "Required name.",
+                    ConfigSchemaValue::string(),
+                ),
+            ],
+        );
+
+        let missing_enabled = schema
+            .validate(&key, &serde_json::json!({}))
+            .expect_err("a UI construction default does not make a field optional");
+        assert!(missing_enabled.to_string().contains("$.enabled"));
+
+        schema
+            .validate(
+                &key,
+                &serde_json::json!({ "enabled": false, "name": "example" }),
+            )
+            .expect("explicit required fields are valid");
     }
 
     #[test]

@@ -130,16 +130,16 @@ pub use source::{
 pub use state::{
     NativeDylibLoaderRollbackLifecycle, NativeDylibLoaderStateRollback, NativeDylibRolloutGuard,
     PendingShadowRollout, PendingShadowRolloutContext, ROLLOUT_DIAGNOSTIC_TAIL_BYTES,
-    RecordedRolloutTransition, RolloutActivationGuard, RolloutFailureDiagnostics,
-    RolloutMainActivation, RolloutMainExitRecord, RolloutTelemetryAdvanceState,
-    RolloutTelemetryGateConfig, RolloutTransitionRecord, acquire_native_dylib_rollout_guard,
-    acquire_rollout_activation_guard, clear_rollout_status, native_dylib_rollout_lock_path,
-    read_object, read_pending_shadow_rollout, read_rollout_main_activation, read_rollout_main_exit,
-    read_rollout_runtime_state, read_rollout_status, read_rollout_telemetry_advance_state,
-    read_rollout_telemetry_gate_config, read_tail_lossy, record_activation_failure,
-    record_main_activation_staged, record_main_rollout_failure,
-    record_main_rollout_failure_with_diagnostics, record_rollout_main_exit,
-    record_rollout_transition, record_shadow_rollout_finalized,
+    ROLLOUT_TELEMETRY_GATE_CONFIG_KEY, RecordedRolloutTransition, RolloutActivationGuard,
+    RolloutFailureDiagnostics, RolloutMainActivation, RolloutMainExitRecord,
+    RolloutTelemetryAdvanceState, RolloutTelemetryGateConfig, RolloutTransitionRecord,
+    acquire_native_dylib_rollout_guard, acquire_rollout_activation_guard, clear_rollout_status,
+    native_dylib_rollout_lock_path, read_object, read_pending_shadow_rollout,
+    read_rollout_main_activation, read_rollout_main_exit, read_rollout_runtime_state,
+    read_rollout_status, read_rollout_telemetry_advance_state, read_rollout_telemetry_gate_config,
+    read_tail_lossy, record_activation_failure, record_main_activation_staged,
+    record_main_rollout_failure, record_main_rollout_failure_with_diagnostics,
+    record_rollout_main_exit, record_rollout_transition, record_shadow_rollout_finalized,
     recover_unresolved_native_dylib_loader_rollback_intents, register_config_definitions,
     remove_main_activation, remove_native_dylib_loader_state_rollback, remove_shadow_finalize,
     restore_native_dylib_loader_state_for_activation, restore_native_dylib_loader_state_rollback,
@@ -229,6 +229,12 @@ pub fn rollout_module_surfaces() -> sinomo_module::ModuleSurfaces {
         ))
         .with_event_kind_name(ROLLOUT_TRANSITION_COMPLETED_EVENT_KIND)
         .with_storage_owner(SINOMO_ROLLOUT_MODULE_OWNER);
+    surfaces = surfaces
+        .with_config_definition(
+            rollout_telemetry_gate_config_definition()
+                .expect("rollout telemetry config definition must be valid"),
+        )
+        .expect("rollout settings surface must be valid");
     surfaces.capabilities = rollout_module_capabilities();
     surfaces
 }

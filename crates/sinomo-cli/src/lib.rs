@@ -794,6 +794,15 @@ fn cli_runtime_config() -> &'static CliRuntimeConfig {
     CLI_RUNTIME_CONFIG.get_or_init(default_cli_runtime_config)
 }
 
+fn register_cli_runtime_config_definitions(
+    mut builder: sinomo_runtime::config::ConfigRegistryBuilder,
+) -> Result<sinomo_runtime::config::ConfigRegistryBuilder, String> {
+    for hook in &cli_runtime_config().config_registry_hooks {
+        builder = hook(builder)?;
+    }
+    Ok(builder)
+}
+
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct CliCommandOutput {
     pub stdout: Vec<u8>,
@@ -5102,10 +5111,8 @@ pub(crate) fn main_agent_config_store() -> Result<sinomo_runtime::config::Config
     let builder = sinomo_runtime::sandbox::register_config_definitions(builder)?;
     let builder =
         sinomo_lm::register_config_definitions(builder).map_err(CliError::LanguageModel)?;
-    let mut builder = builder;
-    for hook in &cli_runtime_config().config_registry_hooks {
-        builder = hook(builder).map_err(|detail| CliError::Parse { detail })?;
-    }
+    let builder = register_cli_runtime_config_definitions(builder)
+        .map_err(|detail| CliError::Parse { detail })?;
     Ok(sinomo_runtime::config::ConfigStore::new(builder.build()))
 }
 

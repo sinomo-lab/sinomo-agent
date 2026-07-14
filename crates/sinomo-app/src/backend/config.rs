@@ -55,6 +55,9 @@ impl ConfigEditKind {
 pub struct ConfigItem {
     pub key: String,
     pub owner: String,
+    /// Explicit module lifecycle identity supplied by the config catalog.
+    /// Settings surfaces must not infer this association from crate/owner names.
+    pub module_id: Option<String>,
     pub description: String,
     pub value: String,
     pub source: &'static str,
@@ -64,10 +67,13 @@ pub struct ConfigItem {
     pub edit_kind: ConfigEditKind,
     /// The full (non-elided) editable representation seeded into the inline editor.
     pub edit_value: String,
-    /// Full resolved value used by schema-driven editors that write one nested field at a time.
+    /// Full resolved value used to seed schema-driven, whole-definition drafts.
     pub raw_value: Value,
     /// Optional structured schema declared by the owner crate/module.
     pub schema: Option<ConfigSchema>,
+    /// Catalog intent for operational documents that may be inspected but not
+    /// edited from the user-facing settings surface.
+    pub read_only: bool,
 }
 
 impl ConfigItem {
@@ -92,6 +98,8 @@ pub fn build_config_store() -> Result<ConfigStore, String> {
         .map_err(|e| format!("sandbox config: {e:?}"))?;
     let builder =
         sinomo_lm::register_config_definitions(builder).map_err(|e| format!("lm config: {e:?}"))?;
+    let builder = sinomo_evolution::register_config_definitions(builder)
+        .map_err(|e| format!("evolution config: {e:?}"))?;
     Ok(ConfigStore::new(builder.build()))
 }
 
@@ -115,6 +123,7 @@ pub fn resolve_items(client: &dyn ConfigClient) -> Vec<ConfigItem> {
         items.push(ConfigItem {
             key,
             owner: def.owner.clone(),
+            module_id: def.module_id.clone(),
             description: def.description.clone(),
             value: compact(&value),
             source,
@@ -123,6 +132,7 @@ pub fn resolve_items(client: &dyn ConfigClient) -> Vec<ConfigItem> {
             edit_value,
             raw_value: value,
             schema: def.schema.clone(),
+            read_only: def.read_only,
         });
     }
     items
@@ -234,6 +244,21 @@ mod tests {
         let data_dir = SinomoDataDir::new(root.clone());
         let store = Arc::new(build_config_store().expect("config store"));
         (LocalConfigClient::new(store, data_dir, None), root)
+    }
+
+    #[test]
+    fn app_config_store_includes_evolution_schema() {
+        let store = build_config_store().expect("config store");
+        let definition = store
+            .registry()
+            .get(sinomo_evolution::EVOLUTION_CONFIG_KEY)
+            .expect("evolution config definition");
+        let expected_module_id = sinomo_evolution::evolution_module_id().to_string();
+        assert!(definition.schema.is_some());
+        assert_eq!(
+            definition.module_id.as_deref(),
+            Some(expected_module_id.as_str())
+        );
     }
 
     #[test]

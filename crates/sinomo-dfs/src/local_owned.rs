@@ -99,6 +99,81 @@ impl DfsExposeConfig {
 
 pub const DFS_EXPOSE_CONFIG_KEY: &str = "dfs.expose";
 
+pub fn dfs_expose_config_schema() -> sinomo_config::ConfigSchema {
+    use sinomo_config::{ConfigSchema, ConfigSchemaField, ConfigSchemaValue};
+
+    let entry = ConfigSchemaValue::object(vec![
+        ConfigSchemaField::new(
+            "id",
+            "Exposure ID",
+            "Stable identifier for this exposed directory.",
+            ConfigSchemaValue::string(),
+        ),
+        ConfigSchemaField::new(
+            "file_system_id",
+            "Filesystem ID",
+            "SIFS filesystem that owns the virtual path.",
+            ConfigSchemaValue::string(),
+        ),
+        ConfigSchemaField::new(
+            "dfs_path",
+            "SIFS path",
+            "Absolute virtual path where the directory is exposed.",
+            ConfigSchemaValue::string(),
+        ),
+        ConfigSchemaField::new(
+            "source_path",
+            "Local source directory",
+            "Host directory exported by this node.",
+            ConfigSchemaValue::string(),
+        ),
+        ConfigSchemaField::new(
+            "owner_node_id",
+            "Owner node",
+            "Node that retains write authority for the exposed directory.",
+            ConfigSchemaValue::string(),
+        ),
+        ConfigSchemaField::new(
+            "writable",
+            "Writable",
+            "Allow writes through the SIFS path.",
+            ConfigSchemaValue::bool(),
+        )
+        .optional()
+        .with_default_value(serde_json::Value::Bool(true)),
+        ConfigSchemaField::new(
+            "follow_symlinks",
+            "Follow symlinks",
+            "Allow traversal through symlinks below the source directory.",
+            ConfigSchemaValue::bool(),
+        )
+        .optional()
+        .with_default_value(serde_json::Value::Bool(false)),
+        ConfigSchemaField::new(
+            "created_at",
+            "Created at",
+            "RFC 3339 creation timestamp for this exposure.",
+            ConfigSchemaValue::string(),
+        ),
+    ])
+    .without_unknown_fields();
+
+    ConfigSchema::object(
+        "DfsExposeConfig",
+        "Local-owned directories exposed through SIFS by this node.",
+        vec![
+            ConfigSchemaField::new(
+                "entries",
+                "Exposed directories",
+                "Directory exposure records managed by this node.",
+                ConfigSchemaValue::list(entry),
+            )
+            .optional()
+            .with_default_value(serde_json::json!([])),
+        ],
+    )
+}
+
 pub fn dfs_expose_config_definition() -> Result<sinomo_config::ConfigDefinition, DfsExposeStoreError>
 {
     sinomo_config::ConfigDefinition::new(
@@ -113,6 +188,16 @@ pub fn dfs_expose_config_definition() -> Result<sinomo_config::ConfigDefinition,
     .map_err(map_dfs_config_error)?
     .with_default(&DfsExposeConfig::empty())
     .map_err(map_dfs_config_error)
+    .and_then(|definition| {
+        definition
+            .with_schema(dfs_expose_config_schema())
+            .map_err(map_dfs_config_error)
+    })
+    .and_then(|definition| {
+        definition
+            .with_module_id(crate::dfs_module_id().to_string())
+            .map_err(map_dfs_config_error)
+    })
     .map(|definition| definition.with_local_legacy_path("config/dfs-expose.json"))
 }
 
@@ -667,6 +752,86 @@ fn local_owned_durable_file_error(error: durable_file::DurableFileError) -> Loca
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_fully_typed_schema(value: &sinomo_config::ConfigSchemaValue) {
+        use sinomo_config::ConfigSchemaValue;
+
+        match value {
+            ConfigSchemaValue::Object { fields, .. } => {
+                assert!(
+                    !fields.is_empty(),
+                    "object schemas must declare their fields"
+                );
+                for field in fields {
+                    assert_fully_typed_schema(&field.value);
+                }
+            }
+            ConfigSchemaValue::Map { value } | ConfigSchemaValue::List { value } => {
+                assert_fully_typed_schema(value);
+            }
+            ConfigSchemaValue::Json => panic!("config schema must not use an untyped JSON value"),
+            ConfigSchemaValue::Bool
+            | ConfigSchemaValue::I64 { .. }
+            | ConfigSchemaValue::U64 { .. }
+            | ConfigSchemaValue::F64 { .. }
+            | ConfigSchemaValue::String { .. }
+            | ConfigSchemaValue::StringList => {}
+        }
+    }
+
+    #[test]
+    fn dfs_expose_config_schema_is_recursive_and_validates_default() {
+        let definition = dfs_expose_config_definition().expect("DFS expose definition");
+        let default = definition
+            .default_value
+            .as_ref()
+            .expect("DFS expose default");
+        definition
+            .validate_value(default)
+            .expect("DFS expose default must satisfy its schema");
+
+        let schema = definition.schema.as_ref().expect("DFS expose schema");
+        assert_fully_typed_schema(&schema.value);
+        assert!(matches!(
+            &schema.value,
+            sinomo_config::ConfigSchemaValue::Object { fields, .. }
+                if matches!(
+                    fields.as_slice(),
+                    [sinomo_config::ConfigSchemaField {
+                        name,
+                        value: sinomo_config::ConfigSchemaValue::List { .. },
+                        ..
+                    }] if name == "entries"
+                )
+        ));
+
+        let node_id = NodeId::from_legacy_named("node_schema_legacy").expect("node id");
+        let mut sparse = serde_json::to_value(DfsExposeConfig::default_for_node(
+            Path::new("/tmp/sinomo-schema"),
+            node_id,
+        ))
+        .expect("serialize DFS config");
+        let entry = sparse["entries"][0]
+            .as_object_mut()
+            .expect("serialized DFS entry");
+        entry.remove("writable");
+        entry.remove("follow_symlinks");
+        definition
+            .validate_value(&sparse)
+            .expect("legacy omitted DFS defaults must satisfy the schema");
+        let decoded: DfsExposeConfig =
+            serde_json::from_value(sparse).expect("decode legacy sparse DFS config");
+        assert!(decoded.entries[0].writable);
+        assert!(!decoded.entries[0].follow_symlinks);
+
+        let empty = serde_json::json!({});
+        definition
+            .validate_value(&empty)
+            .expect("an omitted legacy DFS entries list must satisfy the schema");
+        let decoded: DfsExposeConfig =
+            serde_json::from_value(empty).expect("decode empty legacy DFS config");
+        assert!(decoded.entries.is_empty());
+    }
 
     #[test]
     fn default_config_exposes_data_files_under_node_sifs_path() {

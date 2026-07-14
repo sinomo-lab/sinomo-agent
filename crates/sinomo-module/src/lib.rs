@@ -277,7 +277,8 @@ pub fn module_runtime_config_schema() -> sinomo_config::ConfigSchema {
                             "Enabled",
                             "Whether this module should run when this config layer applies.",
                             sinomo_config::ConfigSchemaValue::bool(),
-                        ),
+                        )
+                        .with_default_value(serde_json::Value::Bool(false)),
                     ])
                     .without_unknown_fields(),
                 ),
@@ -956,7 +957,25 @@ impl ModuleRegistration {
     }
 
     pub fn validate_surfaces(&self) -> Result<(), ModuleSurfaceError> {
-        self.surfaces.validate()
+        self.surfaces.validate()?;
+        let expected_module_id = self.module_id().as_str();
+        for definition in self.surfaces.config_definitions()? {
+            let Some(module_id) = definition.module_id.as_deref() else {
+                return Err(ModuleSurfaceError::InvalidSettingsDefinition {
+                    key: definition.key.to_string(),
+                    detail: "module settings exports must declare their module id".to_string(),
+                });
+            };
+            if module_id != expected_module_id {
+                return Err(ModuleSurfaceError::InvalidSettingsDefinition {
+                    key: definition.key.to_string(),
+                    detail: format!(
+                        "settings module id `{module_id}` does not match registration `{expected_module_id}`"
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1075,6 +1094,11 @@ pub struct ModuleSurfaces {
     pub agent_definitions: Vec<ModuleAgentDefinitionExport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declarative_resources: Vec<ModuleDeclarativeResourceExport>,
+    /// User-facing configuration definitions exported as self-contained SOBJ
+    /// records. The config service decodes these into its validated registry;
+    /// JSON is never the module catalog contract.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settings: Vec<sinomo_module_api::ModuleSettingsExport>,
     #[serde(default, skip_serializing_if = "ModuleCapabilities::is_empty")]
     pub capabilities: ModuleCapabilities,
     /// Cluster transport kinds this module serves as a runtime network module
@@ -1093,6 +1117,7 @@ impl ModuleSurfaces {
             && self.storage_owners.is_empty()
             && self.agent_definitions.is_empty()
             && self.declarative_resources.is_empty()
+            && self.settings.is_empty()
             && self.capabilities.is_empty()
             && self.network_transports.is_empty()
     }
@@ -1130,6 +1155,88 @@ impl ModuleSurfaces {
     pub fn with_declarative_resource(mut self, resource: ModuleDeclarativeResourceExport) -> Self {
         self.declarative_resources.push(resource);
         self
+    }
+
+    pub fn with_config_definition(
+        mut self,
+        definition: sinomo_config::ConfigDefinition,
+    ) -> Result<Self, ModuleSurfaceError> {
+        if definition.module_id.is_none() {
+            return Err(ModuleSurfaceError::InvalidSettingsDefinition {
+                key: definition.key.as_str().to_string(),
+                detail: "module settings exports must declare their module id".to_string(),
+            });
+        }
+        definition.validate_contract().map_err(|error| {
+            ModuleSurfaceError::InvalidSettingsDefinition {
+                key: definition.key.as_str().to_string(),
+                detail: error.to_string(),
+            }
+        })?;
+        let key = definition.key.as_str().to_string();
+        let definition_sobj = sinomo_module_api::encode_sobj(&definition).map_err(|error| {
+            ModuleSurfaceError::InvalidSettingsDefinition {
+                key: key.clone(),
+                detail: error.to_string(),
+            }
+        })?;
+        self.settings
+            .push(sinomo_module_api::ModuleSettingsExport::new(
+                key,
+                definition_sobj,
+            ));
+        Ok(self)
+    }
+
+    pub fn config_definitions(
+        &self,
+    ) -> Result<Vec<sinomo_config::ConfigDefinition>, ModuleSurfaceError> {
+        self.settings
+            .iter()
+            .map(|export| {
+                let definition = sinomo_module_api::decode_sobj::<sinomo_config::ConfigDefinition>(
+                    &export.definition_sobj,
+                )
+                .map_err(|error| {
+                    ModuleSurfaceError::InvalidSettingsDefinition {
+                        key: export.key.clone(),
+                        detail: error.to_string(),
+                    }
+                })?;
+                if definition.key.as_str() != export.key {
+                    return Err(ModuleSurfaceError::InvalidSettingsDefinition {
+                        key: export.key.clone(),
+                        detail: format!(
+                            "encoded definition key `{}` does not match export key",
+                            definition.key
+                        ),
+                    });
+                }
+                definition.validate_contract().map_err(|error| {
+                    ModuleSurfaceError::InvalidSettingsDefinition {
+                        key: export.key.clone(),
+                        detail: error.to_string(),
+                    }
+                })?;
+                Ok(definition)
+            })
+            .collect()
+    }
+
+    pub fn register_config_definitions(
+        &self,
+        mut builder: sinomo_config::ConfigRegistryBuilder,
+    ) -> Result<sinomo_config::ConfigRegistryBuilder, ModuleSurfaceError> {
+        for definition in self.config_definitions()? {
+            let key = definition.key.as_str().to_string();
+            builder = builder.register(definition).map_err(|error| {
+                ModuleSurfaceError::InvalidSettingsDefinition {
+                    key,
+                    detail: error.to_string(),
+                }
+            })?;
+        }
+        Ok(builder)
     }
 
     pub fn with_skill_resource(self, id: impl Into<String>, path: impl Into<String>) -> Self {
@@ -1238,6 +1345,16 @@ impl ModuleSurfaces {
             if !declarative_resource_ids.insert(resource.id.as_str()) {
                 return Err(ModuleSurfaceError::DuplicateDeclarativeResource {
                     id: resource.id.clone(),
+                });
+            }
+        }
+
+        let mut settings_keys = BTreeSet::new();
+        for definition in self.config_definitions()? {
+            let key = definition.key.as_str();
+            if !settings_keys.insert(key.to_string()) {
+                return Err(ModuleSurfaceError::DuplicateSettingsDefinition {
+                    key: key.to_string(),
                 });
             }
         }
@@ -1641,6 +1758,7 @@ impl ModuleRegistry {
         }
 
         let mut object_rpc_routes = BTreeMap::<String, ModuleId>::new();
+        let mut settings_keys = BTreeMap::<String, ModuleId>::new();
         for (module_id, registration) in &self.registrations {
             if registration.module_id() != module_id {
                 return Err(ModuleRegistryError::InvalidRegistrationOrder {
@@ -1669,6 +1787,25 @@ impl ModuleRegistry {
                 {
                     return Err(ModuleRegistryError::DuplicateObjectRpcRoute {
                         route: descriptor.route,
+                        first_module_id: previous_module_id,
+                        second_module_id: module_id.clone(),
+                    });
+                }
+            }
+            for definition in registration
+                .surfaces
+                .config_definitions()
+                .map_err(|source| ModuleRegistryError::InvalidModuleSurfaces {
+                    module_id: module_id.clone(),
+                    detail: source.to_string(),
+                })?
+            {
+                let key = definition.key.to_string();
+                if let Some(previous_module_id) =
+                    settings_keys.insert(key.clone(), module_id.clone())
+                {
+                    return Err(ModuleRegistryError::DuplicateSettingsKey {
+                        key,
                         first_module_id: previous_module_id,
                         second_module_id: module_id.clone(),
                     });
@@ -1852,6 +1989,12 @@ pub enum ModuleRegistryError {
         first_module_id: ModuleId,
         second_module_id: ModuleId,
     },
+    #[error("duplicate module settings key `{key}` from {first_module_id} and {second_module_id}")]
+    DuplicateSettingsKey {
+        key: String,
+        first_module_id: ModuleId,
+        second_module_id: ModuleId,
+    },
     #[error("invalid module registry order: {detail}")]
     InvalidRegistrationOrder { detail: String },
     #[error("module registry snapshot lock failed: {detail}")]
@@ -1882,6 +2025,10 @@ pub enum ModuleSurfaceError {
     InvalidDeclarativeResource { id: String, detail: String },
     #[error("duplicate module declarative resource `{id}`")]
     DuplicateDeclarativeResource { id: String },
+    #[error("module settings definition `{key}` is invalid: {detail}")]
+    InvalidSettingsDefinition { key: String, detail: String },
+    #[error("duplicate module settings definition `{key}`")]
+    DuplicateSettingsDefinition { key: String },
     #[error("duplicate module capability import `{capability}`")]
     DuplicateCapabilityImport { capability: String },
     #[error("duplicate module capability export `{capability}`")]
@@ -3065,6 +3212,7 @@ fn native_descriptor_surfaces_to_module_surfaces(
         surfaces = surfaces
             .with_declarative_resource(native_descriptor_resource_to_module_resource(resource)?);
     }
+    surfaces.settings = descriptor.surfaces.settings.clone();
     for transport in &descriptor.surfaces.network_transports {
         surfaces = surfaces.with_network_transport(transport.clone());
     }
@@ -5010,6 +5158,244 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
 
+    fn test_module_settings_definition(module_id: &str) -> sinomo_config::ConfigDefinition {
+        use sinomo_config::{
+            ConfigClusterMode, ConfigDefinition, ConfigSchema, ConfigSchemaChoice,
+            ConfigSchemaField, ConfigSchemaValue, ConfigValueType,
+        };
+
+        ConfigDefinition::new(
+            "test.module.settings",
+            "sinomo-module-test",
+            ConfigValueType::Object {
+                schema_name: "TestModuleSettings".to_string(),
+            },
+            "Settings exported by a test module.",
+            ConfigClusterMode::ClusterOverrideLocal,
+        )
+        .expect("settings definition")
+        .with_default(&serde_json::json!({
+            "enabled": true,
+            "builder": {
+                "mode": "balanced"
+            },
+            "target_triples": ["x86_64-unknown-linux-gnu"]
+        }))
+        .expect("settings default")
+        .with_schema(ConfigSchema::object(
+            "TestModuleSettings",
+            "Field-complete settings exported by a test module.",
+            vec![
+                ConfigSchemaField::new(
+                    "enabled",
+                    "Enabled",
+                    "Whether the module is enabled.",
+                    ConfigSchemaValue::bool(),
+                ),
+                ConfigSchemaField::new(
+                    "builder",
+                    "Builder",
+                    "Builder selection settings.",
+                    ConfigSchemaValue::object(vec![
+                        ConfigSchemaField::new(
+                            "mode",
+                            "Mode",
+                            "Builder selection strategy.",
+                            ConfigSchemaValue::string_choices(vec![
+                                ConfigSchemaChoice::new("balanced", "Balanced"),
+                                ConfigSchemaChoice::new("fastest", "Fastest"),
+                            ]),
+                        ),
+                        ConfigSchemaField::new(
+                            "endpoint",
+                            "Endpoint",
+                            "Optional preferred builder endpoint.",
+                            ConfigSchemaValue::string(),
+                        )
+                        .optional(),
+                    ])
+                    .without_unknown_fields(),
+                ),
+                ConfigSchemaField::new(
+                    "target_triples",
+                    "Target triples",
+                    "Supported target OS and architecture triples.",
+                    ConfigSchemaValue::StringList,
+                ),
+            ],
+        ))
+        .expect("settings schema")
+        .with_module_id(module_id)
+        .expect("settings module id")
+    }
+
+    #[test]
+    fn module_settings_definition_round_trips_through_sobj_surfaces() {
+        let module_id = "module.settings.test";
+        let definition = test_module_settings_definition(module_id);
+        let canonical_module_id = ModuleId::from_legacy_named(module_id).expect("module id");
+        assert_eq!(
+            definition.module_id.as_deref(),
+            Some(canonical_module_id.as_str()),
+            "legacy module names are normalized before entering the SOBJ catalog"
+        );
+        let surfaces = ModuleSurfaces::default()
+            .with_config_definition(definition.clone())
+            .expect("export settings definition");
+
+        surfaces.validate().expect("valid module surfaces");
+        let encoded = sinomo_module_api::encode_sobj(&surfaces).expect("encode module surfaces");
+        let decoded: ModuleSurfaces =
+            sinomo_module_api::decode_sobj(&encoded).expect("decode module surfaces");
+
+        assert_eq!(decoded.settings.len(), 1);
+        assert_eq!(
+            decoded.config_definitions().expect("decode settings"),
+            vec![definition]
+        );
+
+        let registration = ModuleRegistration::native_rust(
+            canonical_module_id,
+            "0.1.0",
+            "sinomo-module-test",
+            "sinomo-module-test",
+            "sinomo.test.settings.v1",
+            TrustRing::R1TrustedRuntime,
+            "module.settings.test",
+        )
+        .with_surfaces(decoded);
+        registration
+            .validate_surfaces()
+            .expect("registration owns its settings export");
+    }
+
+    #[test]
+    fn module_settings_surface_rejects_duplicate_definition_keys() {
+        let definition = test_module_settings_definition("module.settings.test");
+        let surfaces = ModuleSurfaces::default()
+            .with_config_definition(definition.clone())
+            .expect("first settings definition")
+            .with_config_definition(definition)
+            .expect("second settings definition");
+
+        let error = surfaces
+            .validate()
+            .expect_err("duplicate settings key must be rejected");
+        assert!(matches!(
+            error,
+            ModuleSurfaceError::DuplicateSettingsDefinition { key }
+                if key == "test.module.settings"
+        ));
+    }
+
+    #[test]
+    fn module_settings_surface_requires_explicit_module_ownership() {
+        let mut definition = test_module_settings_definition("module.settings.test");
+        definition.module_id = None;
+
+        let error = ModuleSurfaces::default()
+            .with_config_definition(definition)
+            .expect_err("module settings must identify their owner");
+        assert!(matches!(
+            error,
+            ModuleSurfaceError::InvalidSettingsDefinition { key, ref detail }
+                if key == "test.module.settings"
+                    && detail.contains("must declare their module id")
+        ));
+    }
+
+    #[test]
+    fn module_registration_rejects_settings_owned_by_another_module() {
+        let surfaces = ModuleSurfaces::default()
+            .with_config_definition(test_module_settings_definition("module.settings.other"))
+            .expect("settings definition");
+        let registration = ModuleRegistration::native_rust(
+            ModuleId::from_legacy_named("module.settings.test").expect("module id"),
+            "0.1.0",
+            "sinomo-module-test",
+            "sinomo-module-test",
+            "sinomo.test.settings.v1",
+            TrustRing::R1TrustedRuntime,
+            "module.settings.test",
+        )
+        .with_surfaces(surfaces);
+
+        let error = registration
+            .validate_surfaces()
+            .expect_err("foreign settings owner must be rejected");
+        assert!(matches!(
+            error,
+            ModuleSurfaceError::InvalidSettingsDefinition { key, ref detail }
+                if key == "test.module.settings"
+                    && detail.contains("does not match registration")
+        ));
+    }
+
+    #[test]
+    fn module_registry_rejects_settings_key_collisions_across_modules() {
+        let registration = |legacy_module_id: &str| {
+            let module_id = ModuleId::from_legacy_named(legacy_module_id).expect("module id");
+            ModuleRegistration::native_rust(
+                module_id,
+                "0.1.0",
+                legacy_module_id,
+                legacy_module_id,
+                "sinomo.test.settings.v1",
+                TrustRing::R1TrustedRuntime,
+                legacy_module_id,
+            )
+            .with_surfaces(
+                ModuleSurfaces::default()
+                    .with_config_definition(test_module_settings_definition(legacy_module_id))
+                    .expect("settings definition"),
+            )
+        };
+
+        let error = ModuleRegistry::builder()
+            .register(registration("module.settings.first"))
+            .expect("first module")
+            .register(registration("module.settings.second"))
+            .expect("second module")
+            .try_build()
+            .expect_err("two modules cannot claim one settings key");
+        assert!(matches!(
+            error,
+            ModuleRegistryError::DuplicateSettingsKey { key, .. }
+                if key == "test.module.settings"
+        ));
+    }
+
+    #[test]
+    fn legacy_module_surfaces_without_settings_decode_with_empty_settings() {
+        #[derive(serde::Serialize)]
+        struct LegacyModuleSurfaces {
+            object_rpc_routes: Vec<ModuleObjectRpcRoute>,
+            event_kinds: Vec<EventKind>,
+            storage_owners: Vec<String>,
+            agent_definitions: Vec<ModuleAgentDefinitionExport>,
+            declarative_resources: Vec<ModuleDeclarativeResourceExport>,
+            capabilities: ModuleCapabilities,
+            network_transports: Vec<String>,
+        }
+
+        let legacy = LegacyModuleSurfaces {
+            object_rpc_routes: Vec::new(),
+            event_kinds: Vec::new(),
+            storage_owners: vec!["legacy-owner".to_string()],
+            agent_definitions: Vec::new(),
+            declarative_resources: Vec::new(),
+            capabilities: ModuleCapabilities::default(),
+            network_transports: Vec::new(),
+        };
+        let encoded = sinomo_module_api::encode_sobj(&legacy).expect("encode legacy surfaces");
+        let decoded: ModuleSurfaces =
+            sinomo_module_api::decode_sobj(&encoded).expect("decode current surfaces");
+
+        assert_eq!(decoded.storage_owners, vec!["legacy-owner"]);
+        assert!(decoded.settings.is_empty());
+        decoded.validate().expect("legacy surfaces remain valid");
+    }
+
     #[test]
     fn module_runtime_config_resolves_node_then_cluster_then_disabled() {
         let module_id = "module.remote-management";
@@ -5309,6 +5695,12 @@ mod tests {
     #[test]
     fn native_dylib_descriptor_surfaces_convert_to_registration() {
         let module_id = ModuleId::from_legacy_named("module.dynamic-native").expect("module");
+        let settings_definition = test_module_settings_definition("module.dynamic-native");
+        let settings_export = sinomo_module_api::ModuleSettingsExport::new(
+            settings_definition.key.as_str(),
+            sinomo_module_api::encode_sobj(&settings_definition)
+                .expect("encode native module settings"),
+        );
         let state = NativeDylibModuleLoaderState {
             module_id: module_id.clone(),
             artifact_id: None,
@@ -5354,6 +5746,7 @@ mod tests {
                 storage_owners: vec!["dynamic-native".to_string()],
                 capability_imports: vec!["filesystem.read".to_string()],
                 capability_exports: vec!["dynamic.native.inspect".to_string()],
+                settings: vec![settings_export],
                 network_transports: vec!["iroh".to_string()],
             },
         };
@@ -5383,6 +5776,16 @@ mod tests {
             Some("# Dynamic Native\n\nInspect the dynamic module.")
         );
         assert_eq!(registration.surfaces.storage_owners, vec!["dynamic-native"]);
+        assert_eq!(
+            registration
+                .surfaces
+                .config_definitions()
+                .expect("decode native settings"),
+            vec![settings_definition]
+        );
+        registration
+            .validate_surfaces()
+            .expect("native registration settings ownership");
         assert!(
             registration
                 .surfaces

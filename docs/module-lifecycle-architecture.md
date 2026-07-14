@@ -221,8 +221,28 @@ compatibility, policy, and loader or rollout state.
 Module catalog registration is pure data. It records the manifest, backend
 descriptor, declared capabilities, and public surfaces exposed by the module.
 Public surfaces include object-RPC routes, event kinds, capability imports and
-exports, and storage contract owners. This data is serializable, inspectable,
-comparable across nodes, and safe to place in registry or cluster desired state.
+exports, settings definitions, and storage contract owners. This data is
+serializable, inspectable, comparable across nodes, and safe to place in
+registry or cluster desired state.
+
+### Settings Surfaces
+
+A module that exposes settings also owns their field-complete schema. The
+schema describes nested structure, labels, defaults, constraints, choices,
+sensitive values, and collection element types closely enough for clients to
+validate values and construct typed controls. A schema-less definition is a
+legacy compatibility case, not the normal module contract. Catalog entries use
+an explicit module ID to associate settings with a module; clients must not
+infer ownership from display names or key prefixes.
+
+SOBJ is the native settings representation across the module ABI, object RPC,
+and cluster KV. Human-editable JSON files and JSON-shaped interface values
+are projections for local inspection and editing, not a parallel distributed
+contract. Settings interfaces render the declared schema by default and expose
+a raw JSON editor only for legacy schema-less definitions or fields explicitly
+declared as dynamic JSON. A catalog may also expose operational documents as
+read-only, in which case interfaces present their structured values without
+offering mutation.
 
 Runtime binding is separate. A static native Rust module may have a compile-time
 binding table that maps a `native-rust` registration key to service builders,

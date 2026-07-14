@@ -152,6 +152,12 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
             ModuleRouteAuth::LocalOrClusterMember,
         ));
     }
+    surfaces = surfaces
+        .with_config_definition(
+            crate::dfs_expose_config_definition()
+                .expect("DFS exposure config definition must be valid"),
+        )
+        .expect("DFS settings surface must be valid");
     surfaces.capabilities = dfs_module_capabilities();
     surfaces
 }

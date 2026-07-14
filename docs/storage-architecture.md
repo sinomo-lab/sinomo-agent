@@ -41,6 +41,15 @@ Internal runtime state is binary-first. SOBJ documents and packed binary logs
 provide schema-aware, bounded formats for state that people are not expected to
 edit directly.
 
+The configuration system is SOBJ-native across the module ABI, object RPC, and
+cluster KV. JSON configuration files are a human-friendly local storage and
+interface projection of that contract; they do not define the distributed
+schema or become a second source of authority. Modules publish detailed field
+schemas for editable settings, while raw JSON editing remains a compatibility
+fallback for schema-less legacy definitions and explicitly dynamic JSON
+fields. Read-only operational configuration documents may use the same schema
+and projection without granting write authority.
+
 Human-readable formats are appropriate for:
 
 - user-managed configuration;

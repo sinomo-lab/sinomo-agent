@@ -699,6 +699,213 @@ impl Default for SandboxClusterPolicyConfig {
     }
 }
 
+pub fn sandbox_policy_config_schema() -> sinomo_config::ConfigSchema {
+    use sinomo_config::{ConfigSchema, ConfigSchemaField, ConfigSchemaValue};
+
+    let limits = ConfigSchemaValue::object(vec![
+        ConfigSchemaField::new(
+            "memory_mb",
+            "Memory limit",
+            "Maximum memory available to one sandbox, in MiB.",
+            ConfigSchemaValue::u64(None),
+        ),
+        ConfigSchemaField::new(
+            "wall_time_ms",
+            "Wall-time limit",
+            "Maximum command wall time in milliseconds.",
+            ConfigSchemaValue::u64(None),
+        ),
+        ConfigSchemaField::new(
+            "max_input_bytes",
+            "Maximum input bytes",
+            "Maximum input bytes accepted by one command.",
+            ConfigSchemaValue::u64(None),
+        )
+        .optional()
+        .with_default_value(serde_json::json!(
+            SandboxResourceLimits::default_size_limit()
+        )),
+        ConfigSchemaField::new(
+            "max_output_bytes",
+            "Maximum output bytes",
+            "Maximum output bytes returned by one command.",
+            ConfigSchemaValue::u64(None),
+        )
+        .optional()
+        .with_default_value(serde_json::json!(
+            SandboxResourceLimits::default_size_limit()
+        )),
+        ConfigSchemaField::new(
+            "max_workspace_bytes",
+            "Maximum workspace bytes",
+            "Maximum total bytes stored in one sandbox workspace.",
+            ConfigSchemaValue::u64(None),
+        )
+        .optional()
+        .with_default_value(serde_json::json!(
+            SandboxResourceLimits::default_size_limit()
+        )),
+        ConfigSchemaField::new(
+            "max_written_bytes_per_command",
+            "Maximum written bytes per command",
+            "Maximum workspace bytes one command may write.",
+            ConfigSchemaValue::u64(None),
+        )
+        .optional()
+        .with_default_value(serde_json::json!(
+            SandboxResourceLimits::default_size_limit()
+        )),
+        ConfigSchemaField::new(
+            "max_file_count",
+            "Maximum file count",
+            "Maximum number of files in one sandbox workspace.",
+            ConfigSchemaValue::u64(None),
+        )
+        .optional()
+        .with_default_value(serde_json::json!(
+            SandboxResourceLimits::default_size_limit()
+        )),
+    ])
+    .without_unknown_fields();
+
+    let policy = ConfigSchemaValue::object(vec![
+        ConfigSchemaField::new(
+            "allowed_mount_prefixes",
+            "Allowed mount prefixes",
+            "SIFS path prefixes that sandbox manifests may mount.",
+            ConfigSchemaValue::StringList,
+        )
+        .optional()
+        .with_default_value(serde_json::json!([])),
+        ConfigSchemaField::new(
+            "allow_read_write_sifs_mounts",
+            "Allow read-write SIFS mounts",
+            "Permit allowlisted SIFS prefixes to be mounted read-write.",
+            ConfigSchemaValue::bool(),
+        )
+        .optional()
+        .with_default_value(serde_json::json!(false)),
+        ConfigSchemaField::new(
+            "allow_remote_local_owned_mounts",
+            "Allow remote local-owned mounts",
+            "Permit placement away from the owner of a local-owned mount.",
+            ConfigSchemaValue::bool(),
+        )
+        .optional()
+        .with_default_value(serde_json::json!(false)),
+        ConfigSchemaField::new(
+            "allowed_command_capabilities",
+            "Allowed command capabilities",
+            "Command capability names that sandbox toolchains may request.",
+            ConfigSchemaValue::StringList,
+        )
+        .optional()
+        .with_default_value(serde_json::json!([])),
+        ConfigSchemaField::new(
+            "allowed_toolchain_ids",
+            "Allowed toolchains",
+            "Toolchain identifiers allowed to execute.",
+            ConfigSchemaValue::StringList,
+        )
+        .optional()
+        .with_default_value(serde_json::json!([])),
+        ConfigSchemaField::new(
+            "allowed_toolchain_provenance_prefixes",
+            "Allowed toolchain provenance",
+            "Accepted provenance prefixes for imported toolchains.",
+            ConfigSchemaValue::StringList,
+        )
+        .optional()
+        .with_default_value(serde_json::json!([])),
+        ConfigSchemaField::new(
+            "allowed_package_cache_prefixes",
+            "Allowed package caches",
+            "SIFS prefixes that toolchains may use as package caches.",
+            ConfigSchemaValue::StringList,
+        )
+        .optional()
+        .with_default_value(serde_json::json!(default_sandbox_package_cache_prefixes())),
+        ConfigSchemaField::new(
+            "allow_unsigned_toolchains",
+            "Allow unsigned toolchains",
+            "Permit toolchains without a trusted signature.",
+            ConfigSchemaValue::bool(),
+        )
+        .optional()
+        .with_default_value(serde_json::json!(false)),
+        ConfigSchemaField::new(
+            "allowed_http_hosts",
+            "Allowed HTTP hosts",
+            "Host names that mediated sandbox HTTP requests may contact.",
+            ConfigSchemaValue::StringList,
+        )
+        .optional()
+        .with_default_value(serde_json::json!([])),
+        ConfigSchemaField::new(
+            "max_http_request_bytes",
+            "Maximum HTTP request bytes",
+            "Maximum mediated HTTP request body size.",
+            ConfigSchemaValue::u64(None),
+        )
+        .optional()
+        .with_default_value(serde_json::json!(default_sandbox_http_request_bytes())),
+        ConfigSchemaField::new(
+            "max_http_response_bytes",
+            "Maximum HTTP response bytes",
+            "Maximum mediated HTTP response body size.",
+            ConfigSchemaValue::u64(None),
+        )
+        .optional()
+        .with_default_value(serde_json::json!(default_sandbox_http_response_bytes())),
+        ConfigSchemaField::new(
+            "max_http_timeout_ms",
+            "Maximum HTTP timeout",
+            "Maximum mediated HTTP request timeout in milliseconds.",
+            ConfigSchemaValue::u64(None),
+        )
+        .optional()
+        .with_default_value(serde_json::json!(default_sandbox_http_timeout_ms())),
+        ConfigSchemaField::new(
+            "max_concurrent_commands_per_sandbox",
+            "Commands per sandbox",
+            "Maximum simultaneously admitted commands in one sandbox.",
+            ConfigSchemaValue::u64(None),
+        )
+        .optional()
+        .with_default_value(serde_json::json!(
+            default_sandbox_max_concurrent_commands_per_sandbox()
+        )),
+        ConfigSchemaField::new(
+            "max_concurrent_sandboxes_per_node",
+            "Sandboxes per node",
+            "Maximum simultaneously active sandboxes on one node.",
+            ConfigSchemaValue::u64(None),
+        )
+        .optional()
+        .with_default_value(serde_json::json!(
+            default_sandbox_max_concurrent_sandboxes_per_node()
+        )),
+        ConfigSchemaField::new(
+            "max_limits",
+            "Sandbox resource ceilings",
+            "Upper bounds a sandbox manifest may request.",
+            limits,
+        ),
+    ])
+    .without_unknown_fields();
+
+    ConfigSchema::object(
+        "SandboxClusterPolicyConfig",
+        "Cluster and local policy controlling sandbox authority and resource limits.",
+        vec![ConfigSchemaField::new(
+            "policy",
+            "Sandbox policy",
+            "Sandbox permissions, allowlists, concurrency, and resource ceilings.",
+            policy,
+        )],
+    )
+}
+
 #[derive(Debug, Error)]
 pub enum SandboxPolicyConfigError {
     #[error("sandbox policy config store error at {path}: {detail}")]
@@ -720,6 +927,8 @@ pub fn sandbox_policy_config_definition()
     )
     .map_err(map_sandbox_config_error)?
     .with_default(&SandboxClusterPolicyConfig::default())
+    .map_err(map_sandbox_config_error)?
+    .with_schema(sandbox_policy_config_schema())
     .map_err(map_sandbox_config_error)?
     .with_local_legacy_path("config/sandbox-policy.json");
     debug_assert_eq!(definition.cluster_key(), SANDBOX_POLICY_CONFIG_KV_KEY);
@@ -985,6 +1194,86 @@ fn local_owned_mount_nodes(mounts: &[SandboxMount]) -> Result<Vec<NodeId>, Sandb
 mod tests {
     use super::*;
     use sinomo_core::kv::{KvOp, KvRevision, KvVersion};
+
+    fn assert_fully_typed_schema(value: &sinomo_config::ConfigSchemaValue) {
+        use sinomo_config::ConfigSchemaValue;
+
+        match value {
+            ConfigSchemaValue::Object { fields, .. } => {
+                assert!(
+                    !fields.is_empty(),
+                    "object schemas must declare their fields"
+                );
+                for field in fields {
+                    assert_fully_typed_schema(&field.value);
+                }
+            }
+            ConfigSchemaValue::Map { value } | ConfigSchemaValue::List { value } => {
+                assert_fully_typed_schema(value);
+            }
+            ConfigSchemaValue::Json => panic!("config schema must not use an untyped JSON value"),
+            ConfigSchemaValue::Bool
+            | ConfigSchemaValue::I64 { .. }
+            | ConfigSchemaValue::U64 { .. }
+            | ConfigSchemaValue::F64 { .. }
+            | ConfigSchemaValue::String { .. }
+            | ConfigSchemaValue::StringList => {}
+        }
+    }
+
+    #[test]
+    fn sandbox_policy_schema_is_recursive_and_validates_default() {
+        let definition = sandbox_policy_config_definition().expect("sandbox policy definition");
+        let default = definition
+            .default_value
+            .as_ref()
+            .expect("sandbox policy default");
+        definition
+            .validate_value(default)
+            .expect("sandbox policy default must satisfy its schema");
+
+        let schema = definition.schema.as_ref().expect("sandbox policy schema");
+        assert_fully_typed_schema(&schema.value);
+        let sinomo_config::ConfigSchemaValue::Object { fields, .. } = &schema.value else {
+            panic!("sandbox policy schema must be an object")
+        };
+        let policy = fields
+            .iter()
+            .find(|field| field.name == "policy")
+            .expect("policy field");
+        let sinomo_config::ConfigSchemaValue::Object { fields, .. } = &policy.value else {
+            panic!("policy field must have a typed object schema")
+        };
+        assert!(
+            fields
+                .iter()
+                .any(|field| field.name == "allowed_mount_prefixes")
+        );
+        assert!(fields.iter().any(|field| field.name == "max_limits"));
+
+        let sparse = serde_json::json!({
+            "policy": {
+                "max_limits": {
+                    "memory_mb": 128,
+                    "wall_time_ms": 1_000
+                }
+            }
+        });
+        definition
+            .validate_value(&sparse)
+            .expect("legacy omitted sandbox defaults must satisfy the schema");
+        let decoded: SandboxClusterPolicyConfig =
+            serde_json::from_value(sparse).expect("decode legacy sparse sandbox config");
+        assert!(decoded.policy.allowed_mount_prefixes.is_empty());
+        assert_eq!(
+            decoded.policy.max_http_request_bytes,
+            default_sandbox_http_request_bytes()
+        );
+        assert_eq!(
+            decoded.policy.max_limits.max_input_bytes,
+            SandboxResourceLimits::default_size_limit()
+        );
+    }
 
     fn kv_entry_from_put(op: KvOp) -> KvEntry {
         let KvOp::Put { key, value, .. } = op else {

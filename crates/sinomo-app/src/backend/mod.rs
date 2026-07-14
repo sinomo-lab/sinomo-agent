@@ -655,7 +655,9 @@ fn agent_runtime_control_service_hook(
         sinomo_agent::register_services_with_runtime_control(builder, host)
     })
     .with_config_definitions(|builder| {
-        sinomo_lm::register_config_definitions(builder).map_err(|error| error.to_string())
+        let builder =
+            sinomo_lm::register_config_definitions(builder).map_err(|error| error.to_string())?;
+        sinomo_evolution::register_config_definitions(builder).map_err(|error| error.to_string())
     })
 }
 
@@ -861,6 +863,12 @@ mod tests {
             config_registry
                 .get(sinomo_lm::LM_PROVIDER_CONFIG_KEY)
                 .is_ok()
+        );
+        assert!(
+            config_registry
+                .get(sinomo_evolution::EVOLUTION_CONFIG_KEY)
+                .is_ok(),
+            "the embedded app hook must expose evolution's detailed settings schema"
         );
         assert!(
             config_registry

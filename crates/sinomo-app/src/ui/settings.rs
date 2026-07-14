@@ -15,7 +15,7 @@
 //! rebuilt as ordinary `Label` / `Link` composition when its typed state changes.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -31,15 +31,15 @@ use sinomo_cli::app_api::{
 use sui::{
     Alignment, ArrangeCtx, Constraints, ContextMenu, ControlSize, DefaultTheme, Event, EventCtx,
     FieldGroup, Flex, FlexItem, FlexWrap, FontWeight, FormRow, FormSection, IconGlyph, Label,
-    ListItem, ListView, MeasureCtx, MenuItem, PaintCtx, PointerEventKind, ProgressBar, Rect,
-    ScrollState, ScrollView, Select, SelectionScope, SemanticTone, SemanticsCtx, Separator, Size,
-    SizedBox, Spinner, Stack, StatusBadge, Switch, SwitchView, TabBar, TextArea, TextCommand,
+    ListItem, ListView, MeasureCtx, MenuItem, NumberInput, PaintCtx, PointerEventKind, ProgressBar,
+    Rect, ScrollState, ScrollView, Select, SelectionScope, SemanticTone, SemanticsCtx, Separator,
+    Size, SizedBox, Spinner, Stack, StatusBadge, Switch, SwitchView, TabBar, TextArea, TextCommand,
     TextInput, ThemeTextToken, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
     WindowEvent,
 };
 
 use sinomo_runtime::config::{
-    ConfigClient, ConfigSchema, ConfigSchemaField, ConfigSchemaValue, ConfigWriteTarget,
+    ConfigClient, ConfigKey, ConfigSchema, ConfigSchemaField, ConfigSchemaValue, ConfigWriteTarget,
 };
 use sinomo_runtime::local::SinomoDataDir;
 
@@ -199,6 +199,13 @@ pub struct SettingsState {
     /// Text controls write drafts here. A daemon/config write only starts from an explicit Save
     /// action, so typing never waits for the RPC timeout and failed saves retain the user's input.
     field_drafts: HashMap<String, String>,
+    /// One typed, whole-definition draft per schema-backed config key. Field editors mutate this
+    /// value locally and an explicit Save writes the complete validated definition, so sibling
+    /// edits compose instead of racing stale whole-object writes.
+    config_drafts: HashMap<String, Value>,
+    /// Rebuild only for structural draft changes (list/map add/remove, optional unset, Reset).
+    /// Scalar text controls retain their own edit/cursor state between keystrokes.
+    config_ui_revision: u64,
     initial_load_rx: Option<Receiver<SettingsInitialLoadResult>>,
     initial_load_started: bool,
     operation_lane: Option<SettingsOperationLane>,
@@ -313,10 +320,10 @@ enum SettingsOperation {
         raw: String,
         draft_key: String,
     },
-    SetConfigJson {
+    SetConfigDocument {
         key: String,
         value: Value,
-        saved_draft: Option<(String, String)>,
+        saved_draft: Option<ConfigSavedDraft>,
     },
     SetConfigBool {
         key: String,
@@ -453,7 +460,31 @@ struct ProviderHealthOperationResult {
 
 struct ConfigOperationSuccess {
     items: Vec<ConfigItem>,
-    saved_draft: Option<(String, String)>,
+    saved_draft: Option<ConfigSavedDraft>,
+}
+
+#[derive(Clone, Debug)]
+enum ConfigSavedDraft {
+    Raw { key: String, value: String },
+    Schema { key: String, value: Value },
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+enum ConfigPathSegment {
+    Field(String),
+    Index(usize),
+}
+
+impl From<&str> for ConfigPathSegment {
+    fn from(value: &str) -> Self {
+        Self::Field(value.to_string())
+    }
+}
+
+impl From<String> for ConfigPathSegment {
+    fn from(value: String) -> Self {
+        Self::Field(value)
+    }
 }
 
 struct ProviderOperationSuccess {
@@ -894,6 +925,8 @@ impl SettingsState {
             skill_action_status: None,
             skill_text_expanded: false,
             field_drafts: HashMap::new(),
+            config_drafts: HashMap::new(),
+            config_ui_revision: 0,
             initial_load_rx: None,
             initial_load_started: false,
             operation_lane: None,
@@ -992,6 +1025,8 @@ impl SettingsState {
             skill_action_status: None,
             skill_text_expanded: false,
             field_drafts: HashMap::new(),
+            config_drafts: HashMap::new(),
+            config_ui_revision: 0,
             initial_load_rx: None,
             initial_load_started: false,
             operation_lane: None,
@@ -1263,15 +1298,19 @@ impl SettingsState {
 
     fn mark_operation_pending(&mut self, operation: &SettingsOperation) {
         match operation {
-            SettingsOperation::SetConfigValue { draft_key, .. }
-            | SettingsOperation::SetConfigJson {
-                saved_draft: Some((draft_key, _)),
-                ..
-            } => {
+            SettingsOperation::SetConfigValue { draft_key, .. } => {
                 self.field_errors
                     .insert(draft_key.clone(), "Saving…".to_string());
             }
-            SettingsOperation::SetConfigJson { .. } | SettingsOperation::SetConfigBool { .. } => {}
+            SettingsOperation::SetConfigDocument {
+                saved_draft: Some(ConfigSavedDraft::Schema { key, .. }),
+                ..
+            } => {
+                self.field_errors
+                    .insert(config_schema_field_key(key, &[]), "Saving…".to_string());
+            }
+            SettingsOperation::SetConfigDocument { .. }
+            | SettingsOperation::SetConfigBool { .. } => {}
             SettingsOperation::AddProvider { .. } => {
                 self.provider_add_error = None;
                 self.provider_action_error = None;
@@ -1419,11 +1458,29 @@ impl SettingsState {
                         .bump(SettingsOperationDomain::Config);
                     self.config_items = success.items;
                     self.config_error = None;
-                    if let Some((key, saved)) = success.saved_draft {
-                        if self.field_drafts.get(&key) == Some(&saved) {
-                            self.field_drafts.remove(&key);
+                    if let Some(saved_draft) = success.saved_draft {
+                        match saved_draft {
+                            ConfigSavedDraft::Raw { key, value } => {
+                                if self.field_drafts.get(&key) == Some(&value) {
+                                    self.field_drafts.remove(&key);
+                                }
+                                self.field_errors.remove(&key);
+                            }
+                            ConfigSavedDraft::Schema { key, value } => {
+                                let prefix = config_schema_field_prefix(&key);
+                                self.field_errors
+                                    .remove(&config_schema_field_key(&key, &[]));
+                                if self.config_drafts.get(&key) == Some(&value) {
+                                    self.config_drafts.remove(&key);
+                                    self.field_drafts
+                                        .retain(|draft_key, _| !draft_key.starts_with(&prefix));
+                                    self.field_errors
+                                        .retain(|error_key, _| !error_key.starts_with(&prefix));
+                                    self.config_ui_revision =
+                                        self.config_ui_revision.wrapping_add(1);
+                                }
+                            }
                         }
-                        self.field_errors.remove(&key);
                     }
                 }
                 SettingsOperationPayload::Config(Err(error)) => {
@@ -2122,7 +2179,7 @@ impl SettingsState {
         let Some(item) = self.config_items.get(index) else {
             return;
         };
-        if item.edit_kind == ConfigEditKind::Bool {
+        if item.edit_kind == ConfigEditKind::Bool || item.read_only {
             return;
         }
         let key = config_field_key(&item.key);
@@ -2135,7 +2192,7 @@ impl SettingsState {
         index: usize,
     ) -> Option<(SettingsOperationScope, SettingsOperation)> {
         let item = self.config_items.get(index)?;
-        if item.edit_kind == ConfigEditKind::Bool {
+        if item.edit_kind == ConfigEditKind::Bool || item.read_only {
             return None;
         }
         let draft_key = config_field_key(&item.key);
@@ -2158,56 +2215,240 @@ impl SettingsState {
     fn set_config_schema_text_draft(
         &mut self,
         index: usize,
-        path: Vec<String>,
+        path: Vec<ConfigPathSegment>,
         schema: ConfigSchemaValue,
         raw: String,
     ) {
         let Some(item) = self.config_items.get(index) else {
             return;
         };
-        let key = config_schema_field_key(&item.key, &path);
+        if item.read_only {
+            return;
+        }
+        let config_key = item.key.clone();
+        let base = item.raw_value.clone();
+        let key = config_schema_field_key(&config_key, &path);
+        self.field_drafts.insert(key.clone(), raw.clone());
         match parse_schema_editor_value(&schema, &raw) {
-            Ok(_) => {
+            Ok(value) => {
                 self.field_errors.remove(&key);
+                let draft = self.config_drafts.entry(config_key).or_insert(base);
+                if let Err(error) = set_json_path_value(draft, &path, value) {
+                    self.field_errors.insert(key, error);
+                }
             }
             Err(error) => {
-                self.field_errors.insert(key.clone(), error);
+                self.field_errors.insert(key, error);
             }
         }
-        self.set_field_draft(SettingsOperationDomain::Config, key, raw);
+        self.mark_draft_changed(SettingsOperationDomain::Config);
     }
 
-    fn config_schema_text_operation(
-        &self,
+    fn set_config_schema_value_draft(
+        &mut self,
         index: usize,
-        path: Vec<String>,
-        schema: ConfigSchemaValue,
-    ) -> Result<(SettingsOperationScope, SettingsOperation), String> {
+        path: Vec<ConfigPathSegment>,
+        value: Value,
+    ) -> Result<(), String> {
         let item = self
             .config_items
             .get(index)
             .ok_or_else(|| "configuration field is no longer available".to_string())?;
-        let draft_key = config_schema_field_key(&item.key, &path);
-        let raw = self
-            .field_drafts
-            .get(&draft_key)
-            .cloned()
-            .unwrap_or_else(|| {
-                config_value_at_path(&item.raw_value, &path)
-                    .map(|value| schema_scalar_edit_value(&schema, value))
-                    .unwrap_or_default()
-            });
-        let value = parse_schema_editor_value(&schema, &raw)?;
-        let mut next = item.raw_value.clone();
-        set_json_path_value(&mut next, &path, value)?;
+        if item.read_only {
+            return Err("this configuration is read-only".to_string());
+        }
+        let config_key = item.key.clone();
+        let base = item.raw_value.clone();
+        let error_key = config_schema_field_key(&config_key, &path);
+        let draft = self.config_drafts.entry(config_key).or_insert(base);
+        set_json_path_value(draft, &path, value)?;
+        self.field_errors.remove(&error_key);
+        self.mark_draft_changed(SettingsOperationDomain::Config);
+        Ok(())
+    }
+
+    fn config_schema_draft_value<'a>(&'a self, item: &'a ConfigItem) -> &'a Value {
+        self.config_drafts.get(&item.key).unwrap_or(&item.raw_value)
+    }
+
+    fn config_schema_is_dirty(&self, key: &str) -> bool {
+        let Some(draft) = self.config_drafts.get(key) else {
+            return false;
+        };
+        self.config_items
+            .iter()
+            .find(|item| item.key == key)
+            .is_none_or(|item| draft != &item.raw_value)
+    }
+
+    fn config_schema_save_operation(
+        &self,
+        index: usize,
+    ) -> Result<(SettingsOperationScope, SettingsOperation), String> {
+        let item = self
+            .config_items
+            .get(index)
+            .ok_or_else(|| "configuration definition is no longer available".to_string())?;
+        if item.read_only {
+            return Err("this configuration is read-only".to_string());
+        }
+        let schema = item
+            .schema
+            .as_ref()
+            .ok_or_else(|| "configuration does not declare a typed schema".to_string())?;
+        let prefix = config_schema_field_prefix(&item.key);
+        if let Some(error) = self
+            .field_errors
+            .iter()
+            .find_map(|(key, error)| key.starts_with(&prefix).then(|| error.clone()))
+        {
+            return Err(error);
+        }
+        let value = self.config_schema_draft_value(item).clone();
+        let key = ConfigKey::new(item.key.clone()).map_err(|error| error.to_string())?;
+        schema
+            .validate(&key, &value)
+            .map_err(|error| error.to_string())?;
+        let scope_key = config_schema_field_key(&item.key, &[]);
         Ok((
-            SettingsOperationScope::ConfigField(draft_key.clone()),
-            SettingsOperation::SetConfigJson {
+            SettingsOperationScope::ConfigField(scope_key),
+            SettingsOperation::SetConfigDocument {
                 key: item.key.clone(),
-                value: next,
-                saved_draft: Some((draft_key, raw)),
+                value: value.clone(),
+                saved_draft: Some(ConfigSavedDraft::Schema {
+                    key: item.key.clone(),
+                    value,
+                }),
             },
         ))
+    }
+
+    fn reset_config_schema_draft(&mut self, index: usize) {
+        let Some(key) = self.config_items.get(index).map(|item| item.key.clone()) else {
+            return;
+        };
+        self.config_drafts.remove(&key);
+        let prefix = config_schema_field_prefix(&key);
+        self.field_drafts
+            .retain(|draft_key, _| !draft_key.starts_with(&prefix));
+        self.field_errors
+            .retain(|error_key, _| !error_key.starts_with(&prefix));
+        self.config_ui_revision = self.config_ui_revision.wrapping_add(1);
+        self.mark_draft_changed(SettingsOperationDomain::Config);
+    }
+
+    fn append_config_schema_list_item(
+        &mut self,
+        index: usize,
+        path: &[ConfigPathSegment],
+        item_schema: &ConfigSchemaValue,
+    ) -> Result<(), String> {
+        let item = self
+            .config_items
+            .get(index)
+            .ok_or_else(|| "configuration definition is no longer available".to_string())?;
+        if item.read_only {
+            return Err("this configuration is read-only".to_string());
+        }
+        let key = item.key.clone();
+        let base = item.raw_value.clone();
+        let draft = self.config_drafts.entry(key).or_insert(base);
+        let list = config_value_mut_at_path(draft, path, ValueContainerKind::List)?;
+        let list = list
+            .as_array_mut()
+            .ok_or_else(|| "list setting is not an array".to_string())?;
+        list.push(schema_default_value(item_schema));
+        self.config_ui_revision = self.config_ui_revision.wrapping_add(1);
+        self.mark_draft_changed(SettingsOperationDomain::Config);
+        Ok(())
+    }
+
+    fn insert_config_schema_map_entry(
+        &mut self,
+        index: usize,
+        path: &[ConfigPathSegment],
+        entry_key: &str,
+        item_schema: &ConfigSchemaValue,
+    ) -> Result<(), String> {
+        let entry_key = entry_key.trim();
+        if entry_key.is_empty() {
+            return Err("entry key cannot be empty".to_string());
+        }
+        let item = self
+            .config_items
+            .get(index)
+            .ok_or_else(|| "configuration definition is no longer available".to_string())?;
+        if item.read_only {
+            return Err("this configuration is read-only".to_string());
+        }
+        let key = item.key.clone();
+        let base = item.raw_value.clone();
+        let draft = self.config_drafts.entry(key.clone()).or_insert(base);
+        let map = config_value_mut_at_path(draft, path, ValueContainerKind::Object)?;
+        let map = map
+            .as_object_mut()
+            .ok_or_else(|| "map setting is not an object".to_string())?;
+        if map.contains_key(entry_key) {
+            return Err(format!("entry `{entry_key}` already exists"));
+        }
+        map.insert(entry_key.to_string(), schema_default_value(item_schema));
+        let add_key = config_schema_add_key(&key, path);
+        self.field_drafts.remove(&add_key);
+        self.field_errors.remove(&add_key);
+        self.config_ui_revision = self.config_ui_revision.wrapping_add(1);
+        self.mark_draft_changed(SettingsOperationDomain::Config);
+        Ok(())
+    }
+
+    fn remove_config_schema_path(
+        &mut self,
+        index: usize,
+        path: &[ConfigPathSegment],
+    ) -> Result<(), String> {
+        let item = self
+            .config_items
+            .get(index)
+            .ok_or_else(|| "configuration definition is no longer available".to_string())?;
+        if item.read_only {
+            return Err("this configuration is read-only".to_string());
+        }
+        let key = item.key.clone();
+        let base = item.raw_value.clone();
+        let draft = self.config_drafts.entry(key.clone()).or_insert(base);
+        let list_shift = match path.split_last() {
+            Some((ConfigPathSegment::Index(item_index), parent_path)) => {
+                config_value_at_path(draft, parent_path)
+                    .and_then(Value::as_array)
+                    .map(|items| (*item_index, items.len(), parent_path.to_vec()))
+            }
+            _ => None,
+        };
+        remove_json_path_value(draft, path)?;
+        clear_config_schema_auxiliary_path(&mut self.field_drafts, &key, path);
+        clear_config_schema_auxiliary_path(&mut self.field_errors, &key, path);
+        if let Some((removed_index, old_len, parent_path)) = list_shift {
+            for old_index in removed_index + 1..old_len {
+                let mut old_path = parent_path.clone();
+                old_path.push(ConfigPathSegment::Index(old_index));
+                let mut new_path = parent_path.clone();
+                new_path.push(ConfigPathSegment::Index(old_index - 1));
+                move_config_schema_auxiliary_path(
+                    &mut self.field_drafts,
+                    &key,
+                    &old_path,
+                    &new_path,
+                );
+                move_config_schema_auxiliary_path(
+                    &mut self.field_errors,
+                    &key,
+                    &old_path,
+                    &new_path,
+                );
+            }
+        }
+        self.config_ui_revision = self.config_ui_revision.wrapping_add(1);
+        self.mark_draft_changed(SettingsOperationDomain::Config);
+        Ok(())
     }
 
     fn set_provider_field_draft(&mut self, index: usize, field: ProviderField, raw: String) {
@@ -2373,29 +2614,6 @@ impl SettingsState {
         }
         true
     }
-
-    fn config_schema_value_operation(
-        &self,
-        index: usize,
-        path: Vec<String>,
-        value: Value,
-    ) -> Result<(SettingsOperationScope, SettingsOperation), String> {
-        let item = self
-            .config_items
-            .get(index)
-            .ok_or_else(|| "configuration field is no longer available".to_string())?;
-        let error_key = config_schema_field_key(&item.key, &path);
-        let mut next = item.raw_value.clone();
-        set_json_path_value(&mut next, &path, value)?;
-        Ok((
-            SettingsOperationScope::ConfigField(error_key),
-            SettingsOperation::SetConfigJson {
-                key: item.key.clone(),
-                value: next,
-                saved_draft: None,
-            },
-        ))
-    }
 }
 
 fn settings_operation_worker(
@@ -2434,10 +2652,13 @@ fn execute_settings_operation(
             set_value(backend.config.as_ref(), &key, kind, &raw)?;
             Ok(ConfigOperationSuccess {
                 items: resolve_items(backend.config.as_ref()),
-                saved_draft: Some((draft_key, raw)),
+                saved_draft: Some(ConfigSavedDraft::Raw {
+                    key: draft_key,
+                    value: raw,
+                }),
             })
         })()),
-        SettingsOperation::SetConfigJson {
+        SettingsOperation::SetConfigDocument {
             key,
             value,
             saved_draft,
@@ -2934,29 +3155,91 @@ fn config_field_key(key: &str) -> String {
     format!("config:{key}")
 }
 
-fn config_schema_field_key(key: &str, path: &[String]) -> String {
+fn config_schema_field_prefix(key: &str) -> String {
+    format!("config-schema:{key}:")
+}
+
+fn config_schema_field_key(key: &str, path: &[ConfigPathSegment]) -> String {
+    let mut output = config_schema_field_prefix(key);
     if path.is_empty() {
-        return format!("config-schema:{key}:$");
+        output.push('$');
+        return output;
     }
-    format!("config-schema:{key}:{}", path.join("."))
+    for segment in path {
+        match segment {
+            ConfigPathSegment::Field(field) => {
+                output.push('.');
+                output.push_str(&field.len().to_string());
+                output.push(':');
+                output.push_str(field);
+            }
+            ConfigPathSegment::Index(index) => {
+                output.push('[');
+                output.push_str(&index.to_string());
+                output.push(']');
+            }
+        }
+    }
+    output
+}
+
+fn config_schema_add_key(key: &str, path: &[ConfigPathSegment]) -> String {
+    format!("{}:add", config_schema_field_key(key, path))
+}
+
+fn clear_config_schema_auxiliary_path<T>(
+    values: &mut HashMap<String, T>,
+    config_key: &str,
+    path: &[ConfigPathSegment],
+) {
+    let prefix = config_schema_field_key(config_key, path);
+    values.retain(|key, _| !key.starts_with(&prefix));
+}
+
+fn move_config_schema_auxiliary_path<T>(
+    values: &mut HashMap<String, T>,
+    config_key: &str,
+    old_path: &[ConfigPathSegment],
+    new_path: &[ConfigPathSegment],
+) {
+    let old_prefix = config_schema_field_key(config_key, old_path);
+    let new_prefix = config_schema_field_key(config_key, new_path);
+    let moves = values
+        .keys()
+        .filter(|key| key.starts_with(&old_prefix))
+        .cloned()
+        .collect::<Vec<_>>();
+    for old_key in moves {
+        let new_key = format!("{}{}", new_prefix, &old_key[old_prefix.len()..]);
+        if let Some(value) = values.remove(&old_key) {
+            values.insert(new_key, value);
+        }
+    }
 }
 
 fn parse_schema_editor_value(schema: &ConfigSchemaValue, raw: &str) -> Result<Value, String> {
     let trimmed = raw.trim();
     match schema {
         ConfigSchemaValue::Bool => Ok(Value::Bool(trimmed.eq_ignore_ascii_case("true"))),
-        ConfigSchemaValue::I64 { .. } => trimmed
-            .parse::<i64>()
-            .map(|value| Value::Number(value.into()))
-            .map_err(|error| format!("invalid i64: {error}")),
-        ConfigSchemaValue::U64 { .. } => trimmed
-            .parse::<u64>()
-            .map(|value| Value::Number(value.into()))
-            .map_err(|error| format!("invalid u64: {error}")),
-        ConfigSchemaValue::F64 { .. } => {
+        ConfigSchemaValue::I64 { range } => {
+            let value = trimmed
+                .parse::<i64>()
+                .map_err(|error| format!("invalid i64: {error}"))?;
+            validate_schema_editor_number_range(value as f64, range.as_ref())?;
+            Ok(Value::Number(value.into()))
+        }
+        ConfigSchemaValue::U64 { range } => {
+            let value = trimmed
+                .parse::<u64>()
+                .map_err(|error| format!("invalid u64: {error}"))?;
+            validate_schema_editor_number_range(value as f64, range.as_ref())?;
+            Ok(Value::Number(value.into()))
+        }
+        ConfigSchemaValue::F64 { range } => {
             let value = trimmed
                 .parse::<f64>()
                 .map_err(|error| format!("invalid number: {error}"))?;
+            validate_schema_editor_number_range(value, range.as_ref())?;
             serde_json::Number::from_f64(value)
                 .map(Value::Number)
                 .ok_or_else(|| "invalid finite number".to_string())
@@ -2972,31 +3255,206 @@ fn parse_schema_editor_value(schema: &ConfigSchemaValue, raw: &str) -> Result<Va
     }
 }
 
-fn set_json_path_value(root: &mut Value, path: &[String], value: Value) -> Result<(), String> {
+fn validate_schema_editor_number_range(
+    value: f64,
+    range: Option<&sinomo_runtime::config::ConfigNumberRange>,
+) -> Result<(), String> {
+    let Some(range) = range else {
+        return Ok(());
+    };
+    if let Some(minimum) = range.min
+        && value < minimum
+    {
+        return Err(format!("value must be at least {minimum}"));
+    }
+    if let Some(maximum) = range.max
+        && value > maximum
+    {
+        return Err(format!("value must be at most {maximum}"));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ValueContainerKind {
+    Object,
+    List,
+}
+
+fn config_value_mut_at_path<'a>(
+    root: &'a mut Value,
+    path: &[ConfigPathSegment],
+    target_kind: ValueContainerKind,
+) -> Result<&'a mut Value, String> {
+    let mut current = root;
+    for (index, segment) in path.iter().enumerate() {
+        let next_kind = path
+            .get(index + 1)
+            .map(|next| match next {
+                ConfigPathSegment::Field(_) => ValueContainerKind::Object,
+                ConfigPathSegment::Index(_) => ValueContainerKind::List,
+            })
+            .unwrap_or(target_kind);
+        match segment {
+            ConfigPathSegment::Field(field) => {
+                if !current.is_object() {
+                    *current = Value::Object(serde_json::Map::new());
+                }
+                let map = current
+                    .as_object_mut()
+                    .ok_or_else(|| format!("{field} is not an object field"))?;
+                current = map.entry(field.clone()).or_insert(Value::Null);
+            }
+            ConfigPathSegment::Index(item_index) => {
+                if !current.is_array() {
+                    *current = Value::Array(Vec::new());
+                }
+                let list = current
+                    .as_array_mut()
+                    .ok_or_else(|| format!("item {item_index} is not in a list"))?;
+                while list.len() <= *item_index {
+                    list.push(Value::Null);
+                }
+                current = &mut list[*item_index];
+            }
+        }
+        if current.is_null() {
+            *current = match next_kind {
+                ValueContainerKind::Object => Value::Object(serde_json::Map::new()),
+                ValueContainerKind::List => Value::Array(Vec::new()),
+            };
+        }
+    }
+    Ok(current)
+}
+
+fn set_json_path_value(
+    root: &mut Value,
+    path: &[ConfigPathSegment],
+    value: Value,
+) -> Result<(), String> {
     if path.is_empty() {
         *root = value;
         return Ok(());
     }
-    let mut current = root;
-    for segment in &path[..path.len() - 1] {
-        if !current.is_object() {
-            *current = Value::Object(serde_json::Map::new());
+    let (parent_path, tail) = path.split_at(path.len() - 1);
+    let parent_kind = match tail[0] {
+        ConfigPathSegment::Field(_) => ValueContainerKind::Object,
+        ConfigPathSegment::Index(_) => ValueContainerKind::List,
+    };
+    let parent = config_value_mut_at_path(root, parent_path, parent_kind)?;
+    match &tail[0] {
+        ConfigPathSegment::Field(field) => {
+            if !parent.is_object() {
+                *parent = Value::Object(serde_json::Map::new());
+            }
+            parent
+                .as_object_mut()
+                .ok_or_else(|| "parent value is not an object".to_string())?
+                .insert(field.clone(), value);
         }
-        let map = current
-            .as_object_mut()
-            .ok_or_else(|| format!("{segment} is not an object"))?;
-        current = map
-            .entry(segment.clone())
-            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        ConfigPathSegment::Index(index) => {
+            if !parent.is_array() {
+                *parent = Value::Array(Vec::new());
+            }
+            let list = parent
+                .as_array_mut()
+                .ok_or_else(|| "parent value is not an array".to_string())?;
+            while list.len() <= *index {
+                list.push(Value::Null);
+            }
+            list[*index] = value;
+        }
     }
-    if !current.is_object() {
-        *current = Value::Object(serde_json::Map::new());
-    }
-    let map = current
-        .as_object_mut()
-        .ok_or_else(|| "parent value is not an object".to_string())?;
-    map.insert(path[path.len() - 1].clone(), value);
     Ok(())
+}
+
+fn remove_json_path_value(root: &mut Value, path: &[ConfigPathSegment]) -> Result<(), String> {
+    if path.is_empty() {
+        *root = Value::Null;
+        return Ok(());
+    }
+    let (parent_path, tail) = path.split_at(path.len() - 1);
+    let parent_kind = match tail[0] {
+        ConfigPathSegment::Field(_) => ValueContainerKind::Object,
+        ConfigPathSegment::Index(_) => ValueContainerKind::List,
+    };
+    let parent = config_value_mut_at_path(root, parent_path, parent_kind)?;
+    match &tail[0] {
+        ConfigPathSegment::Field(field) => {
+            parent
+                .as_object_mut()
+                .ok_or_else(|| "parent value is not an object".to_string())?
+                .remove(field);
+        }
+        ConfigPathSegment::Index(index) => {
+            let list = parent
+                .as_array_mut()
+                .ok_or_else(|| "parent value is not an array".to_string())?;
+            if *index >= list.len() {
+                return Err(format!("list item {index} no longer exists"));
+            }
+            list.remove(*index);
+        }
+    }
+    Ok(())
+}
+
+fn schema_default_value(schema: &ConfigSchemaValue) -> Value {
+    match schema {
+        ConfigSchemaValue::Bool => Value::Bool(false),
+        ConfigSchemaValue::I64 { range } => {
+            let value = schema_default_number(range.as_ref()).round() as i64;
+            Value::Number(value.into())
+        }
+        ConfigSchemaValue::U64 { range } => {
+            let value = schema_default_number(range.as_ref()).max(0.0).round() as u64;
+            Value::Number(value.into())
+        }
+        ConfigSchemaValue::F64 { range } => {
+            serde_json::Number::from_f64(schema_default_number(range.as_ref()))
+                .map(Value::Number)
+                .unwrap_or_else(|| Value::Number(0.into()))
+        }
+        ConfigSchemaValue::String { choices, .. } => Value::String(
+            choices
+                .first()
+                .map(|choice| choice.value.clone())
+                .unwrap_or_default(),
+        ),
+        ConfigSchemaValue::StringList | ConfigSchemaValue::List { .. } => Value::Array(Vec::new()),
+        ConfigSchemaValue::Object { fields, .. } => Value::Object(
+            fields
+                .iter()
+                .filter(|field| field.required || field.default_value.is_some())
+                .map(|field| {
+                    (
+                        field.name.clone(),
+                        field
+                            .default_value
+                            .clone()
+                            .unwrap_or_else(|| schema_default_value(&field.value)),
+                    )
+                })
+                .collect(),
+        ),
+        ConfigSchemaValue::Map { .. } => Value::Object(serde_json::Map::new()),
+        ConfigSchemaValue::Json => Value::Null,
+    }
+}
+
+fn schema_default_number(range: Option<&sinomo_runtime::config::ConfigNumberRange>) -> f64 {
+    let Some(range) = range else {
+        return 0.0;
+    };
+    let mut value: f64 = 0.0;
+    if let Some(min) = range.min {
+        value = value.max(min);
+    }
+    if let Some(max) = range.max {
+        value = value.min(max);
+    }
+    value
 }
 
 /// Field-error map key for a provider text field (Providers section).
@@ -3599,16 +4057,7 @@ fn configuration_key(shared: &Shared) -> String {
     let item_key = settings
         .config_items
         .iter()
-        .map(|item| {
-            format!(
-                "{}:{}:{:?}:{:?}:{}",
-                item.key,
-                item.source,
-                item.edit_kind,
-                item.bool_value,
-                item.edit_value.len()
-            )
-        })
+        .map(config_item_rebuild_signature)
         .collect::<Vec<_>>()
         .join("\n");
     let expanded = settings
@@ -3617,7 +4066,25 @@ fn configuration_key(shared: &Shared) -> String {
         .map(String::as_str)
         .collect::<Vec<_>>()
         .join(",");
-    format!("{item_key}\nexpanded:{expanded}")
+    format!(
+        "{item_key}\nexpanded:{expanded};revision:{}",
+        settings.config_ui_revision
+    )
+}
+
+fn config_item_rebuild_signature(item: &ConfigItem) -> String {
+    format!(
+        "{}:{}:{}:{:?}:{:?}:{:?}:{}:{:?}:{:?}",
+        item.key,
+        item.owner,
+        item.source,
+        item.module_id,
+        item.edit_kind,
+        item.bool_value,
+        item.read_only,
+        item.raw_value,
+        item.schema,
+    )
 }
 
 fn skills_section_key(shared: &Shared) -> String {
@@ -7225,12 +7692,20 @@ fn module_section_key(shared: &Shared) -> String {
             format!("{}:{:?}:{}", node.summary.node_id, node.error, config)
         })
         .unwrap_or_default();
+    let module_settings = settings
+        .config_items
+        .iter()
+        .filter(|item| item.module_id.is_some())
+        .map(config_item_rebuild_signature)
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
-        "selected:{:?};error:{:?};status:{:?};warnings:{:?}\n{nodes}\n{modules}\n{cluster}\n{selected}",
+        "selected:{:?};error:{:?};status:{:?};warnings:{:?};config-revision:{}\n{nodes}\n{modules}\n{cluster}\n{selected}\n{module_settings}",
         settings.module_selected_node_id,
         settings.module_action_error,
         settings.module_action_status,
-        snapshot.warnings
+        snapshot.warnings,
+        settings.config_ui_revision,
     )
 }
 
@@ -7363,6 +7838,17 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                 )
                 .theme_when(clone_reader(reader)),
         );
+    let module_config_catalog = {
+        let settings = shared.settings();
+        settings
+            .config_items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.module_id.is_some())
+            .map(|(index, item)| (index, item.clone()))
+            .collect::<Vec<_>>()
+    };
+    let mut rendered_config_indices = HashSet::new();
     if snapshot.modules.is_empty() {
         let empty = FieldGroup::new().spacing(8.0).with_child(value_row(
             shared,
@@ -7370,11 +7856,41 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             "Status",
             "No installed or configured modules were found",
         ));
-        return stack
-            .with_child(FormSection::new("Catalog", empty).theme_when(clone_reader(reader)));
+        stack =
+            stack.with_child(FormSection::new("Catalog", empty).theme_when(clone_reader(reader)));
     }
     for module in snapshot.modules {
-        stack = stack.with_child(module_config_section(shared, reader, module));
+        let mut associated = Vec::new();
+        for (index, item) in &module_config_catalog {
+            if !rendered_config_indices.contains(index)
+                && item.module_id.as_deref().is_some_and(|config_module_id| {
+                    module_ids_match(config_module_id, &module.module_id)
+                })
+            {
+                rendered_config_indices.insert(*index);
+                associated.push((*index, item.clone()));
+            }
+        }
+        stack = stack.with_child(module_config_section(shared, reader, module, associated));
+    }
+    let unmatched = module_config_catalog
+        .into_iter()
+        .filter(|(index, _)| !rendered_config_indices.contains(index))
+        .collect::<Vec<_>>();
+    if !unmatched.is_empty() {
+        let mut body = FieldGroup::new().spacing(8.0);
+        for (index, item) in unmatched {
+            body = body.with_child(PodHost::new(module_config_editor_row(
+                shared, reader, index, &item,
+            )));
+        }
+        stack = stack.with_child(
+            FormSection::new("Additional module settings", body)
+                .description(
+                    "Settings declared by modules that do not currently have a lifecycle card on this node.",
+                )
+                .theme_when(clone_reader(reader)),
+        );
     }
     stack
 }
@@ -7383,6 +7899,7 @@ fn module_config_section(
     shared: &Shared,
     reader: &ThemeReader,
     module: crate::backend::modules::ModuleConfigModuleSummary,
+    module_config_items: Vec<(usize, ConfigItem)>,
 ) -> impl Widget + use<> {
     let module_id = module.module_id.clone();
     let selected_node_label = {
@@ -7539,6 +8056,12 @@ fn module_config_section(
         .with_child(cluster_switch)
         .with_child(node_override);
 
+    for (index, item) in module_config_items {
+        body = body.with_child(PodHost::new(module_config_editor_row(
+            shared, reader, index, &item,
+        )));
+    }
+
     if module_runtime_state_mismatch(&module) {
         body = body.with_child(
             FormRow::new(
@@ -7562,6 +8085,50 @@ fn module_config_section(
     }
 
     FormSection::new(module.label.clone(), body).theme_when(clone_reader(reader))
+}
+
+fn module_config_editor_row(
+    shared: &Shared,
+    reader: &ThemeReader,
+    index: usize,
+    item: &ConfigItem,
+) -> WidgetPod {
+    let editor = if let Some(schema) = item.schema.as_ref() {
+        WidgetPod::new(config_schema_editor(shared, reader, index, item, schema))
+    } else {
+        WidgetPod::new(config_detail_editor(shared, reader, index, item))
+    };
+    let mut settings_body = Stack::vertical()
+        .spacing(5.0)
+        .alignment(Alignment::Stretch)
+        .with_child(muted_meta_label(shared, config_metadata_line(item)));
+    if !item.description.trim().is_empty() {
+        settings_body = settings_body.with_child(muted_meta_label(
+            shared,
+            short_one_line(&item.description, 160),
+        ));
+    }
+    settings_body = settings_body.with_child(PodHost::new(editor));
+    WidgetPod::new(
+        FormRow::new(
+            format!("Settings · {}", item.key.trim_start_matches('/')),
+            settings_body,
+        )
+        .stacked()
+        .theme_when(clone_reader(reader)),
+    )
+}
+
+fn module_ids_match(left: &str, right: &str) -> bool {
+    fn normalized(value: &str) -> Option<sinomo_runtime::core::Id> {
+        sinomo_runtime::core::Id::new(value.to_string())
+            .or_else(|_| sinomo_runtime::core::Id::from_legacy_named(value))
+            .ok()
+    }
+
+    normalized(left)
+        .zip(normalized(right))
+        .is_some_and(|(left, right)| left == right)
 }
 
 fn module_node_option(node: &crate::backend::modules::ModuleConfigNodeSummary) -> String {
@@ -8142,7 +8709,7 @@ fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widge
     let display_key = key.trim_start_matches('/').to_string();
 
     if let Some(on) = bool_value {
-        if edit_kind == ConfigEditKind::Bool {
+        if edit_kind == ConfigEditKind::Bool && !item.read_only {
             let on_toggle = {
                 let s = shared.clone();
                 let key = key.clone();
@@ -8263,9 +8830,11 @@ fn config_detail_editor(
     let detail = shared
         .settings()
         .field_draft_or(&draft_key, || config_detail_value(item));
-    let editable = !config_item_has_sensitive_detail(item);
-    let note = if editable {
-        "Edit the draft, then Save. The config service write runs in the background."
+    let editable = !config_item_has_sensitive_detail(item) && !item.read_only;
+    let note = if item.read_only {
+        "This operational document is read-only. JSON is only a human-readable projection of the SOBJ value."
+    } else if editable {
+        "No detailed field schema is available, so this raw editor is the fallback. JSON is only the human editing projection; the config service transports the typed value as SOBJ."
     } else {
         "Sensitive fields are redacted here. Use the dedicated settings section to update credentials."
     };
@@ -8284,6 +8853,26 @@ fn config_detail_editor(
     let mut stack = Stack::vertical()
         .spacing(5.0)
         .alignment(Alignment::Stretch)
+        .with_child(
+            Stack::horizontal().with_child(
+                StatusBadge::new(if item.read_only {
+                    "Read-only raw projection"
+                } else {
+                    "Raw editor fallback"
+                })
+                .icon(if item.read_only {
+                    IconGlyph::Lock
+                } else {
+                    IconGlyph::Alert
+                })
+                .tone(if item.read_only {
+                    SemanticTone::Neutral
+                } else {
+                    SemanticTone::Warning
+                })
+                .theme_when(clone_reader(reader)),
+            ),
+        )
         .with_child(muted_meta_label(shared, note))
         .with_child(SizedBox::new().height(112.0).with_child(editor));
     if editable {
@@ -8318,20 +8907,126 @@ fn config_schema_editor(
     item: &ConfigItem,
     schema: &ConfigSchema,
 ) -> impl Widget + use<> {
+    let (value, read_only) = {
+        let settings = shared.settings();
+        (
+            settings.config_schema_draft_value(item).clone(),
+            item.read_only,
+        )
+    };
     let mut stack = Stack::vertical().spacing(8.0).alignment(Alignment::Stretch);
     if !schema.description.trim().is_empty() {
         stack = stack.with_child(muted_meta_label(shared, schema.description.clone()));
     }
-    stack.with_child(PodHost::new(config_schema_value_editor(
+    if read_only {
+        stack = stack.with_child(
+            Stack::horizontal().with_child(
+                StatusBadge::new("Read only")
+                    .icon(IconGlyph::Lock)
+                    .tone(SemanticTone::Neutral)
+                    .theme_when(clone_reader(reader)),
+            ),
+        );
+    }
+    stack = stack.with_child(PodHost::new(config_schema_value_editor(
         shared,
         reader,
         index,
-        &item.raw_value,
+        &value,
         &schema.value,
         Vec::new(),
         &schema.name,
         "",
-    )))
+        read_only,
+    )));
+    if !read_only {
+        let root_scope =
+            SettingsOperationScope::ConfigField(config_schema_field_key(&item.key, &[]));
+        let save = {
+            let s = shared.clone();
+            let scope = root_scope.clone();
+            sui::Button::new("Save settings")
+                .icon(IconGlyph::Check)
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
+                .enabled_when({
+                    let s = s.clone();
+                    let key = item.key.clone();
+                    let scope = scope.clone();
+                    move || {
+                        s.settings().config_schema_is_dirty(&key)
+                            && !s.settings().operation_pending(&scope)
+                    }
+                })
+                .on_press(
+                    move || match s.settings().config_schema_save_operation(index) {
+                        Ok((scope, operation)) => {
+                            queue_settings_operation(&s, scope, operation);
+                        }
+                        Err(error) => {
+                            if let SettingsOperationScope::ConfigField(key) = &scope {
+                                s.settings_mut().field_errors.insert(key.clone(), error);
+                            }
+                        }
+                    },
+                )
+        };
+        let reset = {
+            let s = shared.clone();
+            let key = item.key.clone();
+            sui::Button::new("Reset draft")
+                .icon(IconGlyph::Redo)
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
+                .enabled_when({
+                    let s = s.clone();
+                    let key = key.clone();
+                    move || s.settings().config_schema_is_dirty(&key)
+                })
+                .on_press(move || s.settings_mut().reset_config_schema_draft(index))
+        };
+        let root_error_key = config_schema_field_key(&item.key, &[]);
+        stack = stack.with_child(
+            Flex::horizontal()
+                .wrap(FlexWrap::Wrap)
+                .gap(8.0)
+                .with_child(save)
+                .with_child(reset),
+        );
+        stack = stack.with_child(config_schema_feedback_label(
+            shared,
+            root_error_key,
+            String::new(),
+        ));
+    }
+    stack
+}
+
+fn config_schema_feedback_label(shared: &Shared, error_key: String, fallback: String) -> Label {
+    let s = shared.clone();
+    let token = shared.theme().text.sm;
+    settings_label(shared, fallback.clone(), token)
+        .text_when({
+            let s = s.clone();
+            let error_key = error_key.clone();
+            move || {
+                s.settings()
+                    .field_errors
+                    .get(&error_key)
+                    .cloned()
+                    .unwrap_or_else(|| fallback.clone())
+            }
+        })
+        .color_when(move || {
+            let palette = palette(&s);
+            if s.settings().field_errors.contains_key(&error_key) {
+                palette.danger_text
+            } else {
+                palette.text_muted
+            }
+        })
 }
 
 fn config_schema_value_editor(
@@ -8340,9 +9035,10 @@ fn config_schema_value_editor(
     index: usize,
     value: &Value,
     schema: &ConfigSchemaValue,
-    path: Vec<String>,
+    path: Vec<ConfigPathSegment>,
     label: &str,
     description: &str,
+    read_only: bool,
 ) -> WidgetPod {
     match schema {
         ConfigSchemaValue::Object { fields, .. } => config_schema_object_editor(
@@ -8354,6 +9050,7 @@ fn config_schema_value_editor(
             path,
             label,
             description,
+            read_only,
         ),
         ConfigSchemaValue::Map { value: item_schema } => config_schema_map_editor(
             shared,
@@ -8364,10 +9061,31 @@ fn config_schema_value_editor(
             path,
             label,
             description,
+            read_only,
         ),
-        ConfigSchemaValue::List { .. }
-        | ConfigSchemaValue::StringList
-        | ConfigSchemaValue::Json => config_schema_json_row(
+        ConfigSchemaValue::List { value: item_schema } => config_schema_list_editor(
+            shared,
+            reader,
+            index,
+            value,
+            item_schema,
+            path,
+            label,
+            description,
+            read_only,
+        ),
+        ConfigSchemaValue::StringList => config_schema_list_editor(
+            shared,
+            reader,
+            index,
+            value,
+            &ConfigSchemaValue::string(),
+            path,
+            label,
+            description,
+            read_only,
+        ),
+        ConfigSchemaValue::Json => config_schema_json_row(
             shared,
             reader,
             index,
@@ -8376,6 +9094,7 @@ fn config_schema_value_editor(
             path,
             label,
             description,
+            read_only,
         ),
         ConfigSchemaValue::Bool
         | ConfigSchemaValue::I64 { .. }
@@ -8390,6 +9109,7 @@ fn config_schema_value_editor(
             path,
             label,
             description,
+            read_only,
         ),
     }
 }
@@ -8400,9 +9120,10 @@ fn config_schema_object_editor(
     index: usize,
     value: &Value,
     fields: &[ConfigSchemaField],
-    path: Vec<String>,
+    path: Vec<ConfigPathSegment>,
     label: &str,
     description: &str,
+    read_only: bool,
 ) -> WidgetPod {
     let mut group = FieldGroup::new().spacing(8.0);
     if !description.trim().is_empty() {
@@ -8410,10 +9131,72 @@ fn config_schema_object_editor(
     }
     for field in fields {
         let mut field_path = path.clone();
-        field_path.push(field.name.clone());
-        let field_value = value
+        field_path.push(ConfigPathSegment::Field(field.name.clone()));
+        let field_label = if field.required {
+            format!("{} *", field.label)
+        } else {
+            field.label.clone()
+        };
+        let stored_field_value = value
             .as_object()
             .and_then(|map| map.get(&field.name))
+            .filter(|value| !value.is_null());
+        let field_present = stored_field_value.is_some();
+        if !field.required && !field_present && field.default_value.is_none() {
+            let error_key = shared
+                .settings()
+                .config_items
+                .get(index)
+                .map(|item| config_schema_field_key(&item.key, &field_path));
+            let mut body = Stack::vertical()
+                .spacing(4.0)
+                .alignment(Alignment::Stretch)
+                .with_child(config_schema_feedback_label(
+                    shared,
+                    error_key.clone().unwrap_or_default(),
+                    "Not set".to_string(),
+                ));
+            if !field.description.trim().is_empty() {
+                body = body.with_child(muted_meta_label(shared, field.description.clone()));
+            }
+            if !read_only {
+                let s = shared.clone();
+                let set_path = field_path.clone();
+                let initial_value = if matches!(&field.value, ConfigSchemaValue::Json) {
+                    Value::Object(serde_json::Map::new())
+                } else {
+                    schema_default_value(&field.value)
+                };
+                let field_label = field.label.clone();
+                body = body.with_child(
+                    Stack::horizontal().with_child(
+                        sui::Button::new(format!("Set {field_label}"))
+                            .icon(IconGlyph::Add)
+                            .theme_when(clone_reader(reader))
+                            .appearance(sui::ButtonAppearance::Tonal)
+                            .tone(SemanticTone::Neutral)
+                            .on_press(move || {
+                                if let Err(error) = s.settings_mut().set_config_schema_value_draft(
+                                    index,
+                                    set_path.clone(),
+                                    initial_value.clone(),
+                                ) && let Some(key) = &error_key
+                                {
+                                    s.settings_mut().field_errors.insert(key.clone(), error);
+                                }
+                            }),
+                    ),
+                );
+            }
+            group = group.with_child(
+                FormRow::new(field_label, body)
+                    .stacked()
+                    .theme_when(clone_reader(reader)),
+            );
+            continue;
+        }
+        let field_value = stored_field_value
+            .or(field.default_value.as_ref())
             .unwrap_or(&Value::Null);
         group = group.with_child(PodHost::new(config_schema_value_editor(
             shared,
@@ -8421,10 +9204,38 @@ fn config_schema_object_editor(
             index,
             field_value,
             &field.value,
-            field_path,
-            &field.label,
+            field_path.clone(),
+            &field_label,
             &field.description,
+            read_only,
         )));
+        if !field.required && !read_only && field_present {
+            let s = shared.clone();
+            let unset_path = field_path;
+            let error_key = s
+                .settings()
+                .config_items
+                .get(index)
+                .map(|item| config_schema_field_key(&item.key, &unset_path));
+            group = group.with_child(
+                Stack::horizontal().with_child(
+                    sui::Button::new(format!("Unset {}", field.label))
+                        .icon(IconGlyph::Close)
+                        .theme_when(clone_reader(reader))
+                        .appearance(sui::ButtonAppearance::Tonal)
+                        .tone(SemanticTone::Neutral)
+                        .on_press(move || {
+                            if let Err(error) = s
+                                .settings_mut()
+                                .remove_config_schema_path(index, &unset_path)
+                                && let Some(key) = &error_key
+                            {
+                                s.settings_mut().field_errors.insert(key.clone(), error);
+                            }
+                        }),
+                ),
+            );
+        }
     }
     WidgetPod::new(group)
 }
@@ -8435,9 +9246,10 @@ fn config_schema_map_editor(
     index: usize,
     value: &Value,
     item_schema: &ConfigSchemaValue,
-    path: Vec<String>,
+    path: Vec<ConfigPathSegment>,
     label: &str,
     description: &str,
+    read_only: bool,
 ) -> WidgetPod {
     let mut group = FieldGroup::new().spacing(8.0);
     let entries = value
@@ -8465,46 +9277,188 @@ fn config_schema_map_editor(
     );
     for (entry_key, entry_value) in entries {
         let mut entry_path = path.clone();
-        entry_path.push(entry_key.clone());
-        match item_schema {
-            ConfigSchemaValue::Object { fields, .. } => {
-                for field in fields {
-                    let mut field_path = entry_path.clone();
-                    field_path.push(field.name.clone());
-                    let field_value = entry_value
-                        .as_object()
-                        .and_then(|map| map.get(&field.name))
-                        .unwrap_or(&Value::Null);
-                    let field_label = format!(
-                        "{} {}",
-                        short_one_line(&entry_key, 42),
-                        field.label.to_ascii_lowercase()
-                    );
-                    group = group.with_child(PodHost::new(config_schema_value_editor(
-                        shared,
-                        reader,
-                        index,
-                        field_value,
-                        &field.value,
-                        field_path,
-                        &field_label,
-                        &field.description,
-                    )));
-                }
-            }
-            other => {
-                group = group.with_child(PodHost::new(config_schema_value_editor(
-                    shared,
-                    reader,
-                    index,
-                    &entry_value,
-                    other,
-                    entry_path,
-                    &entry_key,
-                    "",
-                )));
-            }
+        entry_path.push(ConfigPathSegment::Field(entry_key.clone()));
+        group = group.with_child(PodHost::new(config_schema_value_editor(
+            shared,
+            reader,
+            index,
+            &entry_value,
+            item_schema,
+            entry_path.clone(),
+            &entry_key,
+            "",
+            read_only,
+        )));
+        if !read_only {
+            let s = shared.clone();
+            let remove_path = entry_path;
+            group = group.with_child(
+                Stack::horizontal().with_child(
+                    sui::Button::new(format!("Remove {}", short_one_line(&entry_key, 32)))
+                        .icon(IconGlyph::Close)
+                        .theme_when(clone_reader(reader))
+                        .appearance(sui::ButtonAppearance::Tonal)
+                        .tone(SemanticTone::Neutral)
+                        .on_press(move || {
+                            let _ = s
+                                .settings_mut()
+                                .remove_config_schema_path(index, &remove_path);
+                        }),
+                ),
+            );
         }
+    }
+    if !read_only {
+        let add_key = shared
+            .settings()
+            .config_items
+            .get(index)
+            .map(|item| config_schema_add_key(&item.key, &path));
+        if let Some(add_key) = add_key {
+            let draft = shared.settings().field_draft_or(&add_key, String::new);
+            let input = {
+                let s = shared.clone();
+                let draft_key = add_key.clone();
+                TextInput::new(format!("{}-map-key", schema_control_name(index, &path)))
+                    .value(draft)
+                    .placeholder("New entry key")
+                    .theme_when(clone_reader(reader))
+                    .on_change(move |value| {
+                        let mut settings = s.settings_mut();
+                        settings.field_errors.remove(&draft_key);
+                        settings.set_field_draft(
+                            SettingsOperationDomain::Config,
+                            draft_key.clone(),
+                            value,
+                        );
+                    })
+            };
+            let add = {
+                let s = shared.clone();
+                let add_path = path.clone();
+                let item_schema = item_schema.clone();
+                let draft_key = add_key.clone();
+                sui::Button::new("Add entry")
+                    .icon(IconGlyph::Add)
+                    .theme_when(clone_reader(reader))
+                    .appearance(sui::ButtonAppearance::Tonal)
+                    .tone(SemanticTone::Neutral)
+                    .on_press(move || {
+                        let entry_key = s
+                            .settings()
+                            .field_drafts
+                            .get(&draft_key)
+                            .cloned()
+                            .unwrap_or_default();
+                        if let Err(error) = s.settings_mut().insert_config_schema_map_entry(
+                            index,
+                            &add_path,
+                            &entry_key,
+                            &item_schema,
+                        ) {
+                            s.settings_mut()
+                                .field_errors
+                                .insert(draft_key.clone(), error);
+                        }
+                    })
+            };
+            let add_body = Stack::vertical()
+                .spacing(4.0)
+                .alignment(Alignment::Stretch)
+                .with_child(input)
+                .with_child(Stack::horizontal().with_child(add))
+                .with_child(config_schema_feedback_label(
+                    shared,
+                    add_key.clone(),
+                    String::new(),
+                ));
+            group = group.with_child(
+                FormRow::new("New entry", add_body)
+                    .stacked()
+                    .theme_when(clone_reader(reader)),
+            );
+        }
+    }
+    WidgetPod::new(group)
+}
+
+fn config_schema_list_editor(
+    shared: &Shared,
+    reader: &ThemeReader,
+    index: usize,
+    value: &Value,
+    item_schema: &ConfigSchemaValue,
+    path: Vec<ConfigPathSegment>,
+    label: &str,
+    description: &str,
+    read_only: bool,
+) -> WidgetPod {
+    let items = value.as_array().cloned().unwrap_or_default();
+    let mut summary = Stack::vertical()
+        .spacing(4.0)
+        .alignment(Alignment::Stretch)
+        .with_child(muted_meta_label(shared, format!("{} items", items.len())));
+    if !description.trim().is_empty() {
+        summary = summary.with_child(muted_meta_label(shared, description.to_string()));
+    }
+    let mut group = FieldGroup::new().spacing(8.0).with_child(
+        FormRow::new(label, summary)
+            .stacked()
+            .theme_when(clone_reader(reader)),
+    );
+    for (item_index, item_value) in items.iter().enumerate() {
+        let mut item_path = path.clone();
+        item_path.push(ConfigPathSegment::Index(item_index));
+        group = group.with_child(PodHost::new(config_schema_value_editor(
+            shared,
+            reader,
+            index,
+            item_value,
+            item_schema,
+            item_path.clone(),
+            &format!("Item {}", item_index + 1),
+            "",
+            read_only,
+        )));
+        if !read_only {
+            let s = shared.clone();
+            let remove_path = item_path;
+            group = group.with_child(
+                Stack::horizontal().with_child(
+                    sui::Button::new(format!("Remove item {}", item_index + 1))
+                        .icon(IconGlyph::Close)
+                        .theme_when(clone_reader(reader))
+                        .appearance(sui::ButtonAppearance::Tonal)
+                        .tone(SemanticTone::Neutral)
+                        .on_press(move || {
+                            let _ = s
+                                .settings_mut()
+                                .remove_config_schema_path(index, &remove_path);
+                        }),
+                ),
+            );
+        }
+    }
+    if !read_only {
+        let s = shared.clone();
+        let add_path = path;
+        let item_schema = item_schema.clone();
+        group = group.with_child(
+            Stack::horizontal().with_child(
+                sui::Button::new("Add item")
+                    .icon(IconGlyph::Add)
+                    .theme_when(clone_reader(reader))
+                    .appearance(sui::ButtonAppearance::Tonal)
+                    .tone(SemanticTone::Neutral)
+                    .on_press(move || {
+                        let _ = s.settings_mut().append_config_schema_list_item(
+                            index,
+                            &add_path,
+                            &item_schema,
+                        );
+                    }),
+            ),
+        );
     }
     WidgetPod::new(group)
 }
@@ -8515,10 +9469,19 @@ fn config_schema_primitive_row(
     index: usize,
     value: &Value,
     schema: &ConfigSchemaValue,
-    path: Vec<String>,
+    path: Vec<ConfigPathSegment>,
     label: &str,
     description: &str,
+    read_only: bool,
 ) -> WidgetPod {
+    if read_only {
+        let mut detail = config_schema_inline_summary(value, schema);
+        if !description.trim().is_empty() {
+            detail.push_str(" · ");
+            detail.push_str(description);
+        }
+        return WidgetPod::new(value_row(shared, reader, label, detail));
+    }
     match schema {
         ConfigSchemaValue::Bool => {
             let current = value.as_bool().unwrap_or(false);
@@ -8526,27 +9489,28 @@ fn config_schema_primitive_row(
                 let s = shared.clone();
                 let path = path.clone();
                 move |enabled| {
-                    let operation = s.settings().config_schema_value_operation(
+                    if let Err(error) = s.settings_mut().set_config_schema_value_draft(
                         index,
                         path.clone(),
                         Value::Bool(enabled),
-                    );
-                    match operation {
-                        Ok((scope, operation)) => {
-                            queue_settings_operation(&s, scope, operation);
-                        }
-                        Err(error) => {
-                            if let Some(item) = s.settings().config_items.get(index) {
-                                let key = config_schema_field_key(&item.key, &path);
-                                s.settings_mut().field_errors.insert(key, error);
-                            }
-                        }
+                    ) && let Some(item) = s.settings().config_items.get(index)
+                    {
+                        let key = config_schema_field_key(&item.key, &path);
+                        s.settings_mut().field_errors.insert(key, error);
                     }
                 }
             });
-            WidgetPod::new(row)
+            let mut body = Stack::vertical()
+                .spacing(4.0)
+                .alignment(Alignment::Stretch)
+                .with_child(row);
+            if !description.trim().is_empty() {
+                body = body.with_child(muted_meta_label(shared, description.to_string()));
+            }
+            WidgetPod::new(body)
         }
         ConfigSchemaValue::String { choices, secret } if !choices.is_empty() && !*secret => {
+            let fallback_value = value.as_str().map(str::to_string);
             let options = choices
                 .iter()
                 .map(|choice| {
@@ -8563,9 +9527,14 @@ fn config_schema_primitive_row(
                     let s = shared.clone();
                     let path = path.clone();
                     let choices = choices.clone();
+                    let fallback_value = fallback_value.clone();
                     move || {
-                        let item = s.settings().config_items.get(index)?.clone();
-                        let current = config_value_at_path(&item.raw_value, &path)?.as_str()?;
+                        let settings = s.settings();
+                        let item = settings.config_items.get(index)?;
+                        let current =
+                            config_value_at_path(settings.config_schema_draft_value(item), &path)
+                                .and_then(Value::as_str)
+                                .or(fallback_value.as_deref())?;
                         choices.iter().position(|choice| choice.value == current)
                     }
                 })
@@ -8576,14 +9545,11 @@ fn config_schema_primitive_row(
                     let choices = choices.clone();
                     move |choice_index, _label| {
                         if let Some(choice) = choices.get(choice_index) {
-                            let operation = s.settings().config_schema_value_operation(
+                            let _ = s.settings_mut().set_config_schema_value_draft(
                                 index,
                                 path.clone(),
                                 Value::String(choice.value.clone()),
                             );
-                            if let Ok((scope, operation)) = operation {
-                                queue_settings_operation(&s, scope, operation);
-                            }
                         }
                     }
                 });
@@ -8601,12 +9567,52 @@ fn config_schema_primitive_row(
             )
         }
         ConfigSchemaValue::String { secret, .. } if *secret => {
-            WidgetPod::new(value_row(shared, reader, label, "Configured secret"))
+            let configured = value.as_str().is_some_and(|value| !value.is_empty());
+            let error_key = shared
+                .settings()
+                .config_items
+                .get(index)
+                .map(|item| config_schema_field_key(&item.key, &path));
+            let replacement = error_key
+                .as_ref()
+                .and_then(|key| shared.settings().field_drafts.get(key).cloned())
+                .unwrap_or_default();
+            let input = TextInput::new(schema_control_name(index, &path))
+                .value(replacement)
+                .placeholder("Enter replacement secret")
+                .theme_when(clone_reader(reader))
+                .on_change({
+                    let s = shared.clone();
+                    let path = path.clone();
+                    let schema = schema.clone();
+                    move |raw| {
+                        s.settings_mut().set_config_schema_text_draft(
+                            index,
+                            path.clone(),
+                            schema.clone(),
+                            raw,
+                        );
+                    }
+                });
+            let body = Stack::vertical()
+                .spacing(4.0)
+                .alignment(Alignment::Stretch)
+                .with_child(muted_meta_label(
+                    shared,
+                    if configured {
+                        "Current value: •••••••• · enter a replacement; the current secret is never prefilled"
+                    } else {
+                        "Not configured · enter a secret to configure this field"
+                    },
+                ))
+                .with_child(input);
+            WidgetPod::new(
+                FormRow::new(label, body)
+                    .stacked()
+                    .theme_when(clone_reader(reader)),
+            )
         }
-        ConfigSchemaValue::String { .. }
-        | ConfigSchemaValue::I64 { .. }
-        | ConfigSchemaValue::U64 { .. }
-        | ConfigSchemaValue::F64 { .. } => {
+        ConfigSchemaValue::I64 { .. } | ConfigSchemaValue::U64 { .. } => {
             let error_key = {
                 let settings = shared.settings();
                 settings
@@ -8639,55 +9645,109 @@ fn config_schema_primitive_row(
                         );
                     }
                 });
-            let save = {
-                let s = shared.clone();
-                let path = path.clone();
-                let schema = schema.clone();
-                let scope = error_key.clone().map(SettingsOperationScope::ConfigField);
-                sui::Button::new("Save")
-                    .icon(sui::IconGlyph::Check)
-                    .theme_when(clone_reader(reader))
-                    .appearance(sui::ButtonAppearance::Tonal)
-                    .tone(SemanticTone::Neutral)
-                    .enabled_when({
-                        let s = s.clone();
-                        let scope = scope.clone();
-                        move || {
-                            scope
-                                .as_ref()
-                                .is_none_or(|scope| !s.settings().operation_pending(scope))
-                        }
-                    })
-                    .on_press(move || {
-                        match s.settings().config_schema_text_operation(
-                            index,
-                            path.clone(),
-                            schema.clone(),
-                        ) {
-                            Ok((scope, operation)) => {
-                                queue_settings_operation(&s, scope, operation);
-                            }
-                            Err(error) => {
-                                if let Some(key) = scope.as_ref().and_then(|scope| match scope {
-                                    SettingsOperationScope::ConfigField(key) => Some(key.clone()),
-                                    _ => None,
-                                }) {
-                                    s.settings_mut().field_errors.insert(key, error);
-                                }
-                            }
-                        }
-                    })
-            };
             let mut body = Stack::vertical()
                 .spacing(4.0)
                 .alignment(Alignment::Stretch)
-                .with_child(input)
-                .with_child(Stack::horizontal().with_child(save));
-            let detail = error_key
-                .and_then(|key| shared.settings().field_errors.get(&key).cloned())
-                .unwrap_or_else(|| schema_field_detail(schema, description));
+                .with_child(input);
+            let fallback = schema_field_detail(schema, description);
+            if let Some(error_key) = error_key {
+                body = body.with_child(config_schema_feedback_label(shared, error_key, fallback));
+            } else if !fallback.trim().is_empty() {
+                body = body.with_child(muted_meta_label(shared, fallback));
+            }
+            WidgetPod::new(
+                FormRow::new(label, body)
+                    .stacked()
+                    .theme_when(clone_reader(reader)),
+            )
+        }
+        ConfigSchemaValue::F64 { range } => {
+            let current = value
+                .as_f64()
+                .unwrap_or_else(|| schema_default_number(range.as_ref()));
+            let type_bounds = (-f64::MAX, f64::MAX);
+            let (min, max) = range.as_ref().map_or(type_bounds, |range| {
+                (
+                    range.min.unwrap_or(type_bounds.0),
+                    range.max.unwrap_or(type_bounds.1),
+                )
+            });
+            let number = NumberInput::new(schema_control_name(index, &path))
+                .range(min, max)
+                .step(0.01)
+                .precision(2)
+                .value(current)
+                .theme_when(clone_reader(reader))
+                .on_change({
+                    let s = shared.clone();
+                    let path = path.clone();
+                    move |number| {
+                        let value = serde_json::Number::from_f64(number)
+                            .map(Value::Number)
+                            .unwrap_or(Value::Null);
+                        let _ = s.settings_mut().set_config_schema_value_draft(
+                            index,
+                            path.clone(),
+                            value,
+                        );
+                    }
+                });
+            let mut body = Stack::vertical()
+                .spacing(4.0)
+                .alignment(Alignment::Stretch)
+                .with_child(number);
+            let detail = schema_field_detail(schema, description);
             if !detail.trim().is_empty() {
                 body = body.with_child(muted_meta_label(shared, detail));
+            }
+            WidgetPod::new(
+                FormRow::new(label, body)
+                    .stacked()
+                    .theme_when(clone_reader(reader)),
+            )
+        }
+        ConfigSchemaValue::String { .. } => {
+            let error_key = {
+                let settings = shared.settings();
+                settings
+                    .config_items
+                    .get(index)
+                    .map(|item| config_schema_field_key(&item.key, &path))
+            };
+            let value_text = error_key
+                .as_ref()
+                .map(|key| {
+                    shared
+                        .settings()
+                        .field_draft_or(key, || schema_scalar_edit_value(schema, value))
+                })
+                .unwrap_or_else(|| schema_scalar_edit_value(schema, value));
+            let input = TextInput::new(schema_control_name(index, &path))
+                .value(value_text)
+                .placeholder(schema_placeholder(schema))
+                .theme_when(clone_reader(reader))
+                .on_change({
+                    let s = shared.clone();
+                    let path = path.clone();
+                    let schema = schema.clone();
+                    move |raw| {
+                        s.settings_mut().set_config_schema_text_draft(
+                            index,
+                            path.clone(),
+                            schema.clone(),
+                            raw,
+                        );
+                    }
+                });
+            let mut body = Stack::vertical()
+                .spacing(4.0)
+                .alignment(Alignment::Stretch)
+                .with_child(input);
+            let fallback = schema_field_detail(schema, description);
+            if let Some(error_key) = error_key {
+                body = body.with_child(config_schema_feedback_label(shared, error_key, fallback));
+            } else if !fallback.trim().is_empty() {
+                body = body.with_child(muted_meta_label(shared, fallback));
             }
             WidgetPod::new(
                 FormRow::new(label, body)
@@ -8704,6 +9764,7 @@ fn config_schema_primitive_row(
             path,
             label,
             description,
+            false,
         ),
     }
 }
@@ -8714,10 +9775,19 @@ fn config_schema_json_row(
     index: usize,
     value: &Value,
     schema: &ConfigSchemaValue,
-    path: Vec<String>,
+    path: Vec<ConfigPathSegment>,
     label: &str,
     description: &str,
+    read_only: bool,
 ) -> WidgetPod {
+    if read_only {
+        return WidgetPod::new(value_row(
+            shared,
+            reader,
+            label,
+            config_json_value_summary(value),
+        ));
+    }
     let fallback_value = if value.is_null() {
         String::new()
     } else {
@@ -8753,52 +9823,27 @@ fn config_schema_json_row(
                 );
             }
         });
-    let save = {
-        let s = shared.clone();
-        let path = path.clone();
-        let schema = schema.clone();
-        let scope = error_key.clone().map(SettingsOperationScope::ConfigField);
-        sui::Button::new("Save JSON")
-            .icon(sui::IconGlyph::Check)
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Tonal)
-            .tone(SemanticTone::Neutral)
-            .enabled_when({
-                let s = s.clone();
-                let scope = scope.clone();
-                move || {
-                    scope
-                        .as_ref()
-                        .is_none_or(|scope| !s.settings().operation_pending(scope))
-                }
-            })
-            .on_press(move || {
-                match s
-                    .settings()
-                    .config_schema_text_operation(index, path.clone(), schema.clone())
-                {
-                    Ok((scope, operation)) => {
-                        queue_settings_operation(&s, scope, operation);
-                    }
-                    Err(error) => {
-                        if let Some(SettingsOperationScope::ConfigField(key)) = scope.as_ref() {
-                            s.settings_mut().field_errors.insert(key.clone(), error);
-                        }
-                    }
-                }
-            })
-    };
     let mut body = Stack::vertical()
         .spacing(4.0)
         .alignment(Alignment::Stretch)
-        .with_child(SizedBox::new().height(92.0).with_child(editor))
-        .with_child(Stack::horizontal().with_child(save));
-    let detail = error_key
-        .as_ref()
-        .and_then(|key| shared.settings().field_errors.get(key).cloned())
-        .unwrap_or_else(|| schema_field_detail(schema, description));
-    if !detail.trim().is_empty() {
-        body = body.with_child(muted_meta_label(shared, detail));
+        .with_child(
+            Stack::horizontal().with_child(
+                StatusBadge::new("Raw JSON fallback")
+                    .icon(IconGlyph::Alert)
+                    .tone(SemanticTone::Warning)
+                    .theme_when(clone_reader(reader)),
+            ),
+        )
+        .with_child(muted_meta_label(
+            shared,
+            "This schema explicitly permits arbitrary data. JSON is only the human editing projection; the config service transports the typed value as SOBJ.",
+        ))
+        .with_child(SizedBox::new().height(92.0).with_child(editor));
+    let fallback = schema_field_detail(schema, description);
+    if let Some(error_key) = error_key {
+        body = body.with_child(config_schema_feedback_label(shared, error_key, fallback));
+    } else if !fallback.trim().is_empty() {
+        body = body.with_child(muted_meta_label(shared, fallback));
     }
     WidgetPod::new(
         FormRow::new(label, body)
@@ -8807,21 +9852,28 @@ fn config_schema_json_row(
     )
 }
 
-fn config_value_at_path<'a>(value: &'a Value, path: &[String]) -> Option<&'a Value> {
+fn config_value_at_path<'a>(value: &'a Value, path: &[ConfigPathSegment]) -> Option<&'a Value> {
     let mut current = value;
     for segment in path {
-        current = current.as_object()?.get(segment)?;
+        current = match segment {
+            ConfigPathSegment::Field(field) => current.as_object()?.get(field)?,
+            ConfigPathSegment::Index(index) => current.as_array()?.get(*index)?,
+        };
     }
     Some(current)
 }
 
-fn schema_control_name(index: usize, path: &[String]) -> String {
+fn schema_control_name(index: usize, path: &[ConfigPathSegment]) -> String {
     if path.is_empty() {
         return format!("config-{index}-schema-root");
     }
     let path = path
         .iter()
         .map(|segment| {
+            let segment = match segment {
+                ConfigPathSegment::Field(field) => field.clone(),
+                ConfigPathSegment::Index(index) => format!("item-{index}"),
+            };
             segment
                 .chars()
                 .map(|ch| {
@@ -8963,7 +10015,10 @@ fn config_schema_value_summary(value: &Value, schema: &ConfigSchemaValue, name: 
             };
             let mut parts = Vec::new();
             for field in fields.iter().take(2) {
-                let value = map.get(&field.name).unwrap_or(&Value::Null);
+                let value = map
+                    .get(&field.name)
+                    .or(field.default_value.as_ref())
+                    .unwrap_or(&Value::Null);
                 parts.push(format!(
                     "{}: {}",
                     field.label,
@@ -8996,7 +10051,13 @@ fn config_schema_inline_summary(value: &Value, schema: &ConfigSchemaValue) -> St
                 value.to_string()
             }
         }
-        ConfigSchemaValue::String { secret, .. } if *secret => "configured secret".to_string(),
+        ConfigSchemaValue::String { secret, .. } if *secret => {
+            if value.as_str().is_some_and(|value| !value.is_empty()) {
+                "configured secret".to_string()
+            } else {
+                "unset".to_string()
+            }
+        }
         ConfigSchemaValue::String { .. } => value
             .as_str()
             .map(|text| short_one_line(text, 64))
@@ -10263,13 +11324,16 @@ mod tests {
         );
 
         let path = vec![
-            "modules".to_string(),
-            "observe".to_string(),
-            "enabled".to_string(),
+            ConfigPathSegment::Field("modules".to_string()),
+            ConfigPathSegment::Field("observe".to_string()),
+            ConfigPathSegment::Field("enabled".to_string()),
         ];
+        state
+            .set_config_schema_value_draft(idx, path.clone(), Value::Bool(true))
+            .expect("schema draft");
         let (scope, operation) = state
-            .config_schema_value_operation(idx, path.clone(), Value::Bool(true))
-            .expect("schema operation");
+            .config_schema_save_operation(idx)
+            .expect("whole-definition schema operation");
         apply_test_operation(&mut state, &backend, scope, operation);
         assert!(
             !state.field_errors.contains_key(&config_schema_field_key(
@@ -10294,6 +11358,162 @@ mod tests {
         );
         assert!(config_value_summary(&state.config_items[idx]).contains("ModuleRuntimeConfig"));
         assert!(config_value_summary(&state.config_items[idx]).contains("1 entries"));
+    }
+
+    #[test]
+    fn schema_config_draft_composes_sibling_edits_into_one_save() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+        let idx = state
+            .config_items
+            .iter()
+            .position(|item| item.key == sinomo_runtime::module::MODULE_NODE_CONFIG_KEY)
+            .expect("module node config item");
+        let observe = vec![
+            ConfigPathSegment::Field("modules".to_string()),
+            ConfigPathSegment::Field("observe".to_string()),
+            ConfigPathSegment::Field("enabled".to_string()),
+        ];
+        let dfs = vec![
+            ConfigPathSegment::Field("modules".to_string()),
+            ConfigPathSegment::Field("dfs".to_string()),
+            ConfigPathSegment::Field("enabled".to_string()),
+        ];
+
+        state
+            .set_config_schema_value_draft(idx, observe.clone(), Value::Bool(true))
+            .expect("observe draft");
+        state
+            .set_config_schema_value_draft(idx, dfs.clone(), Value::Bool(false))
+            .expect("dfs draft");
+        let draft = state.config_schema_draft_value(&state.config_items[idx]);
+        assert_eq!(
+            config_value_at_path(draft, &observe).and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            config_value_at_path(draft, &dfs).and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let (scope, operation) = state
+            .config_schema_save_operation(idx)
+            .expect("one validated save");
+        let SettingsOperation::SetConfigDocument { value, .. } = &operation else {
+            panic!("schema save must write the whole typed definition");
+        };
+        assert_eq!(
+            config_value_at_path(value, &observe).and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            config_value_at_path(value, &dfs).and_then(Value::as_bool),
+            Some(false)
+        );
+
+        apply_test_operation(&mut state, &backend, scope, operation);
+        assert!(
+            !state
+                .config_drafts
+                .contains_key(sinomo_runtime::module::MODULE_NODE_CONFIG_KEY)
+        );
+    }
+
+    #[test]
+    fn schema_path_helpers_edit_nested_lists_and_maps() {
+        let mut value = serde_json::json!({
+            "services": {
+                "primary": {
+                    "targets": [{"url": "one"}]
+                }
+            }
+        });
+        let second_url = vec![
+            ConfigPathSegment::Field("services".to_string()),
+            ConfigPathSegment::Field("primary".to_string()),
+            ConfigPathSegment::Field("targets".to_string()),
+            ConfigPathSegment::Index(1),
+            ConfigPathSegment::Field("url".to_string()),
+        ];
+        set_json_path_value(&mut value, &second_url, Value::String("two".to_string()))
+            .expect("set nested list value");
+        assert_eq!(
+            config_value_at_path(&value, &second_url).and_then(Value::as_str),
+            Some("two")
+        );
+
+        let first = vec![
+            ConfigPathSegment::Field("services".to_string()),
+            ConfigPathSegment::Field("primary".to_string()),
+            ConfigPathSegment::Field("targets".to_string()),
+            ConfigPathSegment::Index(0),
+        ];
+        remove_json_path_value(&mut value, &first).expect("remove first list item");
+        let now_first_url = vec![
+            ConfigPathSegment::Field("services".to_string()),
+            ConfigPathSegment::Field("primary".to_string()),
+            ConfigPathSegment::Field("targets".to_string()),
+            ConfigPathSegment::Index(0),
+            ConfigPathSegment::Field("url".to_string()),
+        ];
+        assert_eq!(
+            config_value_at_path(&value, &now_first_url).and_then(Value::as_str),
+            Some("two")
+        );
+
+        let config_key = "test.list";
+        let old_first = vec![ConfigPathSegment::Index(0)];
+        let old_second = vec![ConfigPathSegment::Index(1)];
+        let mut drafts = HashMap::from([
+            (
+                config_schema_field_key(config_key, &old_first),
+                "one".to_string(),
+            ),
+            (
+                config_schema_field_key(config_key, &old_second),
+                "two".to_string(),
+            ),
+        ]);
+        clear_config_schema_auxiliary_path(&mut drafts, config_key, &old_first);
+        move_config_schema_auxiliary_path(&mut drafts, config_key, &old_second, &old_first);
+        assert_eq!(
+            drafts
+                .get(&config_schema_field_key(config_key, &old_first))
+                .map(String::as_str),
+            Some("two")
+        );
+        assert!(!drafts.contains_key(&config_schema_field_key(config_key, &old_second)));
+    }
+
+    #[test]
+    fn schema_read_only_definition_rejects_drafts() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+        let idx = state
+            .config_items
+            .iter()
+            .position(|item| item.schema.is_some())
+            .expect("schema-backed config item");
+        state.config_items[idx].read_only = true;
+        let result = state.set_config_schema_value_draft(idx, Vec::new(), Value::Null);
+        assert_eq!(
+            result.expect_err("read-only draft must fail"),
+            "this configuration is read-only"
+        );
+        assert!(state.config_schema_save_operation(idx).is_err());
+        assert!(state.config_drafts.is_empty());
+    }
+
+    #[test]
+    fn module_id_matching_normalizes_legacy_aliases() {
+        let legacy = "module.sandbox.wasix";
+        let canonical = sinomo_runtime::core::Id::from_legacy_named(legacy)
+            .expect("canonical module id")
+            .to_string();
+        assert!(module_ids_match(&canonical, legacy));
+        assert!(module_ids_match(legacy, &canonical));
+        assert!(!module_ids_match(&canonical, "module.other"));
+        assert!(!module_ids_match("not valid / id", legacy));
     }
 
     #[test]
@@ -10882,6 +12102,8 @@ mod tests {
     fn settings_modules_section_names_and_separates_lifecycle_states() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
+        let associated_index;
+        let unmatched_index;
         {
             let mut app = shared.borrow_mut();
             app.active_tab = Tab::Settings;
@@ -10915,6 +12137,59 @@ mod tests {
                 }],
                 warnings: Vec::new(),
             };
+            associated_index = settings.config_items.len();
+            let mut associated = test_config_item(
+                "test.sandbox.settings",
+                ConfigEditKind::Json,
+                r#"{"enabled":true,"endpoint":"https://sandbox.test"}"#,
+            );
+            associated.module_id = Some(
+                sinomo_runtime::core::Id::from_legacy_named("module.sandbox.wasix")
+                    .expect("canonical module id")
+                    .to_string(),
+            );
+            associated.schema = Some(ConfigSchema::object(
+                "SandboxSettings",
+                "Sandbox module settings",
+                vec![
+                    ConfigSchemaField::new(
+                        "enabled",
+                        "Enabled",
+                        "Enable the sandbox integration.",
+                        ConfigSchemaValue::bool(),
+                    ),
+                    ConfigSchemaField::new(
+                        "endpoint",
+                        "Endpoint",
+                        "Sandbox service endpoint.",
+                        ConfigSchemaValue::string(),
+                    ),
+                ],
+            ));
+            settings.config_items.push(associated);
+
+            unmatched_index = settings.config_items.len();
+            let mut unmatched = test_config_item(
+                "test.headless.settings",
+                ConfigEditKind::Json,
+                r#"{"workspace":"/tmp/evolution"}"#,
+            );
+            unmatched.module_id = Some(
+                sinomo_runtime::core::Id::from_legacy_named("module.without.lifecycle.card")
+                    .expect("canonical module id")
+                    .to_string(),
+            );
+            unmatched.schema = Some(ConfigSchema::object(
+                "HeadlessModuleSettings",
+                "Settings for a module without a lifecycle card",
+                vec![ConfigSchemaField::new(
+                    "workspace",
+                    "Workspace",
+                    "Module workspace.",
+                    ConfigSchemaValue::string(),
+                )],
+            ));
+            settings.config_items.push(unmatched);
         }
 
         let runtime = sui::Application::new()
@@ -10948,6 +12223,166 @@ mod tests {
             .get_by_text("Technical ID")
             .expect()
             .to_be_visible()?;
+        assert!(
+            window
+                .get_by_text("Settings · test.sandbox.settings")
+                .count()?
+                >= 1,
+            "a canonical config module ID must match its legacy lifecycle card"
+        );
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name(format!("config-{associated_index}-schema-endpoint"))
+            .expect()
+            .to_have_value("https://sandbox.test")?;
+        window
+            .get_by_text("Additional module settings")
+            .expect()
+            .to_be_visible()?;
+        assert!(
+            window
+                .get_by_text("Settings · test.headless.settings")
+                .count()?
+                >= 1,
+            "module settings without lifecycle cards must remain visible"
+        );
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name(format!("config-{unmatched_index}-schema-workspace"))
+            .expect()
+            .to_have_value("/tmp/evolution")?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn schema_editor_displays_omitted_defaults_without_offering_unset() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let index;
+        let item;
+        let schema;
+        {
+            let mut settings = shared.settings_mut();
+            index = settings.config_items.len();
+            let mut config_item = test_config_item(
+                "test.defaults",
+                ConfigEditKind::Json,
+                r#"{"present":"custom","token":"sk-stored-secret","exact_limit":18446744073709551615}"#,
+            );
+            config_item.schema = Some(ConfigSchema::object(
+                "DefaultSettings",
+                "",
+                vec![
+                    ConfigSchemaField::new(
+                        "mode",
+                        "Mode",
+                        "",
+                        ConfigSchemaValue::string_choices(vec![
+                            sinomo_runtime::config::ConfigSchemaChoice::new("auto", "Automatic"),
+                            sinomo_runtime::config::ConfigSchemaChoice::new("manual", "Manual"),
+                        ]),
+                    )
+                    .optional()
+                    .with_default_value(Value::String("auto".to_string())),
+                    ConfigSchemaField::new("present", "Present", "", ConfigSchemaValue::string())
+                        .optional()
+                        .with_default_value(Value::String("default".to_string())),
+                    ConfigSchemaField::new(
+                        "limit_ms",
+                        "Latency limit",
+                        "Optional latency limit.",
+                        ConfigSchemaValue::u64(None),
+                    )
+                    .optional(),
+                    ConfigSchemaField::new(
+                        "exact_limit",
+                        "Exact integer limit",
+                        "A full-width integer must not round through f64.",
+                        ConfigSchemaValue::u64(None),
+                    ),
+                    ConfigSchemaField::new(
+                        "optional_token",
+                        "Optional token",
+                        "Optional replacement credential.",
+                        ConfigSchemaValue::secret_string(),
+                    )
+                    .optional(),
+                    ConfigSchemaField::new(
+                        "token",
+                        "Token",
+                        "Replacement credential.",
+                        ConfigSchemaValue::secret_string(),
+                    ),
+                ],
+            ));
+            settings.config_items.push(config_item);
+            item = settings.config_items[index].clone();
+            schema = item.schema.clone().expect("schema");
+        }
+        let reader: ThemeReader = {
+            let s = shared.clone();
+            Rc::new(move || s.theme())
+        };
+        let runtime =
+            sui::Application::new()
+                .window(sui::WindowBuilder::new().title("Schema defaults").root(
+                    config_schema_editor(&shared, &reader, index, &item, &schema),
+                ))
+                .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::ComboBox)
+            .with_name(format!("config-{index}-schema-mode"))
+            .expect()
+            .to_have_value("Automatic")?;
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Unset Mode")
+                .count()?,
+            0,
+            "an inherited default is not a stored field and must not offer Unset"
+        );
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Unset Present")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Set Latency limit")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name(format!("config-{index}-schema-exact_limit"))
+            .expect()
+            .to_have_value("18446744073709551615")?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Set Optional token")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name(format!("config-{index}-schema-token"))
+            .expect()
+            .to_have_value("")?;
+        assert_eq!(
+            window.get_by_text("sk-stored-secret").count()?,
+            0,
+            "stored schema secrets must never be copied into the rendered editor"
+        );
+        assert_eq!(
+            config_schema_inline_summary(
+                &Value::String(String::new()),
+                &ConfigSchemaValue::secret_string(),
+            ),
+            "unset"
+        );
 
         Ok(())
     }
@@ -11888,6 +13323,7 @@ mod tests {
         ConfigItem {
             key: key.to_string(),
             owner: "test".to_string(),
+            module_id: None,
             description: "test setting".to_string(),
             value: raw.to_string(),
             source: "cluster",
@@ -11896,6 +13332,7 @@ mod tests {
             edit_value: raw.to_string(),
             raw_value,
             schema: None,
+            read_only: false,
         }
     }
 
@@ -11916,6 +13353,57 @@ mod tests {
         let detail = config_detail_value(&item);
         assert!(detail.contains("[redacted]"));
         assert!(!detail.contains("sk-live-secret"));
+    }
+
+    #[test]
+    fn schema_default_value_recurses_and_materializes_declared_field_defaults() {
+        let schema =
+            ConfigSchemaValue::object(vec![
+                ConfigSchemaField::new("mode", "Mode", "", ConfigSchemaValue::string())
+                    .optional()
+                    .with_default_value(Value::String("auto".to_string())),
+                ConfigSchemaField::new("enabled", "Enabled", "", ConfigSchemaValue::bool()),
+                ConfigSchemaField::new(
+                    "targets",
+                    "Targets",
+                    "",
+                    ConfigSchemaValue::list(ConfigSchemaValue::object(vec![
+                        ConfigSchemaField::new("url", "URL", "", ConfigSchemaValue::string()),
+                    ])),
+                ),
+                ConfigSchemaField::new("note", "Note", "", ConfigSchemaValue::string()).optional(),
+            ]);
+
+        assert_eq!(
+            schema_default_value(&schema),
+            serde_json::json!({"mode": "auto", "enabled": false, "targets": []})
+        );
+        assert!(
+            config_schema_value_summary(&serde_json::json!({}), &schema, "TestSettings")
+                .contains("Mode: auto"),
+            "summaries should project declared defaults for omitted fields"
+        );
+    }
+
+    #[test]
+    fn config_rebuild_signature_tracks_same_length_values_and_schema_metadata() {
+        let mut item = test_config_item("test.signature", ConfigEditKind::Json, r#"{"v":1}"#);
+        let before = config_item_rebuild_signature(&item);
+        item.update_value(serde_json::json!({"v": 2}));
+        let value_changed = config_item_rebuild_signature(&item);
+        assert_ne!(before, value_changed);
+
+        item.schema = Some(ConfigSchema::object(
+            "SignatureSettings",
+            "",
+            vec![ConfigSchemaField::new(
+                "v",
+                "Value",
+                "",
+                ConfigSchemaValue::i64(None),
+            )],
+        ));
+        assert_ne!(value_changed, config_item_rebuild_signature(&item));
     }
 
     #[test]
@@ -11942,6 +13430,14 @@ mod tests {
             app.active_tab = Tab::Settings;
             let settings = &mut app.ready.as_mut().expect("ready state").settings;
             settings.open(SettingsSection::Configuration);
+            settings.config_items.insert(
+                0,
+                test_config_item(
+                    "test.raw-fallback",
+                    ConfigEditKind::Json,
+                    r#"{"legacy":true}"#,
+                ),
+            );
         }
 
         let runtime = sui::Application::new()
@@ -12002,6 +13498,10 @@ mod tests {
         window
             .get_by_role(sui::SemanticsRole::TextInput)
             .with_name("config-0-raw")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_text("Raw editor fallback")
             .expect()
             .to_be_visible()?;
 

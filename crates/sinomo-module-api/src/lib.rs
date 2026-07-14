@@ -173,6 +173,11 @@ pub struct NativeModuleSurfaces {
     pub capability_imports: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capability_exports: Vec<String>,
+    /// SOBJ-encoded `sinomo_config::ConfigDefinition` records contributed by
+    /// this module. Keeping the stable ABI payload SOBJ-native avoids making
+    /// JSON or JSON Schema part of the module settings contract.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settings: Vec<ModuleSettingsExport>,
     /// Cluster transport kinds this dylib serves as a runtime network module
     /// (e.g. `"iroh"`). Non-empty surfaces tell the host to resolve the
     /// dylib's network-module entry symbol in addition to the standard module
@@ -189,7 +194,25 @@ impl NativeModuleSurfaces {
             && self.storage_owners.is_empty()
             && self.capability_imports.is_empty()
             && self.capability_exports.is_empty()
+            && self.settings.is_empty()
             && self.network_transports.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ModuleSettingsExport {
+    /// Duplicated outside the encoded definition for cheap catalog inspection
+    /// and deterministic duplicate detection before decoding the payload.
+    pub key: String,
+    pub definition_sobj: Vec<u8>,
+}
+
+impl ModuleSettingsExport {
+    pub fn new(key: impl Into<String>, definition_sobj: Vec<u8>) -> Self {
+        Self {
+            key: key.into(),
+            definition_sobj,
+        }
     }
 }
 

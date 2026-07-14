@@ -806,6 +806,47 @@ pub fn list_job_records(
     Ok(records)
 }
 
+pub fn evolution_config_schema() -> sinomo_runtime::config::ConfigSchema {
+    use sinomo_runtime::config::{ConfigSchema, ConfigSchemaField, ConfigSchemaValue};
+
+    ConfigSchema::object(
+        "EvolutionConfig",
+        "Local defaults used when creating evolution jobs and storing their artifacts.",
+        vec![
+            ConfigSchemaField::new(
+                "repo",
+                "Target repository",
+                "Repository used when an evolution command does not supply an explicit target.",
+                ConfigSchemaValue::string(),
+            ),
+            ConfigSchemaField::new(
+                "default_provider",
+                "Default model provider",
+                "Optional language-model provider selected for evolution work.",
+                ConfigSchemaValue::string(),
+            )
+            .optional(),
+            ConfigSchemaField::new(
+                "default_model",
+                "Default model",
+                "Optional provider model selected for evolution work.",
+                ConfigSchemaValue::string(),
+            )
+            .optional(),
+            ConfigSchemaField::new(
+                "sifs_artifact_root",
+                "SIFS artifact root",
+                "SIFS directory where evolution artifacts are mirrored. Defaults to /services/evolution/artifacts.",
+                ConfigSchemaValue::string(),
+            )
+            .optional()
+            .with_default_value(serde_json::Value::String(
+                default_evolution_sifs_artifact_root(),
+            )),
+        ],
+    )
+}
+
 pub fn evolution_config_definition() -> Result<ConfigDefinition, EvolutionPersistenceError> {
     ConfigDefinition::new(
         EVOLUTION_CONFIG_KEY,
@@ -816,6 +857,10 @@ pub fn evolution_config_definition() -> Result<ConfigDefinition, EvolutionPersis
         "Local evolution defaults such as target repo and preferred model.",
         ConfigClusterMode::LocalOnly,
     )
+    .map_err(map_evolution_config_error)?
+    .with_schema(evolution_config_schema())
+    .map_err(map_evolution_config_error)?
+    .with_module_id(crate::evolution_module_id().to_string())
     .map_err(map_evolution_config_error)
 }
 
@@ -1530,6 +1575,69 @@ mod tests {
     use sinomo_runtime::node::NodeId;
 
     type ScorecardId = Id;
+
+    fn assert_fully_typed_schema(value: &sinomo_runtime::config::ConfigSchemaValue) {
+        use sinomo_runtime::config::ConfigSchemaValue;
+
+        match value {
+            ConfigSchemaValue::Object { fields, .. } => {
+                assert!(
+                    !fields.is_empty(),
+                    "object schemas must declare their fields"
+                );
+                for field in fields {
+                    assert_fully_typed_schema(&field.value);
+                }
+            }
+            ConfigSchemaValue::Map { value } | ConfigSchemaValue::List { value } => {
+                assert_fully_typed_schema(value);
+            }
+            ConfigSchemaValue::Json => panic!("config schema must not use an untyped JSON value"),
+            ConfigSchemaValue::Bool
+            | ConfigSchemaValue::I64 { .. }
+            | ConfigSchemaValue::U64 { .. }
+            | ConfigSchemaValue::F64 { .. }
+            | ConfigSchemaValue::String { .. }
+            | ConfigSchemaValue::StringList => {}
+        }
+    }
+
+    #[test]
+    fn evolution_config_schema_is_recursive_and_validates_config_shape() {
+        let definition = evolution_config_definition().expect("evolution config definition");
+        assert!(
+            definition.default_value.is_none(),
+            "evolution keeps requiring an explicit target repository"
+        );
+        let value = serde_json::to_value(EvolutionConfig {
+            repo: "/workspace/sinomo".to_string(),
+            default_provider: Some("openai".to_string()),
+            default_model: Some("gpt-5".to_string()),
+            sifs_artifact_root: default_evolution_sifs_artifact_root(),
+        })
+        .expect("serialize evolution config");
+        definition
+            .validate_value(&value)
+            .expect("representative evolution config must satisfy its schema");
+
+        let schema = definition.schema.as_ref().expect("evolution config schema");
+        assert_fully_typed_schema(&schema.value);
+        let sinomo_runtime::config::ConfigSchemaValue::Object { fields, .. } = &schema.value else {
+            panic!("evolution config schema must be an object")
+        };
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "repo",
+                "default_provider",
+                "default_model",
+                "sifs_artifact_root",
+            ]
+        );
+    }
 
     #[test]
     fn evolution_config_writes_shared_config_document() {

@@ -74,6 +74,12 @@ pub fn evolution_module_surfaces() -> sinomo_runtime::module::ModuleSurfaces {
         .with_event_kind_name(EVOLUTION_REPLAY_FAILURE_EVENT_KIND)
         .with_event_kind_name(EVOLUTION_SCORECARD_STALE_EVENT_KIND)
         .with_storage_owner(SINOMO_EVOLUTION_MODULE_OWNER);
+    surfaces = surfaces
+        .with_config_definition(
+            persistence::evolution_config_definition()
+                .expect("evolution config definition must be valid"),
+        )
+        .expect("evolution settings surface must be valid");
     surfaces.capabilities = evolution_module_capabilities();
     surfaces
 }
@@ -161,6 +167,19 @@ mod module_declaration_tests {
                 .exports
                 .iter()
                 .any(|capability| capability.as_str() == "evolution.cli")
+        );
+        registration
+            .validate_surfaces()
+            .expect("evolution settings must belong to this module");
+        let definitions = registration
+            .surfaces
+            .config_definitions()
+            .expect("evolution settings surface");
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].key.as_str(), EVOLUTION_CONFIG_KEY);
+        assert_eq!(
+            definitions[0].module_id.as_deref(),
+            Some(evolution_module_id().as_str())
         );
     }
 

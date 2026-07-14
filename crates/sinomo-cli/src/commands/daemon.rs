@@ -275,8 +275,9 @@ pub(crate) fn run_daemon_with_paths(
         vec![
             sinomo_runtime::daemon::DaemonServiceRegistryHook::new(sinomo_agent::register_services)
                 .with_config_definitions(|builder| {
-                    sinomo_lm::register_config_definitions(builder)
-                        .map_err(|error| error.to_string())
+                    let builder = sinomo_lm::register_config_definitions(builder)
+                        .map_err(|error| error.to_string())?;
+                    register_cli_runtime_config_definitions(builder)
                 })
                 .with_observe_metric_exporters(sinomo_agent::register_observe_metric_exporters),
         ],
