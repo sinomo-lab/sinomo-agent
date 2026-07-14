@@ -1,0 +1,56 @@
+image: rust:1.96.0-bookworm
+
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - when: never
+
+stages:
+  - build
+
+variables:
+  CARGO_HOME: "$CI_PROJECT_DIR/.cache/cargo"
+  CARGO_TARGET_DIR: "$CI_PROJECT_DIR/target/ci"
+  CARGO_TERM_COLOR: "always"
+  SUI_REF: "main"
+  SINOMO_RELEASE_TARGETS: >-
+    x86_64-unknown-linux-gnu
+    aarch64-unknown-linux-gnu
+    x86_64-pc-windows-gnu
+
+default:
+  interruptible: true
+  cache:
+    key:
+      files:
+        - Cargo.lock
+      prefix: cargo-rust-1.96
+    paths:
+      - .cache/cargo/registry/index/
+      - .cache/cargo/registry/cache/
+      - .cache/cargo/git/db/
+
+build:cross-platform-cli:
+  stage: build
+  timeout: 2h
+  before_script:
+    - >-
+      apt-get update
+      && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends
+      ca-certificates
+      file
+      gcc-aarch64-linux-gnu
+      gcc-mingw-w64-x86-64-posix
+      git
+      libc6-dev-arm64-cross
+      mingw-w64-x86-64-dev
+      zip
+    - rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-gnu
+    - ./scripts/ci/checkout-sui.sh
+  script:
+    - ./scripts/ci/build-release-artifacts.sh
+  artifacts:
+    name: "sinomo-$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - dist/
+    expire_in: 14 days
