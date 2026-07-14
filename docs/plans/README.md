@@ -11,6 +11,7 @@ tests for that.
 | [R0/R1 crate boundary refactor](r0-r1-crate-boundary-refactor.md) | Completed implementation record. |
 | [Reactive cluster KV/Raft improvements](reactive-cluster-kv-raft-improvement-plan.md) | Proposed follow-up work. |
 | [DFS policy and authority hardening](dfs-policy-and-authority-hardening.md) | Proposed follow-up work. |
+| [Indexed-file memory implementation](indexed-file-memory-implementation.md) | Proposed follow-up work. |
 | [Formal verification roadmap](formal-verification-roadmap.md) | Active verification backlog. |
 | [System architecture proposal](system-architecture-proposal.md) | Historical and superseded by the current architecture. |
 

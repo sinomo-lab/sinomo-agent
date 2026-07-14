@@ -27,7 +27,7 @@ subsystem document relevant to the change:
 | Cluster identity, membership, consensus, and failure | [Clustering](clustering-architecture.md) |
 | Routing, endpoint selection, and transports | [Network](network-architecture.md) |
 | Distributed metadata, content, and consistency | [DFS](dfs-architecture.md) |
-| Long-horizon records, retrieval, and governance | [Memory](memory-architecture.md) |
+| Indexed-file memory, retrieval, overlays, and governance | [Memory](memory-architecture.md) |
 | Module identity, activation, and replacement | [Module lifecycle](module-lifecycle-architecture.md) |
 | Evaluation, mutation, promotion, and rollback | [Self-evolution](self-evolution-architecture.md) |
 | Logs, metrics, traces, and observation routes | [Observability](observability-architecture.md) |

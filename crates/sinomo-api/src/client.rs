@@ -1061,9 +1061,20 @@ pub async fn send_daemon_rpc_stream_async(
     address: &str,
     request: &ObjectRpcRequest,
     timeouts: sinomo_core::network::DaemonRpcTimeouts,
-    mut on_response: impl FnMut(ObjectRpcResponse) -> Result<bool, DaemonApiError>,
+    on_response: impl FnMut(ObjectRpcResponse) -> Result<bool, DaemonApiError>,
 ) -> Result<(), DaemonApiError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
+    send_daemon_rpc_stream_from_data_dir_async(data_dir, address, request, timeouts, on_response)
+        .await
+}
+
+pub async fn send_daemon_rpc_stream_from_data_dir_async(
+    data_dir: SinomoDataDir,
+    address: &str,
+    request: &ObjectRpcRequest,
+    timeouts: sinomo_core::network::DaemonRpcTimeouts,
+    mut on_response: impl FnMut(ObjectRpcResponse) -> Result<bool, DaemonApiError>,
+) -> Result<(), DaemonApiError> {
     let runtime = tokio::runtime::Handle::current();
     let mut host = DaemonApiSessionHost {
         data_dir: data_dir.clone(),
@@ -1091,6 +1102,7 @@ pub async fn send_daemon_rpc_stream_async(
             .call_endpoint_session(&state, &endpoint, call, options)
             .await?
     };
+    result.response.error_detail()?;
     let mut body = result.body;
     loop {
         let rpc = sinomo_core::network::read_object_frame_async(

@@ -81,7 +81,16 @@ use sinomo_cli::app_api::{
     ChatUsageSnapshot, ProviderSummary, SifsAgentChannelStore, agent_summaries,
     agent_summaries_with_error, built_in_agent_summaries, reasoning_efforts,
 };
-use sinomo_runtime::{config::ConfigClient, events::SessionId, local::SinomoDataDir};
+use sinomo_runtime::{
+    api::{
+        DAEMON_EVENT_SUBSCRIBE_ROUTE, DAEMON_RPC_CATEGORY, DaemonApiError, DaemonEventStreamItem,
+        DaemonEventSubscribeRequest, send_daemon_rpc_stream_from_data_dir_async,
+    },
+    config::ConfigClient,
+    events::SessionId,
+    local::SinomoDataDir,
+    network::{DaemonRpcTimeouts, ObjectRpcRequest},
+};
 
 use crate::backend::Backend;
 use crate::backend::chat_engine::{
@@ -148,10 +157,6 @@ const COMPOSER_INPUT_MAX_H: f32 = 160.0;
 const COMPOSER_INPUT_PAD_Y: f32 = 14.0;
 const SESSION_LIST_UI_TIMEOUT: Duration = Duration::from_secs(8);
 const TRANSCRIPT_LOAD_UI_TIMEOUT: Duration = Duration::from_secs(8);
-/// Poll SIFS for remote-device catalog and timeline changes. SIFS remains the
-/// source of truth; this is only a bounded UI refresh cadence until DFS watch
-/// cursors are exposed through the app API.
-pub(crate) const MULTI_DEVICE_SYNC_INTERVAL_SECS: f64 = 2.0;
 /// Budget for the background SIFS-backed agent-catalog load; past this the app
 /// keeps the built-in agents and reports the catalog as degraded.
 const AGENT_CATALOG_LOAD_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1321,6 +1326,8 @@ pub struct ChatState {
     pub data_dir: Arc<SinomoDataDir>,
     daemon_address: Option<String>,
     sifs_daemon: Option<SifsDaemonAccess>,
+    daemon_event_rx: Receiver<DaemonEventWorkerUpdate>,
+    daemon_event_abort: Option<tokio::task::AbortHandle>,
     ui_waker: Option<sui::UiHandle>,
     pub handle: ChatHandle,
     pub session_id: String,
@@ -1412,7 +1419,6 @@ pub struct ChatState {
     session_list_slow_notice_shown: bool,
     session_list_details_open: bool,
     session_list_refresh_queued: bool,
-    session_list_timeline_refresh_started: bool,
     channel_agent_idx: usize,
     /// Narrow-layout access to the agents/conversations surface. This is kept
     /// separately from session-edit state so opening a row editor can replace
@@ -1494,7 +1500,11 @@ struct TranscriptLoadWorkerResult {
 struct SessionListWorkerResult {
     sessions: Vec<SessionRef>,
     error: Option<String>,
-    complete: bool,
+}
+
+enum DaemonEventWorkerUpdate {
+    Item(DaemonEventStreamItem),
+    Disconnected(String),
 }
 
 struct ProviderListWorkerResult {
@@ -1563,11 +1573,23 @@ impl ChatState {
             list_conversations_with_error(&backend.data_dir, None)
         };
         let (attachment_validation_tx, attachment_validation_rx) = mpsc::channel();
+        let (daemon_event_tx, daemon_event_rx) = mpsc::channel();
+        let daemon_event_abort = daemon_address.as_ref().map(|address| {
+            spawn_daemon_event_subscription(
+                backend.app_runtime.handle(),
+                (*backend.data_dir).clone(),
+                address.clone(),
+                daemon_event_tx,
+                waker.clone(),
+            )
+        });
 
         let mut state = Self {
             data_dir: backend.data_dir.clone(),
             daemon_address,
             sifs_daemon,
+            daemon_event_rx,
+            daemon_event_abort,
             ui_waker: waker,
             handle,
             session_id: String::new(),
@@ -1653,7 +1675,6 @@ impl ChatState {
             session_list_slow_notice_shown: false,
             session_list_details_open: false,
             session_list_refresh_queued: false,
-            session_list_timeline_refresh_started: false,
             channel_agent_idx: 0,
             compact_drawer_open: false,
         };
@@ -1709,10 +1730,26 @@ impl ChatState {
             event_wake,
         );
 
+        if let Some(abort) = self.daemon_event_abort.take() {
+            abort.abort();
+        }
+        let (daemon_event_tx, daemon_event_rx) = mpsc::channel();
+        let daemon_event_abort = daemon_address.as_ref().map(|address| {
+            spawn_daemon_event_subscription(
+                backend.app_runtime.handle(),
+                (*backend.data_dir).clone(),
+                address.clone(),
+                daemon_event_tx,
+                self.ui_waker.clone(),
+            )
+        });
+
         self.handle = handle;
         self.daemon_address = daemon_address.clone();
         self.sifs_daemon = daemon_address
             .map(|address| SifsDaemonAccess::new(address, backend.app_runtime.handle()));
+        self.daemon_event_rx = daemon_event_rx;
+        self.daemon_event_abort = daemon_event_abort;
         self.streaming = false;
         self.control = ChatControlOverview::default();
         self.models_loading = false;
@@ -1882,7 +1919,6 @@ impl ChatState {
         }
         self.session_list_slow_notice_shown = false;
         self.session_list_details_open = false;
-        self.session_list_timeline_refresh_started = false;
         let (tx, rx) = mpsc::channel();
         let data_dir = self.data_dir.clone();
         let sifs_daemon = self.sifs_daemon.clone();
@@ -1890,35 +1926,9 @@ impl ChatState {
         let spawn_result = thread::Builder::new()
             .name("sinomo-app-chat-list".to_string())
             .spawn(move || {
-                let (chat_sessions, chat_error) =
-                    list_chat_conversations_with_error(&data_dir, sifs_daemon.as_ref());
-                if !chat_sessions.is_empty()
-                    && tx
-                        .send(SessionListWorkerResult {
-                            sessions: chat_sessions.clone(),
-                            error: None,
-                            complete: false,
-                        })
-                        .is_ok()
-                {
-                    if let Some(waker) = worker_waker.as_ref() {
-                        waker.wake();
-                    }
-                }
-
-                let (channel_sessions, channel_error) =
-                    list_channel_conversations_with_error(&data_dir, sifs_daemon.as_ref());
-                let mut sessions = chat_sessions;
-                merge_channel_conversations(&mut sessions, channel_sessions);
-                sort_conversations(&mut sessions);
-                let error = chat_error
-                    .filter(|_| sessions.is_empty())
-                    .or_else(|| channel_error.filter(|_| sessions.is_empty()));
-                let _ = tx.send(SessionListWorkerResult {
-                    sessions,
-                    error,
-                    complete: true,
-                });
+                let (sessions, error) =
+                    list_conversations_with_error(&data_dir, sifs_daemon.as_ref());
+                let _ = tx.send(SessionListWorkerResult { sessions, error });
                 if let Some(waker) = worker_waker {
                     waker.wake();
                 }
@@ -1942,19 +1952,14 @@ impl ChatState {
         self.session_list_started_at = Some(Instant::now());
     }
 
-    /// Start a non-blocking refresh of the conversation catalog and the open
-    /// timeline. Calls are coalesced with in-flight workers, so the shell may
-    /// invoke this on every multi-device sync timer tick.
-    pub(crate) fn begin_multi_device_sync(&mut self) {
-        if !self.session_list_loading {
-            self.start_session_list_load(self.ui_waker.clone());
-        }
+    #[cfg(test)]
+    fn reconcile_after_daemon_event(&mut self) {
+        self.start_session_list_load(self.ui_waker.clone());
         if !self.streaming
             && !self.transcript_load_pending()
             && let Some(session) = self.current_session_ref().cloned()
         {
             self.start_transcript_load(session, TranscriptLoadMode::ReconcileLatest);
-            self.session_list_timeline_refresh_started = true;
         }
     }
 
@@ -2008,25 +2013,21 @@ impl ChatState {
                     return true;
                 }
             };
-            let complete = result.complete;
-            self.apply_session_list_result(result);
-            changed = true;
-            if complete {
-                self.session_list_rx = None;
-                self.session_list_loading = false;
-                self.session_list_started_at = None;
-                self.session_list_slow_notice_shown = false;
-                self.session_list_details_open = false;
-                self.session_list_timeline_refresh_started = false;
-                if std::mem::take(&mut self.session_list_refresh_queued) {
-                    self.start_session_list_load(self.ui_waker.clone());
-                }
-                return true;
+            changed |= self.apply_session_list_result(result);
+            self.session_list_rx = None;
+            self.session_list_loading = false;
+            self.session_list_started_at = None;
+            self.session_list_slow_notice_shown = false;
+            self.session_list_details_open = false;
+            if std::mem::take(&mut self.session_list_refresh_queued) {
+                self.start_session_list_load(self.ui_waker.clone());
             }
+            return changed;
         }
     }
 
     pub fn pump_worker_events(&mut self) -> bool {
+        let daemon_events_changed = self.pump_daemon_event_subscription();
         let attachment_picker_changed = self.pump_attachment_lanes();
         let rename_changed = self.pump_session_rename();
         let channel_config_changed = self.pump_channel_config();
@@ -2035,44 +2036,96 @@ impl ChatState {
         for event in events {
             self.apply_event(event);
         }
-        changed || rename_changed || channel_config_changed || attachment_picker_changed
+        changed
+            || daemon_events_changed
+            || rename_changed
+            || channel_config_changed
+            || attachment_picker_changed
     }
 
-    fn apply_session_list_result(&mut self, result: SessionListWorkerResult) {
-        let SessionListWorkerResult {
-            sessions,
-            error,
-            complete,
-        } = result;
-        self.sessions = sessions;
+    fn pump_daemon_event_subscription(&mut self) -> bool {
+        let mut changed = false;
+        let mut refresh = false;
+        loop {
+            match self.daemon_event_rx.try_recv() {
+                Ok(DaemonEventWorkerUpdate::Item(DaemonEventStreamItem::Ready { .. })) => {
+                    changed |= self
+                        .activity
+                        .iter()
+                        .any(|entry| entry.title == "chat updates");
+                    self.activity.retain(|entry| entry.title != "chat updates");
+                    refresh = true;
+                }
+                Ok(DaemonEventWorkerUpdate::Item(DaemonEventStreamItem::Event { event })) => {
+                    if event
+                        .payload
+                        .get("operation")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("create-dir-all")
+                    {
+                        refresh = true;
+                    }
+                }
+                Ok(DaemonEventWorkerUpdate::Item(DaemonEventStreamItem::Lagged { .. })) => {
+                    refresh = true;
+                }
+                Ok(DaemonEventWorkerUpdate::Disconnected(detail)) => {
+                    let already_reported = self
+                        .activity
+                        .iter()
+                        .any(|entry| entry.title == "chat updates" && entry.detail == detail);
+                    if !already_reported {
+                        self.replace_activity("chat updates", detail, ActivityTone::Warn);
+                        changed = true;
+                    }
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+        if refresh {
+            self.start_session_list_load(self.ui_waker.clone());
+            changed = true;
+        }
+        changed
+    }
+
+    fn apply_session_list_result(&mut self, result: SessionListWorkerResult) -> bool {
+        let SessionListWorkerResult { sessions, error } = result;
+        let mut changed = self.sessions != sessions;
+        if changed {
+            self.sessions = sessions;
+        }
         match error {
             Some(detail) => {
-                self.notice = Some(format!("chat list failed: {detail}"));
+                let notice = format!("chat list failed: {detail}");
+                changed |= self.notice.as_deref() != Some(notice.as_str())
+                    || !self
+                        .activity
+                        .iter()
+                        .any(|entry| entry.title == "chat list" && entry.detail == detail);
+                self.notice = Some(notice);
                 self.replace_activity("chat list", detail, ActivityTone::Warn);
             }
             None => {
-                if self
+                let cleared_notice = self
                     .notice
                     .as_deref()
-                    .is_some_and(|notice| notice.starts_with("chat list failed:"))
-                {
+                    .is_some_and(|notice| notice.starts_with("chat list failed:"));
+                let cleared_activity = self.activity.iter().any(|entry| entry.title == "chat list");
+                if cleared_notice {
                     self.notice = None;
                 }
-                if complete {
-                    self.activity.retain(|entry| entry.title != "chat list");
-                }
+                self.activity.retain(|entry| entry.title != "chat list");
+                changed |= cleared_notice || cleared_activity;
             }
         }
-        let timeline_refresh_already_started =
-            complete && std::mem::take(&mut self.session_list_timeline_refresh_started);
-        if complete
-            && !timeline_refresh_already_started
-            && !self.streaming
+        if !self.streaming
             && !self.transcript_load_pending()
             && let Some(session) = self.current_session_ref().cloned()
         {
             self.start_transcript_load(session, TranscriptLoadMode::ReconcileLatest);
         }
+        changed
     }
 
     fn upsert_session_ref(&mut self, session: SessionRef) {
@@ -2088,7 +2141,6 @@ impl ChatState {
         self.session_list_slow_notice_shown = false;
         self.session_list_details_open = false;
         self.session_list_refresh_queued = false;
-        self.session_list_timeline_refresh_started = false;
     }
 
     fn retry_chat_list_with_waker(&mut self, waker: Option<sui::UiHandle>) {
@@ -5736,11 +5788,7 @@ impl ChatState {
                             .map_err(channel_store_io_error)?;
                         let (sessions, error) =
                             list_conversations_with_error(&data_dir, sifs_daemon.as_ref());
-                        Ok(SessionListWorkerResult {
-                            sessions,
-                            error,
-                            complete: true,
-                        })
+                        Ok(SessionListWorkerResult { sessions, error })
                     })
                     .map_err(|error| error.to_string());
                 let _ = tx.send(ChannelCreateWorkerResult {
@@ -6026,71 +6074,95 @@ impl ChatState {
     }
 }
 
-fn list_conversations_with_error(
-    data_dir: &SinomoDataDir,
-    sifs_daemon: Option<&SifsDaemonAccess>,
-) -> (Vec<SessionRef>, Option<String>) {
-    let (mut conversations, chat_error) = list_chat_conversations_with_error(data_dir, sifs_daemon);
-    let (channel_sessions, channel_error) =
-        list_channel_conversations_with_error(data_dir, sifs_daemon);
-    merge_channel_conversations(&mut conversations, channel_sessions);
-    sort_conversations(&mut conversations);
-    let error = chat_error
-        .filter(|_| conversations.is_empty())
-        .or_else(|| channel_error.filter(|_| conversations.is_empty()));
-    (conversations, error)
-}
-
-fn list_chat_conversations_with_error(
-    data_dir: &SinomoDataDir,
-    sifs_daemon: Option<&SifsDaemonAccess>,
-) -> (Vec<SessionRef>, Option<String>) {
-    list_agent_chat_conversations_with_error(data_dir, sifs_daemon)
-}
-
-fn list_channel_conversations_with_error(
-    data_dir: &SinomoDataDir,
-    sifs_daemon: Option<&SifsDaemonAccess>,
-) -> (Vec<SessionRef>, Option<String>) {
-    let channel_result = open_agent_channel_store(data_dir, sifs_daemon).and_then(|store| {
-        store
-            .list_channel_summaries()
-            .map_err(channel_store_io_error)
-    });
-    let mut conversations = Vec::new();
-    let error = match channel_result {
-        Ok(channels) => {
-            let mut seen_channel_ids = BTreeSet::new();
-            for channel in channels {
-                if channel.channel_kind != AgentChannelKind::Channel {
-                    continue;
-                }
-                let id = channel.channel_id.to_string();
-                if !seen_channel_ids.insert(id.clone()) {
-                    continue;
-                }
-                conversations.push(SessionRef {
-                    id,
-                    title: if channel.title.trim().is_empty() {
-                        "New channel".to_string()
-                    } else {
-                        channel.title
-                    },
-                    kind: ConversationKind::Channel,
-                    updated_unix: channel.updated_at.unix_timestamp(),
-                    participant_count: channel.enabled_participant_count,
-                    participant_names: channel.participant_names,
-                });
-            }
-            None
+impl Drop for ChatState {
+    fn drop(&mut self) {
+        if let Some(abort) = self.daemon_event_abort.take() {
+            abort.abort();
         }
-        Err(error) => Some(error.to_string()),
-    };
-    sort_conversations(&mut conversations);
-    (conversations, error)
+    }
 }
 
-fn list_agent_chat_conversations_with_error(
+fn spawn_daemon_event_subscription(
+    runtime: &tokio::runtime::Handle,
+    data_dir: SinomoDataDir,
+    address: String,
+    tx: Sender<DaemonEventWorkerUpdate>,
+    waker: Option<sui::UiHandle>,
+) -> tokio::task::AbortHandle {
+    let task = runtime.spawn(async move {
+        let request = match ObjectRpcRequest::encode_body(
+            DAEMON_EVENT_SUBSCRIBE_ROUTE,
+            DAEMON_RPC_CATEGORY,
+            &DaemonEventSubscribeRequest::for_path_prefix(
+                sinomo_cli::app_api::SIFS_AGENT_CHANNELS_ROOT,
+            ),
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = tx.send(DaemonEventWorkerUpdate::Disconnected(format!(
+                    "chat update subscription could not be created: {error}"
+                )));
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+                return;
+            }
+        };
+        let mut retry_delay = Duration::from_millis(250);
+        loop {
+            let mut received_ready = false;
+            let mut consumer_closed = false;
+            let result = send_daemon_rpc_stream_from_data_dir_async(
+                data_dir.clone(),
+                &address,
+                &request,
+                DaemonRpcTimeouts::default().with_connect_timeout(Some(Duration::from_secs(3))),
+                |response| {
+                    response.error_detail()?;
+                    let item = response
+                        .decode_body::<DaemonEventStreamItem>()
+                        .map_err(DaemonApiError::from)?;
+                    received_ready |= matches!(&item, DaemonEventStreamItem::Ready { .. });
+                    if tx.send(DaemonEventWorkerUpdate::Item(item)).is_err() {
+                        consumer_closed = true;
+                        return Ok(false);
+                    }
+                    if let Some(waker) = waker.as_ref() {
+                        waker.wake();
+                    }
+                    Ok(true)
+                },
+            )
+            .await;
+            if consumer_closed {
+                return;
+            }
+            if received_ready {
+                retry_delay = Duration::from_millis(250);
+            }
+            let detail = match result {
+                Ok(()) => "daemon closed the event stream".to_string(),
+                Err(error) => error.to_string(),
+            };
+            if tx
+                .send(DaemonEventWorkerUpdate::Disconnected(format!(
+                    "Live chat updates disconnected; retrying: {detail}"
+                )))
+                .is_err()
+            {
+                return;
+            }
+            if let Some(waker) = waker.as_ref() {
+                waker.wake();
+            }
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+        }
+    });
+    task.abort_handle()
+}
+
+fn list_conversations_with_error(
     data_dir: &SinomoDataDir,
     sifs_daemon: Option<&SifsDaemonAccess>,
 ) -> (Vec<SessionRef>, Option<String>) {
@@ -6104,23 +6176,32 @@ fn list_agent_chat_conversations_with_error(
         Ok(channels) => {
             let mut seen = BTreeSet::new();
             for channel in channels {
-                if channel.channel_kind != AgentChannelKind::Chat {
-                    continue;
-                }
                 let id = channel.channel_id.to_string();
                 if !seen.insert(id.clone()) {
                     continue;
                 }
+                let (kind, fallback_title, participant_count) = match channel.channel_kind {
+                    AgentChannelKind::Chat => (
+                        ConversationKind::Chat,
+                        "New chat",
+                        channel.enabled_participant_count.max(1),
+                    ),
+                    AgentChannelKind::Channel => (
+                        ConversationKind::Channel,
+                        "New channel",
+                        channel.enabled_participant_count,
+                    ),
+                };
                 conversations.push(SessionRef {
                     id,
                     title: if channel.title.trim().is_empty() {
-                        "New chat".to_string()
+                        fallback_title.to_string()
                     } else {
                         channel.title
                     },
-                    kind: ConversationKind::Chat,
+                    kind,
                     updated_unix: channel.updated_at.unix_timestamp(),
-                    participant_count: channel.enabled_participant_count.max(1),
+                    participant_count,
                     participant_names: channel.participant_names,
                 });
             }
@@ -6130,19 +6211,6 @@ fn list_agent_chat_conversations_with_error(
     };
     sort_conversations(&mut conversations);
     (conversations, error)
-}
-
-fn merge_channel_conversations(conversations: &mut Vec<SessionRef>, channels: Vec<SessionRef>) {
-    let mut seen_channel_ids = BTreeSet::new();
-    for channel in channels {
-        if !seen_channel_ids.insert(channel.id.clone()) {
-            continue;
-        }
-        conversations.retain(|conversation| {
-            !(conversation.id == channel.id && conversation.kind == ConversationKind::Chat)
-        });
-        conversations.push(channel);
-    }
 }
 
 fn session_ref_for_channel(channel: &AgentChannel) -> SessionRef {
@@ -18377,7 +18445,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_device_sync_pulls_remote_timeline_messages_without_reopening_chat() {
+    fn pushed_namespace_event_reconciles_remote_timeline_without_reopening_chat() {
         let (_backend, mut state) = isolated_chat_state("multi-device-timeline-sync");
         seed_default_provider(&mut state);
         let channel_id = SessionId::generate();
@@ -18420,7 +18488,7 @@ mod tests {
             .expect("append remote message");
         store.save_channel(&remote).expect("save remote snapshot");
 
-        state.begin_multi_device_sync();
+        state.reconcile_after_daemon_event();
         wait_for(&mut state, Duration::from_secs(5), |state| {
             !state.transcript_load_pending()
                 && state
@@ -18441,7 +18509,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_device_sync_reconciles_backdated_message_when_updated_timestamp_is_unchanged() {
+    fn pushed_namespace_event_reconciles_backdated_message_with_unchanged_timestamp() {
         let (_backend, mut state) = isolated_chat_state("multi-device-backdated-sync");
         seed_default_provider(&mut state);
         let channel_id = SessionId::generate();
@@ -18514,10 +18582,10 @@ mod tests {
                 .expect("current session")
                 .updated_unix,
             same_updated_unix,
-            "the periodic sync must not depend on detecting a newer second-resolution timestamp"
+            "event-driven reconciliation must not depend on a newer second-resolution timestamp"
         );
 
-        state.begin_multi_device_sync();
+        state.reconcile_after_daemon_event();
         wait_for(&mut state, Duration::from_secs(5), |state| {
             !state.transcript_load_pending()
                 && state.messages.iter().any(|message| {
@@ -21719,7 +21787,7 @@ mod tests {
         assert_eq!(messages[0].text, "structured question");
         assert!(messages[1].text.contains("structured answer"));
 
-        let (sessions, error) = list_chat_conversations_with_error(&state.data_dir, None);
+        let (sessions, error) = list_conversations_with_error(&state.data_dir, None);
         assert!(error.is_none());
         let session = sessions
             .iter()
@@ -22113,7 +22181,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_session_list_result_shows_chat_history_while_channels_load() {
+    fn session_list_result_applies_chat_and_channel_catalog_atomically() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
         let (tx, rx) = mpsc::channel();
@@ -22122,30 +22190,6 @@ mod tests {
         state.session_list_started_at = Some(Instant::now());
 
         let chat_id = SessionId::generate().to_string();
-        tx.send(SessionListWorkerResult {
-            sessions: vec![SessionRef {
-                id: chat_id.clone(),
-                title: "Visible chat".to_string(),
-                kind: ConversationKind::Chat,
-                updated_unix: 10,
-                participant_count: 1,
-                participant_names: Vec::new(),
-            }],
-            error: None,
-            complete: false,
-        })
-        .expect("send partial chat result");
-
-        assert!(
-            state.pump_session_list(),
-            "partial chat result should update visible history"
-        );
-        assert_eq!(state.sessions.len(), 1);
-        assert_eq!(state.sessions[0].id, chat_id);
-        assert!(state.session_list_loading);
-        assert!(state.session_list_rx.is_some());
-        assert!(state.session_list_started_at.is_some());
-
         let channel_id = SessionId::generate().to_string();
         tx.send(SessionListWorkerResult {
             sessions: vec![
@@ -22167,13 +22211,12 @@ mod tests {
                 },
             ],
             error: None,
-            complete: true,
         })
-        .expect("send final merged result");
+        .expect("send atomic catalog result");
 
         assert!(
             state.pump_session_list(),
-            "final result should finish history loading"
+            "the complete catalog should update visible history"
         );
         assert_eq!(state.sessions.len(), 2);
         assert!(state.sessions.iter().any(|session| session.id == chat_id));
@@ -22186,6 +22229,33 @@ mod tests {
         assert!(!state.session_list_loading);
         assert!(state.session_list_rx.is_none());
         assert!(state.session_list_started_at.is_none());
+
+        let unchanged = state.sessions.clone();
+        assert!(
+            !state.apply_session_list_result(SessionListWorkerResult {
+                sessions: unchanged,
+                error: None,
+            }),
+            "an identical pushed refresh must not rebuild or flash the conversation list"
+        );
+    }
+
+    #[test]
+    fn pushed_daemon_event_starts_catalog_refresh_without_a_polling_timer() {
+        let (_backend, mut state) = isolated_chat_state("pushed-catalog-refresh");
+        let (tx, rx) = mpsc::channel();
+        state.daemon_event_rx = rx;
+
+        tx.send(DaemonEventWorkerUpdate::Item(
+            DaemonEventStreamItem::Ready {
+                subscription_id: SessionId::generate().to_string(),
+            },
+        ))
+        .expect("send ready frame");
+
+        assert!(state.pump_daemon_event_subscription());
+        assert!(state.session_list_loading);
+        assert!(state.session_list_rx.is_some());
     }
 
     #[test]
@@ -22245,7 +22315,6 @@ mod tests {
                 participant_names: Vec::new(),
             }],
             error: None,
-            complete: true,
         })
         .expect("send late result");
 

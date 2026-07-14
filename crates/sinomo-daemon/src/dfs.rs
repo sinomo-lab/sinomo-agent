@@ -1623,6 +1623,7 @@ mod tests {
                 source_node_id: Some(node_id.clone()),
                 verify_prefix_only: false,
                 prefix_probe: None,
+                authority_probe: None,
                 batch,
             },
         )
@@ -1669,6 +1670,7 @@ mod tests {
                 source_node_id: Some(node_id.clone()),
                 verify_prefix_only: false,
                 prefix_probe: None,
+                authority_probe: None,
                 batch,
             },
         )
@@ -1765,6 +1767,7 @@ mod tests {
                 source_node_id: Some(stale.clone()),
                 verify_prefix_only: false,
                 prefix_probe: None,
+                authority_probe: None,
                 batch,
             },
         )
@@ -2468,6 +2471,7 @@ mod tests {
                     next_after_sequence: command.batch.next_after_sequence,
                     applied_entries: command.batch.entries.len(),
                     verified_prefix_only: command.verify_prefix_only,
+                    verified_authority_probe_id: None,
                     result: DfsMetadataJournalBatchResult::Applied,
                 })
             });
@@ -2610,6 +2614,7 @@ mod tests {
                     next_after_sequence: command.batch.next_after_sequence,
                     applied_entries: command.batch.entries.len(),
                     verified_prefix_only: command.verify_prefix_only,
+                    verified_authority_probe_id: None,
                     result: DfsMetadataJournalBatchResult::Applied,
                 })
             });
@@ -2749,6 +2754,7 @@ mod tests {
                     next_after_sequence: command.batch.next_after_sequence,
                     applied_entries: command.batch.entries.len(),
                     verified_prefix_only: command.verify_prefix_only,
+                    verified_authority_probe_id: None,
                     result: DfsMetadataJournalBatchResult::Applied,
                 })
             });
@@ -2880,6 +2886,7 @@ mod tests {
                     next_after_sequence: command.batch.next_after_sequence + 1,
                     applied_entries: command.batch.entries.len(),
                     verified_prefix_only: command.verify_prefix_only,
+                    verified_authority_probe_id: None,
                     result: DfsMetadataJournalBatchResult::Applied,
                 })
             });
@@ -2993,6 +3000,7 @@ mod tests {
                     next_after_sequence: command.batch.next_after_sequence,
                     applied_entries: 0,
                     verified_prefix_only: false,
+                    verified_authority_probe_id: None,
                     result: DfsMetadataJournalBatchResult::Rejected {
                         reason: "replica already has a conflicting journal entry".to_string(),
                     },
@@ -3100,6 +3108,7 @@ mod tests {
                     next_after_sequence: command.batch.next_after_sequence,
                     applied_entries: 0,
                     verified_prefix_only: false,
+                    verified_authority_probe_id: None,
                     result: DfsMetadataJournalBatchResult::Rejected {
                         reason: format!(
                             "metadata journal sequence {} already exists with a different entry while replaying shard root",

@@ -5,6 +5,7 @@ mod cluster;
 mod control;
 mod dfs;
 mod error;
+mod event_stream;
 mod idle_stats;
 mod install;
 mod observe;
@@ -26,11 +27,11 @@ pub use sinomo_api::{
     DAEMON_DFS_BROWSER_ROUTES, DAEMON_DFS_BROWSER_STAT_ROUTE, DAEMON_DFS_BROWSER_STATUS_ROUTE,
     DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE, DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
     DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE, DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
-    DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
-    DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
-    DAEMON_STATUS_ROUTE, DaemonApiError, DaemonClusterMaintenanceRefreshRequest,
-    DaemonClusterMaintenanceRefreshResponse, DaemonClusterStatus,
-    DaemonDfsBrowserCreateDirAllRequest, DaemonDfsBrowserCreateDirAllResponse,
+    DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_EVENT_SUBSCRIBE_ROUTE,
+    DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE, DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
+    DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE, DFS_NAMESPACE_CHANGED_EVENT_KIND, DaemonApiError,
+    DaemonClusterMaintenanceRefreshRequest, DaemonClusterMaintenanceRefreshResponse,
+    DaemonClusterStatus, DaemonDfsBrowserCreateDirAllRequest, DaemonDfsBrowserCreateDirAllResponse,
     DaemonDfsBrowserDeleteRequest, DaemonDfsBrowserDeleteResponse, DaemonDfsBrowserEntry,
     DaemonDfsBrowserFileRead, DaemonDfsBrowserHealthSummary, DaemonDfsBrowserListRequest,
     DaemonDfsBrowserListResponse, DaemonDfsBrowserMetadataShard, DaemonDfsBrowserObjectHealth,
@@ -50,7 +51,8 @@ pub use sinomo_api::{
     DaemonDfsBrowserUnpinContentResponse, DaemonDfsBrowserUnpinMetadataRequest,
     DaemonDfsBrowserUnpinMetadataResponse, DaemonDfsBrowserWriteFileRequest,
     DaemonDfsBrowserWriteFileResponse, DaemonDfsBrowserWriteReceipt,
-    DaemonDfsObjectRpcForwardRequest, DaemonLocalConnectivityReloadRequest,
+    DaemonDfsObjectRpcForwardRequest, DaemonEventStreamItem, DaemonEventSubscribeRequest,
+    DaemonEventSubscribeResponse, DaemonLocalConnectivityReloadRequest,
     DaemonLocalConnectivityReloadResponse, DaemonObjectRpcForwardDeliveryState,
     DaemonObjectRpcForwardRequest, DaemonObjectRpcForwardResponse, DaemonPaths, DaemonProbeStatus,
     DaemonRunOptions, DaemonStatus, IdleStatsSnapshot, SINOMO_DAEMON_DEFAULT_HOST,
