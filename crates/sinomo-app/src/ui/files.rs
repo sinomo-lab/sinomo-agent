@@ -31,14 +31,14 @@ use std::time::Duration;
 use sui::{
     Alignment, ArrangeCtx, Background, Breadcrumb, BreadcrumbItem, ButtonAppearance,
     CheckboxIndicatorState, Color, Constraints, ControlSize, DefaultTheme, DetailRow, Dock,
-    EmptyState, Event, EventCtx, FixedPaneSplit, Flex, FlexItem, FlexWrap, FontWeight, IconButton,
-    IconGlyph, Insets, Label, LeadingLabelCellPaint, ListItem, ListView, MeasureCtx, PaintCtx,
-    PanelSection, PlacementBadge, PlacementBadgePaint, PointerEventKind, RebuildOnChange, Rect,
-    RichText, ScrollState, ScrollView, SectionLabel, SegmentedControl, SegmentedControlItem,
-    SemanticRegion, SemanticTone, SemanticsCtx, SemanticsRole, Separator, SideSheet,
-    SideSheetPlacement, Size, SizedBox, Stack, StackHostOptions, StatusBadge, StatusBar,
-    StatusBarSegment, Surface, SurfaceBorder, SurfaceRole, SwitchView, TextCellPaint, Tooltip,
-    TooltipPlacement, TrailingSlotRow, VirtualTable, VirtualTableColumn,
+    EmptyState, Event, EventCtx, EventPhase, FixedPaneSplit, Flex, FlexItem, FlexWrap, FontWeight,
+    IconButton, IconGlyph, Insets, KeyState, Label, LeadingLabelCellPaint, ListItem, ListView,
+    MeasureCtx, PaintCtx, PanelSection, PlacementBadge, PlacementBadgePaint, PointerEventKind,
+    RebuildOnChange, Rect, RichText, ScrollState, ScrollView, SectionLabel, SegmentedControl,
+    SegmentedControlItem, SemanticRegion, SemanticTone, SemanticsCtx, SemanticsRole, Separator,
+    SideSheet, SideSheetPlacement, Size, SizedBox, Stack, StackHostOptions, StatusBadge, StatusBar,
+    StatusBarSegment, Surface, SurfaceBorder, SurfaceRole, SwitchView, TextCellPaint, TextSurface,
+    TextWrap, Tooltip, TooltipPlacement, TrailingSlotRow, VirtualTable, VirtualTableColumn,
     VirtualTableRowActivationKind, VirtualTableRowContext, VirtualTableSortDirection, Widget,
     WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
     containers::Padding as WidgetPadding, paint_checkbox_indicator, paint_leading_label_cell,
@@ -48,12 +48,13 @@ use sui::{
 use sinomo_cli::app_api::{
     SifsBrowser, SifsEntry, SifsEntryPage, SifsFileRead, SifsHealthSummary, SifsListOptions,
     SifsListSortDirection, SifsListSortKey, SifsMetadataShardDetails, SifsObjectDetails,
-    SifsObjectHealth,
+    SifsObjectHealth, SifsReplaceFileIfVersionOutcome,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use time::format_description::well_known::Rfc3339;
 
 use crate::backend::Backend;
+use crate::native_picker::{NativePickerKind, NativePickerLane, NativePickerOutcome};
 use crate::state::{Shared, Tab};
 use crate::theme::Palette;
 use crate::ui::settings::SettingsSection;
@@ -67,6 +68,9 @@ const CONTENT_PAD: f32 = 16.0;
 const HEADER_H: f32 = 44.0;
 const HEADER_COMMAND_GAP: f32 = 4.0;
 const HEADER_PAD_Y: f32 = 8.0;
+/// Minimum inner width for the complete desktop command row. Below this, the wide Files layout
+/// keeps its inspector but uses a picker-first row with secondary commands in an overflow sheet.
+const FULL_HEADER_INNER_MIN_W: f32 = 860.0;
 const FILES_STATUS_H: f32 = 34.0;
 const LIST_TASK_STRIP_H: f32 = 88.0;
 const FILES_LIST_PAGE_SIZE: usize = 512;
@@ -74,6 +78,11 @@ const PLACES_W: f32 = 190.0;
 const PLACE_ROW_H: f32 = 38.0;
 const FILE_PREVIEW_MAX_BYTES: u64 = 32 * 1024;
 const FILE_PREVIEW_MAX_LINES: usize = 8;
+/// The text surface keeps the entire accepted document resident. Reject larger files explicitly
+/// instead of silently presenting a partial document that could be saved over the original.
+const FILE_DOCUMENT_MAX_BYTES: u64 = 2 * 1024 * 1024;
+/// Chat attachments may be binary, but still need a bounded read on the Files worker lane.
+const FILE_ATTACHMENT_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_NAV_HISTORY: usize = 64;
 
@@ -383,6 +392,129 @@ struct FilesPreview {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalFileFingerprint {
+    canonical_path: PathBuf,
+    len: u64,
+    modified_at_unix_nanos: Option<u64>,
+    content_digest: String,
+    readonly: bool,
+    symlink: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SifsFileFingerprint {
+    object_id: String,
+    version: String,
+    content_hash: Option<String>,
+    size_bytes: Option<u64>,
+    policy: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FilesDocumentLoad {
+    source: FilesSourceKind,
+    path: String,
+    title: String,
+    text: String,
+    local_fingerprint: Option<LocalFileFingerprint>,
+    sifs_fingerprint: Option<SifsFileFingerprint>,
+    read_only_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FilesDocumentSave {
+    Local {
+        fingerprint: LocalFileFingerprint,
+        maintenance_warning: Option<String>,
+        requires_reload: bool,
+    },
+    Sifs {
+        fingerprint: SifsFileFingerprint,
+        maintenance_warning: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FilesDocument {
+    source: FilesSourceKind,
+    path: String,
+    title: String,
+    text: String,
+    saved_text: String,
+    local_fingerprint: Option<LocalFileFingerprint>,
+    sifs_fingerprint: Option<SifsFileFingerprint>,
+    read_only_reason: Option<String>,
+    loading: bool,
+    load_error: Option<String>,
+    saving: bool,
+    save_error: Option<String>,
+    save_warning: Option<String>,
+}
+
+impl FilesDocument {
+    fn loading(source: FilesSourceKind, path: String, title: String) -> Self {
+        Self {
+            source,
+            path,
+            title,
+            text: String::new(),
+            saved_text: String::new(),
+            local_fingerprint: None,
+            sifs_fingerprint: None,
+            read_only_reason: None,
+            loading: true,
+            load_error: None,
+            saving: false,
+            save_error: None,
+            save_warning: None,
+        }
+    }
+
+    fn dirty(&self) -> bool {
+        !self.loading && self.load_error.is_none() && self.text != self.saved_text
+    }
+
+    fn editable(&self) -> bool {
+        !self.loading && self.load_error.is_none() && self.read_only_reason.is_none()
+    }
+}
+
+/// Immutable snapshot handed to Chat after the Files worker has read and verified it. Chat owns
+/// what happens next; Files never reaches into chat state from a file-manager callback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FilesAttachmentIntent {
+    pub file_name: String,
+    pub bytes: Vec<u8>,
+    pub provenance: FilesAttachmentProvenance,
+    /// True when the bytes come from the open editor rather than a persisted file version.
+    pub is_unsaved_editor_buffer: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FilesAttachmentProvenance {
+    Local {
+        path: String,
+        canonical_path: String,
+        modified_at_unix_nanos: Option<u64>,
+    },
+    Sifs {
+        path: String,
+        object_id: String,
+        version: String,
+        content_hash: Option<String>,
+        policy: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FilesPickerAction {
+    OpenFile,
+    OpenFolder,
+    ImportFiles,
+    ImportFolder,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum FilesOperationFailure {
     Cancelled(String),
     Error(String),
@@ -432,6 +564,18 @@ pub struct FilesState {
     selected_preview: Option<FilesPreview>,
     preview_loading: bool,
     preview_error: Option<String>,
+    document: Option<FilesDocument>,
+    document_revision: u64,
+    document_close_confirmation: bool,
+    pending_document_open: Option<(FilesSourceKind, String, String)>,
+    attachment_loading: bool,
+    attachment_error: Option<String>,
+    ready_attachment_intent: Option<FilesAttachmentIntent>,
+    picker_lane: NativePickerLane,
+    picker_action: Option<FilesPickerAction>,
+    picker_context_generation: u64,
+    picker_error: Option<String>,
+    external_file_hovered: bool,
     action_prompt: Option<FileActionPrompt>,
     marked_entries: BTreeSet<usize>,
     sort_mode: FileSortMode,
@@ -451,6 +595,12 @@ pub struct FilesState {
     completed_request_id: Option<u64>,
     pending_details_request_id: Option<u64>,
     pending_preview_request_id: Option<u64>,
+    pending_document_request_id: Option<u64>,
+    pending_document_save_request_id: Option<u64>,
+    pending_document_saved_text: Option<String>,
+    pending_attachment_request_id: Option<u64>,
+    pending_attachment_source_path: Option<(FilesSourceKind, String)>,
+    pending_import_request_ids: BTreeSet<u64>,
 }
 
 impl FilesState {
@@ -487,6 +637,18 @@ impl FilesState {
             selected_preview: None,
             preview_loading: false,
             preview_error: None,
+            document: None,
+            document_revision: 0,
+            document_close_confirmation: false,
+            pending_document_open: None,
+            attachment_loading: false,
+            attachment_error: None,
+            ready_attachment_intent: None,
+            picker_lane: NativePickerLane::new(),
+            picker_action: None,
+            picker_context_generation: 0,
+            picker_error: None,
+            external_file_hovered: false,
             action_prompt: None,
             marked_entries: BTreeSet::new(),
             sort_mode: FileSortMode::default(),
@@ -506,6 +668,12 @@ impl FilesState {
             completed_request_id: None,
             pending_details_request_id: None,
             pending_preview_request_id: None,
+            pending_document_request_id: None,
+            pending_document_save_request_id: None,
+            pending_document_saved_text: None,
+            pending_attachment_request_id: None,
+            pending_attachment_source_path: None,
+            pending_import_request_ids: BTreeSet::new(),
         }
     }
 
@@ -811,6 +979,22 @@ impl FilesState {
         self.completed_request_id = None;
         self.pending_details_request_id = None;
         self.pending_preview_request_id = None;
+        self.pending_document_request_id = None;
+        self.pending_document_save_request_id = None;
+        self.pending_document_saved_text = None;
+        self.pending_attachment_request_id = None;
+        self.pending_attachment_source_path = None;
+        self.pending_import_request_ids.clear();
+        self.attachment_loading = false;
+        if let Some(document) = self.document.as_mut()
+            && document.saving
+        {
+            document.saving = false;
+            document.save_error = Some(
+                "The connection changed before the save completed. Your edits are still open."
+                    .to_string(),
+            );
+        }
         self.worker_tx = None;
         self.worker_rx = None;
         self.worker_result_tx = None;
@@ -862,7 +1046,7 @@ impl FilesState {
     }
 
     pub fn pump_load(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = self.poll_native_picker();
         loop {
             let result = match self.worker_rx.as_ref().map(|rx| rx.try_recv()) {
                 Some(Ok(result)) => result,
@@ -888,6 +1072,37 @@ impl FilesState {
                         self.pending_preview_request_id = None;
                         self.selected_preview = None;
                         self.preview_error = Some("SIFS browser worker stopped".to_string());
+                        changed = true;
+                    }
+                    if self.pending_document_request_id.take().is_some() {
+                        if let Some(document) = self.document.as_mut() {
+                            document.loading = false;
+                            document.load_error = Some(
+                                "The Files background worker stopped while reading the document."
+                                    .to_string(),
+                            );
+                        }
+                        self.document_revision = self.document_revision.wrapping_add(1);
+                        changed = true;
+                    }
+                    if self.pending_document_save_request_id.take().is_some() {
+                        self.pending_document_saved_text = None;
+                        if let Some(document) = self.document.as_mut() {
+                            document.saving = false;
+                            document.save_error = Some(
+                                "The Files background worker stopped while saving. Your edits are still open."
+                                    .to_string(),
+                            );
+                        }
+                        changed = true;
+                    }
+                    if self.pending_attachment_request_id.take().is_some() {
+                        self.pending_attachment_source_path = None;
+                        self.attachment_loading = false;
+                        self.attachment_error = Some(
+                            "The Files background worker stopped while reading the attachment."
+                                .to_string(),
+                        );
                         changed = true;
                     }
                     self.worker_rx = None;
@@ -1068,6 +1283,169 @@ impl FilesState {
                 }
                 true
             }
+            FilesWorkerResult::Document {
+                request_id,
+                source,
+                path,
+                result,
+            } => {
+                if self.pending_document_request_id != Some(request_id) {
+                    return false;
+                }
+                let matches_open = self
+                    .document
+                    .as_ref()
+                    .is_some_and(|document| document.source == source && document.path == path);
+                if !matches_open {
+                    return false;
+                }
+                self.pending_document_request_id = None;
+                match result {
+                    Ok(load) => {
+                        self.document = Some(FilesDocument {
+                            source: load.source,
+                            path: load.path,
+                            title: load.title,
+                            saved_text: load.text.clone(),
+                            text: load.text,
+                            local_fingerprint: load.local_fingerprint,
+                            sifs_fingerprint: load.sifs_fingerprint,
+                            read_only_reason: load.read_only_reason,
+                            loading: false,
+                            load_error: None,
+                            saving: false,
+                            save_error: None,
+                            save_warning: None,
+                        });
+                    }
+                    Err(error) => {
+                        if let Some(document) = self.document.as_mut() {
+                            document.loading = false;
+                            document.load_error = Some(error);
+                        }
+                    }
+                }
+                self.document_revision = self.document_revision.wrapping_add(1);
+                true
+            }
+            FilesWorkerResult::DocumentSaved {
+                request_id,
+                source,
+                path,
+                result,
+            } => {
+                if self.pending_document_save_request_id != Some(request_id) {
+                    return false;
+                }
+                let Some(document) = self.document.as_mut() else {
+                    return false;
+                };
+                if document.source != source || document.path != path {
+                    return false;
+                }
+                self.pending_document_save_request_id = None;
+                let saved_text = self.pending_document_saved_text.take();
+                document.saving = false;
+                match result {
+                    Ok(FilesDocumentSave::Local {
+                        fingerprint,
+                        maintenance_warning,
+                        requires_reload,
+                    }) => {
+                        document.local_fingerprint = Some(fingerprint);
+                        if let Some(saved_text) = saved_text.clone() {
+                            document.saved_text = saved_text;
+                        }
+                        document.save_error = None;
+                        document.save_warning = maintenance_warning;
+                        document.read_only_reason = requires_reload.then(|| {
+                            "The content was saved, but the host did not return a complete post-save metadata receipt. Reload before editing again."
+                                .to_string()
+                        });
+                    }
+                    Ok(FilesDocumentSave::Sifs {
+                        fingerprint,
+                        maintenance_warning,
+                    }) => {
+                        document.sifs_fingerprint = Some(fingerprint);
+                        if let Some(saved_text) = saved_text {
+                            document.saved_text = saved_text;
+                        }
+                        document.save_error = None;
+                        document.save_warning = maintenance_warning;
+                        self.pending_select_path = Some(path);
+                        self.refresh(None);
+                    }
+                    Err(error) => {
+                        document.save_error = Some(error);
+                        document.save_warning = None;
+                    }
+                }
+                true
+            }
+            FilesWorkerResult::Attachment {
+                request_id,
+                source,
+                path,
+                result,
+            } => {
+                if self.pending_attachment_request_id != Some(request_id) {
+                    return false;
+                }
+                let still_requested =
+                    self.pending_attachment_source_path.as_ref() == Some(&(source, path.clone()));
+                self.pending_attachment_request_id = None;
+                self.pending_attachment_source_path = None;
+                self.attachment_loading = false;
+                if !still_requested {
+                    return false;
+                }
+                match result {
+                    Ok(intent) => {
+                        self.ready_attachment_intent = Some(intent);
+                        self.attachment_error = None;
+                    }
+                    Err(error) => {
+                        self.ready_attachment_intent = None;
+                        self.attachment_error = Some(error);
+                    }
+                }
+                true
+            }
+            FilesWorkerResult::ImportPrepared {
+                request_id,
+                destination_source,
+                destination_path,
+                result,
+            } => {
+                if !self.pending_import_request_ids.remove(&request_id) {
+                    return false;
+                }
+                if self.source != destination_source || self.path != destination_path {
+                    self.picker_error = Some(
+                        "The destination changed before the import started. Nothing was copied."
+                            .to_string(),
+                    );
+                    return true;
+                }
+                match result {
+                    Ok(operations) => {
+                        let waker = self.worker_waker.clone();
+                        for (source, queued) in operations {
+                            self.start_operation_for_source(
+                                source,
+                                queued.operation,
+                                queued.title,
+                                queued.detail,
+                                waker.clone(),
+                            );
+                        }
+                        self.picker_error = None;
+                    }
+                    Err(error) => self.picker_error = Some(error),
+                }
+                true
+            }
             FilesWorkerResult::TaskProgress {
                 request_id,
                 detail,
@@ -1125,7 +1503,15 @@ impl FilesState {
                 .as_ref()
                 .map(|b| b.normalize(path))
                 .unwrap_or_else(|| normalize_path(path))),
-            FilesSourceKind::Local => normalize_local_path(path),
+            FilesSourceKind::Local => {
+                let path = Path::new(path);
+                let candidate = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    Path::new(&self.path).join(path)
+                };
+                normalize_local_path(&candidate.to_string_lossy())
+            }
         }
     }
 
@@ -1135,6 +1521,7 @@ impl FilesState {
         path: String,
         waker: Option<sui::UiHandle>,
     ) {
+        let location_changed = self.source != source || self.path != path;
         if self.source != source {
             self.store_active_path();
             self.source = source;
@@ -1156,6 +1543,9 @@ impl FilesState {
             self.loaded = true;
         }
         self.path = path;
+        if location_changed {
+            self.picker_context_generation = self.picker_context_generation.wrapping_add(1);
+        }
         self.store_active_path();
         self.reload();
     }
@@ -1381,6 +1771,467 @@ impl FilesState {
             Ok(preview) => self.selected_preview = Some(preview),
             Err(error) => self.preview_error = Some(error),
         }
+    }
+
+    fn open_selected_document(&mut self, waker: Option<sui::UiHandle>) {
+        let Some(entry) = self.selected_entry().cloned() else {
+            return;
+        };
+        if entry.is_dir {
+            return;
+        }
+        self.open_document(self.source, entry.path, entry.name, waker);
+    }
+
+    fn open_document(
+        &mut self,
+        source: FilesSourceKind,
+        path: String,
+        title: String,
+        waker: Option<sui::UiHandle>,
+    ) {
+        if self.document.as_ref().is_some_and(FilesDocument::dirty) {
+            self.pending_document_open = Some((source, path, title));
+            self.document_close_confirmation = true;
+            self.document_revision = self.document_revision.wrapping_add(1);
+            return;
+        }
+        self.begin_document_load(source, path, title, waker);
+    }
+
+    fn begin_document_load(
+        &mut self,
+        source: FilesSourceKind,
+        path: String,
+        title: String,
+        waker: Option<sui::UiHandle>,
+    ) {
+        if let Some(waker) = waker {
+            self.ensure_worker(waker);
+        }
+        self.compact_overlay = None;
+        self.action_prompt = None;
+        self.document_close_confirmation = false;
+        self.pending_document_open = None;
+        self.pending_document_save_request_id = None;
+        self.pending_document_saved_text = None;
+        self.document = Some(FilesDocument::loading(source, path.clone(), title));
+        self.document_revision = self.document_revision.wrapping_add(1);
+        let Some(tx) = self.worker_tx.clone() else {
+            if let Some(document) = self.document.as_mut() {
+                document.loading = false;
+                document.load_error = Some("The Files background worker is not ready. Retry after the folder finishes loading.".to_string());
+            }
+            self.document_revision = self.document_revision.wrapping_add(1);
+            return;
+        };
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        self.pending_document_request_id = Some(request_id);
+        if tx
+            .send(FilesWorkerCommand::ReadDocument {
+                request_id,
+                source,
+                path,
+            })
+            .is_err()
+        {
+            self.pending_document_request_id = None;
+            if let Some(document) = self.document.as_mut() {
+                document.loading = false;
+                document.load_error =
+                    Some("The Files background worker stopped. Retry the document.".to_string());
+            }
+            self.document_revision = self.document_revision.wrapping_add(1);
+        }
+    }
+
+    fn retry_document(&mut self, waker: Option<sui::UiHandle>) {
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let request = (
+            document.source,
+            document.path.clone(),
+            document.title.clone(),
+        );
+        self.begin_document_load(request.0, request.1, request.2, waker);
+    }
+
+    fn set_document_text(&mut self, value: String) {
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        if !document.editable() {
+            return;
+        }
+        document.text = value;
+        document.save_error = None;
+    }
+
+    fn save_document(&mut self, waker: Option<sui::UiHandle>) {
+        if let Some(waker) = waker {
+            self.ensure_worker(waker);
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        if !document.editable() || !document.dirty() || document.saving {
+            return;
+        }
+        let Some(tx) = self.worker_tx.clone() else {
+            document.save_error = Some("The Files background worker is not available.".to_string());
+            return;
+        };
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        document.saving = true;
+        document.save_error = None;
+        document.save_warning = None;
+        self.pending_document_saved_text = Some(document.text.clone());
+        self.pending_document_save_request_id = Some(request_id);
+        let command = match document.source {
+            FilesSourceKind::Local => {
+                let Some(expected) = document.local_fingerprint.clone() else {
+                    document.saving = false;
+                    self.pending_document_save_request_id = None;
+                    self.pending_document_saved_text = None;
+                    document.save_error = Some(
+                        "The local file fingerprint is missing. Reload before saving.".to_string(),
+                    );
+                    return;
+                };
+                FilesWorkerCommand::SaveLocalDocument {
+                    request_id,
+                    path: document.path.clone(),
+                    expected,
+                    text: document.text.clone(),
+                }
+            }
+            FilesSourceKind::Sifs => {
+                let Some(expected) = document.sifs_fingerprint.clone() else {
+                    document.saving = false;
+                    self.pending_document_save_request_id = None;
+                    self.pending_document_saved_text = None;
+                    document.save_error = Some(
+                        "The SIFS object version is missing. Reload before saving.".to_string(),
+                    );
+                    return;
+                };
+                FilesWorkerCommand::SaveSifsDocument {
+                    request_id,
+                    path: document.path.clone(),
+                    expected,
+                    text: document.text.clone(),
+                }
+            }
+        };
+        if tx.send(command).is_err() {
+            self.pending_document_save_request_id = None;
+            self.pending_document_saved_text = None;
+            document.saving = false;
+            document.save_error =
+                Some("The Files background worker stopped before saving.".to_string());
+        }
+    }
+
+    fn request_close_document(&mut self) {
+        if self.document.as_ref().is_some_and(FilesDocument::dirty) {
+            self.document_close_confirmation = true;
+            self.document_revision = self.document_revision.wrapping_add(1);
+            return;
+        }
+        self.close_document_now();
+    }
+
+    fn close_document_now(&mut self) {
+        self.document = None;
+        self.document_close_confirmation = false;
+        self.pending_document_open = None;
+        self.pending_document_request_id = None;
+        self.pending_document_save_request_id = None;
+        self.pending_document_saved_text = None;
+        self.document_revision = self.document_revision.wrapping_add(1);
+    }
+
+    fn cancel_document_close(&mut self) {
+        self.document_close_confirmation = false;
+        self.pending_document_open = None;
+        self.document_revision = self.document_revision.wrapping_add(1);
+    }
+
+    fn discard_document_and_continue(&mut self, waker: Option<sui::UiHandle>) {
+        let pending = self.pending_document_open.take();
+        self.document = None;
+        self.document_close_confirmation = false;
+        self.pending_document_request_id = None;
+        self.pending_document_save_request_id = None;
+        self.pending_document_saved_text = None;
+        self.document_revision = self.document_revision.wrapping_add(1);
+        if let Some((source, path, title)) = pending {
+            self.begin_document_load(source, path, title, waker);
+        }
+    }
+
+    fn start_attach_selected(&mut self, waker: Option<sui::UiHandle>) {
+        let Some(entry) = self.selected_entry().cloned() else {
+            return;
+        };
+        if entry.is_dir {
+            self.attachment_error =
+                Some("Folders cannot be attached directly. Choose a file.".to_string());
+            return;
+        }
+        self.start_attach_path(self.source, entry.path, entry.name, waker);
+    }
+
+    fn start_attach_document(&mut self, waker: Option<sui::UiHandle>) {
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let provenance = match document.source {
+            FilesSourceKind::Local => {
+                let Some(fingerprint) = document.local_fingerprint.as_ref() else {
+                    self.attachment_error = Some(
+                        "The document has no local snapshot fingerprint. Reload before attaching."
+                            .to_string(),
+                    );
+                    return;
+                };
+                FilesAttachmentProvenance::Local {
+                    path: document.path.clone(),
+                    canonical_path: fingerprint.canonical_path.to_string_lossy().into_owned(),
+                    modified_at_unix_nanos: fingerprint.modified_at_unix_nanos,
+                }
+            }
+            FilesSourceKind::Sifs => {
+                let Some(fingerprint) = document.sifs_fingerprint.as_ref() else {
+                    self.attachment_error = Some(
+                        "The document has no SIFS object version. Reload before attaching."
+                            .to_string(),
+                    );
+                    return;
+                };
+                FilesAttachmentProvenance::Sifs {
+                    path: document.path.clone(),
+                    object_id: fingerprint.object_id.clone(),
+                    version: fingerprint.version.clone(),
+                    content_hash: fingerprint.content_hash.clone(),
+                    policy: fingerprint.policy.clone(),
+                }
+            }
+        };
+        self.ready_attachment_intent = Some(FilesAttachmentIntent {
+            file_name: document.title.clone(),
+            bytes: document.text.as_bytes().to_vec(),
+            provenance,
+            is_unsaved_editor_buffer: document.dirty(),
+        });
+        self.attachment_error = None;
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn start_attach_path(
+        &mut self,
+        source: FilesSourceKind,
+        path: String,
+        file_name: String,
+        waker: Option<sui::UiHandle>,
+    ) {
+        if let Some(waker) = waker {
+            self.ensure_worker(waker);
+        }
+        let Some(tx) = self.worker_tx.clone() else {
+            self.attachment_error =
+                Some("The Files background worker is not available.".to_string());
+            return;
+        };
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        self.pending_attachment_request_id = Some(request_id);
+        self.pending_attachment_source_path = Some((source, path.clone()));
+        self.attachment_loading = true;
+        self.attachment_error = None;
+        self.ready_attachment_intent = None;
+        if tx
+            .send(FilesWorkerCommand::ReadAttachment {
+                request_id,
+                source,
+                path,
+                file_name,
+            })
+            .is_err()
+        {
+            self.pending_attachment_request_id = None;
+            self.pending_attachment_source_path = None;
+            self.attachment_loading = false;
+            self.attachment_error = Some(
+                "The Files background worker stopped before reading the attachment.".to_string(),
+            );
+        }
+    }
+
+    pub(crate) fn take_ready_attachment_intent(&mut self) -> Option<FilesAttachmentIntent> {
+        self.ready_attachment_intent.take()
+    }
+
+    fn request_native_picker(&mut self, action: FilesPickerAction, waker: Option<sui::UiHandle>) {
+        let (kind, title) = match action {
+            FilesPickerAction::OpenFile => (NativePickerKind::OneFile, "Open a local file"),
+            FilesPickerAction::OpenFolder => (NativePickerKind::OneFolder, "Open a local folder"),
+            FilesPickerAction::ImportFiles => (
+                NativePickerKind::MultipleFiles,
+                "Import files into this folder",
+            ),
+            FilesPickerAction::ImportFolder => (
+                NativePickerKind::OneFolder,
+                "Import a folder into this folder",
+            ),
+        };
+        self.picker_error = None;
+        match self
+            .picker_lane
+            .request(kind, title, self.picker_context_generation, waker)
+        {
+            Ok(_) => self.picker_action = Some(action),
+            Err(error) => self.picker_error = Some(error),
+        }
+    }
+
+    fn poll_native_picker(&mut self) -> bool {
+        let Some(result) = self.picker_lane.poll() else {
+            return false;
+        };
+        let action = self.picker_action.take();
+        if result.context_generation != self.picker_context_generation
+            && matches!(
+                action,
+                Some(FilesPickerAction::ImportFiles | FilesPickerAction::ImportFolder)
+            )
+        {
+            self.picker_error = Some(
+                "The destination changed while the picker was open. Nothing was imported."
+                    .to_string(),
+            );
+            return true;
+        }
+        match (action, result.outcome) {
+            (_, NativePickerOutcome::Cancelled) => {}
+            (_, NativePickerOutcome::Failed(error)) => self.picker_error = Some(error),
+            (Some(FilesPickerAction::OpenFile), NativePickerOutcome::Selected(mut paths)) => {
+                if let Some(path) = paths.pop() {
+                    self.open_picked_local_file(path);
+                }
+            }
+            (Some(FilesPickerAction::OpenFolder), NativePickerOutcome::Selected(mut paths)) => {
+                if let Some(path) = paths.pop() {
+                    match normalize_local_path(&path.to_string_lossy()) {
+                        Ok(path) => self.open_location(
+                            FilesSourceKind::Local,
+                            path,
+                            self.worker_waker.clone(),
+                        ),
+                        Err(error) => self.picker_error = Some(error),
+                    }
+                }
+            }
+            (
+                Some(FilesPickerAction::ImportFiles | FilesPickerAction::ImportFolder),
+                NativePickerOutcome::Selected(paths),
+            ) => {
+                if let Err(error) = self.import_external_paths(paths, self.worker_waker.clone()) {
+                    self.picker_error = Some(error);
+                }
+            }
+            (None, NativePickerOutcome::Selected(_)) => {
+                self.picker_error = Some("The picker result no longer has an owner.".to_string())
+            }
+        }
+        true
+    }
+
+    fn open_picked_local_file(&mut self, path: PathBuf) {
+        let path_string = path.to_string_lossy().into_owned();
+        let title = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path_string.clone());
+        if let Some(parent) = path.parent() {
+            let parent = parent.to_string_lossy().into_owned();
+            self.pending_select_path = Some(path_string.clone());
+            self.open_location(FilesSourceKind::Local, parent, self.worker_waker.clone());
+        }
+        self.open_document(
+            FilesSourceKind::Local,
+            path_string,
+            title,
+            self.worker_waker.clone(),
+        );
+    }
+
+    fn import_external_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        waker: Option<sui::UiHandle>,
+    ) -> Result<(), String> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        if !self.can_modify_current_location() {
+            return Err(
+                "Wait for the destination folder to become available before importing.".to_string(),
+            );
+        }
+        if let Some(waker) = waker {
+            self.ensure_worker(waker);
+        }
+        let Some(tx) = self.worker_tx.clone() else {
+            return Err("The Files background worker is not available.".to_string());
+        };
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        self.pending_import_request_ids.insert(request_id);
+        if tx
+            .send(FilesWorkerCommand::PrepareImport {
+                request_id,
+                destination_source: self.source,
+                destination_path: self.path.clone(),
+                paths,
+            })
+            .is_err()
+        {
+            self.pending_import_request_ids.remove(&request_id);
+            return Err(
+                "The Files background worker stopped before preparing the import.".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_external_file_hover(&mut self, _path: PathBuf) -> bool {
+        let changed = !self.external_file_hovered;
+        self.external_file_hovered = true;
+        changed
+    }
+
+    pub(crate) fn cancel_external_file_hover(&mut self) -> bool {
+        let changed = self.external_file_hovered;
+        self.external_file_hovered = false;
+        changed
+    }
+
+    pub(crate) fn accept_external_file_drop(
+        &mut self,
+        path: PathBuf,
+        waker: Option<sui::UiHandle>,
+    ) -> bool {
+        self.external_file_hovered = false;
+        if let Err(error) = self.import_external_paths(vec![path], waker) {
+            self.picker_error = Some(error);
+        }
+        true
     }
 
     fn select_entry(&mut self, index: usize) -> bool {
@@ -1833,6 +2684,17 @@ impl FilesState {
         detail: String,
         waker: Option<sui::UiHandle>,
     ) {
+        self.start_operation_for_source(self.source, operation, title, detail, waker);
+    }
+
+    fn start_operation_for_source(
+        &mut self,
+        source: FilesSourceKind,
+        operation: FilesOperation,
+        title: String,
+        detail: String,
+        waker: Option<sui::UiHandle>,
+    ) {
         if let Some(waker) = waker {
             self.ensure_worker(waker);
         }
@@ -1843,7 +2705,7 @@ impl FilesState {
             0,
             FilesTask {
                 id: request_id,
-                source: self.source,
+                source,
                 title,
                 detail,
                 state: FilesTaskState::Running,
@@ -1856,7 +2718,7 @@ impl FilesState {
             if tx
                 .send(FilesWorkerCommand::Operation {
                     request_id,
-                    source: self.source,
+                    source,
                     operation,
                 })
                 .is_err()
@@ -1871,7 +2733,7 @@ impl FilesState {
         }
 
         let result = self
-            .execute_operation(operation, &self.path)
+            .execute_operation_for_source(source, operation, &self.path)
             .map_err(FilesOperationFailure::Error);
         self.apply_operation_result(request_id, result);
     }
@@ -2080,15 +2942,16 @@ impl FilesState {
         }
     }
 
-    fn execute_operation(
+    fn execute_operation_for_source(
         &self,
+        source: FilesSourceKind,
         operation: FilesOperation,
         current_path: &str,
     ) -> Result<FilesOperationOutcome, String> {
         if files_operation_is_cross_source(&operation) {
             if let Some(browser) = self.browser.as_ref() {
                 return execute_cross_source_operation(
-                    self.source,
+                    source,
                     browser,
                     operation,
                     current_path,
@@ -2103,16 +2966,10 @@ impl FilesState {
                 .and_then(|address| {
                     SifsBrowser::open_daemon_on_runtime(address, &self.app_runtime)
                 })?;
-            return execute_cross_source_operation(
-                self.source,
-                &browser,
-                operation,
-                current_path,
-                None,
-            )
-            .map_err(files_operation_failure_detail);
+            return execute_cross_source_operation(source, &browser, operation, current_path, None)
+                .map_err(files_operation_failure_detail);
         }
-        match self.source {
+        match source {
             FilesSourceKind::Sifs => self
                 .browser
                 .as_ref()
@@ -2182,6 +3039,11 @@ impl FilesState {
     }
 
     fn apply_operation_result(&mut self, request_id: u64, result: FilesOperationResult) -> bool {
+        let operation_source = self
+            .tasks
+            .iter()
+            .find(|task| task.id == request_id)
+            .map(|task| task.source);
         let cancel_requested = self
             .tasks
             .iter()
@@ -2199,8 +3061,10 @@ impl FilesState {
                     outcome.message.clone()
                 };
                 self.finish_task(request_id, FilesTaskState::Completed, detail);
-                self.path = outcome.refresh_path;
-                self.pending_select_path = outcome.select_path;
+                if operation_source == Some(self.source) {
+                    self.path = outcome.refresh_path;
+                    self.pending_select_path = outcome.select_path;
+                }
                 self.refresh(None);
             }
             Err(FilesOperationFailure::Cancelled(detail)) => {
@@ -2223,7 +3087,8 @@ impl FilesState {
         }
     }
 
-    /// Activate a listing row from keyboard or double-click: directories navigate, files select.
+    /// Activate a listing row from keyboard or double-click: directories navigate and files open
+    /// in the document surface.
     /// Returns whether the navigation changed the *path*.
     fn activate_row(&mut self, index: usize) -> bool {
         let is_dir = self.entries.get(index).map(|e| e.is_dir).unwrap_or(false);
@@ -2233,6 +3098,7 @@ impl FilesState {
             true
         } else {
             self.select_entry(index);
+            self.open_selected_document(self.worker_waker.clone());
             false
         }
     }
@@ -2302,6 +3168,30 @@ enum FilesWorkerResult {
         path: String,
         result: Result<FilesPreview, String>,
     },
+    Document {
+        request_id: u64,
+        source: FilesSourceKind,
+        path: String,
+        result: Result<FilesDocumentLoad, String>,
+    },
+    DocumentSaved {
+        request_id: u64,
+        source: FilesSourceKind,
+        path: String,
+        result: Result<FilesDocumentSave, String>,
+    },
+    Attachment {
+        request_id: u64,
+        source: FilesSourceKind,
+        path: String,
+        result: Result<FilesAttachmentIntent, String>,
+    },
+    ImportPrepared {
+        request_id: u64,
+        destination_source: FilesSourceKind,
+        destination_path: String,
+        result: Result<Vec<(FilesSourceKind, FilesQueuedOperation)>, String>,
+    },
     TaskProgress {
         request_id: u64,
         detail: String,
@@ -2332,6 +3222,35 @@ enum FilesWorkerCommand {
         request_id: u64,
         source: FilesSourceKind,
         path: String,
+    },
+    ReadDocument {
+        request_id: u64,
+        source: FilesSourceKind,
+        path: String,
+    },
+    SaveLocalDocument {
+        request_id: u64,
+        path: String,
+        expected: LocalFileFingerprint,
+        text: String,
+    },
+    SaveSifsDocument {
+        request_id: u64,
+        path: String,
+        expected: SifsFileFingerprint,
+        text: String,
+    },
+    ReadAttachment {
+        request_id: u64,
+        source: FilesSourceKind,
+        path: String,
+        file_name: String,
+    },
+    PrepareImport {
+        request_id: u64,
+        destination_source: FilesSourceKind,
+        destination_path: String,
+        paths: Vec<PathBuf>,
     },
     Operation {
         request_id: u64,
@@ -2626,6 +3545,181 @@ fn files_worker_loop(
                     result,
                 });
             }
+            FilesWorkerCommand::ReadDocument {
+                request_id,
+                source,
+                path,
+            } => {
+                let requested_path = normalize_source_path(source, &path);
+                let (path, result) = if source == FilesSourceKind::Local {
+                    match requested_path {
+                        Ok(path) => {
+                            let result = load_local_text_document(&path, FILE_DOCUMENT_MAX_BYTES);
+                            (path, result)
+                        }
+                        Err(error) => (path, Err(error)),
+                    }
+                } else if let Some(error) = &open_error {
+                    (normalize_path(&path), Err(error.clone()))
+                } else {
+                    let requested_path = requested_path.unwrap_or_else(|_| normalize_path(&path));
+                    if browser.is_none() {
+                        match daemon_address.as_deref() {
+                            Some(address) => {
+                                match SifsBrowser::open_daemon_on_runtime(address, &app_runtime) {
+                                    Ok(opened) => browser = Some(opened),
+                                    Err(error) => open_error = Some(error),
+                                }
+                            }
+                            None => {
+                                open_error =
+                                    Some("SIFS browsing requires a daemon connection".to_string())
+                            }
+                        }
+                    }
+                    match (&browser, &open_error) {
+                        (Some(browser), _) => {
+                            let path = browser.normalize(&requested_path);
+                            let result =
+                                load_sifs_text_document(browser, &path, FILE_DOCUMENT_MAX_BYTES);
+                            (path, result)
+                        }
+                        (None, Some(error)) => (requested_path, Err(error.clone())),
+                        (None, None) => (
+                            requested_path,
+                            Err("SIFS browser did not start".to_string()),
+                        ),
+                    }
+                };
+                let _ = result_tx.send(FilesWorkerResult::Document {
+                    request_id,
+                    source,
+                    path,
+                    result,
+                });
+            }
+            FilesWorkerCommand::SaveLocalDocument {
+                request_id,
+                path,
+                expected,
+                text,
+            } => {
+                let result = save_local_text_document(&path, &expected, text.as_bytes());
+                let _ = result_tx.send(FilesWorkerResult::DocumentSaved {
+                    request_id,
+                    source: FilesSourceKind::Local,
+                    path,
+                    result,
+                });
+            }
+            FilesWorkerCommand::SaveSifsDocument {
+                request_id,
+                path,
+                expected,
+                text,
+            } => {
+                if browser.is_none() && open_error.is_none() {
+                    match daemon_address.as_deref() {
+                        Some(address) => {
+                            match SifsBrowser::open_daemon_on_runtime(address, &app_runtime) {
+                                Ok(opened) => browser = Some(opened),
+                                Err(error) => open_error = Some(error),
+                            }
+                        }
+                        None => {
+                            open_error =
+                                Some("SIFS browsing requires a daemon connection".to_string())
+                        }
+                    }
+                }
+                let result = match (&browser, &open_error) {
+                    (Some(browser), _) => {
+                        save_sifs_text_document(browser, &path, &expected, text.as_bytes())
+                    }
+                    (None, Some(error)) => Err(error.clone()),
+                    (None, None) => Err("SIFS browser did not start".to_string()),
+                };
+                let _ = result_tx.send(FilesWorkerResult::DocumentSaved {
+                    request_id,
+                    source: FilesSourceKind::Sifs,
+                    path,
+                    result,
+                });
+            }
+            FilesWorkerCommand::ReadAttachment {
+                request_id,
+                source,
+                path,
+                file_name,
+            } => {
+                let requested_path = normalize_source_path(source, &path);
+                let (path, result) = if source == FilesSourceKind::Local {
+                    match requested_path {
+                        Ok(path) => {
+                            let result =
+                                load_local_attachment(&path, file_name, FILE_ATTACHMENT_MAX_BYTES);
+                            (path, result)
+                        }
+                        Err(error) => (path, Err(error)),
+                    }
+                } else if let Some(error) = &open_error {
+                    (normalize_path(&path), Err(error.clone()))
+                } else {
+                    let requested_path = requested_path.unwrap_or_else(|_| normalize_path(&path));
+                    if browser.is_none() {
+                        match daemon_address.as_deref() {
+                            Some(address) => {
+                                match SifsBrowser::open_daemon_on_runtime(address, &app_runtime) {
+                                    Ok(opened) => browser = Some(opened),
+                                    Err(error) => open_error = Some(error),
+                                }
+                            }
+                            None => {
+                                open_error =
+                                    Some("SIFS browsing requires a daemon connection".to_string())
+                            }
+                        }
+                    }
+                    match (&browser, &open_error) {
+                        (Some(browser), _) => {
+                            let path = browser.normalize(&requested_path);
+                            let result = load_sifs_attachment(
+                                browser,
+                                &path,
+                                file_name,
+                                FILE_ATTACHMENT_MAX_BYTES,
+                            );
+                            (path, result)
+                        }
+                        (None, Some(error)) => (requested_path, Err(error.clone())),
+                        (None, None) => (
+                            requested_path,
+                            Err("SIFS browser did not start".to_string()),
+                        ),
+                    }
+                };
+                let _ = result_tx.send(FilesWorkerResult::Attachment {
+                    request_id,
+                    source,
+                    path,
+                    result,
+                });
+            }
+            FilesWorkerCommand::PrepareImport {
+                request_id,
+                destination_source,
+                destination_path,
+                paths,
+            } => {
+                let result =
+                    prepare_import_operations(destination_source, &destination_path, paths);
+                let _ = result_tx.send(FilesWorkerResult::ImportPrepared {
+                    request_id,
+                    destination_source,
+                    destination_path,
+                    result,
+                });
+            }
             FilesWorkerCommand::Operation {
                 request_id,
                 source,
@@ -2824,20 +3918,11 @@ fn normalize_local_path(path: &str) -> Result<String, String> {
     if trimmed.bytes().any(|byte| byte == 0) {
         return Err("path cannot contain NUL bytes".to_string());
     }
-    let path = PathBuf::from(trimmed);
-    let path = if path.is_absolute() {
-        path
-    } else {
-        std::env::current_dir()
-            .map_err(|error| format!("cannot read current directory: {error}"))?
-            .join(path)
-    };
-    Ok(path
-        .canonicalize()
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned())
-    .map(display_local_path)
+    // Keep this callback-safe: no canonicalize/current-dir/filesystem access. In particular, do
+    // not fold leading `..` components; callers join relative paths to an explicit browsing base.
+    Ok(display_local_path(
+        PathBuf::from(trimmed).to_string_lossy().into_owned(),
+    ))
 }
 
 fn parent_local_path(path: &str) -> Option<String> {
@@ -3121,6 +4206,412 @@ fn local_read_file_prefix(path: &str, max_bytes: u64) -> Result<SifsFileRead, St
         .read_to_end(&mut bytes)
         .map_err(|error| format!("cannot read {path}: {error}"))?;
     Ok(SifsFileRead { bytes, truncated })
+}
+
+fn local_file_fingerprint(path: &str) -> Result<LocalFileFingerprint, String> {
+    let path_ref = Path::new(path);
+    let link_metadata = fs::symlink_metadata(path_ref)
+        .map_err(|error| format!("cannot inspect {path}: {error}"))?;
+    if link_metadata.file_type().is_dir() {
+        return Err(format!("{path} is a folder, not a file"));
+    }
+    let canonical_path = path_ref
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve {path}: {error}"))?;
+    let metadata = fs::metadata(&canonical_path)
+        .map_err(|error| format!("cannot inspect {}: {error}", canonical_path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{path} is not a regular file"));
+    }
+    Ok(LocalFileFingerprint {
+        canonical_path,
+        len: metadata.len(),
+        modified_at_unix_nanos: metadata.modified().ok().and_then(system_time_unix_nanos),
+        content_digest: String::new(),
+        readonly: metadata.permissions().readonly(),
+        symlink: link_metadata.file_type().is_symlink(),
+    })
+}
+
+fn read_local_file_snapshot(
+    path: &str,
+    max_bytes: u64,
+) -> Result<(Vec<u8>, LocalFileFingerprint), String> {
+    let before = local_file_fingerprint(path)?;
+    if before.len > max_bytes {
+        return Err(format!(
+            "{} is {:.1} MiB; the limit is {:.1} MiB",
+            path,
+            before.len as f64 / (1024.0 * 1024.0),
+            max_bytes as f64 / (1024.0 * 1024.0),
+        ));
+    }
+    let file = fs::File::open(&before.canonical_path)
+        .map_err(|error| format!("cannot open {path}: {error}"))?;
+    let mut bytes = Vec::with_capacity(before.len.min(max_bytes) as usize);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {path}: {error}"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "{path} grew beyond the {:.1} MiB limit while it was being read",
+            max_bytes as f64 / (1024.0 * 1024.0),
+        ));
+    }
+    let mut after = local_file_fingerprint(path)?;
+    if after != before {
+        return Err(format!(
+            "{path} changed while it was being read. Retry to load a consistent snapshot."
+        ));
+    }
+    after.content_digest = blake3::hash(&bytes).to_hex().to_string();
+    Ok((bytes, after))
+}
+
+fn local_document_read_only_reason(fingerprint: &LocalFileFingerprint) -> Option<String> {
+    if fingerprint.symlink {
+        Some(
+            "Editing through a symbolic link is disabled because an atomic replacement could change link semantics. Open the target file directly to edit it."
+                .to_string(),
+        )
+    } else if fingerprint.readonly {
+        Some("The host filesystem marks this file read-only.".to_string())
+    } else {
+        None
+    }
+}
+
+fn load_local_text_document(path: &str, max_bytes: u64) -> Result<FilesDocumentLoad, String> {
+    let (bytes, fingerprint) = read_local_file_snapshot(path, max_bytes)?;
+    if !preview_bytes_are_text(&bytes) {
+        return Err(
+            "This file contains binary control bytes and cannot be opened in the text editor. It can still be attached to chat."
+                .to_string(),
+        );
+    }
+    let text = String::from_utf8(bytes).map_err(|_| {
+        "This file is not valid UTF-8 and cannot be opened in the text editor. It can still be attached to chat."
+            .to_string()
+    })?;
+    let title = Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    let read_only_reason = local_document_read_only_reason(&fingerprint);
+    Ok(FilesDocumentLoad {
+        source: FilesSourceKind::Local,
+        path: path.to_string(),
+        title,
+        text,
+        local_fingerprint: Some(fingerprint),
+        sifs_fingerprint: None,
+        read_only_reason,
+    })
+}
+
+fn sifs_file_fingerprint(details: &SifsObjectDetails) -> Result<SifsFileFingerprint, String> {
+    if details.kind != "file" {
+        return Err(format!(
+            "{} is {}, not a regular file",
+            details.path, details.kind
+        ));
+    }
+    Ok(SifsFileFingerprint {
+        object_id: details.object_id.clone(),
+        version: details.version.clone(),
+        content_hash: details.content_hash.clone(),
+        size_bytes: details.size_bytes,
+        policy: details.policy.clone(),
+    })
+}
+
+fn read_sifs_file_snapshot(
+    browser: &SifsBrowser,
+    path: &str,
+    max_bytes: u64,
+) -> Result<(Vec<u8>, SifsFileFingerprint, u32), String> {
+    let details = browser.stat(path)?;
+    let fingerprint = sifs_file_fingerprint(&details)?;
+    let size = fingerprint
+        .size_bytes
+        .ok_or_else(|| format!("SIFS did not report the size of {path}"))?;
+    if size > max_bytes {
+        return Err(format!(
+            "{} is {:.1} MiB; the limit is {:.1} MiB",
+            path,
+            size as f64 / (1024.0 * 1024.0),
+            max_bytes as f64 / (1024.0 * 1024.0),
+        ));
+    }
+    let content_hash = fingerprint
+        .content_hash
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("SIFS did not report the content hash of {path}"))?;
+    let bytes = browser.read_object_version(
+        &fingerprint.object_id,
+        &fingerprint.version,
+        content_hash,
+        size,
+    )?;
+    if bytes.len() as u64 != size {
+        return Err(format!(
+            "SIFS returned {} bytes for {path}, but its selected version reports {size} bytes",
+            bytes.len()
+        ));
+    }
+    Ok((bytes, fingerprint, details.mode))
+}
+
+fn load_sifs_text_document(
+    browser: &SifsBrowser,
+    path: &str,
+    max_bytes: u64,
+) -> Result<FilesDocumentLoad, String> {
+    let (bytes, fingerprint, mode) = read_sifs_file_snapshot(browser, path, max_bytes)?;
+    if !preview_bytes_are_text(&bytes) {
+        return Err(
+            "This SIFS object contains binary control bytes and cannot be opened in the text editor. It can still be attached to chat."
+                .to_string(),
+        );
+    }
+    let text = String::from_utf8(bytes).map_err(|_| {
+        "This SIFS object is not valid UTF-8 and cannot be opened in the text editor. It can still be attached to chat."
+            .to_string()
+    })?;
+    let title = path
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(path)
+        .to_string();
+    let read_only_reason = (mode & 0o222 == 0).then(|| {
+        format!(
+            "SIFS mode {:o} does not grant write permission for this file.",
+            mode
+        )
+    });
+    Ok(FilesDocumentLoad {
+        source: FilesSourceKind::Sifs,
+        path: path.to_string(),
+        title,
+        text,
+        local_fingerprint: None,
+        sifs_fingerprint: Some(fingerprint),
+        read_only_reason,
+    })
+}
+
+fn save_local_text_document(
+    path: &str,
+    expected: &LocalFileFingerprint,
+    bytes: &[u8],
+) -> Result<FilesDocumentSave, String> {
+    if expected.symlink {
+        return Err("Safe editing through a symbolic link is not supported.".to_string());
+    }
+    if expected.readonly {
+        return Err("The file was opened read-only and cannot be saved.".to_string());
+    }
+    if bytes.len() as u64 > FILE_DOCUMENT_MAX_BYTES {
+        return Err(format!(
+            "The edited document exceeds the {:.1} MiB text-editor limit.",
+            FILE_DOCUMENT_MAX_BYTES as f64 / (1024.0 * 1024.0),
+        ));
+    }
+    let (_current_bytes, current) = read_local_file_snapshot(path, FILE_DOCUMENT_MAX_BYTES)?;
+    if &current != expected {
+        return Err(
+            "Save conflict: the file changed on disk after it was opened. Your edits are still available; reload and merge before saving."
+                .to_string(),
+        );
+    }
+    if current.symlink || current.readonly {
+        return Err(
+            "The file is no longer safely writable. Your edits were not saved.".to_string(),
+        );
+    }
+    let permissions = fs::metadata(&current.canonical_path)
+        .map_err(|error| {
+            format!(
+                "cannot inspect {}: {error}",
+                current.canonical_path.display()
+            )
+        })?
+        .permissions();
+    let fallback_name = current
+        .canonical_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("document");
+    sinomo_runtime::storage::durable_file::write_file_atomic(
+        &current.canonical_path,
+        bytes,
+        sinomo_runtime::storage::durable_file::DurableAtomicFileOptions::new(
+            fallback_name,
+            "sinomo-app-edit",
+        )
+        .sync_all(),
+    )
+    .map_err(|error| format!("cannot safely save {path}: {error}"))?;
+    let mut maintenance = Vec::new();
+    if let Err(error) = fs::set_permissions(&current.canonical_path, permissions) {
+        maintenance.push(format!(
+            "could not restore the original permissions: {error}"
+        ));
+    }
+    let digest = blake3::hash(bytes).to_hex().to_string();
+    let (mut fingerprint, metadata_receipt_missing) = match local_file_fingerprint(path) {
+        Ok(fingerprint) => (fingerprint, false),
+        Err(error) => {
+            maintenance.push(format!("could not refresh post-save metadata: {error}"));
+            let mut fallback = current.clone();
+            fallback.len = bytes.len() as u64;
+            fallback.modified_at_unix_nanos = None;
+            (fallback, true)
+        }
+    };
+    fingerprint.content_digest = digest;
+    let requires_reload = metadata_receipt_missing || fingerprint.symlink || fingerprint.readonly;
+    Ok(FilesDocumentSave::Local {
+        fingerprint,
+        maintenance_warning: (!maintenance.is_empty()).then(|| maintenance.join(" ")),
+        requires_reload,
+    })
+}
+
+fn save_sifs_text_document(
+    browser: &SifsBrowser,
+    path: &str,
+    expected: &SifsFileFingerprint,
+    bytes: &[u8],
+) -> Result<FilesDocumentSave, String> {
+    if bytes.len() as u64 > FILE_DOCUMENT_MAX_BYTES {
+        return Err(format!(
+            "The edited document exceeds the {:.1} MiB text-editor limit.",
+            FILE_DOCUMENT_MAX_BYTES as f64 / (1024.0 * 1024.0),
+        ));
+    }
+    let outcome = browser
+        .replace_file_if_version(path, &expected.object_id, &expected.version, bytes)
+        .map_err(|error| {
+            format!(
+                "The SIFS save could not reach a definitive conditional-write result. Your edits are still open; retry or reload before saving again. {error}"
+            )
+        })?;
+    match outcome {
+        SifsReplaceFileIfVersionOutcome::Committed {
+            receipt,
+            maintenance_warning,
+        } => Ok(FilesDocumentSave::Sifs {
+            fingerprint: SifsFileFingerprint {
+                object_id: receipt.object_id,
+                version: receipt.version,
+                content_hash: receipt.content_hash,
+                size_bytes: receipt.size_bytes,
+                policy: expected.policy.clone(),
+            },
+            maintenance_warning,
+        }),
+        SifsReplaceFileIfVersionOutcome::Conflict { detail } => Err(format!(
+            "Save conflict: this SIFS file changed after it was opened. Your edits are still available; reload and merge before saving. {detail}"
+        )),
+        SifsReplaceFileIfVersionOutcome::NotFound { detail } => Err(format!(
+            "The SIFS file no longer exists at this path. Your edits are still available and were not written. {detail}"
+        )),
+        SifsReplaceFileIfVersionOutcome::Rejected { detail } => Err(format!(
+            "SIFS policy rejected the conditional save. Your edits are still available and were not written. {detail}"
+        )),
+    }
+}
+
+fn load_local_attachment(
+    path: &str,
+    file_name: String,
+    max_bytes: u64,
+) -> Result<FilesAttachmentIntent, String> {
+    let (bytes, fingerprint) = read_local_file_snapshot(path, max_bytes)?;
+    Ok(FilesAttachmentIntent {
+        file_name,
+        bytes,
+        provenance: FilesAttachmentProvenance::Local {
+            path: path.to_string(),
+            canonical_path: fingerprint.canonical_path.to_string_lossy().into_owned(),
+            modified_at_unix_nanos: fingerprint.modified_at_unix_nanos,
+        },
+        is_unsaved_editor_buffer: false,
+    })
+}
+
+fn load_sifs_attachment(
+    browser: &SifsBrowser,
+    path: &str,
+    file_name: String,
+    max_bytes: u64,
+) -> Result<FilesAttachmentIntent, String> {
+    let (bytes, fingerprint, _mode) = read_sifs_file_snapshot(browser, path, max_bytes)?;
+    Ok(FilesAttachmentIntent {
+        file_name,
+        bytes,
+        provenance: FilesAttachmentProvenance::Sifs {
+            path: path.to_string(),
+            object_id: fingerprint.object_id,
+            version: fingerprint.version,
+            content_hash: fingerprint.content_hash,
+            policy: fingerprint.policy,
+        },
+        is_unsaved_editor_buffer: false,
+    })
+}
+
+fn prepare_import_operations(
+    destination_source: FilesSourceKind,
+    destination_path: &str,
+    paths: Vec<PathBuf>,
+) -> Result<Vec<(FilesSourceKind, FilesQueuedOperation)>, String> {
+    let mut queued = Vec::with_capacity(paths.len());
+    for path in paths {
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "{} is a symbolic link. Resolve it to an explicit file or folder before importing.",
+                path.display()
+            ));
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("{} has no importable file name", path.display()))?;
+        let from = path.to_string_lossy().into_owned();
+        let (source, kind, target, title) = match destination_source {
+            FilesSourceKind::Sifs => (
+                FilesSourceKind::Local,
+                FilesOperationKind::CopyToSifs,
+                join_sifs_child(destination_path, name)?,
+                "Import to SIFS",
+            ),
+            FilesSourceKind::Local => (
+                FilesSourceKind::Local,
+                FilesOperationKind::Copy,
+                join_local_child(destination_path, name)?,
+                "Import local item",
+            ),
+        };
+        queued.push((
+            source,
+            FilesQueuedOperation {
+                operation: FilesOperation {
+                    kind,
+                    path: from.clone(),
+                    target: Some(target.clone()),
+                    directory: metadata.file_type().is_dir(),
+                },
+                title: title.to_string(),
+                detail: format!("{from} -> {target}"),
+            },
+        ));
+    }
+    Ok(queued)
 }
 
 fn system_time_unix_nanos(time: std::time::SystemTime) -> Option<u64> {
@@ -3855,6 +5346,7 @@ fn copy_local_file_to_sifs_with_progress(
         progress,
         format!("cancelled before copying {source_path} to SIFS {target_path}"),
     )?;
+    validate_local_copy_source(source_path)?;
     let mut source = fs::File::open(source_path).map_err(|error| {
         FilesOperationFailure::Error(format!("cannot open {source_path}: {error}"))
     })?;
@@ -3942,6 +5434,12 @@ fn collect_local_to_sifs_copy_plan(
     let metadata = fs::symlink_metadata(source).map_err(|error| {
         FilesOperationFailure::Error(format!("cannot inspect {}: {error}", source.display()))
     })?;
+    if metadata.file_type().is_symlink() {
+        return Err(FilesOperationFailure::Error(format!(
+            "{} is a symbolic link. Folder imports do not follow symbolic links; resolve it to an explicit file or folder and retry.",
+            source.display()
+        )));
+    }
     if metadata.file_type().is_dir() {
         let source_display = source.to_string_lossy().into_owned();
         plan.push(FilesCopyPlanItem {
@@ -4262,6 +5760,12 @@ fn collect_local_copy_plan(
     let metadata = fs::symlink_metadata(source).map_err(|error| {
         FilesOperationFailure::Error(format!("cannot inspect {}: {error}", source.display()))
     })?;
+    if metadata.file_type().is_symlink() {
+        return Err(FilesOperationFailure::Error(format!(
+            "{} is a symbolic link. Folder copies do not follow symbolic links; resolve it to an explicit file or folder and retry.",
+            source.display()
+        )));
+    }
     if metadata.file_type().is_dir() {
         let source_display = source.to_string_lossy().into_owned();
         plan.push(FilesCopyPlanItem {
@@ -4406,6 +5910,7 @@ fn copy_local_file_with_progress(
     target_path: &str,
     progress: Option<&FilesOperationProgress<'_>>,
 ) -> Result<(), FilesOperationFailure> {
+    validate_local_copy_source(source_path)?;
     let mut source = fs::File::open(source_path).map_err(|error| {
         FilesOperationFailure::Error(format!("cannot open {source_path}: {error}"))
     })?;
@@ -4490,6 +5995,23 @@ fn copy_local_file_with_progress(
     target_file.flush().map_err(|error| {
         FilesOperationFailure::Error(format!("cannot finalize {target_path}: {error}"))
     })?;
+    Ok(())
+}
+
+fn validate_local_copy_source(source_path: &str) -> Result<(), FilesOperationFailure> {
+    let metadata = fs::symlink_metadata(source_path).map_err(|error| {
+        FilesOperationFailure::Error(format!("cannot inspect {source_path}: {error}"))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(FilesOperationFailure::Error(format!(
+            "{source_path} is a symbolic link. File copies and imports do not follow symbolic links; resolve it to an explicit file and retry."
+        )));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(FilesOperationFailure::Error(format!(
+            "{source_path} is not a regular file"
+        )));
+    }
     Ok(())
 }
 
@@ -5599,6 +7121,20 @@ fn unselected_inspector_rows(files: &FilesState) -> Vec<(&'static str, String)> 
     if let Some(health) = unselected_inspector_health_summary(files) {
         rows.push(("SIFS health", health));
     }
+    if files.external_file_hovered {
+        rows.push((
+            "Drop",
+            "Release to import this host file or folder into the current location".to_string(),
+        ));
+    } else if let Some(error) = files.picker_error.as_ref() {
+        rows.push(("Import", error.clone()));
+    } else {
+        rows.push((
+            "Import",
+            "Use the native picker or drag files and folders here; pasted paths remain available under Go to path."
+                .to_string(),
+        ));
+    }
     if files.source == FilesSourceKind::Sifs && files.inspector_details_open {
         if let Some(detail) = files_sifs_connection_detail(files) {
             rows.push(("Daemon", detail));
@@ -5898,6 +7434,54 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             })
     };
 
+    let open_local_file = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::FileText, "Open local file")
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || !s.files().picker_lane.is_pending()
+            })
+            .on_press(move || {
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut()
+                    .request_native_picker(FilesPickerAction::OpenFile, waker);
+            })
+    };
+
+    let open_local_folder = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::Folder, "Choose local folder")
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || !s.files().picker_lane.is_pending()
+            })
+            .on_press(move || {
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut()
+                    .request_native_picker(FilesPickerAction::OpenFolder, waker);
+            })
+    };
+
+    let import_files = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::Attach, "Import files")
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || {
+                    let files = s.files();
+                    files.can_modify_current_location() && !files.picker_lane.is_pending()
+                }
+            })
+            .on_press(move || {
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut()
+                    .request_native_picker(FilesPickerAction::ImportFiles, waker);
+            })
+    };
+
     let new_file = {
         let s = shared.clone();
         IconButton::new(IconGlyph::File, "New file")
@@ -6084,6 +7668,18 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             FlexItem::new().no_shrink(),
         )
         .with_item(
+            toolbar_tooltip("Open local file", open_local_file, reader),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
+            toolbar_tooltip("Choose local folder", open_local_folder, reader),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
+            toolbar_tooltip("Import files", import_files, reader),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
             toolbar_tooltip("Go to path", go_to, reader),
             FlexItem::new().no_shrink(),
         )
@@ -6127,6 +7723,212 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .with_child(SizedBox::new().height(HEADER_PAD_Y))
 }
 
+/// Intermediate desktop header used while the inspector is still visible but the complete
+/// command row would overflow. File/folder pickers stay first-class; path entry and mutation
+/// commands remain available through the same keyboard-focusable overflow sheet as narrow Files.
+fn picker_first_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let crumbs = shared.files().crumbs();
+    let current = crumbs.len().saturating_sub(1);
+    let targets: Vec<String> = crumbs.iter().map(|(_, target)| target.clone()).collect();
+
+    let back = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::ChevronLeft, "Back")
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || s.files().can_go_back()
+            })
+            .on_press(move || {
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut().go_back(waker);
+            })
+    };
+    let forward = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::ChevronRight, "Forward")
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || s.files().can_go_forward()
+            })
+            .on_press(move || {
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut().go_forward(waker);
+            })
+    };
+    let up = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::ChevronUp, "Up")
+            .theme_when(clone_reader(reader))
+            .on_press(move || s.files_mut().go_up())
+    };
+    let source = {
+        let s = shared.clone();
+        let selected = match shared.files().source {
+            FilesSourceKind::Sifs => 0,
+            FilesSourceKind::Local => 1,
+        };
+        SegmentedControl::new("Files source")
+            .items([
+                SegmentedControlItem::new("SIFS")
+                    .semantic_name("Browse SIFS")
+                    .description("Browse distributed SIFS objects"),
+                SegmentedControlItem::new("Local")
+                    .semantic_name("Browse local files")
+                    .description("Browse this node's local filesystem"),
+            ])
+            .selected(selected)
+            .theme_when(clone_reader(reader))
+            .on_change(move |index, _label| {
+                let source = if index == 1 {
+                    FilesSourceKind::Local
+                } else {
+                    FilesSourceKind::Sifs
+                };
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut().switch_source(source, waker);
+            })
+    };
+    let breadcrumb = {
+        let s = shared.clone();
+        Breadcrumb::new(shared.files().source.path_label())
+            .items(
+                crumbs
+                    .iter()
+                    .map(|(label, _)| BreadcrumbItem::new(label.clone())),
+            )
+            .current(current)
+            .theme_when(clone_reader(reader))
+            .on_activate(move |index, _label| {
+                if let Some(target) = targets.get(index) {
+                    s.files_mut().navigate(target.clone());
+                }
+            })
+    };
+    let open_local_file = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::FileText, "Open local file")
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || !s.files().picker_lane.is_pending()
+            })
+            .on_press(move || {
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut()
+                    .request_native_picker(FilesPickerAction::OpenFile, waker);
+            })
+    };
+    let open_local_folder = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::Folder, "Choose local folder")
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || !s.files().picker_lane.is_pending()
+            })
+            .on_press(move || {
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut()
+                    .request_native_picker(FilesPickerAction::OpenFolder, waker);
+            })
+    };
+    let import_files = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::Attach, "Import files")
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || {
+                    let files = s.files();
+                    files.can_modify_current_location() && !files.picker_lane.is_pending()
+                }
+            })
+            .on_press(move || {
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut()
+                    .request_native_picker(FilesPickerAction::ImportFiles, waker);
+            })
+    };
+    let refresh = {
+        let s = shared.clone();
+        IconButton::new(
+            IconGlyph::Redo,
+            format!("Refresh {}", shared.files().source.label()),
+        )
+        .theme_when(clone_reader(reader))
+        .selected_when({
+            let s = s.clone();
+            move || s.files().loading
+        })
+        .enabled_when({
+            let s = s.clone();
+            move || !s.files().loading
+        })
+        .on_press(move || {
+            let waker = { s.borrow().waker.clone() };
+            s.files_mut().refresh(waker);
+        })
+    };
+    let commands = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::MoreHorizontal, "More file commands")
+            .theme_when(clone_reader(reader))
+            .selected_when({
+                let s = s.clone();
+                move || s.files().compact_overlay == Some(CompactFilesOverlay::Commands)
+            })
+            .on_press_with_ctx(move |ctx| {
+                s.files_mut()
+                    .open_compact_overlay(CompactFilesOverlay::Commands);
+                request_files_overlay_rebuild(ctx);
+            })
+    };
+
+    let toolbar_row = Flex::horizontal()
+        .main_gap(HEADER_COMMAND_GAP)
+        .align_items(Alignment::Center)
+        .with_item(back, FlexItem::new().no_shrink())
+        .with_item(forward, FlexItem::new().no_shrink())
+        .with_item(up, FlexItem::new().no_shrink())
+        .with_item(
+            SizedBox::new().width(120.0).with_child(source),
+            FlexItem::fixed(120.0),
+        )
+        .with_item(breadcrumb, FlexItem::fill().min_width(96.0))
+        .with_item(
+            toolbar_tooltip("Open local file", open_local_file, reader),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
+            toolbar_tooltip("Choose local folder", open_local_folder, reader),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
+            toolbar_tooltip("Import files", import_files, reader),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
+            toolbar_tooltip(
+                format!("Refresh {}", shared.files().source.label()),
+                refresh,
+                reader,
+            ),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
+            toolbar_tooltip("More file commands", commands, reader),
+            FlexItem::new().no_shrink(),
+        );
+
+    Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .with_child(SizedBox::new().height(HEADER_PAD_Y))
+        .with_child(toolbar_row)
+        .with_child(SizedBox::new().height(HEADER_PAD_Y))
+}
+
 /// Narrow file-manager chrome keeps the essential navigation controls visible
 /// and moves the remaining commands plus the hidden wide inspector into
 /// explicit, keyboard-focusable overlays.
@@ -6156,7 +7958,22 @@ fn compact_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> 
         let files = shared.files();
         let theme = shared.theme();
         let pal = palette(shared);
-        Label::new(format!("{} · {}", files.source.label(), files.path))
+        let source_label = match files.source {
+            FilesSourceKind::Sifs => "SIFS",
+            FilesSourceKind::Local => "Local",
+        };
+        let leaf = match files.source {
+            FilesSourceKind::Sifs => files
+                .path
+                .rsplit('/')
+                .find(|segment| !segment.is_empty())
+                .unwrap_or("/"),
+            FilesSourceKind::Local => Path::new(&files.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(files.path.as_str()),
+        };
+        Label::new(format!("{source_label} · {}", middle_short(leaf, 18)))
             .semantic_name(format!(
                 "Current {} path {}",
                 files.source.label(),
@@ -6893,6 +8710,18 @@ fn files_status_bar_selection(files: &FilesState) -> String {
 }
 
 fn files_task_status(files: &FilesState) -> String {
+    if files.external_file_hovered {
+        return "drop to import".to_string();
+    }
+    if files.picker_lane.is_pending() {
+        return "picker open".to_string();
+    }
+    if !files.pending_import_request_ids.is_empty() {
+        return "preparing import".to_string();
+    }
+    if files.picker_error.is_some() {
+        return "import needs attention".to_string();
+    }
     let running = files
         .tasks
         .iter()
@@ -7993,6 +9822,8 @@ fn open_cluster_tab(shared: &Shared) {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InspectorAction {
     OpenFolder,
+    ViewFile,
+    AttachToChat,
     Copy,
     CopyIdentifiers,
     CopyToSifs,
@@ -8014,6 +9845,8 @@ impl InspectorAction {
     fn label(self) -> &'static str {
         match self {
             Self::OpenFolder => "Open folder",
+            Self::ViewFile => "View or edit",
+            Self::AttachToChat => "Attach to current chat",
             Self::Copy => "Copy",
             Self::CopyIdentifiers => "Copy IDs",
             Self::CopyToSifs => "Copy to SIFS",
@@ -8035,6 +9868,8 @@ impl InspectorAction {
     fn glyph(self) -> IconGlyph {
         match self {
             Self::OpenFolder => IconGlyph::Folder,
+            Self::ViewFile => IconGlyph::FileText,
+            Self::AttachToChat => IconGlyph::Attach,
             Self::Copy | Self::CopyIdentifiers => IconGlyph::Restore,
             Self::CopyToSifs => IconGlyph::Storage,
             Self::CopyToLocal => IconGlyph::Download,
@@ -8061,6 +9896,8 @@ impl InspectorAction {
             Self::Rename => Some(FileActionPromptKind::Rename),
             Self::Delete => Some(FileActionPromptKind::Delete),
             Self::OpenFolder
+            | Self::ViewFile
+            | Self::AttachToChat
             | Self::CopyIdentifiers
             | Self::RefreshPlacement
             | Self::RepairReplicas
@@ -8076,6 +9913,8 @@ impl InspectorAction {
     fn semantic_name(self, entry: &SifsEntry) -> String {
         match self {
             Self::OpenFolder => "Open folder".to_string(),
+            Self::ViewFile => format!("View or edit {}", entry.name),
+            Self::AttachToChat => format!("Attach {} to current chat", entry.name),
             Self::RefreshPlacement => format!("Refresh placement {}", entry.name),
             Self::RepairReplicas => format!("Repair replicas {}", entry.name),
             Self::MakeMetadataPrimary => format!("Make metadata primary {}", entry.name),
@@ -8098,6 +9937,9 @@ fn inspector_actions(files: &FilesState, entry: &SifsEntry) -> Vec<InspectorActi
     let mut actions = Vec::with_capacity(8);
     if entry.is_dir {
         actions.push(InspectorAction::OpenFolder);
+    } else {
+        actions.push(InspectorAction::ViewFile);
+        actions.push(InspectorAction::AttachToChat);
     }
     actions.push(InspectorAction::Copy);
     match files.source {
@@ -8448,6 +10290,14 @@ fn activate_root_inspector_action(
 fn inspector_action_description(action: InspectorAction, entry: &SifsEntry) -> String {
     match action {
         InspectorAction::OpenFolder => format!("Open {}", entry.path),
+        InspectorAction::ViewFile => format!(
+            "Open the complete text contents of {} in the selectable document viewer",
+            entry.path
+        ),
+        InspectorAction::AttachToChat => format!(
+            "Read a verified snapshot of {} and attach it to the current chat",
+            entry.path
+        ),
         InspectorAction::RefreshPlacement => {
             format!("Refresh SIFS placement metadata for {}", entry.path)
         }
@@ -8501,7 +10351,10 @@ fn inspector_buttons(
         let action_entry = entry.clone();
         let path = entry.path.clone();
         let (appearance, tone) = match action {
-            InspectorAction::OpenFolder => (ButtonAppearance::Filled, SemanticTone::Accent),
+            InspectorAction::OpenFolder | InspectorAction::ViewFile => {
+                (ButtonAppearance::Filled, SemanticTone::Accent)
+            }
+            InspectorAction::AttachToChat => (ButtonAppearance::Tonal, SemanticTone::Accent),
             InspectorAction::Delete => (ButtonAppearance::Tonal, SemanticTone::Danger),
             InspectorAction::RefreshPlacement
             | InspectorAction::RepairReplicas
@@ -8544,6 +10397,14 @@ fn activate_inspector_action(
 ) {
     match action {
         InspectorAction::OpenFolder => shared.files_mut().navigate(path.to_string()),
+        InspectorAction::ViewFile => {
+            let waker = { shared.borrow().waker.clone() };
+            shared.files_mut().open_selected_document(waker);
+        }
+        InspectorAction::AttachToChat => {
+            let waker = { shared.borrow().waker.clone() };
+            shared.files_mut().start_attach_selected(waker);
+        }
         InspectorAction::RefreshPlacement => {
             let waker = { shared.borrow().waker.clone() };
             shared.files_mut().start_placement_refresh(waker);
@@ -8750,7 +10611,7 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
     kind_style.font_size = theme.text.sm.size;
     kind_style.line_height = theme.text.sm.line_height;
     let actions = inspector_actions(&files, &entry);
-    let selected_body = Stack::vertical()
+    let mut selected_body = Stack::vertical()
         .alignment(Alignment::Stretch)
         .spacing(10.0)
         .with_child(Label::new(kind_line).style(kind_style))
@@ -8760,6 +10621,17 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
                 .theme_when(clone_reader(reader))
                 .max_value_lines(6),
         );
+    if files.attachment_loading {
+        selected_body = selected_body.with_child(
+            StatusBadge::new("Preparing chat attachment")
+                .tone(SemanticTone::Accent)
+                .theme_when(clone_reader(reader)),
+        );
+    } else if let Some(error) = files.attachment_error.as_deref() {
+        selected_body = selected_body.with_child(
+            Label::new(error.to_string()).style(theme.text_style(theme.palette.danger)),
+        );
+    }
     let selected_card = inspector_card(
         entry.name.clone(),
         selected_body,
@@ -9067,7 +10939,106 @@ fn header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         },
         move |_key| WidgetPod::new(header(&s, &r)),
     );
-    WidgetPadding::horizontal(CONTENT_PAD, rebuilt).fill_child_height()
+    Surface::window(
+        WidgetPadding::horizontal(CONTENT_PAD, rebuilt)
+            .fill_child_width()
+            .fill_child_height(),
+    )
+    .theme_when(clone_reader(reader))
+    .fill_width()
+}
+
+fn picker_first_header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    let rebuilt = RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || {
+                let files = s.files();
+                (
+                    files.source,
+                    files.path.clone(),
+                    files.history_back.len(),
+                    files.history_forward.len(),
+                    files.loading,
+                )
+            }
+        },
+        move |_key| WidgetPod::new(picker_first_header(&s, &r)),
+    );
+    Surface::window(
+        WidgetPadding::horizontal(CONTENT_PAD, rebuilt)
+            .fill_child_width()
+            .fill_child_height(),
+    )
+    .theme_when(clone_reader(reader))
+    .fill_width()
+}
+
+/// Chooses only the desktop command-row density; the surrounding wide Files body and inspector
+/// stay mounted. This avoids making the 640px inspector breakpoint also carry the much wider
+/// complete-toolbar requirement.
+struct FilesDesktopHeader {
+    full: WidgetPod,
+    picker_first: WidgetPod,
+    use_full: Cell<bool>,
+}
+
+impl FilesDesktopHeader {
+    fn new(shared: &Shared, reader: &ThemeReader) -> Self {
+        Self {
+            full: WidgetPod::new(header_bar(shared, reader)),
+            picker_first: WidgetPod::new(picker_first_header_bar(shared, reader)),
+            use_full: Cell::new(true),
+        }
+    }
+
+    fn active(&self) -> &WidgetPod {
+        if self.use_full.get() {
+            &self.full
+        } else {
+            &self.picker_first
+        }
+    }
+
+    fn active_mut(&mut self) -> &mut WidgetPod {
+        if self.use_full.get() {
+            &mut self.full
+        } else {
+            &mut self.picker_first
+        }
+    }
+}
+
+impl Widget for FilesDesktopHeader {
+    fn event(&mut self, _ctx: &mut EventCtx, _event: &Event) {}
+
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.use_full
+            .set(constraints.max.width >= FULL_HEADER_INNER_MIN_W + CONTENT_PAD * 2.0);
+        self.active_mut().measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.active_mut().arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.active().paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.active().semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(self.active());
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(self.active_mut());
+    }
 }
 
 fn compact_header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -9088,7 +11059,21 @@ fn compact_header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
         },
         move |_key| WidgetPod::new(compact_header(&s, &r)),
     );
-    WidgetPadding::horizontal(8.0, rebuilt).fill_child_height()
+    Surface::window(
+        WidgetPadding::new(
+            Insets {
+                left: 8.0,
+                top: 6.0,
+                right: 8.0,
+                bottom: 6.0,
+            },
+            rebuilt,
+        )
+        .fill_child_width()
+        .fill_child_height(),
+    )
+    .theme_when(clone_reader(reader))
+    .fill_width()
 }
 
 /// The file-list column wrapped so it rebuilds (rows) whenever the path changes. A shared
@@ -9151,7 +11136,7 @@ fn wide_pod(
         .with_child(
             SizedBox::new()
                 .height(HEADER_H)
-                .with_child(header_bar(shared, reader)),
+                .with_child(FilesDesktopHeader::new(shared, reader)),
         )
         .with_child(Separator::horizontal().theme_when(clone_reader(reader)));
     WidgetPod::new(
@@ -9266,6 +11251,80 @@ fn compact_files_commands(shared: &Shared, reader: &ThemeReader) -> impl Widget 
                 let mut files = action.files_mut();
                 files.close_compact_overlay();
                 files.switch_source(FilesSourceKind::Local, waker);
+                drop(files);
+                request_files_overlay_rebuild(ctx);
+            },
+        )
+    };
+    let open_local_file = {
+        let enabled = shared.clone();
+        let action = shared.clone();
+        compact_command_button(
+            "Open local file...",
+            reader,
+            move || !enabled.files().picker_lane.is_pending(),
+            move |ctx| {
+                let waker = { action.borrow().waker.clone() };
+                let mut files = action.files_mut();
+                files.close_compact_overlay();
+                files.request_native_picker(FilesPickerAction::OpenFile, waker);
+                drop(files);
+                request_files_overlay_rebuild(ctx);
+            },
+        )
+    };
+    let open_local_folder = {
+        let enabled = shared.clone();
+        let action = shared.clone();
+        compact_command_button(
+            "Choose local folder...",
+            reader,
+            move || !enabled.files().picker_lane.is_pending(),
+            move |ctx| {
+                let waker = { action.borrow().waker.clone() };
+                let mut files = action.files_mut();
+                files.close_compact_overlay();
+                files.request_native_picker(FilesPickerAction::OpenFolder, waker);
+                drop(files);
+                request_files_overlay_rebuild(ctx);
+            },
+        )
+    };
+    let import_files = {
+        let enabled = shared.clone();
+        let action = shared.clone();
+        compact_command_button(
+            "Import files...",
+            reader,
+            move || {
+                let files = enabled.files();
+                files.can_modify_current_location() && !files.picker_lane.is_pending()
+            },
+            move |ctx| {
+                let waker = { action.borrow().waker.clone() };
+                let mut files = action.files_mut();
+                files.close_compact_overlay();
+                files.request_native_picker(FilesPickerAction::ImportFiles, waker);
+                drop(files);
+                request_files_overlay_rebuild(ctx);
+            },
+        )
+    };
+    let import_folder = {
+        let enabled = shared.clone();
+        let action = shared.clone();
+        compact_command_button(
+            "Import folder...",
+            reader,
+            move || {
+                let files = enabled.files();
+                files.can_modify_current_location() && !files.picker_lane.is_pending()
+            },
+            move |ctx| {
+                let waker = { action.borrow().waker.clone() };
+                let mut files = action.files_mut();
+                files.close_compact_overlay();
+                files.request_native_picker(FilesPickerAction::ImportFolder, waker);
                 drop(files);
                 request_files_overlay_rebuild(ctx);
             },
@@ -9452,6 +11511,10 @@ fn compact_files_commands(shared: &Shared, reader: &ThemeReader) -> impl Widget 
         .with_child(refresh)
         .with_child(browse_sifs)
         .with_child(browse_local)
+        .with_child(open_local_file)
+        .with_child(open_local_folder)
+        .with_child(import_files)
+        .with_child(import_folder)
         .with_child(go_to)
         .with_child(new_file)
         .with_child(new_folder)
@@ -9667,7 +11730,314 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     ))
 }
 
+fn document_status_text(shared: &Shared) -> String {
+    let files = shared.files();
+    let Some(document) = files.document.as_ref() else {
+        return "Document closed".to_string();
+    };
+    if document.loading {
+        return "Reading a verified snapshot...".to_string();
+    }
+    if document.load_error.is_some() {
+        return "Document unavailable".to_string();
+    }
+    if document.saving {
+        return "Saving safely...".to_string();
+    }
+    if document.save_error.is_some() {
+        return "Save needs attention; your edits are still open".to_string();
+    }
+    if document.save_warning.is_some() {
+        return match document.source {
+            FilesSourceKind::Sifs => "Saved; SIFS maintenance needs attention".to_string(),
+            FilesSourceKind::Local => {
+                "Saved; host filesystem follow-up needs attention".to_string()
+            }
+        };
+    }
+    if document.dirty() {
+        return "Unsaved changes".to_string();
+    }
+    if document.read_only_reason.is_some() {
+        return "Read-only verified snapshot".to_string();
+    }
+    match document.source {
+        FilesSourceKind::Sifs => "Saved to SIFS with version protection".to_string(),
+        FilesSourceKind::Local => "Saved".to_string(),
+    }
+}
+
+fn document_detail_text(shared: &Shared) -> String {
+    let files = shared.files();
+    let Some(document) = files.document.as_ref() else {
+        return String::new();
+    };
+    if let Some(error) = &document.load_error {
+        return error.clone();
+    }
+    if let Some(error) = &document.save_error {
+        return error.clone();
+    }
+    if let Some(warning) = &document.save_warning {
+        return match document.source {
+            FilesSourceKind::Sifs => format!(
+                "The new SIFS version is visible, but follow-up maintenance warned: {warning}"
+            ),
+            FilesSourceKind::Local => format!(
+                "The local content was committed, but host filesystem follow-up warned: {warning}"
+            ),
+        };
+    }
+    if let Some(reason) = &document.read_only_reason {
+        return reason.clone();
+    }
+    if document.dirty() {
+        return format!(
+            "{} - Attach sends this unsaved editor buffer and labels it as unpersisted; Ctrl+S saves with conflict protection.",
+            document.path
+        );
+    }
+    match document.source {
+        FilesSourceKind::Local => format!(
+            "{} - Ctrl+S saves by atomic same-folder replacement after checking path, size, and modified time.",
+            document.path
+        ),
+        FilesSourceKind::Sifs => format!(
+            "{} - Ctrl+S uses an expected object ID and version, so a concurrent SIFS update cannot be overwritten.",
+            document.path
+        ),
+    }
+}
+
+fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
+    let document = shared.files().document.clone()?;
+    let theme = reader();
+    let mut text_style = theme.mono_text_style(theme.palette.text);
+    text_style.font_size = theme.text.sm.size;
+    text_style.line_height = theme.text.sm.line_height;
+    let editor_shared = shared.clone();
+    let mut editor = TextSurface::new(format!("files-document:{}", document.path))
+        .theme(theme.clone())
+        .text_style(text_style)
+        .padding(Insets::all(12.0))
+        .min_width(0.0)
+        .min_height(420.0)
+        .wrap(TextWrap::NoWrap)
+        .value(document.text.clone())
+        .on_change(move |value| editor_shared.files_mut().set_document_text(value));
+    if !document.editable() {
+        editor = editor.read_only();
+    }
+    let status_shared = shared.clone();
+    let detail_shared = shared.clone();
+    let status = Surface::panel(
+        Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .spacing(3.0)
+            .with_child(
+                Label::dynamic("Document", move || document_status_text(&status_shared))
+                    .style(theme.text_style(theme.palette.text)),
+            )
+            .with_child(
+                Label::dynamic("Document path", move || {
+                    document_detail_text(&detail_shared)
+                })
+                .style(theme.text_style(theme.palette.text_muted)),
+            ),
+    )
+    .theme_when(clone_reader(reader))
+    .padding(Insets {
+        left: 12.0,
+        top: 8.0,
+        right: 12.0,
+        bottom: 8.0,
+    })
+    .fill_width();
+    let editor_body = Dock::new(
+        Surface::field(editor)
+            .theme_when(clone_reader(reader))
+            .fill_width(),
+    )
+    .bottom(74.0, status)
+    .fallback_width(780.0)
+    .fallback_body_height(520.0);
+    let body = SwitchView::new()
+        .selected(if document.loading {
+            0
+        } else if document.load_error.is_some() {
+            1
+        } else {
+            2
+        })
+        .with_child(centered_note(
+            reader,
+            IconGlyph::Hourglass,
+            "Opening document",
+            "Reading the complete selected version on the Files background worker",
+        ))
+        .with_child(centered_note(
+            reader,
+            IconGlyph::Alert,
+            "Document unavailable",
+            document
+                .load_error
+                .clone()
+                .unwrap_or_else(|| "The document could not be opened".to_string()),
+        ))
+        .with_child(editor_body);
+
+    let close_shared = shared.clone();
+    let close = sui::Button::new("Close")
+        .appearance(ButtonAppearance::Outline)
+        .tone(SemanticTone::Neutral)
+        .theme_when(clone_reader(reader))
+        .on_press_with_ctx(move |ctx| {
+            close_shared.files_mut().request_close_document();
+            request_files_overlay_rebuild(ctx);
+        });
+    let attach_shared = shared.clone();
+    let attach_enabled = shared.clone();
+    let attach = sui::Button::new("Attach to current chat")
+        .icon(IconGlyph::Attach)
+        .appearance(ButtonAppearance::Tonal)
+        .tone(SemanticTone::Accent)
+        .theme_when(clone_reader(reader))
+        .enabled_when(move || {
+            let files = attach_enabled.files();
+            files
+                .document
+                .as_ref()
+                .is_some_and(|document| !document.loading && document.load_error.is_none())
+                && !files.attachment_loading
+        })
+        .on_press_with_ctx(move |ctx| {
+            let waker = { attach_shared.borrow().waker.clone() };
+            attach_shared.files_mut().start_attach_document(waker);
+            request_files_overlay_rebuild(ctx);
+        });
+    let mut sheet = SideSheet::new(document.title.clone(), body)
+        .theme_when(clone_reader(reader))
+        .description(format!(
+            "Complete {} text document - {}",
+            document.source.label(),
+            document.path
+        ))
+        .placement(SideSheetPlacement::Right)
+        .width(920.0)
+        .modal(true)
+        .dismiss_on_scrim(true)
+        .action(attach);
+    if document.load_error.is_some() {
+        let retry_shared = shared.clone();
+        sheet = sheet.action(
+            sui::Button::new("Retry")
+                .appearance(ButtonAppearance::Tonal)
+                .tone(SemanticTone::Accent)
+                .theme_when(clone_reader(reader))
+                .on_press_with_ctx(move |ctx| {
+                    let waker = { retry_shared.borrow().waker.clone() };
+                    retry_shared.files_mut().retry_document(waker);
+                    request_files_overlay_rebuild(ctx);
+                }),
+        );
+    } else if !document.loading {
+        let save_shared = shared.clone();
+        let save_enabled = shared.clone();
+        sheet = sheet.action(
+            sui::Button::new("Save")
+                .icon(IconGlyph::Check)
+                .appearance(ButtonAppearance::Filled)
+                .tone(SemanticTone::Accent)
+                .theme_when(clone_reader(reader))
+                .enabled_when(move || {
+                    save_enabled
+                        .files()
+                        .document
+                        .as_ref()
+                        .is_some_and(|document| {
+                            document.editable() && document.dirty() && !document.saving
+                        })
+                })
+                .on_press_with_ctx(move |ctx| {
+                    let waker = { save_shared.borrow().waker.clone() };
+                    save_shared.files_mut().save_document(waker);
+                    request_files_overlay_rebuild(ctx);
+                }),
+        );
+    }
+    let dismiss_shared = shared.clone();
+    Some(WidgetPod::new(sheet.action(close).on_dismiss(move || {
+        dismiss_shared.files_mut().request_close_document()
+    })))
+}
+
+fn files_document_close_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
+    if !shared.files().document_close_confirmation {
+        return None;
+    }
+    let title = shared
+        .files()
+        .document
+        .as_ref()
+        .map(|document| document.title.clone())
+        .unwrap_or_else(|| "document".to_string());
+    let discard_shared = shared.clone();
+    let keep_shared = shared.clone();
+    let actions = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(8.0)
+        .align_items(Alignment::End)
+        .with_child(
+            sui::Button::new("Discard changes")
+                .appearance(ButtonAppearance::Tonal)
+                .tone(SemanticTone::Danger)
+                .theme_when(clone_reader(reader))
+                .on_press_with_ctx(move |ctx| {
+                    let waker = { discard_shared.borrow().waker.clone() };
+                    discard_shared
+                        .files_mut()
+                        .discard_document_and_continue(waker);
+                    request_files_overlay_rebuild(ctx);
+                }),
+        )
+        .with_child(
+            sui::Button::new("Keep editing")
+                .appearance(ButtonAppearance::Filled)
+                .tone(SemanticTone::Accent)
+                .theme_when(clone_reader(reader))
+                .on_press_with_ctx(move |ctx| {
+                    keep_shared.files_mut().cancel_document_close();
+                    request_files_overlay_rebuild(ctx);
+                }),
+        );
+    let body = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(12.0)
+        .with_child(
+            Label::new(format!(
+                "{title} has unsaved changes. Discarding closes the current snapshot without writing it."
+            ))
+            .theme(reader()),
+        )
+        .with_child(actions);
+    Some(WidgetPod::new(
+        sui::Dialog::new("Unsaved changes", body)
+            .theme(reader())
+            .description("Choose whether to keep editing or discard the document changes")
+            .max_width(480.0)
+            .dismiss_on_scrim(false),
+    ))
+}
+
 fn files_dialog_signature(shared: &Shared) -> String {
+    let files = shared.files();
+    if files.document_close_confirmation {
+        return format!("document-confirm|{}", files.document_revision);
+    }
+    if files.document.is_some() {
+        return format!("document|{}", files.document_revision);
+    }
+    drop(files);
     let action = files_action_dialog_signature(shared);
     if action != "closed" {
         return format!("action|{action}");
@@ -9721,7 +12091,11 @@ fn compact_files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
 }
 
 fn files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
-    if shared.files().action_prompt.is_some() {
+    if shared.files().document_close_confirmation {
+        files_document_close_dialog(shared, reader)
+    } else if shared.files().document.is_some() {
+        files_document_sheet(shared, reader)
+    } else if shared.files().action_prompt.is_some() {
         files_action_dialog(shared, reader)
     } else {
         compact_files_dialog(shared, reader)
@@ -9763,7 +12137,19 @@ impl FilesDialogHost {
 }
 
 impl Widget for FilesDialogHost {
-    fn event(&mut self, ctx: &mut EventCtx, _event: &Event) {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        if ctx.phase() == EventPhase::Capture
+            && let Event::Keyboard(key) = event
+            && key.state == KeyState::Pressed
+            && (key.modifiers.control || key.modifiers.meta)
+            && key.key.eq_ignore_ascii_case("s")
+            && self.shared.files().document.is_some()
+        {
+            let waker = { self.shared.borrow().waker.clone() };
+            self.shared.files_mut().save_document(waker);
+            ctx.set_handled();
+            request_files_overlay_rebuild(ctx);
+        }
         let signature = files_dialog_signature(&self.shared);
         if signature != self.dialog_signature {
             ctx.request_measure();
@@ -10928,6 +13314,66 @@ mod tests {
     }
 
     #[test]
+    fn local_folder_copy_plans_reject_nested_symbolic_links() {
+        let root = files_test_temp_dir("local-copy-nested-symlink");
+        let source = root.join("workspace");
+        let nested = source.join("nested");
+        let outside = root.join("outside.txt");
+        let link = nested.join("outside-link.txt");
+        fs::create_dir_all(&nested).expect("create source tree");
+        fs::write(&outside, b"must not be imported").expect("write link target");
+
+        #[cfg(unix)]
+        let link_result = std::os::unix::fs::symlink(&outside, &link);
+        #[cfg(windows)]
+        let link_result = std::os::windows::fs::symlink_file(&outside, &link);
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        if let Err(error) = link_result {
+            eprintln!("symbolic links are unavailable for this test: {error}");
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+
+        let mut local_plan = Vec::new();
+        let local_error =
+            collect_local_copy_plan(&source, &root.join("workspace copy"), &mut local_plan, None)
+                .expect_err("nested symbolic link must stop a local folder copy plan");
+        assert!(matches!(
+            local_error,
+            FilesOperationFailure::Error(message) if message.contains("symbolic link")
+        ));
+        assert!(!root.join("workspace copy").exists());
+
+        let mut sifs_plan = Vec::new();
+        let sifs_error =
+            collect_local_to_sifs_copy_plan(&source, "/services/workspace", &mut sifs_plan, None)
+                .expect_err("nested symbolic link must stop a SIFS folder import plan");
+        assert!(matches!(
+            sifs_error,
+            FilesOperationFailure::Error(message) if message.contains("symbolic link")
+        ));
+
+        let direct_target = root.join("copied-link.txt");
+        let direct_error = copy_local_file_with_progress(
+            &link.to_string_lossy(),
+            &direct_target.to_string_lossy(),
+            None,
+        )
+        .expect_err("file copy must revalidate a symbolic-link source at use time");
+        assert!(matches!(
+            direct_error,
+            FilesOperationFailure::Error(message) if message.contains("symbolic link")
+        ));
+        assert!(!direct_target.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn local_recursive_delete_operation_removes_directory_tree() {
         let root = files_test_temp_dir("local-delete-directory-operation");
         let source = root.join("workspace");
@@ -11444,6 +13890,7 @@ mod tests {
             FilesWorkerCommand::Operation { .. } => panic!("expected list command"),
             FilesWorkerCommand::Details { .. } => panic!("expected list command"),
             FilesWorkerCommand::Preview { .. } => panic!("expected list command"),
+            _ => panic!("expected list command"),
         }
 
         Ok(())
@@ -11510,6 +13957,7 @@ mod tests {
             FilesWorkerCommand::List { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
+            _ => panic!("expected operation command"),
         }
 
         Ok(())
@@ -12941,6 +15389,7 @@ mod tests {
             FilesWorkerCommand::Details { .. } => panic!("expected list command"),
             FilesWorkerCommand::Preview { .. } => panic!("expected list command"),
             FilesWorkerCommand::Operation { .. } => panic!("expected list command"),
+            _ => panic!("expected list command"),
         }
     }
 
@@ -12982,6 +15431,7 @@ mod tests {
             FilesWorkerCommand::List { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
+            _ => panic!("expected operation command"),
         }
     }
 
@@ -13122,6 +15572,7 @@ mod tests {
                 FilesWorkerCommand::List { .. } => panic!("expected operation command"),
                 FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
                 FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
+                _ => panic!("expected operation command"),
             }
         }
     }
@@ -13235,6 +15686,7 @@ mod tests {
                 FilesWorkerCommand::List { .. } => panic!("expected operation command"),
                 FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
                 FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
+                _ => panic!("expected operation command"),
             }
         }
 
@@ -14886,6 +17338,7 @@ mod tests {
             FilesWorkerCommand::List { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
+            _ => panic!("expected operation command"),
         }
 
         window
@@ -14908,6 +17361,7 @@ mod tests {
             FilesWorkerCommand::List { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
+            _ => panic!("expected operation command"),
         }
 
         window
@@ -14930,6 +17384,7 @@ mod tests {
             FilesWorkerCommand::List { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
+            _ => panic!("expected operation command"),
         }
 
         assert_eq!(
@@ -14960,6 +17415,7 @@ mod tests {
             FilesWorkerCommand::List { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
+            _ => panic!("expected operation command"),
         }
 
         assert_eq!(
@@ -14990,6 +17446,7 @@ mod tests {
             FilesWorkerCommand::List { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
+            _ => panic!("expected operation command"),
         }
 
         Ok(())
@@ -15074,6 +17531,7 @@ mod tests {
             FilesWorkerCommand::List { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
+            _ => panic!("expected operation command"),
         }
 
         assert_eq!(
@@ -15104,6 +17562,7 @@ mod tests {
             FilesWorkerCommand::List { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
+            _ => panic!("expected operation command"),
         }
 
         Ok(())
@@ -15391,6 +17850,404 @@ mod tests {
             "expanded inspector details should be vertically scrollable"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn local_document_load_is_complete_beyond_preview_limit() {
+        let root = files_test_temp_dir("complete-document");
+        let path = root.join("large-source.rs");
+        let text = "let complete = true;\n".repeat(3_000);
+        assert!(text.len() as u64 > FILE_PREVIEW_MAX_BYTES);
+        fs::write(&path, text.as_bytes()).expect("write document");
+
+        let loaded =
+            load_local_text_document(path.to_string_lossy().as_ref(), FILE_DOCUMENT_MAX_BYTES)
+                .expect("load complete document");
+
+        assert_eq!(loaded.text, text);
+        let expected_digest = blake3::hash(text.as_bytes()).to_hex().to_string();
+        assert_eq!(
+            loaded
+                .local_fingerprint
+                .as_ref()
+                .map(|fingerprint| fingerprint.content_digest.as_str()),
+            Some(expected_digest.as_str())
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lexical_local_normalization_preserves_leading_relative_parents() {
+        let normalized = normalize_local_path("../../folder/file.txt").expect("normalize path");
+        let parent_count = Path::new(&normalized)
+            .components()
+            .filter(|component| matches!(component, std::path::Component::ParentDir))
+            .count();
+        assert_eq!(parent_count, 2, "normalized path was {normalized}");
+        let normalized_path = Path::new(&normalized);
+        assert_eq!(
+            normalized_path.file_name(),
+            Some(std::ffi::OsStr::new("file.txt"))
+        );
+        assert_eq!(
+            normalized_path.parent().and_then(Path::file_name),
+            Some(std::ffi::OsStr::new("folder"))
+        );
+    }
+
+    #[test]
+    fn local_document_rejects_oversize_and_binary_content_explicitly() {
+        let root = files_test_temp_dir("document-bounds");
+        let oversize = root.join("oversize.txt");
+        fs::write(&oversize, vec![b'x'; FILE_DOCUMENT_MAX_BYTES as usize + 1])
+            .expect("write oversize document");
+        let error =
+            load_local_text_document(oversize.to_string_lossy().as_ref(), FILE_DOCUMENT_MAX_BYTES)
+                .expect_err("oversize document must be rejected");
+        assert!(error.contains("limit"), "unexpected error: {error}");
+
+        let binary = root.join("binary.dat");
+        fs::write(&binary, b"text\0binary").expect("write binary document");
+        let error =
+            load_local_text_document(binary.to_string_lossy().as_ref(), FILE_DOCUMENT_MAX_BYTES)
+                .expect_err("binary document must be rejected");
+        assert!(error.contains("binary control bytes"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_safe_save_detects_same_length_content_change_by_digest() {
+        let root = files_test_temp_dir("document-conflict");
+        let path = root.join("notes.txt");
+        fs::write(&path, b"first version").expect("write first version");
+        let loaded =
+            load_local_text_document(path.to_string_lossy().as_ref(), FILE_DOCUMENT_MAX_BYTES)
+                .expect("load document");
+        let expected = loaded.local_fingerprint.expect("local fingerprint");
+        fs::write(&path, b"other version").expect("replace with same-length content");
+        let (_, current) =
+            read_local_file_snapshot(path.to_string_lossy().as_ref(), FILE_DOCUMENT_MAX_BYTES)
+                .expect("read current snapshot");
+        assert_eq!(current.len, expected.len);
+        assert_ne!(current.content_digest, expected.content_digest);
+
+        let error = save_local_text_document(
+            path.to_string_lossy().as_ref(),
+            &expected,
+            b"edited version",
+        )
+        .expect_err("stale save must fail");
+        assert!(error.contains("Save conflict"));
+        assert_eq!(
+            fs::read(&path).expect("read untouched conflict"),
+            b"other version"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_safe_save_returns_committed_receipt() {
+        let root = files_test_temp_dir("document-save");
+        let path = root.join("notes.txt");
+        fs::write(&path, b"before").expect("write before");
+        let loaded =
+            load_local_text_document(path.to_string_lossy().as_ref(), FILE_DOCUMENT_MAX_BYTES)
+                .expect("load document");
+        let expected = loaded.local_fingerprint.expect("local fingerprint");
+
+        let result =
+            save_local_text_document(path.to_string_lossy().as_ref(), &expected, b"after safely")
+                .expect("safe save");
+        let FilesDocumentSave::Local {
+            fingerprint,
+            requires_reload,
+            ..
+        } = result
+        else {
+            panic!("expected local receipt");
+        };
+        assert!(!requires_reload);
+        assert_eq!(fingerprint.len, 12);
+        assert_eq!(
+            fingerprint.content_digest,
+            blake3::hash(b"after safely").to_hex().to_string()
+        );
+        assert_eq!(
+            fs::read(&path).expect("read saved document"),
+            b"after safely"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn viewer_attachment_uses_dirty_editor_buffer_with_snapshot_provenance() {
+        let backend = Backend::local_fallback();
+        let mut files = FilesState::new(&backend);
+        let root = files_test_temp_dir("editor-attachment");
+        let path = root.join("draft.txt");
+        fs::write(&path, b"persisted").expect("write persisted");
+        let loaded =
+            load_local_text_document(path.to_string_lossy().as_ref(), FILE_DOCUMENT_MAX_BYTES)
+                .expect("load document");
+        files.document = Some(FilesDocument {
+            source: loaded.source,
+            path: loaded.path,
+            title: loaded.title,
+            text: "unsaved editor text".to_string(),
+            saved_text: loaded.text,
+            local_fingerprint: loaded.local_fingerprint,
+            sifs_fingerprint: None,
+            read_only_reason: None,
+            loading: false,
+            load_error: None,
+            saving: false,
+            save_error: None,
+            save_warning: None,
+        });
+
+        files.start_attach_document(None);
+        let intent = files
+            .take_ready_attachment_intent()
+            .expect("ready attachment intent");
+        assert_eq!(intent.bytes, b"unsaved editor text");
+        assert!(intent.is_unsaved_editor_buffer);
+        assert!(matches!(
+            intent.provenance,
+            FilesAttachmentProvenance::Local { .. }
+        ));
+        assert_eq!(fs::read(&path).expect("read persisted"), b"persisted");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn files_picker_toolbar_and_document_viewer_render_at_target_widths() -> sui::Result<()> {
+        fn prepared_shared(with_document: bool) -> Shared {
+            let backend = Backend::local_fallback();
+            let shared = Shared::new(AppState::ready(backend));
+            let path = r"C:\workspace\sinomo\src";
+            let document_path = format!(r"{path}\service_handler.rs");
+            {
+                let mut files = shared.files_mut();
+                files.source = FilesSourceKind::Local;
+                files.loaded = true;
+                files.loading = false;
+                files.path = path.to_string();
+                files.entries = vec![SifsEntry {
+                    name: "service_handler.rs".to_string(),
+                    path: document_path.clone(),
+                    is_dir: false,
+                    is_link: false,
+                    size: Some(2_048),
+                }];
+                files.selected = Some(0);
+                if with_document {
+                    let saved_text =
+                        "pub fn handle_request() {\n    tracing::info!(\"ready\");\n}\n";
+                    files.document = Some(FilesDocument {
+                        source: FilesSourceKind::Local,
+                        path: document_path.clone(),
+                        title: "service_handler.rs".to_string(),
+                        text: format!(
+                            "{saved_text}\n// Unsaved verification line that intentionally extends beyond the narrow editor viewport without wrapping."
+                        ),
+                        saved_text: saved_text.to_string(),
+                        local_fingerprint: Some(LocalFileFingerprint {
+                            canonical_path: PathBuf::from(&document_path),
+                            len: saved_text.len() as u64,
+                            modified_at_unix_nanos: Some(1),
+                            content_digest: blake3::hash(saved_text.as_bytes())
+                                .to_hex()
+                                .to_string(),
+                            readonly: false,
+                            symlink: false,
+                        }),
+                        sifs_fingerprint: None,
+                        read_only_reason: None,
+                        loading: false,
+                        load_error: None,
+                        saving: false,
+                        save_error: None,
+                        save_warning: None,
+                    });
+                    files.document_revision = 1;
+                }
+            }
+            shared
+        }
+
+        fn named_bounds(
+            snapshot: &sui_testing::WindowSnapshot,
+            role: sui::SemanticsRole,
+            name: &str,
+        ) -> Rect {
+            snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| node.role == role && node.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("missing {role:?} named {name}"))
+                .bounds
+        }
+
+        fn assert_inside(bounds: Rect, width: f32, height: f32, name: &str) {
+            assert!(
+                bounds.x() >= 0.0
+                    && bounds.y() >= 0.0
+                    && bounds.max_x() <= width
+                    && bounds.max_y() <= height,
+                "{name} escaped {width}x{height}: {bounds:?}"
+            );
+        }
+
+        let artifact_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("codex")
+            .join("files-workflow-layout");
+        fs::create_dir_all(&artifact_dir).expect("create visual artifact directory");
+
+        for width in [560.0_f32, 760.0_f32] {
+            let shared = prepared_shared(false);
+            let runtime = sui::Application::new()
+                .window(
+                    sui::WindowBuilder::new()
+                        .title("Files picker toolbar")
+                        .root(view(shared.clone())),
+                )
+                .build()?;
+            let app = sui_testing::TestApp::from_runtime(runtime)?;
+            let window = app.main_window()?;
+            window
+                .root()
+                .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(width, 720.0))))?;
+            window.run_until_idle()?;
+            let mut snapshot = window.snapshot()?;
+            window
+                .capture_screenshot()?
+                .write_png(artifact_dir.join(format!("picker-toolbar-{width:.0}.png")))?;
+            if width < WIDE_THRESHOLD {
+                let more =
+                    named_bounds(&snapshot, sui::SemanticsRole::Button, "More file commands");
+                let inspector =
+                    named_bounds(&snapshot, sui::SemanticsRole::Button, "Open file inspector");
+                let location = named_bounds(
+                    &snapshot,
+                    sui::SemanticsRole::Text,
+                    r"Current Local files path C:\workspace\sinomo\src",
+                );
+                eprintln!(
+                    "compact header width={width:.0} location={location:?} more={more:?} inspector={inspector:?}"
+                );
+                assert!(
+                    more.x() >= width - 80.0,
+                    "compact commands did not trail the filling location: {more:?}"
+                );
+                assert!(more.max_x() <= inspector.x());
+                assert_inside(inspector, width, HEADER_H, "compact inspector");
+                assert!(location.width() >= 200.0 && location.height() <= HEADER_H);
+                assert_inside(more, width, 720.0, "compact command overflow");
+                window
+                    .get_by_role(sui::SemanticsRole::Button)
+                    .with_name("More file commands")
+                    .click()?;
+                window.advance_time(1.0)?;
+                window.run_until_idle()?;
+                snapshot = window.snapshot()?;
+                for name in [
+                    "Open local file...",
+                    "Choose local folder...",
+                    "Import files...",
+                    "Import folder...",
+                ] {
+                    let bounds = named_bounds(&snapshot, sui::SemanticsRole::Button, name);
+                    eprintln!("toolbar width={width:.0} {name}: {bounds:?}");
+                    assert_inside(bounds, width, 720.0, name);
+                    assert!(bounds.width() >= 32.0 && bounds.height() >= 32.0);
+                }
+            } else {
+                for name in [
+                    "Open local file",
+                    "Choose local folder",
+                    "Import files",
+                    "More file commands",
+                ] {
+                    let bounds = named_bounds(&snapshot, sui::SemanticsRole::Button, name);
+                    eprintln!("toolbar width={width:.0} {name}: {bounds:?}");
+                    assert_inside(bounds, width, HEADER_H, name);
+                    assert!(bounds.width() >= 28.0 && bounds.height() >= 28.0);
+                }
+                window
+                    .get_by_role(sui::SemanticsRole::Button)
+                    .with_name("More file commands")
+                    .click()?;
+                window.advance_time(1.0)?;
+                window.run_until_idle()?;
+                snapshot = window.snapshot()?;
+                for name in ["Go to path", "Rename", "Delete selected item"] {
+                    let bounds = named_bounds(&snapshot, sui::SemanticsRole::Button, name);
+                    eprintln!("overflow width={width:.0} {name}: {bounds:?}");
+                    assert_inside(bounds, width, 720.0, name);
+                    assert!(bounds.width() >= 32.0 && bounds.height() >= 32.0);
+                }
+            }
+            window
+                .capture_screenshot()?
+                .write_png(artifact_dir.join(format!("command-overflow-{width:.0}.png")))?;
+
+            let shared = prepared_shared(true);
+            let runtime = sui::Application::new()
+                .window(
+                    sui::WindowBuilder::new()
+                        .title("Files document viewer")
+                        .root(view(shared)),
+                )
+                .build()?;
+            let app = sui_testing::TestApp::from_runtime(runtime)?;
+            let window = app.main_window()?;
+            window
+                .root()
+                .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(width, 720.0))))?;
+            window.run_until_idle()?;
+            window.advance_time(1.0)?;
+            window.run_until_idle()?;
+            let snapshot = window.snapshot()?;
+            let dialog = named_bounds(&snapshot, sui::SemanticsRole::Dialog, "service_handler.rs");
+            let editor = named_bounds(
+                &snapshot,
+                sui::SemanticsRole::TextInput,
+                r"files-document:C:\workspace\sinomo\src\service_handler.rs",
+            );
+            eprintln!("viewer width={width:.0} dialog={dialog:?} editor={editor:?}");
+            assert_inside(dialog, width, 720.0, "document sheet");
+            assert_inside(editor, width, 720.0, "document editor");
+            assert!(
+                editor.width() >= width - 80.0,
+                "editor too narrow: {editor:?}"
+            );
+            assert!(editor.height() >= 360.0, "editor too short: {editor:?}");
+
+            let mut actions = ["Attach to current chat", "Save", "Close"].map(|name| {
+                let bounds = named_bounds(&snapshot, sui::SemanticsRole::Button, name);
+                eprintln!("viewer width={width:.0} {name}: {bounds:?}");
+                assert_inside(bounds, width, 720.0, name);
+                assert!(bounds.width() >= 32.0 && bounds.height() >= 28.0);
+                bounds
+            });
+            actions.sort_by(|left, right| left.x().total_cmp(&right.x()));
+            for pair in actions.windows(2) {
+                assert!(
+                    pair[0].max_x() <= pair[1].x(),
+                    "document actions overlap at width {width}: {:?} and {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+            window
+                .capture_screenshot()?
+                .write_png(artifact_dir.join(format!("document-viewer-{width:.0}.png")))?;
+        }
         Ok(())
     }
 }

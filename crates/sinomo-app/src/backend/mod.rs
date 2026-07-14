@@ -22,13 +22,17 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use sinomo_runtime::api::{
-    DaemonApiClient, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
-    RemoteConfigClient, probe_daemon_status, probe_daemon_status_at_address,
+    DaemonApiClient, DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions,
+    DaemonStatus, RemoteConfigClient, probe_daemon_status, probe_daemon_status_at_address,
 };
 use sinomo_runtime::cluster::ClusterControlInitRequest;
 use sinomo_runtime::config::{ConfigClient, ConfigRegistry, ConfigStore, LocalConfigClient};
-use sinomo_runtime::daemon::{DaemonServiceRegistryHook, run_daemon_control_loop_with_services};
+use sinomo_runtime::daemon::{
+    DaemonClusterProcess, DaemonServiceRegistryHook, daemon_cluster_status,
+    run_daemon_control_loop_with_services,
+};
 use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::network::ClusterPaths;
 use sinomo_runtime::node::NodeProfile;
 
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
@@ -36,6 +40,9 @@ const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 const DAEMON_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long to wait for an app-started in-process daemon to bind and publish its status.
 const IN_PROCESS_DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Cluster initialization replaces the identity captured by foundational daemon services. Give
+/// the old embedded daemon time to drain before binding its replacement to the same address.
+const IN_PROCESS_DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Owns the thread running an app-started in-process daemon, keeping it alive for the lifetime
 /// of the [`Backend`]. The OS reclaims the thread on process exit; a clean shutdown RPC is a
@@ -131,7 +138,7 @@ impl Backend {
 
         progress("Looking for a daemon…");
         let paths = DaemonPaths::new(&data_dir);
-        let (connection, daemon) = match probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT) {
+        let (connection, mut daemon) = match probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT) {
             DaemonProbeStatus::Running(status)
             | DaemonProbeStatus::Locked {
                 status: Some(status),
@@ -144,10 +151,9 @@ impl Backend {
             DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
                 progress("Starting a local daemon…");
                 match start_in_process_daemon(&paths, &progress, agent_runtime_control.clone()) {
-                    Ok((status, handle)) => (
-                        Connection::InProcessDaemon(Box::new(status)),
-                        Some(Arc::new(handle)),
-                    ),
+                    Ok((status, handle)) => {
+                        (Connection::InProcessDaemon(Box::new(status)), Some(handle))
+                    }
                     Err(error) => {
                         tracing::warn!(%error, "sinomo-app could not start embedded daemon");
                         progress(&format!("Local daemon failed: {error}"));
@@ -162,8 +168,28 @@ impl Backend {
             }
         };
 
-        let connection =
+        let (mut connection, restart_embedded_daemon) =
             ensure_app_cluster(connection, &paths, data_dir.as_ref(), &node, &progress);
+        if restart_embedded_daemon {
+            progress("Restarting the local daemon with its cluster identity...");
+            match restart_in_process_daemon_after_cluster_init(
+                &paths,
+                &progress,
+                agent_runtime_control.clone(),
+                &mut daemon,
+            ) {
+                Ok(status) => {
+                    connection = Connection::InProcessDaemon(Box::new(status));
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "sinomo-app could not restart embedded daemon after cluster initialization");
+                    progress(&format!("Local daemon failed: {error}"));
+                    connection = Connection::LocalFallback {
+                        reason: Some(error),
+                    };
+                }
+            }
+        }
         progress("Preparing configuration…");
         let config = build_config_client(&connection, &data_dir, app_runtime.handle());
 
@@ -174,7 +200,7 @@ impl Backend {
             connection,
             config,
             agent_runtime_control,
-            _daemon: daemon,
+            _daemon: daemon.map(Arc::new),
             _local_fallback_data_dir_cleanup: None,
         }
     }
@@ -406,29 +432,38 @@ fn ensure_app_cluster(
     data_dir: &SinomoDataDir,
     node: &NodeProfile,
     progress: &impl Fn(&str),
-) -> Connection {
+) -> (Connection, bool) {
     if !connection.is_daemon() || connection.is_clustered() {
-        return connection;
+        return (connection, false);
     }
 
     progress("Initializing single-node cluster...");
     match ensure_app_cluster_through_daemon(&connection, data_dir, node) {
-        Ok(_) => match probe_daemon_status(paths, DAEMON_RPC_TIMEOUT) {
-            DaemonProbeStatus::Running(status)
-            | DaemonProbeStatus::Locked {
-                status: Some(status),
-            } => match connection {
-                Connection::Daemon(_) => Connection::Daemon(Box::new(status)),
-                Connection::InProcessDaemon(_) => Connection::InProcessDaemon(Box::new(status)),
-                Connection::LocalFallback { reason } => Connection::LocalFallback { reason },
+        Ok(initialized) if initialized && matches!(&connection, Connection::InProcessDaemon(_)) => {
+            // `/cluster/control/init` drains the serving daemon because its foundational services
+            // captured the pre-cluster identity. An embedded daemon has no shadow supervisor, so
+            // the app must replace it before exposing the backend as ready.
+            (connection, true)
+        }
+        Ok(_) => (
+            match probe_daemon_status(paths, DAEMON_RPC_TIMEOUT) {
+                DaemonProbeStatus::Running(status)
+                | DaemonProbeStatus::Locked {
+                    status: Some(status),
+                } => match connection {
+                    Connection::Daemon(_) => Connection::Daemon(Box::new(status)),
+                    Connection::InProcessDaemon(_) => Connection::InProcessDaemon(Box::new(status)),
+                    Connection::LocalFallback { reason } => Connection::LocalFallback { reason },
+                },
+                DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
+                    connection
+                }
             },
-            DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
-                connection
-            }
-        },
+            false,
+        ),
         Err(error) => {
             tracing::warn!(%error, "sinomo-app could not initialize local cluster");
-            connection
+            (connection, false)
         }
     }
 }
@@ -440,9 +475,9 @@ fn ensure_app_cluster_through_daemon(
     connection: &Connection,
     data_dir: &SinomoDataDir,
     node: &NodeProfile,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if sinomo_cli::app_api::cluster_status(data_dir).clustered {
-        return Ok(());
+        return Ok(false);
     }
     let address = connection
         .daemon_address()
@@ -454,8 +489,48 @@ fn ensure_app_cluster_through_daemon(
             cluster_name: name.to_string(),
             node_display_name: Some(name.to_string()),
         })
-        .map(|_| ())
+        .map(|_| true)
         .map_err(|error| error.to_string())
+}
+
+fn restart_in_process_daemon_after_cluster_init(
+    paths: &DaemonPaths,
+    progress: &impl Fn(&str),
+    agent_runtime_control: sinomo_agent::AgentRuntimeControlRegistry,
+    daemon: &mut Option<InProcessDaemon>,
+) -> Result<DaemonStatus, String> {
+    let current = daemon.as_ref().ok_or_else(|| {
+        "embedded daemon ownership was lost during cluster initialization".to_string()
+    })?;
+    wait_for_in_process_daemon_exit(current, IN_PROCESS_DAEMON_STOP_TIMEOUT)?;
+    daemon.take();
+
+    let (status, replacement) = start_in_process_daemon(paths, progress, agent_runtime_control)?;
+    *daemon = Some(replacement);
+    if status.cluster.is_none() {
+        return Err(
+            "replacement embedded daemon started without the initialized cluster identity"
+                .to_string(),
+        );
+    }
+    Ok(status)
+}
+
+fn wait_for_in_process_daemon_exit(
+    daemon: &InProcessDaemon,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    while !daemon._thread.is_finished() {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "embedded daemon did not stop within {} seconds after cluster initialization",
+                timeout.as_secs()
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Ok(())
 }
 
 /// Build the [`ConfigClient`] for the current connection. Normally this is an RPC client to the
@@ -500,17 +575,16 @@ fn start_in_process_daemon(
     agent_runtime_control: sinomo_agent::AgentRuntimeControlRegistry,
 ) -> Result<(DaemonStatus, InProcessDaemon), String> {
     let options = DaemonRunOptions::default();
+    let cluster = in_process_daemon_cluster_status(paths)?;
     let loop_paths = paths.clone();
     let control_host = agent_runtime_control.clone();
     let (exit_tx, exit_rx) = mpsc::channel::<String>();
     let thread = thread::Builder::new()
         .name("sinomo-app-daemon".to_string())
         .spawn(move || {
-            // A fresh app-started daemon may still be pre-bootstrap; it serves config and joins a
-            // cluster later if one is available.
             let hooks = vec![agent_runtime_control_service_hook(control_host)];
             if let Err(error) =
-                run_daemon_control_loop_with_services(options, loop_paths, "daemon", None, hooks)
+                run_daemon_control_loop_with_services(options, loop_paths, "daemon", cluster, hooks)
             {
                 let detail = error.to_string();
                 tracing::warn!(%error, "in-process daemon exited");
@@ -547,6 +621,32 @@ fn start_in_process_daemon(
     }
 }
 
+fn in_process_daemon_cluster_status(
+    paths: &DaemonPaths,
+) -> Result<Option<DaemonClusterStatus>, String> {
+    let data_dir = paths.root.parent().ok_or_else(|| {
+        format!(
+            "embedded daemon path {} has no data directory parent",
+            paths.root.display()
+        )
+    })?;
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    if !cluster_paths.state.exists() {
+        return Ok(None);
+    }
+
+    let state = sinomo_runtime::cluster::read_cluster_state_without_kv(&cluster_paths)
+        .map_err(|error| format!("failed to read embedded daemon cluster state: {error}"))?;
+    daemon_cluster_status(&state, DaemonClusterProcess::Main)
+        .map(Some)
+        .ok_or_else(|| {
+            format!(
+                "embedded daemon cluster state at {} has no local member",
+                cluster_paths.state.display()
+            )
+        })
+}
+
 fn agent_runtime_control_service_hook(
     control_host: sinomo_agent::AgentRuntimeControlRegistry,
 ) -> DaemonServiceRegistryHook {
@@ -562,8 +662,10 @@ fn agent_runtime_control_service_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_runtime::core::{ClusterBootstrapState, Id};
     use sinomo_runtime::node::NodeRole;
     use sinomo_runtime::service::ServiceRegistry;
+    use time::OffsetDateTime;
 
     #[test]
     fn run_with_timeout_returns_result_within_budget() {
@@ -592,6 +694,83 @@ mod tests {
         );
         // Unblock the detached worker; its late result must be discarded harmlessly.
         let _ = release_tx.send(());
+    }
+
+    #[test]
+    fn embedded_daemon_restart_wait_observes_completed_thread() {
+        let daemon = InProcessDaemon {
+            _thread: thread::spawn(|| {}),
+        };
+
+        wait_for_in_process_daemon_exit(&daemon, Duration::from_secs(1))
+            .expect("completed embedded daemon should be ready to replace");
+    }
+
+    #[test]
+    fn embedded_daemon_restart_wait_times_out_without_losing_thread_ownership() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let daemon = InProcessDaemon {
+            _thread: thread::spawn(move || {
+                let _ = release_rx.recv();
+            }),
+        };
+
+        let error = wait_for_in_process_daemon_exit(&daemon, Duration::from_millis(25))
+            .expect_err("a running embedded daemon must not be replaced on the same address");
+        assert!(
+            error.contains("did not stop"),
+            "unexpected restart wait error: {error}"
+        );
+        assert!(
+            !daemon._thread.is_finished(),
+            "timing out must retain ownership of the running daemon thread"
+        );
+
+        let _ = release_tx.send(());
+        wait_for_in_process_daemon_exit(&daemon, Duration::from_secs(1))
+            .expect("released daemon thread should finish");
+    }
+
+    #[test]
+    fn embedded_daemon_startup_has_no_cluster_for_fresh_data_dir() {
+        let (data_dir, _cleanup) = local_fallback_data_dir();
+        data_dir
+            .ensure_root_layout()
+            .expect("create data directory");
+
+        let cluster = in_process_daemon_cluster_status(&DaemonPaths::new(&data_dir))
+            .expect("fresh data directory should be readable");
+
+        assert!(cluster.is_none());
+    }
+
+    #[test]
+    fn embedded_daemon_startup_loads_initialized_cluster_identity() {
+        let (data_dir, _cleanup) = local_fallback_data_dir();
+        data_dir
+            .ensure_root_layout()
+            .expect("create data directory");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let cluster_id = Id::generate();
+        let node_id = Id::generate();
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "App cluster",
+            node_id.clone(),
+            "App node",
+            "test-public-key",
+            OffsetDateTime::now_utc(),
+        );
+        sinomo_runtime::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
+
+        let cluster = in_process_daemon_cluster_status(&DaemonPaths::new(&data_dir))
+            .expect("initialized cluster state should be readable")
+            .expect("initialized data directory should produce daemon cluster status");
+
+        assert_eq!(cluster.cluster_id, cluster_id);
+        assert_eq!(cluster.node_id, node_id);
+        assert_eq!(cluster.process, "daemon-main");
     }
 
     #[test]

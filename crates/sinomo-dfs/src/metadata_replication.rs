@@ -13,11 +13,12 @@ use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{ClusterPaths, NetworkError};
 use sinomo_core::node::NodeId;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
@@ -28,20 +29,48 @@ use crate::{
     DfsFileSystemId, DfsMetadataBackend, DfsMetadataJournalBatch, DfsMetadataJournalBatchCommand,
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
     DfsMetadataReplicationSuppressionRecord, DfsMetadataShardConfig, DfsMetadataShardId,
-    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
-    DfsMetadataSnapshotInstallResult, DfsNamespaceResult, DfsObjectRpcSendOptions,
-    DfsObjectVersionRecord, DfsPeerTransport, DfsPeerTransportFuture, LocalShardedMetadataBackend,
-    NetworkedDfsServiceEvent, cluster_dfs_metadata_shards, cluster_dfs_peer_node_ids,
+    DfsMetadataShardMembershipHandoff, DfsMetadataSnapshotInstallCommand,
+    DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult, DfsNamespaceResult,
+    DfsObjectRpcSendOptions, DfsObjectVersionRecord, DfsPeerTransport, DfsPeerTransportFuture,
+    LocalShardedMetadataBackend, LocalSobjMetadataBackend, NetworkedDfsServiceEvent,
+    cluster_dfs_metadata_shards, cluster_dfs_peer_node_ids,
     decode_dfs_metadata_journal_batch_rpc_response,
     decode_dfs_metadata_snapshot_install_rpc_response,
     default_dfs_metadata_replication_suppression_snapshot_path,
     dfs_metadata_journal_batch_rpc_request, dfs_metadata_snapshot_install_rpc_request,
     dfs_now_unix_nanos, distributed_sifs, distributed_sifs_bootstrap_objects_for_nodes,
-    local_dfs_metadata_shard_path, metadata_shards_prefix, object_rpc_request_from_kv_payload,
-    open_local_metadata_shard_backend, put_local_dfs_metadata_replication_suppression,
+    local_dfs_metadata_shard_path, metadata_shard_key, metadata_shard_membership_handoff_key,
+    object_rpc_request_from_kv_payload, open_local_metadata_shard_backend,
+    put_local_dfs_metadata_replication_suppression,
     read_dfs_metadata_replication_suppression_snapshot, sifs_file_system_id,
 };
 use crate::{metadata_cursor, metadata_lock};
+
+type ClusterMetadataBackendCache =
+    BTreeMap<(PathBuf, DfsMetadataShardId), Arc<Mutex<LocalSobjMetadataBackend>>>;
+
+fn cached_cluster_metadata_backend(
+    data_dir: &SinomoDataDir,
+    shard_id: &DfsMetadataShardId,
+) -> Result<Arc<Mutex<LocalSobjMetadataBackend>>, DfsError> {
+    static BACKENDS: OnceLock<Mutex<ClusterMetadataBackendCache>> = OnceLock::new();
+    let key = (data_dir.root(), shard_id.clone());
+    let mut backends = BACKENDS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map_err(|_| DfsError::Metadata {
+            message: "cluster metadata backend cache lock is poisoned".to_string(),
+        })?;
+    if let Some(backend) = backends.get(&key) {
+        return Ok(Arc::clone(backend));
+    }
+    let backend = Arc::new(Mutex::new(open_local_metadata_shard_backend(
+        data_dir,
+        shard_id.clone(),
+    )?));
+    backends.insert(key, Arc::clone(&backend));
+    Ok(backend)
+}
 
 pub const DEFAULT_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
 
@@ -245,6 +274,7 @@ fn refresh_cluster_dfs_kv_snapshot_with_peer_transport_for_state(
 pub struct DfsMetadataReplicaShardContext {
     pub local_node_id: NodeId,
     pub shard: DfsMetadataShardConfig,
+    pub pending_membership_handoff: Option<DfsMetadataShardMembershipHandoff>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2399,6 +2429,7 @@ pub fn process_dfs_metadata_journal_batch(
                 next_after_sequence,
                 applied_entries: 0,
                 verified_prefix_only: true,
+                verified_authority_probe_id: None,
                 result: DfsMetadataJournalBatchResult::Applied,
             },
             Err(reason) => DfsMetadataJournalBatchResponse {
@@ -2407,30 +2438,134 @@ pub fn process_dfs_metadata_journal_batch(
                 next_after_sequence,
                 applied_entries: 0,
                 verified_prefix_only: false,
+                verified_authority_probe_id: None,
                 result: DfsMetadataJournalBatchResult::Rejected { reason },
             },
         };
     }
+    if command.authority_probe.is_some()
+        && let Err(reason) = validate_contiguous_metadata_authority_batch(backend, &command.batch)
+    {
+        return dfs_metadata_journal_rejection_response(&command, reason);
+    }
     match backend.apply_journal_batch(&command.batch) {
-        Ok(applied_entries) => DfsMetadataJournalBatchResponse {
-            request_id: command.request_id,
-            shard_id,
-            next_after_sequence,
-            applied_entries,
-            verified_prefix_only: false,
-            result: DfsMetadataJournalBatchResult::Applied,
-        },
+        Ok(applied_entries) => {
+            if let Some(probe) = command.authority_probe.as_ref() {
+                let Some(context) = context else {
+                    return dfs_metadata_journal_rejection_response(
+                        &command,
+                        "metadata authority probe requires an exact committed cluster shard context"
+                            .to_string(),
+                    );
+                };
+                if let Err(error) =
+                    crate::service_replica::verify_persisted_metadata_authority_operation(
+                        backend,
+                        &context.shard,
+                        &probe.operation,
+                    )
+                {
+                    return dfs_metadata_journal_rejection_response(&command, error.to_string());
+                }
+                if let Err(error) =
+                    backend.put_metadata_authority_ack_floor(&crate::DfsMetadataAuthorityAckFloor {
+                        shard_id: command.batch.shard_id.clone(),
+                        journal_sequence: command.batch.next_after_sequence,
+                    })
+                {
+                    return dfs_metadata_journal_rejection_response(
+                        &command,
+                        format!(
+                            "persist metadata authority acknowledgement floor for shard {} sequence {}: {error}",
+                            command.batch.shard_id.0, command.batch.next_after_sequence
+                        ),
+                    );
+                }
+            }
+            DfsMetadataJournalBatchResponse {
+                request_id: command.request_id,
+                shard_id,
+                next_after_sequence,
+                applied_entries,
+                verified_prefix_only: false,
+                // Echo the fresh nonce only after the exact hidden operation
+                // prepare is durably present and revalidated from DFS metadata.
+                verified_authority_probe_id: command
+                    .authority_probe
+                    .as_ref()
+                    .map(|probe| probe.probe_id.clone()),
+                result: DfsMetadataJournalBatchResult::Applied,
+            }
+        }
         Err(error) => DfsMetadataJournalBatchResponse {
             request_id: command.request_id,
             shard_id,
             next_after_sequence,
             applied_entries: 0,
             verified_prefix_only: false,
+            verified_authority_probe_id: None,
             result: DfsMetadataJournalBatchResult::Rejected {
                 reason: error.to_string(),
             },
         },
     }
+}
+
+fn validate_contiguous_metadata_authority_batch(
+    backend: &dyn DfsMetadataBackend,
+    batch: &DfsMetadataJournalBatch,
+) -> Result<(), String> {
+    let Some(last_entry) = batch.entries.last() else {
+        return Err(format!(
+            "metadata authority batch for shard {} must contain the exact hidden operation prepare",
+            batch.shard_id.0
+        ));
+    };
+    if last_entry.sequence != batch.next_after_sequence {
+        return Err(format!(
+            "metadata authority batch for shard {} ends at sequence {} but names sequence {}",
+            batch.shard_id.0, last_entry.sequence, batch.next_after_sequence
+        ));
+    }
+    let replayed_through_sequence =
+        backend
+            .metadata_replay_cursor(&batch.shard_id)
+            .map_err(|error| {
+                format!(
+                    "read metadata replay cursor for authority batch shard {}: {error}",
+                    batch.shard_id.0
+                )
+            })?;
+    let mut previous_sequence: Option<u64> = None;
+    let mut expected_unseen_sequence = replayed_through_sequence.saturating_add(1);
+    for entry in &batch.entries {
+        if entry.shard_id != batch.shard_id {
+            return Err(format!(
+                "metadata authority batch for shard {} contains entry from shard {}",
+                batch.shard_id.0, entry.shard_id.0
+            ));
+        }
+        if let Some(previous_sequence) = previous_sequence
+            && entry.sequence != previous_sequence.saturating_add(1)
+        {
+            return Err(format!(
+                "metadata authority batch for shard {} is not contiguous between sequences {} and {}",
+                batch.shard_id.0, previous_sequence, entry.sequence
+            ));
+        }
+        previous_sequence = Some(entry.sequence);
+        if entry.sequence <= replayed_through_sequence {
+            continue;
+        }
+        if entry.sequence != expected_unseen_sequence {
+            return Err(format!(
+                "metadata authority batch for shard {} starts unseen history at sequence {} but durable replay requires sequence {}",
+                batch.shard_id.0, entry.sequence, expected_unseen_sequence
+            ));
+        }
+        expected_unseen_sequence = expected_unseen_sequence.saturating_add(1);
+    }
+    Ok(())
 }
 
 fn verify_dfs_metadata_journal_prefix(
@@ -2500,19 +2635,33 @@ pub fn cluster_dfs_metadata_replica_shard_context(
     }
     let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
         .map_err(DfsError::from_network)?;
-    let mut shard = None;
-    for entry in sinomo_core::kv::read_cluster_kv_prefix_entries(
+    let shard = sinomo_core::kv::read_cluster_kv_entry(
         &cluster_paths.kv_paths(),
-        &format!("{}/", metadata_shards_prefix(&sifs_file_system_id())),
-    )? {
-        let candidate: DfsMetadataShardConfig = entry.decode()?;
-        if candidate.shard_id == shard_id.0.as_str() {
-            shard = Some(candidate);
-            break;
-        }
-    }
+        &metadata_shard_key(&sifs_file_system_id(), &shard_id.0),
+    )?
+    .map(|entry| entry.decode::<DfsMetadataShardConfig>())
+    .transpose()?;
+    let pending_membership_handoff = shard
+        .as_ref()
+        .map(|shard| {
+            sinomo_core::kv::read_cluster_kv_entry(
+                &cluster_paths.kv_paths(),
+                &metadata_shard_membership_handoff_key(&shard.file_system_id, &shard.shard_id),
+            )?
+            .map(|entry| entry.decode::<DfsMetadataShardMembershipHandoff>())
+            .transpose()
+        })
+        .transpose()?
+        .flatten();
     Ok(shard.map(|shard| DfsMetadataReplicaShardContext {
         local_node_id: state.local_node_id,
+        pending_membership_handoff: pending_membership_handoff.filter(|handoff| {
+            handoff.retiring_shard == shard
+                && handoff.desired_shard.file_system_id == shard.file_system_id
+                && handoff.desired_shard.shard_id == shard.shard_id
+                && handoff.desired_shard.primary_node_id == shard.primary_node_id
+                && handoff.desired_shard.epoch == shard.epoch.saturating_add(1)
+        }),
         shard,
     }))
 }
@@ -2529,9 +2678,15 @@ pub fn process_cluster_dfs_metadata_journal_batch(
         })?;
     let context =
         cluster_dfs_metadata_replica_shard_context(cluster_paths, &command.batch.shard_id)?;
-    let mut backend = open_local_metadata_shard_backend(data_dir, command.batch.shard_id.clone())?;
+    let backend = cached_cluster_metadata_backend(data_dir, &command.batch.shard_id)?;
+    let mut backend = backend.lock().map_err(|_| DfsError::Metadata {
+        message: format!(
+            "cluster metadata backend lock is poisoned for shard {}",
+            command.batch.shard_id.0
+        ),
+    })?;
     Ok(process_dfs_metadata_journal_batch(
-        &mut backend,
+        &mut *backend,
         context.as_ref(),
         command,
     ))
@@ -2603,6 +2758,46 @@ pub(crate) fn validate_dfs_metadata_snapshot_install_state(
             command.shard_id.0
         )));
     }
+    if let Some(proof) = command.snapshot.prefix_proof.as_ref() {
+        if !proof.is_well_formed() || proof.journal_sequence != command.next_after_sequence {
+            return Ok(Some(format!(
+                "metadata snapshot prefix proof does not name exact install sequence {} for shard {}",
+                command.next_after_sequence, command.shard_id.0
+            )));
+        }
+        let Some(expected_semantic_fingerprint) =
+            command.snapshot.semantic_state_fingerprint.as_ref()
+        else {
+            return Ok(Some(format!(
+                "metadata snapshot prefix proof for shard {} sequence {} is missing its semantic checksum",
+                command.shard_id.0, command.next_after_sequence
+            )));
+        };
+        let actual_semantic_fingerprint =
+            crate::metadata_records::dfs_metadata_table_snapshot_state_fingerprint(
+                &command.snapshot,
+            )
+            .map_err(|source| DfsError::Serialization {
+                message: format!(
+                    "encode metadata snapshot semantic checksum for {}: {source}",
+                    command.shard_id.0
+                ),
+            })?;
+        if &actual_semantic_fingerprint != expected_semantic_fingerprint {
+            return Ok(Some(format!(
+                "metadata snapshot semantic checksum does not match its prefix proof transfer for shard {} sequence {}",
+                command.shard_id.0, command.next_after_sequence
+            )));
+        }
+    }
+    if let Some(authority_floor) = backend.metadata_authority_ack_floor(&command.shard_id)?
+        && command.next_after_sequence <= authority_floor.journal_sequence
+    {
+        return Ok(Some(format!(
+            "metadata snapshot sequence {} would replace shard {} at or behind locally acknowledged authority operation {}",
+            command.next_after_sequence, command.shard_id.0, authority_floor.journal_sequence
+        )));
+    }
     let Some(floor) = backend.metadata_prefix_ack_floor(&command.shard_id)? else {
         return Ok(None);
     };
@@ -2613,8 +2808,10 @@ pub(crate) fn validate_dfs_metadata_snapshot_install_state(
         )));
     }
     if command.next_after_sequence == floor.journal_sequence {
-        let fingerprint = crate::metadata_records::dfs_metadata_table_snapshot_state_fingerprint(
+        let matches = crate::metadata_records::dfs_metadata_table_snapshot_matches_checkpoint(
             &command.snapshot,
+            command.next_after_sequence,
+            &floor.state_fingerprint,
         )
         .map_err(|source| DfsError::Serialization {
             message: format!(
@@ -2622,7 +2819,7 @@ pub(crate) fn validate_dfs_metadata_snapshot_install_state(
                 command.shard_id.0
             ),
         })?;
-        if fingerprint != floor.state_fingerprint {
+        if !matches {
             return Ok(Some(format!(
                 "metadata snapshot state does not match locally acknowledged checkpoint for shard {} sequence {}",
                 command.shard_id.0, command.next_after_sequence
@@ -2707,13 +2904,43 @@ pub fn validate_dfs_metadata_journal_batch_source(
     context: Option<&DfsMetadataReplicaShardContext>,
     command: &DfsMetadataJournalBatchCommand,
 ) -> Option<DfsMetadataJournalBatchResponse> {
-    let Some(context) = context else {
-        return None;
+    let context = match context {
+        Some(context) => context,
+        None if command.authority_probe.is_some() => {
+            return Some(dfs_metadata_journal_rejection_response(
+                command,
+                "metadata authority probe requires an exact committed cluster shard context"
+                    .to_string(),
+            ));
+        }
+        None => return None,
     };
     if context.shard.shard_id != command.batch.shard_id.0 {
         return Some(dfs_metadata_journal_rejection_response(
             command,
             "metadata journal batch has no local shard config".to_string(),
+        ));
+    }
+    if let Some(probe) = command.authority_probe.as_ref()
+        && (command.verify_prefix_only
+            || command.prefix_probe.is_some()
+            || command.batch.entries.is_empty()
+            || probe.probe_id.is_empty()
+            || probe.expected_shard != context.shard
+            || !crate::service_replica::metadata_authority_operation_is_well_formed_for_shard(
+                &probe.operation,
+                &context.shard,
+            )
+            || crate::service_replica::metadata_authority_operation_prepare_sequence(
+                &probe.operation,
+            ) != command.batch.next_after_sequence)
+    {
+        return Some(dfs_metadata_journal_rejection_response(
+            command,
+            format!(
+                "metadata authority probe does not match the exact committed assignment for shard {} epoch {}",
+                context.shard.shard_id, context.shard.epoch
+            ),
         ));
     }
     if command.verify_prefix_only
@@ -2751,15 +2978,19 @@ pub fn validate_dfs_metadata_journal_batch_source(
             "metadata primary must not apply a replica journal batch".to_string(),
         ));
     }
-    if !context
+    let configured_replica = context
         .shard
         .replica_node_ids
-        .contains(&context.local_node_id)
-    {
+        .contains(&context.local_node_id);
+    let handoff_catch_up_target = metadata_membership_handoff_allows_local_target(context)
+        && command.verify_prefix_only
+        && command.prefix_probe.is_some()
+        && command.authority_probe.is_none();
+    if !configured_replica && !handoff_catch_up_target {
         return Some(dfs_metadata_journal_rejection_response(
             command,
             format!(
-                "local node {} is not configured as a replica for metadata shard {}",
+                "local node {} is neither a configured replica nor an exact pending membership-handoff catch-up target for metadata shard {}",
                 context.local_node_id, context.shard.shard_id
             ),
         ));
@@ -2811,13 +3042,33 @@ pub fn validate_dfs_metadata_snapshot_install_source(
         .shard
         .replica_node_ids
         .contains(&context.local_node_id)
+        && !metadata_membership_handoff_allows_local_target(context)
     {
         return Some(reject(format!(
-            "local node {} is not configured as a replica for metadata shard {}",
+            "local node {} is neither a configured replica nor a pending membership-handoff catch-up target for metadata shard {}",
             context.local_node_id, context.shard.shard_id
         )));
     }
     None
+}
+
+fn metadata_membership_handoff_allows_local_target(
+    context: &DfsMetadataReplicaShardContext,
+) -> bool {
+    context
+        .pending_membership_handoff
+        .as_ref()
+        .is_some_and(|handoff| {
+            !handoff.handoff_id.is_empty()
+                && handoff.retiring_shard == context.shard
+                && handoff.desired_shard.file_system_id == context.shard.file_system_id
+                && handoff.desired_shard.shard_id == context.shard.shard_id
+                && handoff.desired_shard.primary_node_id == context.shard.primary_node_id
+                && handoff.desired_shard.epoch == context.shard.epoch.saturating_add(1)
+                && std::iter::once(&handoff.desired_shard.primary_node_id)
+                    .chain(handoff.desired_shard.replica_node_ids.iter())
+                    .any(|node_id| node_id == &context.local_node_id)
+        })
 }
 
 fn dfs_metadata_journal_rejection_response(
@@ -2830,6 +3081,7 @@ fn dfs_metadata_journal_rejection_response(
         next_after_sequence: command.batch.next_after_sequence,
         applied_entries: 0,
         verified_prefix_only: false,
+        verified_authority_probe_id: None,
         result: DfsMetadataJournalBatchResult::Rejected { reason },
     }
 }
@@ -2860,6 +3112,7 @@ fn dfs_metadata_journal_batch_command(
         source_node_id: Some(local_node_id.clone()),
         verify_prefix_only: false,
         prefix_probe: None,
+        authority_probe: None,
         batch,
     }
 }

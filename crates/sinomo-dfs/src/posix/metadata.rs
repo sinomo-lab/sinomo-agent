@@ -321,10 +321,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             parent = "/";
         }
         loop {
-            if let Some(object) = self.lookup_metadata_path_raw(file_system_id, parent)?
-                && object.kind == DfsObjectKind::Tombstone
-            {
-                return Ok(true);
+            match self.lookup_metadata_path_raw(file_system_id, parent) {
+                Ok(Some(object)) if object.kind == DfsObjectKind::Tombstone => return Ok(true),
+                Ok(_) => {}
+                Err(DfsPosixError::Metadata(
+                    crate::metadata_error::MetadataBackendError::UnknownFileSystem { .. },
+                )) => {
+                    // A node may own or replicate a nested path-prefix shard
+                    // without opening its ancestor shard. Crossing that local
+                    // shard boundary is not evidence of a tombstoned
+                    // ancestor; namespace moves/deletes are fenced when the
+                    // shard journal is authored. The exact target lookup still
+                    // fails closed below if its own shard is unavailable.
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
             }
             if parent == "/" {
                 return Ok(false);
@@ -851,6 +862,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(super) fn touch_directory_modified(&mut self, path: &str) -> Result<()> {
+        let object = self.directory_modified_metadata(path)?;
+        self.add_object_metadata(object)?;
+        Ok(())
+    }
+
+    pub(super) fn directory_modified_metadata(&mut self, path: &str) -> Result<DfsObjectMetadata> {
         let mut object =
             self.lookup_sifs_path(path)?
                 .ok_or_else(|| DfsPosixError::MissingParent {
@@ -872,8 +889,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object.modified_at_unix_nanos = now;
         object.changed_at_unix_nanos = now;
         object.version = next_version(&object.version);
-        self.add_object_metadata(object)?;
-        Ok(())
+        Ok(object)
     }
 
     pub(super) fn stat_object(&self, object: &DfsObjectMetadata) -> Result<DfsStat> {

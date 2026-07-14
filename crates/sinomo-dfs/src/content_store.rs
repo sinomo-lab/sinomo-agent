@@ -426,7 +426,9 @@ struct StagingGcCandidate {
 
 #[derive(Debug, Clone)]
 struct VersionManifestEntry {
+    object_id: String,
     version: String,
+    content_hash: String,
     path: PathBuf,
     version_dir: PathBuf,
     object_dir: PathBuf,
@@ -596,6 +598,7 @@ impl LocalContentStore {
                             new_hash: hash,
                         });
                     }
+                    self.ensure_content_manifest_index_best_effort(&existing);
                     manifests.push(existing);
                     continue;
                 }
@@ -955,6 +958,32 @@ impl LocalContentStore {
         Ok((manifest, bytes))
     }
 
+    /// Read a range through the durable content-identity manifest index.
+    ///
+    /// Metadata-only DFS revisions intentionally keep the same immutable
+    /// content hash while advancing the visible version. Patch writes may be
+    /// represented by an extent manifest rather than a single blob named by
+    /// the aggregate hash, so a hash-only blob lookup is insufficient. Every
+    /// published version manifest is hard-linked into a deterministic
+    /// per-object hash index; this keeps steady-state and post-restart lookup
+    /// O(1) without copying the object or scanning all historical versions.
+    pub fn read_object_content_range(
+        &self,
+        object_id: &str,
+        content_hash: &str,
+        size_bytes: u64,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<Option<(ContentManifest, Vec<u8>)>> {
+        let Some(manifest) =
+            self.manifest_for_object_content(object_id, content_hash, size_bytes)?
+        else {
+            return Ok(None);
+        };
+        let bytes = self.read_manifest_range(&manifest, offset, max_bytes)?;
+        Ok(Some((manifest, bytes)))
+    }
+
     pub fn read_object_version(
         &self,
         object_id: &str,
@@ -1063,6 +1092,30 @@ impl LocalContentStore {
         Ok((manifest, reader))
     }
 
+    /// Open a bounded range stream for a content identity whose visible DFS
+    /// metadata version may be newer than the stored extent manifest.
+    pub fn open_object_content_range_stream(
+        &self,
+        object_id: &str,
+        content_hash: &str,
+        size_bytes: u64,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<Option<(ContentManifest, ObjectVersionReader)>> {
+        let Some(manifest) =
+            self.manifest_for_object_content(object_id, content_hash, size_bytes)?
+        else {
+            return Ok(None);
+        };
+        let (_, reader) = self.open_object_version_range_stream(
+            &manifest.object_id,
+            &manifest.version,
+            offset,
+            max_bytes,
+        )?;
+        Ok(Some((manifest, reader)))
+    }
+
     pub fn open_object_version_blob_stream(
         &self,
         object_id: &str,
@@ -1111,6 +1164,43 @@ impl LocalContentStore {
         }
         manifests.sort_by(|left, right| left.version.cmp(&right.version));
         Ok(manifests)
+    }
+
+    fn manifest_for_object_content(
+        &self,
+        object_id: &str,
+        content_hash: &str,
+        size_bytes: u64,
+    ) -> Result<Option<ContentManifest>> {
+        let index_path = self.content_manifest_index_path(object_id, content_hash)?;
+        if index_path.is_file() {
+            match decode_manifest(&read_file(&index_path)?) {
+                Ok(manifest)
+                    if manifest.object_id == object_id
+                        && manifest.content_hash == content_hash
+                        && manifest.size_bytes == size_bytes =>
+                {
+                    return Ok(Some(manifest));
+                }
+                Ok(_) | Err(_) => {
+                    // The index is derived cache state. Discard a corrupt or
+                    // mismatched link and rebuild it from source manifests.
+                    let _ = remove_file_if_exists(&index_path);
+                }
+            }
+        }
+
+        let manifest = self
+            .manifests_for_object(object_id)?
+            .into_iter()
+            .rev()
+            .find(|manifest| {
+                manifest.content_hash == content_hash && manifest.size_bytes == size_bytes
+            });
+        if let Some(manifest) = manifest.as_ref() {
+            self.ensure_content_manifest_index_best_effort(manifest);
+        }
+        Ok(manifest)
     }
 
     pub fn scrub(&self) -> Result<ContentStoreScrubReport> {
@@ -1406,6 +1496,7 @@ impl LocalContentStore {
                 if options.dry_run {
                     continue;
                 }
+                self.remove_content_manifest_index_for_version_if_current(entry)?;
                 if remove_file_if_exists_and_sync_parent(&entry.path)? {
                     report.deleted_version_count = report.deleted_version_count.saturating_add(1);
                     report.deleted_logical_bytes = report
@@ -1998,6 +2089,7 @@ impl LocalContentStore {
                 })?;
                 self.write_tracked_blob_bytes(&hash, &blob_path, bytes)?;
             }
+            self.ensure_content_manifest_index_best_effort(&existing);
             return Ok(existing);
         }
 
@@ -2038,6 +2130,7 @@ impl LocalContentStore {
                         new_hash: manifest.content_hash,
                     });
                 }
+                self.ensure_content_manifest_index_best_effort(&existing);
                 return Ok(existing);
             }
             return Err(error);
@@ -2046,6 +2139,7 @@ impl LocalContentStore {
             &manifest,
             manifest_bytes.len() as u64,
         ))?;
+        self.ensure_content_manifest_index_best_effort(&manifest);
         Ok(manifest)
     }
 
@@ -2081,6 +2175,7 @@ impl LocalContentStore {
                 manifest_check_started.elapsed().as_millis(),
                 trace_started.elapsed().as_millis()
             ));
+            self.ensure_content_manifest_index_best_effort(&existing);
             return Ok(existing);
         }
         let manifest_check_ms = manifest_check_started.elapsed().as_millis();
@@ -2353,6 +2448,7 @@ impl LocalContentStore {
                 &prepared.manifest,
                 prepared.manifest_bytes.len() as u64,
             ));
+            self.ensure_content_manifest_index_best_effort(&prepared.manifest);
         }
         self.apply_stats_delta(manifest_delta)?;
         Ok(prepared
@@ -2478,6 +2574,7 @@ impl LocalContentStore {
                 })?;
                 self.publish_tracked_file_as_blob(&hash, source_path, &blob_path, &hash)?;
             }
+            self.ensure_content_manifest_index_best_effort(&existing);
             return Ok(existing);
         }
 
@@ -2524,6 +2621,7 @@ impl LocalContentStore {
                         new_hash: manifest.content_hash,
                     });
                 }
+                self.ensure_content_manifest_index_best_effort(&existing);
                 return Ok(existing);
             }
             return Err(error);
@@ -2532,6 +2630,7 @@ impl LocalContentStore {
             &manifest,
             manifest_bytes.len() as u64,
         ))?;
+        self.ensure_content_manifest_index_best_effort(&manifest);
         Ok(manifest)
     }
 
@@ -2584,7 +2683,9 @@ impl LocalContentStore {
                 .entry(manifest.object_id.clone())
                 .or_default()
                 .push(VersionManifestEntry {
+                    object_id: manifest.object_id,
                     version: manifest.version,
+                    content_hash: manifest.content_hash,
                     path: entry_path,
                     version_dir,
                     object_dir,
@@ -3424,6 +3525,7 @@ impl LocalContentStore {
                     new_hash: manifest.content_hash,
                 });
             }
+            self.ensure_content_manifest_index_best_effort(&existing);
             return Ok(existing);
         }
         let manifest_bytes = encode_manifest(&manifest)?;
@@ -3447,6 +3549,7 @@ impl LocalContentStore {
                         new_hash: manifest.content_hash,
                     });
                 }
+                self.ensure_content_manifest_index_best_effort(&existing);
                 return Ok(existing);
             }
             return Err(error);
@@ -3455,7 +3558,58 @@ impl LocalContentStore {
             &manifest,
             manifest_bytes.len() as u64,
         ))?;
+        self.ensure_content_manifest_index_best_effort(&manifest);
         Ok(manifest)
+    }
+
+    fn ensure_content_manifest_index_best_effort(&self, manifest: &ContentManifest) {
+        let result = (|| {
+            let index_path =
+                self.content_manifest_index_path(&manifest.object_id, &manifest.content_hash)?;
+            if index_path.is_file() {
+                return Ok(());
+            }
+            let manifest_path = self.manifest_path(&manifest.object_id, &manifest.version);
+            match fs::hard_link(&manifest_path, &index_path) {
+                Ok(()) => Ok(()),
+                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+                Err(source) => Err(ContentStoreError::Io {
+                    path: index_path,
+                    source,
+                }),
+            }
+        })();
+        if let Err(error) = result {
+            // The index is a rebuildable accelerator. The manifest remains
+            // authoritative and the first identity lookup will fall back to
+            // one version-directory scan if this best-effort link fails.
+            content_store_perf_trace(format_args!(
+                "content manifest index link skipped object={} version={} error={error}",
+                manifest.object_id, manifest.version
+            ));
+        }
+    }
+
+    fn remove_content_manifest_index_for_version_if_current(
+        &self,
+        entry: &VersionManifestEntry,
+    ) -> Result<()> {
+        let index_path = self.content_manifest_index_path(&entry.object_id, &entry.content_hash)?;
+        if !index_path.is_file() {
+            return Ok(());
+        }
+        let Ok(indexed_manifest) = decode_manifest(&read_file(&index_path)?) else {
+            // A derived index that does not decode cannot be proven to point
+            // at the version being collected. Leave it for scrub/lookup repair.
+            return Ok(());
+        };
+        if indexed_manifest.object_id == entry.object_id
+            && indexed_manifest.version == entry.version
+            && indexed_manifest.content_hash == entry.content_hash
+        {
+            remove_file_if_exists_and_sync_parent(&index_path)?;
+        }
+        Ok(())
     }
 
     fn blob_path(&self, hash: &str) -> Result<PathBuf> {
@@ -3469,6 +3623,15 @@ impl LocalContentStore {
             .join(object_id)
             .join(version)
             .join("manifest.sobj")
+    }
+
+    fn content_manifest_index_path(&self, object_id: &str, content_hash: &str) -> Result<PathBuf> {
+        let hex = hash_hex(content_hash)?;
+        Ok(self
+            .root
+            .join("objects")
+            .join(object_id)
+            .join(format!(".content-{hex}.sobj")))
     }
 
     fn hash_tree_path(&self, object_id: &str, version: &str) -> PathBuf {
@@ -4877,6 +5040,39 @@ mod tests {
             expected[range_offset as usize..range_offset as usize + patch.len() + 16]
         );
 
+        let (_, identity_range) = store
+            .read_object_content_range(
+                "object-patch",
+                &patched.content_hash,
+                patched.size_bytes,
+                range_offset,
+                patch.len() + 16,
+            )
+            .expect("read patched identity range")
+            .expect("indexed patched identity");
+        assert_eq!(identity_range, range);
+        assert!(
+            store
+                .content_manifest_index_path("object-patch", &patched.content_hash)
+                .expect("content manifest index path")
+                .is_file(),
+            "extent manifests must have a durable O(1) content-identity index"
+        );
+
+        drop(store);
+        let reopened = LocalContentStore::new(&root).expect("reopen content store");
+        let (_, reopened_range) = reopened
+            .read_object_content_range(
+                "object-patch",
+                &patched.content_hash,
+                patched.size_bytes,
+                range_offset,
+                patch.len() + 16,
+            )
+            .expect("read patched identity range after reopen")
+            .expect("persisted patched identity index");
+        assert_eq!(reopened_range, range);
+
         cleanup(&root);
     }
 
@@ -5214,6 +5410,60 @@ mod tests {
             final_scrub.is_healthy(),
             "final scrub issues: {final_scrub:?}"
         );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn collect_versions_removes_deleted_manifest_index_and_rebuilds_from_survivor() {
+        let root = temp_root("collect_versions_rebuilds_content_index");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let version_1 = store
+            .put_object_version("object-shared-content", "version_1", b"shared bytes")
+            .expect("put version 1");
+        let version_2 = store
+            .put_object_version("object-shared-content", "version_2", b"shared bytes")
+            .expect("put version 2");
+        assert_eq!(version_1.content_hash, version_2.content_hash);
+
+        let index_path = store
+            .content_manifest_index_path("object-shared-content", &version_1.content_hash)
+            .expect("content index path");
+        let indexed = decode_manifest(&read_file(&index_path).expect("read initial index"))
+            .expect("decode initial index");
+        assert_eq!(indexed.version, version_1.version);
+
+        let report = store
+            .collect_versions(ContentStoreVersionGcOptions::delete_eligible(
+                Duration::from_nanos(0),
+                1,
+            ))
+            .expect("collect old version");
+        assert_eq!(report.deleted_version_count, 1);
+        assert!(
+            !store
+                .manifest_path("object-shared-content", &version_1.version)
+                .is_file()
+        );
+        assert!(
+            !index_path.is_file(),
+            "the index hardlink must not retain a collected manifest"
+        );
+
+        let (_, bytes) = store
+            .read_object_content_range(
+                "object-shared-content",
+                &version_2.content_hash,
+                version_2.size_bytes,
+                0,
+                usize::MAX,
+            )
+            .expect("read surviving content identity")
+            .expect("surviving content identity");
+        assert_eq!(bytes, b"shared bytes");
+        let rebuilt = decode_manifest(&read_file(&index_path).expect("read rebuilt index"))
+            .expect("decode rebuilt index");
+        assert_eq!(rebuilt.version, version_2.version);
 
         cleanup(&root);
     }

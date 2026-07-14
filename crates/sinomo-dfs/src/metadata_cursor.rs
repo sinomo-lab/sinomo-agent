@@ -9,7 +9,8 @@ use crate::metadata_io::{read_dir, read_sobj_optional, write_sobj_atomic};
 use crate::metadata_journal::{DfsMetadataJournalHead, DfsMetadataReplayCursor};
 use crate::metadata_keys::key_segment;
 use crate::metadata_records::{
-    DfsMetadataPrefixAckFloor, DfsMetadataReplayCursorStatus, DfsMetadataShardId,
+    DfsMetadataAuthorityAckFloor, DfsMetadataPrefixAckFloor, DfsMetadataReplayCursorStatus,
+    DfsMetadataShardId,
 };
 
 const LOCAL_MATERIALIZATION_CURSOR_FLUSH_INTERVAL: u64 = 512;
@@ -47,6 +48,15 @@ pub(crate) fn metadata_prefix_ack_floor_path(
 ) -> PathBuf {
     root.join("coordination")
         .join("metadata-prefix-ack-floors")
+        .join(format!("{}.sobj", key_segment(&shard_id.0)))
+}
+
+pub(crate) fn metadata_authority_ack_floor_path(
+    root: &Path,
+    shard_id: &DfsMetadataShardId,
+) -> PathBuf {
+    root.join("coordination")
+        .join("metadata-authority-ack-floors")
         .join(format!("{}.sobj", key_segment(&shard_id.0)))
 }
 
@@ -267,6 +277,34 @@ pub(crate) fn put_metadata_prefix_ack_floor(
     )
 }
 
+pub(crate) fn metadata_authority_ack_floor(
+    root: &Path,
+    shard_id: &DfsMetadataShardId,
+) -> Result<Option<DfsMetadataAuthorityAckFloor>> {
+    read_sobj_optional(&metadata_authority_ack_floor_path(root, shard_id))
+}
+
+pub(crate) fn put_metadata_authority_ack_floor(
+    root: &Path,
+    floor: &DfsMetadataAuthorityAckFloor,
+) -> Result<()> {
+    if floor.journal_sequence == 0 {
+        return Err(MetadataBackendError::Serde(format!(
+            "metadata authority acknowledgement for shard {} has sequence zero",
+            floor.shard_id.0
+        )));
+    }
+    if let Some(current) = metadata_authority_ack_floor(root, &floor.shard_id)?
+        && floor.journal_sequence <= current.journal_sequence
+    {
+        return Ok(());
+    }
+    write_sobj_atomic(
+        &metadata_authority_ack_floor_path(root, &floor.shard_id),
+        floor,
+    )
+}
+
 pub(crate) fn write_journal_head(root: &Path, next_sequence: u64) -> Result<()> {
     write_sobj_atomic(
         &journal_head_path(root),
@@ -383,6 +421,38 @@ mod tests {
         assert_eq!(cursor.last_sequence, 42);
 
         cleanup(&root);
+    }
+
+    #[test]
+    fn metadata_authority_ack_floor_is_durable_and_monotonic() {
+        let root = sinomo_testdir::TestDir::new("sinomo-metadata-authority-ack-floor");
+        let shard_id = DfsMetadataShardId::new("root");
+        let first = DfsMetadataAuthorityAckFloor {
+            shard_id: shard_id.clone(),
+            journal_sequence: 10,
+        };
+        put_metadata_authority_ack_floor(&root, &first).expect("write first floor");
+        put_metadata_authority_ack_floor(
+            &root,
+            &DfsMetadataAuthorityAckFloor {
+                shard_id: shard_id.clone(),
+                journal_sequence: 7,
+            },
+        )
+        .expect("stale floor is ignored");
+        assert_eq!(
+            metadata_authority_ack_floor(&root, &shard_id).expect("read floor"),
+            Some(first)
+        );
+        let advanced = DfsMetadataAuthorityAckFloor {
+            shard_id: shard_id.clone(),
+            journal_sequence: 11,
+        };
+        put_metadata_authority_ack_floor(&root, &advanced).expect("advance floor");
+        assert_eq!(
+            metadata_authority_ack_floor(&root, &shard_id).expect("read advanced floor"),
+            Some(advanced)
+        );
     }
 
     fn cleanup(root: &Path) {

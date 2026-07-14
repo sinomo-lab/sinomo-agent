@@ -502,7 +502,6 @@ fn metadata_journal_batch_prefix_encoded_len(entries: &[DfsMetadataJournalEntry]
     .map_err(|source| MetadataBackendError::Serde(source.to_string()))
 }
 
-#[cfg(test)]
 pub(crate) fn metadata_journal_batch_encoded_len(batch: &DfsMetadataJournalBatch) -> Result<usize> {
     sinomo_object_serde::to_bytes(batch, 1, LengthMode::U32)
         .map(|bytes| bytes.len())

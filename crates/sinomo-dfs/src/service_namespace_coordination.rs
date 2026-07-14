@@ -13,6 +13,72 @@ use crate::*;
 use crate::{posix_model, posix_path};
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    pub(crate) fn metadata_shard_config_snapshot(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Option<Vec<DfsMetadataShardConfig>>, DfsError> {
+        let Some(kv) = self.control_plane.as_mut() else {
+            return Ok(None);
+        };
+        DfsControlPlaneStore::new(kv.as_mut())
+            .list_metadata_shards(file_system_id)
+            .map(Some)
+            .map_err(DfsError::from)
+    }
+
+    pub(crate) fn namespace_shards_for_normalized_paths_from_snapshot<'a>(
+        file_system_id: &DfsFileSystemId,
+        shards: &[DfsMetadataShardConfig],
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
+        let mut selected = Vec::new();
+        for path in paths {
+            let Some(shard) =
+                crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                    file_system_id,
+                    shards,
+                    path,
+                )
+                .map_err(DfsError::from)?
+            else {
+                continue;
+            };
+            if !selected
+                .iter()
+                .any(|existing: &DfsMetadataShardConfig| existing.shard_id == shard.shard_id)
+            {
+                selected.push(shard);
+            }
+        }
+        Ok(selected)
+    }
+
+    fn normalized_namespace_paths<'a>(
+        paths: impl IntoIterator<Item = &'a str>,
+        include_parents: bool,
+        operation: &'static str,
+    ) -> Result<Vec<String>, DfsError> {
+        let mut seen = BTreeSet::new();
+        let mut candidates = Vec::new();
+        for path in paths {
+            let normalized = posix_path::normalized_posix_path_key(path).ok_or_else(|| {
+                DfsError::Distributed {
+                    message: format!("invalid namespace {operation} path: {path}"),
+                }
+            })?;
+            if seen.insert(normalized.clone()) {
+                candidates.push(normalized.clone());
+            }
+            if include_parents
+                && let Some(parent) = posix_path::parent_posix_path(&normalized)
+                && seen.insert(parent.clone())
+            {
+                candidates.push(parent);
+            }
+        }
+        Ok(candidates)
+    }
+
     /// Adoption operations install records minted by another shard authority;
     /// only the source path's configured primary may send them. Returns the
     /// rejection reason for an unauthorized sender, `None` when authorized or
@@ -66,6 +132,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         operation: &DfsNamespaceOperation,
     ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
+        if self.control_plane.is_none() {
+            return Ok(Vec::new());
+        }
         match operation {
             DfsNamespaceOperation::LookupPath { path }
             | DfsNamespaceOperation::SyncPath { path }
@@ -85,18 +154,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let DfsNamespaceOperation::ApplyTransaction { transaction } = operation {
             return self.affected_namespace_transaction_shards(file_system_id, transaction);
         }
-        let mut shards: Vec<DfsMetadataShardConfig> = Vec::new();
-        for path in operation.involved_paths() {
-            for shard in self.namespace_shards_for_path(file_system_id, path)? {
-                if !shards
-                    .iter()
-                    .any(|existing| existing.shard_id == shard.shard_id)
-                {
-                    shards.push(shard);
-                }
-            }
-        }
-        Ok(shards)
+        let candidates =
+            Self::normalized_namespace_paths(operation.involved_paths(), true, "operation")?;
+        let Some(shards) = self.metadata_shard_config_snapshot(file_system_id)? else {
+            return Ok(Vec::new());
+        };
+        Self::namespace_shards_for_normalized_paths_from_snapshot(
+            file_system_id,
+            &shards,
+            candidates.iter().map(String::as_str),
+        )
     }
 
     /// The shard(s) directly covering read-only namespace paths.
@@ -113,34 +180,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if self.control_plane.is_none() {
             return Ok(Vec::new());
         }
-        let mut shards: Vec<DfsMetadataShardConfig> = Vec::new();
-        for path in paths {
-            let normalized = posix_path::normalized_posix_path_key(path).ok_or_else(|| {
-                DfsError::Distributed {
-                    message: format!("invalid namespace operation path: {path}"),
-                }
-            })?;
-            let kv = self
-                .control_plane
-                .as_mut()
-                .expect("control plane checked above");
-            let Some(shard) = DfsControlPlaneStore::new(kv.as_mut())
-                .select_metadata_shard_for_path_strict_default_sifs_split(
-                    file_system_id,
-                    &normalized,
-                )
-                .map_err(DfsError::from)?
-            else {
-                continue;
-            };
-            if !shards
-                .iter()
-                .any(|existing| existing.shard_id == shard.shard_id)
-            {
-                shards.push(shard);
-            }
+        let candidates = Self::normalized_namespace_paths(paths, false, "operation")?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(shards)
+        let Some(shards) = self.metadata_shard_config_snapshot(file_system_id)? else {
+            return Ok(Vec::new());
+        };
+        Self::namespace_shards_for_normalized_paths_from_snapshot(
+            file_system_id,
+            &shards,
+            candidates.iter().map(String::as_str),
+        )
     }
 
     fn affected_namespace_transaction_shards(
@@ -151,14 +202,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if transaction.objects.is_empty() || self.control_plane.is_none() {
             return Ok(Vec::new());
         }
-        let shards = {
-            let kv = self
-                .control_plane
-                .as_mut()
-                .expect("control plane checked before namespace transaction shard selection");
-            DfsControlPlaneStore::new(kv.as_mut())
-                .list_metadata_shards(file_system_id)
-                .map_err(DfsError::from)?
+        let Some(shards) = self.metadata_shard_config_snapshot(file_system_id)? else {
+            return Ok(Vec::new());
         };
         let mut candidate_paths = BTreeSet::new();
         for object in &transaction.objects {
@@ -174,68 +219,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             candidate_paths.insert(normalized);
         }
 
-        let mut affected = Vec::new();
-        for path in candidate_paths {
-            let Some(shard) =
-                crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
-                    file_system_id,
-                    &shards,
-                    &path,
-                )
-                .map_err(DfsError::from)?
-            else {
-                continue;
-            };
-            if !affected
-                .iter()
-                .any(|existing: &DfsMetadataShardConfig| existing.shard_id == shard.shard_id)
-            {
-                affected.push(shard);
-            }
-        }
-        Ok(affected)
-    }
-
-    /// The metadata shards covering a path and its parent directory.
-    pub(crate) fn namespace_shards_for_path(
-        &mut self,
-        file_system_id: &DfsFileSystemId,
-        path: &str,
-    ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
-        if self.control_plane.is_none() {
-            return Ok(Vec::new());
-        }
-        let normalized =
-            posix_path::normalized_posix_path_key(path).ok_or_else(|| DfsError::Distributed {
-                message: format!("invalid namespace operation path: {path}"),
-            })?;
-        let mut candidates = vec![normalized.clone()];
-        if let Some(parent) = posix_path::parent_posix_path(&normalized) {
-            candidates.push(parent);
-        }
-        let mut shards: Vec<DfsMetadataShardConfig> = Vec::new();
-        for candidate in candidates {
-            let kv = self
-                .control_plane
-                .as_mut()
-                .expect("control plane checked above");
-            let Some(shard) = DfsControlPlaneStore::new(kv.as_mut())
-                .select_metadata_shard_for_path_strict_default_sifs_split(
-                    file_system_id,
-                    &candidate,
-                )
-                .map_err(DfsError::from)?
-            else {
-                continue;
-            };
-            if !shards
-                .iter()
-                .any(|existing| existing.shard_id == shard.shard_id)
-            {
-                shards.push(shard);
-            }
-        }
-        Ok(shards)
+        Self::namespace_shards_for_normalized_paths_from_snapshot(
+            file_system_id,
+            &shards,
+            candidate_paths.iter().map(String::as_str),
+        )
     }
 
     /// Validates the source side of a coordinated rename and resolves the
@@ -257,7 +245,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // before deciding which side owns the source; otherwise two stale
         // primaries can redirect a cross-shard rename back and forth.
         self.refresh_control_plane_latest()?;
-        self.cached_sifs_metadata_shards = None;
         if self.resume_running_cross_shard_namespace_job_for_paths(
             file_system_id,
             from,
@@ -289,7 +276,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }));
         }
         self.refresh_control_plane_latest()?;
-        self.cached_sifs_metadata_shards = None;
         if self.resume_running_cross_shard_namespace_job_for_paths(
             file_system_id,
             existing_path,
@@ -317,7 +303,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         source_path: &str,
         destination_path: &str,
     ) -> posix_model::Result<Option<NodeId>> {
-        let source_shards = self.namespace_shards_for_exact_paths(file_system_id, [source_path])?;
+        if self.control_plane.is_none() {
+            return Ok(None);
+        }
+        let source_paths = Self::normalized_namespace_paths([source_path], false, "operation")?;
+        let destination_paths =
+            Self::normalized_namespace_paths([destination_path], true, "operation")?;
+        let Some(shards) = self.metadata_shard_config_snapshot(file_system_id)? else {
+            return Ok(None);
+        };
+        let source_shards = Self::namespace_shards_for_normalized_paths_from_snapshot(
+            file_system_id,
+            &shards,
+            source_paths.iter().map(String::as_str),
+        )?;
         if let Some(shard) = source_shards
             .iter()
             .find(|shard| shard.primary_node_id != self.node_id)
@@ -329,8 +328,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 epoch: shard.epoch,
             }));
         }
-        let destination_shards =
-            self.namespace_shards_for_path(file_system_id, destination_path)?;
+        let destination_shards = Self::namespace_shards_for_normalized_paths_from_snapshot(
+            file_system_id,
+            &shards,
+            destination_paths.iter().map(String::as_str),
+        )?;
         let mut foreign_primary: Option<NodeId> = None;
         for shard in destination_shards {
             if shard.primary_node_id == self.node_id {

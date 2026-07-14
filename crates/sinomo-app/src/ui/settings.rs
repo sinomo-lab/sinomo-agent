@@ -29,12 +29,13 @@ use sinomo_cli::app_api::{
     AgentSummary, ProviderSummary, SkillDetail, SkillMutationResult, SkillSummary, agent_summaries,
 };
 use sui::{
-    Alignment, ArrangeCtx, Constraints, ControlSize, DefaultTheme, Event, EventCtx, FieldGroup,
-    Flex, FlexItem, FlexWrap, FontWeight, FormRow, FormSection, IconGlyph, Label, ListItem,
-    ListView, MeasureCtx, PaintCtx, PointerEventKind, ProgressBar, Rect, ScrollState, ScrollView,
-    Select, SemanticTone, SemanticsCtx, Separator, Size, SizedBox, Spinner, Stack, StatusBadge,
-    Switch, SwitchView, TabBar, TextArea, TextInput, ThemeTextToken, Widget, WidgetPod,
-    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
+    Alignment, ArrangeCtx, Constraints, ContextMenu, ControlSize, DefaultTheme, Event, EventCtx,
+    FieldGroup, Flex, FlexItem, FlexWrap, FontWeight, FormRow, FormSection, IconGlyph, Label,
+    ListItem, ListView, MeasureCtx, MenuItem, PaintCtx, PointerEventKind, ProgressBar, Rect,
+    ScrollState, ScrollView, Select, SelectionScope, SemanticTone, SemanticsCtx, Separator, Size,
+    SizedBox, Spinner, Stack, StatusBadge, Switch, SwitchView, TabBar, TextArea, TextCommand,
+    TextInput, ThemeTextToken, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    WindowEvent,
 };
 
 use sinomo_runtime::config::{
@@ -3704,10 +3705,7 @@ fn copyable_text_row(
     value: impl Into<String>,
 ) -> FormRow {
     let value = value.into();
-    let input = TextInput::new(name)
-        .value(value.clone())
-        .read_only()
-        .theme_when(clone_reader(reader));
+    let input = selectable_read_only_input(reader, name, value.clone());
     let copy_value = value;
     let copy = sui::Button::new("Copy")
         .semantic_name(format!("Copy {label}"))
@@ -3738,12 +3736,9 @@ fn copyable_area_row(
     value: impl Into<String>,
 ) -> FormRow {
     let value = value.into();
-    let area = SizedBox::new().height(72.0).with_child(
-        TextArea::new(name)
-            .value(value.clone())
-            .read_only()
-            .theme_when(clone_reader(reader)),
-    );
+    let area = SizedBox::new()
+        .height(72.0)
+        .with_child(selectable_read_only_area(reader, name, value.clone()));
     let copy_value = value;
     let copy = sui::Button::new("Copy")
         .semantic_name(format!("Copy {label}"))
@@ -3767,6 +3762,76 @@ fn copyable_area_row(
     )
     .stacked()
     .theme_when(clone_reader(reader))
+}
+
+/// A read-only single-line field that behaves like selectable document text.
+fn selectable_read_only_input(reader: &ThemeReader, name: &str, value: String) -> ContextMenu {
+    let has_text = !value.is_empty();
+    let selection = SelectionScope::new();
+    let field = TextInput::new(name)
+        .value(value)
+        .read_only()
+        .selection_scope(selection.clone())
+        .theme_when(clone_reader(reader));
+    read_only_text_menu(reader, name, field, selection, has_text)
+}
+
+/// A read-only multiline field that behaves like selectable document text.
+fn selectable_read_only_area(reader: &ThemeReader, name: &str, value: String) -> ContextMenu {
+    let has_text = !value.is_empty();
+    let selection = SelectionScope::new();
+    let field = TextArea::new(name)
+        .value(value)
+        .read_only()
+        .selection_scope(selection.clone())
+        .theme_when(clone_reader(reader));
+    read_only_text_menu(reader, name, field, selection, has_text)
+}
+
+/// Wrap a SUI text editor in its standard read-only selection menu.
+///
+/// The editor remains authoritative for pointer selection, hotkeys, clipboard
+/// contents, and accessibility actions. Menu activation only posts the same
+/// typed commands understood by `TextInput` and `TextArea`.
+fn read_only_text_menu<W>(
+    reader: &ThemeReader,
+    name: &str,
+    field: W,
+    selection: SelectionScope,
+    has_text: bool,
+) -> ContextMenu
+where
+    W: Widget + 'static,
+{
+    let menu =
+        ContextMenu::new(format!("{name}-context-menu"), field).theme_when(clone_reader(reader));
+    let field_id = menu.trigger_id();
+
+    menu.items_when(move || {
+        let has_selection = selection.has_owner_selection(field_id);
+        let copy = MenuItem::new("Copy").shortcut("Ctrl+C");
+        let select_all = MenuItem::new("Select All")
+            .shortcut("Ctrl+A")
+            .separator_before();
+        vec![
+            if has_selection { copy } else { copy.disabled() },
+            if has_text {
+                select_all
+            } else {
+                select_all.disabled()
+            },
+        ]
+    })
+    .on_activate_with_ctx(move |ctx, _index, item| {
+        let command = match item.label() {
+            "Copy" => Some(TextCommand::Copy),
+            "Select All" => Some(TextCommand::SelectAll),
+            _ => None,
+        };
+        if let Some(command) = command {
+            ctx.post_event(field_id, command.into_event());
+        }
+    })
 }
 
 /// A toggle row: `label` + a `Switch` seeded `on`, calling `on_toggle` when flipped.
@@ -4179,12 +4244,9 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
             Tab::Files => "connection-files-detail",
             _ => "connection-issue-detail",
         };
-        SizedBox::new().height(68.0).with_child(
-            TextArea::new(name)
-                .value(detail)
-                .read_only()
-                .theme_when(clone_reader(reader)),
-        )
+        SizedBox::new()
+            .height(68.0)
+            .with_child(selectable_read_only_area(reader, name, detail))
     };
     let button = {
         let s = shared.clone();
@@ -10918,6 +10980,41 @@ mod tests {
         window
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Copy Node ID")
+            .click()?;
+        assert_eq!(clipboard.text().as_deref(), Some(full_id));
+
+        clipboard.set_text("context menu did not copy");
+        let field = window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("copy-node-id");
+        field.focus()?;
+        let mut select_all = sui::KeyboardEvent::new("a", sui::KeyState::Pressed);
+        select_all.modifiers.control = true;
+        field.dispatch_event(sui::Event::Keyboard(select_all))?;
+        let field_node = window
+            .snapshot()?
+            .accessibility
+            .nodes
+            .into_iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::TextInput
+                    && node.name.as_deref() == Some("copy-node-id")
+            })
+            .expect("copyable Node ID semantics");
+        let field_center = sui::Point::new(
+            field_node.bounds.x() + field_node.bounds.width() * 0.5,
+            field_node.bounds.y() + field_node.bounds.height() * 0.5,
+        );
+        let mut secondary_down = sui::PointerEvent::new(sui::PointerEventKind::Down, field_center);
+        secondary_down.pointer_id = 1;
+        secondary_down.button = Some(sui::PointerButton::Secondary);
+        secondary_down.buttons = sui::PointerButtons::new(2);
+        window
+            .root()
+            .dispatch_event(sui::Event::Pointer(secondary_down))?;
+        window
+            .get_by_role(sui::SemanticsRole::MenuItem)
+            .with_name("Copy")
             .click()?;
         assert_eq!(clipboard.text().as_deref(), Some(full_id));
 

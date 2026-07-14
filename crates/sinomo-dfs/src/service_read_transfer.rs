@@ -229,7 +229,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         range_len,
                     ) {
                         Ok(reader) => ObjectVersionReader::from_blob_range(reader),
-                        Err(_) => return Ok(Some((DfsReadResult::NotFound, false))),
+                        Err(_) => match self.content.open_object_content_range_stream(
+                            object_id.as_str(),
+                            &content_hash,
+                            total_size_bytes,
+                            range_offset,
+                            range_len,
+                        )? {
+                            Some((_, reader)) => reader,
+                            None => return Ok(Some((DfsReadResult::NotFound, false))),
+                        },
                     };
                     let data = DfsReadRangeData {
                         object_id,
@@ -252,7 +261,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .read_blob_range(&content_hash, offset, max_bytes)
                 {
                     Ok(bytes) => bytes,
-                    Err(_) => return Ok(Some((DfsReadResult::NotFound, false))),
+                    Err(_) => match self.content.read_object_content_range(
+                        object_id.as_str(),
+                        &content_hash,
+                        total_size_bytes,
+                        offset,
+                        max_bytes,
+                    )? {
+                        Some((_, bytes)) => bytes,
+                        None => return Ok(Some((DfsReadResult::NotFound, false))),
+                    },
                 };
                 return Ok(Some((
                     DfsReadResult::RangeFound(DfsReadRangeData {

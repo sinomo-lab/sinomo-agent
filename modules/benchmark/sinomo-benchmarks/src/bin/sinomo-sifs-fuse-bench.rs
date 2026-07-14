@@ -92,7 +92,9 @@ Tuning:
 
 Optional performance gates (zero disables the gate):
   --max-create-p95-ms N
-  --min-sequential-write-mib-s N
+  --min-sequential-write-mib-s N  Open-file data throughput (create excluded).
+  --min-sequential-read-mib-s N
+  --min-parallel-create-speedup N
   --min-random-iops N
 
 Exit codes:
@@ -143,6 +145,8 @@ struct Config {
     cache_ttl_ms: u64,
     max_create_p95_ms: f64,
     min_sequential_write_mib_s: f64,
+    min_sequential_read_mib_s: f64,
+    min_parallel_create_speedup: f64,
     min_random_iops: f64,
     report_only: bool,
     require_fuse: bool,
@@ -179,6 +183,8 @@ impl Config {
         let mut cache_ttl_ms = DEFAULT_CACHE_TTL_MS;
         let mut max_create_p95_ms = 0.0;
         let mut min_sequential_write_mib_s = 0.0;
+        let mut min_sequential_read_mib_s = 0.0;
+        let mut min_parallel_create_speedup = 0.0;
         let mut min_random_iops = 0.0;
         let mut report_only = false;
         let mut require_fuse = false;
@@ -212,6 +218,12 @@ impl Config {
                 "--min-sequential-write-mib-s" => {
                     min_sequential_write_mib_s = parse_nonnegative_f64(flag, value()?)?
                 }
+                "--min-sequential-read-mib-s" => {
+                    min_sequential_read_mib_s = parse_nonnegative_f64(flag, value()?)?
+                }
+                "--min-parallel-create-speedup" => {
+                    min_parallel_create_speedup = parse_nonnegative_f64(flag, value()?)?
+                }
                 "--min-random-iops" => min_random_iops = parse_nonnegative_f64(flag, value()?)?,
                 "--report-only" => report_only = true,
                 "--require-fuse" => require_fuse = true,
@@ -236,6 +248,8 @@ impl Config {
             cache_ttl_ms,
             max_create_p95_ms,
             min_sequential_write_mib_s,
+            min_sequential_read_mib_s,
+            min_parallel_create_speedup,
             min_random_iops,
             report_only,
             require_fuse,
@@ -1375,7 +1389,9 @@ mod unix_runner {
     struct PerformanceResults {
         create: Option<LatencyMetrics>,
         random: Option<LatencyMetrics>,
-        sequential_write: Option<ThroughputMetrics>,
+        sequential_write_open_fd: Option<ThroughputMetrics>,
+        sequential_read_hot: Option<ThroughputMetrics>,
+        parallel_create_scaling: Option<ScalingMetrics>,
     }
 
     fn run_performance(config: &Config, report: &mut BenchmarkReport) {
@@ -1603,26 +1619,48 @@ mod unix_runner {
 
         let sequential_path = root.join(format!("{prefix}-sequential.bin"));
         let sequential_payload = payload(config.large_file_bytes(), 43);
-        let write_started = Instant::now();
-        match write_chunked(&sequential_path, &sequential_payload, LARGE_WRITE_CHUNK) {
-            Ok(()) => {
-                let metrics =
-                    ThroughputMetrics::new(config.large_file_bytes(), write_started.elapsed());
-                report.metric(format!("{prefix}.sequential_write"), &metrics);
-                results.sequential_write = Some(metrics);
+        let create_started = Instant::now();
+        match File::create(&sequential_path) {
+            Ok(mut file) => {
+                let write_started = Instant::now();
+                match write_chunks(&mut file, &sequential_payload, LARGE_WRITE_CHUNK) {
+                    Ok(()) => {
+                        let open_fd_metrics = ThroughputMetrics::new(
+                            config.large_file_bytes(),
+                            write_started.elapsed(),
+                        );
+                        report.metric(
+                            format!("{prefix}.sequential_write_open_fd"),
+                            &open_fd_metrics,
+                        );
+                        drop(file);
+                        let end_to_end_metrics = ThroughputMetrics::new(
+                            config.large_file_bytes(),
+                            create_started.elapsed(),
+                        );
+                        report.metric(format!("{prefix}.sequential_write"), &end_to_end_metrics);
+                        results.sequential_write_open_fd = Some(open_fd_metrics);
+                    }
+                    Err(source) => record_measurement_error(
+                        report,
+                        &format!("{prefix}.sequential_write_open_fd"),
+                        io_error("sequential write", &sequential_path, source),
+                    ),
+                }
             }
             Err(source) => record_measurement_error(
                 report,
                 &format!("{prefix}.sequential_write"),
-                io_error("sequential write", &sequential_path, source),
+                io_error("create sequential-write file", &sequential_path, source),
             ),
         }
         let read_started = Instant::now();
         match fs::read(&sequential_path) {
-            Ok(actual) if actual == sequential_payload => report.metric(
-                format!("{prefix}.sequential_read_hot"),
-                ThroughputMetrics::new(actual.len(), read_started.elapsed()),
-            ),
+            Ok(actual) if actual == sequential_payload => {
+                let metrics = ThroughputMetrics::new(actual.len(), read_started.elapsed());
+                report.metric(format!("{prefix}.sequential_read_hot"), &metrics);
+                results.sequential_read_hot = Some(metrics);
+            }
             Ok(actual) => record_measurement_error(
                 report,
                 &format!("{prefix}.sequential_read_hot"),
@@ -1640,7 +1678,10 @@ mod unix_runner {
         }
 
         match measure_scaling(root, prefix, config.iterations, config.concurrency) {
-            Ok(metrics) => report.metric(format!("{prefix}.parallel_create_scaling"), metrics),
+            Ok(metrics) => {
+                report.metric(format!("{prefix}.parallel_create_scaling"), &metrics);
+                results.parallel_create_scaling = Some(metrics);
+            }
             Err(detail) => record_measurement_error(
                 report,
                 &format!("{prefix}.parallel_create_scaling"),
@@ -1789,7 +1830,7 @@ mod unix_runner {
         }
         if config.min_sequential_write_mib_s > 0.0 {
             let started = Instant::now();
-            match &results.sequential_write {
+            match &results.sequential_write_open_fd {
                 Some(metrics) if metrics.mib_per_second >= config.min_sequential_write_mib_s => {
                     report.pass(
                         "threshold.sequential-write",
@@ -1811,7 +1852,63 @@ mod unix_runner {
                 None => report.fail(
                     "threshold.sequential-write",
                     started.elapsed(),
-                    "sequential-write measurement unavailable",
+                    "open-file sequential-write measurement unavailable",
+                ),
+            }
+        }
+        if config.min_sequential_read_mib_s > 0.0 {
+            let started = Instant::now();
+            match &results.sequential_read_hot {
+                Some(metrics) if metrics.mib_per_second >= config.min_sequential_read_mib_s => {
+                    report.pass(
+                        "threshold.sequential-read",
+                        started.elapsed(),
+                        format!(
+                            "{:.3} MiB/s >= {:.3} MiB/s",
+                            metrics.mib_per_second, config.min_sequential_read_mib_s
+                        ),
+                    );
+                }
+                Some(metrics) => report.fail(
+                    "threshold.sequential-read",
+                    started.elapsed(),
+                    format!(
+                        "{:.3} MiB/s < {:.3} MiB/s",
+                        metrics.mib_per_second, config.min_sequential_read_mib_s
+                    ),
+                ),
+                None => report.fail(
+                    "threshold.sequential-read",
+                    started.elapsed(),
+                    "hot sequential-read measurement unavailable",
+                ),
+            }
+        }
+        if config.min_parallel_create_speedup > 0.0 {
+            let started = Instant::now();
+            match &results.parallel_create_scaling {
+                Some(metrics) if metrics.speedup >= config.min_parallel_create_speedup => {
+                    report.pass(
+                        "threshold.parallel-create-speedup",
+                        started.elapsed(),
+                        format!(
+                            "{:.3}x >= {:.3}x",
+                            metrics.speedup, config.min_parallel_create_speedup
+                        ),
+                    );
+                }
+                Some(metrics) => report.fail(
+                    "threshold.parallel-create-speedup",
+                    started.elapsed(),
+                    format!(
+                        "{:.3}x < {:.3}x",
+                        metrics.speedup, config.min_parallel_create_speedup
+                    ),
+                ),
+                None => report.fail(
+                    "threshold.parallel-create-speedup",
+                    started.elapsed(),
+                    "parallel-create scaling measurement unavailable",
                 ),
             }
         }
@@ -1843,12 +1940,16 @@ mod unix_runner {
         }
     }
 
-    fn write_chunked(path: &Path, bytes: &[u8], chunk: usize) -> std::io::Result<()> {
-        let mut file = File::create(path)?;
+    fn write_chunks(file: &mut File, bytes: &[u8], chunk: usize) -> std::io::Result<()> {
         for part in bytes.chunks(chunk.max(1)) {
             file.write_all(part)?;
         }
         file.flush()
+    }
+
+    fn write_chunked(path: &Path, bytes: &[u8], chunk: usize) -> std::io::Result<()> {
+        let mut file = File::create(path)?;
+        write_chunks(&mut file, bytes, chunk)
     }
 
     fn validate_file(path: &Path, expected_len: usize, seed: u8) -> Result<String, String> {
@@ -1880,6 +1981,63 @@ mod unix_runner {
             .map(|errno| format!(" errno={errno}"))
             .unwrap_or_default();
         format!("{operation} {} failed: {source}{errno}", path.display())
+    }
+
+    #[cfg(test)]
+    mod performance_gate_tests {
+        use super::*;
+
+        fn threshold_config(read_mib_s: &str, parallel_speedup: &str) -> Config {
+            match Config::parse_with_environment(
+                [
+                    "--root".to_string(),
+                    "/sinomo/agents/test/home".to_string(),
+                    "--min-sequential-read-mib-s".to_string(),
+                    read_mib_s.to_string(),
+                    "--min-parallel-create-speedup".to_string(),
+                    parallel_speedup.to_string(),
+                ],
+                None,
+                None,
+            )
+            .expect("threshold arguments")
+            {
+                ParseResult::Run(config) => config,
+                ParseResult::Help => panic!("unexpected help"),
+            }
+        }
+
+        #[test]
+        fn sequential_read_and_parallel_scaling_floors_are_enforced() {
+            let config = threshold_config("2", "1.5");
+            let mut report = BenchmarkReport::new(config.clone());
+            let results = PerformanceResults {
+                sequential_read_hot: Some(ThroughputMetrics::new(
+                    1024 * 1024,
+                    Duration::from_secs(1),
+                )),
+                parallel_create_scaling: Some(ScalingMetrics {
+                    operations: 32,
+                    workers: 4,
+                    sequential_elapsed_us: 100,
+                    parallel_elapsed_us: 80,
+                    sequential_ops_per_second: 320.0,
+                    parallel_ops_per_second: 400.0,
+                    speedup: 1.25,
+                }),
+                ..PerformanceResults::default()
+            };
+
+            apply_performance_gates(&config, &mut report, &results);
+
+            assert!(report.checks.iter().any(|check| {
+                check.name == "threshold.sequential-read" && check.status == CheckStatus::Failed
+            }));
+            assert!(report.checks.iter().any(|check| {
+                check.name == "threshold.parallel-create-speedup"
+                    && check.status == CheckStatus::Failed
+            }));
+        }
     }
 }
 
@@ -1957,6 +2115,10 @@ mod tests {
             "100",
             "--min-sequential-write-mib-s",
             "0.25",
+            "--min-sequential-read-mib-s",
+            "0.75",
+            "--min-parallel-create-speedup",
+            "1.5",
             "--min-random-iops",
             "0.5",
             "--report-only",
@@ -1968,6 +2130,8 @@ mod tests {
         assert_eq!(config.cache_ttl_ms, 50);
         assert_eq!(config.max_create_p95_ms, 100.0);
         assert_eq!(config.min_sequential_write_mib_s, 0.25);
+        assert_eq!(config.min_sequential_read_mib_s, 0.75);
+        assert_eq!(config.min_parallel_create_speedup, 1.5);
         assert_eq!(config.min_random_iops, 0.5);
         assert!(config.report_only);
     }

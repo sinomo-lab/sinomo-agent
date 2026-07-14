@@ -32,6 +32,56 @@ fn stale_write_base_error(
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    fn persist_receipts_and_apply_ready_intent(
+        &mut self,
+        intent: &DistributedWriteIntent,
+        base_object: &DfsObjectMetadata,
+        content_hash: &str,
+        content_size_bytes: u64,
+        receipt_node_ids: &[NodeId],
+        foreground_replica_repair: bool,
+    ) -> Result<DistributedWriteIntent, DfsError> {
+        // A replicated-eventual write with W=1 is authoritative as soon as its
+        // first durable receipt exists. Persist that receipt, the committed
+        // intent, and the new visible object/version in one backend batch. The
+        // object/version pair remains atomic, while the missing N-W copies stay
+        // represented by coordinator repair jobs. First publication uses the
+        // dedicated parent-inclusive namespace batch in the same helper.
+        let can_commit_in_one_batch = !foreground_replica_repair
+            && intent.policy.min_commit_replicas <= 1
+            && !receipt_node_ids.is_empty()
+            && self.can_commit_ready_intent_batched(intent)?;
+
+        if can_commit_in_one_batch {
+            let mut updated_intent = intent.clone();
+            for replica_node_id in receipt_node_ids {
+                updated_intent = self
+                    .coordinator
+                    .record_durable_receipt(&updated_intent.intent_id, replica_node_id.clone())?;
+            }
+            self.commit_ready_intent_batched(
+                &updated_intent,
+                base_object,
+                content_hash,
+                content_size_bytes,
+            )?;
+            return Ok(updated_intent);
+        }
+
+        self.put_metadata_intent_and_receipts(intent, content_hash, receipt_node_ids)?;
+        let mut updated_intent = intent.clone();
+        for replica_node_id in receipt_node_ids {
+            updated_intent = self
+                .coordinator
+                .record_durable_receipt(&updated_intent.intent_id, replica_node_id.clone())?;
+        }
+        self.try_apply_committed_intent_if_ready_with_repair_mode(
+            &updated_intent.intent_id,
+            foreground_replica_repair,
+        )?;
+        Ok(updated_intent)
+    }
+
     pub fn plan_distributed_eventual_replicas(
         &self,
         request: &DfsWriteRequest,
@@ -348,7 +398,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let owner_epoch = match self.select_metadata_shard_for_object(&object)? {
             Some(shard) if shard.primary_node_id != self.node_id => return Ok(None),
             Some(shard) => shard.epoch,
-            None => 0,
+            None if self.control_plane.is_none() => 0,
+            None => {
+                return Err(crate::service_replica::missing_metadata_shard_assignment(
+                    &object,
+                ));
+            }
         };
 
         if self
@@ -414,7 +469,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             Err(error) => return Err(error.into()),
         };
-        self.put_metadata_intent(&intent, Some(&manifest.content_hash))?;
         self.pending_writes.insert(
             intent.intent_id.clone(),
             PendingNetworkedWrite::with_patch(
@@ -432,23 +486,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ),
         );
 
-        let updated_intent = if desired_replica_nodes.contains(&self.node_id) {
-            let local_node_id = self.node_id.clone();
-            self.put_metadata_receipt(
-                &request.file_system_id,
-                &request.object_id,
-                &request.target_version,
-                &local_node_id,
-                &manifest.content_hash,
-            )?;
-            self.coordinator
-                .record_durable_receipt(&intent.intent_id, self.node_id.clone())?
-        } else {
-            intent
-        };
-
-        self.try_apply_committed_intent_if_ready_with_repair_mode(
-            &updated_intent.intent_id,
+        let receipt_node_ids = desired_replica_nodes
+            .contains(&self.node_id)
+            .then(|| vec![self.node_id.clone()])
+            .unwrap_or_default();
+        let updated_intent = self.persist_receipts_and_apply_ready_intent(
+            &intent,
+            &object,
+            &manifest.content_hash,
+            manifest.size_bytes,
+            &receipt_node_ids,
             foreground_replica_repair,
         )?;
 
@@ -531,7 +578,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let owner_epoch = match self.select_metadata_shard_for_object(&object)? {
             Some(shard) if shard.primary_node_id != self.node_id => return Ok(None),
             Some(shard) => shard.epoch,
-            None => 0,
+            None if self.control_plane.is_none() => 0,
+            None => {
+                return Err(crate::service_replica::missing_metadata_shard_assignment(
+                    &object,
+                ));
+            }
         };
 
         if self
@@ -594,7 +646,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             Err(error) => return Err(error.into()),
         };
-        self.put_metadata_intent(&intent, Some(&manifest.content_hash))?;
         self.pending_writes.insert(
             intent.intent_id.clone(),
             PendingNetworkedWrite::with_patch(
@@ -612,23 +663,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ),
         );
 
-        let updated_intent = if desired_replica_nodes.contains(&self.node_id) {
-            let local_node_id = self.node_id.clone();
-            self.put_metadata_receipt(
-                &request.file_system_id,
-                &request.object_id,
-                &request.target_version,
-                &local_node_id,
-                &manifest.content_hash,
-            )?;
-            self.coordinator
-                .record_durable_receipt(&intent.intent_id, self.node_id.clone())?
-        } else {
-            intent
-        };
-
-        self.try_apply_committed_intent_if_ready_with_repair_mode(
-            &updated_intent.intent_id,
+        let receipt_node_ids = desired_replica_nodes
+            .contains(&self.node_id)
+            .then(|| vec![self.node_id.clone()])
+            .unwrap_or_default();
+        let updated_intent = self.persist_receipts_and_apply_ready_intent(
+            &intent,
+            &object,
+            &manifest.content_hash,
+            manifest.size_bytes,
+            &receipt_node_ids,
             foreground_replica_repair,
         )?;
 
@@ -656,7 +700,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
     ) -> Result<Option<NetworkedDfsWriteOutcome>, DfsError> {
-        if bytes.is_empty() {
+        if bytes.is_empty() || self.control_plane.is_some() {
             return Ok(None);
         }
         let object = self.current_object_for_write(&request.object_id)?;
@@ -743,6 +787,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
     ) -> Result<Option<NetworkedDfsWriteOutcome>, DfsError> {
+        if self.control_plane.is_some() {
+            return Ok(None);
+        }
         let object = self.current_object_for_write(&request.object_id)?;
         if object.policy != DfsObjectPolicy::ReplicatedEventual {
             return Ok(None);
@@ -821,6 +868,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object: DfsObjectMetadata,
         manifest: ContentManifest,
     ) -> Result<Option<NetworkedDfsWriteOutcome>, DfsError> {
+        if self.control_plane.is_some() {
+            return Err(DfsError::Distributed {
+                message: "clustered self-only writes require a canonical metadata prepare"
+                    .to_string(),
+            });
+        }
         let mut committed_object = object.clone();
         let write_time = dfs_now_unix_nanos();
         committed_object.version = request.target_version.clone();
@@ -945,7 +998,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 );
             }
             Some(shard) => shard.epoch,
-            None => 0,
+            None if self.control_plane.is_none() => 0,
+            None => {
+                return Err(crate::service_replica::missing_metadata_shard_assignment(
+                    &object,
+                ));
+            }
         };
 
         if expected_base_version
@@ -987,7 +1045,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             reader,
         )?;
 
-        if !touch_parent_on_create
+        if self.control_plane.is_none()
+            && !touch_parent_on_create
             && object.policy == DfsObjectPolicy::ReplicatedEventual
             && policy.min_commit_replicas == 1
             && desired_replica_nodes.len() == 1
@@ -1046,7 +1105,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             Err(error) => return Err(error.into()),
         };
-        self.put_metadata_intent(&intent, Some(&manifest.content_hash))?;
         self.pending_writes.insert(
             intent.intent_id.clone(),
             PendingNetworkedWrite::new(
@@ -1057,23 +1115,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ),
         );
 
-        let updated_intent = if desired_replica_nodes.contains(&self.node_id) {
-            let local_node_id = self.node_id.clone();
-            self.put_metadata_receipt(
-                &request.file_system_id,
-                &request.object_id,
-                &request.target_version,
-                &local_node_id,
-                &manifest.content_hash,
-            )?;
-            self.coordinator
-                .record_durable_receipt(&intent.intent_id, self.node_id.clone())?
-        } else {
-            intent
-        };
-
-        self.try_apply_committed_intent_if_ready_with_repair_mode(
-            &updated_intent.intent_id,
+        let receipt_node_ids = desired_replica_nodes
+            .contains(&self.node_id)
+            .then(|| vec![self.node_id.clone()])
+            .unwrap_or_default();
+        let updated_intent = self.persist_receipts_and_apply_ready_intent(
+            &intent,
+            &object,
+            &manifest.content_hash,
+            manifest.size_bytes,
+            &receipt_node_ids,
             foreground_replica_repair,
         )?;
 
@@ -1194,7 +1245,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .to_string(),
             });
         }
-        let owner_epoch = self.local_metadata_owner_epoch_for_object(&object)?;
+        // Creating the in-memory intent is not the visible linearization
+        // point. The commit path certifies this hinted epoch through a fresh
+        // operation-bound full-shard acknowledgement immediately before
+        // atomic publication, using cluster quorum only as the partition
+        // fallback. A second barrier here only adds a WAN round trip (most
+        // visibly for first publication of a newly created file).
+        let owner_epoch = self.local_metadata_owner_epoch_hint_for_object(&object)?;
 
         if expected_base_version
             .as_ref()
@@ -1272,9 +1329,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let commit_started = Instant::now();
         if !foreground_replica_repair
             && updated_intent.policy.min_commit_replicas <= 1
-            && !updated_intent.touch_parent_on_create
+            && self.can_commit_ready_intent_batched(&updated_intent)?
         {
-            self.commit_remote_manifest_ready_intent_batched(
+            self.commit_ready_intent_batched(
                 &updated_intent,
                 &object,
                 &content_hash,
@@ -1482,7 +1539,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 );
             }
             Some(shard) => shard.epoch,
-            None => 0,
+            None if self.control_plane.is_none() => 0,
+            None => {
+                return Err(crate::service_replica::missing_metadata_shard_assignment(
+                    &object,
+                ));
+            }
         };
 
         if expected_base_version
@@ -1518,7 +1580,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Err(error.into());
         }
 
-        if !touch_parent_on_create
+        if self.control_plane.is_none()
+            && !touch_parent_on_create
             && object.policy == DfsObjectPolicy::ReplicatedEventual
             && policy.min_commit_replicas == 1
             && desired_replica_nodes.len() == 1
@@ -1617,23 +1680,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         {
             receipt_node_ids.push(request.requesting_node_id.clone());
         }
-        let put_intent_started = Instant::now();
-        self.put_metadata_intent_and_receipts(&intent, &manifest.content_hash, &receipt_node_ids)?;
-        let put_intent_elapsed = put_intent_started.elapsed();
-
-        let mut updated_intent = intent;
-        for replica_node_id in receipt_node_ids {
-            updated_intent = self
-                .coordinator
-                .record_durable_receipt(&updated_intent.intent_id, replica_node_id)?;
-        }
-
-        let commit_started = Instant::now();
-        self.try_apply_committed_intent_if_ready_with_repair_mode(
-            &updated_intent.intent_id,
+        let metadata_commit_started = Instant::now();
+        let updated_intent = self.persist_receipts_and_apply_ready_intent(
+            &intent,
+            &object,
+            &manifest.content_hash,
+            manifest.size_bytes,
+            &receipt_node_ids,
             foreground_replica_repair,
         )?;
-        let commit_elapsed = commit_started.elapsed();
+        let metadata_commit_elapsed = metadata_commit_started.elapsed();
 
         let stage_started = Instant::now();
         if self.should_stage_missing_replicas_after_write(
@@ -1649,7 +1705,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
         let outcome = self.write_outcome(&updated_intent.intent_id)?;
         dfs_perf_trace(format_args!(
-            "distributed-write-apply node={} requester={} object={} version={} bytes={} desired={} policy_min={} policy_desired={} outcome={} content_ms={} create_intent_ms={} put_intent_receipts_ms={} commit_ms={} stage_ms={} total_ms={}",
+            "distributed-write-apply node={} requester={} object={} version={} bytes={} desired={} policy_min={} policy_desired={} outcome={} content_ms={} create_intent_ms={} metadata_commit_ms={} stage_ms={} total_ms={}",
             self.node_id,
             trace_requester,
             trace_object_id,
@@ -1671,8 +1727,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             },
             content_elapsed.as_millis(),
             create_intent_elapsed.as_millis(),
-            put_intent_elapsed.as_millis(),
-            commit_elapsed.as_millis(),
+            metadata_commit_elapsed.as_millis(),
             stage_elapsed.as_millis(),
             trace_started.elapsed().as_millis()
         ));

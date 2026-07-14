@@ -12,7 +12,7 @@ use crate::advisory_lock::{
     DfsAdvisoryLockTransitionContext,
 };
 use crate::intent::write_intent_status_is_active;
-use crate::metadata_error::Result;
+use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_hardlink::{object_is_hardlink_to_target, sort_hardlinks_by_path};
 use crate::metadata_journal::bounded_metadata_journal_batch;
 use crate::metadata_keys::{normalize_posix_path, write_intent_page_cursor};
@@ -27,6 +27,30 @@ use crate::posix_path::posix_path_is_at_or_under_prefix;
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
 };
+
+/// Durable shard-local freeze installed while a same-primary membership
+/// handoff carries the retiring authority's exact state.
+///
+/// This bounded marker is local coordination state, not file metadata. A
+/// pending marker rejects every authoritative mutation. After activation, only
+/// the backend instance explicitly rebound to the marker's exact active epoch
+/// may mutate; independently opened stale instances remain fenced. Read,
+/// snapshot, prefix-proof, and replication-cursor operations remain usable.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataShardWriteFreeze {
+    pub handoff_id: String,
+    pub retiring_epoch: u64,
+    /// Active authority generation installed after the handoff commits.
+    ///
+    /// `None` is a pending write freeze. `Some(epoch)` remains durable after
+    /// activation so already-open backend instances bound to the retiring
+    /// generation cannot resume writes merely because another process
+    /// completed the handoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activated_epoch: Option<u64>,
+    pub journal_sequence: u64,
+    pub state_fingerprint: String,
+}
 
 /// Durable DFS metadata store interface.
 ///
@@ -52,6 +76,19 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
             return Ok(None);
         }
         self.put_file_system(file_system).map(Some)
+    }
+
+    /// Ensure a filesystem record exists on one exact metadata shard.
+    ///
+    /// Single-shard backends delegate to their ordinary ensure. Sharded
+    /// routers override this so a primary never authors the same filesystem
+    /// record on sibling shards for which it is only a replica.
+    fn ensure_file_system_on_shard(
+        &mut self,
+        _shard_id: &DfsMetadataShardId,
+        file_system: &DfsFileSystem,
+    ) -> Result<Option<DfsMetadataJournalEntry>> {
+        self.ensure_file_system(file_system)
     }
 
     /// List all filesystem records known to this backend.
@@ -90,6 +127,21 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// Fetch an object record by object id.
     fn get_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsObjectMetadata>>;
 
+    /// Fetch an object record from one exact metadata shard.
+    ///
+    /// Namespace prepares use this point read after selecting their immutable
+    /// request-scoped shard. A sharded router must not resolve the object
+    /// through its global object index here: during a cross-shard adoption the
+    /// same object id is intentionally still visible on the source shard, but
+    /// destination preconditions describe only destination-shard state.
+    fn get_object_on_shard(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+        object_id: &DfsObjectId,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        self.get_object(object_id)
+    }
+
     /// Fetch the durable whole-file advisory-lock aggregate for an object.
     fn get_advisory_lock_state(
         &self,
@@ -125,6 +177,20 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         file_system_id: &DfsFileSystemId,
         path: &str,
     ) -> Result<Option<DfsObjectMetadata>>;
+
+    /// Fetch the visible object at a path from one exact metadata shard.
+    ///
+    /// Single-shard backends delegate to their normal lookup. Sharded routers
+    /// override this so prepare expectations cannot accidentally span shard
+    /// authorities while a namespace saga is moving an object.
+    fn get_object_by_path_on_shard(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        self.get_object_by_path(file_system_id, path)
+    }
 
     /// Compatibility helper that drains all object pages for a filesystem.
     fn objects_for_file_system(
@@ -431,19 +497,36 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(vec![object_entry, version_entry])
     }
 
-    /// Store object, version, write intent, and receipts for a content commit.
-    /// Implementations may override this to reduce write amplification.
+    /// Atomically commit an existing object's next visible content version
+    /// together with its write intent and durable receipts.
+    ///
+    /// Implementations must validate the intent base version and receipt
+    /// threshold while holding the same metadata write lock used to publish the
+    /// visible-version transition. New-object publication remains a namespace
+    /// transaction and must not use this method.
     fn put_object_version_intent_and_receipts(
         &mut self,
         object: &DfsObjectMetadata,
         version: &DfsObjectVersionRecord,
         intent: &DfsWriteIntentRecord,
         receipts: &[DfsReplicaReceiptRecord],
-    ) -> Result<Vec<DfsMetadataJournalEntry>> {
-        let mut entries = self.put_object_and_version(object, version)?;
-        entries.extend(self.put_intent_and_receipts_for_object(Some(object), intent, receipts)?);
-        Ok(entries)
-    }
+    ) -> Result<Vec<DfsMetadataJournalEntry>>;
+
+    /// Atomically publish a new object and its parent-directory touch together
+    /// with the write intent and durable receipts that authorize the first
+    /// visible version.
+    ///
+    /// The namespace transaction must contain the child and its first visible
+    /// version. Implementations must preserve replay-prefix safety: the child
+    /// remains invisible before the transaction entry, and any visible prefix
+    /// already contains the commit-ready intent and receipt threshold.
+    fn commit_create_intent_receipts_and_namespace(
+        &mut self,
+        pending_intent: &DfsWriteIntentRecord,
+        receipts: &[DfsReplicaReceiptRecord],
+        transaction: &DfsNamespaceTransaction,
+        committed_intent: &DfsWriteIntentRecord,
+    ) -> Result<Vec<DfsMetadataJournalEntry>>;
 
     /// Fetch one object-version record by object id and version id.
     fn get_version(
@@ -881,6 +964,65 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         transaction: &DfsNamespaceTransaction,
     ) -> Result<DfsMetadataJournalEntry>;
 
+    /// Durably reserve one shard-local namespace transaction without making
+    /// any of its object or path changes visible.
+    ///
+    /// Implementations must validate all object-version and path-occupant
+    /// expectations, reject overlap with another active prepare, and persist
+    /// only the hidden prepare record while holding the metadata write lock.
+    fn prepare_namespace_transaction(
+        &mut self,
+        prepare: &DfsNamespacePrepareRecord,
+    ) -> Result<DfsMetadataJournalEntry>;
+
+    /// Move an exact durable namespace prepare to a newer shard-owner epoch.
+    ///
+    /// Implementations must compare `expected_operation_digest` and
+    /// `expected_owner_epoch` while holding the metadata write lock, require
+    /// the current and rebound records to remain `Prepared`, and preserve the
+    /// operation id, filesystem/shard, expectations, and transaction exactly.
+    /// Only the owner epoch and its derived operation digest may change.
+    fn rebind_prepared_namespace_transaction(
+        &mut self,
+        operation_id: &str,
+        expected_operation_digest: &str,
+        expected_owner_epoch: u64,
+        rebound_prepare: &DfsNamespacePrepareRecord,
+    ) -> Result<DfsMetadataJournalEntry>;
+
+    /// Revalidate and atomically publish an existing hidden namespace prepare.
+    ///
+    /// The digest and owner epoch fence operation-id reuse. Implementations
+    /// must apply the prepared namespace transaction and mark the record
+    /// committed in one durable metadata table batch.
+    fn commit_prepared_namespace_transaction(
+        &mut self,
+        operation_id: &str,
+        expected_operation_digest: &str,
+        expected_owner_epoch: u64,
+    ) -> Result<DfsMetadataJournalEntry>;
+
+    /// Fetch a durable hidden namespace prepare by operation id.
+    fn get_namespace_prepare(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<DfsNamespacePrepareRecord>> {
+        let _ = operation_id;
+        Ok(None)
+    }
+
+    /// Move an exact non-terminal write intent to a newer shard-owner epoch.
+    ///
+    /// The compare and replacement must be atomic. Implementations must reject
+    /// any payload/status change and may change only `owner_epoch` plus the
+    /// bookkeeping `updated_at` timestamp.
+    fn rebind_prepared_write_intent(
+        &mut self,
+        object: Option<&DfsObjectMetadata>,
+        expected_intent: &DfsWriteIntentRecord,
+        rebound_intent: &DfsWriteIntentRecord,
+    ) -> Result<DfsMetadataJournalEntry>;
+
     /// Fetch a recorded namespace transaction by id when the backend supports
     /// transaction recovery.
     fn get_namespace_transaction(
@@ -1018,6 +1160,48 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(None)
     }
 
+    /// Return the O(1), durable identity of one shard's exact materialized
+    /// journal prefix. Implementations must return `None` instead of deriving
+    /// a partial or sequence-only identity.
+    fn metadata_prefix_proof(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<DfsMetadataPrefixProof>> {
+        Ok(None)
+    }
+
+    /// Return the durable membership-handoff write freeze for one shard.
+    fn metadata_shard_write_freeze(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<DfsMetadataShardWriteFreeze>> {
+        Ok(None)
+    }
+
+    /// Atomically freeze authoritative mutations and capture the exact current
+    /// shard state under the backend's cross-process write lock.
+    fn freeze_metadata_shard_for_membership_handoff(
+        &mut self,
+        _shard_id: &DfsMetadataShardId,
+        _handoff_id: &str,
+        _retiring_epoch: u64,
+    ) -> Result<Option<DfsMetadataShardWriteFreeze>> {
+        Ok(None)
+    }
+
+    /// Advance the exact matching freeze to a durable active generation after
+    /// the desired assignment is active. The calling backend instance is
+    /// rebound to `activated_epoch`; independently opened stale instances stay
+    /// fenced until they separately prove and observe that generation.
+    fn clear_metadata_shard_membership_handoff_freeze(
+        &mut self,
+        _shard_id: &DfsMetadataShardId,
+        _handoff_id: &str,
+        _activated_epoch: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Read at most `max_entries` journal entries after `after_sequence`.
     fn journal_since_limited(
         &self,
@@ -1092,6 +1276,39 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// corresponding prefix probe.
     fn put_metadata_prefix_ack_floor(&mut self, _floor: &DfsMetadataPrefixAckFloor) -> Result<()> {
         Ok(())
+    }
+
+    /// Return the replica-local floor persisted before an exact ordinary-write
+    /// authority acknowledgement.
+    fn metadata_authority_ack_floor(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<DfsMetadataAuthorityAckFloor>> {
+        Ok(None)
+    }
+
+    /// Persist a monotonic ordinary-write authority floor before returning the
+    /// corresponding request nonce.
+    fn put_metadata_authority_ack_floor(
+        &mut self,
+        floor: &DfsMetadataAuthorityAckFloor,
+    ) -> Result<()> {
+        Err(MetadataBackendError::Serde(format!(
+            "metadata backend cannot durably fence authority acknowledgement for shard {} sequence {}",
+            floor.shard_id.0, floor.journal_sequence
+        )))
+    }
+
+    /// Return the durable replay cursor for journal entries originating from
+    /// `source_shard_id`.
+    fn metadata_replay_cursor(&self, source_shard_id: &DfsMetadataShardId) -> Result<u64> {
+        Ok(self
+            .metadata_shard_statuses()?
+            .into_iter()
+            .flat_map(|status| status.replay_cursors)
+            .find(|cursor| cursor.source_shard_id == *source_shard_id)
+            .map(|cursor| cursor.replayed_through_sequence)
+            .unwrap_or(0))
     }
 
     /// Return per-shard metadata journal and replay status.

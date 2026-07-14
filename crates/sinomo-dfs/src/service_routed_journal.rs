@@ -49,6 +49,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &DfsMetadataShardId::new(shard.shard_id),
             after_sequence,
             max_batches,
+            DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+            DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
         )
     }
 
@@ -57,11 +59,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shard_id: &DfsMetadataShardId,
         mut after_sequence: u64,
         max_batches: usize,
+        max_entries_per_batch: usize,
+        max_encoded_bytes_per_batch: usize,
     ) -> Result<Vec<DfsMetadataJournalBatch>, DfsError> {
         let mut batches = Vec::new();
         for _ in 0..max_batches {
-            let Some(batch) =
-                self.metadata_journal_batch_for_shard_since(shard_id, after_sequence)?
+            let Some(batch) = self.metadata_journal_batch_for_shard_since_limited(
+                shard_id,
+                after_sequence,
+                max_entries_per_batch,
+                max_encoded_bytes_per_batch,
+            )?
             else {
                 break;
             };
@@ -120,6 +128,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 next_after_sequence,
                 applied_entries: 0,
                 verified_prefix_only: false,
+                verified_authority_probe_id: None,
                 result: DfsMetadataJournalBatchResult::Rejected { reason },
             }),
         )?;

@@ -194,6 +194,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 source_node_id: Some(self.node_id.clone()),
                 verify_prefix_only: false,
                 prefix_probe: None,
+                authority_probe: None,
                 batch: batch.clone(),
             }),
         )?;
@@ -293,6 +294,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     source_node_id: Some(self.node_id.clone()),
                     verify_prefix_only: false,
                     prefix_probe: None,
+                    authority_probe: None,
                     batch,
                 }),
             )?;

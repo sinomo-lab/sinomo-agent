@@ -110,6 +110,7 @@ fn dfs_route_accepts_request_body(route: &str) -> bool {
             | crate::DFS_DATA_STAGE_BLOB_ROUTE
             | crate::DFS_DATA_STAGE_PATCH_ROUTE
             | crate::DFS_DATA_REPAIR_REPLICA_ROUTE
+            | crate::DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE
     )
 }
 
@@ -804,6 +805,15 @@ mod tests {
                     .map(|timeout| timeout.as_millis().min(u128::from(u64::MAX)) as u64)
             );
         }
+
+        let snapshot_install = service_routes
+            .get(crate::DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE)
+            .expect("metadata snapshot install route");
+        assert_eq!(
+            snapshot_install.request_body_mode,
+            ServiceBodyMode::Optional,
+            "compacted metadata checkpoints must use the streamed RPC body"
+        );
     }
 
     #[tokio::test]
@@ -1050,6 +1060,7 @@ mod tests {
             source_node_id: None,
             verify_prefix_only: false,
             prefix_probe: None,
+            authority_probe: None,
             batch: DfsMetadataJournalBatch {
                 shard_id: DfsMetadataShardId::new("shard-local"),
                 entries: Vec::new(),

@@ -39,8 +39,63 @@ pub(crate) fn journal_entry_has_replay_payloads(entry: &DfsMetadataJournalEntry)
         DfsMetadataMutation::PutConflict { conflict, .. } => conflict.is_some(),
         DfsMetadataMutation::PutAdvisoryLockState { state, .. } => state.is_some(),
         DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } => transaction.is_some(),
+        DfsMetadataMutation::PutNamespacePrepare { prepare, .. } => prepare.is_some(),
         DfsMetadataMutation::PutNamespaceJob { job, .. } => job.is_some(),
     }
+}
+
+/// Validate payload completeness before sequence/fork checks. This keeps a
+/// malformed replay diagnosable without weakening the later contiguous-prefix
+/// validation. A missing conflict payload is intentional: that mutation also
+/// represents removal of an existing conflict record.
+pub(crate) fn require_journal_entry_replay_payloads(entry: &DfsMetadataJournalEntry) -> Result<()> {
+    match &entry.mutation {
+        DfsMetadataMutation::PutFileSystem { file_system, .. } => {
+            required_replay_payload(entry, "put-file-system", file_system.as_ref())?;
+        }
+        DfsMetadataMutation::PutObject { object, .. } => {
+            required_replay_payload(entry, "put-object", object.as_ref())?;
+        }
+        DfsMetadataMutation::PutVersion { version_record, .. } => {
+            required_replay_payload(entry, "put-version", version_record.as_ref())?;
+        }
+        DfsMetadataMutation::PutReceipt { receipt, .. } => {
+            required_replay_payload(entry, "put-receipt", receipt.as_ref())?;
+        }
+        DfsMetadataMutation::RemoveReceipt { .. } | DfsMetadataMutation::PutConflict { .. } => {}
+        DfsMetadataMutation::PutIntent { intent, .. } => {
+            required_replay_payload(entry, "put-intent", intent.as_ref())?;
+        }
+        DfsMetadataMutation::CommitVisibleVersion {
+            committed_object,
+            visible_version,
+            ..
+        } => {
+            required_replay_payload(
+                entry,
+                "commit-visible-version committed object",
+                committed_object.as_ref(),
+            )?;
+            required_replay_payload(
+                entry,
+                "commit-visible-version visible version",
+                visible_version.as_ref(),
+            )?;
+        }
+        DfsMetadataMutation::PutAdvisoryLockState { state, .. } => {
+            required_replay_payload(entry, "put-advisory-lock-state", state.as_ref())?;
+        }
+        DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } => {
+            required_replay_payload(entry, "apply-namespace-transaction", transaction.as_ref())?;
+        }
+        DfsMetadataMutation::PutNamespacePrepare { prepare, .. } => {
+            required_replay_payload(entry, "put-namespace-prepare", prepare.as_ref())?;
+        }
+        DfsMetadataMutation::PutNamespaceJob { job, .. } => {
+            required_replay_payload(entry, "put-namespace-job", job.as_ref())?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn hydrate_journal_entry_payload<B: DfsMetadataBackend + ?Sized>(
@@ -140,6 +195,13 @@ pub(crate) fn hydrate_journal_entry_payload<B: DfsMetadataBackend + ?Sized>(
             ..
         } if transaction.is_none() => {
             *transaction = backend.get_namespace_transaction(transaction_id)?;
+        }
+        DfsMetadataMutation::PutNamespacePrepare {
+            operation_id,
+            prepare,
+            ..
+        } if prepare.is_none() => {
+            *prepare = backend.get_namespace_prepare(operation_id)?;
         }
         DfsMetadataMutation::PutNamespaceJob { job_id, job, .. } if job.is_none() => {
             *job = backend.get_namespace_job(job_id)?;

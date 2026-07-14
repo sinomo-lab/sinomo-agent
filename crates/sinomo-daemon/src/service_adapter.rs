@@ -128,12 +128,13 @@ use crate::{
     DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE, DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE, DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILES_ROUTE, DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
-    DAEMON_DFS_BROWSER_RENAME_ROUTE, DAEMON_DFS_BROWSER_ROUTES, DAEMON_DFS_BROWSER_STAT_ROUTE,
-    DAEMON_DFS_BROWSER_STATUS_ROUTE, DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
-    DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE, DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE,
-    DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
-    DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE, DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
-    DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE,
+    DAEMON_DFS_BROWSER_RENAME_ROUTE, DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE,
+    DAEMON_DFS_BROWSER_ROUTES, DAEMON_DFS_BROWSER_STAT_ROUTE, DAEMON_DFS_BROWSER_STATUS_ROUTE,
+    DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE, DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
+    DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE, DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
+    DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
+    DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
+    DAEMON_STATUS_ROUTE,
 };
 
 static DAEMON_CLUSTER_NETWORK_PING_NODE_IDS: OnceLock<
@@ -2160,6 +2161,74 @@ impl DaemonDfsBrowserBackend {
         Ok(crate::DaemonDfsBrowserWriteFileResponse)
     }
 
+    fn replace_file_if_version(
+        &self,
+        request: crate::DaemonDfsBrowserReplaceFileIfVersionRequest,
+    ) -> Result<crate::DaemonDfsBrowserReplaceFileIfVersionResponse, ServiceError> {
+        use crate::DaemonDfsBrowserReplaceFileIfVersionOutcome as Outcome;
+
+        let path = match normalize_sifs_browser_path(&request.path) {
+            Ok(path) => path,
+            Err(error) => {
+                return Ok(crate::DaemonDfsBrowserReplaceFileIfVersionResponse {
+                    outcome: Outcome::Rejected {
+                        detail: error.to_string(),
+                    },
+                });
+            }
+        };
+        let object_id = match sinomo_dfs::DfsObjectId::new(&request.expected_object_id) {
+            Ok(object_id) => object_id,
+            Err(error) => {
+                return Ok(crate::DaemonDfsBrowserReplaceFileIfVersionResponse {
+                    outcome: Outcome::Rejected {
+                        detail: format!("invalid expected SIFS object id: {error}"),
+                    },
+                });
+            }
+        };
+        let version = match sinomo_dfs::DfsVersion::new(&request.expected_version) {
+            Ok(version) => version,
+            Err(error) => {
+                return Ok(crate::DaemonDfsBrowserReplaceFileIfVersionResponse {
+                    outcome: Outcome::Rejected {
+                        detail: format!("invalid expected SIFS version: {error}"),
+                    },
+                });
+            }
+        };
+        let mut service = self.lock_service()?;
+        let replica_candidates =
+            sinomo_dfs::discover_mounted_sifs_content_replica_candidates(&self.data_dir)
+                .map_err(dfs_browser_service_error)?;
+        let options = sifs_browser_write_options(&replica_candidates);
+        let stat = match service.posix_replace_file_if_version(
+            &path,
+            &object_id,
+            &version,
+            &request.bytes,
+            options,
+        ) {
+            Ok(stat) => stat,
+            Err(error) => {
+                return Ok(crate::DaemonDfsBrowserReplaceFileIfVersionResponse {
+                    outcome: daemon_dfs_browser_conditional_write_error(error),
+                });
+            }
+        };
+        let maintenance_warning = self.flush_after_mutation(&mut service).err().map(|error| {
+            format!(
+                "the file version committed, but follow-up DFS maintenance needs retry: {error}"
+            )
+        });
+        Ok(crate::DaemonDfsBrowserReplaceFileIfVersionResponse {
+            outcome: Outcome::Committed {
+                receipt: daemon_dfs_browser_write_receipt(&stat),
+                maintenance_warning,
+            },
+        })
+    }
+
     fn create_dir_all(
         &self,
         request: crate::DaemonDfsBrowserCreateDirAllRequest,
@@ -2549,6 +2618,38 @@ impl Service for DaemonDfsBrowserService {
                     );
                     ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, &result)?
                 }
+                DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE => {
+                    let payload = request.decode_body()?;
+                    let backend_data_dir = Arc::clone(&data_dir);
+                    let publish_data_dir = Arc::clone(&data_dir);
+                    let backend_runtime = runtime.clone();
+                    let traceparent = request_traceparent.clone();
+                    let result = run_blocking_service_task(
+                        route.clone(),
+                        "DFS browser conditional replace file",
+                        move || {
+                            sinomo_dfs::with_dfs_traceparent(traceparent.as_deref(), || {
+                                DaemonDfsBrowserBackend::for_data_dir(
+                                    backend_data_dir,
+                                    &backend_runtime,
+                                )?
+                                .replace_file_if_version(payload)
+                            })
+                        },
+                    )
+                    .await?;
+                    if result.outcome.is_committed() {
+                        schedule_daemon_sifs_metadata_publish(
+                            publish_data_dir.as_ref(),
+                            Some(&runtime),
+                            request_traceparent.as_deref(),
+                        );
+                    }
+                    ObjectRpcResponse::encode_body(
+                        DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE,
+                        &result,
+                    )?
+                }
                 DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE => {
                     let payload = request.decode_body()?;
                     let backend_data_dir = Arc::clone(&data_dir);
@@ -2924,6 +3025,35 @@ fn sifs_browser_write_options(
 
 fn dfs_browser_service_error(error: impl std::fmt::Display) -> ServiceError {
     ServiceError::Service(error.to_string())
+}
+
+fn daemon_dfs_browser_write_receipt(
+    stat: &sinomo_dfs::DfsStat,
+) -> crate::DaemonDfsBrowserWriteReceipt {
+    crate::DaemonDfsBrowserWriteReceipt {
+        object_id: stat.object_id.to_string(),
+        version: stat.version.to_string(),
+        content_hash: stat.content_hash.clone(),
+        size_bytes: stat.size_bytes,
+    }
+}
+
+fn daemon_dfs_browser_conditional_write_error(
+    error: sinomo_dfs::DfsPosixError,
+) -> crate::DaemonDfsBrowserReplaceFileIfVersionOutcome {
+    use crate::DaemonDfsBrowserReplaceFileIfVersionOutcome as Outcome;
+
+    match error {
+        sinomo_dfs::DfsPosixError::Conflict { path, reason } => Outcome::Conflict {
+            detail: format!("write conflicted at {path}: {reason}"),
+        },
+        sinomo_dfs::DfsPosixError::NotFound { path } => Outcome::NotFound {
+            detail: format!("not found: {path}"),
+        },
+        error => Outcome::Rejected {
+            detail: error.to_string(),
+        },
+    }
 }
 
 fn normalize_sifs_browser_path(path: &str) -> Result<String, ServiceError> {
@@ -4733,6 +4863,29 @@ mod tests {
     use super::*;
     use sinomo_core::kv::{InProcessKvStore, KvEntry, KvRevision, KvVersion};
     use std::time::Duration;
+
+    #[test]
+    fn conditional_write_maps_expected_posix_failures_to_typed_outcomes() {
+        assert!(matches!(
+            daemon_dfs_browser_conditional_write_error(sinomo_dfs::DfsPosixError::Conflict {
+                path: "/notes.txt".to_string(),
+                reason: "stale base".to_string(),
+            }),
+            crate::DaemonDfsBrowserReplaceFileIfVersionOutcome::Conflict { .. }
+        ));
+        assert!(matches!(
+            daemon_dfs_browser_conditional_write_error(sinomo_dfs::DfsPosixError::NotFound {
+                path: "/notes.txt".to_string(),
+            }),
+            crate::DaemonDfsBrowserReplaceFileIfVersionOutcome::NotFound { .. }
+        ));
+        assert!(matches!(
+            daemon_dfs_browser_conditional_write_error(sinomo_dfs::DfsPosixError::IsDirectory {
+                path: "/notes.txt".to_string(),
+            }),
+            crate::DaemonDfsBrowserReplaceFileIfVersionOutcome::Rejected { .. }
+        ));
+    }
 
     #[test]
     fn rollout_build_session_body_rehydrates_source_bundle() {

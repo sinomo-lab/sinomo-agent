@@ -53,6 +53,7 @@ register_case membership specs/quint/checks/membership/membership_safety.qnt mem
 register_case membership-kv specs/quint/checks/membership/membership_kv_safety.qnt membership_kv_safety "${QUINT_MEMBERSHIP_KV_VERIFY_MAX_STEPS:-4}" tlc step stepCore deep
 register_case membership-raft-config specs/quint/checks/membership/raft_config_transition_safety.qnt raft_config_transition_safety "${QUINT_MEMBERSHIP_RAFT_CONFIG_VERIFY_MAX_STEPS:-4}" apalache step step fast "witnessOneToTwoLearnerPromotionCommitted witnessOneToTwoNonVotingPromotionCommitted witnessThreeToTwoShrinkCommitted witnessTwoToOneShrinkRejected witnessDirectVoterAdditionRejected witnessTwoVoterAdditionsRejected witnessHealthObservationWithoutConfigMutation witnessPartialAcknowledgementDoesNotCommit"
 register_case dfs-metadata specs/quint/checks/dfs/metadata_safety.qnt dfs_metadata_safety "$verify_steps"
+register_case dfs-canonical-write-eligibility specs/quint/checks/dfs/canonical_write_eligibility_safety.qnt dfs_canonical_write_eligibility_safety "${QUINT_DFS_CANONICAL_WRITE_ELIGIBILITY_VERIFY_MAX_STEPS:-5}" apalache step step fast "witnessConnectedWriteUsesFullShardAcksWithoutQuorumPermit witnessMinorityWithWCannotPublish witnessStaleAssignmentAcknowledgementsCannotPublish witnessTwoVisibleVersionsHaveOneDenseHistory witnessQuorumSideSuccessorPublishesAfterReconfiguration witnessCompetingOldAndNewAttemptsChooseOnlyNewAuthority witnessSamePrimaryMembershipCommitDoesNotActivateNewAuthority witnessRetiringShardPublishesBeforeMembershipActivation witnessMembershipActivationCarriesRetiringFullShardWrite witnessDirectPrimaryChangeIsRejected witnessProofCarryingReplicaPromotion witnessNewAssignmentPublicationWaitsForRetiringStateCarry"
 register_case dfs-authority-routing specs/quint/checks/dfs/authority_routing_safety.qnt dfs_authority_routing_safety "${QUINT_DFS_ROUTING_VERIFY_MAX_STEPS:-$verify_steps}" apalache step step deep
 register_case dfs-read-freshness specs/quint/checks/dfs/read_freshness_safety.qnt dfs_read_freshness_safety "${QUINT_DFS_READ_FRESHNESS_VERIFY_MAX_STEPS:-3}"
 register_case dfs-routed-namespace specs/quint/checks/dfs/routed_namespace_freshness_safety.qnt dfs_routed_namespace_freshness_safety "${QUINT_DFS_ROUTED_NAMESPACE_VERIFY_MAX_STEPS:-3}"
@@ -276,8 +277,26 @@ run_network_timed_smoke() {
     "witnessCausalTransportDelivery"
 }
 
+run_canonical_write_scenarios() {
+  run_scenario \
+    dfs-canonical-write-membership-handoff \
+    specs/quint/scenarios/dfs/canonical_write_membership_handoff.qnt \
+    dfs_canonical_write_membership_handoff_scenario \
+    9 \
+    1 \
+    "witnessPostCommitRetiringWriteIsCapturedAndCarried"
+  run_scenario \
+    dfs-canonical-write-quorum-fallback \
+    specs/quint/scenarios/dfs/canonical_write_quorum_fallback.qnt \
+    dfs_canonical_write_quorum_fallback_scenario \
+    15 \
+    1 \
+    "witnessQuorumPermitPublishesWithoutFullShardAcks witnessStaleEpochOrPermitCannotPublish"
+}
+
 run_smoke_scenarios() {
   run_network_timed_smoke
+  run_canonical_write_scenarios
   run_scenario \
     dfs-pending-read-identity \
     specs/quint/scenarios/dfs/pending_read_identity.qnt \
@@ -674,6 +693,9 @@ case "$mode" in
     run_focused_checks
     network_timed_smoke_run_samples="${QUINT_NETWORK_TIMED_COVERAGE_MAX_SAMPLES:-500}"
     run_network_timed_smoke
+    if case_selected dfs-canonical-write-eligibility; then
+      run_canonical_write_scenarios
+    fi
     ;;
   -h|--help|help)
     usage

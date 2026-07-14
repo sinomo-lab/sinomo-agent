@@ -14,6 +14,11 @@ pub enum DaemonApiError {
     Parse { detail: String },
     #[error("network error at {address}: {detail}")]
     Network { address: String, detail: String },
+    #[error("daemon network request failed ({delivery_state:?}): {detail}")]
+    NetworkDelivery {
+        detail: String,
+        delivery_state: sinomo_core::network::NetworkDeliveryState,
+    },
     #[error("daemon-forwarded network request failed: {detail}")]
     ForwardNetwork {
         detail: String,
@@ -29,6 +34,18 @@ pub enum DaemonApiError {
     ClusterOrphan,
     #[error("cluster is read-only: {detail}")]
     ClusterReadOnly { detail: String },
+}
+
+impl DaemonApiError {
+    /// Delivery certainty for mutation callers that must reconcile an
+    /// ambiguous transport failure before retrying.
+    pub fn delivery_state(&self) -> Option<sinomo_core::network::NetworkDeliveryState> {
+        match self {
+            Self::NetworkDelivery { delivery_state, .. } => Some(*delivery_state),
+            Self::ForwardNetwork { delivery_state, .. } => *delivery_state,
+            _ => None,
+        }
+    }
 }
 
 impl From<sinomo_core::service::ServiceError> for DaemonApiError {
@@ -65,6 +82,12 @@ impl From<sinomo_core::node::NodeIdentityError> for DaemonApiError {
 
 impl From<sinomo_core::network::NetworkError> for DaemonApiError {
     fn from(error: sinomo_core::network::NetworkError) -> Self {
+        if let Some(delivery_state) = error.delivery_state() {
+            return Self::NetworkDelivery {
+                detail: error.to_string(),
+                delivery_state,
+            };
+        }
         match error {
             sinomo_core::network::NetworkError::AuthDenied => Self::AuthDenied,
             sinomo_core::network::NetworkError::AuthExpired => Self::AuthExpired,

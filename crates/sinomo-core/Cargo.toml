@@ -14,6 +14,8 @@ ring = "r0-boundary"
 [features]
 # Forwards the cluster test-support surface to sibling-crate tests.
 cluster-test-support = ["sinomo-cluster/test-support"]
+# Forwards exact network wire-encoding probes to sibling-crate tests.
+network-test-support = ["sinomo-network/test-support"]
 
 [dependencies]
 sinomo-base = { path = "../sinomo-base" }

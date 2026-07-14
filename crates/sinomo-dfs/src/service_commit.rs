@@ -95,7 +95,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 message: format!("intent {intent_id} is not ready to commit"),
             });
         }
-        self.ensure_intent_epoch_current(&intent)?;
         let pending =
             self.pending_writes
                 .get(intent_id)
@@ -111,41 +110,170 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         }
-        let durable_receipts: Vec<DistributedReplicaReceipt> = self
-            .coordinator
-            .receipts_for_intent(intent_id)
-            .into_iter()
-            .cloned()
-            .collect();
-        for receipt in durable_receipts {
-            self.put_metadata_receipt(
-                &intent.file_system_id,
-                &receipt.object_id,
-                &receipt.version,
-                &receipt.replica_node_id,
+        let create_operation_id = format!("namespace:create:{}", intent.intent_id);
+        let clustered_first_visible_create = if self.control_plane.is_some() {
+            let transient_create = self
+                .transient_metadata_object_ids
+                .contains(&intent.object_id);
+            let backend = self
+                .metadata_backend
+                .as_ref()
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "clustered canonical write requires a durable metadata backend"
+                        .to_string(),
+                })?;
+            backend
+                .get_namespace_prepare(&create_operation_id)?
+                .is_some()
+                || transient_create
+                || backend.get_object(&intent.object_id)?.is_none()
+        } else {
+            false
+        };
+        if clustered_first_visible_create {
+            let base_object = self.current_read_object_metadata(&intent.object_id)?;
+            self.commit_ready_intent_batched(
+                &intent,
+                &base_object,
                 &pending.content_hash,
+                pending.size_bytes,
             )?;
         }
-        let write_time = dfs_now_unix_nanos();
-        self.commit_visible_version_in_metadata_backend(&intent, &pending, write_time)?;
-        self.coordinator
-            .commit_intent(intent_id)
-            .map_err(DfsError::from)?;
-        let committed_intent =
-            self.coordinator
-                .intent(intent_id)
+        if !clustered_first_visible_create {
+            let durable_receipts: Vec<DistributedReplicaReceipt> = self
+                .coordinator
+                .receipts_for_intent(intent_id)
+                .into_iter()
                 .cloned()
-                .ok_or_else(|| DfsError::Distributed {
-                    message: format!("missing committed intent after finalize: {intent_id}"),
+                .collect();
+            let receipt_records = durable_receipts
+                .iter()
+                .map(|receipt| DfsReplicaReceiptRecord {
+                    receipt: DfsWriteReceipt {
+                        file_system_id: intent.file_system_id.clone(),
+                        object_id: receipt.object_id.clone(),
+                        committed_version: receipt.version.clone(),
+                        owner_node_id: self.node_id.clone(),
+                        event_id: EventId::generate(),
+                    },
+                    replica_node_id: receipt.replica_node_id.clone(),
+                    content_hash: Some(pending.content_hash.clone()),
+                    received_at: OffsetDateTime::now_utc(),
+                })
+                .collect::<Vec<_>>();
+            let canonical_authorization = if self.control_plane.is_some() {
+                let base_object = self.current_read_object_metadata(&intent.object_id)?;
+                let shard = self
+                    .select_metadata_shard_for_object(&base_object)?
+                    .ok_or_else(|| DfsError::Distributed {
+                        message: format!(
+                            "clustered DFS intent {} has no metadata-shard assignment",
+                            intent.intent_id
+                        ),
+                    })?;
+                let mut pending_intent = intent.clone();
+                pending_intent.state = DfsWriteIntentState::AwaitingReceipts;
+                let pending_intent_record = write_intent_record(
+                    &pending_intent,
+                    Some(&pending.content_hash),
+                    Some(base_object.clone()),
+                );
+                let backend = self
+                    .metadata_backend
+                    .as_mut()
+                    .ok_or_else(|| DfsError::Metadata {
+                        message: "clustered canonical write requires a durable metadata backend"
+                            .to_string(),
+                    })?;
+                let entries = backend.put_intent_and_receipts_for_object(
+                    Some(&base_object),
+                    &pending_intent_record,
+                    &receipt_records,
+                )?;
+                let prepare_sequence =
+                    entries.last().map(|entry| entry.sequence).ok_or_else(|| {
+                        DfsError::Metadata {
+                            message: format!(
+                                "canonical DFS prepare for intent {} produced no journal entries",
+                                intent.intent_id
+                            ),
+                        }
+                    })?;
+                if entries
+                    .iter()
+                    .any(|entry| entry.shard_id.0 != shard.shard_id)
+                {
+                    return Err(DfsError::Metadata {
+                        message: format!(
+                            "canonical DFS prepare for intent {} crossed metadata shards",
+                            intent.intent_id
+                        ),
+                    });
+                }
+                let prepared_batch = DfsMetadataJournalBatch {
+                    shard_id: DfsMetadataShardId::new(shard.shard_id.clone()),
+                    entries,
+                    next_after_sequence: prepare_sequence,
+                };
+                let receipt_node_ids = receipt_records
+                    .iter()
+                    .map(|receipt| receipt.replica_node_id.clone())
+                    .collect::<Vec<_>>();
+                let operation = crate::service_replica::metadata_authority_operation_for_intent(
+                    &intent,
+                    &pending.content_hash,
+                    &receipt_node_ids,
+                    None,
+                    prepare_sequence,
+                    &shard,
+                )?;
+                let authorization = self.authorize_prepared_intent_for_selected_shard(
+                    &intent,
+                    &base_object,
+                    shard,
+                    &operation,
+                    &prepared_batch,
+                )?;
+                Some((authorization, operation))
+            } else {
+                for receipt in &durable_receipts {
+                    self.put_metadata_receipt(
+                        &intent.file_system_id,
+                        &receipt.object_id,
+                        &receipt.version,
+                        &receipt.replica_node_id,
+                        &pending.content_hash,
+                    )?;
+                }
+                None
+            };
+            let publication_guard = canonical_authorization
+                .as_ref()
+                .map(|(authorization, operation)| {
+                    self.validate_canonical_authorization(authorization, operation)
+                })
+                .transpose()?;
+            let write_time = dfs_now_unix_nanos();
+            self.commit_visible_version_in_metadata_backend(&intent, &pending, write_time)?;
+            drop(publication_guard);
+            self.coordinator
+                .commit_intent(intent_id)
+                .map_err(DfsError::from)?;
+            let committed_intent =
+                self.coordinator.intent(intent_id).cloned().ok_or_else(|| {
+                    DfsError::Distributed {
+                        message: format!("missing committed intent after finalize: {intent_id}"),
+                    }
                 })?;
-        self.put_metadata_intent(&committed_intent, Some(&pending.content_hash))?;
-        self.commit_local_metadata(
-            &pending.object_id,
-            &pending.version,
-            &pending.content_hash,
-            write_time,
-        )?;
-        self.clear_active_replica_stage(&pending.object_id, &pending.version);
+            self.put_metadata_intent(&committed_intent, Some(&pending.content_hash))?;
+            self.commit_local_metadata(
+                &pending.object_id,
+                &pending.version,
+                &pending.content_hash,
+                write_time,
+            )?;
+            self.clear_active_replica_stage(&pending.object_id, &pending.version);
+        }
 
         let durable_nodes: BTreeSet<NodeId> = self
             .coordinator
@@ -1084,7 +1212,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(Some(touched_parent))
     }
 
-    pub(crate) fn commit_remote_manifest_ready_intent_batched(
+    pub(crate) fn commit_ready_intent_batched(
         &mut self,
         intent: &DistributedWriteIntent,
         base_object: &DfsObjectMetadata,
@@ -1101,13 +1229,62 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         let prepare_started = Instant::now();
-        self.ensure_intent_epoch_current(intent)?;
         let durable_nodes: BTreeSet<NodeId> = self
             .coordinator
             .receipts_for_intent(&intent.intent_id)
             .into_iter()
             .map(|receipt| receipt.replica_node_id.clone())
             .collect();
+        let durable_object_exists = match self.metadata_backend.as_ref() {
+            Some(backend) => backend.get_object(&intent.object_id)?.is_some(),
+            None => intent.base_version.is_some() && !intent.touch_parent_on_create,
+        };
+        let operation_id = format!("namespace:create:{}", intent.intent_id);
+        let durable_create_prepare = self
+            .metadata_backend
+            .as_ref()
+            .map(|backend| backend.get_namespace_prepare(&operation_id))
+            .transpose()?
+            .flatten()
+            .map(|mut prepare| {
+                if prepare.status == DfsNamespacePrepareStatus::Aborted {
+                    return Err(DfsError::Metadata {
+                        message: format!(
+                            "durable create prepare {} is aborted",
+                            prepare.operation_id
+                        ),
+                    });
+                }
+                // `prepare_namespace_transaction` accepts Prepared input;
+                // its exact-retry branch recognizes an already-Committed
+                // durable record and re-journals that terminal identity.
+                prepare.status = DfsNamespacePrepareStatus::Prepared;
+                let digest =
+                    crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)?;
+                if prepare.operation_digest != digest
+                    || prepare.file_system_id != intent.file_system_id
+                    || prepare.owner_epoch != intent.owner_epoch
+                {
+                    return Err(DfsError::Metadata {
+                        message: format!(
+                            "durable create prepare {} does not match recovered intent {}",
+                            prepare.operation_id, intent.intent_id
+                        ),
+                    });
+                }
+                Ok(prepare)
+            })
+            .transpose()?;
+        let first_visible_create = intent.touch_parent_on_create
+            || self
+                .transient_metadata_object_ids
+                .contains(&intent.object_id)
+            || durable_create_prepare.is_some()
+            || !durable_object_exists;
+        // The combined backend operation validates receipt identity and hash
+        // under the same write lock as visible publication. A separate lookup
+        // here would replay/clone a large externally advanced metadata table
+        // only to repeat the check after taking that lock.
         let write_time = dfs_now_unix_nanos();
         let mut committed_object = base_object.clone();
         committed_object.version = intent.target_version.clone();
@@ -1120,15 +1297,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             committed_object.last_modified_by_event_id = Some(EventId::generate());
         }
         committed_object.current_locations = durable_nodes.iter().cloned().collect();
-        let visible_version = object_version_record(&committed_object, Some(content_size_bytes));
+        let mut visible_version =
+            object_version_record(&committed_object, Some(content_size_bytes));
 
         let mut committed_intent = intent.clone();
         committed_intent.state = DfsWriteIntentState::Committed;
-        let intent_record = write_intent_record(
+        let mut pending_intent = intent.clone();
+        pending_intent.state = DfsWriteIntentState::AwaitingReceipts;
+        let pending_intent_record = write_intent_record(
+            &pending_intent,
+            Some(content_hash),
+            Some(base_object.clone()),
+        );
+        let mut intent_record = write_intent_record(
             &committed_intent,
             Some(content_hash),
             Some(committed_object.clone()),
         );
+        intent_record.created_at = pending_intent_record.created_at;
         let receipts = durable_nodes
             .iter()
             .map(|replica_node_id| DfsReplicaReceiptRecord {
@@ -1144,16 +1330,288 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 received_at: OffsetDateTime::now_utc(),
             })
             .collect::<Vec<_>>();
+        let mut touched_parent = None;
+        let create_transaction = if first_visible_create {
+            if let Some(prepare) = durable_create_prepare.as_ref() {
+                let recovered_object = prepare
+                    .transaction
+                    .objects
+                    .iter()
+                    .find(|object| object.object_id == intent.object_id)
+                    .cloned()
+                    .ok_or_else(|| DfsError::Metadata {
+                        message: format!(
+                            "durable create prepare {} is missing object {}",
+                            prepare.operation_id, intent.object_id
+                        ),
+                    })?;
+                let recovered_version = prepare
+                    .transaction
+                    .versions
+                    .iter()
+                    .find(|version| {
+                        version.object_id == intent.object_id
+                            && version.version == intent.target_version
+                    })
+                    .cloned()
+                    .ok_or_else(|| DfsError::Metadata {
+                        message: format!(
+                            "durable create prepare {} is missing target version {}",
+                            prepare.operation_id, intent.target_version
+                        ),
+                    })?;
+                if recovered_object.file_system_id != intent.file_system_id
+                    || recovered_object.version != intent.target_version
+                    || recovered_object.content_hash.as_deref() != Some(content_hash)
+                    || recovered_object.content_size_bytes != Some(content_size_bytes)
+                    || recovered_version.content_hash.as_deref() != Some(content_hash)
+                    || recovered_version.size_bytes != Some(content_size_bytes)
+                    || !recovered_version.visible
+                    || !recovered_object
+                        .current_locations
+                        .iter()
+                        .all(|node_id| durable_nodes.contains(node_id))
+                    || recovered_object.current_locations.len() < intent.policy.min_commit_replicas
+                {
+                    return Err(DfsError::Metadata {
+                        message: format!(
+                            "durable create prepare {} target payload does not match recovered intent {}",
+                            prepare.operation_id, intent.intent_id
+                        ),
+                    });
+                }
+                committed_object = recovered_object;
+                visible_version = recovered_version;
+                let recovered_parents = prepare
+                    .transaction
+                    .objects
+                    .iter()
+                    .filter(|object| object.object_id != intent.object_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if recovered_parents.len() > 1 {
+                    return Err(DfsError::Metadata {
+                        message: format!(
+                            "durable create prepare {} has multiple parent metadata records",
+                            prepare.operation_id
+                        ),
+                    });
+                }
+                touched_parent = recovered_parents.into_iter().next();
+                Some(prepare.transaction.clone())
+            } else {
+                if durable_object_exists {
+                    return Err(DfsError::Distributed {
+                        message: format!(
+                            "cannot batch first publication for already-durable object {}",
+                            intent.object_id
+                        ),
+                    });
+                }
+                if let Some(backend) = self.metadata_backend.as_ref() {
+                    let durable_path_object = backend.get_object_by_path(
+                        &committed_object.file_system_id,
+                        &committed_object.path,
+                    )?;
+                    if !create_visible_path_is_available(intent, durable_path_object.as_ref()) {
+                        let occupant = durable_path_object
+                            .as_ref()
+                            .map(|object| format!("{} {:?}", object.object_id, object.kind))
+                            .unwrap_or_else(|| "unknown object".to_string());
+                        self.abort_pending_write(&intent.intent_id)?;
+                        return Err(DfsError::Distributed {
+                            message: format!(
+                                "cannot publish created object {} because its path is owned by {occupant}",
+                                committed_object.path
+                            ),
+                        });
+                    }
+                }
+                touched_parent = if intent.touch_parent_on_create {
+                    self.parent_directory_touch_metadata_for_create(&committed_object)?
+                } else {
+                    None
+                };
+                let mut objects = vec![committed_object.clone()];
+                let mut versions = vec![visible_version.clone()];
+                if let Some(parent) = touched_parent.as_ref() {
+                    objects.push(parent.clone());
+                    versions.push(object_version_record(parent, parent.content_size_bytes));
+                }
+                Some(DfsNamespaceTransaction {
+                    transaction_id: namespace_transaction_id_for_object(
+                        "create-visible-batched",
+                        &intent.object_id,
+                        &intent.target_version,
+                    ),
+                    file_system_id: committed_object.file_system_id.clone(),
+                    objects,
+                    versions,
+                    advisory_lock_states: Vec::new(),
+                    created_at: OffsetDateTime::now_utc(),
+                })
+            }
+        } else {
+            None
+        };
+        // Recovery may have replaced the synthesized child metadata with the
+        // exact durable prepare payload. Terminal intent metadata must point
+        // at that same object, not at a newly timestamped reconstruction.
+        intent_record.object_metadata = Some(committed_object.clone());
+        // In clustered mode, durably journal the pending intent and exact
+        // receipt set before collecting authority. The healthy fast path then
+        // replicates this hidden prepare to every configured metadata replica;
+        // a promoted replica therefore retains the same base/target
+        // reservation instead of learning only that the old primary was once
+        // reachable.
+        let canonical_authorization = if self.control_plane.is_some() {
+            let shard = self
+                .select_metadata_shard_for_object(base_object)?
+                .ok_or_else(|| DfsError::Distributed {
+                    message: format!(
+                        "clustered DFS intent {} has no metadata-shard assignment",
+                        intent.intent_id
+                    ),
+                })?;
+            let namespace_prepare = if let Some(prepare) = durable_create_prepare.as_ref() {
+                if prepare.shard_id.0 != shard.shard_id || prepare.owner_epoch != shard.epoch {
+                    return Err(DfsError::StaleOwnerEpoch {
+                        file_system_id: prepare.file_system_id.clone(),
+                        local_node_id: self.node_id.clone(),
+                        primary_node_id: shard.primary_node_id.clone(),
+                        epoch: shard.epoch,
+                    });
+                }
+                Some(prepare.clone())
+            } else if let Some(transaction) = create_transaction.as_ref() {
+                let backend = self
+                    .metadata_backend
+                    .as_ref()
+                    .ok_or_else(|| DfsError::Metadata {
+                        message: "clustered canonical create requires a durable metadata backend"
+                            .to_string(),
+                    })?;
+                let (expected_object_versions, expected_path_occupants, _) =
+                    crate::service_metadata::namespace_prepare_expectations(
+                        backend.as_ref(),
+                        &DfsMetadataShardId::new(shard.shard_id.clone()),
+                        transaction,
+                    )?;
+                let mut prepare = DfsNamespacePrepareRecord {
+                    operation_id: format!("namespace:create:{}", intent.intent_id),
+                    file_system_id: transaction.file_system_id.clone(),
+                    shard_id: DfsMetadataShardId::new(shard.shard_id.clone()),
+                    owner_epoch: shard.epoch,
+                    operation_digest: String::new(),
+                    expected_object_versions,
+                    expected_path_occupants,
+                    transaction: transaction.clone(),
+                    status: DfsNamespacePrepareStatus::Prepared,
+                };
+                prepare.operation_digest =
+                    crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)?;
+                Some(prepare)
+            } else {
+                None
+            };
+            let backend = self
+                .metadata_backend
+                .as_mut()
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "clustered canonical write requires a durable metadata backend"
+                        .to_string(),
+                })?;
+            let mut entries = backend.put_intent_and_receipts_for_object(
+                Some(base_object),
+                &pending_intent_record,
+                &receipts,
+            )?;
+            if let Some(prepare) = namespace_prepare.as_ref() {
+                entries.push(backend.prepare_namespace_transaction(prepare)?);
+            }
+            let prepare_sequence =
+                entries
+                    .last()
+                    .map(|entry| entry.sequence)
+                    .ok_or_else(|| DfsError::Metadata {
+                        message: format!(
+                            "canonical DFS prepare for intent {} produced no journal entries",
+                            intent.intent_id
+                        ),
+                    })?;
+            if entries
+                .iter()
+                .any(|entry| entry.shard_id.0 != shard.shard_id)
+            {
+                return Err(DfsError::Metadata {
+                    message: format!(
+                        "canonical DFS prepare for intent {} crossed metadata shards",
+                        intent.intent_id
+                    ),
+                });
+            }
+            let prepared_batch = DfsMetadataJournalBatch {
+                shard_id: DfsMetadataShardId::new(shard.shard_id.clone()),
+                entries,
+                next_after_sequence: prepare_sequence,
+            };
+            let receipt_node_ids = durable_nodes.iter().cloned().collect::<Vec<_>>();
+            let operation = crate::service_replica::metadata_authority_operation_for_intent(
+                intent,
+                content_hash,
+                &receipt_node_ids,
+                namespace_prepare.as_ref(),
+                prepare_sequence,
+                &shard,
+            )?;
+            let authorization = self.authorize_prepared_intent_for_selected_shard(
+                intent,
+                base_object,
+                shard,
+                &operation,
+                &prepared_batch,
+            )?;
+            Some((authorization, operation, namespace_prepare))
+        } else {
+            None
+        };
+        // Keep the operation-bound authority round at the publication
+        // boundary. Everything above is preparation or hidden state; the
+        // backend call below is the atomic base/intent/receipt CAS that makes
+        // the target version visible.
+        let publication_guard = canonical_authorization
+            .as_ref()
+            .map(|(authorization, operation, _)| {
+                self.validate_canonical_authorization(authorization, operation)
+            })
+            .transpose()?;
         let prepare_ms = prepare_started.elapsed().as_millis();
         let backend_started = Instant::now();
         if let Some(backend) = self.metadata_backend.as_mut() {
-            backend.put_object_version_intent_and_receipts(
-                &committed_object,
-                &visible_version,
-                &intent_record,
-                &receipts,
-            )?;
+            if let Some((_, _, Some(prepare))) = canonical_authorization.as_ref() {
+                backend.commit_prepared_namespace_transaction(
+                    &prepare.operation_id,
+                    &prepare.operation_digest,
+                    prepare.owner_epoch,
+                )?;
+                backend.put_intent_for_object(Some(&committed_object), &intent_record)?;
+            } else if let Some(transaction) = create_transaction.as_ref() {
+                backend.commit_create_intent_receipts_and_namespace(
+                    &pending_intent_record,
+                    &receipts,
+                    transaction,
+                    &intent_record,
+                )?;
+            } else {
+                backend.put_object_version_intent_and_receipts(
+                    &committed_object,
+                    &visible_version,
+                    &intent_record,
+                    &receipts,
+                )?;
+            }
         }
+        drop(publication_guard);
         let backend_ms = backend_started.elapsed().as_millis();
         let coordinator_started = Instant::now();
         self.coordinator
@@ -1162,14 +1620,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let coordinator_ms = coordinator_started.elapsed().as_millis();
         let memory_started = Instant::now();
         self.track_metadata_tombstone(&committed_object);
-        self.metadata.add_object(committed_object)?;
+        self.metadata.add_object(committed_object.clone())?;
+        if let Some(parent) = touched_parent {
+            self.metadata.add_object(parent)?;
+        }
+        self.coordinator.set_committed_version(
+            committed_object.file_system_id.clone(),
+            committed_object.object_id.clone(),
+            committed_object.version.clone(),
+        );
+        self.transient_metadata_object_ids.remove(&intent.object_id);
+        self.transient_metadata_predecessor_object_ids
+            .remove(&intent.object_id);
+        self.clear_metadata_lookup_cache();
         self.clear_active_replica_stage(&intent.object_id, &intent.target_version);
         let memory_ms = memory_started.elapsed().as_millis();
         dfs_perf_trace(format_args!(
-            "remote-manifest-commit-batched intent={} object={} version={} receipts={} prepare_ms={} backend_ms={} coordinator_ms={} memory_ms={} total_ms={}",
+            "ready-intent-commit-batched intent={} object={} version={} create={} receipts={} prepare_ms={} backend_ms={} coordinator_ms={} memory_ms={} total_ms={}",
             trace_intent_id,
             trace_object_id,
             trace_version,
+            intent.touch_parent_on_create,
             receipts.len(),
             prepare_ms,
             backend_ms,
@@ -1178,6 +1649,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             trace_started.elapsed().as_millis()
         ));
         Ok(())
+    }
+
+    /// A base version can belong to transient, not-yet-published metadata.
+    /// Existing-object batching therefore keys off durable backend state, while
+    /// first publication uses an exact namespace prepare (with the parent touch
+    /// included when POSIX create semantics require one).
+    pub(crate) fn can_commit_ready_intent_batched(
+        &self,
+        intent: &DistributedWriteIntent,
+    ) -> Result<bool, DfsError> {
+        if intent.touch_parent_on_create {
+            return Ok(true);
+        }
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(true);
+        };
+        let operation_id = format!("namespace:create:{}", intent.intent_id);
+        if backend.get_namespace_prepare(&operation_id)?.is_some() {
+            return Ok(true);
+        }
+        match backend.get_object(&intent.object_id)? {
+            Some(_) => Ok(intent.base_version.is_some()),
+            None => Ok(true),
+        }
     }
 
     pub(crate) fn store_command_bytes(

@@ -417,7 +417,7 @@ pub fn sifs_fuse_benchmark_plan() -> BenchmarkHarnessPlan {
             "cargo build --release -p sinomo-benchmarks --features sifs-fuse-bench --bin sinomo-sifs-fuse-bench"
                 .to_string(),
         ],
-        run_command: "target/release/sinomo-sifs-fuse-bench --root \"$SINOMO_SIFS_FUSE_BENCH_ROOT\" --suite full --require-fuse --json-out benchmark-results/sifs-fuse/report.json"
+        run_command: "target/release/sinomo-sifs-fuse-bench --root \"$SINOMO_SIFS_FUSE_BENCH_ROOT\" --suite full --require-fuse --min-sequential-read-mib-s \"${SINOMO_SIFS_FUSE_MIN_SEQUENTIAL_READ_MIB_S:-0}\" --min-parallel-create-speedup \"${SINOMO_SIFS_FUSE_MIN_PARALLEL_CREATE_SPEEDUP:-0}\" --json-out benchmark-results/sifs-fuse/report.json"
             .to_string(),
         required_tools: vec![AgentToolKind::RunShellCommand],
         notes: vec![
@@ -426,6 +426,8 @@ pub fn sifs_fuse_benchmark_plan() -> BenchmarkHarnessPlan {
             "SINOMO_SIFS_FUSE_BENCH_ROOT must identify an existing caller-writable SIFS subtree; every run uses a unique child and removes it on exit."
                 .to_string(),
             "Correctness failures produce a non-zero exit; performance thresholds are opt-in so unconfigured runs report measurements without imposing host-specific gates."
+                .to_string(),
+            "Set SINOMO_SIFS_FUSE_MIN_SEQUENTIAL_READ_MIB_S and SINOMO_SIFS_FUSE_MIN_PARALLEL_CREATE_SPEEDUP to make the catalog run enforce read-throughput and concurrency-scaling floors."
                 .to_string(),
         ],
     }
@@ -1611,6 +1613,16 @@ mod tests {
         assert!(plan.run_command.contains("$SINOMO_SIFS_FUSE_BENCH_ROOT"));
         assert!(plan.run_command.contains("--suite full"));
         assert!(plan.run_command.contains("--require-fuse"));
+        assert!(plan.run_command.contains("--min-sequential-read-mib-s"));
+        assert!(
+            plan.run_command
+                .contains("SINOMO_SIFS_FUSE_MIN_SEQUENTIAL_READ_MIB_S")
+        );
+        assert!(plan.run_command.contains("--min-parallel-create-speedup"));
+        assert!(
+            plan.run_command
+                .contains("SINOMO_SIFS_FUSE_MIN_PARALLEL_CREATE_SPEEDUP")
+        );
         assert!(
             plan.run_command
                 .contains("benchmark-results/sifs-fuse/report.json")

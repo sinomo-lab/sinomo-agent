@@ -254,21 +254,96 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn bootstrap_distributed_sifs(&mut self) -> Result<()> {
         let fallback_file_system = crate::namespace::distributed_sifs(self.node_id.clone());
         let file_system_id = fallback_file_system.file_system_id.clone();
-        let file_system = if let Some(kv) = self.control_plane.as_mut() {
-            DfsControlPlaneStore::new(kv.as_mut())
+        let (file_system, configured_shards) = if let Some(kv) = self.control_plane.as_mut() {
+            let store = DfsControlPlaneStore::new(kv.as_mut());
+            let file_system = store
                 .get_file_system_config(&file_system_id)
                 .map_err(DfsError::from)?
                 .map(DfsFileSystem::from)
-                .unwrap_or(fallback_file_system)
+                .unwrap_or(fallback_file_system);
+            let shards = store
+                .list_metadata_shards(&file_system_id)
+                .map_err(DfsError::from)?;
+            (file_system, Some(shards))
         } else {
-            fallback_file_system
+            (fallback_file_system, None)
         };
         let bootstrap_owner_node_id = file_system.owner_node_id.clone();
-        self.add_file_system(file_system)?;
+        if configured_shards.is_some() {
+            // Cluster KV is the source of filesystem configuration. Register
+            // it in memory for path resolution, but do not journal it across
+            // every locally opened shard. Each exact shard primary persists
+            // the record on that shard when it prepares its first canonical
+            // namespace mutation; replicas learn it through that journal.
+            self.clear_metadata_lookup_cache();
+            self.metadata.add_file_system(file_system);
+            self.clear_metadata_lookup_cache();
+        } else {
+            self.add_file_system(file_system)?;
+        }
         for object in
             crate::namespace::distributed_sifs_bootstrap_objects(bootstrap_owner_node_id.clone())
         {
-            match self.lookup_metadata_path(&object.file_system_id, &object.path)? {
+            if let Some(shards) = configured_shards.as_deref() {
+                // Bootstrap is an authority-local maintenance action. A
+                // client/replica must not manufacture root metadata when the
+                // configured primary is elsewhere, and an incomplete default
+                // split must fail closed for that anchor without preventing
+                // the service from opening. The responsible primary will
+                // create or repair its own fixed bootstrap objects.
+                let Ok(Some(shard)) =
+                    crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                        &file_system_id,
+                        shards,
+                        &object.path,
+                    )
+                else {
+                    continue;
+                };
+                if shard.primary_node_id != self.node_id {
+                    continue;
+                }
+                // A shard-primary bootstrap can start from journal genesis.
+                // Seed the configured filesystem on this exact shard before
+                // the first lookup: backend lookup intentionally rejects an
+                // unknown filesystem, and using the broad sharded ensure here
+                // would author the same entry on sibling replica shards.
+                let backend = self.metadata_backend.as_mut().ok_or_else(|| {
+                    DfsPosixError::Dfs(DfsError::Metadata {
+                        message: format!(
+                            "clustered SIFS bootstrap for shard {} requires a durable metadata backend",
+                            shard.shard_id
+                        ),
+                    })
+                })?;
+                backend.ensure_file_system_on_shard(
+                    &crate::DfsMetadataShardId::new(shard.shard_id),
+                    self.metadata
+                        .filesystems
+                        .get(&file_system_id)
+                        .ok_or_else(|| {
+                            DfsPosixError::Dfs(DfsError::Metadata {
+                                message: "clustered SIFS bootstrap lost its configured filesystem"
+                                    .to_string(),
+                            })
+                        })?,
+                )?;
+            }
+            // Clustered bootstrap objects are shard anchors. Their parent can
+            // legitimately live on a shard that is not opened locally (or,
+            // during a partial rollout, is not configured yet), so the
+            // ordinary tombstone-ancestor walk would route `/_anchor` through
+            // `/` and turn an exact local-shard bootstrap into
+            // `UnknownFileSystem`. The anchor itself is still checked on its
+            // selected shard; a tombstoned anchor is therefore not
+            // resurrected. Standalone bootstrap retains the full ancestor
+            // check.
+            let existing = if configured_shards.is_some() {
+                self.lookup_metadata_path_raw(&object.file_system_id, &object.path)?
+            } else {
+                self.lookup_metadata_path(&object.file_system_id, &object.path)?
+            };
+            match existing {
                 None => self.add_object_metadata(object)?,
                 // Early SIFS metadata predates persisted POSIX modes. A zero
                 // mode on a runtime-owned bootstrap directory makes the
@@ -527,6 +602,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsStat> {
         self.posix_write_file_bytes_checked_parent(
             path, bytes, options, true, true, true, None, false, false,
+        )
+    }
+
+    /// Replace an existing file only while its stable identity and visible
+    /// version still match the caller's snapshot.
+    ///
+    /// Unlike [`Self::posix_write_file`], this operation deliberately performs
+    /// a single write attempt.  A stale base is returned as a conflict instead
+    /// of being refreshed and retried against a newer version, which makes it
+    /// suitable for editors and other compare-and-swap callers.
+    pub fn posix_replace_file_if_version(
+        &mut self,
+        path: &str,
+        expected_object_id: &DfsObjectId,
+        expected_version: &DfsVersion,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
+        self.posix_write_file_bytes_checked_parent_once(
+            path,
+            bytes,
+            options,
+            true,
+            false,
+            true,
+            None,
+            false,
+            false,
+            Some((expected_object_id, expected_version)),
         )
     }
 
@@ -1006,6 +1110,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 create_attrs,
                 exclusive_create,
                 follow_final_for_exclusive_create,
+                None,
             ) {
                 Ok(stat) => return Ok(stat),
                 Err(error)
@@ -1037,6 +1142,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         create_attrs: Option<DfsPosixCreateAttrs>,
         exclusive_create: bool,
         follow_final_for_exclusive_create: bool,
+        expected_existing: Option<(&DfsObjectId, &DfsVersion)>,
     ) -> Result<DfsStat> {
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
         let path = self.resolve_posix_path_distributed(
@@ -1070,6 +1176,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Some(object) if object.kind == DfsObjectKind::Hardlink => {
                 self.resolve_hardlink_target(&object)?
             }
+            Some(object)
+                if object.kind == DfsObjectKind::Tombstone && expected_existing.is_some() =>
+            {
+                return Err(DfsPosixError::NotFound { path });
+            }
             Some(object) if object.kind == DfsObjectKind::Tombstone => {
                 let mut object =
                     recreated_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
@@ -1081,6 +1192,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 object
             }
             Some(object) => object,
+            None if expected_existing.is_some() => {
+                return Err(DfsPosixError::NotFound { path });
+            }
             None => {
                 let mut object =
                     new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
@@ -1092,6 +1206,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 object
             }
         };
+        if let Some((expected_object_id, expected_version)) = expected_existing {
+            if &object.object_id != expected_object_id {
+                return Err(DfsPosixError::Conflict {
+                    path,
+                    reason: format!(
+                        "file identity changed: expected {expected_object_id}, found {}",
+                        object.object_id
+                    ),
+                });
+            }
+            if &object.version != expected_version {
+                return Err(DfsPosixError::Conflict {
+                    path,
+                    reason: format!(
+                        "file changed since it was opened: expected version {expected_version}, found {}",
+                        object.version
+                    ),
+                });
+            }
+        }
         let target_version = next_version(&object.version);
         let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
         let committed_locations = candidates.clone();

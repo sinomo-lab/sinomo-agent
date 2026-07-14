@@ -11,7 +11,8 @@ use super::{
 };
 use crate::namespace::next_version;
 use crate::posix_model::{
-    DfsPosixError, DfsPosixFileRangeReadStream, DfsPosixFileReadStream, Result, read_conflict_error,
+    DfsPosixError, DfsPosixFileRangeReadStream, DfsPosixFileReadStream, DfsStat, Result,
+    read_conflict_error,
 };
 use crate::posix_path::normalize_posix_path;
 use crate::{
@@ -809,6 +810,63 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    /// Read one immutable range through the exact identity captured when a
+    /// file handle was opened.
+    ///
+    /// Unlike [`Self::posix_read_file_range_for_opened_object`], this does not
+    /// resolve the pathname or current object metadata. Content versions are
+    /// immutable, so the opened version/hash/location tuple is sufficient for
+    /// a local read or an exact remote range request. This preserves an open
+    /// descriptor across rename/unlink and removes a metadata-authority RTT
+    /// from every kernel read. Missing or mismatched content still fails
+    /// closed through the existing exact-version and hash validation.
+    pub fn posix_read_file_range_for_opened_stat(
+        &mut self,
+        path: &str,
+        opened: &DfsStat,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        if max_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        let path = normalize_posix_path(path)?;
+        if opened.kind == DfsObjectKind::Tombstone {
+            return Err(DfsPosixError::NotFound { path });
+        }
+        if opened.kind == DfsObjectKind::Directory {
+            return Err(DfsPosixError::IsDirectory { path });
+        }
+
+        // The exact-content read path does not consult metadata ownership.
+        // DfsStat deliberately omits owner_node_id, so use the local node as a
+        // non-authoritative placeholder while reconstructing the immutable
+        // content identity consumed by the range transport.
+        let object = DfsObjectMetadata {
+            object_id: opened.object_id.clone(),
+            file_system_id: opened.file_system_id.clone(),
+            path: path.clone(),
+            kind: opened.kind.clone(),
+            owner_node_id: self.node_id.clone(),
+            current_locations: opened.current_locations.clone(),
+            content_hash: opened.content_hash.clone(),
+            content_size_bytes: opened.size_bytes,
+            link_target_object_id: None,
+            mode: opened.mode,
+            uid: opened.uid,
+            gid: opened.gid,
+            accessed_at_unix_nanos: opened.accessed_at_unix_nanos,
+            modified_at_unix_nanos: opened.modified_at_unix_nanos,
+            created_at_unix_nanos: opened.created_at_unix_nanos,
+            changed_at_unix_nanos: opened.changed_at_unix_nanos,
+            version: opened.version.clone(),
+            policy: opened.policy.clone(),
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        self.posix_read_file_range_for_opened_metadata(path, object, offset, max_bytes, false)
+    }
+
     fn posix_read_file_range_for_opened_metadata(
         &mut self,
         path: String,
@@ -1220,5 +1278,107 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Err(read_conflict_error(path, conflicts))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod opened_stat_tests {
+    use super::*;
+    use crate::{DfsRoutedMessage, DfsTransportIdentity, LocalContentStore};
+    use sinomo_core::DfsObjectPolicy;
+    use sinomo_core::network::NetworkError;
+
+    #[derive(Clone, Debug)]
+    struct NoNetworkTransport {
+        local_node_id: NodeId,
+    }
+
+    impl DfsTransportIdentity for NoNetworkTransport {
+        fn local_node_id(&self) -> &NodeId {
+            &self.local_node_id
+        }
+    }
+
+    impl DfsMessageTransport for NoNetworkTransport {
+        fn send_routed_message(
+            &mut self,
+            target_node_id: &NodeId,
+            _message: DfsRoutedMessage,
+        ) -> std::result::Result<(), NetworkError> {
+            Err(NetworkError::UnknownNode {
+                node_id: target_node_id.clone(),
+            })
+        }
+
+        fn drain_incoming_messages(
+            &mut self,
+        ) -> std::result::Result<Vec<DfsRoutedMessage>, NetworkError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn opened_stat_read_keeps_exact_version_without_resolving_current_path_metadata() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-opened-stat-read");
+        let local = NodeId::from_legacy_named("node_opened_stat_read").expect("node id");
+        let object_id =
+            DfsObjectId::from_legacy_named("object_opened_stat_read").expect("object id");
+        let mut service = NetworkedDfsService::new(
+            NoNetworkTransport {
+                local_node_id: local.clone(),
+            },
+            LocalContentStore::new(root.join("content")).expect("content store"),
+        );
+        let mut object = DfsObjectMetadata {
+            object_id,
+            file_system_id: sifs_file_system_id(),
+            path: "/opened.txt".to_string(),
+            kind: DfsObjectKind::File,
+            owner_node_id: local.clone(),
+            current_locations: vec![local],
+            content_hash: None,
+            content_size_bytes: None,
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+            accessed_at_unix_nanos: 1,
+            modified_at_unix_nanos: 1,
+            created_at_unix_nanos: 1,
+            changed_at_unix_nanos: 1,
+            version: DfsVersion::from_legacy_named("version_opened_stat_1").expect("first version"),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        service
+            .put_local_object_version(object.clone(), b"version-one")
+            .expect("publish first version");
+        let opened = service.posix_stat("/opened.txt").expect("opened stat");
+
+        object.version =
+            DfsVersion::from_legacy_named("version_opened_stat_2").expect("second version");
+        service
+            .put_local_object_version(object, b"version-two")
+            .expect("publish second version");
+        assert_ne!(
+            service
+                .posix_stat("/opened.txt")
+                .expect("current stat")
+                .version,
+            opened.version
+        );
+
+        assert_eq!(
+            service
+                .posix_read_file_range_for_opened_stat(
+                    "/renamed-or-unlinked-after-open.txt",
+                    &opened,
+                    0,
+                    usize::MAX,
+                )
+                .expect("read exact opened version"),
+            b"version-one"
+        );
     }
 }
