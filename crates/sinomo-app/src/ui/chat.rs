@@ -4646,7 +4646,12 @@ impl ChatState {
                 }
                 self.models_loading = false;
             }
-            ChatEvent::Error { error, .. } => {
+            ChatEvent::Error { session_id, error } => {
+                tracing::warn!(
+                    session_id = session_id.as_deref().unwrap_or_default(),
+                    %error,
+                    "chat runtime command failed"
+                );
                 self.streaming = false;
                 self.control.active_turn = false;
                 self.queued_turn_inputs.clear();
@@ -8644,6 +8649,13 @@ fn text_mentions_connection_problem(text: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+fn text_mentions_chat_sync_problem(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("agent session checkpoint")
+        || lower.contains("roaming agent session")
+        || lower.contains("reconciled chat channel")
+}
+
 fn connection_problem_summary(text: &str) -> Option<String> {
     if !text_mentions_connection_problem(text) {
         return None;
@@ -8651,7 +8663,9 @@ fn connection_problem_summary(text: &str) -> Option<String> {
 
     let lower = text.to_ascii_lowercase();
     let denied = lower.contains("device authorization") || lower.contains("denied");
-    let summary = if lower.contains("agent channel") || lower.contains("channel store") {
+    let summary = if text_mentions_chat_sync_problem(text) {
+        "Chat session state could not be synchronized through SIFS."
+    } else if lower.contains("agent channel") || lower.contains("channel store") {
         if denied {
             "Agent channel storage could not open through SIFS; device authorization was denied."
         } else {
@@ -8685,7 +8699,9 @@ fn connection_recovery_display_detail(text: &str) -> Option<String> {
     }
 
     let lower = text.to_ascii_lowercase();
-    let summary = if lower.contains("agent channel")
+    let summary = if text_mentions_chat_sync_problem(text) {
+        "Sinomo could not synchronize this chat."
+    } else if lower.contains("agent channel")
         || lower.contains("channel create")
         || lower.contains("channel store")
     {
@@ -8724,7 +8740,9 @@ fn detail_should_offer_sifs_check(text: &str) -> bool {
 
 fn activity_status_summary(text: &str) -> String {
     let lower = text.to_ascii_lowercase();
-    let summary = if lower.contains("agent channel")
+    let summary = if text_mentions_chat_sync_problem(text) {
+        Some("Chat synchronization needs attention")
+    } else if lower.contains("agent channel")
         || lower.contains("channel create")
         || lower.contains("channel store")
     {
@@ -8861,29 +8879,46 @@ fn transcript_message_display_text(message: &ChatMessage) -> String {
     if text_mentions_connection_problem(detail) {
         let lower = detail.to_ascii_lowercase();
         let denied = lower.contains("device authorization") || lower.contains("denied");
-        let summary = if lower.contains("agent channel") || lower.contains("channel store") {
+        let (title, summary) = if text_mentions_chat_sync_problem(detail) {
+            (
+                "Chat sync issue",
+                "This chat's roaming session state could not be synchronized.",
+            )
+        } else if lower.contains("agent channel") || lower.contains("channel store") {
             if denied {
-                "This chat needs storage authorization."
+                ("Connection issue", "This chat needs storage authorization.")
             } else {
-                "Sinomo could not open this chat channel."
+                (
+                    "Connection issue",
+                    "Sinomo could not open this chat channel.",
+                )
             }
         } else if lower.contains("chat list") {
-            "Saved chats could not be loaded."
+            ("Connection issue", "Saved chats could not be loaded.")
         } else if lower.contains("chat save") {
-            "This chat could not be saved."
+            ("Connection issue", "This chat could not be saved.")
         } else if lower.contains("device authorization") {
-            "This chat action needs storage authorization."
+            (
+                "Connection issue",
+                "This chat action needs storage authorization.",
+            )
         } else if lower.contains("daemon") || lower.contains("cluster") {
-            "The local cluster service is not reachable."
+            (
+                "Connection issue",
+                "The local cluster service is not reachable.",
+            )
         } else {
-            "The chat runtime could not reach a required cluster service."
+            (
+                "Connection issue",
+                "The chat runtime could not reach a required cluster service.",
+            )
         };
         let next = if detail_should_offer_sifs_check(detail) {
             "Check SIFS first. Connection settings has low-level detail."
         } else {
             "Open Connection settings for low-level detail."
         };
-        format!("Connection issue\n{summary}\n{next}")
+        format!("{title}\n{summary}\n{next}")
     } else {
         format!("Error\n{detail}")
     }
@@ -22054,6 +22089,14 @@ mod tests {
         assert!(!rendered.contains("SIFS store failed"));
         assert!(!rendered.contains("device authorization was denied"));
 
+        let sync = ChatMessage::system_error(
+            "Error: resume failed: publish reconciled agent session checkpoint failed: network error at /daemon/dfs/browser/write-file: clustered DFS object has no committed metadata-shard assignment",
+        );
+        let rendered = transcript_message_display_text(&sync);
+        assert!(rendered.starts_with("Chat sync issue\n"));
+        assert!(rendered.contains("This chat's roaming session state could not be synchronized."));
+        assert!(!rendered.contains("The local cluster service is not reachable."));
+
         let provider = ChatMessage::system_error("Error: provider unavailable");
         assert_eq!(
             transcript_message_display_text(&provider),
@@ -23749,6 +23792,12 @@ mod tests {
         assert!(!channel.contains("device authorization"));
         assert!(!channel.contains("SIFS"));
         assert!(!channel.contains("storage"));
+
+        let sync = connection_recovery_display_detail(
+            "publish reconciled agent session checkpoint failed: clustered DFS object has no committed metadata-shard assignment",
+        )
+        .expect("chat sync display detail");
+        assert_eq!(sync, "Sinomo could not synchronize this chat.");
 
         assert!(connection_recovery_display_detail("provider unavailable").is_none());
     }

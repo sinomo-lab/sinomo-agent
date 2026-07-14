@@ -603,6 +603,16 @@ fn chat_task_status(status: &AgentTaskLifecycleStatus) -> &'static str {
     }
 }
 
+fn log_resume_sync_warnings(chat: &mut AgentChat, session_id: &str) {
+    for warning in chat.take_resume_sync_warnings() {
+        tracing::warn!(
+            %session_id,
+            %warning,
+            "chat resumed with degraded roaming synchronization"
+        );
+    }
+}
+
 fn worker(
     data_dir: SinomoDataDir,
     daemon_connected: bool,
@@ -657,6 +667,7 @@ fn worker(
                 } else {
                     match chat.resume_session(&session_id, &[]) {
                         Ok(()) => {
+                            log_resume_sync_warnings(&mut chat, &session_id);
                             set_active_session_id(&active_session_id, &evt_tx, &session_id);
                             session_id
                         }
@@ -813,17 +824,19 @@ fn worker(
                     });
                 }
             },
-            ChatCommand::NewSession { session_id } => {
-                if let Err(error) = chat.resume_session(&session_id, &[]) {
+            ChatCommand::NewSession { session_id } => match chat.resume_session(&session_id, &[]) {
+                Err(error) => {
                     let _ = evt_tx.send(ChatEvent::Error {
                         session_id: Some(session_id),
                         error: format!("new session failed: {error}"),
                     });
-                } else {
+                }
+                Ok(()) => {
+                    log_resume_sync_warnings(&mut chat, &session_id);
                     set_active_session_id(&active_session_id, &evt_tx, &session_id);
                     let _ = evt_tx.send(ChatEvent::SessionReset { session_id });
                 }
-            }
+            },
             ChatCommand::Resume {
                 session_id,
                 history,
@@ -834,6 +847,7 @@ fn worker(
                         error: format!("resume failed: {error}"),
                     });
                 } else {
+                    log_resume_sync_warnings(&mut chat, &session_id);
                     set_active_session_id(&active_session_id, &evt_tx, session_id);
                     let _ = evt_tx.send(ChatEvent::ToolRuntime(chat.tool_runtime()));
                     match chat.control_state() {
@@ -874,6 +888,9 @@ fn worker(
                 } else {
                     chat.resume_session(&session_id, &history)
                 };
+                if resume_result.is_ok() {
+                    log_resume_sync_warnings(&mut chat, &session_id);
+                }
                 match resume_result.and_then(|_| chat.set_agent(&key)) {
                     Ok(info) => {
                         if !session_id.trim().is_empty() {

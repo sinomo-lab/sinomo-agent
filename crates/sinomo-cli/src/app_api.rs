@@ -2172,6 +2172,7 @@ pub struct AgentChat {
     runtime: InteractionRuntime<InMemoryEventStore, Handler>,
     tool_runtime: ChatToolRuntimeSelection,
     tool_runtime_explicit_override: bool,
+    resume_sync_warnings: Vec<String>,
 }
 
 impl AgentChat {
@@ -2264,11 +2265,13 @@ impl AgentChat {
             runtime,
             tool_runtime,
             tool_runtime_explicit_override: false,
+            resume_sync_warnings: Vec::new(),
         })
     }
 
     /// Begin a brand-new chat (clears the in-memory transcript/context).
     pub fn reset_session(&mut self) {
+        self.resume_sync_warnings.clear();
         let session = app_session(&self.data_dir, None);
         self.runtime
             .replace_store_and_session(InMemoryEventStore::new(), session.clone());
@@ -2293,6 +2296,7 @@ impl AgentChat {
         session_id: &str,
         history: &[ChatHistoryMessage],
     ) -> Result<(), CliError> {
+        self.resume_sync_warnings.clear();
         let session = app_session(&self.data_dir, Some(session_id));
         let info = self.runtime_info();
         let (mut channel, loaded_existing_channel) =
@@ -2437,7 +2441,14 @@ impl AgentChat {
                     self.tool_runtime.workspace_root = None;
                 }
                 let channel_view = channel.clone();
-                if let Some(participant_id) = participant_id.as_ref() {
+                let session_participant_id = participant_id.as_ref().filter(|participant_id| {
+                    channel
+                        .participant(participant_id)
+                        .is_some_and(|participant| {
+                            participant.agent_session_id == persisted.session_id
+                        })
+                });
+                if let Some(participant_id) = session_participant_id {
                     let channel_id = channel.channel_id.clone();
                     let channel_participant =
                         channel
@@ -2458,14 +2469,14 @@ impl AgentChat {
                     .map_err(|source| CliError::Parse {
                         detail: format!("persist reconciled chat session failed: {source}"),
                     })?;
-                if participant_id.is_some() {
-                    self.session_checkpoint_store
-                        .publish(&channel, &participant, &persisted)
-                        .map_err(|detail| CliError::Parse {
-                            detail: format!(
-                                "publish reconciled agent session checkpoint failed: {detail}"
-                            ),
-                        })?;
+                if session_participant_id.is_some()
+                    && let Err(detail) =
+                        self.session_checkpoint_store
+                            .publish(&channel, &participant, &persisted)
+                {
+                    self.resume_sync_warnings.push(format!(
+                        "publish reconciled agent session checkpoint failed: {detail}"
+                    ));
                 }
                 tui::app_prepare_agent(
                     self.runtime.handler_mut(),
@@ -2524,9 +2535,18 @@ impl AgentChat {
         self.channel = channel;
         self.configure_tool_runtime_for_session(&session.session_id)?;
         if loaded_existing_channel && self.channel != channel_before_resume {
-            self.save_channel()?;
+            if let Err(error) = self.save_channel() {
+                self.resume_sync_warnings
+                    .push(format!("save reconciled chat channel failed: {error}"));
+            }
         }
         Ok(())
+    }
+
+    /// Return non-fatal SIFS synchronization failures from the latest resume.
+    /// The local runtime remains usable when a roaming checkpoint cannot be published.
+    pub fn take_resume_sync_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.resume_sync_warnings)
     }
 
     pub fn session_id(&self) -> String {
@@ -7583,6 +7603,41 @@ mod tests {
                 "resume must not persist a process-default participant or enablement change"
             );
         }
+    }
+
+    #[test]
+    fn app_chat_resume_group_outer_session_does_not_claim_participant_checkpoint() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-outer-session-resume");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let channel_id = SessionId::generate();
+        let mut channel = AgentChannel::new_channel(channel_id.clone(), "Durable team");
+        channel.ensure_user(AgentChannelUser::app_local());
+        let participant_id = channel.ensure_participant("main-agent", "main-agent");
+        let participant_session_id = channel
+            .participant(&participant_id)
+            .expect("main participant")
+            .agent_session_id
+            .clone();
+        let durable_participants = channel.participants.clone();
+        store.save_channel(&channel).expect("save channel");
+
+        let outer_session = AgentSession::new(channel_id.clone(), AgentRole::Main)
+            .with_agent_definition_key("main-agent");
+        FileAgentSessionStore::for_data_dir(&data_dir)
+            .save_session(&outer_session)
+            .expect("save outer channel session");
+
+        let mut chat = AgentChat::new(data_dir, false).expect("chat runtime");
+        chat.resume_session(&channel_id.to_string(), &[])
+            .expect("resume group outer session");
+
+        assert_ne!(participant_session_id, channel_id);
+        assert_eq!(chat.channel.participants, durable_participants);
+        assert!(
+            chat.take_resume_sync_warnings().is_empty(),
+            "an outer channel session must not be published as a participant checkpoint"
+        );
     }
 
     #[test]
