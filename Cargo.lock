@@ -8136,8 +8136,8 @@ dependencies = [
  "sinomo-evolution",
  "sinomo-lm",
  "sinomo-runtime",
+ "sinomo-ui",
  "sinomo-video",
- "sui",
  "sui-testing",
  "syntect",
  "time",
@@ -8150,7 +8150,7 @@ name = "sinomo-app-android"
 version = "0.1.0"
 dependencies = [
  "sinomo-app",
- "sui",
+ "sinomo-ui",
  "tracing",
 ]
 
@@ -8909,6 +8909,20 @@ name = "sinomo-testdir"
 version = "0.1.0"
 
 [[package]]
+name = "sinomo-ui"
+version = "0.1.0"
+dependencies = [
+ "sui-core",
+ "sui-layout",
+ "sui-platform",
+ "sui-render-wgpu",
+ "sui-runtime",
+ "sui-scene",
+ "sui-text",
+ "sui-widgets",
+]
+
+[[package]]
 name = "sinomo-vfs"
 version = "0.1.0"
 dependencies = [
@@ -9194,20 +9208,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
-name = "sui"
-version = "0.1.0"
-dependencies = [
- "sui-core",
- "sui-layout",
- "sui-platform",
- "sui-render-wgpu",
- "sui-runtime",
- "sui-scene",
- "sui-text",
- "sui-widgets",
-]
-
-[[package]]
 name = "sui-animation"
 version = "0.1.0"
 dependencies = [
@@ -9323,7 +9323,7 @@ version = "0.1.0"
 dependencies = [
  "exr",
  "png 0.17.16",
- "sui",
+ "sinomo-ui",
  "sui-avif",
  "sui-core",
  "sui-layout",
