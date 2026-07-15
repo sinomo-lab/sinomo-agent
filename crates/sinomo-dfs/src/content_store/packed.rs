@@ -80,8 +80,39 @@ struct OpenedPackedBlobRange {
     remaining_bytes: u64,
 }
 
+pub(super) struct PackedBlobLockGuard {
+    _file: Option<fs::File>,
+    hold_started_at: Option<Instant>,
+    mode: &'static str,
+}
+
+impl PackedBlobLockGuard {
+    fn new(file: fs::File, hold_started_at: Option<Instant>, mode: &'static str) -> Self {
+        Self {
+            _file: Some(file),
+            hold_started_at,
+            mode,
+        }
+    }
+}
+
+impl Drop for PackedBlobLockGuard {
+    fn drop(&mut self) {
+        if let Some(file) = self._file.take() {
+            let _ = FileExt::unlock(&file);
+        }
+        if let Some(hold_started_at) = self.hold_started_at {
+            crate::dfs_perf_trace(format_args!(
+                "packed-blob-lock mode={} hold_us={}",
+                self.mode,
+                hold_started_at.elapsed().as_micros()
+            ));
+        }
+    }
+}
+
 impl LocalContentStore {
-    pub(super) fn lock_packed_blobs(&self) -> Result<fs::File> {
+    pub(super) fn lock_packed_blobs(&self) -> Result<PackedBlobLockGuard> {
         let path = self.root.join(PACKED_BLOB_DIR).join(PACKED_BLOB_LOCK_FILE);
         if let Some(parent) = path.parent() {
             create_dir_all(parent.to_owned())?;
@@ -95,12 +126,21 @@ impl LocalContentStore {
                 path: path.clone(),
                 source,
             })?;
+        let wait_started_at = crate::dfs_perf_trace_enabled().then(Instant::now);
         file.lock_exclusive()
             .map_err(|source| ContentStoreError::Io { path, source })?;
-        Ok(file)
+        let hold_started_at = wait_started_at.map(|wait_started_at| {
+            let acquired_at = Instant::now();
+            crate::dfs_perf_trace(format_args!(
+                "packed-blob-lock mode=exclusive wait_us={}",
+                acquired_at.duration_since(wait_started_at).as_micros()
+            ));
+            Instant::now()
+        });
+        Ok(PackedBlobLockGuard::new(file, hold_started_at, "exclusive"))
     }
 
-    fn lock_packed_blobs_for_read(&self) -> Result<Option<fs::File>> {
+    fn lock_packed_blobs_for_read(&self) -> Result<Option<PackedBlobLockGuard>> {
         let path = self.root.join(PACKED_BLOB_DIR).join(PACKED_BLOB_LOCK_FILE);
         let file = match fs::OpenOptions::new().read(true).open(&path) {
             Ok(file) => file,
@@ -112,9 +152,22 @@ impl LocalContentStore {
                 });
             }
         };
+        let wait_started_at = crate::dfs_perf_trace_enabled().then(Instant::now);
         file.lock_shared()
             .map_err(|source| ContentStoreError::Io { path, source })?;
-        Ok(Some(file))
+        let hold_started_at = wait_started_at.map(|wait_started_at| {
+            let acquired_at = Instant::now();
+            crate::dfs_perf_trace(format_args!(
+                "packed-blob-lock mode=shared wait_us={}",
+                acquired_at.duration_since(wait_started_at).as_micros()
+            ));
+            Instant::now()
+        });
+        Ok(Some(PackedBlobLockGuard::new(
+            file,
+            hold_started_at,
+            "shared",
+        )))
     }
 
     pub(super) fn read_packed_blob_index_unlocked(&self) -> Result<PackedBlobIndex> {
@@ -600,18 +653,7 @@ impl LocalContentStore {
             return Ok(());
         }
         let path = self.packed_blob_index_log_path();
-        let mut records = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let bytes = encode_packed_blob_index_log_entry(entry)?;
-            u32::try_from(bytes.len()).map_err(|_| {
-                ContentStoreError::Serde(format!(
-                    "packed blob index entry for {} is too large: {} bytes",
-                    entry.content_hash,
-                    bytes.len()
-                ))
-            })?;
-            records.push(bytes);
-        }
+        let append_bytes = encode_packed_blob_index_log_entries(entries)?;
         if let Some(parent) = path.parent() {
             create_dir_all(parent.to_owned())?;
         }
@@ -623,15 +665,11 @@ impl LocalContentStore {
                 path: path.clone(),
                 source,
             })?;
-        for bytes in records {
-            let len = u32::try_from(bytes.len()).expect("length checked before append");
-            file.write_all(&len.to_le_bytes())
-                .and_then(|()| file.write_all(&bytes))
-                .map_err(|source| ContentStoreError::Io {
-                    path: path.clone(),
-                    source,
-                })?;
-        }
+        file.write_all(&append_bytes)
+            .map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
         if sync_writes {
             file.sync_all().map_err(|source| ContentStoreError::Io {
                 path: path.clone(),
@@ -653,6 +691,36 @@ fn decode_packed_blob_index(bytes: &[u8]) -> Result<PackedBlobIndex> {
 fn encode_packed_blob_index_log_entry(entry: &PackedBlobIndexLogEntry) -> Result<Vec<u8>> {
     sinomo_object_serde::to_bytes(entry, 1, LengthMode::U32)
         .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn encode_packed_blob_index_log_entries(entries: &[PackedBlobIndexLogEntry]) -> Result<Vec<u8>> {
+    let mut records = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let bytes = encode_packed_blob_index_log_entry(entry)?;
+        u32::try_from(bytes.len()).map_err(|_| {
+            ContentStoreError::Serde(format!(
+                "packed blob index entry for {} is too large: {} bytes",
+                entry.content_hash,
+                bytes.len()
+            ))
+        })?;
+        records.push(bytes);
+    }
+    let append_bytes_len = records.iter().try_fold(0_usize, |total, bytes| {
+        total.checked_add(std::mem::size_of::<u32>() + bytes.len())
+    });
+    let Some(append_bytes_len) = append_bytes_len else {
+        return Err(ContentStoreError::Serde(
+            "packed blob index append batch is too large".to_string(),
+        ));
+    };
+    let mut append_bytes = Vec::with_capacity(append_bytes_len);
+    for bytes in records {
+        let len = u32::try_from(bytes.len()).expect("length checked before append");
+        append_bytes.extend_from_slice(&len.to_le_bytes());
+        append_bytes.extend_from_slice(&bytes);
+    }
+    Ok(append_bytes)
 }
 
 fn packed_blob_index_file_fingerprint(
@@ -741,4 +809,46 @@ fn truncate_torn_packed_blob_index_log_tail(path: &Path, offset: u64) -> Result<
     durable_file::truncate_file_and_sync(path, offset, durable_file::DurableFileSync::All)
         .map_err(content_durable_file_error)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packed_index_append_batch_is_legacy_byte_identical() {
+        let entries = [
+            PackedBlobIndexLogEntry {
+                version: PACKED_BLOB_INDEX_VERSION,
+                content_hash: "11".repeat(32),
+                location: Some(PackedBlobLocation {
+                    segment_id: "0000000000000000.pack".to_string(),
+                    offset: 0,
+                    size_bytes: 17,
+                }),
+                next_segment_id: 1,
+            },
+            PackedBlobIndexLogEntry {
+                version: PACKED_BLOB_INDEX_VERSION,
+                content_hash: "22".repeat(32),
+                location: Some(PackedBlobLocation {
+                    segment_id: "0000000000000000.pack".to_string(),
+                    offset: 17,
+                    size_bytes: 29,
+                }),
+                next_segment_id: 1,
+            },
+        ];
+        let mut legacy = Vec::new();
+        for entry in &entries {
+            let bytes = encode_packed_blob_index_log_entry(entry).expect("encode legacy record");
+            let len = u32::try_from(bytes.len()).expect("test record length");
+            legacy.extend_from_slice(&len.to_le_bytes());
+            legacy.extend_from_slice(&bytes);
+        }
+
+        let batched = encode_packed_blob_index_log_entries(&entries).expect("encode append batch");
+
+        assert_eq!(batched, legacy);
+    }
 }

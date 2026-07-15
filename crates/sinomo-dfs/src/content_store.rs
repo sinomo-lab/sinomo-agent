@@ -35,7 +35,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 
@@ -379,7 +382,7 @@ pub struct ContentStoreVersionGcReport {
 pub struct LocalContentStore {
     root: PathBuf,
     quota: Option<ContentStoreQuota>,
-    stats_snapshot_active: Arc<AtomicBool>,
+    quota_stats_initialized: Arc<AtomicBool>,
     deferred_durable_blobs: Arc<Mutex<BTreeMap<PathBuf, PathBuf>>>,
     packed_index_cache: Arc<Mutex<PackedBlobIndexCache>>,
 }
@@ -470,13 +473,13 @@ impl LocalContentStore {
         create_dir_all(root.join(PACKED_BLOB_DIR).join(PACKED_BLOB_SEGMENT_DIR))?;
         create_dir_all(root.join("objects"))?;
         create_dir_all(root.join("staging"))?;
-        let stats_snapshot_active = Arc::new(AtomicBool::new(
-            root.join(CONTENT_STORE_STATS_FILE).is_file(),
-        ));
         Ok(Self {
             root,
             quota: None,
-            stats_snapshot_active,
+            // A persisted stats snapshot is derived observability state. It is
+            // not trusted for quota admission until this process has rebuilt
+            // it from the durable store while quota mode is active.
+            quota_stats_initialized: Arc::new(AtomicBool::new(false)),
             deferred_durable_blobs: Arc::new(Mutex::new(BTreeMap::new())),
             packed_index_cache: Arc::new(Mutex::new(PackedBlobIndexCache::default())),
         })
@@ -484,11 +487,16 @@ impl LocalContentStore {
 
     pub fn with_quota(mut self, quota: ContentStoreQuota) -> Self {
         self.quota = Some(quota);
+        // The snapshot may have been produced by an earlier no-quota process,
+        // whose mutations intentionally do not persist deltas. Force one
+        // durable scan before using it as authoritative quota state.
+        self.quota_stats_initialized.store(false, Ordering::Release);
         self
     }
 
     pub fn without_quota(mut self) -> Self {
         self.quota = None;
+        self.quota_stats_initialized.store(false, Ordering::Release);
         self
     }
 
@@ -2180,11 +2188,7 @@ impl LocalContentStore {
         }
         let manifest_check_ms = manifest_check_started.elapsed().as_millis();
 
-        if durability == BlobOnlyDurability::Deferred
-            && !self.tracks_stats_deltas()
-            && self.quota.is_none()
-            && bytes.len() >= STREAMED_BLOB_ONLY_MIN_BYTES
-        {
+        if self.uses_streamed_blob_only_deferred_path(durability, bytes.len()) {
             return self.write_object_version_blob_only_streamed_deferred(
                 object_id,
                 version,
@@ -2359,6 +2363,17 @@ impl LocalContentStore {
             remove_file_if_exists(&tmp_path).ok();
         }
         result
+    }
+
+    fn uses_streamed_blob_only_deferred_path(
+        &self,
+        durability: BlobOnlyDurability,
+        bytes_len: usize,
+    ) -> bool {
+        durability == BlobOnlyDurability::Deferred
+            && self.quota.is_none()
+            && !self.tracks_stats_deltas()
+            && bytes_len >= STREAMED_BLOB_ONLY_MIN_BYTES
     }
 
     fn write_small_object_versions_batch<'a>(
@@ -4457,15 +4472,28 @@ mod tests {
     }
 
     #[test]
-    fn put_object_version_blob_only_large_blob_skips_manifest() {
-        let root = temp_root("put_object_version_blob_only_large_blob_skips_manifest");
+    fn no_quota_status_snapshot_preserves_streamed_blob_only_branch() {
+        let root = temp_root("no_quota_status_snapshot_preserves_streamed_blob_only_branch");
         let store = LocalContentStore::new(&root).expect("create store");
-        let bytes = vec![0x71; PACKED_BLOB_SMALL_LIMIT_BYTES as usize + 4096];
+        let bytes = vec![0x71; STREAMED_BLOB_ONLY_MIN_BYTES + 4096];
+
+        let empty = store.stats().expect("status materializes derived snapshot");
+        assert_eq!(empty, ContentStoreStats::default());
+        let snapshot_before_write = read_file(&store.stats_snapshot_path()).expect("read snapshot");
+        assert!(!store.tracks_stats_deltas());
+        assert!(
+            store.uses_streamed_blob_only_deferred_path(BlobOnlyDurability::Deferred, bytes.len())
+        );
 
         let manifest = store
             .put_object_version_blob_only("object-blob-only-large", "v1", &bytes)
             .expect("put blob-only large object");
 
+        assert_eq!(
+            read_file(&store.stats_snapshot_path()).expect("read unchanged snapshot"),
+            snapshot_before_write,
+            "a derived status snapshot must not activate synchronous write deltas"
+        );
         assert_eq!(
             store
                 .read_blob(&manifest.content_hash)
@@ -4476,6 +4504,10 @@ mod tests {
             store.read_manifest("object-blob-only-large", "v1").is_err(),
             "blob-only large writes should not create per-object manifests"
         );
+        let rebuilt = store.stats().expect("derive stats from durable blob");
+        assert_eq!(rebuilt.blob_count, 1);
+        assert_eq!(rebuilt.blob_bytes, bytes.len() as u64);
+        assert_eq!(rebuilt.manifest_count, 0);
 
         cleanup(&root);
     }
@@ -4927,18 +4959,61 @@ mod tests {
         assert_eq!(initial.blob_count, 1);
         assert_eq!(initial.manifest_count, 1);
         assert!(store.stats_snapshot_path().exists());
+        assert!(
+            !store.tracks_stats_deltas(),
+            "derived status state must not become synchronous write authority"
+        );
+        let snapshot_before_second_write =
+            read_file(&store.stats_snapshot_path()).expect("read initial derived snapshot");
 
         store
             .put_object_version("object-lazy-stats", "v2", b"lazy stats bravo")
             .expect("put second object");
-        let updated = store
-            .stats()
-            .expect("cached stats stay current once requested");
+        assert_eq!(
+            read_file(&store.stats_snapshot_path()).expect("read lagging derived snapshot"),
+            snapshot_before_second_write,
+            "no-quota writes must not rewrite a status snapshot"
+        );
+        let updated = store.stats().expect("derived stats rescan durable content");
         assert_eq!(updated.blob_count, 2);
         assert_eq!(updated.manifest_count, 2);
         assert_eq!(
             updated.logical_object_bytes,
             b"lazy stats alpha".len() as u64 + b"lazy stats bravo".len() as u64
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn no_quota_reopen_ignores_legacy_stale_stats_snapshot() {
+        let root = temp_root("no_quota_reopen_ignores_legacy_stale_stats_snapshot");
+        let store = LocalContentStore::new(&root).expect("create store");
+        store
+            .put_object_version("object-legacy-a", "v1", b"legacy alpha")
+            .expect("put first object");
+        let initial = store.stats().expect("materialize legacy snapshot");
+        assert_eq!(initial.blob_count, 1);
+        assert_eq!(initial.manifest_count, 1);
+        let stale_snapshot = read_file(&store.stats_snapshot_path()).expect("read legacy snapshot");
+
+        store
+            .put_object_version("object-legacy-b", "v1", b"legacy bravo")
+            .expect("put second object without synchronous stats");
+        assert_eq!(
+            read_file(&store.stats_snapshot_path()).expect("read stale snapshot"),
+            stale_snapshot
+        );
+        drop(store);
+
+        let reopened = LocalContentStore::new(&root).expect("reopen store");
+        assert!(!reopened.tracks_stats_deltas());
+        let rebuilt = reopened.stats().expect("rebuild derived stats on reopen");
+        assert_eq!(rebuilt.blob_count, 2);
+        assert_eq!(rebuilt.manifest_count, 2);
+        assert_eq!(
+            rebuilt.logical_object_bytes,
+            b"legacy alpha".len() as u64 + b"legacy bravo".len() as u64
         );
 
         cleanup(&root);
@@ -5145,8 +5220,8 @@ mod tests {
     }
 
     #[test]
-    fn stats_snapshot_is_cached_and_scrub_rebuilds_drift() {
-        let root = temp_root("stats_snapshot_is_cached_and_scrub_rebuilds_drift");
+    fn no_quota_stats_rescan_observes_out_of_band_durable_content() {
+        let root = temp_root("no_quota_stats_rescan_observes_out_of_band_durable_content");
         let store = LocalContentStore::new(&root).expect("create store");
         store
             .put_object_version("object-live", "v1", b"live referenced blob")
@@ -5163,13 +5238,83 @@ mod tests {
         )
         .expect("write orphan outside store counters");
 
-        let still_cached = store.stats().expect("cached stats");
-        assert_eq!(still_cached, cached);
+        let rescanned = store.stats().expect("rescan derived stats");
+        assert_eq!(rescanned.blob_count, 2);
+        assert_eq!(rescanned.manifest_count, cached.manifest_count);
+        assert_eq!(
+            rescanned.blob_bytes,
+            cached.blob_bytes + orphan_bytes.len() as u64
+        );
 
         let scrub = store.scrub().expect("scrub rebuilds stats");
         assert_eq!(scrub.orphan_blob_count, 1);
         assert_eq!(scrub.stats.blob_count, 2);
         assert_eq!(store.stats().expect("rebuilt stats"), scrub.stats);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn quota_entry_rebuilds_stale_snapshot_then_updates_synchronously() {
+        let root = temp_root("quota_entry_rebuilds_stale_snapshot_then_updates_synchronously");
+        let store = LocalContentStore::new(&root).expect("create store");
+        store
+            .put_object_version("object-prequota-a", "v1", b"abcd")
+            .expect("put first pre-quota object");
+        let initial = store.stats().expect("materialize pre-quota snapshot");
+        assert_eq!(initial.blob_bytes, 4);
+        let stale_snapshot =
+            read_file(&store.stats_snapshot_path()).expect("read pre-quota snapshot");
+        store
+            .put_object_version("object-prequota-b", "v1", b"efgh")
+            .expect("put second pre-quota object");
+        assert_eq!(
+            read_file(&store.stats_snapshot_path()).expect("read stale pre-quota snapshot"),
+            stale_snapshot
+        );
+        drop(store);
+
+        let quota_store = LocalContentStore::new(&root)
+            .expect("reopen quota store")
+            .with_quota(ContentStoreQuota {
+                max_blob_bytes: Some(9),
+                ..ContentStoreQuota::default()
+            });
+        assert!(quota_store.tracks_stats_deltas());
+        let error = quota_store
+            .put_object_version("object-quota-reject", "v1", b"ij")
+            .expect_err("durable eight-byte usage plus two bytes exceeds quota");
+        assert!(matches!(
+            error,
+            ContentStoreError::QuotaExceeded {
+                resource: ContentStoreQuotaResource::BlobBytes,
+                limit_bytes: 9,
+                current_bytes: 8,
+                additional_bytes: 2,
+            }
+        ));
+
+        let quota_store = quota_store.with_quota(ContentStoreQuota {
+            max_blob_bytes: Some(10),
+            ..ContentStoreQuota::default()
+        });
+        quota_store
+            .put_object_version("object-quota-accepted", "v1", b"ij")
+            .expect("exact quota boundary accepts");
+        assert_eq!(quota_store.stats().expect("quota usage").blob_bytes, 10);
+
+        let error = quota_store
+            .put_object_version("object-quota-followup", "v1", b"k")
+            .expect_err("synchronous quota delta blocks follow-up growth");
+        assert!(matches!(
+            error,
+            ContentStoreError::QuotaExceeded {
+                resource: ContentStoreQuotaResource::BlobBytes,
+                limit_bytes: 10,
+                current_bytes: 10,
+                additional_bytes: 1,
+            }
+        ));
 
         cleanup(&root);
     }

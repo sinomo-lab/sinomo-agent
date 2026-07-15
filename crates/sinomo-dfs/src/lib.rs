@@ -112,6 +112,7 @@ pub(crate) use cluster_service::{
     object_rpc_request_from_kv_payload, open_cluster_dfs_service_with_message_sender,
     open_cluster_dfs_service_with_message_sender_lazy,
     open_cluster_dfs_service_with_peer_transports_for_nodes,
+    open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state,
 };
 pub(crate) use content_store::content_hash;
 pub use content_store::{
@@ -228,6 +229,7 @@ pub use maintenance::{
     migrate_legacy_dfs_metadata_replication_cursor, put_local_dfs_metadata_replication_suppression,
     read_dfs_anti_entropy_cursor, read_dfs_metadata_replication_suppression_snapshot,
     read_dfs_repair_attempt_snapshot, run_cluster_dfs_maintenance_tick_with_async_peer_transport,
+    run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state,
     run_cluster_dfs_maintenance_tick_with_peer_transport, run_dfs_lifecycle_maintenance_with_host,
     run_dfs_maintenance_tick_with_async_host, run_dfs_maintenance_tick_with_host,
     write_dfs_anti_entropy_cursor, write_dfs_metadata_replication_suppression_snapshot,
@@ -239,9 +241,11 @@ pub(crate) use maintenance::{
 };
 pub use message_transport::{
     AsyncDfsMessageTransport, DfsMessageTransport, DfsMessageTransportFuture, DfsOutboundBody,
-    DfsTransportIdentity,
+    DfsRoutedBodySend, DfsRoutedBodySendOutcome, DfsTransportIdentity,
 };
-pub use metadata_api::{DfsMetadataBackend, DfsMetadataShardWriteFreeze};
+pub use metadata_api::{
+    DfsMetadataBackend, DfsMetadataReplicaIngestPermit, DfsMetadataShardWriteFreeze,
+};
 pub use metadata_backend::LocalSobjMetadataBackend;
 pub use metadata_error::MetadataBackendError;
 pub use metadata_limits::{
@@ -252,18 +256,18 @@ pub use metadata_records::{
     DfsConflictScanPage, DfsConflictStatus, DfsDentryPageCursor, DfsDirFragmentId,
     DfsDirFragmentRecord, DfsDirectoryPage, DfsDirectoryPageCursor, DfsInodeId, DfsInodeRecord,
     DfsMetadataAuthorityAckFloor, DfsMetadataJournalBatch, DfsMetadataJournalEntry,
-    DfsMetadataMutation, DfsMetadataPrefixAckFloor, DfsMetadataReplayCursorStatus,
-    DfsMetadataReplicaLagStatus, DfsMetadataShardId, DfsMetadataShardMigrationReport,
-    DfsMetadataShardStatus, DfsMetadataSubscription, DfsMetadataSummary, DfsMetadataTableSnapshot,
-    DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobPage, DfsNamespaceJobPageCursor,
-    DfsNamespaceJobRecord, DfsNamespaceJobStatus, DfsNamespaceObjectVersionExpectation,
-    DfsNamespacePathOccupantExpectation, DfsNamespacePrepareRecord, DfsNamespacePrepareStatus,
-    DfsNamespaceTransaction, DfsObjectPage, DfsObjectPageCursor, DfsObjectVersionPage,
-    DfsObjectVersionPageCursor, DfsObjectVersionRecord, DfsObjectVersionScanCursor,
-    DfsObjectVersionScanPage, DfsPathRecord, DfsReplicaReceiptPage, DfsReplicaReceiptPageCursor,
-    DfsReplicaReceiptRecord, DfsReplicaReceiptScanCursor, DfsReplicaReceiptScanPage,
-    DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport, DfsWriteIntentPage,
-    DfsWriteIntentPageCursor, DfsWriteIntentRecord, DfsWriteIntentScanCursor,
+    DfsMetadataMutation, DfsMetadataPrefixAckFloor, DfsMetadataPrefixProof,
+    DfsMetadataReplayCursorStatus, DfsMetadataReplicaLagStatus, DfsMetadataShardId,
+    DfsMetadataShardMigrationReport, DfsMetadataShardStatus, DfsMetadataSubscription,
+    DfsMetadataSummary, DfsMetadataTableSnapshot, DfsNamespaceJobFrame, DfsNamespaceJobKind,
+    DfsNamespaceJobPage, DfsNamespaceJobPageCursor, DfsNamespaceJobRecord, DfsNamespaceJobStatus,
+    DfsNamespaceObjectVersionExpectation, DfsNamespacePathOccupantExpectation,
+    DfsNamespacePrepareRecord, DfsNamespacePrepareStatus, DfsNamespaceTransaction, DfsObjectPage,
+    DfsObjectPageCursor, DfsObjectVersionPage, DfsObjectVersionPageCursor, DfsObjectVersionRecord,
+    DfsObjectVersionScanCursor, DfsObjectVersionScanPage, DfsPathRecord, DfsReplicaReceiptPage,
+    DfsReplicaReceiptPageCursor, DfsReplicaReceiptRecord, DfsReplicaReceiptScanCursor,
+    DfsReplicaReceiptScanPage, DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport,
+    DfsWriteIntentPage, DfsWriteIntentPageCursor, DfsWriteIntentRecord, DfsWriteIntentScanCursor,
     DfsWriteIntentScanPage, DfsWriteIntentStatus,
 };
 pub(crate) use metadata_records::{
@@ -358,8 +362,9 @@ pub(crate) use node_transport::{
     dfs_direct_read_sender_from_peer_transport,
 };
 pub use node_transport::{
-    AsyncDfsPeerTransport, DfsNodeServedMessageTransport, DfsNodeTransport,
-    DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError, DfsPeerTransportFuture,
+    AsyncDfsPeerTransport, DfsNodeDetachedSendState, DfsNodeDetachedSendWorker,
+    DfsNodeServedMessageTransport, DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport,
+    DfsPeerTransportError, DfsPeerTransportFuture,
 };
 pub(crate) use node_transport::{DfsMessageSender, dfs_message_sender_from_peer_transport};
 #[cfg(test)]
@@ -424,16 +429,18 @@ pub use routes::{
     DFS_DATA_WRITE_RESPONSE_ROUTE, DFS_DATA_WRITE_ROUTE, DFS_DIRECT_READ_ROUTE,
     DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE, DFS_MESSAGE_DATA_PLANE_ROUTES,
     DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_OBJECT_RPC_ROUTES,
-    DFS_RPC_CATEGORY, DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE, decode_dfs_inspection_rpc_response,
-    decode_dfs_message_rpc_request, decode_dfs_message_rpc_response,
-    decode_dfs_metadata_journal_batch_rpc_response,
+    DFS_RPC_CATEGORY, DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE, DfsMessageExecutionScope,
+    decode_dfs_inspection_rpc_response, decode_dfs_message_rpc_request,
+    decode_dfs_message_rpc_response, decode_dfs_metadata_journal_batch_rpc_response,
     decode_dfs_metadata_snapshot_install_rpc_response, decode_dfs_smoke_rpc_response,
     decode_dfs_status_rpc_response, dfs_inspection_rpc_request,
-    dfs_message_allows_write_repair_progress, dfs_message_is_read_only_request,
-    dfs_message_requires_fresh_metadata, dfs_message_requires_full_metadata_hydrate,
-    dfs_message_rpc_request, dfs_metadata_journal_batch_rpc_request,
-    dfs_metadata_snapshot_install_rpc_request, dfs_route_is_message_data_plane,
-    dfs_routed_message_rpc_request, dfs_smoke_rpc_request, dfs_status_rpc_request,
+    dfs_message_allows_write_repair_progress, dfs_message_execution_scope,
+    dfs_message_is_read_only_request, dfs_message_requires_fresh_metadata,
+    dfs_message_requires_full_metadata_hydrate, dfs_message_rpc_request,
+    dfs_metadata_journal_batch_execution_scope, dfs_metadata_journal_batch_rpc_request,
+    dfs_metadata_snapshot_install_execution_scope, dfs_metadata_snapshot_install_rpc_request,
+    dfs_route_is_message_data_plane, dfs_routed_message_rpc_request, dfs_smoke_rpc_request,
+    dfs_status_rpc_request,
 };
 pub(crate) use routes::{
     build_dfs_routed_message, dfs_network_message_allows_write_repair_progress,

@@ -44,6 +44,114 @@ pub(crate) struct DfsRepairBlobRequestOutcome {
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// Number of new stage sends that may be reserved for this intent now.
+    /// Background writes reserve only the exact W deficit; foreground writes
+    /// may reserve every missing desired replica. A timed-out inflight request
+    /// is treated as a freed reservation so its exact request can be retried.
+    fn pending_stage_send_budget(
+        &self,
+        intent: &DistributedWriteIntent,
+        pending: &PendingNetworkedWrite,
+        durable_nodes: &BTreeSet<NodeId>,
+    ) -> usize {
+        let durable_desired = intent
+            .desired_replica_nodes
+            .iter()
+            .filter(|node_id| durable_nodes.contains(*node_id))
+            .count();
+        let active_stage_reservations = pending
+            .stage_inflight_request_ids
+            .keys()
+            .filter(|node_id| {
+                intent.desired_replica_nodes.contains(*node_id)
+                    && !durable_nodes.contains(*node_id)
+                    && !self.stage_retry_is_due(&intent.intent_id, node_id)
+            })
+            .cloned();
+        let active_repair_reservations = pending
+            .repair_inflight_request_ids
+            .keys()
+            .filter(|node_id| {
+                intent.desired_replica_nodes.contains(*node_id)
+                    && !durable_nodes.contains(*node_id)
+                    && !self.repair_retry_is_due(&intent.intent_id, node_id)
+            })
+            .cloned();
+        let active_reservations = active_stage_reservations
+            .chain(active_repair_reservations)
+            .collect::<BTreeSet<_>>()
+            .len();
+        let target_receipts = if pending.foreground_replica_repair {
+            intent.desired_replica_nodes.len()
+        } else {
+            intent.policy.min_commit_replicas
+        };
+        target_receipts.saturating_sub(durable_desired.saturating_add(active_reservations))
+    }
+
+    fn pending_stage_targets(
+        &self,
+        intent: &DistributedWriteIntent,
+        pending: &PendingNetworkedWrite,
+        durable_nodes: &BTreeSet<NodeId>,
+    ) -> Vec<NodeId> {
+        let budget = self.pending_stage_send_budget(intent, pending, durable_nodes);
+        intent
+            .desired_replica_nodes
+            .iter()
+            .filter(|node_id| *node_id != &self.node_id && !durable_nodes.contains(*node_id))
+            .filter(|node_id| self.stage_retry_is_due(&intent.intent_id, node_id))
+            .filter(|node_id| !self.repair_request_is_active(&intent.intent_id, node_id))
+            .take(budget)
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn stage_request_is_active(
+        &self,
+        intent_id: &str,
+        replica_node_id: &NodeId,
+    ) -> bool {
+        self.pending_writes.get(intent_id).is_some_and(|pending| {
+            pending
+                .stage_inflight_request_ids
+                .contains_key(replica_node_id)
+                && !self.stage_retry_is_due(intent_id, replica_node_id)
+        })
+    }
+
+    fn repair_request_is_active(&self, intent_id: &str, replica_node_id: &NodeId) -> bool {
+        self.pending_writes.get(intent_id).is_some_and(|pending| {
+            pending
+                .repair_inflight_request_ids
+                .contains_key(replica_node_id)
+                && !self.repair_retry_is_due(intent_id, replica_node_id)
+        })
+    }
+
+    /// Reserve a committed target for RepairReplica only after any StageBlob
+    /// reservation has expired. Keep a suppressed stage retry tombstone so a
+    /// late response carrying the superseded stage request id is rejected.
+    fn prepare_repair_target(&mut self, intent_id: &str, replica_node_id: &NodeId) -> bool {
+        if self.stage_request_is_active(intent_id, replica_node_id) {
+            return false;
+        }
+        if let Some(pending) = self.pending_writes.get_mut(intent_id)
+            && pending
+                .stage_inflight_request_ids
+                .remove(replica_node_id)
+                .is_some()
+        {
+            let state = pending
+                .stage_retries
+                .entry(replica_node_id.clone())
+                .or_default();
+            state.inflight = false;
+            state.next_retry_tick = DFS_REPAIR_RETRY_SUPPRESSED_TICK;
+        }
+        true
+    }
+
     pub(crate) fn handle_repair_replica(
         &mut self,
         requester_node_id: NodeId,
@@ -384,8 +492,19 @@ where
         self.retry_pending_stages_async().await?;
         let repair_jobs = self.coordinator.repair_jobs().to_vec();
         let mut scheduled = Vec::new();
+        let mut consumed_repair_targets = BTreeSet::new();
 
-        for job in repair_jobs {
+        for job in repair_jobs.iter().cloned() {
+            if consumed_repair_targets
+                .contains(&(job.intent_id.clone(), job.missing_replica_node_id.clone()))
+            {
+                continue;
+            }
+            consumed_repair_targets
+                .insert((job.intent_id.clone(), job.missing_replica_node_id.clone()));
+            if !self.prepare_repair_target(&job.intent_id, &job.missing_replica_node_id) {
+                continue;
+            }
             let Some(pending) = self.pending_writes.get(&job.intent_id).cloned() else {
                 continue;
             };
@@ -449,11 +568,66 @@ where
                 .get(&job.missing_replica_node_id)
                 .cloned()
                 .unwrap_or_else(|| self.next_request_id());
+            let remaining = max_scheduled.saturating_sub(scheduled.len());
+            if remaining == 0 {
+                break;
+            }
+            let mut fanout_jobs = vec![(job.clone(), request_id)];
+            if remaining > 1 {
+                if let Some(companion) = repair_jobs
+                    .iter()
+                    .find(|candidate| {
+                        candidate.intent_id == job.intent_id
+                            && candidate.missing_replica_node_id != job.missing_replica_node_id
+                            && candidate.missing_replica_node_id != self.node_id
+                            && !consumed_repair_targets.contains(&(
+                                candidate.intent_id.clone(),
+                                candidate.missing_replica_node_id.clone(),
+                            ))
+                            && self.repair_retry_is_due(
+                                &candidate.intent_id,
+                                &candidate.missing_replica_node_id,
+                            )
+                            && !self.stage_request_is_active(
+                                &candidate.intent_id,
+                                &candidate.missing_replica_node_id,
+                            )
+                    })
+                    .cloned()
+                    && self.prepare_repair_target(
+                        &companion.intent_id,
+                        &companion.missing_replica_node_id,
+                    )
+                {
+                    let companion_pending = self
+                        .pending_writes
+                        .get(&companion.intent_id)
+                        .cloned()
+                        .expect("same-intent pending repair validated");
+                    if self
+                        .pending_repair_targets_current_content(&companion, &companion_pending)?
+                    {
+                        let companion_request_id = companion_pending
+                            .repair_inflight_request_ids
+                            .get(&companion.missing_replica_node_id)
+                            .cloned()
+                            .unwrap_or_else(|| self.next_request_id());
+                        consumed_repair_targets.insert((
+                            companion.intent_id.clone(),
+                            companion.missing_replica_node_id.clone(),
+                        ));
+                        fanout_jobs.push((companion, companion_request_id));
+                    }
+                }
+            }
             let object_metadata = Some(self.current_object_for_write(&pending.object_id)?);
-            let outcome = self
-                .send_repair_replica_body_if_routable_async(
-                    &job.missing_replica_node_id,
-                    request_id.clone(),
+            let fanout_targets = fanout_jobs
+                .iter()
+                .map(|(job, request_id)| (job.missing_replica_node_id.clone(), request_id.clone()))
+                .collect::<Vec<_>>();
+            let outcomes = self
+                .send_repair_replica_bodies_if_routable_async(
+                    &fanout_targets,
                     &job.intent_id,
                     &job.file_system_id,
                     &pending.object_id,
@@ -466,23 +640,24 @@ where
                     object_metadata,
                 )
                 .await?;
-
-            if outcome.sent {
-                self.record_repair_inflight(
-                    &job.intent_id,
-                    &job.missing_replica_node_id,
-                    request_id,
-                );
-                scheduled.push(job);
-                if scheduled.len() >= max_scheduled {
-                    break;
+            for ((fanout_job, request_id), outcome) in fanout_jobs.into_iter().zip(outcomes) {
+                if outcome.sent {
+                    self.record_repair_inflight(
+                        &fanout_job.intent_id,
+                        &fanout_job.missing_replica_node_id,
+                        request_id,
+                    );
+                    scheduled.push(fanout_job);
+                } else {
+                    self.record_repair_retry_scheduled_with_error(
+                        &fanout_job.intent_id,
+                        &fanout_job.missing_replica_node_id,
+                        outcome.last_error,
+                    );
                 }
-            } else {
-                self.record_repair_retry_scheduled_with_error(
-                    &job.intent_id,
-                    &job.missing_replica_node_id,
-                    outcome.last_error,
-                );
+            }
+            if scheduled.len() >= max_scheduled {
+                break;
             }
         }
 
@@ -498,71 +673,64 @@ where
             if !matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) {
                 continue;
             }
-            let Some(pending) = self.pending_writes.get(&intent_id).cloned() else {
-                continue;
-            };
-            let durable_nodes = self
-                .coordinator
-                .receipts_for_intent(&intent_id)
-                .into_iter()
-                .map(|receipt| receipt.replica_node_id.clone())
-                .collect::<BTreeSet<_>>();
-            let stage_targets = intent
-                .desired_replica_nodes
-                .iter()
-                .filter(|node_id| *node_id != &self.node_id && !durable_nodes.contains(*node_id))
-                .filter(|node_id| self.stage_retry_is_due(&intent_id, node_id))
-                .cloned()
-                .collect::<Vec<_>>();
-            if stage_targets.is_empty() {
-                continue;
-            }
-            let object_metadata = Some(self.current_object_for_write(&pending.object_id)?);
-            let mut full_stage_targets = Vec::new();
-            for replica_node_id in stage_targets {
-                let request_id = pending
-                    .stage_inflight_request_ids
-                    .get(&replica_node_id)
-                    .cloned()
-                    .unwrap_or_else(|| self.next_request_id());
-                match self
-                    .send_pending_stage_patch_if_routable_async(
-                        &replica_node_id,
-                        request_id.clone(),
-                        &intent,
-                        &pending,
-                        object_metadata.clone(),
-                    )
-                    .await?
-                {
-                    Some(outcome) if outcome.sent => {
-                        self.record_stage_inflight(&intent_id, &replica_node_id, request_id);
-                    }
-                    Some(_) => {
-                        self.record_stage_retry_scheduled(&intent_id, &replica_node_id);
-                    }
-                    None => full_stage_targets.push((replica_node_id, request_id)),
+            loop {
+                let Some(pending) = self.pending_writes.get(&intent_id).cloned() else {
+                    break;
+                };
+                let durable_nodes = self
+                    .coordinator
+                    .receipts_for_intent(&intent_id)
+                    .into_iter()
+                    .map(|receipt| receipt.replica_node_id.clone())
+                    .collect::<BTreeSet<_>>();
+                let stage_targets = self.pending_stage_targets(&intent, &pending, &durable_nodes);
+                if stage_targets.is_empty() {
+                    break;
                 }
-            }
-            if full_stage_targets.is_empty() {
-                continue;
-            }
-            if self.open_pending_write_blob_stream(&pending).is_err() {
-                let fetch_requested = self
-                    .request_stage_blob_from_alternate_async(&intent, &pending)
-                    .await?;
-                if !fetch_requested {
-                    for (replica_node_id, _) in full_stage_targets {
-                        self.record_stage_retry_scheduled(&intent_id, &replica_node_id);
+                let object_metadata = Some(self.current_object_for_write(&pending.object_id)?);
+                let mut full_stage_targets = Vec::new();
+                for replica_node_id in stage_targets {
+                    let request_id = pending
+                        .stage_inflight_request_ids
+                        .get(&replica_node_id)
+                        .cloned()
+                        .unwrap_or_else(|| self.next_request_id());
+                    match self
+                        .send_pending_stage_patch_if_routable_async(
+                            &replica_node_id,
+                            request_id.clone(),
+                            &intent,
+                            &pending,
+                            object_metadata.clone(),
+                        )
+                        .await?
+                    {
+                        Some(outcome) if outcome.sent => {
+                            self.record_stage_inflight(&intent_id, &replica_node_id, request_id);
+                        }
+                        Some(_) => {
+                            self.record_stage_retry_scheduled(&intent_id, &replica_node_id);
+                        }
+                        None => full_stage_targets.push((replica_node_id, request_id)),
                     }
                 }
-                continue;
-            }
-            for (replica_node_id, request_id) in full_stage_targets {
-                let outcome = self
-                    .send_stage_blob_body_if_routable_async(
-                        &replica_node_id,
-                        request_id.clone(),
+                if full_stage_targets.is_empty() {
+                    continue;
+                }
+                if self.open_pending_write_blob_stream(&pending).is_err() {
+                    let fetch_requested = self
+                        .request_stage_blob_from_alternate_async(&intent, &pending)
+                        .await?;
+                    if !fetch_requested {
+                        for (replica_node_id, _) in full_stage_targets {
+                            self.record_stage_retry_scheduled(&intent_id, &replica_node_id);
+                        }
+                    }
+                    break;
+                }
+                let outcomes = self
+                    .send_stage_blob_bodies_if_routable_async(
+                        &full_stage_targets,
                         &intent.intent_id,
                         &intent.file_system_id,
                         &intent.object_id,
@@ -570,13 +738,17 @@ where
                         &intent.target_version,
                         &pending.content_hash,
                         pending.size_bytes,
-                        object_metadata.clone(),
+                        object_metadata,
                     )
                     .await?;
-                if outcome.sent {
-                    self.record_stage_inflight(&intent_id, &replica_node_id, request_id);
-                } else {
-                    self.record_stage_retry_scheduled(&intent_id, &replica_node_id);
+                for ((replica_node_id, request_id), outcome) in
+                    full_stage_targets.into_iter().zip(outcomes)
+                {
+                    if outcome.sent {
+                        self.record_stage_inflight(&intent_id, &replica_node_id, request_id);
+                    } else {
+                        self.record_stage_retry_scheduled(&intent_id, &replica_node_id);
+                    }
                 }
             }
         }
@@ -815,9 +987,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.retry_pending_stages_scoped(intent_filter)?;
         let repair_jobs = self.coordinator.repair_jobs().to_vec();
         let mut scheduled = Vec::new();
+        let mut consumed_repair_targets = BTreeSet::new();
 
-        for job in repair_jobs {
+        for job in repair_jobs.iter().cloned() {
             if intent_filter.is_some_and(|intent_ids| !intent_ids.contains(&job.intent_id)) {
+                continue;
+            }
+            if consumed_repair_targets
+                .contains(&(job.intent_id.clone(), job.missing_replica_node_id.clone()))
+            {
+                continue;
+            }
+            consumed_repair_targets
+                .insert((job.intent_id.clone(), job.missing_replica_node_id.clone()));
+            if !self.prepare_repair_target(&job.intent_id, &job.missing_replica_node_id) {
                 continue;
             }
             let Some(pending) = self.pending_writes.get(&job.intent_id).cloned() else {
@@ -879,10 +1062,65 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .get(&job.missing_replica_node_id)
                 .cloned()
                 .unwrap_or_else(|| self.next_request_id());
+            let remaining = max_scheduled.saturating_sub(scheduled.len());
+            if remaining == 0 {
+                break;
+            }
+            let mut fanout_jobs = vec![(job.clone(), request_id)];
+            if remaining > 1 {
+                if let Some(companion) = repair_jobs
+                    .iter()
+                    .find(|candidate| {
+                        candidate.intent_id == job.intent_id
+                            && candidate.missing_replica_node_id != job.missing_replica_node_id
+                            && candidate.missing_replica_node_id != self.node_id
+                            && !consumed_repair_targets.contains(&(
+                                candidate.intent_id.clone(),
+                                candidate.missing_replica_node_id.clone(),
+                            ))
+                            && self.repair_retry_is_due(
+                                &candidate.intent_id,
+                                &candidate.missing_replica_node_id,
+                            )
+                            && !self.stage_request_is_active(
+                                &candidate.intent_id,
+                                &candidate.missing_replica_node_id,
+                            )
+                    })
+                    .cloned()
+                    && self.prepare_repair_target(
+                        &companion.intent_id,
+                        &companion.missing_replica_node_id,
+                    )
+                {
+                    let companion_pending = self
+                        .pending_writes
+                        .get(&companion.intent_id)
+                        .cloned()
+                        .expect("same-intent pending repair validated");
+                    if self
+                        .pending_repair_targets_current_content(&companion, &companion_pending)?
+                    {
+                        let companion_request_id = companion_pending
+                            .repair_inflight_request_ids
+                            .get(&companion.missing_replica_node_id)
+                            .cloned()
+                            .unwrap_or_else(|| self.next_request_id());
+                        consumed_repair_targets.insert((
+                            companion.intent_id.clone(),
+                            companion.missing_replica_node_id.clone(),
+                        ));
+                        fanout_jobs.push((companion, companion_request_id));
+                    }
+                }
+            }
             let object_metadata = Some(self.current_object_for_write(&pending.object_id)?);
-            let outcome = self.send_repair_replica_body_if_routable(
-                &job.missing_replica_node_id,
-                request_id.clone(),
+            let fanout_targets = fanout_jobs
+                .iter()
+                .map(|(job, request_id)| (job.missing_replica_node_id.clone(), request_id.clone()))
+                .collect::<Vec<_>>();
+            let outcomes = self.send_repair_replica_bodies_if_routable(
+                &fanout_targets,
                 &job.intent_id,
                 &job.file_system_id,
                 &pending.object_id,
@@ -894,23 +1132,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 pending.size_bytes,
                 object_metadata,
             )?;
-
-            if outcome.sent {
-                self.record_repair_inflight(
-                    &job.intent_id,
-                    &job.missing_replica_node_id,
-                    request_id,
-                );
-                scheduled.push(job);
-                if scheduled.len() >= max_scheduled {
-                    break;
+            for ((fanout_job, request_id), outcome) in fanout_jobs.into_iter().zip(outcomes) {
+                if outcome.sent {
+                    self.record_repair_inflight(
+                        &fanout_job.intent_id,
+                        &fanout_job.missing_replica_node_id,
+                        request_id,
+                    );
+                    scheduled.push(fanout_job);
+                } else {
+                    self.record_repair_retry_scheduled_with_error(
+                        &fanout_job.intent_id,
+                        &fanout_job.missing_replica_node_id,
+                        outcome.last_error,
+                    );
                 }
-            } else {
-                self.record_repair_retry_scheduled_with_error(
-                    &job.intent_id,
-                    &job.missing_replica_node_id,
-                    outcome.last_error,
-                );
+            }
+            if scheduled.len() >= max_scheduled {
+                break;
             }
         }
 
@@ -963,27 +1202,58 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if !matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) {
                 continue;
             }
-            let Some(pending) = self.pending_writes.get(&intent_id).cloned() else {
+            let Some(object_id) = self
+                .pending_writes
+                .get(&intent_id)
+                .map(|pending| pending.object_id.clone())
+            else {
                 continue;
+            };
+            let object_metadata = self.current_object_for_write(&object_id)?;
+            self.stage_missing_desired_replicas_for_intent(&intent_id, object_metadata)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn should_stage_missing_replicas_after_write(&self, intent_id: &str) -> bool {
+        matches!(
+            self.coordinator
+                .intent(intent_id)
+                .map(|intent| &intent.state),
+            Some(DfsWriteIntentState::AwaitingReceipts)
+        )
+    }
+
+    pub(crate) fn stage_missing_desired_replicas_for_intent(
+        &mut self,
+        intent_id: &str,
+        object_metadata: DfsObjectMetadata,
+    ) -> Result<(), DfsError> {
+        let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
+            return Ok(());
+        };
+        // StageBlob is a pre-commit protocol. Once W publishes the version,
+        // missing desired replicas converge through RepairReplica so a target
+        // can never own both transfer kinds for the same intent.
+        if !matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) {
+            return Ok(());
+        }
+        loop {
+            let Some(pending) = self.pending_writes.get(intent_id).cloned() else {
+                break;
             };
             let durable_nodes = self
                 .coordinator
-                .receipts_for_intent(&intent_id)
+                .receipts_for_intent(intent_id)
                 .into_iter()
                 .map(|receipt| receipt.replica_node_id.clone())
                 .collect::<BTreeSet<_>>();
-            let stage_targets = intent
-                .desired_replica_nodes
-                .iter()
-                .filter(|node_id| *node_id != &self.node_id && !durable_nodes.contains(*node_id))
-                .filter(|node_id| self.stage_retry_is_due(&intent_id, node_id))
-                .cloned()
-                .collect::<Vec<_>>();
+            let stage_targets = self.pending_stage_targets(&intent, &pending, &durable_nodes);
             if stage_targets.is_empty() {
-                continue;
+                break;
             }
-            let object_metadata = Some(self.current_object_for_write(&pending.object_id)?);
             let mut full_stage_targets = Vec::new();
+
             for replica_node_id in stage_targets {
                 let request_id = pending
                     .stage_inflight_request_ids
@@ -995,17 +1265,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     request_id.clone(),
                     &intent,
                     &pending,
-                    object_metadata.clone(),
+                    Some(object_metadata.clone()),
                 )? {
                     Some(outcome) if outcome.sent => {
-                        self.record_stage_inflight(&intent_id, &replica_node_id, request_id);
+                        self.record_stage_inflight(intent_id, &replica_node_id, request_id);
                     }
                     Some(_) => {
-                        self.record_stage_retry_scheduled(&intent_id, &replica_node_id);
+                        self.record_stage_retry_scheduled(intent_id, &replica_node_id);
                     }
                     None => full_stage_targets.push((replica_node_id, request_id)),
                 }
             }
+
             if full_stage_targets.is_empty() {
                 continue;
             }
@@ -1013,99 +1284,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let fetch_requested = self.request_stage_blob_from_alternate(&intent, &pending)?;
                 if !fetch_requested {
                     for (replica_node_id, _) in full_stage_targets {
-                        self.record_stage_retry_scheduled(&intent_id, &replica_node_id);
+                        self.record_stage_retry_scheduled(intent_id, &replica_node_id);
                     }
                 }
-                continue;
+                break;
             }
-            for (replica_node_id, request_id) in full_stage_targets {
-                let outcome = self.send_stage_blob_body_if_routable(
-                    &replica_node_id,
-                    request_id.clone(),
-                    &intent.intent_id,
-                    &intent.file_system_id,
-                    &intent.object_id,
-                    intent.base_version.clone(),
-                    &intent.target_version,
-                    &pending.content_hash,
-                    pending.size_bytes,
-                    object_metadata.clone(),
-                )?;
-                if outcome.sent {
-                    self.record_stage_inflight(&intent_id, &replica_node_id, request_id);
-                } else {
-                    self.record_stage_retry_scheduled(&intent_id, &replica_node_id);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn should_stage_missing_replicas_after_write(
-        &self,
-        intent_id: &str,
-        foreground_replica_repair: bool,
-    ) -> bool {
-        foreground_replica_repair
-            || !matches!(
-                self.coordinator
-                    .intent(intent_id)
-                    .map(|intent| &intent.state),
-                Some(DfsWriteIntentState::Committed)
-            )
-    }
-
-    pub(crate) fn stage_missing_desired_replicas_for_intent(
-        &mut self,
-        intent_id: &str,
-        object_metadata: DfsObjectMetadata,
-    ) -> Result<(), DfsError> {
-        let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
-            return Ok(());
-        };
-        let Some(pending) = self.pending_writes.get(intent_id).cloned() else {
-            return Ok(());
-        };
-        let durable_nodes = self
-            .coordinator
-            .receipts_for_intent(intent_id)
-            .into_iter()
-            .map(|receipt| receipt.replica_node_id.clone())
-            .collect::<BTreeSet<_>>();
-        let stage_targets = intent
-            .desired_replica_nodes
-            .iter()
-            .filter(|node_id| *node_id != &self.node_id && !durable_nodes.contains(*node_id))
-            .cloned()
-            .collect::<Vec<_>>();
-
-        for replica_node_id in stage_targets {
-            let request_id = pending
-                .stage_inflight_request_ids
-                .get(&replica_node_id)
-                .cloned()
-                .unwrap_or_else(|| self.next_request_id());
-            match self.send_pending_stage_patch_if_routable(
-                &replica_node_id,
-                request_id.clone(),
-                &intent,
-                &pending,
-                Some(object_metadata.clone()),
-            )? {
-                Some(outcome) if outcome.sent => {
-                    self.record_stage_inflight(intent_id, &replica_node_id, request_id);
-                    continue;
-                }
-                Some(_) => {
-                    self.record_stage_retry_scheduled(intent_id, &replica_node_id);
-                    continue;
-                }
-                None => {}
-            }
-
-            let outcome = self.send_stage_blob_body_if_routable(
-                &replica_node_id,
-                request_id.clone(),
+            let outcomes = self.send_stage_blob_bodies_if_routable(
+                &full_stage_targets,
                 intent_id,
                 &intent.file_system_id,
                 &intent.object_id,
@@ -1115,10 +1300,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 pending.size_bytes,
                 Some(object_metadata.clone()),
             )?;
-            if outcome.sent {
-                self.record_stage_inflight(intent_id, &replica_node_id, request_id);
-            } else {
-                self.record_stage_retry_scheduled(intent_id, &replica_node_id);
+            for ((replica_node_id, request_id), outcome) in
+                full_stage_targets.into_iter().zip(outcomes)
+            {
+                if outcome.sent {
+                    self.record_stage_inflight(intent_id, &replica_node_id, request_id);
+                } else {
+                    self.record_stage_retry_scheduled(intent_id, &replica_node_id);
+                }
             }
         }
         Ok(())
@@ -1757,18 +1946,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent_id: &str,
         replica_node_id: &NodeId,
     ) {
-        let tick = self.repair_retry_tick;
         if let Some(pending) = self.pending_writes.get_mut(intent_id) {
-            let state = pending
-                .repair_retries
-                .entry(replica_node_id.clone())
-                .or_default();
-            state.attempts = state.attempts.max(1);
-            state.inflight = false;
-            state.next_retry_tick =
-                tick.saturating_add(repair_transfer_inflight_timeout_ticks(pending.size_bytes));
+            // Receipt persistence, coordinator convergence, and the visible
+            // location update all completed before this point. Keeping a
+            // timeout-only retry record would retain the whole pending blob
+            // after N without protecting an unfinished metadata operation.
+            pending.repair_retries.remove(replica_node_id);
             pending.repair_inflight_request_ids.remove(replica_node_id);
         }
+        self.repair_attempt_records
+            .remove(&(intent_id.to_string(), replica_node_id.clone()));
     }
 
     pub(crate) fn request_repair_blob_from_alternate(

@@ -27,7 +27,7 @@ use crate::{
     AsyncDfsPeerTransport, DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
     DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT, DfsDistributedWriteResult, DfsError, DfsFileSystem,
     DfsFileSystemId, DfsMetadataBackend, DfsMetadataJournalBatch, DfsMetadataJournalBatchCommand,
-    DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
+    DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataReplicaIngestPermit,
     DfsMetadataReplicationSuppressionRecord, DfsMetadataShardConfig, DfsMetadataShardId,
     DfsMetadataShardMembershipHandoff, DfsMetadataSnapshotInstallCommand,
     DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult, DfsNamespaceResult,
@@ -1924,6 +1924,8 @@ fn prepare_dfs_metadata_journal_target_publish(
         commands.push(dfs_metadata_journal_batch_command(
             local_node_id,
             &target_node_id,
+            &file_system_id,
+            shard_epoch,
             batch,
         ));
         if commands.len() >= options.max_batches_per_target {
@@ -2448,25 +2450,31 @@ pub fn process_dfs_metadata_journal_batch(
     {
         return dfs_metadata_journal_rejection_response(&command, reason);
     }
-    match backend.apply_journal_batch(&command.batch) {
+    let context = context.expect("validated metadata replica ingest has a shard context");
+    let permit = DfsMetadataReplicaIngestPermit::new_validated(
+        context.shard.file_system_id.clone(),
+        shard_id.clone(),
+        context.shard.primary_node_id.clone(),
+        context.shard.epoch,
+    );
+    match backend.apply_journal_batch_with_replica_permit(&permit, &command.batch) {
         Ok(applied_entries) => {
-            if let Some(probe) = command.authority_probe.as_ref() {
-                let Some(context) = context else {
-                    return dfs_metadata_journal_rejection_response(
-                        &command,
-                        "metadata authority probe requires an exact committed cluster shard context"
-                            .to_string(),
-                    );
-                };
-                if let Err(error) =
-                    crate::service_replica::verify_persisted_metadata_authority_operation(
+            let verified_authority_probe_id = if let Some(probe) = command.authority_probe.as_ref()
+            {
+                let confirmation_id =
+                    match crate::service_replica::verify_persisted_metadata_authority_probe(
                         backend,
                         &context.shard,
-                        &probe.operation,
-                    )
-                {
-                    return dfs_metadata_journal_rejection_response(&command, error.to_string());
-                }
+                        probe,
+                    ) {
+                        Ok(confirmation_id) => confirmation_id,
+                        Err(error) => {
+                            return dfs_metadata_journal_rejection_response(
+                                &command,
+                                error.to_string(),
+                            );
+                        }
+                    };
                 if let Err(error) =
                     backend.put_metadata_authority_ack_floor(&crate::DfsMetadataAuthorityAckFloor {
                         shard_id: command.batch.shard_id.clone(),
@@ -2481,19 +2489,19 @@ pub fn process_dfs_metadata_journal_batch(
                         ),
                     );
                 }
-            }
+                Some(confirmation_id)
+            } else {
+                None
+            };
             DfsMetadataJournalBatchResponse {
                 request_id: command.request_id,
                 shard_id,
                 next_after_sequence,
                 applied_entries,
                 verified_prefix_only: false,
-                // Echo the fresh nonce only after the exact hidden operation
-                // prepare is durably present and revalidated from DFS metadata.
-                verified_authority_probe_id: command
-                    .authority_probe
-                    .as_ref()
-                    .map(|probe| probe.probe_id.clone()),
+                // Echo the prefix-bound confirmation only after the exact
+                // hidden operation and complete primary history are durable.
+                verified_authority_probe_id,
                 result: DfsMetadataJournalBatchResult::Applied,
             }
         }
@@ -2594,6 +2602,14 @@ fn verify_dfs_metadata_journal_prefix(
             batch.shard_id.0, batch.next_after_sequence
         ));
     }
+    backend
+        .refresh_metadata_shard_durable_view(&probe.shard_id)
+        .map_err(|error| {
+            format!(
+                "refresh durable metadata view for prefix probe shard {} sequence {}: {error}",
+                batch.shard_id.0, probe.journal_sequence
+            )
+        })?;
     let local_fingerprint = crate::service_sync::metadata_shard_state_fingerprint_at(
         backend,
         &probe.shard_id,
@@ -2669,15 +2685,32 @@ pub fn cluster_dfs_metadata_replica_shard_context(
 pub fn process_cluster_dfs_metadata_journal_batch(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
+    authenticated_source_node_id: &NodeId,
     command: DfsMetadataJournalBatchCommand,
 ) -> Result<DfsMetadataJournalBatchResponse, DfsError> {
+    if command.source_node_id.as_ref() != Some(authenticated_source_node_id) {
+        return Ok(dfs_metadata_journal_rejection_response(
+            &command,
+            format!(
+                "authenticated metadata journal caller {authenticated_source_node_id} does not match claimed source {}",
+                command
+                    .source_node_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "<missing>".to_string())
+            ),
+        ));
+    }
+    let context =
+        cluster_dfs_metadata_replica_shard_context(cluster_paths, &command.batch.shard_id)?;
+    if let Some(response) = validate_dfs_metadata_journal_batch_source(context.as_ref(), &command) {
+        return Ok(response);
+    }
     data_dir
         .ensure_root_layout()
         .map_err(|source| DfsError::Metadata {
             message: source.to_string(),
         })?;
-    let context =
-        cluster_dfs_metadata_replica_shard_context(cluster_paths, &command.batch.shard_id)?;
     let backend = cached_cluster_metadata_backend(data_dir, &command.batch.shard_id)?;
     let mut backend = backend.lock().map_err(|_| DfsError::Metadata {
         message: format!(
@@ -2724,7 +2757,15 @@ pub fn process_dfs_metadata_snapshot_install(
         }
         Ok(None) => {}
     }
-    match backend.replace_with_replicated_snapshot(
+    let context = context.expect("validated metadata snapshot ingest has a shard context");
+    let permit = DfsMetadataReplicaIngestPermit::new_validated(
+        context.shard.file_system_id.clone(),
+        shard_id.clone(),
+        context.shard.primary_node_id.clone(),
+        context.shard.epoch,
+    );
+    match backend.replace_with_replicated_snapshot_with_replica_permit(
+        &permit,
         command.shard_id,
         command.next_after_sequence,
         command.snapshot,
@@ -2832,19 +2873,33 @@ pub(crate) fn validate_dfs_metadata_snapshot_install_state(
 pub fn process_cluster_dfs_metadata_snapshot_install(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
+    authenticated_source_node_id: &NodeId,
     command: DfsMetadataSnapshotInstallCommand,
 ) -> Result<DfsMetadataSnapshotInstallResponse, DfsError> {
-    data_dir
-        .ensure_root_layout()
-        .map_err(|source| DfsError::Metadata {
-            message: source.to_string(),
-        })?;
+    if command.source_node_id != *authenticated_source_node_id {
+        return Ok(DfsMetadataSnapshotInstallResponse {
+            request_id: command.request_id,
+            shard_id: command.shard_id,
+            next_after_sequence: command.next_after_sequence,
+            result: DfsMetadataSnapshotInstallResult::Rejected {
+                reason: format!(
+                    "authenticated metadata snapshot caller {authenticated_source_node_id} does not match claimed source {}",
+                    command.source_node_id
+                ),
+            },
+        });
+    }
     let context = cluster_dfs_metadata_replica_shard_context(cluster_paths, &command.shard_id)?;
     if let Some(response) =
         validate_dfs_metadata_snapshot_install_source(context.as_ref(), &command)
     {
         return Ok(response);
     }
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| DfsError::Metadata {
+            message: source.to_string(),
+        })?;
     match open_local_metadata_shard_backend(data_dir, command.shard_id.clone()) {
         Ok(mut backend) => Ok(process_dfs_metadata_snapshot_install(
             &mut backend,
@@ -2856,7 +2911,17 @@ pub fn process_cluster_dfs_metadata_snapshot_install(
             let shard_id = command.shard_id.clone();
             let next_after_sequence = command.next_after_sequence;
             let root = local_dfs_metadata_shard_path(data_dir, &shard_id);
+            let context = context
+                .as_ref()
+                .expect("validated metadata snapshot ingest has a shard context");
+            let permit = DfsMetadataReplicaIngestPermit::new_validated(
+                context.shard.file_system_id.clone(),
+                shard_id.clone(),
+                context.shard.primary_node_id.clone(),
+                context.shard.epoch,
+            );
             let result = LocalSobjMetadataBackend::replace_unreadable_with_replicated_snapshot(
+                &permit,
                 shard_id.clone(),
                 root,
                 command.shard_id,
@@ -2939,21 +3004,29 @@ pub fn validate_dfs_metadata_journal_batch_source(
     context: Option<&DfsMetadataReplicaShardContext>,
     command: &DfsMetadataJournalBatchCommand,
 ) -> Option<DfsMetadataJournalBatchResponse> {
-    let context = match context {
-        Some(context) => context,
-        None if command.authority_probe.is_some() => {
-            return Some(dfs_metadata_journal_rejection_response(
-                command,
-                "metadata authority probe requires an exact committed cluster shard context"
-                    .to_string(),
-            ));
-        }
-        None => return None,
+    let Some(context) = context else {
+        return Some(dfs_metadata_journal_rejection_response(
+            command,
+            "metadata journal ingest requires an exact committed cluster shard context".to_string(),
+        ));
     };
     if context.shard.shard_id != command.batch.shard_id.0 {
         return Some(dfs_metadata_journal_rejection_response(
             command,
             "metadata journal batch has no local shard config".to_string(),
+        ));
+    }
+    let ordinary_applied_batch = !command.verify_prefix_only && command.authority_probe.is_none();
+    if ordinary_applied_batch
+        && (command.file_system_id.as_ref() != Some(&context.shard.file_system_id)
+            || command.authority_epoch != Some(context.shard.epoch))
+    {
+        return Some(dfs_metadata_journal_rejection_response(
+            command,
+            format!(
+                "metadata journal authority identity does not match filesystem {} shard {} epoch {}",
+                context.shard.file_system_id, context.shard.shard_id, context.shard.epoch
+            ),
         ));
     }
     if let Some(probe) = command.authority_probe.as_ref()
@@ -3017,10 +3090,14 @@ pub fn validate_dfs_metadata_journal_batch_source(
         .shard
         .replica_node_ids
         .contains(&context.local_node_id);
+    // A desired-only member can start behind the retiring prefix. The exact
+    // pending handoff is a scoped replica-ingest permit for both the ordinary
+    // contiguous suffix and its subsequent exact-prefix proof. Restricting
+    // this to the proof alone deadlocks: the sender suppresses that proof
+    // until its durable cursor says the suffix has landed.
     let handoff_catch_up_target = metadata_membership_handoff_allows_local_target(context)
-        && command.verify_prefix_only
-        && command.prefix_probe.is_some()
-        && command.authority_probe.is_none();
+        && command.authority_probe.is_none()
+        && any_handoff_catch_up_command(command, ordinary_applied_batch);
     if !configured_replica && !handoff_catch_up_target {
         return Some(dfs_metadata_journal_rejection_response(
             command,
@@ -3031,6 +3108,14 @@ pub fn validate_dfs_metadata_journal_batch_source(
         ));
     }
     None
+}
+
+fn any_handoff_catch_up_command(
+    command: &DfsMetadataJournalBatchCommand,
+    ordinary_applied_batch: bool,
+) -> bool {
+    (ordinary_applied_batch && command.prefix_probe.is_none())
+        || (command.verify_prefix_only && command.prefix_probe.is_some())
 }
 
 pub fn validate_dfs_metadata_snapshot_install_source(
@@ -3136,6 +3221,8 @@ enum DfsMetadataJournalReplicationStep {
 fn dfs_metadata_journal_batch_command(
     local_node_id: &NodeId,
     target_node_id: &NodeId,
+    file_system_id: &DfsFileSystemId,
+    authority_epoch: u64,
     batch: DfsMetadataJournalBatch,
 ) -> DfsMetadataJournalBatchCommand {
     let next_after_sequence = batch.next_after_sequence;
@@ -3145,6 +3232,8 @@ fn dfs_metadata_journal_batch_command(
             local_node_id, target_node_id, next_after_sequence
         ),
         source_node_id: Some(local_node_id.clone()),
+        file_system_id: Some(file_system_id.clone()),
+        authority_epoch: Some(authority_epoch),
         verify_prefix_only: false,
         prefix_probe: None,
         authority_probe: None,
@@ -3418,7 +3507,13 @@ pub fn replicate_dfs_metadata_shard_to_target(
             break;
         }
 
-        let command = dfs_metadata_journal_batch_command(local_node_id, target_node_id, batch);
+        let command = dfs_metadata_journal_batch_command(
+            local_node_id,
+            target_node_id,
+            file_system_id,
+            authority_epoch,
+            batch,
+        );
         let Some(attempt_timeout) =
             dfs_metadata_replication_attempt_timeout(options, target_started_at)
         else {
@@ -3684,6 +3779,71 @@ mod cursor_update_tests {
         assert!(!metadata_journal_rejection_allows_snapshot_repair(
             "metadata journal batch for shard services contains entry from shard root"
         ));
+    }
+
+    #[test]
+    fn unauthorized_cluster_replica_ingress_does_not_create_local_layout() {
+        let target = sinomo_testdir::TestDir::new("sinomo-dfs-replica-ingress-no-layout");
+        let data_dir = SinomoDataDir::new(target.path());
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let source_node_id =
+            NodeId::from_legacy_named("replica-ingress-source").expect("source node id");
+        let shard_id = DfsMetadataShardId::new("unconfigured");
+        let file_system_id = sifs_file_system_id();
+        assert!(!data_dir.dfs_dir().exists());
+
+        let journal_response = process_cluster_dfs_metadata_journal_batch(
+            &data_dir,
+            &cluster_paths,
+            &source_node_id,
+            DfsMetadataJournalBatchCommand {
+                request_id: "unauthorized-journal".to_string(),
+                source_node_id: Some(source_node_id.clone()),
+                file_system_id: Some(file_system_id.clone()),
+                authority_epoch: Some(1),
+                verify_prefix_only: false,
+                prefix_probe: None,
+                authority_probe: None,
+                batch: DfsMetadataJournalBatch {
+                    shard_id: shard_id.clone(),
+                    entries: Vec::new(),
+                    next_after_sequence: 1,
+                },
+            },
+        )
+        .expect("journal rejection response");
+        assert!(matches!(
+            journal_response.result,
+            DfsMetadataJournalBatchResult::Rejected { .. }
+        ));
+        assert!(!data_dir.dfs_dir().exists());
+
+        let snapshot_source =
+            sinomo_testdir::TestDir::new("sinomo-dfs-replica-ingress-snapshot-source");
+        let snapshot = LocalSobjMetadataBackend::new(shard_id.clone(), snapshot_source.path())
+            .expect("snapshot source backend")
+            .export_table_snapshot();
+        let snapshot_response = process_cluster_dfs_metadata_snapshot_install(
+            &data_dir,
+            &cluster_paths,
+            &source_node_id,
+            DfsMetadataSnapshotInstallCommand {
+                request_id: "unauthorized-snapshot".to_string(),
+                source_node_id: source_node_id.clone(),
+                file_system_id: Some(file_system_id),
+                authority_epoch: Some(1),
+                shard_id,
+                next_after_sequence: 1,
+                snapshot,
+                reason: "test unauthorized ingress".to_string(),
+            },
+        )
+        .expect("snapshot rejection response");
+        assert!(matches!(
+            snapshot_response.result,
+            DfsMetadataSnapshotInstallResult::Rejected { .. }
+        ));
+        assert!(!data_dir.dfs_dir().exists());
     }
 
     #[test]

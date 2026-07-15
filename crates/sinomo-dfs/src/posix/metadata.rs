@@ -267,41 +267,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(cached.clone());
         }
 
-        if let Some(tombstone) = self
-            .tombstones_by_metadata_path
-            .get(&(file_system_id.clone(), normalized_metadata_path.clone()))
-        {
-            let object = Some(tombstone.clone());
-            if cache_active && let Ok(mut cache) = self.metadata_lookup_cache.lock() {
-                cache.insert(cache_key, object.clone());
-            }
-            return Ok(object);
-        }
-        let memory_object = self
-            .metadata
-            .object_by_normalized_posix_path(file_system_id, path)
-            .cloned();
-        let object = if let Some(backend) = self.metadata_backend.as_ref() {
-            let backend_object =
-                backend.get_object_by_path(file_system_id, &normalized_metadata_path)?;
-            match (memory_object.as_ref(), backend_object.as_ref()) {
-                (Some(memory_object), Some(backend_object)) => {
-                    Some(self.resolve_authoritative_object_metadata(
-                        &backend_object.object_id,
-                        Some(memory_object),
-                        Some(backend_object),
-                    )?)
-                }
-                (Some(memory_object), None) => Some(memory_object.clone()),
-                (_, Some(backend_object)) => Some(backend_object.clone()),
-                (None, None) => None,
-            }
+        let object = self
+            .authoritative_metadata_object_for_path(file_system_id, path)
+            .map_err(DfsPosixError::from)?
             .map(|object| self.object_metadata_with_receipt_locations(object))
             .transpose()
-            .map_err(DfsPosixError::from)?
-        } else {
-            memory_object
-        };
+            .map_err(DfsPosixError::from)?;
         if cache_active && let Ok(mut cache) = self.metadata_lookup_cache.lock() {
             cache.insert(cache_key, object.clone());
         }

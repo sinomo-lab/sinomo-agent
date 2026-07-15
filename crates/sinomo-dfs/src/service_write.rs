@@ -75,10 +75,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .coordinator
                 .record_durable_receipt(&updated_intent.intent_id, replica_node_id.clone())?;
         }
-        self.try_apply_committed_intent_if_ready_with_repair_mode(
-            &updated_intent.intent_id,
-            foreground_replica_repair,
-        )?;
+        self.try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
         Ok(updated_intent)
     }
 
@@ -483,7 +480,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     patch_size_bytes,
                     full_stage_fallback_nodes: BTreeSet::new(),
                 }),
-            ),
+            )
+            .with_foreground_replica_repair(foreground_replica_repair),
         );
 
         let receipt_node_ids = desired_replica_nodes
@@ -499,10 +497,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             foreground_replica_repair,
         )?;
 
-        if self.should_stage_missing_replicas_after_write(
-            &updated_intent.intent_id,
-            foreground_replica_repair,
-        ) {
+        if self.should_stage_missing_replicas_after_write(&updated_intent.intent_id) {
             self.stage_missing_desired_replicas_for_intent(
                 &updated_intent.intent_id,
                 object.clone(),
@@ -660,7 +655,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     patch_size_bytes,
                     full_stage_fallback_nodes: BTreeSet::new(),
                 }),
-            ),
+            )
+            .with_foreground_replica_repair(foreground_replica_repair),
         );
 
         let receipt_node_ids = desired_replica_nodes
@@ -676,10 +672,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             foreground_replica_repair,
         )?;
 
-        if self.should_stage_missing_replicas_after_write(
-            &updated_intent.intent_id,
-            foreground_replica_repair,
-        ) {
+        if self.should_stage_missing_replicas_after_write(&updated_intent.intent_id) {
             self.stage_missing_desired_replicas_for_intent(
                 &updated_intent.intent_id,
                 object.clone(),
@@ -1112,7 +1105,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 request.target_version.clone(),
                 manifest.content_hash.clone(),
                 manifest.size_bytes,
-            ),
+            )
+            .with_foreground_replica_repair(foreground_replica_repair),
         );
 
         let receipt_node_ids = desired_replica_nodes
@@ -1128,10 +1122,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             foreground_replica_repair,
         )?;
 
-        if self.should_stage_missing_replicas_after_write(
-            &updated_intent.intent_id,
-            foreground_replica_repair,
-        ) {
+        if self.should_stage_missing_replicas_after_write(&updated_intent.intent_id) {
             self.stage_missing_desired_replicas_for_intent(
                 &updated_intent.intent_id,
                 object.clone(),
@@ -1318,7 +1309,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 request.target_version.clone(),
                 content_hash.clone(),
                 content_size_bytes,
-            ),
+            )
+            .with_foreground_replica_repair(foreground_replica_repair),
         );
 
         let record_receipt_started = Instant::now();
@@ -1340,10 +1332,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             let receipt_node_ids = vec![request.requesting_node_id.clone()];
             self.put_metadata_intent_and_receipts(&intent, &content_hash, &receipt_node_ids)?;
-            self.try_apply_committed_intent_if_ready_with_repair_mode(
-                &updated_intent.intent_id,
-                foreground_replica_repair,
-            )?;
+            self.try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
         }
         let commit_elapsed = commit_started.elapsed();
 
@@ -1668,7 +1657,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 request.target_version.clone(),
                 manifest.content_hash.clone(),
                 manifest.size_bytes,
-            ),
+            )
+            .with_foreground_replica_repair(foreground_replica_repair),
         );
 
         let mut receipt_node_ids = Vec::new();
@@ -1692,10 +1682,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let metadata_commit_elapsed = metadata_commit_started.elapsed();
 
         let stage_started = Instant::now();
-        if self.should_stage_missing_replicas_after_write(
-            &updated_intent.intent_id,
-            foreground_replica_repair,
-        ) {
+        if self.should_stage_missing_replicas_after_write(&updated_intent.intent_id) {
             self.stage_missing_desired_replicas_for_intent(
                 &updated_intent.intent_id,
                 object.clone(),
@@ -1752,6 +1739,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         request_id: String,
         object_id: DfsObjectId,
         primary_node_id: NodeId,
+        authority_shard: DfsMetadataShardConfig,
         command: DfsDistributedWriteCommand,
     ) -> NetworkedDfsWriteOutcome {
         self.pending_routed_writes.insert(
@@ -1759,6 +1747,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             PendingRoutedWrite {
                 object_id,
                 primary_node_id,
+                authority_shard,
                 command,
                 authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
                 remote_intent_id: None,
@@ -1817,6 +1806,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             desired_replica_nodes,
             policy,
             object_metadata: Some(object.clone()),
+            authority_shard: Some(shard.clone()),
             touch_parent_on_create,
             foreground_replica_repair,
             exclusive_create,
@@ -1837,7 +1827,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &primary_node_id,
             ));
         }
-        Ok(self.track_pending_routed_write(request_id, object.object_id, primary_node_id, command))
+        Ok(self.track_pending_routed_write(
+            request_id,
+            object.object_id,
+            primary_node_id,
+            shard,
+            command,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1875,6 +1871,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             desired_replica_nodes,
             policy,
             object_metadata: Some(object.clone()),
+            authority_shard: Some(shard.clone()),
             touch_parent_on_create,
             foreground_replica_repair,
             exclusive_create: false,
@@ -1891,7 +1888,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &primary_node_id,
             ));
         }
-        Ok(self.track_pending_routed_write(request_id, object.object_id, primary_node_id, command))
+        Ok(self.track_pending_routed_write(
+            request_id,
+            object.object_id,
+            primary_node_id,
+            shard,
+            command,
+        ))
     }
 
     pub(crate) fn route_distributed_write_from_reader_to_metadata_primary<R: Read>(
@@ -1976,6 +1979,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             desired_replica_nodes,
             policy,
             object_metadata: Some(object.clone()),
+            authority_shard: Some(shard.clone()),
             touch_parent_on_create,
             foreground_replica_repair,
             exclusive_create: false,
@@ -2012,6 +2016,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &primary_node_id,
             ));
         }
-        Ok(self.track_pending_routed_write(request_id, object.object_id, primary_node_id, command))
+        Ok(self.track_pending_routed_write(
+            request_id,
+            object.object_id,
+            primary_node_id,
+            shard,
+            command,
+        ))
     }
 }

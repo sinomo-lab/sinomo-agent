@@ -20,7 +20,7 @@ pub(crate) mod sync;
 
 use crate::dfs_now_unix_nanos as now_unix_nanos;
 use crate::metadata_records::object_version_record;
-use crate::namespace::{initial_version, namespace_transaction_id_for_path, next_version};
+use crate::namespace::{initial_version, namespace_transaction_id_for_object, next_version};
 use crate::posix_model::{
     DfsPosixCreateAttrs, DfsPosixError, DfsStat, DfsWriteOptions, Result, read_conflict_error,
 };
@@ -252,6 +252,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn bootstrap_distributed_sifs(&mut self) -> Result<()> {
+        // A durable completed handoff does not mutate process-local authority
+        // bindings in service handles opened before or after activation. Every
+        // bootstrap path must therefore verify the exact active assignment,
+        // completion proof, and local marker before its first authoritative
+        // namespace mutation. Keeping this transition here makes it impossible
+        // for a caller to accidentally open a fresh lane and skip the rebind.
+        self.rebind_completed_local_metadata_shard_membership_handoffs(&sifs_file_system_id())?;
         let fallback_file_system = crate::namespace::distributed_sifs(self.node_id.clone());
         let file_system_id = fallback_file_system.file_system_id.clone();
         let (file_system, configured_shards) = if let Some(kv) = self.control_plane.as_mut() {
@@ -446,10 +453,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             objects.push(parent);
         }
         self.apply_namespace_transaction(DfsNamespaceTransaction {
-            transaction_id: namespace_transaction_id_for_path(
+            transaction_id: namespace_transaction_id_for_object(
                 "mkdir-create",
                 &object.object_id,
-                &object.path,
+                &object.version,
             ),
             file_system_id: object.file_system_id.clone(),
             objects,

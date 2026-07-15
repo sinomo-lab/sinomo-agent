@@ -231,6 +231,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(self)
     }
 
+    /// Attach and hydrate a backend while explicitly reconstructing durable
+    /// post-response CommitVersion work into this service's detached outbox.
+    /// Ordinary/request-lane hydration deliberately does not perform this
+    /// background recovery.
+    pub fn with_boxed_metadata_backend_for_commit_promotion_recovery(
+        mut self,
+        backend: Box<dyn DfsMetadataBackend>,
+    ) -> Result<Self, DfsError> {
+        self.metadata_backend = Some(backend);
+        self.hydrate_from_metadata_backend_for_commit_promotion_recovery()?;
+        Ok(self)
+    }
+
     pub fn with_boxed_metadata_backend_lazy(
         mut self,
         backend: Box<dyn DfsMetadataBackend>,
@@ -310,6 +323,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .values()
             .map(|pending| pending.fetch_failed_from.len())
             .sum();
+        let mut authoritative_write_frozen_shard_count = 0usize;
+        if let Some(backend) = self.metadata_backend.as_deref() {
+            for status in backend.metadata_shard_statuses()? {
+                if status.primary_node_id.as_ref() != Some(&self.node_id) {
+                    continue;
+                }
+                if backend.metadata_shard_authoritative_writes_frozen(&status.shard_id)? {
+                    authoritative_write_frozen_shard_count =
+                        authoritative_write_frozen_shard_count.saturating_add(1);
+                }
+            }
+        }
         Ok(DfsOperationalMetrics {
             node_id: self.node_id.clone(),
             file_system_count: self.metadata.filesystems.len(),
@@ -335,6 +360,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             pending_remote_write_response_count: self.pending_remote_write_responses.len(),
             pending_routed_namespace_op_count: self.pending_routed_namespace_ops.len(),
             cross_shard_namespace_lock_count: self.cross_shard_namespace_locks.len(),
+            authoritative_write_frozen_shard_count,
             metadata_backend_configured: self.metadata_backend.is_some(),
             content: self.content.stats()?,
         })

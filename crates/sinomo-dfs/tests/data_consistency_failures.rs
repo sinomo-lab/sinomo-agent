@@ -488,7 +488,7 @@ fn partial_receipt_threshold_defers_visible_version_until_repairable_commit() {
 }
 
 #[test]
-fn offline_replica_converges_via_repair_after_coordinator_commit() {
+fn offline_replica_converges_after_deferred_post_commit_promotion() {
     let owner = node("owner");
     let online = node("online");
     let offline = node("offline");
@@ -560,11 +560,26 @@ fn offline_replica_converges_via_repair_after_coordinator_commit() {
         }
     }
 
-    let read = fixture
+    let staged_read = fixture
         .service(&offline)
         .read_local_object_with_state(&object_id, false)
-        .expect("offline read");
-    assert!(matches!(read, NetworkedDfsReadOutcome::Found { .. }));
+        .expect("offline staged read");
+    assert!(
+        !matches!(staged_read, NetworkedDfsReadOutcome::Found { .. }),
+        "a durable late stage must not become visible before deferred CommitVersion promotion"
+    );
+    fixture
+        .service_mut(&offline)
+        .process_incoming()
+        .expect("offline deferred promotion");
+    let promoted_read = fixture
+        .service(&offline)
+        .read_local_object_with_state(&object_id, false)
+        .expect("offline promoted read");
+    assert!(matches!(
+        promoted_read,
+        NetworkedDfsReadOutcome::Found { .. }
+    ));
     assert_eq!(
         fixture.service(&owner).coordinator().repair_jobs().len(),
         0,

@@ -100,6 +100,26 @@ cargo bench -p sinomo-dfs --bench scale -- \
 The benchmark prints one JSON object per measured step. Byte-sized flags such as `--blob-bytes`, `--blob-range-bytes`, and `--network-blob-bytes` accept suffixes like `MiB` and `GiB`, so expensive one-off runs can be narrowed without changing source code.
 Namespace-load and metadata-replication setup use grouped metadata commits by default; tune `--metadata-batch-size` when comparing write-amplification changes.
 
+To isolate the networked DFS algorithm from physical-disk and container-network overhead, run the `InProcessNetwork` blob scenario with every content and metadata store rooted on tmpfs. This example measures a 128 MiB write with desired replica count N=5 and write quorum W=1, then removes its generated data even if the benchmark fails:
+
+```sh
+(
+  bench_root="$(mktemp -d /dev/shm/sinomo-dfs-network-blob.XXXXXX)"
+  trap 'rm -rf "$bench_root"' EXIT
+  CARGO_INCREMENTAL=0 cargo bench -p sinomo-dfs --bench scale -- \
+    --scenario network-blob \
+    --preset smoke \
+    --root "$bench_root" \
+    --network-blob-bytes 128MiB \
+    --network-blob-desired-replicas 5 \
+    --network-blob-write-quorum 1
+)
+```
+
+In the JSONL output, `desired_replicas` is N and `write_quorum` is W. `network_blob_w_visible_commit.time_to_w_ms` starts immediately before the replica workers are released and the POSIX write is invoked, then stops when that call returns with the version visible and exactly W durable receipts. It is marked as an upper bound because the harness observes the return boundary rather than the internal instant at which W was crossed. `network_blob_all_desired_committed.time_to_all_replica_commits_ms` uses the same start and stops at the latest replica's commit timestamp. It excludes the later owner-side response drain, metrics collection, and worker finalization. Logical throughput counts the object bytes once, while effective quorum/replicated throughput counts the durable bytes represented by W or N copies.
+
+`effective_cores` is process CPU time divided by elapsed wall time over the corresponding boundary. It includes the owner, in-process replica worker threads, and small harness overhead; it can exceed one and is not a percentage of all host CPUs. The reported owner/replica idle-loop counters include a 1 ms sleep used only by this benchmark driver when an `InProcessNetwork` queue is empty. That polling is outside the DFS service hot path and must not be interpreted as an internal DFS wait.
+
 ### Networked DFS Service
 
 `NetworkedDfsService<T>` is the distributed object service over a `sinomo-network` transport. It combines:

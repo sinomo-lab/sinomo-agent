@@ -13,7 +13,10 @@ use crate::advisory_lock::{
 };
 #[cfg(test)]
 use crate::control_plane::DfsMetadataShardConfig;
-use crate::metadata_api::{DfsMetadataBackend, DfsMetadataShardWriteFreeze};
+use crate::metadata_api::{
+    DfsMetadataBackend, DfsMetadataReplicaIngestPermit, DfsMetadataShardWriteFreeze,
+    namespace_prepare_expectations_from_lookups,
+};
 use crate::metadata_cursor;
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_io::{create_dir_all, read_sobj_optional, write_sobj_atomic};
@@ -24,7 +27,7 @@ use crate::metadata_journal::DfsMetadataJournalHead;
 #[cfg(test)]
 use crate::metadata_journal::persist_replayed_journal_entry;
 use crate::metadata_journal::{
-    DfsMetadataReplayCursor, bounded_metadata_journal_batch, journal_entries_since_limited,
+    DfsMetadataReplayCursor, bounded_metadata_journal_batch,
     journal_entries_since_limited_with_next_sequence, migrate_legacy_journal_entries,
     persist_replayed_journal_entries, read_next_journal_sequence_lenient,
     recover_next_journal_sequence, write_local_journal_entries, write_local_journal_entry,
@@ -37,7 +40,7 @@ use crate::metadata_lock::{MetadataWriteLock, metadata_write_lock};
 use crate::metadata_namespace_transaction::{
     namespace_transaction_recovery_is_complete, plan_namespace_transaction_recovery_table_ops,
     plan_namespace_transaction_table_ops as namespace_transaction_table_ops,
-    validate_namespace_transaction_preconditions,
+    preapply_namespace_transaction_table_ops, validate_namespace_transaction_preconditions,
 };
 use crate::metadata_object_index::object_index_table_ops_with_previous as plan_object_index_table_ops_with_previous;
 use crate::metadata_pages::{
@@ -57,7 +60,8 @@ use crate::metadata_receipt::{receipt_for_replica_from_backend, replay_receipt_m
 use crate::metadata_records::*;
 use crate::metadata_replay::{
     hydrate_journal_entry_payloads, journal_entry_has_replay_payloads,
-    require_journal_entry_replay_payloads, required_replay_payload,
+    require_journal_entry_replay_payloads, require_replica_journal_entry_file_system,
+    required_replay_payload,
 };
 use crate::metadata_summary::{
     metadata_summary_for_file_system_from_tables, metadata_summary_from_tables,
@@ -76,7 +80,7 @@ use crate::metadata_table_store::{
 };
 use crate::metadata_tables::{
     DfsMetadataTableRollback, DfsMetadataTables, DfsMetadataTablesSnapshot,
-    MetadataTableReadSnapshotCache, MetadataTableSnapshotFingerprint,
+    MetadataTableReadSnapshotCache, MetadataTableSnapshotFingerprint, namespace_prepare_footprint,
 };
 use crate::metadata_tombstone::{metadata_now_unix_nanos, plan_tombstone_compaction};
 use crate::metadata_visible_commit::{
@@ -135,7 +139,10 @@ fn metadata_backend_perf_trace(args: std::fmt::Arguments<'_>) {
 #[cfg(test)]
 thread_local! {
     static METADATA_BEGIN_WRITE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static METADATA_CURRENT_TABLES_SNAPSHOT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static NAMESPACE_RECOVERY_PLANNER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static NAMESPACE_PREPARED_COMMIT_REFERENCE_PLANNER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static NAMESPACE_PREPARE_HISTORY_SCAN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -149,6 +156,16 @@ fn metadata_begin_write_calls() -> usize {
 }
 
 #[cfg(test)]
+fn reset_metadata_current_tables_snapshot_calls() {
+    METADATA_CURRENT_TABLES_SNAPSHOT_CALLS.set(0);
+}
+
+#[cfg(test)]
+fn metadata_current_tables_snapshot_calls() -> usize {
+    METADATA_CURRENT_TABLES_SNAPSHOT_CALLS.get()
+}
+
+#[cfg(test)]
 fn reset_namespace_recovery_planner_calls() {
     NAMESPACE_RECOVERY_PLANNER_CALLS.set(0);
 }
@@ -156,6 +173,26 @@ fn reset_namespace_recovery_planner_calls() {
 #[cfg(test)]
 fn namespace_recovery_planner_calls() -> usize {
     NAMESPACE_RECOVERY_PLANNER_CALLS.get()
+}
+
+#[cfg(test)]
+fn reset_namespace_prepared_commit_reference_planner_calls() {
+    NAMESPACE_PREPARED_COMMIT_REFERENCE_PLANNER_CALLS.set(0);
+}
+
+#[cfg(test)]
+fn namespace_prepared_commit_reference_planner_calls() -> usize {
+    NAMESPACE_PREPARED_COMMIT_REFERENCE_PLANNER_CALLS.get()
+}
+
+#[cfg(test)]
+fn reset_namespace_prepare_history_scan_calls() {
+    NAMESPACE_PREPARE_HISTORY_SCAN_CALLS.set(0);
+}
+
+#[cfg(test)]
+fn namespace_prepare_history_scan_calls() -> usize {
+    NAMESPACE_PREPARE_HISTORY_SCAN_CALLS.get()
 }
 
 fn namespace_prepare_payload_matches(
@@ -373,40 +410,47 @@ fn validate_namespace_prepare_expectations(
     Ok(())
 }
 
-fn namespace_prepare_footprint(
-    prepare: &DfsNamespacePrepareRecord,
-) -> (BTreeSet<DfsObjectId>, BTreeSet<String>) {
-    let mut object_ids = prepare
-        .expected_object_versions
-        .iter()
-        .map(|expected| expected.object_id.clone())
-        .collect::<BTreeSet<_>>();
-    object_ids.extend(
-        prepare
-            .transaction
-            .objects
-            .iter()
-            .map(|object| object.object_id.clone()),
-    );
-    let mut paths = prepare
-        .expected_path_occupants
-        .iter()
-        .map(|expected| normalize_path(&expected.path))
-        .collect::<BTreeSet<_>>();
-    paths.extend(
-        prepare
-            .transaction
-            .objects
-            .iter()
-            .map(|object| normalize_path(&object.path)),
-    );
-    (object_ids, paths)
-}
-
 fn validate_namespace_prepare_does_not_overlap(
     tables: &DfsMetadataTables,
     prepare: &DfsNamespacePrepareRecord,
 ) -> Result<()> {
+    let (object_ids, paths) = namespace_prepare_footprint(prepare);
+    for object_id in &object_ids {
+        if let Some(existing_operation_id) = tables.namespace_prepare_object_owner_other_than(
+            &prepare.file_system_id,
+            object_id,
+            &prepare.operation_id,
+        ) {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {} overlaps active prepare {}",
+                prepare.operation_id, existing_operation_id
+            )));
+        }
+    }
+    for path in &paths {
+        if let Some(existing_operation_id) = tables
+            .namespace_prepare_normalized_path_owner_other_than(
+                &prepare.file_system_id,
+                path,
+                &prepare.operation_id,
+            )
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {} overlaps active prepare {}",
+                prepare.operation_id, existing_operation_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn validate_namespace_prepare_does_not_overlap_reference(
+    tables: &DfsMetadataTables,
+    prepare: &DfsNamespacePrepareRecord,
+) -> Result<()> {
+    NAMESPACE_PREPARE_HISTORY_SCAN_CALLS
+        .set(NAMESPACE_PREPARE_HISTORY_SCAN_CALLS.get().saturating_add(1));
     let (object_ids, paths) = namespace_prepare_footprint(prepare);
     for existing in tables.namespace_prepares.values().filter(|existing| {
         existing.status == DfsNamespacePrepareStatus::Prepared
@@ -485,6 +529,12 @@ fn namespace_prepare_table_ops_for_record(
                 validate_namespace_prepare_expectations(tables, prepare)?;
                 validate_namespace_prepare_does_not_overlap(tables, prepare)?;
                 validate_namespace_transaction_preconditions(tables, &prepare.transaction)?;
+                #[cfg(test)]
+                NAMESPACE_PREPARED_COMMIT_REFERENCE_PLANNER_CALLS.set(
+                    NAMESPACE_PREPARED_COMMIT_REFERENCE_PLANNER_CALLS
+                        .get()
+                        .saturating_add(1),
+                );
                 namespace_transaction_table_ops(tables, &prepare.transaction)
             };
             ops.push(DfsMetadataTableOp::PutNamespacePrepare {
@@ -519,6 +569,220 @@ fn namespace_prepare_table_ops_for_record(
             }])
         }
     }
+}
+
+fn require_replica_snapshot_record_file_system(
+    record_kind: &str,
+    actual: &DfsFileSystemId,
+    expected: &DfsFileSystemId,
+) -> Result<()> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(MetadataBackendError::Serde(format!(
+        "replicated metadata snapshot {record_kind} filesystem {actual} does not match permit filesystem {expected}"
+    )))
+}
+
+fn require_replica_snapshot_namespace_transaction_file_system(
+    record_kind: &str,
+    transaction: &DfsNamespaceTransaction,
+    expected: &DfsFileSystemId,
+) -> Result<()> {
+    require_replica_snapshot_record_file_system(
+        record_kind,
+        &transaction.file_system_id,
+        expected,
+    )?;
+    for object in &transaction.objects {
+        require_replica_snapshot_record_file_system(
+            "namespace transaction object",
+            &object.file_system_id,
+            expected,
+        )?;
+    }
+    for version in &transaction.versions {
+        require_replica_snapshot_record_file_system(
+            "namespace transaction version",
+            &version.file_system_id,
+            expected,
+        )?;
+    }
+    for state in &transaction.advisory_lock_states {
+        require_replica_snapshot_record_file_system(
+            "namespace transaction advisory-lock state",
+            &state.file_system_id,
+            expected,
+        )?;
+    }
+    Ok(())
+}
+
+/// Validate the complete canonical table image before replica snapshot ingest
+/// acquires the backend writer lock. Derived indexes are included so a legacy
+/// op snapshot and a structured snapshot are checked at the same boundary.
+fn require_replica_snapshot_tables_file_system(
+    tables: &DfsMetadataTables,
+    expected: &DfsFileSystemId,
+) -> Result<()> {
+    for file_system in tables.file_systems.values() {
+        require_replica_snapshot_record_file_system(
+            "filesystem record",
+            &file_system.file_system_id,
+            expected,
+        )?;
+    }
+    for object in tables.objects.values() {
+        require_replica_snapshot_record_file_system(
+            "object record",
+            &object.file_system_id,
+            expected,
+        )?;
+    }
+    for path_record in tables.file_system_objects.values() {
+        require_replica_snapshot_record_file_system(
+            "filesystem-object index",
+            &path_record.file_system_id,
+            expected,
+        )?;
+    }
+    for path_record in tables.paths.values() {
+        require_replica_snapshot_record_file_system(
+            "path record",
+            &path_record.file_system_id,
+            expected,
+        )?;
+    }
+    for inode in tables.inodes.values() {
+        require_replica_snapshot_record_file_system(
+            "inode record",
+            &inode.file_system_id,
+            expected,
+        )?;
+    }
+    for dirfrag in tables.dirfrags.values() {
+        require_replica_snapshot_record_file_system(
+            "directory-fragment record",
+            &dirfrag.file_system_id,
+            expected,
+        )?;
+    }
+    for path_record in tables.dentries.values() {
+        require_replica_snapshot_record_file_system(
+            "dentry record",
+            &path_record.file_system_id,
+            expected,
+        )?;
+    }
+    for path_record in tables.hardlinks.values() {
+        require_replica_snapshot_record_file_system(
+            "hardlink record",
+            &path_record.file_system_id,
+            expected,
+        )?;
+    }
+    for path_record in tables.hardlink_paths.values() {
+        require_replica_snapshot_record_file_system(
+            "hardlink-path index",
+            &path_record.file_system_id,
+            expected,
+        )?;
+    }
+    for object in tables.compacted_tombstones.values() {
+        require_replica_snapshot_record_file_system(
+            "compacted tombstone",
+            &object.file_system_id,
+            expected,
+        )?;
+    }
+    for (file_system_id, _) in tables.compacted_tombstone_paths.keys() {
+        require_replica_snapshot_record_file_system(
+            "compacted-tombstone path index",
+            file_system_id,
+            expected,
+        )?;
+    }
+    for version in tables.versions.values() {
+        require_replica_snapshot_record_file_system(
+            "version record",
+            &version.file_system_id,
+            expected,
+        )?;
+    }
+    for receipt in tables.receipts.values() {
+        require_replica_snapshot_record_file_system(
+            "receipt record",
+            &receipt.receipt.file_system_id,
+            expected,
+        )?;
+    }
+    for intent in tables.intents.values() {
+        require_replica_snapshot_record_file_system(
+            "intent record",
+            &intent.file_system_id,
+            expected,
+        )?;
+        if let Some(object) = intent.object_metadata.as_ref() {
+            require_replica_snapshot_record_file_system(
+                "intent object record",
+                &object.file_system_id,
+                expected,
+            )?;
+        }
+    }
+    for conflict in tables.conflicts.values() {
+        require_replica_snapshot_record_file_system(
+            "conflict record",
+            &conflict.file_system_id,
+            expected,
+        )?;
+    }
+    for state in tables.advisory_lock_states.values() {
+        require_replica_snapshot_record_file_system(
+            "advisory-lock state",
+            &state.file_system_id,
+            expected,
+        )?;
+    }
+    for commit in tables.visible_commits.values() {
+        require_replica_snapshot_record_file_system(
+            "visible-commit object record",
+            &commit.committed_object.file_system_id,
+            expected,
+        )?;
+        require_replica_snapshot_record_file_system(
+            "visible-commit version record",
+            &commit.visible_version.file_system_id,
+            expected,
+        )?;
+    }
+    for transaction in tables.namespace_transactions.values() {
+        require_replica_snapshot_namespace_transaction_file_system(
+            "namespace transaction",
+            transaction,
+            expected,
+        )?;
+    }
+    for prepare in tables.namespace_prepares.values() {
+        require_replica_snapshot_record_file_system(
+            "namespace prepare",
+            &prepare.file_system_id,
+            expected,
+        )?;
+        require_replica_snapshot_namespace_transaction_file_system(
+            "namespace prepare transaction",
+            &prepare.transaction,
+            expected,
+        )?;
+    }
+    for job in tables.namespace_jobs.values() {
+        require_replica_snapshot_record_file_system(
+            "namespace job",
+            &job.file_system_id,
+            expected,
+        )?;
+    }
+    Ok(())
 }
 
 /// Shard-local SOBJ metadata backend.
@@ -810,6 +1074,25 @@ impl LocalSobjMetadataBackend {
     /// into table batches, and then acknowledged by advancing replay cursors.
     pub fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
         let _lock = self.begin_metadata_write()?;
+        self.apply_journal_batch_unlocked(batch)
+    }
+
+    /// Apply a validated replica batch across only the exact activated author
+    /// fence named by `permit`. This path never changes process-local
+    /// authority binding.
+    pub fn apply_journal_batch_with_replica_permit(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+    ) -> Result<usize> {
+        for entry in &batch.entries {
+            require_replica_journal_entry_file_system(entry, permit.file_system_id())?;
+        }
+        let _lock = self.begin_metadata_replica_ingest(permit, &batch.shard_id)?;
+        self.apply_journal_batch_unlocked(batch)
+    }
+
+    fn apply_journal_batch_unlocked(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
         if batch.entries.is_empty() {
             return Ok(0);
         }
@@ -962,17 +1245,54 @@ impl LocalSobjMetadataBackend {
         )
     }
 
+    /// Install a validated replica snapshot across only the exact activated
+    /// author fence named by `permit`. The durable marker is excluded from the
+    /// repair archive and this path never changes process-local authority.
+    pub fn replace_with_replicated_snapshot_with_replica_permit(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        source_shard_id: DfsMetadataShardId,
+        replayed_through_sequence: u64,
+        snapshot: DfsMetadataTableSnapshot,
+    ) -> Result<bool> {
+        let candidate_tables =
+            metadata_tables_from_table_snapshot(snapshot.clone(), "replicated metadata snapshot")?;
+        require_replica_snapshot_tables_file_system(&candidate_tables, permit.file_system_id())?;
+        let _lock = self.begin_metadata_replica_ingest(permit, &source_shard_id)?;
+        self.replace_with_replicated_snapshot_unlocked(
+            source_shard_id,
+            replayed_through_sequence,
+            snapshot,
+        )
+    }
+
     /// Install an authoritative snapshot when ordinary backend open/replay is
-    /// impossible. This path deliberately takes only the shard write lock;
-    /// snapshot validation and durable acknowledgement floors still run before
-    /// the unreadable state is archived and replaced.
+    /// impossible. Source identity and snapshot filesystem are still bounded
+    /// by the exact replica-ingest permit, and any readable durable handoff
+    /// marker continues to fence a stale source epoch. Only table replay is
+    /// bypassed before the unreadable state is archived and replaced.
     pub(crate) fn replace_unreadable_with_replicated_snapshot(
+        permit: &DfsMetadataReplicaIngestPermit,
         shard_id: DfsMetadataShardId,
         root: impl Into<PathBuf>,
         source_shard_id: DfsMetadataShardId,
         replayed_through_sequence: u64,
         snapshot: DfsMetadataTableSnapshot,
     ) -> Result<(Self, bool)> {
+        if permit.shard_id() != &source_shard_id || source_shard_id != shard_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata replica snapshot permit for filesystem {} shard {} source {} epoch {} cannot replace unreadable shard {} from source shard {}",
+                permit.file_system_id(),
+                permit.shard_id().0,
+                permit.source_node_id(),
+                permit.source_epoch(),
+                shard_id.0,
+                source_shard_id.0,
+            )));
+        }
+        let candidate_tables =
+            metadata_tables_from_table_snapshot(snapshot.clone(), "replicated metadata snapshot")?;
+        require_replica_snapshot_tables_file_system(&candidate_tables, permit.file_system_id())?;
         let mut backend = Self {
             shard_id,
             root: root.into(),
@@ -988,6 +1308,17 @@ impl LocalSobjMetadataBackend {
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
         };
         let lock = backend.metadata_write_lock()?;
+        if let Some(freeze) = backend.membership_handoff_write_freeze()? {
+            let permit_is_at_or_after_activated_generation = freeze
+                .activated_epoch
+                .is_some_and(|activated_epoch| permit.source_epoch() >= activated_epoch);
+            if !permit_is_at_or_after_activated_generation {
+                return Err(MetadataBackendError::MembershipHandoffFrozen {
+                    shard_id: backend.shard_id.clone(),
+                    handoff_id: freeze.handoff_id,
+                });
+            }
+        }
         let archived_existing = backend.replace_with_replicated_snapshot_unlocked(
             source_shard_id,
             replayed_through_sequence,
@@ -1927,10 +2258,11 @@ impl LocalSobjMetadataBackend {
             return Ok(());
         }
         loop {
-            let entries = journal_entries_since_limited(
+            let entries = journal_entries_since_limited_with_next_sequence(
                 &self.root,
                 cursor.last_sequence,
                 DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                self.next_sequence,
             )?;
             if entries.is_empty() {
                 break;
@@ -2136,19 +2468,61 @@ impl LocalSobjMetadataBackend {
         metadata_write_lock(self.root.clone(), self.journal_write_lock_path())
     }
 
+    fn reload_durable_metadata_table_state(&mut self) -> Result<()> {
+        let state = read_metadata_table_state_lenient(&self.root)?;
+        self.tables = state.tables;
+        self.table_log_offset = state.table_log_offset;
+        self.materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
+        self.prefix_proof = state.prefix_proof;
+        self.table_snapshot_fingerprint = state.snapshot_fingerprint;
+        if let Ok(mut cache) = self.read_snapshot_cache.lock() {
+            *cache = None;
+        }
+        Ok(())
+    }
+
     fn refresh_after_metadata_write_lock(&mut self) -> Result<()> {
         #[cfg(test)]
         METADATA_BEGIN_WRITE_CALLS.set(METADATA_BEGIN_WRITE_CALLS.get().saturating_add(1));
+        // `next_sequence` advances only after the local journal record is
+        // durably appended. Preserve that live exact tail across refresh. A
+        // newly opened backend obtains the same value from the scanning
+        // recovery path. Healthy writes from another handle advance the table
+        // head below; recovery after a different live handle fails between
+        // journal and table durability is outside this single-writer slice.
+        let durable_next_sequence = self.next_sequence.max(1);
         let previous_materialized_sequence = self.materialized_through_sequence;
         self.refresh_metadata_tables()?;
-        self.next_sequence = self
-            .next_sequence
+        let durable_next_sequence = durable_next_sequence
             .max(self.materialized_through_sequence.saturating_add(1))
             .max(1);
+        let durable_journal_tail = durable_next_sequence.saturating_sub(1);
         let materialization_rewound =
             self.materialized_through_sequence < previous_materialized_sequence;
+        if durable_journal_tail > self.materialized_through_sequence {
+            // The journal is the durability boundary. A prior append may have
+            // succeeded while table-batch materialization failed and rolled
+            // back this live handle. Reload the exact durable table proof so a
+            // same-instance retry does not carry the journal-ahead proof into
+            // replay, then recover the gap before admitting another write.
+            self.reload_durable_metadata_table_state()?;
+        }
+        self.next_sequence = durable_next_sequence
+            .max(self.materialized_through_sequence.saturating_add(1))
+            .max(1);
+        let has_unmaterialized_durable_tail =
+            durable_journal_tail > self.materialized_through_sequence;
         let bootstrapped_prefix = self.ensure_metadata_prefix_proof_checkpoint_unlocked()?;
-        if materialization_rewound {
+        if has_unmaterialized_durable_tail {
+            // Deferred cursor checkpoints are scheduling hints. Recovery must
+            // begin at the exact durable table head whose prefix proof was
+            // just loaded, whether the hint was behind or ahead of that head.
+            self.write_local_materialization_cursor(&DfsMetadataReplayCursor {
+                shard_id: self.shard_id.clone(),
+                last_sequence: self.materialized_through_sequence,
+            })?;
+            self.recover_unmaterialized_local_journal_entries()?;
+        } else if materialization_rewound {
             self.rewind_local_materialization_cursor_to_table_head_if_ahead()?;
             self.recover_unmaterialized_local_journal_entries()?;
         }
@@ -2162,6 +2536,38 @@ impl LocalSobjMetadataBackend {
 
     fn begin_metadata_write_allow_frozen(&mut self) -> Result<MetadataWriteLock> {
         let lock = self.metadata_write_lock()?;
+        self.refresh_after_metadata_write_lock()?;
+        Ok(lock)
+    }
+
+    fn begin_metadata_replica_ingest(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        source_shard_id: &DfsMetadataShardId,
+    ) -> Result<MetadataWriteLock> {
+        if permit.shard_id() != source_shard_id || source_shard_id != &self.shard_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata replica ingest permit for filesystem {} shard {} source {} epoch {} cannot mutate backend shard {} from source shard {}",
+                permit.file_system_id(),
+                permit.shard_id().0,
+                permit.source_node_id(),
+                permit.source_epoch(),
+                self.shard_id.0,
+                source_shard_id.0,
+            )));
+        }
+        let lock = self.metadata_write_lock()?;
+        if let Some(freeze) = self.membership_handoff_write_freeze()? {
+            let permit_is_at_or_after_activated_generation = freeze
+                .activated_epoch
+                .is_some_and(|activated_epoch| permit.source_epoch() >= activated_epoch);
+            if !permit_is_at_or_after_activated_generation {
+                return Err(MetadataBackendError::MembershipHandoffFrozen {
+                    shard_id: self.shard_id.clone(),
+                    handoff_id: freeze.handoff_id,
+                });
+            }
+        }
         self.refresh_after_metadata_write_lock()?;
         Ok(lock)
     }
@@ -2200,10 +2606,15 @@ impl LocalSobjMetadataBackend {
             let same_pending_handoff = existing.activated_epoch.is_none()
                 && existing.handoff_id == handoff_id
                 && existing.retiring_epoch == retiring_epoch;
-            let replacing_observed_active_generation = existing.activated_epoch
-                == Some(retiring_epoch)
-                && self.instance_authority_epoch == Some(retiring_epoch);
-            if !same_pending_handoff && !replacing_observed_active_generation {
+            // A completed marker is a durable fence, not an authority grant.
+            // A later control-plane-authorized handoff may supersede it even
+            // when this backend instance deliberately stayed unbound after
+            // recording the prior activation. Installing the new pending
+            // marker below clears any instance binding again.
+            let replacing_completed_generation = existing
+                .activated_epoch
+                .is_some_and(|activated_epoch| activated_epoch <= retiring_epoch);
+            if !same_pending_handoff && !replacing_completed_generation {
                 return Err(MetadataBackendError::Serde(format!(
                     "metadata shard {} is already fenced by membership handoff {} retiring epoch {} active epoch {:?}",
                     self.shard_id.0,
@@ -2249,12 +2660,11 @@ impl LocalSobjMetadataBackend {
         Ok(freeze)
     }
 
-    fn clear_membership_handoff_write_freeze(
+    fn mark_membership_handoff_write_freeze_activated_unlocked(
         &mut self,
         handoff_id: &str,
         activated_epoch: u64,
     ) -> Result<bool> {
-        let lock = self.begin_metadata_write_allow_frozen()?;
         let Some(existing) = self.membership_handoff_write_freeze()? else {
             return Ok(false);
         };
@@ -2280,9 +2690,7 @@ impl LocalSobjMetadataBackend {
                 activated_epoch
             )));
         }
-        if existing.activated_epoch == Some(activated_epoch)
-            && self.instance_authority_epoch == Some(activated_epoch)
-        {
+        if existing.activated_epoch == Some(activated_epoch) {
             return Ok(true);
         }
         if existing
@@ -2301,6 +2709,29 @@ impl LocalSobjMetadataBackend {
         let mut activated = existing;
         activated.activated_epoch = Some(activated_epoch);
         write_sobj_atomic(&self.membership_handoff_write_freeze_path(), &activated)?;
+        Ok(true)
+    }
+
+    fn mark_membership_handoff_write_freeze_activated(
+        &mut self,
+        handoff_id: &str,
+        activated_epoch: u64,
+    ) -> Result<bool> {
+        let _lock = self.begin_metadata_write_allow_frozen()?;
+        self.mark_membership_handoff_write_freeze_activated_unlocked(handoff_id, activated_epoch)
+    }
+
+    fn clear_membership_handoff_write_freeze(
+        &mut self,
+        handoff_id: &str,
+        activated_epoch: u64,
+    ) -> Result<bool> {
+        let lock = self.begin_metadata_write_allow_frozen()?;
+        if !self
+            .mark_membership_handoff_write_freeze_activated_unlocked(handoff_id, activated_epoch)?
+        {
+            return Ok(false);
+        }
         let previous_instance_authority_epoch =
             self.instance_authority_epoch.replace(activated_epoch);
         drop(lock);
@@ -2385,6 +2816,12 @@ impl LocalSobjMetadataBackend {
     }
 
     pub(crate) fn current_tables_snapshot(&self) -> Result<DfsMetadataTablesSnapshot<'_>> {
+        #[cfg(test)]
+        METADATA_CURRENT_TABLES_SNAPSHOT_CALLS.set(
+            METADATA_CURRENT_TABLES_SNAPSHOT_CALLS
+                .get()
+                .saturating_add(1),
+        );
         metadata_read_snapshot::current_tables_snapshot(
             &self.root,
             &self.tables,
@@ -2645,6 +3082,23 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     ) -> Result<Option<DfsObjectMetadata>> {
         let tables = self.current_tables_snapshot()?;
         Ok(object_by_path_from_tables(&tables, file_system_id, path))
+    }
+
+    fn namespace_prepare_expectations(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+        transaction: &DfsNamespaceTransaction,
+    ) -> Result<(
+        Vec<DfsNamespaceObjectVersionExpectation>,
+        Vec<DfsNamespacePathOccupantExpectation>,
+        BTreeSet<String>,
+    )> {
+        let tables = self.current_tables_snapshot()?;
+        namespace_prepare_expectations_from_lookups(
+            transaction,
+            |object_id| Ok(tables.objects.get(object_id).cloned()),
+            |file_system_id, path| Ok(object_by_path_from_tables(&tables, file_system_id, path)),
+        )
     }
 
     fn objects_for_file_system(
@@ -3740,16 +4194,30 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
 
         let transaction = normalized_namespace_transaction(transaction);
         validate_namespace_transaction_preconditions(&self.tables, &transaction)?;
-        let table_ops = namespace_transaction_table_ops(&self.tables, &transaction);
-        self.write_journal_entry_and_apply_table_ops_unlocked(
-            DfsMetadataMutation::ApplyNamespaceTransaction {
+        let entry =
+            self.write_journal_unlocked(DfsMetadataMutation::ApplyNamespaceTransaction {
                 file_system_id: transaction.file_system_id.clone(),
                 transaction_id: transaction.transaction_id.clone(),
                 object_count: transaction.objects.len(),
                 transaction: Some(transaction),
-            },
+            })?;
+        let mut table_ops = Vec::new();
+        let mut rollback = DfsMetadataTableRollback::default();
+        let transaction = match &entry.mutation {
+            DfsMetadataMutation::ApplyNamespaceTransaction {
+                transaction: Some(transaction),
+                ..
+            } => transaction,
+            _ => unreachable!("the namespace transaction journal entry preserves its payload"),
+        };
+        self.plan_namespace_transaction_table_ops(transaction, &mut table_ops, &mut rollback)?;
+        self.append_preapplied_table_ops_for_written_entries(
+            std::slice::from_ref(&entry),
+            entry.sequence,
             table_ops,
-        )
+            rollback,
+        )?;
+        Ok(entry)
     }
 
     fn prepare_namespace_transaction(
@@ -3895,7 +4363,51 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 "namespace prepare {operation_id} is aborted"
             )));
         }
+        let transitions_from_prepared = prepare.status == DfsNamespacePrepareStatus::Prepared;
         prepare.status = DfsNamespacePrepareStatus::Committed;
+
+        if transitions_from_prepared {
+            // Validate against the still-hidden namespace before making the
+            // committed marker durable. Once the journal append succeeds,
+            // materialize the transaction directly into the live tables and
+            // capture rollback state for the table-batch append. This keeps
+            // the normal Prepared -> Committed path off the full-table clone
+            // used by replay/recovery while preserving the durable journal as
+            // the source of truth across an append failure or crash.
+            validate_namespace_prepare_shape(&self.tables, &self.shard_id, &prepare)?;
+            validate_namespace_prepare_expectations(&self.tables, &prepare)?;
+            validate_namespace_prepare_does_not_overlap(&self.tables, &prepare)?;
+            validate_namespace_transaction_preconditions(&self.tables, &prepare.transaction)?;
+
+            let entry =
+                self.write_journal_unlocked(DfsMetadataMutation::put_namespace_prepare(&prepare))?;
+            let mut table_ops = Vec::new();
+            let mut rollback = DfsMetadataTableRollback::default();
+            if let Err(error) = self.plan_namespace_transaction_table_ops(
+                &prepare.transaction,
+                &mut table_ops,
+                &mut rollback,
+            ) {
+                rollback.rollback(&mut self.tables);
+                return Err(error);
+            }
+            self.plan_preapplied_table_op(
+                DfsMetadataTableOp::PutNamespacePrepare { prepare },
+                &mut table_ops,
+                &mut rollback,
+            );
+            self.append_preapplied_table_ops_for_written_entries(
+                std::slice::from_ref(&entry),
+                entry.sequence,
+                table_ops,
+                rollback,
+            )?;
+            return Ok(entry);
+        }
+
+        // A repeated commit can be repairing a durable Committed marker whose
+        // namespace table batch was interrupted. Keep that idempotent recovery
+        // path on the recovery/reference planner.
         let mut table_ops =
             namespace_prepare_table_ops_for_record(&self.tables, &self.shard_id, &prepare)?;
         if table_ops.is_empty() {
@@ -4120,6 +4632,14 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         LocalSobjMetadataBackend::metadata_prefix_proof(self).map(Some)
     }
 
+    fn refresh_metadata_shard_durable_view(&mut self, shard_id: &DfsMetadataShardId) -> Result<()> {
+        if shard_id != &self.shard_id {
+            return Ok(());
+        }
+        let _lock = self.metadata_write_lock()?;
+        self.refresh_after_metadata_write_lock()
+    }
+
     fn metadata_shard_write_freeze(
         &self,
         shard_id: &DfsMetadataShardId,
@@ -4128,6 +4648,25 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             return Ok(None);
         }
         self.membership_handoff_write_freeze()
+    }
+
+    fn has_any_metadata_shard_write_freeze(&self) -> Result<bool> {
+        Ok(self.membership_handoff_write_freeze()?.is_some())
+    }
+
+    fn metadata_shard_authoritative_writes_frozen(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<bool> {
+        if shard_id != &self.shard_id {
+            return Ok(false);
+        }
+        let Some(freeze) = self.membership_handoff_write_freeze()? else {
+            return Ok(false);
+        };
+        Ok(!freeze
+            .activated_epoch
+            .is_some_and(|epoch| self.instance_authority_epoch == Some(epoch)))
     }
 
     fn freeze_metadata_shard_for_membership_handoff(
@@ -4141,6 +4680,18 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         }
         self.freeze_for_membership_handoff(handoff_id, retiring_epoch)
             .map(Some)
+    }
+
+    fn mark_metadata_shard_membership_handoff_activated(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        handoff_id: &str,
+        activated_epoch: u64,
+    ) -> Result<bool> {
+        if shard_id != &self.shard_id {
+            return Ok(false);
+        }
+        self.mark_membership_handoff_write_freeze_activated(handoff_id, activated_epoch)
     }
 
     fn clear_metadata_shard_membership_handoff_freeze(
@@ -4228,6 +4779,14 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         LocalSobjMetadataBackend::apply_journal_batch(self, batch)
     }
 
+    fn apply_journal_batch_with_replica_permit(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+    ) -> Result<usize> {
+        LocalSobjMetadataBackend::apply_journal_batch_with_replica_permit(self, permit, batch)
+    }
+
     fn replace_with_replicated_snapshot(
         &mut self,
         source_shard_id: DfsMetadataShardId,
@@ -4236,6 +4795,22 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     ) -> Result<bool> {
         LocalSobjMetadataBackend::replace_with_replicated_snapshot(
             self,
+            source_shard_id,
+            replayed_through_sequence,
+            snapshot,
+        )
+    }
+
+    fn replace_with_replicated_snapshot_with_replica_permit(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        source_shard_id: DfsMetadataShardId,
+        replayed_through_sequence: u64,
+        snapshot: DfsMetadataTableSnapshot,
+    ) -> Result<bool> {
+        LocalSobjMetadataBackend::replace_with_replicated_snapshot_with_replica_permit(
+            self,
+            permit,
             source_shard_id,
             replayed_through_sequence,
             snapshot,
@@ -4306,9 +4881,24 @@ impl LocalSobjMetadataBackend {
         table_ops: &mut Vec<DfsMetadataTableOp>,
         rollback: &mut DfsMetadataTableRollback,
     ) -> Result<()> {
-        for op in namespace_transaction_table_ops(&self.tables, transaction) {
-            self.plan_preapplied_table_op(op, table_ops, rollback);
-        }
+        let trace_started = Instant::now();
+        let planned_ops_before = table_ops.len();
+        let metadata_objects_before = self.tables.objects.len();
+        preapply_namespace_transaction_table_ops(
+            &mut self.tables,
+            transaction,
+            table_ops,
+            rollback,
+        );
+        metadata_backend_perf_trace(format_args!(
+            "metadata-namespace-plan planner=preapplied shard={} transaction={} objects={} metadata_objects_before={} planned_ops={} plan_us={}",
+            self.shard_id.0,
+            transaction.transaction_id,
+            transaction.objects.len(),
+            metadata_objects_before,
+            table_ops.len().saturating_sub(planned_ops_before),
+            trace_started.elapsed().as_micros()
+        ));
         Ok(())
     }
 
@@ -4941,6 +5531,12 @@ mod tests {
             Some(prepare.clone()),
             "structured snapshots must preserve hidden prepares"
         );
+        assert!(
+            reopened
+                .tables
+                .namespace_prepare_footprint_indexes_match_history(),
+            "structured snapshot hydration must reconstruct active prepare ownership"
+        );
         assert_eq!(
             reopened
                 .get_object(&current.object_id)
@@ -4963,6 +5559,7 @@ mod tests {
             Some(current.clone())
         );
 
+        reset_namespace_prepared_commit_reference_planner_calls();
         let commit_entry = reopened
             .commit_prepared_namespace_transaction(
                 &prepare.operation_id,
@@ -4970,6 +5567,11 @@ mod tests {
                 prepare.owner_epoch,
             )
             .expect("commit prepared namespace transaction");
+        assert_eq!(
+            namespace_prepared_commit_reference_planner_calls(),
+            0,
+            "the normal prepared commit must preapply directly instead of using the reference clone planner"
+        );
         assert!(matches!(
             commit_entry.mutation,
             DfsMetadataMutation::PutNamespacePrepare {
@@ -4990,12 +5592,31 @@ mod tests {
                 .map(|record| record.status),
             Some(DfsNamespacePrepareStatus::Committed)
         );
+        assert!(
+            reopened
+                .tables
+                .namespace_prepare_footprint_indexes_match_history(),
+            "Prepared -> Committed table apply must release active ownership"
+        );
         assert_eq!(
             reopened
                 .get_namespace_transaction(&prepare.transaction.transaction_id)
                 .expect("committed transaction"),
             Some(prepare.transaction.clone()),
             "the visible transaction and committed marker must share one table batch"
+        );
+        reopened
+            .commit_prepared_namespace_transaction(
+                &prepare.operation_id,
+                &prepare.operation_digest,
+                prepare.owner_epoch,
+            )
+            .expect("repeated committed transaction uses the idempotent recovery path");
+        assert_eq!(
+            reopened
+                .get_object(&current.object_id)
+                .expect("object after repeated commit"),
+            Some(committed.clone())
         );
 
         drop(reopened);
@@ -5013,6 +5634,20 @@ mod tests {
                 .map(|record| record.status),
             Some(DfsNamespacePrepareStatus::Committed)
         );
+        assert!(
+            reopened
+                .tables
+                .namespace_prepare_footprint_indexes_match_history(),
+            "snapshot plus table-log replay must retain terminal release"
+        );
+        let mut reuse_after_reopen = prepare;
+        reuse_after_reopen.operation_id = "operation-reuse-after-reopen".to_string();
+        reuse_after_reopen.transaction.transaction_id =
+            "transaction:reuse-after-reopen".to_string();
+        reset_namespace_prepare_history_scan_calls();
+        validate_namespace_prepare_does_not_overlap(&reopened.tables, &reuse_after_reopen)
+            .expect("terminal history must not block its released footprint after reopen");
+        assert_eq!(namespace_prepare_history_scan_calls(), 0);
 
         cleanup(&root);
     }
@@ -5225,9 +5860,15 @@ mod tests {
         overlap.operation_id = "operation-overlap".to_string();
         overlap.operation_digest = "blake3:operation-overlap".to_string();
         overlap.transaction.transaction_id = "transaction:operation-overlap".to_string();
+        reset_namespace_prepare_history_scan_calls();
         let overlap_error = backend
             .prepare_namespace_transaction(&overlap)
             .expect_err("active footprint overlap must reject prepare");
+        assert_eq!(
+            namespace_prepare_history_scan_calls(),
+            0,
+            "ordinary prepare admission must not scan retained prepare history"
+        );
         assert!(
             overlap_error
                 .to_string()
@@ -5266,6 +5907,141 @@ mod tests {
         );
 
         cleanup(&root);
+    }
+
+    #[test]
+    fn namespace_prepare_footprint_index_matches_reference_lifecycle_and_scope() {
+        fn assert_overlap_equivalent(
+            tables: &DfsMetadataTables,
+            candidate: &DfsNamespacePrepareRecord,
+            expected_accept: bool,
+        ) {
+            reset_namespace_prepare_history_scan_calls();
+            let indexed = validate_namespace_prepare_does_not_overlap(tables, candidate).is_ok();
+            assert_eq!(
+                namespace_prepare_history_scan_calls(),
+                0,
+                "the indexed validator must never call the history-scan oracle"
+            );
+            let reference =
+                validate_namespace_prepare_does_not_overlap_reference(tables, candidate).is_ok();
+            assert_eq!(indexed, reference, "indexed/reference decision mismatch");
+            assert_eq!(indexed, expected_accept, "unexpected overlap decision");
+        }
+
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let current = object(version("version_footprint_active_1"));
+        let mut committed = current.clone();
+        committed.version = version("version_footprint_active_2");
+        let active = namespace_prepare(
+            "operation-footprint-active",
+            &shard_id.0,
+            &current,
+            committed,
+        );
+        let mut tables = DfsMetadataTables::default();
+        tables.apply(DfsMetadataTableOp::PutNamespacePrepare {
+            prepare: active.clone(),
+        });
+        assert!(tables.namespace_prepare_footprint_indexes_match_history());
+
+        assert_overlap_equivalent(&tables, &active, true);
+
+        let mut same_object = current.clone();
+        same_object.path = "/docs/object-conflict-only.md".to_string();
+        let mut same_object_target = same_object.clone();
+        same_object_target.version = version("version_footprint_object_conflict");
+        let object_conflict = namespace_prepare(
+            "operation-footprint-object-conflict",
+            &shard_id.0,
+            &same_object,
+            same_object_target,
+        );
+        assert_overlap_equivalent(&tables, &object_conflict, false);
+
+        let mut same_path = current.clone();
+        same_path.object_id =
+            DfsObjectId::from_legacy_named("obj_footprint_path_conflict").expect("object id");
+        let mut same_path_target = same_path.clone();
+        same_path_target.version = version("version_footprint_path_conflict");
+        let path_conflict = namespace_prepare(
+            "operation-footprint-path-conflict",
+            &shard_id.0,
+            &same_path,
+            same_path_target,
+        );
+        assert_overlap_equivalent(&tables, &path_conflict, false);
+
+        let mut disjoint = same_path.clone();
+        disjoint.path = "/docs/disjoint.md".to_string();
+        let mut disjoint_target = disjoint.clone();
+        disjoint_target.version = version("version_footprint_disjoint");
+        let disjoint_prepare = namespace_prepare(
+            "operation-footprint-disjoint",
+            &shard_id.0,
+            &disjoint,
+            disjoint_target,
+        );
+        assert_overlap_equivalent(&tables, &disjoint_prepare, true);
+
+        let mut other_file_system = current.clone();
+        other_file_system.file_system_id =
+            DfsFileSystemId::from_legacy_named("sifs-footprint-other").expect("filesystem id");
+        let mut other_file_system_target = other_file_system.clone();
+        other_file_system_target.version = version("version_footprint_other_fs");
+        let cross_file_system = namespace_prepare(
+            "operation-footprint-other-fs",
+            &shard_id.0,
+            &other_file_system,
+            other_file_system_target,
+        );
+        assert_overlap_equivalent(&tables, &cross_file_system, true);
+        tables.apply(DfsMetadataTableOp::PutNamespacePrepare {
+            prepare: cross_file_system,
+        });
+        assert!(tables.namespace_prepare_footprint_indexes_match_history());
+
+        let mut committed_active = active.clone();
+        committed_active.status = DfsNamespacePrepareStatus::Committed;
+        tables.apply(DfsMetadataTableOp::PutNamespacePrepare {
+            prepare: committed_active,
+        });
+        let mut replacement = active.clone();
+        replacement.operation_id = "operation-footprint-replacement".to_string();
+        replacement.transaction.transaction_id = "transaction:footprint-replacement".to_string();
+        assert_overlap_equivalent(&tables, &replacement, true);
+        tables.apply(DfsMetadataTableOp::PutNamespacePrepare {
+            prepare: replacement.clone(),
+        });
+
+        let mut aborted_replacement = replacement.clone();
+        aborted_replacement.status = DfsNamespacePrepareStatus::Aborted;
+        tables.apply(DfsMetadataTableOp::PutNamespacePrepare {
+            prepare: aborted_replacement,
+        });
+        let mut after_abort = replacement;
+        after_abort.operation_id = "operation-footprint-after-abort".to_string();
+        after_abort.transaction.transaction_id = "transaction:footprint-after-abort".to_string();
+        assert_overlap_equivalent(&tables, &after_abort, true);
+        assert!(tables.namespace_prepare_footprint_indexes_match_history());
+
+        let before_preapply = tables.clone();
+        let mut rollback = DfsMetadataTableRollback::default();
+        tables.apply_with_rollback(
+            DfsMetadataTableOp::PutNamespacePrepare {
+                prepare: after_abort.clone(),
+            },
+            &mut rollback,
+        );
+        let mut blocked_during_preapply = after_abort;
+        blocked_during_preapply.operation_id =
+            "operation-footprint-preapplied-conflict".to_string();
+        blocked_during_preapply.transaction.transaction_id =
+            "transaction:footprint-preapplied-conflict".to_string();
+        assert_overlap_equivalent(&tables, &blocked_during_preapply, false);
+        rollback.rollback(&mut tables);
+        assert_eq!(tables, before_preapply);
+        assert!(tables.namespace_prepare_footprint_indexes_match_history());
     }
 
     #[test]
@@ -5321,6 +6097,94 @@ mod tests {
                 .expect("object shard index")
                 .map(|index| index.shard_id),
             Some(DfsMetadataShardId::new("services"))
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_namespace_prepare_expectations_use_one_exact_table_snapshot() {
+        let root = temp_root("sharded_namespace_prepare_expectations_one_snapshot");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+
+        let mut moving = object(version("version_snapshot_moving_1"));
+        moving.path = "/services/from.txt".to_string();
+        let mut occupant = object(version("version_snapshot_occupant_1"));
+        occupant.object_id =
+            DfsObjectId::from_legacy_named("obj_namespace_snapshot_occupant").expect("object id");
+        occupant.path = "/services/to.txt".to_string();
+        backend.put_object(&moving).expect("moving object");
+        backend.put_object(&occupant).expect("target occupant");
+
+        let mut moved = moving.clone();
+        moved.path = occupant.path.clone();
+        moved.version = version("version_snapshot_moving_2");
+        let transaction = DfsNamespaceTransaction {
+            transaction_id: "transaction:one-snapshot".to_string(),
+            file_system_id: moving.file_system_id.clone(),
+            objects: vec![moved],
+            versions: Vec::new(),
+            advisory_lock_states: Vec::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+
+        reset_metadata_current_tables_snapshot_calls();
+        let (object_expectations, path_expectations, paths) = backend
+            .namespace_prepare_expectations(&DfsMetadataShardId::new("services"), &transaction)
+            .expect("namespace expectations");
+        assert_eq!(
+            metadata_current_tables_snapshot_calls(),
+            1,
+            "the sharded/local fast path must project every expectation from one table snapshot"
+        );
+        assert_eq!(
+            paths,
+            std::collections::BTreeSet::from([moving.path.clone(), occupant.path.clone()]),
+            "the immutable snapshot must contribute the moving object's current path"
+        );
+        assert_eq!(object_expectations.len(), 2);
+        assert_eq!(path_expectations.len(), 2);
+        assert_eq!(
+            object_expectations
+                .iter()
+                .find(|expected| expected.object_id == moving.object_id)
+                .and_then(|expected| expected.expected_version.as_ref()),
+            Some(&moving.version)
+        );
+        assert_eq!(
+            object_expectations
+                .iter()
+                .find(|expected| expected.object_id == occupant.object_id)
+                .and_then(|expected| expected.expected_version.as_ref()),
+            Some(&occupant.version),
+            "the target-path occupant version must come from the same snapshot"
+        );
+        assert_eq!(
+            path_expectations
+                .iter()
+                .find(|expected| expected.path == moving.path)
+                .and_then(|expected| expected.expected_object_id.as_ref()),
+            Some(&moving.object_id)
+        );
+        assert_eq!(
+            path_expectations
+                .iter()
+                .find(|expected| expected.path == occupant.path)
+                .and_then(|expected| expected.expected_object_id.as_ref()),
+            Some(&occupant.object_id)
         );
 
         cleanup(&root);
@@ -6756,6 +7620,112 @@ mod tests {
     }
 
     #[test]
+    fn sharded_path_and_hydration_reads_ignore_stale_or_missing_replica_index() {
+        let root = temp_root("sharded_path_stale_replica_index");
+        let file_system = file_system();
+        let mut services = object(version("version_services_anchor"));
+        services.object_id =
+            DfsObjectId::from_legacy_named("obj_services_anchor").expect("object id");
+        services.path = "/services".to_string();
+        services.kind = DfsObjectKind::Directory;
+        services.content_hash = None;
+        services.content_size_bytes = None;
+
+        {
+            let mut root_only = LocalShardedMetadataBackend::new(
+                &root,
+                vec![shard_config("root", DfsMetadataShardAssignment::Root)],
+            )
+            .expect("root backend");
+            root_only.put_file_system(&file_system).expect("filesystem");
+            root_only.put_object(&services).expect("root anchor");
+        }
+
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        backend
+            .migrate_objects_to_configured_shards(&file_system.file_system_id, 8)
+            .expect("migrate anchor");
+        let root_shard_id = DfsMetadataShardId::new("root");
+        let services_shard_id = DfsMetadataShardId::new("services");
+        assert_eq!(
+            backend
+                .shard_backend(&root_shard_id)
+                .expect("root shard")
+                .get_object(&services.object_id)
+                .expect("root row")
+                .expect("source tombstone")
+                .kind,
+            DfsObjectKind::Tombstone
+        );
+        assert_eq!(
+            backend
+                .shard_backend(&services_shard_id)
+                .expect("services shard")
+                .get_object(&services.object_id)
+                .expect("services row"),
+            Some(services.clone())
+        );
+
+        for replica_index in [Some(root_shard_id.clone()), None] {
+            match replica_index {
+                Some(ref shard_id) => backend
+                    .write_object_shard_index(&services, shard_id)
+                    .expect("stale replica index"),
+                None => std::fs::remove_file(backend.object_shard_index_path(&services.object_id))
+                    .expect("remove replica index"),
+            }
+            assert_eq!(
+                backend
+                    .get_object_by_path(&file_system.file_system_id, &services.path)
+                    .expect("path lookup"),
+                Some(services.clone()),
+                "path-selected live row must not depend on a derived replica index"
+            );
+            assert_eq!(
+                backend.get_object(&services.object_id).expect("id lookup"),
+                Some(services.clone()),
+                "by-id lookup must not select the retired source tombstone"
+            );
+            assert_eq!(
+                backend
+                    .objects_for_file_system(&file_system.file_system_id)
+                    .expect("hydration scan"),
+                vec![services.clone()],
+                "merged hydration must expose only the routed live row"
+            );
+        }
+
+        backend
+            .write_object_shard_index(&services, &root_shard_id)
+            .expect("stale index before refresh");
+        backend
+            .refresh_metadata_shard_durable_view(&services_shard_id)
+            .expect("refresh services view");
+        assert_eq!(
+            backend
+                .read_object_shard_index(&services.object_id)
+                .expect("repaired index")
+                .map(|index| index.shard_id),
+            Some(services_shard_id),
+            "durable-view refresh must repair derived placement after visibility is established"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn sharded_backend_pages_and_counts_hardlinks_across_shards() {
         let root = temp_root("sharded_backend_pages_hardlinks");
         let mut backend = LocalShardedMetadataBackend::new(
@@ -7913,6 +8883,117 @@ mod tests {
     }
 
     #[test]
+    fn local_backend_recovers_durable_journal_tail_before_same_instance_retry() {
+        let root = temp_root("local_backend_same_instance_journal_tail_recovery");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend
+            .persist_current_metadata_checkpoint_unlocked()
+            .expect("checkpoint table head before injected append failure");
+
+        let mut durable_only = object(version("version_1"));
+        durable_only.object_id =
+            DfsObjectId::from_legacy_named("obj_durable_table_gap").expect("object id");
+        durable_only.path = "/docs/durable-table-gap.md".to_string();
+        let table_path = metadata_table_path(&root);
+        let error = {
+            let _lock = backend.begin_metadata_write().expect("metadata write lock");
+            let durable_only = normalized_object_metadata(&durable_only);
+            let previous = backend
+                .get_object(&durable_only.object_id)
+                .expect("previous object");
+            let entry = backend
+                .write_journal_unlocked(DfsMetadataMutation::put_object(&durable_only))
+                .expect("durable journal append");
+            let mut table_ops = Vec::new();
+            let mut rollback = DfsMetadataTableRollback::default();
+            backend
+                .plan_object_index_table_ops_with_previous(
+                    &durable_only,
+                    previous.as_ref(),
+                    &mut table_ops,
+                    &mut rollback,
+                )
+                .expect("preapplied table plan");
+            assert!(
+                backend.tables.objects.contains_key(&durable_only.object_id),
+                "the injected failure cut starts after in-memory preapply"
+            );
+            fs::remove_file(&table_path).expect("remove empty table log");
+            fs::create_dir(&table_path).expect("block table-log append with a directory");
+            backend
+                .append_preapplied_table_ops(entry.sequence, table_ops, rollback)
+                .expect_err("table append fails after the durable journal append")
+        };
+        assert!(matches!(error, MetadataBackendError::Io { .. }));
+        assert!(
+            !backend.tables.objects.contains_key(&durable_only.object_id),
+            "failed materialization must not expose the durable-only object"
+        );
+        assert_eq!(
+            backend.journal_since(0).expect("durable journal").len(),
+            2,
+            "the failed operation must remain durable after the filesystem record"
+        );
+
+        fs::remove_dir(&table_path).expect("restore table-log path");
+        let mut successor = object(version("version_2"));
+        successor.object_id =
+            DfsObjectId::from_legacy_named("obj_after_table_gap").expect("object id");
+        successor.path = "/docs/after-table-gap.md".to_string();
+        backend
+            .put_object(&successor)
+            .expect("same handle recovers the durable tail before admitting a successor");
+
+        assert_eq!(
+            backend
+                .get_object(&durable_only.object_id)
+                .expect("recovered object"),
+            Some(durable_only.clone())
+        );
+        assert_eq!(
+            backend
+                .get_object(&successor.object_id)
+                .expect("successor object"),
+            Some(successor.clone())
+        );
+        let journal = backend.journal_since(0).expect("contiguous journal");
+        assert_eq!(
+            journal
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(backend.materialized_through_sequence, 3);
+        assert_eq!(
+            backend
+                .metadata_prefix_proof()
+                .expect("recovered prefix proof")
+                .journal_sequence,
+            3
+        );
+
+        drop(backend);
+        let reopened = LocalSobjMetadataBackend::new(shard_id, &root).expect("reopen backend");
+        assert_eq!(
+            reopened
+                .get_object(&durable_only.object_id)
+                .expect("reopened recovered object"),
+            Some(durable_only)
+        );
+        assert_eq!(
+            reopened
+                .get_object(&successor.object_id)
+                .expect("reopened successor object"),
+            Some(successor)
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn local_backend_replays_journal_entries_after_materialization_cursor() {
         let root = temp_root("local_backend_replays_after_materialization_cursor");
         let object = object(version("version_1"));
@@ -8949,7 +10030,7 @@ mod tests {
     }
 
     #[test]
-    fn local_backend_reopen_uses_head_and_cursor_without_scanning_consumed_segments() {
+    fn local_backend_reopen_scans_only_the_highest_segment() {
         let root = temp_root("local_backend_reopen_uses_head_and_cursor");
         let shard_id = DfsMetadataShardId::new("shard-root");
         let file_system = file_system();
@@ -8990,9 +10071,8 @@ mod tests {
             },
         )
         .expect("local cursor");
-        // The cursor/head fast path is valid only when the materialized image
-        // carries the matching installed checkpoint. Do not ask a prefix at 2
-        // to skip unproven history up to the synthetic high sequence.
+        // The bounded reopen scan reads only the highest segment. Do not ask a
+        // prefix at 2 to skip unproven history up to the synthetic sequence.
         backend.materialized_through_sequence = high_sequence;
         backend.prefix_proof = Some(
             backend
@@ -9028,7 +10108,7 @@ mod tests {
     }
 
     #[test]
-    fn local_backend_reopen_uses_matching_head_and_cursor_for_corrupt_current_segment() {
+    fn local_backend_reopen_tolerates_torn_fully_materialized_current_segment() {
         let root = temp_root("local_backend_reopen_with_corrupt_current_segment");
         let shard_id = DfsMetadataShardId::new("shard-root");
         let file_system = file_system();
@@ -9061,8 +10141,11 @@ mod tests {
         .expect("corrupt consumed current segment");
         drop(backend);
 
+        // The reopen scan still examines the current segment. The segmented
+        // reader may truncate a torn consumed tail because the exact table
+        // checkpoint already proves the materialized prefix through two.
         let reopened = LocalSobjMetadataBackend::new(shard_id, &root)
-            .expect("reopen should trust matching head and cursor");
+            .expect("reopen from the exact materialized checkpoint");
         assert_eq!(
             reopened.get_object(&object.object_id).expect("object"),
             Some(object)
@@ -9070,8 +10153,133 @@ mod tests {
         assert!(
             reopened
                 .journal_since(2)
-                .expect("journal after cursor")
+                .expect("journal after materialized prefix")
                 .is_empty()
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_reopen_repairs_matching_stale_head_and_cursor() {
+        let root = temp_root("local_backend_reopen_repairs_matching_stale_hints");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let file_system = file_system();
+        let first_object = object(version("version_1"));
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        assert_eq!(
+            backend
+                .put_file_system(&file_system)
+                .expect("filesystem")
+                .sequence,
+            1
+        );
+        assert_eq!(
+            backend.put_object(&first_object).expect("object").sequence,
+            2
+        );
+
+        // Reproduce the Docker restart cut: both deferred hints agree at one
+        // while the segment and exact materialized prefix are already at two.
+        write_sobj_atomic(
+            &root.join("journal").join("head.sobj"),
+            &DfsMetadataJournalHead { next_sequence: 2 },
+        )
+        .expect("stale journal head");
+        write_sobj_atomic(
+            &backend.local_materialization_cursor_path(),
+            &DfsMetadataReplayCursor {
+                shard_id: shard_id.clone(),
+                last_sequence: 1,
+            },
+        )
+        .expect("stale local cursor");
+        drop(backend);
+
+        let mut reopened = LocalSobjMetadataBackend::new(shard_id.clone(), &root)
+            .expect("reopen repairs the stale hints from the durable segment");
+        assert_eq!(reopened.journal_last_sequence(), 2);
+        assert_eq!(
+            reopened
+                .metadata_prefix_proof()
+                .expect("exact repaired prefix")
+                .journal_sequence,
+            2
+        );
+        let mut successor = object(version("version_2"));
+        successor.object_id =
+            DfsObjectId::from_legacy_named("obj_after_stale_head_repair").expect("object id");
+        successor.path = "/docs/after-stale-head-repair.md".to_string();
+        assert_eq!(
+            reopened
+                .put_object(&successor)
+                .expect("successor append")
+                .sequence,
+            3,
+            "reopen must not reuse the already durable sequence two"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_reopen_repairs_journal_only_tail_behind_matching_hints() {
+        let root = temp_root("local_backend_reopen_repairs_journal_only_stale_hints");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let file_system = file_system();
+        let first_object = object(version("version_1"));
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        assert_eq!(
+            backend
+                .put_file_system(&file_system)
+                .expect("filesystem")
+                .sequence,
+            1
+        );
+        write_sobj_atomic(
+            &root.join("journal").join("head.sobj"),
+            &DfsMetadataJournalHead { next_sequence: 2 },
+        )
+        .expect("journal head");
+        write_sobj_atomic(
+            &backend.local_materialization_cursor_path(),
+            &DfsMetadataReplayCursor {
+                shard_id: shard_id.clone(),
+                last_sequence: 1,
+            },
+        )
+        .expect("local cursor");
+        append_segmented_journal_entry(
+            &root,
+            &DfsMetadataJournalEntry {
+                shard_id: shard_id.clone(),
+                sequence: 2,
+                created_at: OffsetDateTime::now_utc(),
+                mutation: DfsMetadataMutation::put_object(&first_object),
+            },
+        )
+        .expect("durable journal-only tail");
+        drop(backend);
+
+        let mut reopened = LocalSobjMetadataBackend::new(shard_id, &root)
+            .expect("reopen discovers and materializes the journal-only tail");
+        assert_eq!(
+            reopened
+                .get_object(&first_object.object_id)
+                .expect("object"),
+            Some(first_object.clone())
+        );
+        assert_eq!(reopened.journal_last_sequence(), 2);
+        let mut successor = object(version("version_2"));
+        successor.object_id =
+            DfsObjectId::from_legacy_named("obj_after_journal_tail_repair").expect("object id");
+        successor.path = "/docs/after-journal-tail-repair.md".to_string();
+        assert_eq!(
+            reopened
+                .put_object(&successor)
+                .expect("successor append")
+                .sequence,
+            3
         );
 
         cleanup(&root);
@@ -11562,8 +12770,15 @@ mod tests {
             .expect_err("conflicting duplicate must make ordinary replay fail");
         assert!(open_error.to_string().contains("cannot extend prefix"));
 
+        let permit = DfsMetadataReplicaIngestPermit::new_validated(
+            file_system.file_system_id.clone(),
+            shard_id.clone(),
+            node("node_unreadable_snapshot_source"),
+            1,
+        );
         let (repaired, archived) =
             LocalSobjMetadataBackend::replace_unreadable_with_replicated_snapshot(
+                &permit,
                 shard_id.clone(),
                 &replica_root,
                 shard_id.clone(),
@@ -12944,6 +14159,453 @@ mod tests {
             .put_object(&object(version("version_after_handoff_activation")))
             .expect("normal metadata append resumes after activation");
         assert!(reopened.journal_last_sequence() > frozen_head);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn activated_membership_marker_does_not_bind_retiring_backend() {
+        let root = temp_root("membership-handoff-nonbinding-activation");
+        let metadata_root = root.join("metadata");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut retiring = LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root)
+            .expect("retiring metadata backend");
+        retiring
+            .put_file_system(&file_system())
+            .expect("filesystem");
+        let frozen_head = retiring.journal_last_sequence();
+
+        retiring
+            .freeze_metadata_shard_for_membership_handoff(
+                &shard_id,
+                "handoff-nonbinding-activation",
+                17,
+            )
+            .expect("freeze retiring generation")
+            .expect("local shard");
+        assert!(
+            retiring
+                .mark_metadata_shard_membership_handoff_activated(
+                    &shard_id,
+                    "handoff-nonbinding-activation",
+                    18,
+                )
+                .expect("durably mark activated generation")
+        );
+        assert_eq!(retiring.instance_authority_epoch, None);
+        assert_eq!(
+            retiring
+                .metadata_shard_write_freeze(&shard_id)
+                .expect("read activated marker")
+                .and_then(|marker| marker.activated_epoch),
+            Some(18)
+        );
+        assert!(matches!(
+            retiring.put_object(&object(version("version_retiring_stays_frozen"))),
+            Err(MetadataBackendError::MembershipHandoffFrozen {
+                ref handoff_id,
+                ..
+            }) if handoff_id == "handoff-nonbinding-activation"
+        ));
+        assert_eq!(retiring.journal_last_sequence(), frozen_head);
+
+        assert!(
+            retiring
+                .clear_metadata_shard_membership_handoff_freeze(
+                    &shard_id,
+                    "handoff-nonbinding-activation",
+                    18,
+                )
+                .expect("fresh authority observer binds exact activated generation")
+        );
+        assert_eq!(retiring.instance_authority_epoch, Some(18));
+        retiring
+            .put_object(&object(version("version_after_explicit_bind")))
+            .expect("explicitly rebound generation may append");
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn activated_retiring_backend_accepts_replica_ingest_without_binding_authority() {
+        let root = temp_root("membership-handoff-retiring-replica-ingest");
+        let shard_id = DfsMetadataShardId::new("root");
+        let active_source_node_id = node("active-successor");
+        let mut source = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("source"))
+            .expect("source metadata backend");
+        let mut retiring = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("retiring"))
+            .expect("retiring metadata backend");
+
+        source
+            .put_file_system(&file_system())
+            .expect("source filesystem");
+        let initial = source
+            .journal_batch_since_limited(0, 16, usize::MAX)
+            .expect("initial source batch")
+            .expect("initial source entries");
+        retiring
+            .apply_journal_batch(&initial)
+            .expect("seed retiring replica");
+        assert_eq!(
+            retiring.metadata_prefix_proof().expect("retiring proof"),
+            source.metadata_prefix_proof().expect("source proof")
+        );
+
+        retiring
+            .freeze_metadata_shard_for_membership_handoff(
+                &shard_id,
+                "handoff-retiring-replica-ingest",
+                17,
+            )
+            .expect("freeze retiring generation")
+            .expect("local shard");
+
+        let replicated_object = object(version("version_retiring_replica_batch"));
+        source
+            .put_object(&replicated_object)
+            .expect("successor object");
+        let batch = source
+            .journal_batch_since_limited(initial.next_after_sequence, 16, usize::MAX)
+            .expect("successor journal batch")
+            .expect("successor journal entries");
+        let exact_permit = DfsMetadataReplicaIngestPermit::new_validated(
+            file_system_id(),
+            shard_id.clone(),
+            active_source_node_id.clone(),
+            18,
+        );
+        let later_current_permit = DfsMetadataReplicaIngestPermit::new_validated(
+            file_system_id(),
+            shard_id.clone(),
+            active_source_node_id.clone(),
+            20,
+        );
+        assert!(matches!(
+            retiring.apply_journal_batch(&batch),
+            Err(MetadataBackendError::MembershipHandoffFrozen { .. })
+        ));
+        assert!(matches!(
+            retiring.apply_journal_batch_with_replica_permit(&exact_permit, &batch),
+            Err(MetadataBackendError::MembershipHandoffFrozen { .. })
+        ));
+
+        assert!(
+            retiring
+                .mark_metadata_shard_membership_handoff_activated(
+                    &shard_id,
+                    "handoff-retiring-replica-ingest",
+                    18,
+                )
+                .expect("mark successor generation activated")
+        );
+        assert_eq!(retiring.instance_authority_epoch, None);
+        assert!(
+            retiring
+                .metadata_shard_authoritative_writes_frozen(&shard_id)
+                .expect("author fence")
+        );
+        assert!(matches!(
+            retiring.apply_journal_batch(&batch),
+            Err(MetadataBackendError::MembershipHandoffFrozen { .. })
+        ));
+        let wrong_shard_permit = DfsMetadataReplicaIngestPermit::new_validated(
+            file_system_id(),
+            DfsMetadataShardId::new("services"),
+            active_source_node_id.clone(),
+            18,
+        );
+        assert!(matches!(
+            retiring.apply_journal_batch_with_replica_permit(&wrong_shard_permit, &batch),
+            Err(MetadataBackendError::Serde(_))
+        ));
+        let stale_epoch_permit = DfsMetadataReplicaIngestPermit::new_validated(
+            file_system_id(),
+            shard_id.clone(),
+            active_source_node_id.clone(),
+            17,
+        );
+        assert!(matches!(
+            retiring.apply_journal_batch_with_replica_permit(&stale_epoch_permit, &batch),
+            Err(MetadataBackendError::MembershipHandoffFrozen { .. })
+        ));
+
+        let foreign_file_system_id =
+            DfsFileSystemId::from_legacy_named("fs_foreign_replica_ingest")
+                .expect("foreign filesystem");
+        let wrong_file_system_permit = DfsMetadataReplicaIngestPermit::new_validated(
+            foreign_file_system_id.clone(),
+            shard_id.clone(),
+            active_source_node_id,
+            18,
+        );
+        let before_rejected_batches = retiring.export_table_snapshot();
+        let before_rejected_batch_head = retiring.journal_last_sequence();
+        reset_metadata_begin_write_calls();
+
+        let wrong_file_system_error = retiring
+            .apply_journal_batch_with_replica_permit(&wrong_file_system_permit, &batch)
+            .expect_err("foreign-filesystem permit must reject a target batch");
+        assert!(
+            wrong_file_system_error
+                .to_string()
+                .contains("permit filesystem")
+        );
+
+        let mut embedded_mismatch_batch = batch.clone();
+        let DfsMetadataMutation::PutObject {
+            object: Some(embedded_object),
+            ..
+        } = &mut embedded_mismatch_batch.entries[0].mutation
+        else {
+            panic!("expected replicated object mutation");
+        };
+        embedded_object.file_system_id = foreign_file_system_id.clone();
+        let embedded_mismatch_error = retiring
+            .apply_journal_batch_with_replica_permit(&exact_permit, &embedded_mismatch_batch)
+            .expect_err("outer and embedded filesystem mismatch must reject");
+        assert!(
+            embedded_mismatch_error
+                .to_string()
+                .contains("object record filesystem")
+        );
+
+        let mut mixed_file_system_batch = batch.clone();
+        let mut foreign_entry = mixed_file_system_batch.entries[0].clone();
+        foreign_entry.sequence = foreign_entry.sequence.saturating_add(1);
+        let DfsMetadataMutation::PutObject {
+            file_system_id,
+            object_id,
+            path,
+            object: Some(foreign_object),
+        } = &mut foreign_entry.mutation
+        else {
+            panic!("expected replicated object mutation");
+        };
+        *file_system_id = foreign_file_system_id.clone();
+        *object_id =
+            DfsObjectId::from_legacy_named("obj_foreign_replica_ingest").expect("foreign object");
+        *path = "docs/foreign-replica-ingest.md".to_string();
+        foreign_object.file_system_id = foreign_file_system_id.clone();
+        foreign_object.object_id = object_id.clone();
+        foreign_object.path = path.clone();
+        mixed_file_system_batch.next_after_sequence = foreign_entry.sequence;
+        mixed_file_system_batch.entries.push(foreign_entry);
+        let mixed_file_system_error = retiring
+            .apply_journal_batch_with_replica_permit(&exact_permit, &mixed_file_system_batch)
+            .expect_err("mixed-filesystem batch must reject atomically");
+        assert!(
+            mixed_file_system_error
+                .to_string()
+                .contains("outer mutation filesystem")
+        );
+
+        assert_eq!(
+            metadata_begin_write_calls(),
+            0,
+            "filesystem validation must reject before writer-lock refresh"
+        );
+        assert_eq!(retiring.export_table_snapshot(), before_rejected_batches);
+        assert_eq!(retiring.journal_last_sequence(), before_rejected_batch_head);
+        assert_eq!(
+            retiring
+                .get_object(&replicated_object.object_id)
+                .expect("rejected object lookup"),
+            None,
+            "no valid prefix of a mixed batch may materialize"
+        );
+        assert_eq!(
+            retiring
+                .apply_journal_batch_with_replica_permit(&later_current_permit, &batch)
+                .expect("later current successor batch crosses older activated author fence"),
+            1
+        );
+        assert_eq!(
+            retiring.metadata_prefix_proof().expect("retiring proof"),
+            source.metadata_prefix_proof().expect("successor proof")
+        );
+        assert_eq!(retiring.instance_authority_epoch, None);
+        assert!(matches!(
+            retiring.put_object(&object(version(
+                "version_retiring_author_rejected_after_batch"
+            ))),
+            Err(MetadataBackendError::MembershipHandoffFrozen { .. })
+        ));
+
+        let snapshotted_object = {
+            let mut object = object(version("version_retiring_replica_snapshot"));
+            object.object_id =
+                DfsObjectId::from_legacy_named("obj_retiring_replica_snapshot").expect("object");
+            object.path = "docs/replica-snapshot.md".to_string();
+            object
+        };
+        source
+            .put_object(&snapshotted_object)
+            .expect("successor snapshot object");
+        let snapshot_sequence = source.journal_last_sequence();
+        let snapshot = source.export_table_snapshot();
+        assert!(matches!(
+            retiring.replace_with_replicated_snapshot(
+                shard_id.clone(),
+                snapshot_sequence,
+                snapshot.clone(),
+            ),
+            Err(MetadataBackendError::MembershipHandoffFrozen { .. })
+        ));
+        let before_rejected_snapshots = retiring.export_table_snapshot();
+        let before_rejected_snapshot_head = retiring.journal_last_sequence();
+        reset_metadata_begin_write_calls();
+
+        let wrong_file_system_snapshot_error = retiring
+            .replace_with_replicated_snapshot_with_replica_permit(
+                &wrong_file_system_permit,
+                shard_id.clone(),
+                snapshot_sequence,
+                snapshot.clone(),
+            )
+            .expect_err("foreign-filesystem permit must reject a target snapshot");
+        assert!(
+            wrong_file_system_snapshot_error
+                .to_string()
+                .contains("permit filesystem")
+        );
+
+        let mut mixed_file_system_snapshot = snapshot.clone();
+        let mut foreign_snapshot_object = snapshotted_object.clone();
+        foreign_snapshot_object.file_system_id = foreign_file_system_id;
+        foreign_snapshot_object.object_id =
+            DfsObjectId::from_legacy_named("obj_foreign_replica_snapshot")
+                .expect("foreign snapshot object");
+        foreign_snapshot_object.path = "docs/foreign-replica-snapshot.md".to_string();
+        mixed_file_system_snapshot
+            .tables
+            .as_mut()
+            .expect("structured snapshot tables")
+            .objects
+            .push(foreign_snapshot_object);
+        let mixed_snapshot_fingerprint =
+            dfs_metadata_table_snapshot_state_fingerprint(&mixed_file_system_snapshot)
+                .expect("mixed snapshot semantic fingerprint");
+        mixed_file_system_snapshot.semantic_state_fingerprint = Some(mixed_snapshot_fingerprint);
+        let mixed_file_system_snapshot_error = retiring
+            .replace_with_replicated_snapshot_with_replica_permit(
+                &exact_permit,
+                shard_id.clone(),
+                snapshot_sequence,
+                mixed_file_system_snapshot,
+            )
+            .expect_err("mixed-filesystem snapshot must reject atomically");
+        assert!(
+            mixed_file_system_snapshot_error
+                .to_string()
+                .contains("object record filesystem")
+        );
+
+        assert_eq!(
+            metadata_begin_write_calls(),
+            0,
+            "snapshot filesystem validation must reject before writer-lock refresh"
+        );
+        assert_eq!(retiring.export_table_snapshot(), before_rejected_snapshots);
+        assert_eq!(
+            retiring.journal_last_sequence(),
+            before_rejected_snapshot_head
+        );
+        assert_eq!(
+            retiring
+                .get_object(&snapshotted_object.object_id)
+                .expect("rejected snapshot object lookup"),
+            None,
+            "a rejected mixed snapshot must not replace any tables"
+        );
+        retiring
+            .replace_with_replicated_snapshot_with_replica_permit(
+                &later_current_permit,
+                shard_id.clone(),
+                snapshot_sequence,
+                snapshot,
+            )
+            .expect("later current successor snapshot crosses older activated author fence");
+        assert_eq!(
+            retiring.metadata_prefix_proof().expect("retiring proof"),
+            source.metadata_prefix_proof().expect("snapshot proof")
+        );
+        assert_eq!(
+            retiring
+                .get_object(&snapshotted_object.object_id)
+                .expect("snapshotted object"),
+            Some(snapshotted_object)
+        );
+        assert_eq!(retiring.instance_authority_epoch, None);
+        assert_eq!(
+            retiring
+                .metadata_shard_write_freeze(&shard_id)
+                .expect("preserved activated marker")
+                .and_then(|marker| marker.activated_epoch),
+            Some(18),
+            "snapshot repair must preserve the durable author fence"
+        );
+        assert!(
+            retiring
+                .metadata_shard_authoritative_writes_frozen(&shard_id)
+                .expect("author fence after snapshot")
+        );
+        assert!(matches!(
+            retiring.put_object(&object(version(
+                "version_retiring_author_rejected_after_snapshot"
+            ))),
+            Err(MetadataBackendError::MembershipHandoffFrozen { .. })
+        ));
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn completed_inactive_marker_can_be_replaced_by_later_reverse_rotation() {
+        let root = temp_root("membership-handoff-inactive-marker-replacement");
+        let metadata_root = root.join("metadata");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root)
+            .expect("metadata backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+
+        backend
+            .freeze_metadata_shard_for_membership_handoff(&shard_id, "handoff-away-from-local", 31)
+            .expect("freeze first retiring generation")
+            .expect("local shard");
+        backend
+            .mark_metadata_shard_membership_handoff_activated(
+                &shard_id,
+                "handoff-away-from-local",
+                32,
+            )
+            .expect("mark first handoff activated");
+        assert_eq!(backend.instance_authority_epoch, None);
+
+        // The node can later participate in a reverse rotation after the
+        // control plane has advanced beyond its last locally completed marker.
+        // Replacing that marker installs another pending fence; it does not
+        // bind this stale instance to either generation.
+        let reverse = backend
+            .freeze_metadata_shard_for_membership_handoff(&shard_id, "handoff-back-to-local", 34)
+            .expect("replace completed inactive marker")
+            .expect("local shard");
+        assert_eq!(reverse.handoff_id, "handoff-back-to-local");
+        assert_eq!(reverse.retiring_epoch, 34);
+        assert_eq!(reverse.activated_epoch, None);
+        assert_eq!(backend.instance_authority_epoch, None);
+        assert_eq!(
+            backend
+                .metadata_shard_write_freeze(&shard_id)
+                .expect("read reverse-rotation marker"),
+            Some(reverse)
+        );
+        assert!(matches!(
+            backend.put_object(&object(version("version_reverse_rotation_stays_frozen"))),
+            Err(MetadataBackendError::MembershipHandoffFrozen {
+                ref handoff_id,
+                ..
+            }) if handoff_id == "handoff-back-to-local"
+        ));
 
         cleanup(&root);
     }

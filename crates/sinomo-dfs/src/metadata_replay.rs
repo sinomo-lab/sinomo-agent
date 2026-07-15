@@ -4,10 +4,13 @@
 //! materialized tables. This module owns the small validation helpers used by
 //! replay paths so backend code can focus on applying mutations.
 
+use crate::DfsFileSystemId;
 use crate::metadata_api::DfsMetadataBackend;
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_receipt::receipt_for_replica_from_backend;
-use crate::metadata_records::{DfsMetadataJournalEntry, DfsMetadataMutation};
+use crate::metadata_records::{
+    DfsMetadataJournalEntry, DfsMetadataMutation, DfsNamespaceTransaction,
+};
 use crate::metadata_tables::DfsMetadataTables;
 
 pub(crate) fn required_replay_payload<'a, T>(
@@ -96,6 +99,231 @@ pub(crate) fn require_journal_entry_replay_payloads(entry: &DfsMetadataJournalEn
         }
     }
     Ok(())
+}
+
+fn require_replica_record_file_system(
+    entry: &DfsMetadataJournalEntry,
+    record_kind: &str,
+    actual: &DfsFileSystemId,
+    expected: &DfsFileSystemId,
+) -> Result<()> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(MetadataBackendError::Serde(format!(
+        "metadata replica journal entry {}:{} {record_kind} filesystem {actual} does not match permit filesystem {expected}",
+        entry.shard_id.0, entry.sequence
+    )))
+}
+
+fn require_replica_namespace_transaction_file_system(
+    entry: &DfsMetadataJournalEntry,
+    record_kind: &str,
+    transaction: &DfsNamespaceTransaction,
+    expected: &DfsFileSystemId,
+) -> Result<()> {
+    require_replica_record_file_system(entry, record_kind, &transaction.file_system_id, expected)?;
+    for object in &transaction.objects {
+        require_replica_record_file_system(
+            entry,
+            "namespace transaction object",
+            &object.file_system_id,
+            expected,
+        )?;
+    }
+    for version in &transaction.versions {
+        require_replica_record_file_system(
+            entry,
+            "namespace transaction version",
+            &version.file_system_id,
+            expected,
+        )?;
+    }
+    for state in &transaction.advisory_lock_states {
+        require_replica_record_file_system(
+            entry,
+            "namespace transaction advisory-lock state",
+            &state.file_system_id,
+            expected,
+        )?;
+    }
+    Ok(())
+}
+
+/// Validate the filesystem capability boundary for one replicated entry.
+///
+/// This checks both the mutation's outer routing identity and every typed
+/// embedded record before the durable backend takes its writer lock. The
+/// ordinary author path deliberately retains its existing replay semantics.
+pub(crate) fn require_replica_journal_entry_file_system(
+    entry: &DfsMetadataJournalEntry,
+    expected: &DfsFileSystemId,
+) -> Result<()> {
+    require_journal_entry_replay_payloads(entry)?;
+    let outer_file_system_id = match &entry.mutation {
+        DfsMetadataMutation::PutFileSystem { file_system_id, .. }
+        | DfsMetadataMutation::PutObject { file_system_id, .. }
+        | DfsMetadataMutation::PutVersion { file_system_id, .. }
+        | DfsMetadataMutation::PutReceipt { file_system_id, .. }
+        | DfsMetadataMutation::RemoveReceipt { file_system_id, .. }
+        | DfsMetadataMutation::PutIntent { file_system_id, .. }
+        | DfsMetadataMutation::CommitVisibleVersion { file_system_id, .. }
+        | DfsMetadataMutation::PutConflict { file_system_id, .. }
+        | DfsMetadataMutation::PutAdvisoryLockState { file_system_id, .. }
+        | DfsMetadataMutation::ApplyNamespaceTransaction { file_system_id, .. }
+        | DfsMetadataMutation::PutNamespacePrepare { file_system_id, .. }
+        | DfsMetadataMutation::PutNamespaceJob { file_system_id, .. } => file_system_id,
+    };
+    require_replica_record_file_system(entry, "outer mutation", outer_file_system_id, expected)?;
+
+    match &entry.mutation {
+        DfsMetadataMutation::PutFileSystem {
+            file_system: Some(file_system),
+            ..
+        } => require_replica_record_file_system(
+            entry,
+            "filesystem record",
+            &file_system.file_system_id,
+            expected,
+        ),
+        DfsMetadataMutation::PutObject {
+            object: Some(object),
+            ..
+        } => require_replica_record_file_system(
+            entry,
+            "object record",
+            &object.file_system_id,
+            expected,
+        ),
+        DfsMetadataMutation::PutVersion {
+            version_record: Some(version),
+            ..
+        } => require_replica_record_file_system(
+            entry,
+            "version record",
+            &version.file_system_id,
+            expected,
+        ),
+        DfsMetadataMutation::PutReceipt {
+            receipt: Some(receipt),
+            ..
+        } => require_replica_record_file_system(
+            entry,
+            "receipt record",
+            &receipt.receipt.file_system_id,
+            expected,
+        ),
+        DfsMetadataMutation::PutIntent {
+            intent: Some(intent),
+            ..
+        } => {
+            require_replica_record_file_system(
+                entry,
+                "intent record",
+                &intent.file_system_id,
+                expected,
+            )?;
+            if let Some(object) = intent.object_metadata.as_ref() {
+                require_replica_record_file_system(
+                    entry,
+                    "intent object record",
+                    &object.file_system_id,
+                    expected,
+                )?;
+            }
+            Ok(())
+        }
+        DfsMetadataMutation::CommitVisibleVersion {
+            committed_object: Some(object),
+            visible_version: Some(version),
+            ..
+        } => {
+            require_replica_record_file_system(
+                entry,
+                "visible-commit object record",
+                &object.file_system_id,
+                expected,
+            )?;
+            require_replica_record_file_system(
+                entry,
+                "visible-commit version record",
+                &version.file_system_id,
+                expected,
+            )
+        }
+        DfsMetadataMutation::PutConflict {
+            conflict: Some(conflict),
+            ..
+        } => require_replica_record_file_system(
+            entry,
+            "conflict record",
+            &conflict.file_system_id,
+            expected,
+        ),
+        DfsMetadataMutation::PutAdvisoryLockState {
+            state: Some(state), ..
+        } => require_replica_record_file_system(
+            entry,
+            "advisory-lock state",
+            &state.file_system_id,
+            expected,
+        ),
+        DfsMetadataMutation::ApplyNamespaceTransaction {
+            transaction: Some(transaction),
+            ..
+        } => require_replica_namespace_transaction_file_system(
+            entry,
+            "namespace transaction",
+            transaction,
+            expected,
+        ),
+        DfsMetadataMutation::PutNamespacePrepare {
+            prepare: Some(prepare),
+            ..
+        } => {
+            require_replica_record_file_system(
+                entry,
+                "namespace prepare",
+                &prepare.file_system_id,
+                expected,
+            )?;
+            require_replica_namespace_transaction_file_system(
+                entry,
+                "namespace prepare transaction",
+                &prepare.transaction,
+                expected,
+            )
+        }
+        DfsMetadataMutation::PutNamespaceJob { job: Some(job), .. } => {
+            require_replica_record_file_system(
+                entry,
+                "namespace job",
+                &job.file_system_id,
+                expected,
+            )
+        }
+        DfsMetadataMutation::RemoveReceipt { .. }
+        | DfsMetadataMutation::PutConflict { conflict: None, .. } => Ok(()),
+        // Payload completeness was checked above. These arms only keep this
+        // match exhaustive without re-unwrapping every option.
+        DfsMetadataMutation::PutFileSystem {
+            file_system: None, ..
+        }
+        | DfsMetadataMutation::PutObject { object: None, .. }
+        | DfsMetadataMutation::PutVersion {
+            version_record: None,
+            ..
+        }
+        | DfsMetadataMutation::PutReceipt { receipt: None, .. }
+        | DfsMetadataMutation::PutIntent { intent: None, .. }
+        | DfsMetadataMutation::CommitVisibleVersion { .. }
+        | DfsMetadataMutation::PutAdvisoryLockState { state: None, .. }
+        | DfsMetadataMutation::ApplyNamespaceTransaction {
+            transaction: None, ..
+        }
+        | DfsMetadataMutation::PutNamespacePrepare { prepare: None, .. }
+        | DfsMetadataMutation::PutNamespaceJob { job: None, .. } => Ok(()),
+    }
 }
 
 pub(crate) fn hydrate_journal_entry_payload<B: DfsMetadataBackend + ?Sized>(

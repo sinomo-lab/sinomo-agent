@@ -4,7 +4,7 @@
 //! table maps, secondary indexes, and rollback bookkeeping used while
 //! materializing journal entries.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -18,14 +18,15 @@ use crate::metadata_keys::{
 use crate::metadata_records::{
     DfsConflictRecord, DfsDirFragmentId, DfsDirFragmentRecord, DfsInodeId, DfsInodeRecord,
     DfsMetadataPrefixProof, DfsMetadataTableOp, DfsNamespaceJobRecord, DfsNamespacePrepareRecord,
-    DfsNamespaceTransaction, DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptRecord,
-    DfsVisibleVersionCommitRecord, DfsWriteIntentRecord, normalized_object_metadata,
+    DfsNamespacePrepareStatus, DfsNamespaceTransaction, DfsObjectVersionRecord, DfsPathRecord,
+    DfsReplicaReceiptRecord, DfsVisibleVersionCommitRecord, DfsWriteIntentRecord,
+    normalized_object_metadata,
 };
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
 };
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DfsMetadataTables {
     pub(crate) file_systems: BTreeMap<DfsFileSystemId, DfsFileSystem>,
     pub(crate) objects: BTreeMap<DfsObjectId, DfsObjectMetadata>,
@@ -48,6 +49,9 @@ pub(crate) struct DfsMetadataTables {
     pub(crate) visible_commits: BTreeMap<(DfsObjectId, DfsVersion), DfsVisibleVersionCommitRecord>,
     pub(crate) namespace_transactions: BTreeMap<String, DfsNamespaceTransaction>,
     pub(crate) namespace_prepares: BTreeMap<String, DfsNamespacePrepareRecord>,
+    namespace_prepare_object_owners:
+        BTreeMap<DfsFileSystemId, BTreeMap<DfsObjectId, BTreeSet<String>>>,
+    namespace_prepare_path_owners: BTreeMap<DfsFileSystemId, BTreeMap<String, BTreeSet<String>>>,
     pub(crate) namespace_jobs: BTreeMap<String, DfsNamespaceJobRecord>,
 }
 
@@ -105,6 +109,36 @@ pub(crate) fn max_optional_sequence(left: Option<u64>, right: Option<u64>) -> Op
     }
 }
 
+pub(crate) fn namespace_prepare_footprint(
+    prepare: &DfsNamespacePrepareRecord,
+) -> (BTreeSet<DfsObjectId>, BTreeSet<String>) {
+    let mut object_ids = prepare
+        .expected_object_versions
+        .iter()
+        .map(|expected| expected.object_id.clone())
+        .collect::<BTreeSet<_>>();
+    object_ids.extend(
+        prepare
+            .transaction
+            .objects
+            .iter()
+            .map(|object| object.object_id.clone()),
+    );
+    let mut paths = prepare
+        .expected_path_occupants
+        .iter()
+        .map(|expected| normalize_path(&expected.path))
+        .collect::<BTreeSet<_>>();
+    paths.extend(
+        prepare
+            .transaction
+            .objects
+            .iter()
+            .map(|object| normalize_path(&object.path)),
+    );
+    (object_ids, paths)
+}
+
 impl DfsMetadataTables {
     pub(crate) fn has_materialized_state(&self) -> bool {
         !self.file_systems.is_empty()
@@ -144,6 +178,167 @@ impl DfsMetadataTables {
             self.intent_targets
                 .insert(write_intent_target_key(intent), key);
         }
+    }
+
+    fn namespace_prepare_footprint_indexes_from_history(
+        namespace_prepares: &BTreeMap<String, DfsNamespacePrepareRecord>,
+    ) -> (
+        BTreeMap<DfsFileSystemId, BTreeMap<DfsObjectId, BTreeSet<String>>>,
+        BTreeMap<DfsFileSystemId, BTreeMap<String, BTreeSet<String>>>,
+    ) {
+        let mut object_owners =
+            BTreeMap::<DfsFileSystemId, BTreeMap<DfsObjectId, BTreeSet<String>>>::new();
+        let mut path_owners =
+            BTreeMap::<DfsFileSystemId, BTreeMap<String, BTreeSet<String>>>::new();
+        for prepare in namespace_prepares
+            .values()
+            .filter(|prepare| prepare.status == DfsNamespacePrepareStatus::Prepared)
+        {
+            let (object_ids, paths) = namespace_prepare_footprint(prepare);
+            for object_id in object_ids {
+                object_owners
+                    .entry(prepare.file_system_id.clone())
+                    .or_default()
+                    .entry(object_id)
+                    .or_default()
+                    .insert(prepare.operation_id.clone());
+            }
+            for path in paths {
+                path_owners
+                    .entry(prepare.file_system_id.clone())
+                    .or_default()
+                    .entry(path)
+                    .or_default()
+                    .insert(prepare.operation_id.clone());
+            }
+        }
+        (object_owners, path_owners)
+    }
+
+    fn rebuild_namespace_prepare_footprint_indexes(&mut self) {
+        let (object_owners, path_owners) =
+            Self::namespace_prepare_footprint_indexes_from_history(&self.namespace_prepares);
+        self.namespace_prepare_object_owners = object_owners;
+        self.namespace_prepare_path_owners = path_owners;
+    }
+
+    fn index_namespace_prepare_footprint(&mut self, prepare: &DfsNamespacePrepareRecord) {
+        if prepare.status != DfsNamespacePrepareStatus::Prepared {
+            return;
+        }
+        let (object_ids, paths) = namespace_prepare_footprint(prepare);
+        for object_id in object_ids {
+            self.namespace_prepare_object_owners
+                .entry(prepare.file_system_id.clone())
+                .or_default()
+                .entry(object_id)
+                .or_default()
+                .insert(prepare.operation_id.clone());
+        }
+        for path in paths {
+            self.namespace_prepare_path_owners
+                .entry(prepare.file_system_id.clone())
+                .or_default()
+                .entry(path)
+                .or_default()
+                .insert(prepare.operation_id.clone());
+        }
+    }
+
+    fn unindex_namespace_prepare_footprint(&mut self, prepare: &DfsNamespacePrepareRecord) {
+        if prepare.status != DfsNamespacePrepareStatus::Prepared {
+            return;
+        }
+        let (object_ids, paths) = namespace_prepare_footprint(prepare);
+        for object_id in object_ids {
+            let remove_file_system = self
+                .namespace_prepare_object_owners
+                .get_mut(&prepare.file_system_id)
+                .is_some_and(|objects| {
+                    let remove_object = objects.get_mut(&object_id).is_some_and(|owners| {
+                        owners.remove(&prepare.operation_id);
+                        owners.is_empty()
+                    });
+                    if remove_object {
+                        objects.remove(&object_id);
+                    }
+                    objects.is_empty()
+                });
+            if remove_file_system {
+                self.namespace_prepare_object_owners
+                    .remove(&prepare.file_system_id);
+            }
+        }
+        for path in paths {
+            let remove_file_system = self
+                .namespace_prepare_path_owners
+                .get_mut(&prepare.file_system_id)
+                .is_some_and(|paths| {
+                    let remove_path = paths.get_mut(&path).is_some_and(|owners| {
+                        owners.remove(&prepare.operation_id);
+                        owners.is_empty()
+                    });
+                    if remove_path {
+                        paths.remove(&path);
+                    }
+                    paths.is_empty()
+                });
+            if remove_file_system {
+                self.namespace_prepare_path_owners
+                    .remove(&prepare.file_system_id);
+            }
+        }
+    }
+
+    fn put_namespace_prepare_indexed(&mut self, prepare: DfsNamespacePrepareRecord) {
+        let operation_id = prepare.operation_id.clone();
+        if let Some(previous) = self.namespace_prepares.remove(&operation_id) {
+            self.unindex_namespace_prepare_footprint(&previous);
+        }
+        self.index_namespace_prepare_footprint(&prepare);
+        self.namespace_prepares.insert(operation_id, prepare);
+    }
+
+    pub(crate) fn namespace_prepare_object_owner_other_than(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        operation_id: &str,
+    ) -> Option<&str> {
+        self.namespace_prepare_object_owners
+            .get(file_system_id)
+            .and_then(|objects| objects.get(object_id))
+            .and_then(|owners| {
+                owners
+                    .iter()
+                    .map(String::as_str)
+                    .find(|owner| *owner != operation_id)
+            })
+    }
+
+    pub(crate) fn namespace_prepare_normalized_path_owner_other_than(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        normalized_path: &str,
+        operation_id: &str,
+    ) -> Option<&str> {
+        self.namespace_prepare_path_owners
+            .get(file_system_id)
+            .and_then(|paths| paths.get(normalized_path))
+            .and_then(|owners| {
+                owners
+                    .iter()
+                    .map(String::as_str)
+                    .find(|owner| *owner != operation_id)
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn namespace_prepare_footprint_indexes_match_history(&self) -> bool {
+        let (object_owners, path_owners) =
+            Self::namespace_prepare_footprint_indexes_from_history(&self.namespace_prepares);
+        self.namespace_prepare_object_owners == object_owners
+            && self.namespace_prepare_path_owners == path_owners
     }
 
     pub(crate) fn apply(&mut self, op: DfsMetadataTableOp) {
@@ -290,8 +485,7 @@ impl DfsMetadataTables {
                     .insert(transaction.transaction_id.clone(), transaction);
             }
             DfsMetadataTableOp::PutNamespacePrepare { prepare } => {
-                self.namespace_prepares
-                    .insert(prepare.operation_id.clone(), prepare);
+                self.put_namespace_prepare_indexed(prepare);
             }
             DfsMetadataTableOp::PutNamespaceJob { job } => {
                 self.namespace_jobs.insert(job.job_id.clone(), job);
@@ -657,6 +851,7 @@ impl DfsMetadataTableRollback {
             self.namespace_transactions,
         );
         rollback_map(&mut tables.namespace_prepares, self.namespace_prepares);
+        tables.rebuild_namespace_prepare_footprint_indexes();
         rollback_map(&mut tables.namespace_jobs, self.namespace_jobs);
     }
 }

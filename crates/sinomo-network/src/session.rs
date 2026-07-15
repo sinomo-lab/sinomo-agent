@@ -28,12 +28,22 @@ use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 const BODY_READER_BUFFER_BYTES: usize = 64 * 1024;
 const BODY_READER_BUFFER_DEPTH: usize = 2;
+/// Give an active body consumer enough time to absorb a transient scheduler or
+/// allocation stall before falling back to the disk spool. The healthy
+/// `try_send` path does not wait. Five milliseconds is well below the session
+/// no-progress timeout while spanning several ordinary scheduler quanta.
+const BODY_READER_DIRECT_DELIVERY_GRACE: std::time::Duration = std::time::Duration::from_millis(5);
+static BODY_READER_DIRECT_WAIT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BODY_READER_DIRECT_WAIT_DELIVERED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BODY_READER_DIRECT_WAIT_SPILL_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BODY_READER_DIRECT_WAIT_CLOSED_TOTAL: AtomicU64 = AtomicU64::new(0);
 const OBJECT_RPC_SESSION_PROTOCOL: &str = "sinomo.object-rpc-session.v1";
 const OBJECT_RPC_SESSION_METADATA_KEY: &str = "sinomo.rpc-session";
 const OBJECT_RPC_RESPONSE_HEAD_PROOF_METADATA_KEY: &str = "sinomo.rpc-response-head-proof";
@@ -1162,7 +1172,7 @@ where
                 if let Some(staging) = staging.as_mut() {
                     staging.append(payload).await?;
                 } else if let Some(sender) = incoming_sender.as_ref() {
-                    match sender.try_deliver(payload) {
+                    match sender.deliver_with_grace(payload).await {
                         IncomingDirectDelivery::Delivered
                         | IncomingDirectDelivery::ConsumerClosed => {}
                         IncomingDirectDelivery::Spill(payload) => {
@@ -2485,6 +2495,21 @@ impl ObjectRpcIncomingBody {
 
     pub async fn collect_to_vec(mut self, max_bytes: usize) -> Result<Vec<u8>, NetworkError> {
         let mut output = Vec::new();
+        if let Some(total_bytes) = self.total_bytes {
+            let declared_bytes = usize::try_from(total_bytes).unwrap_or(usize::MAX);
+            if declared_bytes > max_bytes {
+                return Err(NetworkError::FrameTooLarge {
+                    actual_bytes: declared_bytes,
+                    max_bytes,
+                });
+            }
+            output.try_reserve_exact(declared_bytes).map_err(|_| {
+                NetworkError::ResourceExhausted {
+                    operation: "reserve object RPC incoming body".to_string(),
+                    requested_bytes: declared_bytes,
+                }
+            })?;
+        }
         let mut buffer = vec![0_u8; BODY_READER_BUFFER_BYTES];
         loop {
             let read = self
@@ -2616,6 +2641,88 @@ impl IncomingBodySender {
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(IncomingBodyItem::Error(_))) => {
                 unreachable!("direct body delivery only sends byte items")
+            }
+        }
+    }
+
+    /// Preserve the allocation-free `try_send` fast path, but do not turn a
+    /// momentary full queue into a whole-body disk spool. The timeout keeps
+    /// the wait finite: ignored consumers and simultaneous full-duplex bodies
+    /// retain the existing spill escape hatch instead of deadlocking the wire
+    /// reader behind application backpressure.
+    async fn deliver_with_grace(&self, bytes: Vec<u8>) -> IncomingDirectDelivery {
+        self.deliver_with_grace_for(bytes, BODY_READER_DIRECT_DELIVERY_GRACE)
+            .await
+    }
+
+    async fn deliver_with_grace_for(
+        &self,
+        bytes: Vec<u8>,
+        grace: std::time::Duration,
+    ) -> IncomingDirectDelivery {
+        let bytes = match self.try_deliver(bytes) {
+            IncomingDirectDelivery::Delivered => return IncomingDirectDelivery::Delivered,
+            IncomingDirectDelivery::ConsumerClosed => {
+                return IncomingDirectDelivery::ConsumerClosed;
+            }
+            IncomingDirectDelivery::Spill(bytes) => bytes,
+        };
+        let direct = match self.direct.lock() {
+            Ok(direct) => direct.clone(),
+            Err(_) => return IncomingDirectDelivery::ConsumerClosed,
+        };
+        let Some(direct) = direct else {
+            return IncomingDirectDelivery::ConsumerClosed;
+        };
+
+        let wait_total = BODY_READER_DIRECT_WAIT_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        let wait_started = std::time::Instant::now();
+        let frame_bytes = bytes.len();
+        match tokio::time::timeout(grace, direct.reserve()).await {
+            Ok(Ok(permit)) => {
+                permit.send(IncomingBodyItem::Bytes(bytes));
+                let delivered_total =
+                    BODY_READER_DIRECT_WAIT_DELIVERED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::debug!(
+                    target: "sinomo.network.object_rpc",
+                    frame_bytes,
+                    wait_us = wait_started.elapsed().as_micros() as u64,
+                    wait_total,
+                    delivered_after_wait_total = delivered_total,
+                    spill_after_wait_total = BODY_READER_DIRECT_WAIT_SPILL_TOTAL
+                        .load(Ordering::Relaxed),
+                    "object RPC body direct delivery resumed after bounded queue wait"
+                );
+                IncomingDirectDelivery::Delivered
+            }
+            Ok(Err(_)) => {
+                let closed_total =
+                    BODY_READER_DIRECT_WAIT_CLOSED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::debug!(
+                    target: "sinomo.network.object_rpc",
+                    frame_bytes,
+                    wait_us = wait_started.elapsed().as_micros() as u64,
+                    wait_total,
+                    closed_after_wait_total = closed_total,
+                    "object RPC body consumer closed during bounded queue wait"
+                );
+                IncomingDirectDelivery::ConsumerClosed
+            }
+            Err(_) => {
+                let spill_total =
+                    BODY_READER_DIRECT_WAIT_SPILL_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::debug!(
+                    target: "sinomo.network.object_rpc",
+                    frame_bytes,
+                    wait_us = wait_started.elapsed().as_micros() as u64,
+                    grace_us = grace.as_micros() as u64,
+                    wait_total,
+                    spill_after_wait_total = spill_total,
+                    delivered_after_wait_total = BODY_READER_DIRECT_WAIT_DELIVERED_TOTAL
+                        .load(Ordering::Relaxed),
+                    "object RPC body direct-delivery grace expired; falling back to spool"
+                );
+                IncomingDirectDelivery::Spill(bytes)
             }
         }
     }
@@ -3433,6 +3540,128 @@ mod body_tests {
             !root.path().join("network-transfers").exists(),
             "a body consumed within the bounded channel must not touch disk"
         );
+    }
+
+    #[tokio::test]
+    async fn incoming_body_waits_for_consumer_progress_before_spilling() {
+        let root = sinomo_testdir::TestDir::new("sinomo-session-body-wait-direct");
+        let bytes = b"abcdef".to_vec();
+        let digest = TransferDigest::blake3(&bytes);
+        let (sender, mut body) = ObjectRpcIncomingBody::channel(Some(bytes.len() as u64));
+        assert!(matches!(
+            sender.try_deliver(b"a".to_vec()),
+            IncomingDirectDelivery::Delivered
+        ));
+        assert!(matches!(
+            sender.try_deliver(b"b".to_vec()),
+            IncomingDirectDelivery::Delivered
+        ));
+
+        let waits_before = BODY_READER_DIRECT_WAIT_TOTAL.load(Ordering::Relaxed);
+        let delivered_before = BODY_READER_DIRECT_WAIT_DELIVERED_TOTAL.load(Ordering::Relaxed);
+        let waiting_sender = sender.clone();
+        let delivery_task = tokio::spawn(async move {
+            waiting_sender
+                .deliver_with_grace_for(b"cdef".to_vec(), std::time::Duration::from_secs(1))
+                .await
+        });
+        while BODY_READER_DIRECT_WAIT_TOTAL.load(Ordering::Relaxed) == waits_before {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !delivery_task.is_finished(),
+            "the full queue must retain the frame during the direct-delivery grace"
+        );
+
+        let mut first = [0_u8; 1];
+        body.read_exact(&mut first)
+            .await
+            .expect("consume first queued frame");
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), delivery_task)
+            .await
+            .expect("direct delivery must resume after consumer progress")
+            .expect("direct delivery task");
+        assert!(matches!(outcome, IncomingDirectDelivery::Delivered));
+        assert!(BODY_READER_DIRECT_WAIT_DELIVERED_TOTAL.load(Ordering::Relaxed) > delivered_before);
+
+        sender
+            .complete(bytes.len() as u64, digest, false, None)
+            .expect("complete direct body after wait");
+        drop(sender);
+        let mut received = first.to_vec();
+        received.extend(
+            body.collect_to_vec(32)
+                .await
+                .expect("collect direct body after wait"),
+        );
+        assert_eq!(received, bytes);
+        assert!(
+            !root.path().join("network-transfers").exists(),
+            "transient queue saturation with consumer progress must not select the spool"
+        );
+    }
+
+    #[tokio::test]
+    async fn incoming_body_direct_wait_is_bounded_before_spill() {
+        let (sender, _body) = ObjectRpcIncomingBody::channel(Some(3));
+        assert!(matches!(
+            sender.try_deliver(b"a".to_vec()),
+            IncomingDirectDelivery::Delivered
+        ));
+        assert!(matches!(
+            sender.try_deliver(b"b".to_vec()),
+            IncomingDirectDelivery::Delivered
+        ));
+        let grace = std::time::Duration::from_millis(5);
+        let started = tokio::time::Instant::now();
+        let outcome = sender.deliver_with_grace_for(b"c".to_vec(), grace).await;
+        assert!(matches!(outcome, IncomingDirectDelivery::Spill(bytes) if bytes == b"c"));
+        assert!(started.elapsed() >= grace);
+    }
+
+    #[tokio::test]
+    async fn incoming_body_close_ends_direct_wait_without_spilling() {
+        let (sender, body) = ObjectRpcIncomingBody::channel(Some(3));
+        assert!(matches!(
+            sender.try_deliver(b"a".to_vec()),
+            IncomingDirectDelivery::Delivered
+        ));
+        assert!(matches!(
+            sender.try_deliver(b"b".to_vec()),
+            IncomingDirectDelivery::Delivered
+        ));
+        let waits_before = BODY_READER_DIRECT_WAIT_TOTAL.load(Ordering::Relaxed);
+        let waiting_sender = sender.clone();
+        let delivery_task = tokio::spawn(async move {
+            waiting_sender
+                .deliver_with_grace_for(b"c".to_vec(), std::time::Duration::from_secs(1))
+                .await
+        });
+        while BODY_READER_DIRECT_WAIT_TOTAL.load(Ordering::Relaxed) == waits_before {
+            tokio::task::yield_now().await;
+        }
+        drop(body);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), delivery_task)
+            .await
+            .expect("consumer close must wake direct waiter")
+            .expect("direct waiter task");
+        assert!(matches!(outcome, IncomingDirectDelivery::ConsumerClosed));
+    }
+
+    #[tokio::test]
+    async fn incoming_body_known_length_rejects_oversize_before_collection() {
+        let body = ObjectRpcIncomingBody::bytes(vec![7_u8; 1024]);
+        let error = body
+            .collect_to_vec(100)
+            .await
+            .expect_err("known body length must enforce the collection bound");
+        assert!(matches!(
+            error,
+            NetworkError::FrameTooLarge {
+                actual_bytes: 1024,
+                max_bytes: 100,
+            }
+        ));
     }
 
     #[tokio::test]

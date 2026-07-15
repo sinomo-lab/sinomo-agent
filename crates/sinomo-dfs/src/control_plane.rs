@@ -68,7 +68,7 @@ fn metadata_shard_operation_floor_key(file_system_id: &DfsFileSystemId, shard_id
     )
 }
 
-/// One bounded, quorum-committed fence for a same-primary membership handoff.
+/// One bounded, quorum-committed fence for a membership or primary-role handoff.
 ///
 /// The active shard configuration remains at [`metadata_shard_key`] until the
 /// retiring assignment has transferred an exact DFS metadata state to every
@@ -179,7 +179,7 @@ struct DfsMetadataShardOperationFloor {
 }
 
 /// Quorum-committed fence separating a retiring metadata assignment from a
-/// desired same-primary assignment.
+/// desired assignment or primary role.
 ///
 /// While this record exists, the retiring configuration remains stored at the
 /// normal shard key but may not authorize a new canonical publication. A data
@@ -203,7 +203,7 @@ pub struct DfsMetadataShardMembershipHandoff {
 }
 
 /// Retiring-primary acknowledgement that closes the cross-process
-/// validate-to-publish race for a membership handoff.
+/// validate-to-publish race for a metadata handoff.
 ///
 /// This is bounded authority evidence, not DFS file metadata. The retiring
 /// primary captures it under the same process-wide publication guard held by
@@ -216,7 +216,7 @@ pub struct DfsMetadataShardMembershipHandoffFence {
     pub state_fingerprint: String,
 }
 
-/// Exact DFS-state evidence consumed to activate a fenced membership change.
+/// Exact DFS-state evidence consumed to activate a fenced reconfiguration.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsMetadataShardMembershipHandoffProof {
     pub handoff_id: String,
@@ -472,10 +472,10 @@ impl<'a> DfsControlPlaneStore<'a> {
 
     /// Create an absent shard or idempotently replace the exact same value.
     ///
-    /// A changed same-primary assignment is deliberately *not* activated here.
+    /// A changed assignment or primary role is deliberately *not* activated here.
     /// It must use [`Self::begin_metadata_shard_membership_handoff`] followed by
     /// [`Self::complete_metadata_shard_membership_handoff`] so a committed
-    /// membership decision cannot outrun the retiring DFS metadata state.
+    /// reconfiguration decision cannot outrun the retiring DFS metadata state.
     pub fn compare_and_put_metadata_shard(
         &mut self,
         expected: Option<&DfsMetadataShardConfig>,
@@ -513,7 +513,7 @@ impl<'a> DfsControlPlaneStore<'a> {
             .succeeded)
     }
 
-    /// Record a pending same-primary membership decision before catch-up.
+    /// Record a pending membership or primary-role decision before catch-up.
     ///
     /// The shard configuration itself is intentionally left unchanged. The
     /// returned record binds the retiring and desired assignments to a fresh
@@ -724,8 +724,8 @@ impl<'a> DfsControlPlaneStore<'a> {
             .then_some(acknowledged))
     }
 
-    /// Activate a desired same-primary assignment only after exact retiring
-    /// state has been acknowledged by every member of both assignments.
+    /// Activate a desired assignment or primary role only after exact retiring
+    /// state has been acknowledged by every member of both configurations.
     pub fn complete_metadata_shard_membership_handoff(
         &mut self,
         retiring: &DfsMetadataShardConfig,
@@ -1192,8 +1192,8 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         .await
     }
 
-    /// Async create/idempotent compare-and-put. Changed assignments require the
-    /// explicit two-phase membership-handoff API.
+    /// Async create/idempotent compare-and-put. Changed assignments or primary
+    /// roles require the explicit two-phase handoff API.
     pub async fn compare_and_put_metadata_shard(
         &mut self,
         expected: Option<&DfsMetadataShardConfig>,
@@ -1796,37 +1796,22 @@ fn validate_metadata_shard_cas_identity(
     Ok(())
 }
 
-/// Validate the only configuration delta a same-primary membership handoff may
-/// carry. Assignment and policy changes are separate administrative decisions,
-/// and an epoch bump without an actual replica-set change has no state-transfer
-/// justification. Primary movement requires a proof-carrying DFS data-plane
-/// handoff and cannot use a generic or KV-only transaction.
+/// Validate a proof-carrying metadata handoff configuration delta.
+///
+/// A handoff is either a same-primary membership change or a pure role rotation
+/// over the exact existing member ring. Assignment and policy changes are
+/// separate administrative decisions. Mixing a primary move with a membership
+/// change would make the promoted-prefix proof ambiguous, so it is rejected.
 fn validate_metadata_shard_cas_reconfiguration(
     expected: &DfsMetadataShardConfig,
     desired: &DfsMetadataShardConfig,
 ) -> Result<(), KvError> {
-    if expected.primary_node_id != desired.primary_node_id {
-        return Err(KvError::Serialization {
-            detail: format!(
-                "metadata shard {} primary changes require a current operation-bound DFS prefix fence and exact promoted-replica acknowledgement",
-                expected.shard_id
-            ),
-        });
-    }
     if expected.assignment != desired.assignment
         || expected.default_policy != desired.default_policy
     {
         return Err(KvError::Serialization {
             detail: format!(
                 "metadata shard {} membership handoff cannot change assignment or default policy",
-                expected.shard_id
-            ),
-        });
-    }
-    if metadata_shard_configured_node_ids(expected) == metadata_shard_configured_node_ids(desired) {
-        return Err(KvError::Serialization {
-            detail: format!(
-                "metadata shard {} membership handoff must change the configured replica set",
                 expected.shard_id
             ),
         });
@@ -1844,6 +1829,39 @@ fn validate_metadata_shard_cas_reconfiguration(
             detail: format!(
                 "metadata shard {} reconfiguration must advance epoch {} to {}",
                 expected.shard_id, expected.epoch, next_epoch
+            ),
+        });
+    }
+
+    if expected.primary_node_id == desired.primary_node_id {
+        if metadata_shard_configured_node_ids(expected)
+            == metadata_shard_configured_node_ids(desired)
+        {
+            return Err(KvError::Serialization {
+                detail: format!(
+                    "metadata shard {} membership handoff must change the configured replica set",
+                    expected.shard_id
+                ),
+            });
+        }
+        return Ok(());
+    }
+
+    let Some(expected_replicas) =
+        topology_preserving_metadata_shard_replicas(expected, &desired.primary_node_id)
+    else {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "metadata shard {} primary handoff target {} must be an existing replica",
+                expected.shard_id, desired.primary_node_id
+            ),
+        });
+    };
+    if desired.replica_node_ids != expected_replicas {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "metadata shard {} primary handoff must preserve the exact configured member ring; mixed primary and membership changes are not allowed",
+                expected.shard_id
             ),
         });
     }
@@ -3037,7 +3055,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_shard_compare_and_put_rejects_direct_primary_change() {
+    fn metadata_shard_compare_and_put_parks_direct_primary_change() {
         let owner = node("node_shard_direct_primary_owner");
         let replacement = node("node_shard_direct_primary_replacement");
         let file_system_id = file_system_id();
@@ -3061,18 +3079,112 @@ mod tests {
             .put_metadata_shard(&current)
             .expect("put current shard");
 
-        assert!(matches!(
-            DfsControlPlaneStore::new(&mut kv)
-                .compare_and_put_metadata_shard(Some(&current), &desired),
-            Err(KvError::Serialization { detail })
-                if detail.contains("current operation-bound DFS prefix fence")
-        ));
+        assert!(
+            !DfsControlPlaneStore::new(&mut kv)
+                .compare_and_put_metadata_shard(Some(&current), &desired)
+                .expect("bare primary-role activation must fail closed")
+        );
         assert_eq!(
             DfsControlPlaneStore::new(&mut kv)
                 .get_metadata_shard(&file_system_id, "root")
                 .expect("read unchanged shard"),
             Some(current)
         );
+    }
+
+    #[test]
+    fn metadata_shard_primary_role_handoff_requires_exact_existing_member_rotation() {
+        let owner = node("node_primary_role_owner");
+        let promoted = node("node_primary_role_promoted");
+        let other_replica = node("node_primary_role_other_replica");
+        let outsider = node("node_primary_role_outsider");
+        let file_system_id = file_system_id();
+        let current = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: vec![promoted.clone(), other_replica.clone()],
+            epoch: 44,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let desired = DfsMetadataShardConfig {
+            primary_node_id: promoted.clone(),
+            replica_node_ids: vec![other_replica.clone(), owner.clone()],
+            epoch: current.epoch + 1,
+            ..current.clone()
+        };
+        let mut kv = InProcessKvStore::new();
+        DfsControlPlaneStore::new(&mut kv)
+            .put_metadata_shard(&current)
+            .expect("put current shard");
+
+        for invalid in [
+            DfsMetadataShardConfig {
+                primary_node_id: outsider,
+                ..desired.clone()
+            },
+            DfsMetadataShardConfig {
+                replica_node_ids: vec![owner.clone()],
+                ..desired.clone()
+            },
+            DfsMetadataShardConfig {
+                replica_node_ids: vec![owner.clone(), other_replica],
+                ..desired.clone()
+            },
+        ] {
+            assert!(matches!(
+                DfsControlPlaneStore::new(&mut kv)
+                    .begin_metadata_shard_membership_handoff(&current, &invalid),
+                Err(KvError::Serialization { .. })
+            ));
+        }
+
+        let handoff = DfsControlPlaneStore::new(&mut kv)
+            .begin_metadata_shard_membership_handoff(&current, &desired)
+            .expect("begin exact role-only handoff")
+            .expect("current shard still active");
+        assert_eq!(handoff.retiring_shard, current);
+        assert_eq!(handoff.desired_shard, desired);
+        assert_eq!(
+            metadata_shard_configured_node_ids(&handoff.retiring_shard),
+            metadata_shard_configured_node_ids(&handoff.desired_shard)
+        );
+    }
+
+    #[tokio::test]
+    async fn async_metadata_shard_primary_role_handoff_accepts_exact_rotation() {
+        let owner = node("node_primary_role_async_owner");
+        let promoted = node("node_primary_role_async_promoted");
+        let file_system_id = file_system_id();
+        let current = DfsMetadataShardConfig {
+            file_system_id,
+            shard_id: "root".to_string(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: vec![promoted.clone()],
+            epoch: 45,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let desired = DfsMetadataShardConfig {
+            primary_node_id: promoted,
+            replica_node_ids: vec![owner],
+            epoch: current.epoch + 1,
+            ..current.clone()
+        };
+        let mut kv = InProcessKvStore::new();
+        DfsControlPlaneAsyncStore::new(&mut kv)
+            .put_metadata_shard(&current)
+            .await
+            .expect("put current shard");
+
+        let handoff = DfsControlPlaneAsyncStore::new(&mut kv)
+            .begin_metadata_shard_membership_handoff(&current, &desired)
+            .await
+            .expect("begin exact async role-only handoff")
+            .expect("current shard still active");
+        assert_eq!(handoff.retiring_shard, current);
+        assert_eq!(handoff.desired_shard, desired);
     }
 
     #[test]

@@ -1,12 +1,15 @@
+#![recursion_limit = "256"]
+
 use serde_json::json;
+use sinomo_core::DfsObjectPolicy;
 use sinomo_core::network::InProcessNetwork;
 use sinomo_core::node::NodeId;
-use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use sinomo_dfs::{
     DfsFileSystem, DfsFileSystemId, DfsMessageTransport, DfsMetadataShardId, DfsNamespaceJobStatus,
     DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsOperationalMetrics, DfsReadResult,
-    DfsReplicationPolicy, DfsVersion, DfsWriteOptions, LocalContentStore, LocalSobjMetadataBackend,
-    NetworkedDfsRangeReadOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
+    DfsReplicaReceiptState, DfsReplicationPolicy, DfsVersion, DfsWriteOptions, LocalContentStore,
+    LocalSobjMetadataBackend, NetworkedDfsRangeReadOutcome, NetworkedDfsService,
+    NetworkedDfsServiceEvent,
 };
 use std::env;
 use std::fs;
@@ -29,6 +32,8 @@ struct Args {
     blob_bytes: u64,
     blob_range_bytes: usize,
     network_blob_bytes: u64,
+    network_blob_desired_replicas: usize,
+    network_blob_write_quorum: usize,
     write_at_ops: usize,
     write_at_bytes: usize,
     list_page_size: usize,
@@ -67,6 +72,8 @@ struct BenchDefaults {
     blob_bytes: u64,
     blob_range_bytes: usize,
     network_blob_bytes: u64,
+    network_blob_desired_replicas: usize,
+    network_blob_write_quorum: usize,
     write_at_ops: usize,
     write_at_bytes: usize,
     list_page_size: usize,
@@ -138,6 +145,8 @@ impl Preset {
                 blob_bytes: 64 * 1024 * 1024,
                 blob_range_bytes: 1024 * 1024,
                 network_blob_bytes: 8 * 1024 * 1024,
+                network_blob_desired_replicas: 2,
+                network_blob_write_quorum: 2,
                 write_at_ops: 64,
                 write_at_bytes: 4 * 1024,
                 list_page_size: 1024,
@@ -152,6 +161,8 @@ impl Preset {
                 blob_bytes: 1024 * 1024 * 1024,
                 blob_range_bytes: 8 * 1024 * 1024,
                 network_blob_bytes: 512 * 1024 * 1024,
+                network_blob_desired_replicas: 2,
+                network_blob_write_quorum: 2,
                 write_at_ops: 1024,
                 write_at_bytes: 16 * 1024,
                 list_page_size: 4096,
@@ -166,6 +177,8 @@ impl Preset {
                 blob_bytes: 4 * 1024 * 1024 * 1024,
                 blob_range_bytes: 16 * 1024 * 1024,
                 network_blob_bytes: 4 * 1024 * 1024 * 1024,
+                network_blob_desired_replicas: 2,
+                network_blob_write_quorum: 2,
                 write_at_ops: 8192,
                 write_at_bytes: 64 * 1024,
                 list_page_size: 4096,
@@ -248,6 +261,14 @@ impl Args {
             "SINOMO_DFS_BENCH_NETWORK_BLOB_BYTES",
             defaults.network_blob_bytes,
         )?;
+        let mut network_blob_desired_replicas = env_usize(
+            "SINOMO_DFS_BENCH_NETWORK_BLOB_DESIRED_REPLICAS",
+            defaults.network_blob_desired_replicas,
+        )?;
+        let mut network_blob_write_quorum = env_usize(
+            "SINOMO_DFS_BENCH_NETWORK_BLOB_WRITE_QUORUM",
+            defaults.network_blob_write_quorum,
+        )?;
         let mut write_at_ops = env_usize("SINOMO_DFS_BENCH_WRITE_AT_OPS", defaults.write_at_ops)?;
         let mut write_at_bytes = byte_count_to_usize(
             "SINOMO_DFS_BENCH_WRITE_AT_BYTES",
@@ -284,6 +305,8 @@ impl Args {
                     blob_bytes = defaults.blob_bytes;
                     blob_range_bytes = defaults.blob_range_bytes;
                     network_blob_bytes = defaults.network_blob_bytes;
+                    network_blob_desired_replicas = defaults.network_blob_desired_replicas;
+                    network_blob_write_quorum = defaults.network_blob_write_quorum;
                     write_at_ops = defaults.write_at_ops;
                     write_at_bytes = defaults.write_at_bytes;
                     list_page_size = defaults.list_page_size;
@@ -301,6 +324,12 @@ impl Args {
                         byte_count_to_usize(&arg, parse_byte_count(&arg, args.next())?)?
                 }
                 "--network-blob-bytes" => network_blob_bytes = parse_byte_count(&arg, args.next())?,
+                "--network-blob-desired-replicas" => {
+                    network_blob_desired_replicas = parse_usize(&arg, args.next())?
+                }
+                "--network-blob-write-quorum" => {
+                    network_blob_write_quorum = parse_usize(&arg, args.next())?
+                }
                 "--write-at-ops" => write_at_ops = parse_usize(&arg, args.next())?,
                 "--write-at-bytes" => {
                     write_at_bytes =
@@ -341,6 +370,17 @@ impl Args {
         if write_at_bytes == 0 {
             return Err("--write-at-bytes must be greater than zero".into());
         }
+        if !(2..=5).contains(&network_blob_desired_replicas) {
+            return Err("--network-blob-desired-replicas must be between 2 and 5 inclusive".into());
+        }
+        if network_blob_write_quorum == 0
+            || network_blob_write_quorum > network_blob_desired_replicas
+        {
+            return Err(format!(
+                "--network-blob-write-quorum must be between 1 and --network-blob-desired-replicas ({network_blob_desired_replicas}) inclusive"
+            )
+            .into());
+        }
 
         let (root, explicit_root) = match root {
             Some(root) => (root, true),
@@ -358,6 +398,8 @@ impl Args {
             blob_bytes,
             blob_range_bytes,
             network_blob_bytes,
+            network_blob_desired_replicas,
+            network_blob_write_quorum,
             write_at_ops,
             write_at_bytes,
             list_page_size,
@@ -387,6 +429,8 @@ impl Args {
                 "blob_bytes": self.blob_bytes,
                 "blob_range_bytes": self.blob_range_bytes,
                 "network_blob_bytes": self.network_blob_bytes,
+                "network_blob_desired_replicas": self.network_blob_desired_replicas,
+                "network_blob_write_quorum": self.network_blob_write_quorum,
                 "write_at_ops": self.write_at_ops,
                 "write_at_bytes": self.write_at_bytes,
                 "list_page_size": self.list_page_size,
@@ -1216,7 +1260,12 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
     fs::create_dir_all(&root)?;
 
     let owner = node("node_dfs_bench_net_owner");
-    let replica = node("node_dfs_bench_net_replica");
+    let replica_nodes = (1..args.network_blob_desired_replicas)
+        .map(|index| NodeId::from_legacy_named(format!("node_dfs_bench_net_replica_{index}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let desired_replica_nodes = std::iter::once(owner.clone())
+        .chain(replica_nodes.iter().cloned())
+        .collect::<Vec<_>>();
     let reader = node("node_dfs_bench_net_reader");
     let range_reader = node("node_dfs_bench_net_range_reader");
     let network = InProcessNetwork::new();
@@ -1228,19 +1277,12 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
         DfsMetadataShardId::new("root"),
         root.join("owner-metadata"),
     )?)?;
-    let mut replica_dfs = NetworkedDfsService::new(
-        network.add_node(replica.clone()),
-        LocalContentStore::new(root.join("replica-content"))?,
-    )
-    .with_metadata_backend(LocalSobjMetadataBackend::new(
-        DfsMetadataShardId::new("root"),
-        root.join("replica-metadata"),
-    )?)?;
+    owner_dfs.bootstrap_distributed_sifs()?;
+    owner_dfs.posix_mkdir_all("/services/dfs-scale")?;
 
     let file_system_id = sifs_id();
     let object_id = DfsObjectId::from_legacy_named("dfsbenchnetblob").expect("object id");
     let base_version = DfsVersion::from_legacy_named("versionnetbase").expect("version");
-    let target_version = DfsVersion::from_legacy_named("versionnettarget").expect("version");
     let object = DfsObjectMetadata {
         object_id: object_id.clone(),
         file_system_id: file_system_id.clone(),
@@ -1264,101 +1306,556 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
         last_modified_by_event_id: None,
     };
     owner_dfs.add_object_metadata(object.clone())?;
-    replica_dfs.add_object_metadata(object)?;
 
     let network_timeout = Duration::from_secs(args.network_timeout_secs);
-    let replica_object_id = object_id.clone();
-    let replica_worker = std::thread::spawn(move || -> BenchResult<ReplicaWorkerReport> {
-        let deadline = Instant::now() + network_timeout;
-        let mut report = ReplicaWorkerReport::default();
-        loop {
-            let events = replica_dfs.process_incoming()?;
-            report.process_loops = report.process_loops.saturating_add(1);
-            report.event_count = report.event_count.saturating_add(events.len());
-            report.staged |= events.iter().any(|event| {
-                matches!(
-                    event,
-                    NetworkedDfsServiceEvent::BlobStaged { object_id: staged, .. }
-                        if staged == &replica_object_id
-                )
-            });
-            report.committed |= events.iter().any(|event| {
-                matches!(
-                    event,
-                    NetworkedDfsServiceEvent::VersionCommitted { object_id: committed, .. }
-                        if committed == &replica_object_id
-                )
-            });
-            if report.committed {
-                break;
-            }
-            if Instant::now() >= deadline {
-                return Err("replica did not observe network blob commit before timeout".into());
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        report.metrics = Some(replica_dfs.operational_metrics()?);
-        Ok(report)
-    });
+    let cpu_clock = ProcessCpuClock::detect();
+    let (commit_progress_sender, commit_progress_receiver) =
+        std::sync::mpsc::channel::<ReplicaCommitProgressResult>();
+    let mut replica_start_senders = Vec::with_capacity(replica_nodes.len());
+    let mut replica_finalize_senders = Vec::with_capacity(replica_nodes.len());
+    let mut replica_workers = Vec::with_capacity(replica_nodes.len());
+    for (index, replica_node) in replica_nodes.iter().cloned().enumerate() {
+        let mut replica_dfs = NetworkedDfsService::new(
+            network.add_node(replica_node.clone()),
+            LocalContentStore::new(root.join(format!("replica-{}-content", index + 1)))?,
+        )
+        .with_metadata_backend(LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            root.join(format!("replica-{}-metadata", index + 1)),
+        )?)?;
+        replica_dfs.bootstrap_distributed_sifs()?;
+        replica_dfs.posix_mkdir_all("/services/dfs-scale")?;
+        replica_dfs.add_object_metadata(object.clone())?;
+
+        let replica_object_id = object_id.clone();
+        let progress_sender = commit_progress_sender.clone();
+        let (start_sender, start_receiver) = std::sync::mpsc::channel::<(Instant, Instant)>();
+        let (finalize_sender, finalize_receiver) = std::sync::mpsc::channel::<()>();
+        replica_start_senders.push(start_sender);
+        replica_finalize_senders.push(finalize_sender);
+        replica_workers.push(
+            std::thread::Builder::new()
+                .name(format!("dfs-bench-replica-{}", index + 1))
+                .spawn(move || -> BenchResult<ReplicaWorkerReport> {
+                    let (started_at, deadline) = start_receiver
+                        .recv()
+                        .map_err(|_| "network blob benchmark start signal was dropped")?;
+                    let cpu_started = cpu_clock.and_then(ProcessCpuClock::sample_thread_ticks);
+                    let mut report = ReplicaWorkerReport::new(replica_node);
+                    let commit_result = (|| -> Result<(), String> {
+                        loop {
+                            let events = replica_dfs.process_incoming().map_err(|error| {
+                                format!(
+                                    "replica {} failed while processing network blob messages: {error}",
+                                    report.node_id
+                                )
+                            })?;
+                            report.process_loops = report.process_loops.saturating_add(1);
+                            if events.is_empty() {
+                                report.idle_loops = report.idle_loops.saturating_add(1);
+                            }
+                            for event in &events {
+                                report.record_event(event, &replica_object_id, started_at);
+                                match event {
+                                    NetworkedDfsServiceEvent::BlobStageRejected {
+                                        object_id: rejected,
+                                        reason,
+                                        ..
+                                    }
+                                    | NetworkedDfsServiceEvent::RepairRejected {
+                                        object_id: rejected,
+                                        reason,
+                                        ..
+                                    } if rejected == &replica_object_id => {
+                                        return Err(format!(
+                                            "replica {} rejected network blob transfer: {reason}",
+                                            report.node_id
+                                        ));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if report.committed {
+                                return Ok(());
+                            }
+                            if Instant::now() >= deadline {
+                                return Err(format!(
+                                    "replica {} did not observe network blob commit before timeout",
+                                    report.node_id
+                                ));
+                            }
+                            if events.is_empty() {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                        }
+                    })();
+                    if let Err(reason) = commit_result {
+                        let _ = progress_sender.send(Err(reason.clone()));
+                        return Err(reason.into());
+                    }
+
+                    let committed_elapsed = report.committed_elapsed.ok_or_else(|| {
+                        format!(
+                            "replica {} reached the commit barrier without a commit timestamp",
+                            report.node_id
+                        )
+                    })?;
+                    let thread_cpu_at_commit =
+                        cpu_clock.and_then(ProcessCpuClock::sample_thread_ticks);
+                    let process_cpu_at_commit =
+                        cpu_clock.and_then(ProcessCpuClock::sample_process_ticks);
+                    progress_sender
+                        .send(Ok(ReplicaCommitProgress {
+                            node_id: report.node_id.clone(),
+                            committed_elapsed,
+                            process_cpu_ticks: process_cpu_at_commit,
+                        }))
+                        .map_err(|_| {
+                            format!(
+                                "network blob benchmark stopped before replica {} commit was recorded",
+                                report.node_id
+                            )
+                        })?;
+
+                    // Do not let metrics collection or thread finalization move
+                    // the all-N wall-clock boundary past this replica's commit.
+                    finalize_receiver.recv().map_err(|_| {
+                        format!(
+                            "network blob benchmark dropped replica {} finalize barrier",
+                            report.node_id
+                        )
+                    })?;
+                    report.cpu_time = cpu_clock.and_then(|clock| {
+                        clock.elapsed_since(cpu_started?, thread_cpu_at_commit?)
+                    });
+                    report.metrics = Some(replica_dfs.operational_metrics()?);
+                    Ok(report)
+                })?,
+        );
+    }
+    drop(commit_progress_sender);
 
     let write_start = Instant::now();
-    let write = owner_dfs.write_distributed_eventual_from_reader(
-        DfsWriteRequest {
-            file_system_id,
-            object_id: object_id.clone(),
-            target_version: target_version.clone(),
-            requesting_node_id: owner.clone(),
-        },
+    let deadline = write_start + network_timeout;
+    let process_cpu_started = cpu_clock.and_then(ProcessCpuClock::sample_process_ticks);
+    for start_sender in replica_start_senders {
+        start_sender
+            .send((write_start, deadline))
+            .map_err(|_| "network blob replica worker stopped before the write began")?;
+    }
+    // Keep repair out of the foreground write so its return is a W-visible
+    // boundary rather than an N-replica convergence boundary. Missing N-W
+    // copies are driven below through the normal repair machinery.
+    let write_stat = owner_dfs.posix_write_file_from_reader(
+        &object.path,
         RepeatingReader::new(args.network_blob_bytes),
-        vec![owner.clone(), replica.clone()],
-        DfsReplicationPolicy::new(2, 2)?,
+        DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(
+                args.network_blob_write_quorum,
+                args.network_blob_desired_replicas,
+            )?,
+            replica_candidates: desired_replica_nodes.clone(),
+            wait_for_commit: true,
+            foreground_replica_repair: false,
+        },
     )?;
-    let initial_owner_metrics = owner_dfs.operational_metrics()?;
+    let write_call_elapsed = write_start.elapsed();
+    let process_cpu_at_write_return = cpu_clock.and_then(ProcessCpuClock::sample_process_ticks);
+    let target_version = write_stat.version.clone();
+    let intent_id = owner_dfs
+        .coordinator()
+        .intent_for_target(&file_system_id, &object_id, &target_version)
+        .map(|intent| intent.intent_id.clone())
+        .ok_or("network blob benchmark could not find the committed write intent")?;
+    let initial_owner_committed = owner_dfs
+        .metadata()
+        .object(&object_id)
+        .is_some_and(|object| object.version == target_version);
+    let mut receipt_nodes_at_w = owner_dfs
+        .coordinator()
+        .receipts_for_intent(&intent_id)
+        .into_iter()
+        .filter(|receipt| receipt.state == DfsReplicaReceiptState::Durable)
+        .map(|receipt| receipt.replica_node_id.clone())
+        .collect::<Vec<_>>();
+    receipt_nodes_at_w.sort();
+    receipt_nodes_at_w.dedup();
+    if !initial_owner_committed
+        || receipt_nodes_at_w.len() != args.network_blob_write_quorum
+        || !receipt_nodes_at_w.contains(&owner)
+        || receipt_nodes_at_w
+            .iter()
+            .any(|node_id| !desired_replica_nodes.contains(node_id))
+    {
+        return Err(format!(
+            "POSIX write did not return at the exact W-visible boundary: committed={initial_owner_committed}, receipt_nodes={receipt_nodes_at_w:?}, W={}, desired_nodes={desired_replica_nodes:?}",
+            args.network_blob_write_quorum,
+        )
+        .into());
+    }
+    let w_visible_elapsed = write_call_elapsed;
+    let process_cpu_to_w = cpu_clock
+        .and_then(|clock| clock.elapsed_since(process_cpu_started?, process_cpu_at_write_return?));
 
-    let deadline = Instant::now() + Duration::from_secs(args.network_timeout_secs);
-    let mut owner_event_count = 0usize;
-    let owner_committed = loop {
-        owner_dfs.retry_pending_repairs()?;
-        owner_event_count = owner_event_count.saturating_add(owner_dfs.process_incoming()?.len());
-        let owner_committed = owner_dfs
-            .metadata()
-            .object(&object_id)
-            .is_some_and(|object| object.version == target_version);
-        if owner_committed {
-            break true;
+    let mut replica_commit_progress = Vec::with_capacity(replica_nodes.len());
+    let mut w_to_n_owner_event_count = 0usize;
+    let mut w_to_n_owner_process_calls = 0usize;
+    let mut w_to_n_owner_idle_process_calls = 0usize;
+    while replica_commit_progress.len() < replica_nodes.len() {
+        drain_replica_commit_progress(
+            &commit_progress_receiver,
+            &mut replica_commit_progress,
+            replica_nodes.len(),
+        )?;
+        if replica_commit_progress.len() == replica_nodes.len() {
+            break;
         }
         if Instant::now() >= deadline {
-            break false;
+            return Err(format!(
+                "network blob replicas did not commit before {} second timeout",
+                args.network_timeout_secs
+            )
+            .into());
         }
-        std::thread::sleep(Duration::from_millis(1));
-    };
-    let write_elapsed = write_start.elapsed();
-    let replica_report = replica_worker
-        .join()
-        .map_err(|_| "replica network blob worker panicked")??;
-    let final_owner_metrics = owner_dfs.operational_metrics()?;
+
+        owner_dfs.retry_pending_repairs()?;
+        let owner_events = owner_dfs.process_incoming()?;
+        w_to_n_owner_process_calls = w_to_n_owner_process_calls.saturating_add(1);
+        w_to_n_owner_event_count = w_to_n_owner_event_count.saturating_add(owner_events.len());
+        if owner_events.is_empty() {
+            w_to_n_owner_idle_process_calls = w_to_n_owner_idle_process_calls.saturating_add(1);
+        }
+        drain_replica_commit_progress(
+            &commit_progress_receiver,
+            &mut replica_commit_progress,
+            replica_nodes.len(),
+        )?;
+        if let Some(finished_node) = replica_nodes
+            .iter()
+            .zip(replica_workers.iter())
+            .find(|(node_id, worker)| {
+                worker.is_finished()
+                    && !replica_commit_progress
+                        .iter()
+                        .any(|progress| &progress.node_id == *node_id)
+            })
+            .map(|(node_id, _)| node_id.clone())
+        {
+            drain_replica_commit_progress(
+                &commit_progress_receiver,
+                &mut replica_commit_progress,
+                replica_nodes.len(),
+            )?;
+            if !replica_commit_progress
+                .iter()
+                .any(|progress| progress.node_id == finished_node)
+            {
+                return Err(format!(
+                    "replica {finished_node} exited before reporting its network blob commit"
+                )
+                .into());
+            }
+        }
+        if owner_events.is_empty() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let last_replica_commit = replica_commit_progress
+        .iter()
+        .max_by_key(|progress| progress.committed_elapsed)
+        .ok_or("network blob benchmark did not receive replica commit progress")?;
+    let all_replica_commit_elapsed = last_replica_commit.committed_elapsed.max(w_visible_elapsed);
+    let process_cpu_to_all_replica_commits = cpu_clock.and_then(|clock| {
+        clock.elapsed_since(process_cpu_started?, last_replica_commit.process_cpu_ticks?)
+    });
+
+    // The replica commit timestamps above are the all-N wall-clock boundary.
+    // Drain the already-sent repair responses afterward so correctness and
+    // owner metrics do not inflate that timing.
+    let mut post_n_owner_finalize_event_count = 0usize;
+    let mut post_n_owner_finalize_process_calls = 0usize;
+    let mut post_n_owner_finalize_idle_process_calls = 0usize;
+    while owner_dfs.coordinator().durable_receipt_count(&intent_id)
+        < args.network_blob_desired_replicas
+    {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "network blob owner did not record all replica receipts before {} second timeout",
+                args.network_timeout_secs
+            )
+            .into());
+        }
+        let owner_events = owner_dfs.process_incoming()?;
+        post_n_owner_finalize_process_calls = post_n_owner_finalize_process_calls.saturating_add(1);
+        post_n_owner_finalize_event_count =
+            post_n_owner_finalize_event_count.saturating_add(owner_events.len());
+        if owner_events.is_empty() {
+            post_n_owner_finalize_idle_process_calls =
+                post_n_owner_finalize_idle_process_calls.saturating_add(1);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let mut final_receipt_nodes = owner_dfs
+        .coordinator()
+        .receipts_for_intent(&intent_id)
+        .into_iter()
+        .filter(|receipt| receipt.state == DfsReplicaReceiptState::Durable)
+        .map(|receipt| receipt.replica_node_id.clone())
+        .collect::<Vec<_>>();
+    final_receipt_nodes.sort();
+    final_receipt_nodes.dedup();
+    if final_receipt_nodes.len() != args.network_blob_desired_replicas
+        || final_receipt_nodes
+            .iter()
+            .any(|node_id| !desired_replica_nodes.contains(node_id))
+    {
+        return Err(format!(
+            "network blob final receipts did not match N: receipt_nodes={final_receipt_nodes:?}, N={}, desired_nodes={desired_replica_nodes:?}",
+            args.network_blob_desired_replicas,
+        )
+        .into());
+    }
+
+    for (replica_node, finalize_sender) in replica_nodes
+        .iter()
+        .zip(replica_finalize_senders.into_iter())
+    {
+        finalize_sender.send(()).map_err(|_| {
+            format!("replica {replica_node} stopped before its finalize barrier was released")
+        })?;
+    }
+
+    let replica_reports = replica_workers
+        .into_iter()
+        .map(|worker| {
+            worker
+                .join()
+                .map_err(|_| "replica network blob worker panicked")?
+        })
+        .collect::<BenchResult<Vec<_>>>()?;
+    let owner_committed = owner_dfs
+        .metadata()
+        .object(&object_id)
+        .is_some_and(|object| object.version == target_version);
+    let all_remote_replicas_committed = replica_reports.iter().all(|report| report.committed);
+    let mut pre_w_staged_replica_nodes = replica_reports
+        .iter()
+        .filter(|report| receipt_nodes_at_w.contains(&report.node_id))
+        .map(|report| report.node_id.clone())
+        .collect::<Vec<_>>();
+    pre_w_staged_replica_nodes.sort();
+    let mut post_w_repaired_replica_nodes = replica_reports
+        .iter()
+        .filter(|report| !receipt_nodes_at_w.contains(&report.node_id))
+        .map(|report| report.node_id.clone())
+        .collect::<Vec<_>>();
+    post_w_repaired_replica_nodes.sort();
+    let pre_w_stage_fanout = pre_w_staged_replica_nodes.len();
+    let post_w_repair_fanout = post_w_repaired_replica_nodes.len();
+    if pre_w_stage_fanout != args.network_blob_write_quorum.saturating_sub(1)
+        || post_w_repair_fanout
+            != args
+                .network_blob_desired_replicas
+                .saturating_sub(args.network_blob_write_quorum)
+    {
+        return Err(format!(
+            "network blob fanout did not match W/N: pre_w_stage_fanout={pre_w_stage_fanout}, post_w_repair_fanout={post_w_repair_fanout}, W={}, N={}",
+            args.network_blob_write_quorum,
+            args.network_blob_desired_replicas,
+        )
+        .into());
+    }
+    for report in &replica_reports {
+        let staged_pre_w = receipt_nodes_at_w.contains(&report.node_id);
+        let repaired_post_w = !staged_pre_w;
+        if (staged_pre_w && (!report.saw_blob_staged || report.repaired_event_count != 0))
+            || (repaired_post_w && (report.saw_blob_staged || report.repaired_event_count == 0))
+        {
+            return Err(format!(
+                "replica {} completion path did not match the W boundary: staged_pre_w={staged_pre_w}, saw_blob_staged={}, repaired_events={}",
+                report.node_id, report.saw_blob_staged, report.repaired_event_count,
+            )
+            .into());
+        }
+    }
+    let replica_event_count = replica_reports
+        .iter()
+        .map(|report| report.event_count)
+        .sum::<usize>();
+    let replica_process_loops = replica_reports
+        .iter()
+        .map(|report| report.process_loops)
+        .sum::<usize>();
+    let replica_idle_loops = replica_reports
+        .iter()
+        .map(|report| report.idle_loops)
+        .sum::<usize>();
+    let replica_report_fields = replica_reports
+        .iter()
+        .map(|report| report.to_json(&receipt_nodes_at_w))
+        .collect::<Vec<_>>();
+    let owner_metrics_after_all_receipts = owner_dfs.operational_metrics()?;
+    if owner_metrics_after_all_receipts.repair_job_count != 0
+        || owner_metrics_after_all_receipts.repair_attempt_count != 0
+        || owner_metrics_after_all_receipts.pending_write_count != 0
+        || owner_metrics_after_all_receipts.stage_inflight_count != 0
+        || owner_metrics_after_all_receipts.repair_inflight_count != 0
+        || owner_metrics_after_all_receipts.fetch_inflight_count != 0
+        || owner_metrics_after_all_receipts.fetch_failed_source_count != 0
+        || owner_metrics_after_all_receipts.active_replica_stage_count != 0
+        || owner_metrics_after_all_receipts.stage_retry_count != 0
+        || owner_metrics_after_all_receipts.repair_retry_count != 0
+    {
+        return Err(format!(
+            "network blob retained transfer state after N: repair_jobs={}, repair_attempts={}, pending_writes={}, stage_inflight={}, repair_inflight={}, fetch_inflight={}, fetch_failed_sources={}, active_replica_stages={}, stage_retries={}, repair_retries={}",
+            owner_metrics_after_all_receipts.repair_job_count,
+            owner_metrics_after_all_receipts.repair_attempt_count,
+            owner_metrics_after_all_receipts.pending_write_count,
+            owner_metrics_after_all_receipts.stage_inflight_count,
+            owner_metrics_after_all_receipts.repair_inflight_count,
+            owner_metrics_after_all_receipts.fetch_inflight_count,
+            owner_metrics_after_all_receipts.fetch_failed_source_count,
+            owner_metrics_after_all_receipts.active_replica_stage_count,
+            owner_metrics_after_all_receipts.stage_retry_count,
+            owner_metrics_after_all_receipts.repair_retry_count,
+        )
+        .into());
+    }
 
     emit(
-        "network_blob_replicated_write",
-        write_elapsed,
+        "network_blob_w_visible_commit",
+        w_visible_elapsed,
         json!({
             "bytes": args.network_blob_bytes,
-            "mib_per_second": mib_per_second(args.network_blob_bytes, write_elapsed),
-            "initial_outcome": format!("{write:?}"),
-            "owner_events": owner_event_count,
-            "replica_events": replica_report.event_count,
-            "replica_process_loops": replica_report.process_loops,
-            "replica_staged": replica_report.staged,
-            "owner_committed": owner_committed,
-            "replica_committed": replica_report.committed,
-            "initial_owner_metrics": initial_owner_metrics,
-            "final_owner_metrics": final_owner_metrics,
-            "replica_metrics": replica_report.metrics,
+            "desired_replicas": args.network_blob_desired_replicas,
+            "write_quorum": args.network_blob_write_quorum,
+            "time_to_w_ms": w_visible_elapsed.as_secs_f64() * 1000.0,
+            "time_to_w_is_upper_bound": true,
+            "time_to_w_boundary": "posix-write-return-with-exact-w-receipts",
+            "durable_receipts_at_return": receipt_nodes_at_w.len(),
+            "receipt_nodes_at_return": &receipt_nodes_at_w,
+            "remote_replica_fanout": replica_nodes.len(),
+            "pre_w_stage_fanout": pre_w_stage_fanout,
+            "post_w_repair_fanout": post_w_repair_fanout,
+            "pre_w_staged_replica_nodes": &pre_w_staged_replica_nodes,
+            "throughput_mib_per_second": mib_per_second(args.network_blob_bytes, w_visible_elapsed),
+            "logical_mib_per_second": mib_per_second(args.network_blob_bytes, w_visible_elapsed),
+            "effective_quorum_mib_per_second": mib_per_second(
+                args.network_blob_bytes.saturating_mul(args.network_blob_write_quorum as u64),
+                w_visible_elapsed,
+            ),
+            "process_cpu_time_ms": duration_ms(process_cpu_to_w),
+            "effective_cores": effective_cores(process_cpu_to_w, w_visible_elapsed),
+            "cpu_clock_source": cpu_clock.map(|_| "linux-proc-stat"),
+            "write_call_ms": write_call_elapsed.as_secs_f64() * 1000.0,
+            "initial_outcome": "committed-at-W",
+            "target_version": &target_version,
+            "content_hash": &write_stat.content_hash,
         }),
     );
 
-    if !owner_committed {
-        return Err("owner did not observe network blob commit before timeout".into());
+    emit(
+        "network_blob_all_desired_committed",
+        all_replica_commit_elapsed,
+        json!({
+            "bytes": args.network_blob_bytes,
+            "desired_replicas": args.network_blob_desired_replicas,
+            "replica_workers": replica_reports.len(),
+            "write_quorum": args.network_blob_write_quorum,
+            "time_to_all_replica_commits_ms": all_replica_commit_elapsed.as_secs_f64() * 1000.0,
+            "throughput_mib_per_second": mib_per_second(args.network_blob_bytes, all_replica_commit_elapsed),
+            "logical_mib_per_second": mib_per_second(args.network_blob_bytes, all_replica_commit_elapsed),
+            "effective_replicated_mib_per_second": mib_per_second(
+                args.network_blob_bytes.saturating_mul(args.network_blob_desired_replicas as u64),
+                all_replica_commit_elapsed,
+            ),
+            "process_cpu_time_ms": duration_ms(process_cpu_to_all_replica_commits),
+            "effective_cores": effective_cores(process_cpu_to_all_replica_commits, all_replica_commit_elapsed),
+            "cpu_clock_source": cpu_clock.map(|_| "linux-proc-stat"),
+            "owner_committed": owner_committed,
+            "all_remote_replicas_committed": all_remote_replicas_committed,
+            "durable_receipts_after_finalize": final_receipt_nodes.len(),
+            "receipt_nodes_after_finalize": &final_receipt_nodes,
+            "remote_replica_fanout": replica_nodes.len(),
+            "pre_w_stage_fanout": pre_w_stage_fanout,
+            "post_w_repair_fanout": post_w_repair_fanout,
+            "pre_w_staged_replica_nodes": &pre_w_staged_replica_nodes,
+            "post_w_repaired_replica_nodes": &post_w_repaired_replica_nodes,
+            "w_to_n_owner_events": w_to_n_owner_event_count,
+            "w_to_n_owner_process_calls": w_to_n_owner_process_calls,
+            "w_to_n_owner_idle_process_calls": w_to_n_owner_idle_process_calls,
+            "post_n_owner_finalize_events": post_n_owner_finalize_event_count,
+            "post_n_owner_finalize_process_calls": post_n_owner_finalize_process_calls,
+            "post_n_owner_finalize_idle_process_calls": post_n_owner_finalize_idle_process_calls,
+            "replicas": replica_report_fields,
+            "owner_metrics_after_all_receipts": owner_metrics_after_all_receipts,
+        }),
+    );
+
+    emit(
+        "network_blob_replicated_write",
+        all_replica_commit_elapsed,
+        json!({
+            "bytes": args.network_blob_bytes,
+            "mib_per_second": mib_per_second(args.network_blob_bytes, all_replica_commit_elapsed),
+            "effective_replicated_mib_per_second": mib_per_second(
+                args.network_blob_bytes.saturating_mul(args.network_blob_desired_replicas as u64),
+                all_replica_commit_elapsed,
+            ),
+            "desired_replicas": args.network_blob_desired_replicas,
+            "write_quorum": args.network_blob_write_quorum,
+            "time_to_w_ms": w_visible_elapsed.as_secs_f64() * 1000.0,
+            "time_to_all_replica_commits_ms": all_replica_commit_elapsed.as_secs_f64() * 1000.0,
+            "time_to_w_is_upper_bound": true,
+            "time_to_w_boundary": "posix-write-return-with-exact-w-receipts",
+            "durable_receipts_at_return": receipt_nodes_at_w.len(),
+            "receipt_nodes_at_return": &receipt_nodes_at_w,
+            "throughput_to_w_mib_per_second": mib_per_second(args.network_blob_bytes, w_visible_elapsed),
+            "throughput_to_all_replica_commits_mib_per_second": mib_per_second(args.network_blob_bytes, all_replica_commit_elapsed),
+            "w_visible_logical_mib_per_second": mib_per_second(args.network_blob_bytes, w_visible_elapsed),
+            "w_visible_effective_quorum_mib_per_second": mib_per_second(
+                args.network_blob_bytes.saturating_mul(args.network_blob_write_quorum as u64),
+                w_visible_elapsed,
+            ),
+            "all_replica_commits_logical_mib_per_second": mib_per_second(args.network_blob_bytes, all_replica_commit_elapsed),
+            "process_cpu_time_to_w_ms": duration_ms(process_cpu_to_w),
+            "effective_cores_to_w": effective_cores(process_cpu_to_w, w_visible_elapsed),
+            "process_cpu_time_to_all_replica_commits_ms": duration_ms(process_cpu_to_all_replica_commits),
+            "effective_cores_to_all_replica_commits": effective_cores(process_cpu_to_all_replica_commits, all_replica_commit_elapsed),
+            "cpu_clock_source": cpu_clock.map(|_| "linux-proc-stat"),
+            "w_visible_ms": w_visible_elapsed.as_secs_f64() * 1000.0,
+            "all_replica_committed_ms": all_replica_commit_elapsed.as_secs_f64() * 1000.0,
+            "initial_outcome": "committed-at-W",
+            "target_version": &target_version,
+            "content_hash": &write_stat.content_hash,
+            "remote_replica_fanout": replica_nodes.len(),
+            "pre_w_stage_fanout": pre_w_stage_fanout,
+            "post_w_repair_fanout": post_w_repair_fanout,
+            "pre_w_staged_replica_nodes": &pre_w_staged_replica_nodes,
+            "post_w_repaired_replica_nodes": &post_w_repaired_replica_nodes,
+            "w_to_n_owner_events": w_to_n_owner_event_count,
+            "w_to_n_owner_process_calls": w_to_n_owner_process_calls,
+            "w_to_n_owner_idle_process_calls": w_to_n_owner_idle_process_calls,
+            "post_n_owner_finalize_events": post_n_owner_finalize_event_count,
+            "post_n_owner_finalize_process_calls": post_n_owner_finalize_process_calls,
+            "post_n_owner_finalize_idle_process_calls": post_n_owner_finalize_idle_process_calls,
+            "replica_events": replica_event_count,
+            "replica_process_loops": replica_process_loops,
+            "replica_idle_loops": replica_idle_loops,
+            "owner_committed": owner_committed,
+            "all_remote_replicas_committed": all_remote_replicas_committed,
+            "durable_receipts_after_finalize": final_receipt_nodes.len(),
+            "receipt_nodes_after_finalize": &final_receipt_nodes,
+            "owner_metrics_after_all_receipts": owner_metrics_after_all_receipts,
+            "replicas": replica_reports.iter().map(|report| report.to_json(&receipt_nodes_at_w)).collect::<Vec<_>>(),
+        }),
+    );
+
+    if !owner_committed
+        || !all_remote_replicas_committed
+        || final_receipt_nodes.len() != args.network_blob_desired_replicas
+    {
+        return Err("network blob did not converge on every desired replica".into());
     }
 
     let mut reader_dfs = NetworkedDfsService::new(
@@ -1815,13 +2312,176 @@ fn run_network_write_at(args: &Args) -> BenchResult<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
+struct ReplicaCommitProgress {
+    node_id: NodeId,
+    committed_elapsed: Duration,
+    process_cpu_ticks: Option<u64>,
+}
+
+type ReplicaCommitProgressResult = Result<ReplicaCommitProgress, String>;
+
+fn drain_replica_commit_progress(
+    receiver: &std::sync::mpsc::Receiver<ReplicaCommitProgressResult>,
+    progress: &mut Vec<ReplicaCommitProgress>,
+    expected: usize,
+) -> BenchResult<()> {
+    loop {
+        match receiver.try_recv() {
+            Ok(Ok(update)) => {
+                if progress
+                    .iter()
+                    .any(|existing| existing.node_id == update.node_id)
+                {
+                    return Err(format!(
+                        "replica {} reported network blob commit more than once",
+                        update.node_id
+                    )
+                    .into());
+                }
+                progress.push(update);
+            }
+            Ok(Err(reason)) => return Err(reason.into()),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                if progress.len() == expected {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "network blob replica progress channel closed after {}/{} commits",
+                    progress.len(),
+                    expected
+                )
+                .into());
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct ReplicaWorkerReport {
+    node_id: NodeId,
     event_count: usize,
+    staged_event_count: usize,
+    committed_event_count: usize,
+    repaired_event_count: usize,
+    rejected_event_count: usize,
+    other_event_count: usize,
     process_loops: usize,
-    staged: bool,
+    idle_loops: usize,
+    saw_blob_staged: bool,
     committed: bool,
+    staged_elapsed: Option<Duration>,
+    repaired_elapsed: Option<Duration>,
+    committed_elapsed: Option<Duration>,
+    cpu_time: Option<Duration>,
     metrics: Option<DfsOperationalMetrics>,
+}
+
+impl ReplicaWorkerReport {
+    fn new(node_id: NodeId) -> Self {
+        Self {
+            node_id,
+            event_count: 0,
+            staged_event_count: 0,
+            committed_event_count: 0,
+            repaired_event_count: 0,
+            rejected_event_count: 0,
+            other_event_count: 0,
+            process_loops: 0,
+            idle_loops: 0,
+            saw_blob_staged: false,
+            committed: false,
+            staged_elapsed: None,
+            repaired_elapsed: None,
+            committed_elapsed: None,
+            cpu_time: None,
+            metrics: None,
+        }
+    }
+
+    fn record_event(
+        &mut self,
+        event: &NetworkedDfsServiceEvent,
+        object_id: &DfsObjectId,
+        started_at: Instant,
+    ) {
+        self.event_count = self.event_count.saturating_add(1);
+        match event {
+            NetworkedDfsServiceEvent::BlobStaged {
+                object_id: staged, ..
+            } if staged == object_id => {
+                self.staged_event_count = self.staged_event_count.saturating_add(1);
+                self.saw_blob_staged = true;
+                self.staged_elapsed
+                    .get_or_insert_with(|| started_at.elapsed());
+            }
+            NetworkedDfsServiceEvent::VersionCommitted {
+                object_id: committed,
+                ..
+            } if committed == object_id => {
+                self.committed_event_count = self.committed_event_count.saturating_add(1);
+                self.committed = true;
+                self.committed_elapsed
+                    .get_or_insert_with(|| started_at.elapsed());
+            }
+            NetworkedDfsServiceEvent::ReplicaRepaired {
+                object_id: repaired,
+                ..
+            } if repaired == object_id => {
+                self.repaired_event_count = self.repaired_event_count.saturating_add(1);
+                // RepairReplica transfers and commits the missing replica in
+                // one command, so no separate VersionCommitted event follows.
+                self.committed = true;
+                let repaired_elapsed = *self
+                    .repaired_elapsed
+                    .get_or_insert_with(|| started_at.elapsed());
+                self.committed_elapsed.get_or_insert(repaired_elapsed);
+            }
+            NetworkedDfsServiceEvent::BlobStageRejected {
+                object_id: rejected,
+                ..
+            }
+            | NetworkedDfsServiceEvent::RepairRejected {
+                object_id: rejected,
+                ..
+            } if rejected == object_id => {
+                self.rejected_event_count = self.rejected_event_count.saturating_add(1);
+            }
+            _ => self.other_event_count = self.other_event_count.saturating_add(1),
+        }
+    }
+
+    fn to_json(&self, receipt_nodes_at_w: &[NodeId]) -> serde_json::Value {
+        let staged_pre_w = receipt_nodes_at_w.contains(&self.node_id);
+        let repaired_post_w = !staged_pre_w;
+        json!({
+            "node_id": self.node_id,
+            "events": {
+                "total": self.event_count,
+                "staged": self.staged_event_count,
+                "committed": self.committed_event_count,
+                "repaired": self.repaired_event_count,
+                "rejected": self.rejected_event_count,
+                "other": self.other_event_count,
+            },
+            "process_loops": self.process_loops,
+            "idle_loops": self.idle_loops,
+            "completion_path": if staged_pre_w { "pre-w-stage" } else { "post-w-repair" },
+            "receipt_at_w": staged_pre_w,
+            "staged_pre_w": staged_pre_w && self.saw_blob_staged,
+            "repaired_post_w": repaired_post_w && self.repaired_event_count > 0,
+            "saw_blob_staged_event": self.saw_blob_staged,
+            "saw_replica_repaired_event": self.repaired_event_count > 0,
+            "committed": self.committed,
+            "blob_staged_observed_ms": self.staged_elapsed.map(|elapsed| elapsed.as_secs_f64() * 1000.0),
+            "replica_repaired_observed_ms": self.repaired_elapsed.map(|elapsed| elapsed.as_secs_f64() * 1000.0),
+            "committed_elapsed_ms": self.committed_elapsed.map(|elapsed| elapsed.as_secs_f64() * 1000.0),
+            "cpu_time_ms": duration_ms(self.cpu_time),
+            "effective_cores": self.committed_elapsed.and_then(|elapsed| effective_cores(self.cpu_time, elapsed)),
+            "metrics": self.metrics,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2055,6 +2715,69 @@ fn emit(name: &str, elapsed: std::time::Duration, fields: serde_json::Value) {
     println!("{value}");
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ProcessCpuClock {
+    ticks_per_second: f64,
+}
+
+impl ProcessCpuClock {
+    fn detect() -> Option<Self> {
+        if !Path::new("/proc/self/stat").is_file() {
+            return None;
+        }
+        let output = process::Command::new("getconf")
+            .arg("CLK_TCK")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let ticks_per_second = std::str::from_utf8(&output.stdout)
+            .ok()?
+            .trim()
+            .parse::<f64>()
+            .ok()?;
+        (ticks_per_second > 0.0).then_some(Self { ticks_per_second })
+    }
+
+    fn sample_process_ticks(self) -> Option<u64> {
+        read_proc_stat_cpu_ticks("/proc/self/stat")
+    }
+
+    fn sample_thread_ticks(self) -> Option<u64> {
+        read_proc_stat_cpu_ticks("/proc/thread-self/stat")
+    }
+
+    fn elapsed_since(self, started_ticks: u64, completed_ticks: u64) -> Option<Duration> {
+        let elapsed_ticks = completed_ticks.checked_sub(started_ticks)?;
+        Some(Duration::from_secs_f64(
+            elapsed_ticks as f64 / self.ticks_per_second,
+        ))
+    }
+}
+
+fn read_proc_stat_cpu_ticks(path: &str) -> Option<u64> {
+    let stat = fs::read_to_string(path).ok()?;
+    // The command name in field 2 is parenthesized and may contain spaces, so
+    // locate its final ')' before indexing from field 3 (state). Fields 14 and
+    // 15 are user and system CPU time in clock ticks.
+    let command_end = stat.rfind(')')?;
+    let mut fields = stat.get(command_end + 1..)?.split_whitespace();
+    let user_ticks = fields.nth(11)?.parse::<u64>().ok()?;
+    let system_ticks = fields.next()?.parse::<u64>().ok()?;
+    user_ticks.checked_add(system_ticks)
+}
+
+fn duration_ms(duration: Option<Duration>) -> Option<f64> {
+    duration.map(|elapsed| elapsed.as_secs_f64() * 1000.0)
+}
+
+fn effective_cores(cpu_time: Option<Duration>, wall_time: Duration) -> Option<f64> {
+    let cpu_time = cpu_time?;
+    let wall_seconds = wall_time.as_secs_f64();
+    (wall_seconds > 0.0).then(|| cpu_time.as_secs_f64() / wall_seconds)
+}
+
 fn rate(count: u64, elapsed: std::time::Duration) -> f64 {
     let seconds = elapsed.as_secs_f64();
     if seconds == 0.0 {
@@ -2194,6 +2917,8 @@ fn print_help() {
            --blob-bytes BYTES\n\
            --blob-range-bytes BYTES\n\
            --network-blob-bytes BYTES\n\
+           --network-blob-desired-replicas COUNT (2..=5, including owner)\n\
+           --network-blob-write-quorum COUNT (1..=desired replicas)\n\
            --write-at-ops COUNT\n\
            --write-at-bytes BYTES\n\
            --list-page-size COUNT\n\
@@ -2208,6 +2933,8 @@ fn print_help() {
            SINOMO_DFS_BENCH_FILE_BYTES, SINOMO_DFS_BENCH_BLOB_BYTES,\n\
            SINOMO_DFS_BENCH_BLOB_RANGE_BYTES,\n\
            SINOMO_DFS_BENCH_NETWORK_BLOB_BYTES,\n\
+           SINOMO_DFS_BENCH_NETWORK_BLOB_DESIRED_REPLICAS,\n\
+           SINOMO_DFS_BENCH_NETWORK_BLOB_WRITE_QUORUM,\n\
            SINOMO_DFS_BENCH_WRITE_AT_OPS, SINOMO_DFS_BENCH_WRITE_AT_BYTES,\n\
            SINOMO_DFS_BENCH_LIST_PAGE_SIZE,\n\
            SINOMO_DFS_BENCH_METADATA_BATCH_SIZE,\n\

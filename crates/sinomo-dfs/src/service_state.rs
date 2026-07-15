@@ -391,13 +391,16 @@ pub(crate) struct PendingMetadataReplication {
     pub(crate) shard_id: DfsMetadataShardId,
     pub(crate) next_after_sequence: u64,
     pub(crate) verify_prefix_only: bool,
+    /// Optional authority identity that a rolling-upgrade-safe response must
+    /// echo before an exact-prefix acknowledgement can count.
+    pub(crate) required_authority_confirmation_id: Option<String>,
     pub(crate) created_at: Instant,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PendingMetadataAuthorityProbe {
     pub(crate) target_node_id: NodeId,
-    pub(crate) probe_id: String,
+    pub(crate) confirmation_id: String,
     pub(crate) expected_shard: DfsMetadataShardConfig,
 }
 
@@ -405,6 +408,10 @@ pub(crate) struct PendingMetadataAuthorityProbe {
 pub(crate) struct PendingRoutedWrite {
     pub(crate) object_id: DfsObjectId,
     pub(crate) primary_node_id: NodeId,
+    /// Exact committed shard assignment used to choose `primary_node_id` for
+    /// this dispatch. Response journals are admitted only while this remains
+    /// the current assignment, including its authority epoch.
+    pub(crate) authority_shard: DfsMetadataShardConfig,
     pub(crate) command: DfsDistributedWriteCommand,
     pub(crate) authority_redirects_remaining: usize,
     pub(crate) remote_intent_id: Option<String>,
@@ -436,6 +443,14 @@ pub(crate) struct PendingRoutedNamespaceResult {
 #[derive(Clone, Debug)]
 pub(crate) struct PendingRoutedNamespaceOp {
     pub(crate) primary_node_id: NodeId,
+    /// Exact immutable assignment whose routing path selected
+    /// `primary_node_id`. Redirects and zero-batch responses bind to this
+    /// authority rather than to any unrelated shard touched by coordination.
+    pub(crate) dispatch_authority_shard: Option<DfsMetadataShardConfig>,
+    /// One immutable authority snapshot for all shards touched by the
+    /// operation. Each response batch must still match its dispatch snapshot
+    /// and the receiver's current committed assignment.
+    pub(crate) authority_shards: Vec<DfsMetadataShardConfig>,
     pub(crate) replay_journal_batches: bool,
     pub(crate) apply_synced_path_object: bool,
     pub(crate) result: Option<PendingRoutedNamespaceResult>,

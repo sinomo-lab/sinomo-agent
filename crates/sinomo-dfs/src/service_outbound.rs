@@ -18,6 +18,52 @@ pub(crate) struct DfsBestEffortMessageSendOutcome {
     pub(crate) last_error: Option<String>,
 }
 
+/// Refinement of `StageFanoutCap` in the verified repair-content model.
+pub(crate) const DFS_REPLICA_BODY_FANOUT_CAP: usize = 2;
+
+fn validate_replica_body_fanout_outcomes(
+    expected_targets: &[NodeId],
+    outcomes: Vec<DfsRoutedBodySendOutcome>,
+) -> Result<Vec<StageBlobSendOutcome>, DfsError> {
+    if outcomes.len() != expected_targets.len() {
+        return Err(DfsError::Distributed {
+            message: format!(
+                "DFS replica body fan-out returned {} outcomes for {} targets",
+                outcomes.len(),
+                expected_targets.len()
+            ),
+        });
+    }
+    expected_targets
+        .iter()
+        .zip(outcomes)
+        .map(|(expected_target, outcome)| {
+            if &outcome.target_node_id != expected_target {
+                return Err(DfsError::Distributed {
+                    message: format!(
+                        "DFS replica body fan-out expected target {expected_target}, got {}",
+                        outcome.target_node_id
+                    ),
+                });
+            }
+            Ok(match outcome.result {
+                Ok(()) => StageBlobSendOutcome {
+                    sent: true,
+                    last_error: None,
+                },
+                Err(NetworkError::UnknownNode { .. }) => StageBlobSendOutcome {
+                    sent: false,
+                    last_error: None,
+                },
+                Err(error) => StageBlobSendOutcome {
+                    sent: false,
+                    last_error: Some(error.to_string()),
+                },
+            })
+        })
+        .collect()
+}
+
 impl<T> NetworkedDfsService<T>
 where
     T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
@@ -247,6 +293,162 @@ where
             sent: send_outcome.sent,
             last_error: send_outcome.last_error,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_stage_blob_bodies_if_routable_async(
+        &mut self,
+        targets: &[(NodeId, String)],
+        intent_id: &str,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        expected_base_version: Option<DfsVersion>,
+        version: &DfsVersion,
+        content_hash: &str,
+        total_size_bytes: u64,
+        object_metadata: Option<DfsObjectMetadata>,
+    ) -> Result<Vec<StageBlobSendOutcome>, DfsError> {
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        if total_size_bytes <= DFS_BLOB_INLINE_LIMIT_BYTES as u64 {
+            let mut outcomes = Vec::with_capacity(targets.len());
+            for (target_node_id, request_id) in targets {
+                outcomes.push(
+                    self.send_stage_blob_body_if_routable_async(
+                        target_node_id,
+                        request_id.clone(),
+                        intent_id,
+                        file_system_id,
+                        object_id,
+                        expected_base_version.clone(),
+                        version,
+                        content_hash,
+                        total_size_bytes,
+                        object_metadata.clone(),
+                    )
+                    .await?,
+                );
+            }
+            return Ok(outcomes);
+        }
+
+        let authority_shard = self.command_authority_shard_for_object(object_metadata.as_ref())?;
+        let mut requests = Vec::with_capacity(targets.len());
+        for (target_node_id, request_id) in targets {
+            let (_, reader) = self.open_content_hash_stream(
+                object_id,
+                version,
+                content_hash,
+                Some(total_size_bytes),
+            )?;
+            let message = DfsNetworkMessage::StageBlob(DfsStageBlobCommand {
+                request_id: request_id.clone(),
+                intent_id: intent_id.to_string(),
+                file_system_id: file_system_id.clone(),
+                object_id: object_id.clone(),
+                expected_base_version: expected_base_version.clone(),
+                version: version.clone(),
+                content_hash: content_hash.to_string(),
+                bytes: Vec::new(),
+                object_metadata: object_metadata.clone(),
+                authority_shard: authority_shard.clone(),
+            });
+            let routed_message = self.next_dfs_routed_message(target_node_id, message);
+            requests.push(DfsRoutedBodySend::new(
+                target_node_id.clone(),
+                routed_message,
+                DfsOutboundBody::from_reader(reader, total_size_bytes, content_hash),
+            ));
+        }
+        let expected_targets = targets
+            .iter()
+            .map(|(target, _)| target.clone())
+            .collect::<Vec<_>>();
+        let outcomes = self
+            .transport
+            .send_routed_message_bodies_bounded_async(requests, DFS_REPLICA_BODY_FANOUT_CAP)
+            .await
+            .map_err(DfsError::from_network)?;
+        validate_replica_body_fanout_outcomes(&expected_targets, outcomes)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_repair_replica_bodies_if_routable_async(
+        &mut self,
+        targets: &[(NodeId, String)],
+        intent_id: &str,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        expected_base_version: Option<DfsVersion>,
+        version: &DfsVersion,
+        content_hash: &str,
+        total_size_bytes: u64,
+        object_metadata: Option<DfsObjectMetadata>,
+    ) -> Result<Vec<StageBlobSendOutcome>, DfsError> {
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        if total_size_bytes <= DFS_BLOB_INLINE_LIMIT_BYTES as u64 {
+            let mut outcomes = Vec::with_capacity(targets.len());
+            for (target_node_id, request_id) in targets {
+                outcomes.push(
+                    self.send_repair_replica_body_if_routable_async(
+                        target_node_id,
+                        request_id.clone(),
+                        intent_id,
+                        file_system_id,
+                        object_id,
+                        expected_base_version.clone(),
+                        version,
+                        content_hash,
+                        total_size_bytes,
+                        object_metadata.clone(),
+                    )
+                    .await?,
+                );
+            }
+            return Ok(outcomes);
+        }
+
+        let authority_shard = self.command_authority_shard_for_object(object_metadata.as_ref())?;
+        let mut requests = Vec::with_capacity(targets.len());
+        for (target_node_id, request_id) in targets {
+            let (_, reader) = self.open_content_hash_stream(
+                object_id,
+                version,
+                content_hash,
+                Some(total_size_bytes),
+            )?;
+            let message = DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
+                request_id: request_id.clone(),
+                intent_id: intent_id.to_string(),
+                file_system_id: file_system_id.clone(),
+                object_id: object_id.clone(),
+                expected_base_version: expected_base_version.clone(),
+                version: version.clone(),
+                content_hash: content_hash.to_string(),
+                bytes: Vec::new(),
+                object_metadata: object_metadata.clone(),
+                authority_shard: authority_shard.clone(),
+            });
+            let routed_message = self.next_dfs_routed_message(target_node_id, message);
+            requests.push(DfsRoutedBodySend::new(
+                target_node_id.clone(),
+                routed_message,
+                DfsOutboundBody::from_reader(reader, total_size_bytes, content_hash),
+            ));
+        }
+        let expected_targets = targets
+            .iter()
+            .map(|(target, _)| target.clone())
+            .collect::<Vec<_>>();
+        let outcomes = self
+            .transport
+            .send_routed_message_bodies_bounded_async(requests, DFS_REPLICA_BODY_FANOUT_CAP)
+            .await
+            .map_err(DfsError::from_network)?;
+        validate_replica_body_fanout_outcomes(&expected_targets, outcomes)
     }
 
     pub(crate) async fn send_best_effort_message_if_routable_async(
@@ -567,6 +769,156 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn send_stage_blob_bodies_if_routable(
+        &mut self,
+        targets: &[(NodeId, String)],
+        intent_id: &str,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        expected_base_version: Option<DfsVersion>,
+        version: &DfsVersion,
+        content_hash: &str,
+        total_size_bytes: u64,
+        object_metadata: Option<DfsObjectMetadata>,
+    ) -> Result<Vec<StageBlobSendOutcome>, DfsError> {
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        if total_size_bytes <= DFS_BLOB_INLINE_LIMIT_BYTES as u64 {
+            return targets
+                .iter()
+                .map(|(target_node_id, request_id)| {
+                    self.send_stage_blob_body_if_routable(
+                        target_node_id,
+                        request_id.clone(),
+                        intent_id,
+                        file_system_id,
+                        object_id,
+                        expected_base_version.clone(),
+                        version,
+                        content_hash,
+                        total_size_bytes,
+                        object_metadata.clone(),
+                    )
+                })
+                .collect();
+        }
+
+        let authority_shard = self.command_authority_shard_for_object(object_metadata.as_ref())?;
+        let mut requests = Vec::with_capacity(targets.len());
+        for (target_node_id, request_id) in targets {
+            let (_, reader) = self.open_content_hash_stream(
+                object_id,
+                version,
+                content_hash,
+                Some(total_size_bytes),
+            )?;
+            let message = DfsNetworkMessage::StageBlob(DfsStageBlobCommand {
+                request_id: request_id.clone(),
+                intent_id: intent_id.to_string(),
+                file_system_id: file_system_id.clone(),
+                object_id: object_id.clone(),
+                expected_base_version: expected_base_version.clone(),
+                version: version.clone(),
+                content_hash: content_hash.to_string(),
+                bytes: Vec::new(),
+                object_metadata: object_metadata.clone(),
+                authority_shard: authority_shard.clone(),
+            });
+            let routed_message = self.next_dfs_routed_message(target_node_id, message);
+            requests.push(DfsRoutedBodySend::new(
+                target_node_id.clone(),
+                routed_message,
+                DfsOutboundBody::from_reader(reader, total_size_bytes, content_hash),
+            ));
+        }
+        let expected_targets = targets
+            .iter()
+            .map(|(target, _)| target.clone())
+            .collect::<Vec<_>>();
+        let outcomes = self
+            .transport
+            .send_routed_message_bodies_bounded(requests, DFS_REPLICA_BODY_FANOUT_CAP)
+            .map_err(DfsError::from_network)?;
+        validate_replica_body_fanout_outcomes(&expected_targets, outcomes)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn send_repair_replica_bodies_if_routable(
+        &mut self,
+        targets: &[(NodeId, String)],
+        intent_id: &str,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        expected_base_version: Option<DfsVersion>,
+        version: &DfsVersion,
+        content_hash: &str,
+        total_size_bytes: u64,
+        object_metadata: Option<DfsObjectMetadata>,
+    ) -> Result<Vec<StageBlobSendOutcome>, DfsError> {
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        if total_size_bytes <= DFS_BLOB_INLINE_LIMIT_BYTES as u64 {
+            return targets
+                .iter()
+                .map(|(target_node_id, request_id)| {
+                    self.send_repair_replica_body_if_routable(
+                        target_node_id,
+                        request_id.clone(),
+                        intent_id,
+                        file_system_id,
+                        object_id,
+                        expected_base_version.clone(),
+                        version,
+                        content_hash,
+                        total_size_bytes,
+                        object_metadata.clone(),
+                    )
+                })
+                .collect();
+        }
+
+        let authority_shard = self.command_authority_shard_for_object(object_metadata.as_ref())?;
+        let mut requests = Vec::with_capacity(targets.len());
+        for (target_node_id, request_id) in targets {
+            let (_, reader) = self.open_content_hash_stream(
+                object_id,
+                version,
+                content_hash,
+                Some(total_size_bytes),
+            )?;
+            let message = DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
+                request_id: request_id.clone(),
+                intent_id: intent_id.to_string(),
+                file_system_id: file_system_id.clone(),
+                object_id: object_id.clone(),
+                expected_base_version: expected_base_version.clone(),
+                version: version.clone(),
+                content_hash: content_hash.to_string(),
+                bytes: Vec::new(),
+                object_metadata: object_metadata.clone(),
+                authority_shard: authority_shard.clone(),
+            });
+            let routed_message = self.next_dfs_routed_message(target_node_id, message);
+            requests.push(DfsRoutedBodySend::new(
+                target_node_id.clone(),
+                routed_message,
+                DfsOutboundBody::from_reader(reader, total_size_bytes, content_hash),
+            ));
+        }
+        let expected_targets = targets
+            .iter()
+            .map(|(target, _)| target.clone())
+            .collect::<Vec<_>>();
+        let outcomes = self
+            .transport
+            .send_routed_message_bodies_bounded(requests, DFS_REPLICA_BODY_FANOUT_CAP)
+            .map_err(DfsError::from_network)?;
+        validate_replica_body_fanout_outcomes(&expected_targets, outcomes)
+    }
+
     pub(crate) fn send_best_effort_message_if_routable(
         &mut self,
         target_node_id: &NodeId,
@@ -574,6 +926,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<bool, DfsError> {
         self.send_best_effort_message_if_routable_outcome(target_node_id, message)
             .map(|outcome| outcome.sent)
+    }
+
+    /// Queue one message without waiting for the target to process it. Replica
+    /// promotion uses this after visible commit so delivery cannot extend the
+    /// W-visible response path. Production served transports retain failed
+    /// CommitVersion work until a matching positive acknowledgement; if a
+    /// transport cannot queue at all, durable intent/receipt hydration can
+    /// reconstruct the exact idempotent promotion after restart.
+    pub(crate) fn send_best_effort_message_if_routable_detached(
+        &mut self,
+        target_node_id: &NodeId,
+        message: DfsNetworkMessage,
+    ) -> Result<bool, DfsError> {
+        match self.send_dfs_message_if_routable_detached(target_node_id, message) {
+            Ok(sent) => Ok(sent),
+            Err(DfsError::Network { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn send_best_effort_message_body_if_routable(

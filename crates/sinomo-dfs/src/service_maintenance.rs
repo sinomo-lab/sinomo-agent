@@ -186,12 +186,39 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(batch) = self.metadata_journal_batch_since(after_sequence)? else {
             return Ok(None);
         };
+        let authority_shard = match self.control_plane.as_mut() {
+            Some(control_plane) => {
+                let file_system_id = metadata_journal_batch_file_system_id(&batch).ok_or_else(|| {
+                    DfsError::Metadata {
+                        message: format!(
+                            "clustered metadata journal batch for shard {} has no filesystem identity",
+                            batch.shard_id.0
+                        ),
+                    }
+                })?;
+                Some(
+                    DfsControlPlaneStore::new(control_plane.as_mut())
+                        .get_metadata_shard(&file_system_id, &batch.shard_id.0)?
+                        .ok_or_else(|| DfsError::Metadata {
+                            message: format!(
+                                "metadata journal batch has no configured shard {} for filesystem {}",
+                                batch.shard_id.0, file_system_id
+                            ),
+                        })?,
+                )
+            }
+            None => None,
+        };
         let request_id = self.next_request_id();
         let sent = self.send_dfs_message_if_routable(
             target_node_id,
             DfsNetworkMessage::MetadataJournalBatch(DfsMetadataJournalBatchCommand {
                 request_id,
                 source_node_id: Some(self.node_id.clone()),
+                file_system_id: authority_shard
+                    .as_ref()
+                    .map(|shard| shard.file_system_id.clone()),
+                authority_epoch: authority_shard.as_ref().map(|shard| shard.epoch),
                 verify_prefix_only: false,
                 prefix_probe: None,
                 authority_probe: None,
@@ -225,6 +252,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
 
+        let authority_file_system_id = shard.file_system_id.clone();
+        let authority_epoch = shard.epoch;
         let shard_id = DfsMetadataShardId::new(shard.shard_id);
         let local_node_id = self.node_id.clone();
         let mut outcomes = Vec::new();
@@ -284,6 +313,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     shard_id: shard_id.clone(),
                     next_after_sequence,
                     verify_prefix_only: false,
+                    required_authority_confirmation_id: None,
                     created_at: std::time::Instant::now(),
                 },
             );
@@ -292,6 +322,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DfsNetworkMessage::MetadataJournalBatch(DfsMetadataJournalBatchCommand {
                     request_id: request_id.clone(),
                     source_node_id: Some(self.node_id.clone()),
+                    file_system_id: Some(authority_file_system_id.clone()),
+                    authority_epoch: Some(authority_epoch),
                     verify_prefix_only: false,
                     prefix_probe: None,
                     authority_probe: None,

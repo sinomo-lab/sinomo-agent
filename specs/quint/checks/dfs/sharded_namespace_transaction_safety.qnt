@@ -78,6 +78,74 @@ module dfs_sharded_namespace_transaction_safety {
     }
 
 
+  /// A tombstone on the retired physical source shard is migration history,
+  /// not the logical path winner once the durable object-shard index and the
+  /// path-selected target shard both expose the live object.
+  def indexedTargetLiveObjectWinsRetiredSourceTombstone: bool =
+    all {
+      affectedRouteShards == Set(ServicesShard),
+      sourceTombstonePresent,
+      targetPathVisible,
+      objectShardIndex == Some(ServicesShard),
+    } implies all {
+      legacyGlobalTombstoneFirstLookup == PathTombstone,
+      shardAwareSelectedLookup == PathLive,
+    }
+
+
+  /// The replica-local index is derived cache state. Both a stale root entry
+  /// and an absent entry must leave the current path-selected services row
+  /// visible; repairing the index is a later convergence step.
+  def replicaDerivedIndexDoesNotAuthorizePathVisibility: bool =
+    all {
+      phase == Complete,
+      affectedRouteShards == Set(ServicesShard),
+      targetRowPresent,
+      any {
+        replicaObjectShardIndex == Some(RootShard),
+        replicaObjectShardIndex == None,
+      },
+    } implies shardAwareSelectedLookup == PathLive
+
+
+  def legacyShadowingExplainsPostCommitFalseRedirect: bool =
+    postMoveProbe.outcome == LegacyResurrectionThenUncorroboratedRedirect implies all {
+      phase == Complete,
+      legacyGlobalTombstoneFirstLookup == PathTombstone,
+      postMoveProbe.legacyBackendLookupBefore == PathMissing,
+      shardAwareSelectedLookup == PathLive,
+      postMoveProbe.committedMutations == 1,
+      postMoveProbe.replicaIndexBeforeLookup == Some(RootShard),
+      postMoveProbe.derivedIndexRepairs == 0,
+      replicaObjectShardIndex == Some(ServicesShard),
+      postMoveProbe.reportedRedirectShard == Some(RootShard),
+      not(postMoveProbe.redirectAccepted),
+      not(postMoveProbe.returnedSuccess),
+    }
+
+
+  def shardAwareMkdirIsAZeroMutationSuccessfulNoOp: bool =
+    postMoveProbe.outcome == ShardAwareExistingDirectorySucceeded implies all {
+      phase == Complete,
+      shardAwareSelectedLookup == PathLive,
+      postMoveProbe.committedMutations == 0,
+      postMoveProbe.replicaIndexBeforeLookup != Some(ServicesShard),
+      postMoveProbe.derivedIndexRepairs == 1,
+      replicaObjectShardIndex == Some(ServicesShard),
+      postMoveProbe.reportedRedirectShard == None,
+      not(postMoveProbe.redirectAccepted),
+      postMoveProbe.returnedSuccess,
+    }
+
+
+  def retiredSourceRedirectIsNeverAcceptedForServicesDispatch: bool =
+    postMoveProbe.reportedRedirectShard == Some(RootShard) implies all {
+      affectedRouteShards == Set(ServicesShard),
+      postMoveProbe.outcome == LegacyResurrectionThenUncorroboratedRedirect,
+      not(postMoveProbe.redirectAccepted),
+    }
+
+
   def replayDoesNotCreateNewVisibleSource: bool =
     replayedShards.contains(ServicesShard) implies all {
       targetRowPresent,
@@ -97,6 +165,73 @@ module dfs_sharded_namespace_transaction_safety {
     }
 
 
+  def witnessRetiredSourceTombstoneWouldShadowIndexedLiveObject: bool = all {
+    phase == Complete,
+    affectedRouteShards == Set(ServicesShard),
+    sourceTombstonePresent,
+    targetPathVisible,
+    replicaObjectShardIndex == Some(RootShard),
+    legacyGlobalTombstoneFirstLookup == PathTombstone,
+    legacyReplicaBackendLookup == PathMissing,
+    shardAwareSelectedLookup == PathLive,
+  }
+
+
+  def witnessLegacyMkdirCommitsBeforeUncorroboratedRedirect: bool = all {
+    postMoveProbe.outcome == LegacyResurrectionThenUncorroboratedRedirect,
+    postMoveProbe.committedMutations == 1,
+    postMoveProbe.reportedRedirectShard == Some(RootShard),
+    not(postMoveProbe.redirectAccepted),
+    not(postMoveProbe.returnedSuccess),
+    legacyShadowingExplainsPostCommitFalseRedirect,
+  }
+
+
+  def witnessShardAwareLookupPrefersPathSelectedLiveObject: bool = all {
+    phase == Complete,
+    affectedRouteShards == Set(ServicesShard),
+    sourceTombstonePresent,
+    objectShardIndex == Some(ServicesShard),
+    replicaObjectShardIndex == Some(RootShard),
+    targetRowPresent,
+    shardAwareSelectedLookup == PathLive,
+    indexedTargetLiveObjectWinsRetiredSourceTombstone,
+  }
+
+
+  def witnessMissingReplicaIndexStillSeesPathSelectedLiveObject: bool = all {
+    phase == Complete,
+    affectedRouteShards == Set(ServicesShard),
+    sourceTombstonePresent,
+    replicaObjectShardIndex == None,
+    targetRowPresent,
+    shardAwareSelectedLookup == PathLive,
+    replicaDerivedIndexDoesNotAuthorizePathVisibility,
+  }
+
+
+  def witnessShardAwareMkdirRepairsStaleIndexWithoutMutation: bool = all {
+    postMoveProbe.outcome == ShardAwareExistingDirectorySucceeded,
+    postMoveProbe.replicaIndexBeforeLookup == Some(RootShard),
+    postMoveProbe.committedMutations == 0,
+    postMoveProbe.derivedIndexRepairs == 1,
+    postMoveProbe.reportedRedirectShard == None,
+    postMoveProbe.returnedSuccess,
+    shardAwareMkdirIsAZeroMutationSuccessfulNoOp,
+  }
+
+
+  def witnessShardAwareMkdirRepairsMissingIndexWithoutMutation: bool = all {
+    postMoveProbe.outcome == ShardAwareExistingDirectorySucceeded,
+    postMoveProbe.replicaIndexBeforeLookup == None,
+    postMoveProbe.committedMutations == 0,
+    postMoveProbe.derivedIndexRepairs == 1,
+    postMoveProbe.reportedRedirectShard == None,
+    postMoveProbe.returnedSuccess,
+    shardAwareMkdirIsAZeroMutationSuccessfulNoOp,
+  }
+
+
   def safety: bool = all {
     affectedRouteShardsMatchServiceHelper,
     sourceCleanupShardComesFromExistingIndex,
@@ -109,6 +244,11 @@ module dfs_sharded_namespace_transaction_safety {
     indexWriteFailurePreservesSourceLookup,
     sourceTombstoneFailureHidesStaleSourceLookup,
     completeMoveHasOnlyTargetVisible,
+    indexedTargetLiveObjectWinsRetiredSourceTombstone,
+    replicaDerivedIndexDoesNotAuthorizePathVisibility,
+    legacyShadowingExplainsPostCommitFalseRedirect,
+    shardAwareMkdirIsAZeroMutationSuccessfulNoOp,
+    retiredSourceRedirectIsNeverAcceptedForServicesDispatch,
     replayDoesNotCreateNewVisibleSource,
     noObjectScenarioHasNoRows,
   }

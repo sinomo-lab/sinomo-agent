@@ -69,54 +69,9 @@ pub(crate) fn namespace_prepare_expectations(
     ),
     DfsError,
 > {
-    let mut object_ids = transaction
-        .objects
-        .iter()
-        .map(|object| object.object_id.clone())
-        .chain(
-            transaction
-                .versions
-                .iter()
-                .map(|version| version.object_id.clone()),
-        )
-        .chain(
-            transaction
-                .advisory_lock_states
-                .iter()
-                .map(|state| state.object_id.clone()),
-        )
-        .collect::<BTreeSet<_>>();
-    let mut paths = transaction
-        .objects
-        .iter()
-        .map(|object| object.path.clone())
-        .collect::<BTreeSet<_>>();
-    for object_id in &object_ids {
-        if let Some(object) = backend.get_object_on_shard(shard_id, object_id)? {
-            paths.insert(object.path);
-        }
-    }
-    let mut expected_path_occupants = Vec::with_capacity(paths.len());
-    for path in &paths {
-        let occupant =
-            backend.get_object_by_path_on_shard(shard_id, &transaction.file_system_id, path)?;
-        if let Some(occupant) = occupant.as_ref() {
-            object_ids.insert(occupant.object_id.clone());
-        }
-        expected_path_occupants.push(DfsNamespacePathOccupantExpectation {
-            path: path.clone(),
-            expected_object_id: occupant.map(|object| object.object_id),
-        });
-    }
-    let mut expected_object_versions = Vec::with_capacity(object_ids.len());
-    for object_id in object_ids {
-        let current = backend.get_object_on_shard(shard_id, &object_id)?;
-        expected_object_versions.push(DfsNamespaceObjectVersionExpectation {
-            object_id,
-            expected_version: current.map(|object| object.version),
-        });
-    }
-    Ok((expected_object_versions, expected_path_occupants, paths))
+    backend
+        .namespace_prepare_expectations(shard_id, transaction)
+        .map_err(DfsError::from)
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -416,6 +371,73 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
+    /// Resolve one logical namespace path without treating the service's
+    /// merged tombstone map as durable authority. Cross-shard migration keeps
+    /// a source eviction tombstone for history, and replicas may observe that
+    /// row after the path-selected live destination. With a backend present,
+    /// its routed path lookup wins unless an explicit in-flight local write
+    /// owns the memory overlay.
+    pub(crate) fn authoritative_metadata_object_for_path(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        normalized_posix_path: &str,
+    ) -> crate::metadata_error::Result<Option<DfsObjectMetadata>> {
+        let metadata_key = metadata_path(normalized_posix_path);
+        let live_memory_object = self
+            .metadata
+            .object_by_normalized_posix_path(file_system_id, normalized_posix_path);
+        let tombstone_memory_object = self
+            .tombstones_by_metadata_path
+            .get(&(file_system_id.clone(), metadata_key.clone()));
+        let memory_object = match (live_memory_object, tombstone_memory_object) {
+            (Some(live), Some(_))
+                if self.transient_metadata_object_ids.contains(&live.object_id) =>
+            {
+                Some(live)
+            }
+            (Some(_), Some(tombstone))
+                if self
+                    .transient_metadata_object_ids
+                    .contains(&tombstone.object_id) =>
+            {
+                Some(tombstone)
+            }
+            (Some(live), Some(tombstone)) if tombstone.version > live.version => Some(tombstone),
+            (Some(live), Some(_)) => Some(live),
+            (Some(live), None) => Some(live),
+            (None, Some(tombstone)) => Some(tombstone),
+            (None, None) => None,
+        };
+        if let Some(memory) = memory_object
+            && self
+                .transient_metadata_object_ids
+                .contains(&memory.object_id)
+        {
+            return Ok(Some(memory.clone()));
+        }
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(memory_object.cloned());
+        };
+        let backend_object = backend.get_object_by_path(file_system_id, &metadata_key)?;
+        Ok(match (memory_object, backend_object) {
+            (Some(memory), Some(backend))
+                if self
+                    .transient_metadata_object_ids
+                    .contains(&memory.object_id)
+                    || self.local_write_view_overrides_backend(
+                        &memory.object_id,
+                        memory,
+                        Some(&backend),
+                    ) =>
+            {
+                Some(memory.clone())
+            }
+            (_, Some(backend)) => Some(backend),
+            (Some(memory), None) => Some(memory.clone()),
+            (None, None) => None,
+        })
+    }
+
     pub fn remove_transient_object_metadata(&mut self, object_id: &DfsObjectId) {
         self.clear_metadata_lookup_cache();
         self.transient_metadata_object_ids.remove(object_id);
@@ -577,6 +599,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_object_count = transaction.objects.len();
         let trace_version_count = transaction.versions.len();
         let mut trace_ensure_fs_ms = 0;
+        let mut trace_expectations_ms = 0;
         let trace_backend_apply_ms;
         let mut trace_memory_coordinator_ms = 0;
         let mut trace_memory_tombstone_ms = 0;
@@ -723,6 +746,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 shard.clone()
             };
             let prepare_shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+            let expectations_started = Instant::now();
             let (expected_object_versions, expected_path_occupants, _) =
                 namespace_prepare_expectations(
                     self.metadata_backend
@@ -732,6 +756,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &prepare_shard_id,
                     &transaction,
                 )?;
+            trace_expectations_ms = expectations_started.elapsed().as_millis();
             let operation_id = if transaction.transaction_id.is_empty() {
                 format!("namespace:{}", sinomo_core::Id::generate())
             } else {
@@ -837,11 +862,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         self.clear_metadata_lookup_cache();
         dfs_perf_trace(format_args!(
-            "apply-namespace-transaction node={} objects={} versions={} ensure_fs_ms={} backend_apply_ms={} memory_coordinator_ms={} memory_tombstone_ms={} memory_add_ms={} total_ms={}",
+            "apply-namespace-transaction node={} objects={} versions={} ensure_fs_ms={} expectations_ms={} backend_apply_ms={} memory_coordinator_ms={} memory_tombstone_ms={} memory_add_ms={} total_ms={}",
             self.node_id,
             trace_object_count,
             trace_version_count,
             trace_ensure_fs_ms,
+            trace_expectations_ms,
             trace_backend_apply_ms,
             trace_memory_coordinator_ms,
             trace_memory_tombstone_ms,

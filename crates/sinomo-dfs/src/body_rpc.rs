@@ -3,11 +3,12 @@
 //! DFS names operations and declares expected lengths/digests in SOBJ heads;
 //! `sinomo-network` owns the private transfer frames.  The helpers here keep
 //! the existing in-process [`DfsNetworkMessage`] state machine while moving
-//! large byte vectors out of its wire representation.
+//! large byte vectors and oversized structured values out of its wire
+//! representation.
 
 use crate::{
-    DfsMessageCommand, DfsMessageResponse, DfsMetadataTableSnapshot, DfsNetworkMessage,
-    DfsReadResult, content_hash,
+    DfsMessageCommand, DfsMessageResponse, DfsMetadataTableSnapshot, DfsNamespaceOperation,
+    DfsNamespaceTransaction, DfsNetworkMessage, DfsReadResult, content_hash,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse, SinomoObjectCodec};
@@ -86,6 +87,31 @@ pub(crate) fn split_dfs_message_request_body(
             let digest = content_hash(&bytes);
             (bytes, digest)
         }
+        DfsNetworkMessage::NamespaceRequest(command) => {
+            let DfsNamespaceOperation::ApplyTransaction { transaction } = &mut command.operation
+            else {
+                return Ok(None);
+            };
+            // A same-shard bulk write is one atomic metadata transaction even
+            // when its encoded object/version rows exceed the bounded session
+            // control head. Move that complete value into one authenticated
+            // body instead of splitting it into independently visible RPCs.
+            // The retained identity/filesystem plus empty row sets form an
+            // invalid standalone sentinel that cannot be applied before body
+            // collection and validation reconstruct the original value.
+            let sentinel = DfsNamespaceTransaction {
+                transaction_id: transaction.transaction_id.clone(),
+                file_system_id: transaction.file_system_id.clone(),
+                objects: Vec::new(),
+                versions: Vec::new(),
+                advisory_lock_states: Vec::new(),
+                created_at: transaction.created_at,
+            };
+            let transaction = std::mem::replace(transaction, sentinel);
+            let bytes = SinomoObjectCodec::network_frame().encode(&transaction)?;
+            let digest = content_hash(&bytes);
+            (bytes, digest)
+        }
         _ => return Ok(None),
     };
     if bytes.is_empty() {
@@ -133,6 +159,25 @@ pub(crate) fn attach_dfs_message_request_body(
         DfsNetworkMessage::RepairReplica(command) => command.bytes = bytes,
         DfsNetworkMessage::MetadataSnapshotInstall(command) => {
             command.snapshot = SinomoObjectCodec::network_frame().decode(&bytes)?;
+        }
+        DfsNetworkMessage::NamespaceRequest(command) => {
+            let DfsNamespaceOperation::ApplyTransaction { transaction } = &mut command.operation
+            else {
+                return Err(serialization_error(
+                    "DFS namespace request body requires an apply-transaction head",
+                ));
+            };
+            let decoded: DfsNamespaceTransaction =
+                SinomoObjectCodec::network_frame().decode(&bytes)?;
+            if decoded.transaction_id != transaction.transaction_id
+                || decoded.file_system_id != transaction.file_system_id
+                || decoded.file_system_id != command.file_system_id
+            {
+                return Err(serialization_error(
+                    "DFS namespace transaction body identity does not match its request head",
+                ));
+            }
+            *transaction = decoded;
         }
         DfsNetworkMessage::FetchBlobResponse(response) => match &mut response.result {
             crate::DfsFetchBlobResult::Found {
@@ -327,11 +372,14 @@ mod tests {
     use crate::metadata_records::DfsMetadataTableOp;
     use crate::{
         DfsDistributedWriteCommand, DfsFileSystemId, DfsMetadataShardId,
-        DfsMetadataSnapshotInstallCommand, DfsObjectId, DfsReplicationPolicy, DfsRoutedMessage,
-        DfsStageBlobCommand, DfsVersion,
+        DfsMetadataSnapshotInstallCommand, DfsNamespaceCommand, DfsObjectId, DfsObjectKind,
+        DfsObjectMetadata, DfsReplicationPolicy, DfsRoutedMessage, DfsStageBlobCommand, DfsVersion,
+        namespace_transaction_id_for_batch, object_version_record, sifs_file_system_id,
     };
-    use sinomo_core::DfsWriteRequest;
     use sinomo_core::node::NodeId;
+    use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
+
+    const SESSION_CONTROL_FRAME_MAX_BYTES: usize = 64 * 1024;
 
     fn stage_blob_command(bytes: Vec<u8>) -> DfsMessageCommand {
         let digest = content_hash(&bytes);
@@ -354,6 +402,85 @@ mod tests {
                     bytes,
                     object_metadata: None,
                     authority_shard: None,
+                }),
+            },
+        }
+    }
+
+    fn oversized_namespace_transaction_command() -> DfsMessageCommand {
+        let source =
+            NodeId::from_legacy_named("namespace-body-source").expect("namespace body source");
+        let target =
+            NodeId::from_legacy_named("namespace-body-target").expect("namespace body target");
+        let mut objects = Vec::new();
+        let mut versions = Vec::new();
+        for index in 0..65 {
+            let object = DfsObjectMetadata {
+                object_id: DfsObjectId::from_legacy_named(format!(
+                    "namespace_body_object_{index:03}"
+                ))
+                .expect("namespace body object"),
+                file_system_id: sifs_file_system_id(),
+                path: format!(
+                    "/services/cluster-tests/body-transport/file-{index:03}-{}.bin",
+                    "x".repeat(64)
+                ),
+                kind: DfsObjectKind::File,
+                owner_node_id: source.clone(),
+                current_locations: vec![source.clone()],
+                content_hash: Some(format!(
+                    "namespace-body-content-{index:03}-{}",
+                    "a".repeat(64)
+                )),
+                content_size_bytes: Some(4096),
+                link_target_object_id: None,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                accessed_at_unix_nanos: 1,
+                modified_at_unix_nanos: 1,
+                created_at_unix_nanos: 1,
+                changed_at_unix_nanos: 1,
+                version: DfsVersion::from_legacy_named(format!(
+                    "namespace_body_version_{index:03}"
+                ))
+                .expect("namespace body version"),
+                policy: DfsObjectPolicy::ReplicatedEventual,
+                created_by_event_id: None,
+                last_modified_by_event_id: None,
+            };
+            versions.push(object_version_record(&object, object.content_size_bytes));
+            objects.push(object);
+        }
+        let file_system_id = sifs_file_system_id();
+        let transaction = DfsNamespaceTransaction {
+            transaction_id: namespace_transaction_id_for_batch(
+                "visible-batch",
+                &file_system_id,
+                &objects,
+                &versions,
+            ),
+            file_system_id: file_system_id.clone(),
+            objects,
+            versions,
+            advisory_lock_states: Vec::new(),
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+        };
+        DfsMessageCommand {
+            request_id: "namespace-body-request".to_string(),
+            routed_message: DfsRoutedMessage {
+                source_node_id: source.clone(),
+                target_node_id: target,
+                frame_id: 29,
+                message_id: 31,
+                message: DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                    request_id: "namespace-body-apply".to_string(),
+                    file_system_id,
+                    requesting_node_id: source,
+                    include_metadata_journal_batches: false,
+                    metadata_journal_after_sequences: Vec::new(),
+                    authority_shards: Vec::new(),
+                    operation: DfsNamespaceOperation::ApplyTransaction { transaction },
                 }),
             },
         }
@@ -462,6 +589,137 @@ mod tests {
     }
 
     #[test]
+    fn oversized_namespace_transaction_streams_as_one_exact_atomic_body() {
+        let command = oversized_namespace_transaction_command();
+        let inline_request = crate::dfs_message_rpc_request(&command).expect("inline request");
+        assert!(
+            inline_request.body.len() > SESSION_CONTROL_FRAME_MAX_BYTES,
+            "fixture must reproduce an oversized inline namespace request: {} bytes",
+            inline_request.body.len()
+        );
+
+        let (head, descriptor, body) = split_dfs_message_request_body(&command)
+            .expect("encode namespace transaction body")
+            .expect("split namespace transaction body");
+        assert!(
+            body.len() > SESSION_CONTROL_FRAME_MAX_BYTES,
+            "fixture must move the oversized transaction into the body"
+        );
+        assert_eq!(descriptor.total_size_bytes, body.len() as u64);
+        assert_eq!(
+            descriptor.content_hash.as_deref(),
+            Some(content_hash(&body).as_str())
+        );
+
+        let streamed_request =
+            encode_dfs_body_message_rpc_request(&inline_request, head.clone(), descriptor.clone())
+                .expect("streamed namespace request head");
+        assert!(
+            streamed_request.body.len() < SESSION_CONTROL_FRAME_MAX_BYTES,
+            "streamed namespace request head must fit the control frame: {} bytes",
+            streamed_request.body.len()
+        );
+
+        let DfsNetworkMessage::NamespaceRequest(head_command) = &head.routed_message.message else {
+            panic!("expected namespace request head");
+        };
+        let DfsNamespaceOperation::ApplyTransaction {
+            transaction: sentinel,
+        } = &head_command.operation
+        else {
+            panic!("expected apply-transaction sentinel");
+        };
+        assert!(sentinel.objects.is_empty());
+        assert!(sentinel.versions.is_empty());
+        assert!(sentinel.advisory_lock_states.is_empty());
+
+        let DfsNetworkMessage::NamespaceRequest(original_command) = &command.routed_message.message
+        else {
+            panic!("expected original namespace request");
+        };
+        let DfsNamespaceOperation::ApplyTransaction {
+            transaction: original_transaction,
+        } = &original_command.operation
+        else {
+            panic!("expected original apply transaction");
+        };
+        assert_eq!(sentinel.transaction_id, original_transaction.transaction_id);
+        assert_eq!(sentinel.file_system_id, original_transaction.file_system_id);
+        let decoded_transaction: DfsNamespaceTransaction = SinomoObjectCodec::network_frame()
+            .decode(&body)
+            .expect("decode transaction body");
+        assert_eq!(&decoded_transaction, original_transaction);
+        assert_eq!(
+            decoded_transaction
+                .objects
+                .iter()
+                .map(|object| object.object_id.clone())
+                .collect::<Vec<_>>(),
+            original_transaction
+                .objects
+                .iter()
+                .map(|object| object.object_id.clone())
+                .collect::<Vec<_>>(),
+            "body transport must preserve transaction record order"
+        );
+
+        let attached = attach_dfs_message_request_body(
+            DfsBodyMessageCommand {
+                command: head,
+                body: descriptor,
+            },
+            body,
+        )
+        .expect("attach namespace transaction body");
+        assert_eq!(attached, command);
+    }
+
+    #[test]
+    fn namespace_transaction_body_rejects_truncation_before_reconstruction() {
+        let command = oversized_namespace_transaction_command();
+        let (head, descriptor, mut body) = split_dfs_message_request_body(&command)
+            .expect("encode namespace transaction body")
+            .expect("split namespace transaction body");
+        body.pop().expect("non-empty transaction body");
+        let error = attach_dfs_message_request_body(
+            DfsBodyMessageCommand {
+                command: head,
+                body: descriptor,
+            },
+            body,
+        )
+        .expect_err("truncated transaction body");
+        assert!(error.to_string().contains("length mismatch"));
+    }
+
+    #[test]
+    fn namespace_transaction_body_rejects_head_identity_mismatch() {
+        let command = oversized_namespace_transaction_command();
+        let (mut head, descriptor, body) = split_dfs_message_request_body(&command)
+            .expect("encode namespace transaction body")
+            .expect("split namespace transaction body");
+        let DfsNetworkMessage::NamespaceRequest(head_command) = &mut head.routed_message.message
+        else {
+            panic!("expected namespace request head");
+        };
+        let DfsNamespaceOperation::ApplyTransaction { transaction } = &mut head_command.operation
+        else {
+            panic!("expected apply-transaction sentinel");
+        };
+        transaction.transaction_id = "mismatched-transaction-id".to_string();
+
+        let error = attach_dfs_message_request_body(
+            DfsBodyMessageCommand {
+                command: head,
+                body: descriptor,
+            },
+            body,
+        )
+        .expect_err("mismatched transaction identity");
+        assert!(error.to_string().contains("identity does not match"));
+    }
+
+    #[test]
     fn distributed_write_attachment_round_trip_preserves_inline_semantics() {
         let source = NodeId::from_legacy_named("body-inline-source").expect("source id");
         let target = NodeId::from_legacy_named("body-inline-target").expect("target id");
@@ -492,6 +750,7 @@ mod tests {
                     desired_replica_nodes: vec![source],
                     policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
                     object_metadata: None,
+                    authority_shard: None,
                     touch_parent_on_create: true,
                     foreground_replica_repair: true,
                     exclusive_create: false,

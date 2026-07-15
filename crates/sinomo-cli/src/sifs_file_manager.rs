@@ -1476,16 +1476,18 @@ fn open_sifs_service_with_hydration_until(
         .map_err(|error| format!("cannot prepare Sinomo data directory: {error}"))?;
     sifs_operation_remaining(operation_deadline, "preparing the Sinomo data directory")?;
     let cluster_paths = ClusterPaths::new(data_dir);
-    let peer_transport = Arc::new(
+    // This transport is scoped to backend opening. Its absolute deadline must
+    // not be retained by the service, otherwise a later read inherits the
+    // nearly-expired open budget instead of its own RPC timeout.
+    let bootstrap_peer_transport: Arc<dyn DfsPeerTransport> = Arc::new(
         SifsDfsPeerTransport::new(rpc_runtime.clone(), data_dir.clone())
             .with_operation_deadline(operation_deadline),
     );
-    let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
     let _ = refresh_sifs_cluster_kv_snapshot(data_dir, &cluster_paths);
     sifs_operation_remaining(operation_deadline, "refreshing the local cluster snapshot")?;
     let _ = refresh_cluster_dfs_kv_snapshot_with_peer_transport(
         &cluster_paths,
-        Arc::clone(&sync_peer_transport),
+        bootstrap_peer_transport,
     );
     sifs_operation_remaining(operation_deadline, "refreshing the DFS cluster snapshot")?;
     let (local_node_id, peer_node_ids) = if cluster_paths.state.exists() {
@@ -1499,7 +1501,17 @@ fn open_sifs_service_with_hydration_until(
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
         .map_err(|error| format!("cannot open DFS content store: {error}"))?;
     sifs_operation_remaining(operation_deadline, "opening the DFS content store")?;
-    let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer_transport;
+    // The daemon transport carries response heads and streamed attachments as
+    // one session. Routing it through the unary SIFS adapter would replace the
+    // encoded DFS response head with the attachment bytes.
+    let (sync_peer_transport, async_peer_transport) =
+        match sinomo_runtime::api::DaemonDfsPeerTransport::connect(data_dir.clone()) {
+            Ok(peer_transport) => shared_sifs_peer_transports(peer_transport),
+            Err(_) => shared_sifs_peer_transports(SifsDfsPeerTransport::new(
+                rpc_runtime.clone(),
+                data_dir.clone(),
+            )),
+        };
     let mut service = NetworkedDfsService::new(
         DfsNodeTransport::with_peer_transports_for_nodes(
             local_node_id,
@@ -1552,6 +1564,18 @@ fn open_sifs_service_with_hydration_until(
     bootstrap?;
     sifs_operation_remaining(operation_deadline, "bootstrapping the SIFS namespace")?;
     Ok(service)
+}
+
+fn shared_sifs_peer_transports<T>(
+    peer_transport: T,
+) -> (Arc<dyn DfsPeerTransport>, Arc<dyn AsyncDfsPeerTransport>)
+where
+    T: DfsPeerTransport + AsyncDfsPeerTransport + 'static,
+{
+    let peer_transport = Arc::new(peer_transport);
+    let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
+    let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer_transport;
+    (sync_peer_transport, async_peer_transport)
 }
 
 /// Refresh the cluster KV snapshot under `cluster_paths` from the daemon that
@@ -2301,6 +2325,70 @@ mod tests {
     use crate::file_manager::FileManagerState;
     use std::sync::Arc;
 
+    #[derive(Clone, Debug)]
+    struct SessionOnlyPeerTransport {
+        response: network::ObjectRpcResponse,
+        attachment: Vec<u8>,
+    }
+
+    impl SessionOnlyPeerTransport {
+        fn session_result(&self) -> network::ObjectRpcSessionResult {
+            network::ObjectRpcSessionResult::new(
+                self.response.clone(),
+                network::ObjectRpcIncomingBody::bytes(self.attachment.clone()),
+            )
+        }
+
+        fn unary_adapter_error() -> DfsPeerTransportError {
+            DfsPeerTransportError::new("session request was flattened through the unary adapter")
+        }
+    }
+
+    impl DfsPeerTransport for SessionOnlyPeerTransport {
+        fn call_object_rpc(
+            &self,
+            _target_node_id: &NodeId,
+            _request: &network::ObjectRpcRequest,
+            _options: DfsObjectRpcSendOptions,
+        ) -> Result<network::ObjectRpcResponse, DfsPeerTransportError> {
+            Err(Self::unary_adapter_error())
+        }
+
+        fn call_object_rpc_session(
+            &self,
+            _target_node_id: &NodeId,
+            _call: network::ObjectRpcSessionCall,
+            _options: DfsObjectRpcSendOptions,
+        ) -> Result<network::ObjectRpcSessionResult, DfsPeerTransportError> {
+            Ok(self.session_result())
+        }
+    }
+
+    impl AsyncDfsPeerTransport for SessionOnlyPeerTransport {
+        fn call_object_rpc_async<'a>(
+            &'a self,
+            _target_node_id: &'a NodeId,
+            _request: &'a network::ObjectRpcRequest,
+            _options: DfsObjectRpcSendOptions,
+        ) -> DfsPeerTransportFuture<'a, Result<network::ObjectRpcResponse, DfsPeerTransportError>>
+        {
+            Box::pin(async { Err(Self::unary_adapter_error()) })
+        }
+
+        fn call_object_rpc_session_async<'a>(
+            &'a self,
+            _target_node_id: &'a NodeId,
+            _call: network::ObjectRpcSessionCall,
+            _options: DfsObjectRpcSendOptions,
+        ) -> DfsPeerTransportFuture<
+            'a,
+            Result<network::ObjectRpcSessionResult, DfsPeerTransportError>,
+        > {
+            let result = self.session_result();
+            Box::pin(async move { Ok(result) })
+        }
+    }
+
     #[test]
     fn conditional_write_expected_failures_remain_typed() {
         assert!(matches!(
@@ -2356,6 +2444,102 @@ mod tests {
             "the SIFS RPC runtime must stay process-shared: per-open runtimes \
              deadlock whichever thread drops the last handle while a blocking \
              daemon probe or peer RPC is still in flight"
+        );
+    }
+
+    #[test]
+    fn shared_peer_transport_preserves_session_response_head_and_attachment() {
+        let route = "/dfs/test/session-preserving";
+        let encoded_head = "encoded-response-head".to_string();
+        let attachment = b"streamed-response-attachment".to_vec();
+        let transport = SessionOnlyPeerTransport {
+            response: network::ObjectRpcResponse::encode_body(route, &encoded_head)
+                .expect("response head"),
+            attachment: attachment.clone(),
+        };
+        let (sync_transport, async_transport) = shared_sifs_peer_transports(transport);
+        let target = NodeId::from_legacy_named("node_sifs_session_target").expect("target node");
+        let request = || {
+            network::ObjectRpcRequest::encode_body(route, "dfs", &"request-head")
+                .expect("request head")
+        };
+        let runtime = SifsRpcRuntime::new().expect("runtime");
+
+        let sync_result = sync_transport
+            .call_object_rpc_session(
+                &target,
+                network::ObjectRpcSessionCall::buffered(request()),
+                DfsObjectRpcSendOptions::default(),
+            )
+            .expect("sync session result");
+        assert_eq!(
+            sync_result
+                .response
+                .decode_body::<String>()
+                .expect("sync encoded response head"),
+            encoded_head
+        );
+        assert_eq!(
+            runtime
+                .runtime
+                .block_on(sync_result.body.collect_to_vec(1024))
+                .expect("sync response attachment"),
+            attachment
+        );
+
+        let async_result = runtime
+            .runtime
+            .block_on(async_transport.call_object_rpc_session_async(
+                &target,
+                network::ObjectRpcSessionCall::buffered(request()),
+                DfsObjectRpcSendOptions::default(),
+            ))
+            .expect("async session result");
+        assert_eq!(
+            async_result
+                .response
+                .decode_body::<String>()
+                .expect("async encoded response head"),
+            encoded_head
+        );
+        assert_eq!(
+            runtime
+                .runtime
+                .block_on(async_result.body.collect_to_vec(1024))
+                .expect("async response attachment"),
+            attachment
+        );
+    }
+
+    #[test]
+    fn persistent_peer_transport_does_not_retain_backend_open_deadline() {
+        let root = temp_sifs_data_dir("persistent-peer-deadline");
+        let data_dir = SinomoDataDir::new(&root);
+        let runtime = SifsRpcRuntime::new().expect("runtime");
+        let expired_open_deadline = Instant::now() - Duration::from_millis(1);
+        let bootstrap = SifsDfsPeerTransport::new(runtime.clone(), data_dir.clone())
+            .with_operation_deadline(Some(expired_open_deadline));
+        let persistent = SifsDfsPeerTransport::new(runtime, data_dir);
+
+        assert_eq!(
+            bootstrap.operation_deadline,
+            Some(expired_open_deadline),
+            "the temporary bootstrap transport must retain the open deadline"
+        );
+        assert_eq!(
+            persistent.operation_deadline, None,
+            "the service transport must start with no backend-open deadline"
+        );
+
+        let started_at = Instant::now();
+        let later_deadline = sifs_rpc_effective_operation_deadline(
+            &DfsObjectRpcSendOptions::default().with_overall_timeout(Duration::from_millis(100)),
+            persistent.operation_deadline,
+        )
+        .expect("later per-RPC deadline");
+        assert!(
+            later_deadline > started_at,
+            "a later RPC was clamped by the expired backend-open deadline"
         );
     }
 

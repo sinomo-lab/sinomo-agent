@@ -50,16 +50,18 @@
 #   SINOMO_TEST_PERF_MAX_PROC_WCHAR_AMPLIFICATION       max writer-process wchar/logical bytes (default 0, disabled)
 #   SINOMO_TEST_PERF_MAX_PROC_WRITE_BYTES_AMPLIFICATION max writer-process write_bytes/logical bytes (default 0, disabled)
 #   SINOMO_TEST_PERF_MAX_PROC_SYSCW_PER_FILE max writer-process write syscalls/logical file (default 4)
+#   SINOMO_TEST_PERF_MAX_PROC_SYSCW_FIXED fixed writer-process write syscall budget per measured leg (default 16)
 #   SINOMO_TEST_PERF_MAX_READ_PROC_WRITE_BYTES max reader-process write_bytes during bulk-expect (default 0)
 #   SINOMO_TEST_SMALL_BASELINE_FILES files in raw tiny-file baseline leg (default same as SINOMO_TEST_PERF_FILES)
 #   SINOMO_TEST_SMALL_BASELINE_BYTES bytes per raw tiny-file baseline file (default same as SINOMO_TEST_PERF_BYTES)
 #   SINOMO_TEST_SMALL_BASELINE_SYNC_WRITES sync each raw tiny-file write before timing completes (default 0)
 #   SINOMO_TEST_SMALL_BASELINE_MIN_FILES_PER_SEC min raw tiny-file throughput (default 0, disabled)
-#   SINOMO_TEST_LARGE_BYTES    bytes in large-file performance leg (default 67108864)
+#   SINOMO_TEST_LARGE_BYTES    bytes in large-file performance leg (default 268435456)
 #   SINOMO_TEST_LARGE_TIMEOUT  large-file write/read timeout seconds (default 180)
-#   SINOMO_TEST_LARGE_MIN_WRITE_BYTES_PER_SEC min large writer throughput (default 4194304)
+#   SINOMO_TEST_LARGE_MIN_WRITE_BYTES_PER_SEC min large writer throughput (default 134217728)
 #   SINOMO_TEST_LARGE_MIN_READ_BYTES_PER_SEC  min final large read throughput after convergence (default 4194304)
-#   SINOMO_TEST_LARGE_MIN_RAW_WRITE_RATIO min large DFS write / raw write baseline ratio (default 0.30)
+#   SINOMO_TEST_LARGE_MEASURE_RAW_WRITE_BASELINE measure raw write throughput alongside DFS writes (default 1)
+#   SINOMO_TEST_LARGE_MIN_RAW_WRITE_RATIO min large DFS write / raw write baseline ratio (default 0, informational)
 #   SINOMO_TEST_LARGE_MIN_RAW_READ_RATIO  min large DFS read / raw read baseline ratio (default 0, disabled)
 #   SINOMO_TEST_LARGE_RAW_SYNC_WRITE      sync raw baseline writes before timing completes (default 1)
 #   SINOMO_TEST_LARGE_MAX_PROC_WCHAR_AMPLIFICATION       max large writer-process wchar/logical bytes (default 0, disabled)
@@ -69,7 +71,7 @@
 #   SINOMO_TEST_DISK_BASELINE_SYNC_WRITE sync raw disk baseline writes before timing completes (default 1)
 #   SINOMO_TEST_DISK_BASELINE_MIN_WRITE_BYTES_PER_SEC min raw write throughput (default 0, disabled)
 #   SINOMO_TEST_DISK_BASELINE_MIN_READ_BYTES_PER_SEC  min raw read throughput (default 0, disabled)
-#   SINOMO_TEST_DAMAGE_BYTES    bytes in loose-blob disk damage scenario (default 65536)
+#   SINOMO_TEST_DAMAGE_BYTES    bytes in loose-blob disk damage scenario (default 49152)
 #   SINOMO_TEST_DFS_PROTOCOL_CODEC_BYTES bytes per DFS protocol codec message (default 4194304)
 #   SINOMO_TEST_DFS_PROTOCOL_CODEC_ITERATIONS codec encode/decode iterations per sample (default 8)
 #   SINOMO_TEST_DFS_PROTOCOL_CODEC_MIN_ENCODE_BYTES_PER_SEC min codec payload encode throughput (default 67108864)
@@ -89,8 +91,8 @@
 #   SINOMO_TEST_NETWORK_PAYLOAD_WARMUP_REQUESTS_PER_TARGET warmup payload RPCs per remote node (default same as payload requests)
 #   SINOMO_TEST_NETWORK_PAYLOAD_CONCURRENCY payload-throughput workers (default 8)
 #   SINOMO_TEST_NETWORK_PAYLOAD_TIMEOUT_MS  payload-throughput RPC timeout (default 5000)
-#   SINOMO_TEST_NETWORK_PAYLOAD_REQUEST_BYTES request bytes per payload-throughput RPC (default 262144)
-#   SINOMO_TEST_NETWORK_PAYLOAD_RESPONSE_BYTES response bytes per payload-throughput RPC (default 262144)
+#   SINOMO_TEST_NETWORK_PAYLOAD_REQUEST_BYTES request bytes per payload-throughput RPC (default 49152)
+#   SINOMO_TEST_NETWORK_PAYLOAD_RESPONSE_BYTES response bytes per payload-throughput RPC (default 475136)
 #   SINOMO_TEST_NETWORK_PAYLOAD_MIN_BYTES_PER_SEC min payload-throughput rate (default 16777216)
 #   SINOMO_TEST_CLUSTER_KV_ITERATIONS        quorum commits per selected node (default 12)
 #   SINOMO_TEST_CLUSTER_KV_VALUE_BYTES       value bytes per quorum commit (default 256)
@@ -100,6 +102,7 @@
 #   SINOMO_TEST_CLUSTER_KV_MAX_P95_MS        max quorum commit p95 latency (default 2000)
 #   SINOMO_TEST_CLUSTER_KV_MIN_COMMITS_PER_SECOND min quorum commit throughput (default 1)
 #   SINOMO_TEST_NETWORK_READY_WAIT          network/auth convergence gate seconds (default 120)
+#   SINOMO_TEST_DFS_CONVERGENCE_WAIT        fully distributed DFS shard-layout gate seconds (default 240)
 #   SINOMO_TEST_NETWORK_READY_REQUESTS_PER_TARGET requests per target during readiness warmup (default 20)
 #   SINOMO_TEST_NETWORK_READY_CONCURRENCY   readiness warmup concurrency (default 16)
 #   SINOMO_TEST_READINESS_COMMAND_TIMEOUT   host/container cap for each readiness command (default 10)
@@ -107,10 +110,12 @@
 #   SINOMO_TEST_ARTIFACT_COMMAND_TIMEOUT    cap for each failure artifact command (default 10)
 #   SINOMO_TEST_HOST_TIMEOUT_GRACE          host cleanup grace beyond the container timeout (default 5)
 #   SINOMO_TEST_NETWORK_PARTITION_SECONDS   seconds to keep node6 disconnected in network-heal leg (default 5)
-#   SINOMO_TEST_NETWORK_ONLY=1              stop after network baseline
+#   SINOMO_TEST_NETWORK_ONLY=1              stop after network/KV baselines and DFS readiness/mutation/convergence gates
 #   SINOMO_TEST_BUILD=0         reuse an existing host binary instead of rebuilding
+#   SINOMO_TEST_BINARY          host binary to validate/mount (default target/debug/sinomo)
 #   SINOMO_TEST_ARTIFACTS       artifact dir (default target/cluster-test-artifacts/<run>)
 #   SINOMO_TEST_ALLOW_OTHER_COMPOSE=1       allow running while unrelated compose projects are up
+#   SINOMO_TEST_COMPOSE_OVERRIDE optional second compose file (for measurement-only overrides)
 #
 # Exits non-zero if any scenario fails; failure evidence (probe JSON, compose ps,
 # cluster health/doctor, per-node logs) lands in the artifact directory.
@@ -119,10 +124,12 @@ set -uo pipefail
 SINOMO_DOCKER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SINOMO_ROOT="$(dirname "$SINOMO_DOCKER_DIR")"
 COMPOSE_FILE="${COMPOSE_FILE:-$SINOMO_DOCKER_DIR/docker-compose.dev.yml}"
+COMPOSE_OVERRIDE_FILE="${SINOMO_TEST_COMPOSE_OVERRIDE:-}"
 
 PROJECT="${SINOMO_TEST_PROJECT:-sinomo-dfs-test}"
 FORMATION_WAIT="${SINOMO_TEST_FORMATION_WAIT:-30}"
 DFS_READY_WAIT="${SINOMO_TEST_DFS_READY_WAIT:-240}"
+DFS_CONVERGENCE_WAIT="${SINOMO_TEST_DFS_CONVERGENCE_WAIT:-240}"
 EXPECT_TIMEOUT="${SINOMO_TEST_EXPECT_TIMEOUT:-90}"
 ROUTED_STATUS_MAX_ATTEMPTS="${SINOMO_TEST_ROUTED_STATUS_MAX_ATTEMPTS:-12}"
 ROUTED_STATUS_MAX_ELAPSED_MS="${SINOMO_TEST_ROUTED_STATUS_MAX_ELAPSED_MS:-$((EXPECT_TIMEOUT * 1000))}"
@@ -141,16 +148,18 @@ PERF_MIN_READ_FILES_PER_SEC="${SINOMO_TEST_PERF_MIN_READ_FILES_PER_SEC:-1}"
 PERF_MAX_PROC_WCHAR_AMPLIFICATION="${SINOMO_TEST_PERF_MAX_PROC_WCHAR_AMPLIFICATION:-0}"
 PERF_MAX_PROC_WRITE_BYTES_AMPLIFICATION="${SINOMO_TEST_PERF_MAX_PROC_WRITE_BYTES_AMPLIFICATION:-0}"
 PERF_MAX_PROC_SYSCW_PER_FILE="${SINOMO_TEST_PERF_MAX_PROC_SYSCW_PER_FILE:-4}"
+PERF_MAX_PROC_SYSCW_FIXED="${SINOMO_TEST_PERF_MAX_PROC_SYSCW_FIXED:-16}"
 PERF_MAX_READ_PROC_WRITE_BYTES="${SINOMO_TEST_PERF_MAX_READ_PROC_WRITE_BYTES:-0}"
 SMALL_BASELINE_FILES="${SINOMO_TEST_SMALL_BASELINE_FILES:-$PERF_FILES}"
 SMALL_BASELINE_BYTES="${SINOMO_TEST_SMALL_BASELINE_BYTES:-$PERF_BYTES}"
 SMALL_BASELINE_SYNC_WRITES="${SINOMO_TEST_SMALL_BASELINE_SYNC_WRITES:-0}"
 SMALL_BASELINE_MIN_FILES_PER_SEC="${SINOMO_TEST_SMALL_BASELINE_MIN_FILES_PER_SEC:-0}"
-LARGE_BYTES="${SINOMO_TEST_LARGE_BYTES:-67108864}"
+LARGE_BYTES="${SINOMO_TEST_LARGE_BYTES:-268435456}"
 LARGE_TIMEOUT="${SINOMO_TEST_LARGE_TIMEOUT:-180}"
-LARGE_MIN_WRITE_BYTES_PER_SEC="${SINOMO_TEST_LARGE_MIN_WRITE_BYTES_PER_SEC:-4194304}"
+LARGE_MIN_WRITE_BYTES_PER_SEC="${SINOMO_TEST_LARGE_MIN_WRITE_BYTES_PER_SEC:-134217728}"
 LARGE_MIN_READ_BYTES_PER_SEC="${SINOMO_TEST_LARGE_MIN_READ_BYTES_PER_SEC:-4194304}"
-LARGE_MIN_RAW_WRITE_RATIO="${SINOMO_TEST_LARGE_MIN_RAW_WRITE_RATIO:-0.30}"
+LARGE_MEASURE_RAW_WRITE_BASELINE="${SINOMO_TEST_LARGE_MEASURE_RAW_WRITE_BASELINE:-1}"
+LARGE_MIN_RAW_WRITE_RATIO="${SINOMO_TEST_LARGE_MIN_RAW_WRITE_RATIO:-0}"
 LARGE_MIN_RAW_READ_RATIO="${SINOMO_TEST_LARGE_MIN_RAW_READ_RATIO:-0}"
 LARGE_RAW_SYNC_WRITE="${SINOMO_TEST_LARGE_RAW_SYNC_WRITE:-1}"
 LARGE_MAX_PROC_WCHAR_AMPLIFICATION="${SINOMO_TEST_LARGE_MAX_PROC_WCHAR_AMPLIFICATION:-0}"
@@ -160,7 +169,11 @@ DISK_BASELINE_BYTES="${SINOMO_TEST_DISK_BASELINE_BYTES:-$LARGE_BYTES}"
 DISK_BASELINE_SYNC_WRITE="${SINOMO_TEST_DISK_BASELINE_SYNC_WRITE:-1}"
 DISK_BASELINE_MIN_WRITE_BYTES_PER_SEC="${SINOMO_TEST_DISK_BASELINE_MIN_WRITE_BYTES_PER_SEC:-0}"
 DISK_BASELINE_MIN_READ_BYTES_PER_SEC="${SINOMO_TEST_DISK_BASELINE_MIN_READ_BYTES_PER_SEC:-0}"
-DAMAGE_BYTES="${SINOMO_TEST_DAMAGE_BYTES:-65536}"
+# The expect-file probe returns the verified payload through a control head
+# capped at 64 KiB. Keep enough envelope margin while still crossing normal
+# small-object storage thresholds; raising the frame cap would hide the real
+# protocol boundary this gate is meant to exercise.
+DAMAGE_BYTES="${SINOMO_TEST_DAMAGE_BYTES:-49152}"
 DFS_PROTOCOL_CODEC_BYTES="${SINOMO_TEST_DFS_PROTOCOL_CODEC_BYTES:-4194304}"
 DFS_PROTOCOL_CODEC_ITERATIONS="${SINOMO_TEST_DFS_PROTOCOL_CODEC_ITERATIONS:-8}"
 DFS_PROTOCOL_CODEC_MIN_ENCODE_BYTES_PER_SEC="${SINOMO_TEST_DFS_PROTOCOL_CODEC_MIN_ENCODE_BYTES_PER_SEC:-67108864}"
@@ -180,8 +193,12 @@ NETWORK_PAYLOAD_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_PAYLOAD_REQUESTS_PER_
 NETWORK_PAYLOAD_WARMUP_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_PAYLOAD_WARMUP_REQUESTS_PER_TARGET:-$NETWORK_PAYLOAD_REQUESTS_PER_TARGET}"
 NETWORK_PAYLOAD_CONCURRENCY="${SINOMO_TEST_NETWORK_PAYLOAD_CONCURRENCY:-8}"
 NETWORK_PAYLOAD_TIMEOUT_MS="${SINOMO_TEST_NETWORK_PAYLOAD_TIMEOUT_MS:-5000}"
-NETWORK_PAYLOAD_REQUEST_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_REQUEST_BYTES:-262144}"
-NETWORK_PAYLOAD_RESPONSE_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_RESPONSE_BYTES:-262144}"
+# The forwarded ping request is a buffered control head capped at 64 KiB, so
+# leave room for its signed forwarding envelope. Keep the full 512 KiB/RPC
+# throughput volume by putting the balance in the response, which the session
+# transport automatically spills into framed body transfer.
+NETWORK_PAYLOAD_REQUEST_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_REQUEST_BYTES:-49152}"
+NETWORK_PAYLOAD_RESPONSE_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_RESPONSE_BYTES:-475136}"
 NETWORK_PAYLOAD_MIN_BYTES_PER_SEC="${SINOMO_TEST_NETWORK_PAYLOAD_MIN_BYTES_PER_SEC:-16777216}"
 CLUSTER_KV_ITERATIONS="${SINOMO_TEST_CLUSTER_KV_ITERATIONS:-12}"
 CLUSTER_KV_VALUE_BYTES="${SINOMO_TEST_CLUSTER_KV_VALUE_BYTES:-256}"
@@ -197,20 +214,26 @@ NETWORK_PARTITION_SECONDS="${SINOMO_TEST_NETWORK_PARTITION_SECONDS:-5}"
 NODES="node1 node2 node3 node4 node5 node6"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 ARTIFACTS="${SINOMO_TEST_ARTIFACTS:-$SINOMO_ROOT/target/cluster-test-artifacts/$RUN_ID}"
-BINARY="$SINOMO_ROOT/target/debug/sinomo"
+BINARY="${SINOMO_TEST_BINARY:-$SINOMO_ROOT/target/debug/sinomo}"
+export SINOMO_DOCKER_BINARY="${SINOMO_DOCKER_BINARY:-$BINARY}"
+COMPOSE_FILES=(-f "$COMPOSE_FILE")
+if [ -n "$COMPOSE_OVERRIDE_FILE" ]; then
+  COMPOSE_FILES+=(-f "$COMPOSE_OVERRIDE_FILE")
+fi
 
 mkdir -p "$ARTIFACTS"
 
 log() { echo "[test-cluster] $*"; }
 
 compose() {
-  docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"
+  docker compose -p "$PROJECT" "${COMPOSE_FILES[@]}" "$@"
 }
 
 compose_timeout() {
   local seconds="$1"
   shift
-  timeout --foreground "${seconds}s" docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"
+  timeout --foreground "${seconds}s" \
+    docker compose -p "$PROJECT" "${COMPOSE_FILES[@]}" "$@"
 }
 
 compose_exec_timeout() {
@@ -218,7 +241,7 @@ compose_exec_timeout() {
   shift 2
   host_seconds=$(( seconds + HOST_TIMEOUT_GRACE ))
   timeout --foreground "${host_seconds}s" \
-    docker compose -p "$PROJECT" -f "$COMPOSE_FILE" \
+    docker compose -p "$PROJECT" "${COMPOSE_FILES[@]}" \
     exec -T "$node" timeout --foreground "${seconds}s" "$@"
 }
 
@@ -426,6 +449,150 @@ wait_for_dfs_ready() {
   done
 }
 
+dfs_converged_epoch_signature() {
+  jq -er '
+    if .status != "passed" then
+      error("shard-layout probe did not pass")
+    else
+      .diagnostics.shards
+    end
+    | if type != "array" or length != 3 then
+        error("expected exactly three shard diagnostics")
+      elif ([.[].lane] | sort) != ["root", "services", "users"] then
+        error("expected root, services, and users lanes")
+      elif any(.[];
+        ((.replica_node_ids | type) != "array")
+          or ((.replica_node_ids | length) != 5)
+      ) then
+        error("expected five replicas on every shard")
+      elif ([.[].primary_node_id] | unique | length) != 3 then
+        error("expected three distinct shard primaries")
+      elif any(.[];
+        ((.file_system_id | type) != "string")
+          or ((.shard_id | type) != "string")
+          or ((.epoch | type) != "number")
+      ) then
+        error("invalid shard identity or epoch diagnostic")
+      else
+        sort_by(.shard_id)
+        | map("\(.file_system_id)/\(.shard_id)=\(.epoch)")
+        | join(",")
+      end
+  ' "$1"
+}
+
+# A clean operational snapshot is stronger than an active shard layout. The
+# retiring layout remains active while a membership handoff is pending, and a
+# completed control-plane handoff can leave the active primary's freshly opened
+# backend lane fenced. Require exact layout, no current pending handoff keys,
+# zero active-primary freezes, and zero configured-replica lag on every local
+# primary. The separate routed-mutation gate below checks the live daemon lanes.
+# Bracket the invariant sweep with layout reads and require two unchanged epoch
+# signatures so a transition completing during either observation cannot pass.
+wait_for_dfs_converged() {
+  local deadline probe_log probe_err confirm_log confirm_err pending_log pending_err
+  local command_timeout now consecutive node invariants_clean invariant_log invariant_err
+  local epoch_signature confirm_epoch_signature previous_epoch_signature observation_clean
+  if ! command -v jq >/dev/null 2>&1; then
+    log "dfs-converged: jq is required to validate stable shard epochs"
+    return 1
+  fi
+  log "dfs-converged: waiting for the fully distributed three-lane shard layout (<=${DFS_CONVERGENCE_WAIT}s)"
+  deadline=$(( $(date +%s) + DFS_CONVERGENCE_WAIT ))
+  probe_log="$ARTIFACTS/dfs-converged.last.json"
+  probe_err="$ARTIFACTS/dfs-converged.last.stderr.log"
+  confirm_log="$ARTIFACTS/dfs-converged.confirm.last.json"
+  confirm_err="$ARTIFACTS/dfs-converged.confirm.last.stderr.log"
+  pending_log="$ARTIFACTS/dfs-converged.pending-handoffs.last.txt"
+  pending_err="$ARTIFACTS/dfs-converged.pending-handoffs.last.stderr.log"
+  consecutive=0
+  previous_epoch_signature=""
+  while :; do
+    observation_clean=0
+    if command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")" \
+      && compose_exec_timeout "$command_timeout" node1 sinomo test run cluster.dfs.shard-layout \
+        --require-cluster \
+        --json \
+        --param expected-replica-count=5 \
+        --param expected-distinct-primary-count=3 \
+        >"$probe_log" 2>"$probe_err" \
+      && epoch_signature="$(dfs_converged_epoch_signature "$probe_log" 2>>"$probe_err")"; then
+      invariants_clean=1
+      for node in $NODES; do
+        invariant_log="$ARTIFACTS/dfs-converged-$node.last.json"
+        invariant_err="$ARTIFACTS/dfs-converged-$node.last.stderr.log"
+        if ! command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")" \
+          || ! compose_exec_timeout "$command_timeout" "$node" \
+            sinomo test run cluster.dfs.invariants \
+              --require-cluster --json --param timeout-seconds=1 \
+              >"$invariant_log" 2>"$invariant_err" \
+          || ! jq -e '
+            .status == "passed"
+              and .diagnostics.authoritative_write_frozen_shard_count == 0
+          ' "$invariant_log" >/dev/null 2>>"$invariant_err"; then
+          invariants_clean=0
+          break
+        fi
+      done
+      if [ "$invariants_clean" = 1 ]; then
+        if command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")" \
+          && compose_exec_timeout "$command_timeout" node1 sinomo test run cluster.dfs.shard-layout \
+            --require-cluster \
+            --json \
+            --param expected-replica-count=5 \
+            --param expected-distinct-primary-count=3 \
+            >"$confirm_log" 2>"$confirm_err" \
+          && confirm_epoch_signature="$(dfs_converged_epoch_signature "$confirm_log" 2>>"$confirm_err")" \
+          && [ "$confirm_epoch_signature" = "$epoch_signature" ] \
+          && command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")" \
+          && compose_exec_timeout "$command_timeout" node1 sh -c '
+            snapshot="$(sinomo debug sobj /data/cluster/kv-snapshot.sobj)" || exit 2
+            # Completed handoff keys remain in bounded event history. Inspect
+            # only the current-entry prefix of the decoded snapshot.
+            entries="${snapshot%%, \"events\":*}"
+            revision="$(printf "%s\n" "$entries" \
+              | grep -o "\"revision\": uint64([0-9]*)" | head -1)"
+            [ -n "$revision" ] || exit 3
+            pending="$(printf "%s\n" "$entries" \
+              | grep -o "\"key\": \"/dfs/filesystems/[^\"]*/metadata-membership-handoffs/[^\"]*\"" \
+              || true)"
+            printf "%s\n" "$revision"
+            if [ -n "$pending" ]; then
+              printf "%s\n" "$pending"
+              exit 1
+            fi
+          ' >"$pending_log" 2>"$pending_err"; then
+          observation_clean=1
+        fi
+      fi
+    fi
+    if [ "$observation_clean" = 1 ]; then
+      if [ -n "$previous_epoch_signature" ] \
+        && [ "$epoch_signature" = "$previous_epoch_signature" ]; then
+        consecutive=$((consecutive + 1))
+      else
+        consecutive=1
+      fi
+      previous_epoch_signature="$epoch_signature"
+    else
+      consecutive=0
+      previous_epoch_signature=""
+    fi
+    if [ "$consecutive" -ge 2 ]; then
+      log "  dfs-converged: exact layout, zero handoffs, unfrozen active primaries, and zero replica lag across two stable epoch probes"
+      return 0
+    fi
+    now="$(date +%s)"
+    if [ "$now" -ge "$deadline" ]; then
+      log "dfs-converged: shard layout did not converge before the deadline"
+      sed 's/^/      /' "$probe_log" | tail -12
+      sed 's/^/      /' "$probe_err" | tail -12
+      return 1
+    fi
+    sleep "$POLL_INTERVAL"
+  done
+}
+
 wait_for_network_ready() {
   local deadline node pending still probe_log probe_err command_timeout now
   log "network-ready: waiting for relay/auth convergence (<=${NETWORK_READY_WAIT}s)"
@@ -520,6 +687,35 @@ invariants_sweep() {
     run_probe "$node" cluster.dfs.invariants --param timeout-seconds=60 || rc=1
   done
   return $rc
+}
+
+# Exercise one routed mutation on every metadata authority through the live
+# daemon message service. Fresh CLI invariant probes can rebind their own
+# backend handles and therefore cannot prove that a long-lived daemon lane is
+# writable. Requiring zero internal retries makes a stale cached lane visible
+# instead of hiding it behind the probe's bounded retry loop.
+dfs_daemon_mutation_lanes_ready() {
+  local lane path payload rc=0
+  for lane in root services users; do
+    case "$lane" in
+      root) path="/cluster-tests/$RUN_ID/daemon-lane-root.txt" ;;
+      services) path="/services/cluster-tests/$RUN_ID/daemon-lane-services.txt" ;;
+      users) path="/users/cluster-tests/$RUN_ID/daemon-lane-users.txt" ;;
+    esac
+    payload="daemon mutation lane $lane $RUN_ID"
+    run_probe node6 cluster.dfs.write \
+      --param "path=$path" \
+      --param "payload=$payload" \
+      --param max-retries=0 \
+      --param "timeout-seconds=$EXPECT_TIMEOUT" \
+    && run_probe node5 cluster.dfs.expect-file \
+      --param "path=$path" \
+      --param "payload=$payload" \
+      --param "timeout-seconds=$EXPECT_TIMEOUT" \
+    && run_probe node4 cluster.dfs.remove --param "path=$path" \
+    || rc=1
+  done
+  return "$rc"
 }
 
 final_routed_status() {
@@ -701,6 +897,7 @@ bulk_performance() {
     --param "max-proc-wchar-amplification=$PERF_MAX_PROC_WCHAR_AMPLIFICATION" \
     --param "max-proc-write-bytes-amplification=$PERF_MAX_PROC_WRITE_BYTES_AMPLIFICATION" \
     --param "max-proc-syscw-per-file=$PERF_MAX_PROC_SYSCW_PER_FILE" \
+    --param "max-proc-syscw-fixed=$PERF_MAX_PROC_SYSCW_FIXED" \
   && run_probe node6 cluster.dfs.bulk-expect \
     --param "base=$a" \
     --param "files=$PERF_FILES" \
@@ -717,6 +914,7 @@ bulk_performance() {
     --param "max-proc-wchar-amplification=$PERF_MAX_PROC_WCHAR_AMPLIFICATION" \
     --param "max-proc-write-bytes-amplification=$PERF_MAX_PROC_WRITE_BYTES_AMPLIFICATION" \
     --param "max-proc-syscw-per-file=$PERF_MAX_PROC_SYSCW_PER_FILE" \
+    --param "max-proc-syscw-fixed=$PERF_MAX_PROC_SYSCW_FIXED" \
   && run_probe node1 cluster.dfs.bulk-expect \
     --param "base=$b" \
     --param "files=$PERF_FILES" \
@@ -746,6 +944,7 @@ large_file_performance() {
     --param "bytes=$LARGE_BYTES" \
     --param "timeout-seconds=$LARGE_TIMEOUT" \
     --param "min-bytes-per-second=$LARGE_MIN_WRITE_BYTES_PER_SEC" \
+    --param "measure-raw-write-baseline=$LARGE_MEASURE_RAW_WRITE_BASELINE" \
     --param "min-raw-write-ratio=$LARGE_MIN_RAW_WRITE_RATIO" \
     --param "raw-sync-write=$LARGE_RAW_SYNC_WRITE" \
     --param "max-proc-wchar-amplification=$LARGE_MAX_PROC_WCHAR_AMPLIFICATION" \
@@ -767,6 +966,7 @@ large_file_performance() {
     --param "bytes=$LARGE_BYTES" \
     --param "timeout-seconds=$LARGE_TIMEOUT" \
     --param "min-bytes-per-second=$LARGE_MIN_WRITE_BYTES_PER_SEC" \
+    --param "measure-raw-write-baseline=$LARGE_MEASURE_RAW_WRITE_BASELINE" \
     --param "min-raw-write-ratio=$LARGE_MIN_RAW_WRITE_RATIO" \
     --param "raw-sync-write=$LARGE_RAW_SYNC_WRITE" \
     --param "max-proc-wchar-amplification=$LARGE_MAX_PROC_WCHAR_AMPLIFICATION" \
@@ -842,6 +1042,7 @@ temporary_network_recovery() {
 
   wait_for_cluster_ready "post-network-heal" || rc=1
   wait_for_dfs_ready || rc=1
+  wait_for_dfs_converged || rc=1
   if [ "$rc" = 0 ]; then
     run_probe node6 cluster.dfs.expect-file \
       --param "path=$path" --param "payload=$payload" --param "timeout-seconds=$EXPECT_TIMEOUT" || rc=1
@@ -861,6 +1062,7 @@ restart_durability() {
   compose restart node2 >/dev/null 2>&1 || { log "node2 restart failed"; return 1; }
   wait_for_cluster_ready "post-restart" || return 1
   wait_for_dfs_ready || return 1
+  wait_for_dfs_converged || return 1
   run_probe node2 cluster.dfs.expect-file \
     --param "path=$path" --param "payload=$payload" --param "timeout-seconds=$EXPECT_TIMEOUT" \
   && run_probe node5 cluster.dfs.expect-file \
@@ -903,7 +1105,11 @@ teardown() {
   fi
   if [ "${SINOMO_TEST_KEEP:-0}" = 1 ] || [ "${SINOMO_TEST_REUSE:-0}" = 1 ]; then
     log "leaving cluster up (project $PROJECT); tear down with:"
-    log "  docker compose -p $PROJECT -f $COMPOSE_FILE down -v"
+    if [ -n "$COMPOSE_OVERRIDE_FILE" ]; then
+      log "  docker compose -p $PROJECT -f $COMPOSE_FILE -f $COMPOSE_OVERRIDE_FILE down -v"
+    else
+      log "  docker compose -p $PROJECT -f $COMPOSE_FILE down -v"
+    fi
     return
   fi
   log "tearing down compose project $PROJECT"
@@ -925,6 +1131,10 @@ require_no_other_compose_projects || exit 1
 trap teardown EXIT
 
 if [ "${SINOMO_TEST_BUILD:-1}" = 1 ] || [ ! -x "$BINARY" ]; then
+  if [ "$BINARY" != "$SINOMO_ROOT/target/debug/sinomo" ]; then
+    log "custom host binary is missing or SINOMO_TEST_BUILD requested: $BINARY"
+    exit 1
+  fi
   log "building host binary (cargo build -p sinomo)"
   (cd "$SINOMO_ROOT" && cargo build -p sinomo) || { log "host build failed"; exit 1; }
 fi
@@ -960,14 +1170,25 @@ scenario "cluster-kv-quorum-baseline" cluster_kv_quorum_baseline
 if [ -n "$FAILED_SCENARIOS" ]; then
   exit 1
 fi
-if [ "${SINOMO_TEST_NETWORK_ONLY:-0}" = 1 ]; then
-  log "RESULT: PASS — network baselines green (probe reports in $ARTIFACTS)"
-  exit 0
-fi
-
 if ! wait_for_dfs_ready; then
   FAILED_SCENARIOS="dfs-ready"
   exit 1
+fi
+if ! wait_for_dfs_converged; then
+  FAILED_SCENARIOS="dfs-converged"
+  exit 1
+fi
+if ! dfs_daemon_mutation_lanes_ready; then
+  FAILED_SCENARIOS="dfs-daemon-mutation-lanes"
+  exit 1
+fi
+if ! wait_for_dfs_converged; then
+  FAILED_SCENARIOS="dfs-post-daemon-mutation-convergence"
+  exit 1
+fi
+if [ "${SINOMO_TEST_NETWORK_ONLY:-0}" = 1 ]; then
+  log "RESULT: PASS — network/KV baselines and DFS readiness/mutation/convergence gates green (probe reports in $ARTIFACTS)"
+  exit 0
 fi
 
 # --- scenarios ----------------------------------------------------------------

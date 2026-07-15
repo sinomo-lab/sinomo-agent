@@ -1,9 +1,12 @@
 //! Node-routed DFS data-plane transport and served-message processing.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{
+    AtomicBool, AtomicU64, AtomicUsize as StdAtomicUsize, Ordering as AtomicOrdering,
+};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -20,16 +23,16 @@ use sinomo_core::node::NodeId;
 #[cfg(test)]
 use crate::dfs_direct_read_response_from_rpc_response;
 use crate::{
-    AsyncDfsMessageTransport, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES,
+    AsyncDfsMessageTransport, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES, DfsBlobTransferResult,
     DfsDirectReadClientBodyResponse, DfsDirectReadClientBodyResult, DfsDirectReadRequest, DfsError,
     DfsMessageCommand, DfsMessageProcessResult, DfsMessageResponse, DfsMessageTransport,
     DfsMessageTransportFuture, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
     DfsNetworkMessage, DfsOutboundBody, DfsReadData, DfsReadResponse, DfsReadResult,
-    DfsRoutedMessage, DfsTransportIdentity, DistributedRepairJob, NetworkedDfsService,
-    NetworkedDfsServiceEvent, decode_dfs_message_rpc_response,
-    decode_dfs_metadata_journal_batch_rpc_response, dfs_direct_read_request_from_read_request,
-    dfs_direct_read_response_from_rpc_session_result, dfs_direct_read_rpc_request,
-    dfs_message_is_read_only_request, dfs_message_rpc_request,
+    DfsRoutedBodySend, DfsRoutedBodySendOutcome, DfsRoutedMessage, DfsTransportIdentity,
+    DistributedRepairJob, NetworkedDfsService, NetworkedDfsServiceEvent,
+    decode_dfs_message_rpc_response, decode_dfs_metadata_journal_batch_rpc_response,
+    dfs_direct_read_request_from_read_request, dfs_direct_read_response_from_rpc_session_result,
+    dfs_direct_read_rpc_request, dfs_message_is_read_only_request, dfs_message_rpc_request,
     dfs_metadata_journal_batch_rpc_request, dfs_network_message_allows_write_repair_progress,
     dfs_perf_trace, dfs_perf_trace_enabled, retained_networked_dfs_service_events,
 };
@@ -42,6 +45,21 @@ use crate::{
 };
 
 const DFS_SERVED_MESSAGE_REPAIR_MAX_JOBS: usize = 2;
+/// Refinement of `PromotionFanoutCap` in `replica_quorum_fanout.qnt`.
+const DFS_COMMIT_PROMOTION_MAX_INFLIGHT: usize = 2;
+/// Refinement of the bounded metadata-checkpoint fan-out model. Direct
+/// checkpoint RPCs are best-effort accelerators: quorum fallback and later
+/// catch-up retain correctness when a sibling is slow or unavailable.
+const DFS_METADATA_JOURNAL_DIRECT_MAX_INFLIGHT: usize = 2;
+/// Keep one slow checkpoint replica from holding a served mutation lane. The
+/// operation-wide deadline, when shorter, is folded into each RPC below.
+const DFS_METADATA_JOURNAL_DIRECT_FANOUT_BUDGET: Duration = Duration::from_millis(250);
+/// Refinement of retry cooling in `replica_promotion_outbox.qnt`.
+///
+/// Failed replay-safe post-response work is intentionally ineligible for one
+/// bounded interval. New healthy work remains ready and bypasses this cooling
+/// queue, so a poison target cannot turn retry pacing into global idleness.
+const DFS_DETACHED_SEND_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsPeerTransportError {
@@ -502,6 +520,196 @@ struct DeferredDfsPeerSend {
     operation_deadline: Option<Instant>,
     target_node_id: NodeId,
     routed_message: DfsRoutedMessage,
+    promotion_sequence: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DfsCommitPromotionIdentity {
+    target_node_id: NodeId,
+    file_system_id: crate::DfsFileSystemId,
+    object_id: crate::DfsObjectId,
+    version: crate::DfsVersion,
+    content_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DfsCommitPromotionSettlementKey {
+    target_node_id: NodeId,
+    file_system_id: crate::DfsFileSystemId,
+    object_id: crate::DfsObjectId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DfsSettledCommitPromotion {
+    identity: DfsCommitPromotionIdentity,
+    enqueue_sequence: u64,
+}
+
+#[derive(Default)]
+struct DfsNodeDetachedSendOutbox {
+    ready_sends: VecDeque<DeferredDfsPeerSend>,
+    cooling_retries: BTreeMap<Instant, VecDeque<DeferredDfsPeerSend>>,
+    pending_commit_promotions: BTreeSet<DfsCommitPromotionIdentity>,
+    settled_commit_promotions: BTreeMap<DfsCommitPromotionSettlementKey, DfsSettledCommitPromotion>,
+    next_promotion_sequence: u64,
+}
+
+/// Queue and replay indexes shared by DFS served-message transports.
+///
+/// Routing capabilities, operation deadlines, and returned-message queues stay
+/// on each transport. Sharing this state only makes detached, replay-safe work
+/// visible to a common recovery worker and keeps its deduplication atomic.
+#[derive(Clone, Default)]
+pub struct DfsNodeDetachedSendState {
+    inner: Arc<std::sync::Mutex<DfsNodeDetachedSendOutbox>>,
+    drain_gate: Arc<std::sync::Mutex<()>>,
+    change_generation: Arc<AtomicU64>,
+    ready_notify: Arc<tokio::sync::Notify>,
+}
+
+impl DfsNodeDetachedSendState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued_send_count(&self) -> usize {
+        let outbox = self.inner.lock().expect("detached send outbox");
+        outbox.ready_sends.len()
+            + outbox
+                .cooling_retries
+                .values()
+                .map(VecDeque::len)
+                .sum::<usize>()
+    }
+
+    fn record_change(&self) {
+        self.change_generation.fetch_add(1, AtomicOrdering::AcqRel);
+        // `notify_waiters` deliberately does not retain a stale permit. The
+        // generation recheck in `wait_for_ready_or_retry` closes the race
+        // between observing the queue and registering this notification.
+        self.ready_notify.notify_waiters();
+    }
+}
+
+impl std::fmt::Debug for DfsNodeDetachedSendState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.inner.lock() {
+            Ok(outbox) => formatter
+                .debug_struct("DfsNodeDetachedSendState")
+                .field("ready_sends", &outbox.ready_sends.len())
+                .field("cooling_retry_deadlines", &outbox.cooling_retries.len())
+                .field(
+                    "pending_commit_promotions",
+                    &outbox.pending_commit_promotions.len(),
+                )
+                .field(
+                    "settled_commit_promotions",
+                    &outbox.settled_commit_promotions.len(),
+                )
+                .finish(),
+            Err(_) => formatter
+                .debug_struct("DfsNodeDetachedSendState")
+                .field("poisoned", &true)
+                .finish(),
+        }
+    }
+}
+
+impl DfsCommitPromotionIdentity {
+    fn settlement_key(&self) -> DfsCommitPromotionSettlementKey {
+        DfsCommitPromotionSettlementKey {
+            target_node_id: self.target_node_id.clone(),
+            file_system_id: self.file_system_id.clone(),
+            object_id: self.object_id.clone(),
+        }
+    }
+}
+
+impl DeferredDfsPeerSend {
+    fn is_commit_version_promotion(&self) -> bool {
+        matches!(
+            &self.routed_message.message,
+            DfsNetworkMessage::CommitVersion(_)
+        )
+    }
+
+    fn commit_version_promotion_identity(&self) -> Option<DfsCommitPromotionIdentity> {
+        let DfsNetworkMessage::CommitVersion(command) = &self.routed_message.message else {
+            return None;
+        };
+        Some(DfsCommitPromotionIdentity {
+            target_node_id: self.target_node_id.clone(),
+            file_system_id: command.file_system_id.clone(),
+            object_id: command.object_id.clone(),
+            version: command.version.clone(),
+            content_hash: command.content_hash.clone(),
+        })
+    }
+
+    fn is_replay_safe_completed_write_response(&self) -> bool {
+        matches!(
+            &self.routed_message.message,
+            DfsNetworkMessage::DistributedWriteResponse(_)
+        )
+    }
+
+    fn uses_fresh_detached_budget(&self) -> bool {
+        self.is_commit_version_promotion() || self.is_replay_safe_completed_write_response()
+    }
+}
+
+fn all_commit_version_response_identity_matches(
+    send: &DeferredDfsPeerSend,
+    command: &crate::DfsCommitVersionCommand,
+    message: &DfsRoutedMessage,
+    response: &crate::DfsCommitVersionResponse,
+) -> bool {
+    message.source_node_id == send.target_node_id
+        && message.target_node_id == send.routed_message.source_node_id
+        && response.request_id == command.request_id
+        && response.intent_id == command.intent_id
+        && response.file_system_id == command.file_system_id
+        && response.object_id == command.object_id
+        && response.version == command.version
+        && response.replica_node_id == send.target_node_id
+}
+
+struct DfsPreparedMetadataJournalBatchRpc {
+    target_node_id: NodeId,
+    request_id: String,
+    shard_id: crate::DfsMetadataShardId,
+    next_after_sequence: u64,
+    request: ObjectRpcRequest,
+    options: DfsObjectRpcSendOptions,
+}
+
+impl DfsPreparedMetadataJournalBatchRpc {
+    fn finish(
+        self,
+        rpc_response: Result<ObjectRpcResponse, DfsPeerTransportError>,
+    ) -> Result<(NodeId, DfsMetadataJournalBatchResponse), NetworkError> {
+        let rpc_response = rpc_response.map_err(|source| NetworkError::Io {
+            operation: format!(
+                "send direct DFS metadata journal batch to {}",
+                self.target_node_id
+            ),
+            detail: source.to_string(),
+        })?;
+        let response = decode_dfs_metadata_journal_batch_rpc_response(&rpc_response)?;
+        if response.request_id != self.request_id
+            || response.shard_id != self.shard_id
+            || response.next_after_sequence != self.next_after_sequence
+        {
+            return Err(NetworkError::Serialization {
+                detail: format!(
+                    "{} returned mismatched direct metadata journal response",
+                    self.target_node_id
+                ),
+            });
+        }
+        Ok((self.target_node_id, response))
+    }
 }
 
 #[derive(Clone)]
@@ -509,7 +717,7 @@ pub struct DfsNodeTransport {
     local_node_id: NodeId,
     known_remote_nodes: BTreeSet<NodeId>,
     incoming_messages: VecDeque<DfsRoutedMessage>,
-    detached_sends: Arc<std::sync::Mutex<Vec<DeferredDfsPeerSend>>>,
+    detached_send_state: DfsNodeDetachedSendState,
     connect_timeout: Duration,
     sender: Option<DfsMessageSender>,
     async_sender: Option<AsyncDfsMessageSender>,
@@ -518,7 +726,83 @@ pub struct DfsNodeTransport {
     async_direct_read_body_sender: Option<AsyncDfsDirectReadBodySender>,
     peer_transport: Option<Arc<dyn DfsPeerTransport>>,
     async_peer_transport: Option<Arc<dyn AsyncDfsPeerTransport>>,
+    blocking_metadata_fanout_workers: Arc<StdAtomicUsize>,
     operation_deadline: Option<Instant>,
+}
+
+/// A clone of the served transport's peer-sending capability that shares only
+/// its detached outbox. Daemon workers use this handle after releasing the DFS
+/// service-lane lock, so replica promotion RPC latency cannot serialize later
+/// primary mutations.
+#[derive(Clone, Debug)]
+pub struct DfsNodeDetachedSendWorker {
+    transport: DfsNodeTransport,
+}
+
+impl DfsNodeDetachedSendWorker {
+    pub fn drain(&mut self) -> Result<(), DfsError> {
+        self.transport
+            .flush_detached_peer_sends()
+            .map_err(DfsError::from_network)
+    }
+
+    #[cfg(test)]
+    fn drain_at(&mut self, now: Instant) -> Result<(), DfsError> {
+        self.transport
+            .flush_detached_peer_sends_with_now(&|| now)
+            .map_err(DfsError::from_network)
+    }
+
+    pub fn has_pending(&self) -> Result<bool, DfsError> {
+        self.transport
+            .detached_send_state
+            .inner
+            .lock()
+            .map(|outbox| !outbox.ready_sends.is_empty() || !outbox.cooling_retries.is_empty())
+            .map_err(|_| {
+                DfsError::from_network(NetworkError::Io {
+                    operation: "inspect detached DFS message sends".to_string(),
+                    detail: "detached send lock is poisoned".to_string(),
+                })
+            })
+    }
+
+    /// Return whether work is immediately eligible, the earliest cooling
+    /// deadline, and the shared change generation observed with that state.
+    pub fn scheduling_snapshot(&self) -> Result<(bool, Option<Instant>, u64), DfsError> {
+        self.transport
+            .detached_send_scheduling_snapshot_at(Instant::now())
+            .map_err(DfsError::from_network)
+    }
+
+    /// Wait without spinning until cooling work becomes eligible or a new
+    /// ready send is accepted by any lane sharing this outbox.
+    pub async fn wait_for_ready_or_retry(
+        &self,
+        observed_generation: u64,
+        retry_not_before: Instant,
+    ) -> Result<(), DfsError> {
+        let notify = Arc::clone(&self.transport.detached_send_state.ready_notify);
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let (ready, current_retry_not_before, current_generation) = self
+            .transport
+            .detached_send_scheduling_snapshot_at(Instant::now())
+            .map_err(DfsError::from_network)?;
+        if ready || current_retry_not_before.is_none() || current_generation != observed_generation
+        {
+            return Ok(());
+        }
+        let wake_at = current_retry_not_before
+            .expect("cooling work has a deadline")
+            .min(retry_not_before);
+        tokio::select! {
+            _ = &mut notified => Ok(()),
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)) => Ok(()),
+        }
+    }
 }
 
 impl std::fmt::Debug for DfsNodeTransport {
@@ -544,9 +828,45 @@ impl DfsNodeTransport {
     pub(crate) fn fork_read_only_request(&self) -> Self {
         let mut fork = self.clone();
         fork.incoming_messages.clear();
-        fork.detached_sends = Arc::new(std::sync::Mutex::new(Vec::new()));
+        fork.detached_send_state = DfsNodeDetachedSendState::default();
         fork.operation_deadline = None;
         fork
+    }
+
+    fn fork_detached_send_worker(&self) -> DfsNodeDetachedSendWorker {
+        let mut transport = self.clone();
+        transport.incoming_messages.clear();
+        // Background promotion is independent of the completed caller's
+        // deadline. Each queued send still retains its own explicit policy.
+        transport.operation_deadline = None;
+        DfsNodeDetachedSendWorker { transport }
+    }
+
+    /// Fork one independent body send while preserving the operation's
+    /// absolute deadline. Returned DFS messages are accumulated in the fork
+    /// and merged into the owning transport only after the bounded fan-out
+    /// joins, so workers never share a mutable response queue. This slice
+    /// reduces full-transfer time-to-all from a sum to a bounded maximum; it
+    /// deliberately does not claim that the owner processes an early W receipt
+    /// while a sibling body send is still active.
+    fn fork_replica_body_send(&self) -> Self {
+        let mut fork = self.clone();
+        fork.incoming_messages.clear();
+        fork.detached_send_state = DfsNodeDetachedSendState::default();
+        fork
+    }
+
+    fn finish_replica_body_fanout(
+        &mut self,
+        mut completed: Vec<(usize, DfsRoutedBodySendOutcome, Vec<DfsRoutedMessage>)>,
+    ) -> Vec<DfsRoutedBodySendOutcome> {
+        completed.sort_by_key(|(index, _, _)| *index);
+        let mut outcomes = Vec::with_capacity(completed.len());
+        for (_, outcome, returned_messages) in completed {
+            self.incoming_messages.extend(returned_messages);
+            outcomes.push(outcome);
+        }
+        outcomes
     }
 
     #[cfg(test)]
@@ -676,11 +996,37 @@ impl DfsNodeTransport {
         peer_transport: Arc<dyn DfsPeerTransport>,
         async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
     ) -> Self {
+        Self::with_peer_transports_for_nodes_and_detached_state(
+            local_node_id,
+            peer_node_ids,
+            connect_timeout,
+            peer_transport,
+            async_peer_transport,
+            DfsNodeDetachedSendState::default(),
+        )
+    }
+
+    /// Construct a node transport whose detached, replay-safe sends are owned
+    /// by `detached_send_state`.
+    ///
+    /// Foreground routing queues and operation deadlines remain local to this
+    /// transport. Supplying shared state does not opt ordinary node transports
+    /// into the served-message early-response contract; it only lets a
+    /// dedicated maintenance service reconstruct and drain durable work into
+    /// the same outbox as the hot message lanes.
+    pub fn with_peer_transports_for_nodes_and_detached_state(
+        local_node_id: NodeId,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
+        connect_timeout: Duration,
+        peer_transport: Arc<dyn DfsPeerTransport>,
+        async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+        detached_send_state: DfsNodeDetachedSendState,
+    ) -> Self {
         let message_peer_transport = Arc::clone(&peer_transport);
         let direct_read_peer_transport = Arc::clone(&peer_transport);
         let message_async_peer_transport = Arc::clone(&async_peer_transport);
         let async_direct_read_peer_transport = Arc::clone(&async_peer_transport);
-        Self::with_senders_for_nodes(
+        Self::with_senders_for_nodes_and_detached_state(
             local_node_id,
             peer_node_ids,
             connect_timeout,
@@ -699,6 +1045,7 @@ impl DfsNodeTransport {
             )),
             Some(peer_transport),
             Some(async_peer_transport),
+            detached_send_state,
         )
     }
 
@@ -738,15 +1085,9 @@ impl DfsNodeTransport {
         peer_transport: Option<Arc<dyn DfsPeerTransport>>,
         async_peer_transport: Option<Arc<dyn AsyncDfsPeerTransport>>,
     ) -> Self {
-        let known_remote_nodes = peer_node_ids
-            .into_iter()
-            .filter(|node_id| node_id != &local_node_id)
-            .collect();
-        Self {
+        Self::with_senders_for_nodes_and_detached_state(
             local_node_id,
-            known_remote_nodes,
-            incoming_messages: VecDeque::new(),
-            detached_sends: Arc::new(std::sync::Mutex::new(Vec::new())),
+            peer_node_ids,
             connect_timeout,
             sender,
             async_sender,
@@ -755,6 +1096,42 @@ impl DfsNodeTransport {
             async_direct_read_body_sender,
             peer_transport,
             async_peer_transport,
+            DfsNodeDetachedSendState::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_senders_for_nodes_and_detached_state(
+        local_node_id: NodeId,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
+        connect_timeout: Duration,
+        sender: Option<DfsMessageSender>,
+        async_sender: Option<AsyncDfsMessageSender>,
+        direct_read_sender: Option<DfsDirectReadSender>,
+        async_direct_read_sender: Option<AsyncDfsDirectReadSender>,
+        async_direct_read_body_sender: Option<AsyncDfsDirectReadBodySender>,
+        peer_transport: Option<Arc<dyn DfsPeerTransport>>,
+        async_peer_transport: Option<Arc<dyn AsyncDfsPeerTransport>>,
+        detached_send_state: DfsNodeDetachedSendState,
+    ) -> Self {
+        let known_remote_nodes = peer_node_ids
+            .into_iter()
+            .filter(|node_id| node_id != &local_node_id)
+            .collect();
+        Self {
+            local_node_id,
+            known_remote_nodes,
+            incoming_messages: VecDeque::new(),
+            detached_send_state,
+            connect_timeout,
+            sender,
+            async_sender,
+            direct_read_sender,
+            async_direct_read_sender,
+            async_direct_read_body_sender,
+            peer_transport,
+            async_peer_transport,
+            blocking_metadata_fanout_workers: Arc::new(StdAtomicUsize::new(0)),
             operation_deadline: None,
         }
     }
@@ -765,6 +1142,80 @@ impl DfsNodeTransport {
 
     pub fn operation_deadline(&self) -> Option<Instant> {
         self.operation_deadline
+    }
+
+    #[cfg(test)]
+    fn detached_send_count(&self) -> usize {
+        let outbox = self
+            .detached_send_state
+            .inner
+            .lock()
+            .expect("detached send outbox");
+        outbox.ready_sends.len()
+            + outbox
+                .cooling_retries
+                .values()
+                .map(VecDeque::len)
+                .sum::<usize>()
+    }
+
+    #[cfg(test)]
+    fn detached_send_targets(&self) -> Vec<NodeId> {
+        let outbox = self
+            .detached_send_state
+            .inner
+            .lock()
+            .expect("detached send outbox");
+        outbox
+            .ready_sends
+            .iter()
+            .chain(outbox.cooling_retries.values().flat_map(VecDeque::iter))
+            .map(|send| send.target_node_id.clone())
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn detached_send_frame_ids(&self) -> Vec<u64> {
+        let outbox = self
+            .detached_send_state
+            .inner
+            .lock()
+            .expect("detached send outbox");
+        outbox
+            .ready_sends
+            .iter()
+            .chain(outbox.cooling_retries.values().flat_map(VecDeque::iter))
+            .map(|send| send.routed_message.frame_id)
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn detached_send_scheduling_snapshot_at_for_test(
+        &self,
+        now: Instant,
+    ) -> (bool, Option<Instant>, u64) {
+        self.detached_send_scheduling_snapshot_at(now)
+            .expect("detached send scheduling snapshot")
+    }
+
+    #[cfg(test)]
+    fn pending_commit_promotion_count(&self) -> usize {
+        self.detached_send_state
+            .inner
+            .lock()
+            .expect("detached send outbox")
+            .pending_commit_promotions
+            .len()
+    }
+
+    #[cfg(test)]
+    fn settled_commit_promotion_count(&self) -> usize {
+        self.detached_send_state
+            .inner
+            .lock()
+            .expect("detached send outbox")
+            .settled_commit_promotions
+            .len()
     }
 
     fn current_send_options(
@@ -1000,6 +1451,55 @@ impl DfsNodeTransport {
         )]))
     }
 
+    fn detached_send_scheduling_snapshot_at(
+        &self,
+        now: Instant,
+    ) -> Result<(bool, Option<Instant>, u64), NetworkError> {
+        let outbox = self
+            .detached_send_state
+            .inner
+            .lock()
+            .map_err(|_| NetworkError::Io {
+                operation: "inspect detached DFS message schedule".to_string(),
+                detail: "detached send lock is poisoned".to_string(),
+            })?;
+        let next_retry_not_before = outbox.cooling_retries.first_key_value().map(|(at, _)| *at);
+        let ready = !outbox.ready_sends.is_empty()
+            || next_retry_not_before.is_some_and(|retry_not_before| retry_not_before <= now);
+        let generation = self
+            .detached_send_state
+            .change_generation
+            .load(AtomicOrdering::Acquire);
+        Ok((ready, next_retry_not_before, generation))
+    }
+
+    fn take_detached_peer_sends_ready_at(
+        &self,
+        now: Instant,
+    ) -> Result<VecDeque<DeferredDfsPeerSend>, NetworkError> {
+        let mut outbox = self
+            .detached_send_state
+            .inner
+            .lock()
+            .map_err(|_| NetworkError::Io {
+                operation: "take ready detached DFS message sends".to_string(),
+                detail: "detached send lock is poisoned".to_string(),
+            })?;
+        while outbox
+            .cooling_retries
+            .first_key_value()
+            .is_some_and(|(retry_not_before, _)| *retry_not_before <= now)
+        {
+            let (_, mut due) = outbox
+                .cooling_retries
+                .pop_first()
+                .expect("eligible detached retry deadline exists");
+            // Healthy work accepted while this retry cooled stays ahead of it.
+            outbox.ready_sends.append(&mut due);
+        }
+        Ok(std::mem::take(&mut outbox.ready_sends))
+    }
+
     fn send_routed_message_to_peer_detached(
         &mut self,
         target_node_id: &NodeId,
@@ -1010,84 +1510,379 @@ impl DfsNodeTransport {
             self.incoming_messages.push_back(routed_message);
             return Ok(());
         }
-        self.validate_routed_message_target(target_node_id, &routed_message, require_local_source)?;
+        let is_commit_version_promotion =
+            matches!(&routed_message.message, DfsNetworkMessage::CommitVersion(_));
+        let is_replay_safe_completed_write_response = matches!(
+            &routed_message.message,
+            DfsNetworkMessage::DistributedWriteResponse(_)
+        );
+        let allows_dynamic_route_recovery =
+            is_commit_version_promotion || is_replay_safe_completed_write_response;
+        if let Err(error) = self.validate_routed_message_target(
+            target_node_id,
+            &routed_message,
+            require_local_source,
+        ) && !(allows_dynamic_route_recovery
+            && matches!(&error, NetworkError::UnknownNode { .. }))
+        {
+            return Err(error);
+        }
         let Some(sender) = self.sender.as_ref().cloned() else {
             return Err(NetworkError::Io {
                 operation: format!("send DFS message to {target_node_id}"),
                 detail: "DFS peer transport was constructed without a sync sender".to_string(),
             });
         };
-        let operation_deadline = self.operation_deadline;
+        // CommitVersion and completed DistributedWriteResponse messages are
+        // replay-safe post-response work. Carrying the completed caller's
+        // absolute deadline into the outbox can expire them before the worker
+        // is scheduled, so each attempt starts a fresh background RPC budget.
+        let operation_deadline = if allows_dynamic_route_recovery {
+            None
+        } else {
+            self.operation_deadline
+        };
         let options = Self::clamp_send_options_to_operation_deadline(
             DfsObjectRpcSendOptions::new(self.connect_timeout),
             operation_deadline,
             format!("send detached DFS message to {target_node_id}"),
         )?;
-        self.detached_sends
+        let mut send = DeferredDfsPeerSend {
+            sender,
+            options,
+            operation_deadline,
+            target_node_id: target_node_id.clone(),
+            routed_message,
+            promotion_sequence: None,
+        };
+        let promotion_identity = send.commit_version_promotion_identity();
+        let mut outbox = self
+            .detached_send_state
+            .inner
             .lock()
             .map_err(|_| NetworkError::Io {
                 operation: "track detached DFS message send".to_string(),
                 detail: "detached send lock is poisoned".to_string(),
-            })?
-            .push(DeferredDfsPeerSend {
-                sender,
-                options,
-                operation_deadline,
-                target_node_id: target_node_id.clone(),
-                routed_message,
-            });
+            })?;
+        if let Some(identity) = promotion_identity {
+            let settlement_key = identity.settlement_key();
+            if outbox
+                .settled_commit_promotions
+                .get(&settlement_key)
+                .is_some_and(|settled| settled.identity == identity)
+                || outbox.pending_commit_promotions.contains(&identity)
+            {
+                return Ok(());
+            }
+            outbox.next_promotion_sequence = outbox.next_promotion_sequence.saturating_add(1);
+            send.promotion_sequence = Some(outbox.next_promotion_sequence);
+            outbox.pending_commit_promotions.insert(identity);
+        }
+        outbox.ready_sends.push_back(send);
+        drop(outbox);
+        self.detached_send_state.record_change();
         Ok(())
     }
 
     fn flush_detached_peer_sends(&mut self) -> Result<(), NetworkError> {
-        let sends = {
-            let mut sends = self.detached_sends.lock().map_err(|_| NetworkError::Io {
-                operation: "flush detached DFS message sends".to_string(),
+        self.flush_detached_peer_sends_with_now(&Instant::now)
+    }
+
+    fn flush_detached_peer_sends_with_now<F>(&mut self, now: &F) -> Result<(), NetworkError>
+    where
+        F: Fn() -> Instant + ?Sized,
+    {
+        // The Quint fan-out cap applies to the shared outbox, not to each
+        // transport clone independently. One worker owns ready work while
+        // retaining cap-two concurrency inside its drain. A competing worker
+        // never blocks a Tokio blocking-pool thread behind the global gate.
+        let drain_gate = Arc::clone(&self.detached_send_state.drain_gate);
+        let _drain_guard = match drain_gate.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(NetworkError::Io {
+                    operation: "serialize detached DFS message drains".to_string(),
+                    detail: "detached send drain lock is poisoned".to_string(),
+                });
+            }
+        };
+        let mut first_replay_error = None;
+        loop {
+            let mut sends = self.take_detached_peer_sends_ready_at(now())?;
+            if sends.is_empty() {
+                break;
+            }
+            let mut replay_retries = VecDeque::new();
+            while let Some(front) = sends.front() {
+                if front.is_commit_version_promotion() {
+                    let mut promotion_wave = Vec::with_capacity(DFS_COMMIT_PROMOTION_MAX_INFLIGHT);
+                    while promotion_wave.len() < DFS_COMMIT_PROMOTION_MAX_INFLIGHT
+                        && sends
+                            .front()
+                            .is_some_and(DeferredDfsPeerSend::is_commit_version_promotion)
+                    {
+                        promotion_wave.push(sends.pop_front().expect("promotion send front"));
+                    }
+                    // Promotion is independent post-response convergence work;
+                    // neither its queued deadline nor a later caller deadline
+                    // may retroactively cancel it.
+                    let current_operation_deadline = None;
+                    let results = std::thread::scope(|scope| {
+                        let handles = promotion_wave
+                            .iter()
+                            .cloned()
+                            .map(|send| {
+                                scope.spawn(move || {
+                                    Self::send_detached_peer_message(
+                                        send,
+                                        current_operation_deadline,
+                                    )
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        promotion_wave
+                            .into_iter()
+                            .zip(handles)
+                            .map(|(send, handle)| {
+                                let result = handle.join().unwrap_or_else(|_| {
+                                    Err(NetworkError::Io {
+                                        operation: "join detached DFS commit promotion fan-out"
+                                            .to_string(),
+                                        detail: "commit promotion worker panicked".to_string(),
+                                    })
+                                });
+                                (send, result)
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    for (send, result) in results {
+                        let result = result.and_then(|returned_messages| {
+                            Self::validate_detached_commit_promotion_response(
+                                &send,
+                                &returned_messages,
+                            )
+                        });
+                        if result.is_ok()
+                            && let Err(error) = self.mark_commit_promotion_settled(&send)
+                        {
+                            replay_retries.push_back(send);
+                            if first_replay_error.is_none() {
+                                first_replay_error = Some(error);
+                            }
+                        } else if let Err(error) = result {
+                            // CommitVersion is idempotent for the same
+                            // object/version/hash. Both transport failure and a
+                            // negative/missing ACK therefore stay in cooling.
+                            replay_retries.push_back(send);
+                            if first_replay_error.is_none() {
+                                first_replay_error = Some(error);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                let send = sends.pop_front().expect("detached send front");
+                let attempted_replay = send
+                    .is_replay_safe_completed_write_response()
+                    .then(|| send.clone());
+                let current_operation_deadline = if send.uses_fresh_detached_budget() {
+                    None
+                } else {
+                    self.operation_deadline
+                };
+                let result = Self::send_detached_peer_message(send, current_operation_deadline)
+                    .and_then(|returned_messages| {
+                        self.route_detached_peer_responses(returned_messages)
+                    });
+                if let Err(error) = result {
+                    if let Some(attempted_replay) = attempted_replay {
+                        replay_retries.push_back(attempted_replay);
+                        if first_replay_error.is_none() {
+                            first_replay_error = Some(error);
+                        }
+                        continue;
+                    }
+                    self.restore_detached_peer_send_work(
+                        sends,
+                        replay_retries,
+                        now() + DFS_DETACHED_SEND_RETRY_DELAY,
+                    )?;
+                    return Err(first_replay_error.take().unwrap_or(error));
+                }
+            }
+
+            self.restore_detached_peer_send_work(
+                VecDeque::new(),
+                replay_retries,
+                now() + DFS_DETACHED_SEND_RETRY_DELAY,
+            )?;
+            // Recheck the shared ready queue before returning. Work accepted
+            // concurrently through another lane is never hidden behind the
+            // cooling failures from this round.
+        }
+        first_replay_error.map_or(Ok(()), Err)
+    }
+
+    fn send_detached_peer_message(
+        send: DeferredDfsPeerSend,
+        current_operation_deadline: Option<Instant>,
+    ) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
+        let operation_deadline =
+            Self::earlier_operation_deadline(send.operation_deadline, current_operation_deadline);
+        let options = Self::clamp_send_options_to_operation_deadline(
+            send.options,
+            operation_deadline,
+            format!("flush detached DFS message send to {}", send.target_node_id),
+        )?;
+        send_dfs_routed_message_to_peer(
+            send.sender,
+            options,
+            send.target_node_id,
+            send.routed_message,
+        )
+    }
+
+    fn validate_detached_commit_promotion_response(
+        send: &DeferredDfsPeerSend,
+        returned_messages: &[DfsRoutedMessage],
+    ) -> Result<(), NetworkError> {
+        let DfsNetworkMessage::CommitVersion(command) = &send.routed_message.message else {
+            return Err(NetworkError::Serialization {
+                detail: "detached promotion validation received a non-CommitVersion message"
+                    .to_string(),
+            });
+        };
+        let response = returned_messages.iter().find_map(|message| {
+            let DfsNetworkMessage::CommitVersionResponse(response) = &message.message else {
+                return None;
+            };
+            all_commit_version_response_identity_matches(send, command, message, response)
+                .then_some(response)
+        });
+        let Some(response) = response else {
+            return Err(NetworkError::Serialization {
+                detail: format!(
+                    "detached CommitVersion promotion to {} returned no matching acknowledgement",
+                    send.target_node_id
+                ),
+            });
+        };
+        match &response.result {
+            DfsBlobTransferResult::Committed { content_hash }
+                if content_hash == &command.content_hash =>
+            {
+                Ok(())
+            }
+            DfsBlobTransferResult::Committed { content_hash } => Err(NetworkError::Serialization {
+                detail: format!(
+                    "detached CommitVersion promotion to {} acknowledged hash {}, expected {}",
+                    send.target_node_id, content_hash, command.content_hash
+                ),
+            }),
+            DfsBlobTransferResult::Durable { content_hash } => Err(NetworkError::Io {
+                operation: format!(
+                    "promote DFS version {} on {}",
+                    command.version, send.target_node_id
+                ),
+                detail: format!(
+                    "replica acknowledged durable content hash {content_hash} but has not committed the version"
+                ),
+            }),
+            DfsBlobTransferResult::Rejected { reason } => Err(NetworkError::Io {
+                operation: format!(
+                    "promote DFS version {} on {}",
+                    command.version, send.target_node_id
+                ),
+                detail: reason.clone(),
+            }),
+        }
+    }
+
+    fn mark_commit_promotion_settled(
+        &self,
+        send: &DeferredDfsPeerSend,
+    ) -> Result<(), NetworkError> {
+        let Some(identity) = send.commit_version_promotion_identity() else {
+            return Ok(());
+        };
+        let Some(enqueue_sequence) = send.promotion_sequence else {
+            return Err(NetworkError::Serialization {
+                detail: "detached CommitVersion promotion has no outbox sequence".to_string(),
+            });
+        };
+        let settlement_key = identity.settlement_key();
+        let mut outbox = self
+            .detached_send_state
+            .inner
+            .lock()
+            .map_err(|_| NetworkError::Io {
+                operation: "record settled DFS commit promotion".to_string(),
+                detail: "settled promotion lock is poisoned".to_string(),
+            })?;
+        outbox.pending_commit_promotions.remove(&identity);
+        let should_advance_settlement = outbox
+            .settled_commit_promotions
+            .get(&settlement_key)
+            .is_none_or(|settled| settled.enqueue_sequence <= enqueue_sequence);
+        if should_advance_settlement {
+            outbox.settled_commit_promotions.insert(
+                settlement_key,
+                DfsSettledCommitPromotion {
+                    identity,
+                    enqueue_sequence,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn route_detached_peer_responses(
+        &mut self,
+        returned_messages: Vec<DfsRoutedMessage>,
+    ) -> Result<(), NetworkError> {
+        for returned_message in returned_messages {
+            let target_node_id = returned_message.target_node_id.clone();
+            self.send_routed_message_to_peer(&target_node_id, returned_message, false)?;
+        }
+        Ok(())
+    }
+
+    fn restore_detached_peer_send_work(
+        &mut self,
+        mut ready_sends: VecDeque<DeferredDfsPeerSend>,
+        mut replay_retries: VecDeque<DeferredDfsPeerSend>,
+        retry_not_before: Instant,
+    ) -> Result<(), NetworkError> {
+        if ready_sends.is_empty() && replay_retries.is_empty() {
+            return Ok(());
+        }
+        let schedule_changed = !ready_sends.is_empty() || !replay_retries.is_empty();
+        let mut outbox = self
+            .detached_send_state
+            .inner
+            .lock()
+            .map_err(|_| NetworkError::Io {
+                operation: "restore detached DFS message sends".to_string(),
                 detail: "detached send lock is poisoned".to_string(),
             })?;
-            std::mem::take(&mut *sends)
-        };
-        let mut sends = VecDeque::from(sends);
-        while let Some(send) = sends.pop_front() {
-            let result = (|| {
-                let operation_deadline = Self::earlier_operation_deadline(
-                    send.operation_deadline,
-                    self.operation_deadline,
-                );
-                let options = Self::clamp_send_options_to_operation_deadline(
-                    send.options,
-                    operation_deadline,
-                    format!("flush detached DFS message send to {}", send.target_node_id),
-                )?;
-                let returned_messages = send_dfs_routed_message_to_peer(
-                    send.sender,
-                    options,
-                    send.target_node_id,
-                    send.routed_message,
-                )?;
-                for returned_message in returned_messages {
-                    let target_node_id = returned_message.target_node_id.clone();
-                    self.send_routed_message_to_peer(&target_node_id, returned_message, false)?;
-                }
-                Ok(())
-            })();
-            if let Err(error) = result {
-                // The current send may already have reached its target, so it
-                // cannot be replayed generically. The remaining suffix has not
-                // been attempted, however, and must stay queued so one failed
-                // peer cannot discard unrelated durable work. Put that older
-                // suffix ahead of sends concurrently enqueued through a clone.
-                if !sends.is_empty() {
-                    let mut queued = self.detached_sends.lock().map_err(|_| NetworkError::Io {
-                        operation: "restore detached DFS message sends".to_string(),
-                        detail: "detached send lock is poisoned".to_string(),
-                    })?;
-                    let mut preserved = sends.into_iter().collect::<Vec<_>>();
-                    preserved.append(&mut queued);
-                    *queued = preserved;
-                }
-                return Err(error);
-            }
+        if !ready_sends.is_empty() {
+            // Preserve the unattempted suffix ahead of work queued while its
+            // failed non-replay-safe predecessor was in flight.
+            ready_sends.append(&mut outbox.ready_sends);
+            outbox.ready_sends = ready_sends;
+        }
+        if !replay_retries.is_empty() {
+            outbox
+                .cooling_retries
+                .entry(retry_not_before)
+                .or_default()
+                .append(&mut replay_retries);
+        }
+        drop(outbox);
+        if schedule_changed {
+            self.detached_send_state.record_change();
         }
         Ok(())
     }
@@ -1553,6 +2348,74 @@ impl AsyncDfsMessageTransport for DfsNodeTransport {
         })
     }
 
+    fn send_routed_message_bodies_bounded_async<'a>(
+        &'a mut self,
+        requests: Vec<DfsRoutedBodySend>,
+        max_inflight: usize,
+    ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedBodySendOutcome>, NetworkError>> {
+        Box::pin(async move {
+            if requests.is_empty() {
+                return Ok(Vec::new());
+            }
+            if requests.len() == 1 {
+                let request = requests.into_iter().next().expect("one body request");
+                let result = self
+                    .send_routed_message_body_to_peer_async(
+                        &request.target_node_id,
+                        request.message,
+                        request.body,
+                        true,
+                    )
+                    .await;
+                return Ok(vec![DfsRoutedBodySendOutcome {
+                    target_node_id: request.target_node_id,
+                    result,
+                }]);
+            }
+            let limiter = Arc::new(tokio::sync::Semaphore::new(max_inflight.max(1)));
+            let mut workers = tokio::task::JoinSet::new();
+            for (index, request) in requests.into_iter().enumerate() {
+                let limiter = Arc::clone(&limiter);
+                let mut transport = self.fork_replica_body_send();
+                workers.spawn(async move {
+                    let _permit = limiter
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| NetworkError::Io {
+                            operation: "acquire DFS body fan-out permit".to_string(),
+                            detail: "DFS body fan-out limiter closed unexpectedly".to_string(),
+                        })?;
+                    let result = transport
+                        .send_routed_message_body_to_peer_async(
+                            &request.target_node_id,
+                            request.message,
+                            request.body,
+                            true,
+                        )
+                        .await;
+                    Ok::<_, NetworkError>((
+                        index,
+                        DfsRoutedBodySendOutcome {
+                            target_node_id: request.target_node_id,
+                            result,
+                        },
+                        transport.incoming_messages.drain(..).collect::<Vec<_>>(),
+                    ))
+                });
+            }
+
+            let mut completed = Vec::new();
+            while let Some(joined) = workers.join_next().await {
+                let completion = joined.map_err(|source| NetworkError::Io {
+                    operation: "join async DFS body fan-out".to_string(),
+                    detail: source.to_string(),
+                })??;
+                completed.push(completion);
+            }
+            Ok(self.finish_replica_body_fanout(completed))
+        })
+    }
+
     fn drain_incoming_messages_async<'a>(
         &'a mut self,
     ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedMessage>, NetworkError>> {
@@ -1564,6 +2427,194 @@ impl AsyncDfsMessageTransport for DfsNodeTransport {
     ) -> DfsMessageTransportFuture<'a, Result<Option<usize>, NetworkError>> {
         Box::pin(async move { Ok(Some(self.incoming_messages.len())) })
     }
+}
+
+fn record_direct_metadata_journal_fanout_outcome(
+    outcome: Result<(NodeId, DfsMetadataJournalBatchResponse), NetworkError>,
+    responses: &mut Vec<(NodeId, DfsMetadataJournalBatchResponse)>,
+) {
+    match outcome {
+        Ok(response) => responses.push(response),
+        Err(error) => dfs_perf_trace(format_args!(
+            "direct-metadata-journal-fanout-peer-error error={error}"
+        )),
+    }
+}
+
+async fn send_direct_metadata_journal_fanout_async(
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    prepared: Vec<DfsPreparedMetadataJournalBatchRpc>,
+    deadline: Instant,
+) -> Vec<(NodeId, DfsMetadataJournalBatchResponse)> {
+    let mut pending = VecDeque::from(prepared);
+    let mut workers = tokio::task::JoinSet::new();
+    let mut responses = Vec::new();
+    let deadline_sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+    tokio::pin!(deadline_sleep);
+
+    loop {
+        while workers.len() < DFS_METADATA_JOURNAL_DIRECT_MAX_INFLIGHT {
+            let Some(prepared) = pending.pop_front() else {
+                break;
+            };
+            let peer_transport = Arc::clone(&peer_transport);
+            workers.spawn(async move {
+                let rpc_response = peer_transport
+                    .call_object_rpc_async(
+                        &prepared.target_node_id,
+                        &prepared.request,
+                        prepared.options,
+                    )
+                    .await;
+                prepared.finish(rpc_response)
+            });
+        }
+        if workers.is_empty() {
+            break;
+        }
+
+        tokio::select! {
+            biased;
+            joined = workers.join_next() => {
+                match joined {
+                    Some(Ok(outcome)) => {
+                        record_direct_metadata_journal_fanout_outcome(outcome, &mut responses);
+                    }
+                    Some(Err(error)) => dfs_perf_trace(format_args!(
+                        "direct-metadata-journal-fanout-worker-error error={error}"
+                    )),
+                    None => break,
+                }
+            }
+            _ = &mut deadline_sleep => {
+                dfs_perf_trace(format_args!(
+                    "direct-metadata-journal-fanout-budget-expired completed={} pending={} active={}",
+                    responses.len(),
+                    pending.len(),
+                    workers.len()
+                ));
+                workers.abort_all();
+                break;
+            }
+        }
+    }
+
+    // Dropping the set aborts and drops any late sibling RPC futures rather
+    // than waiting for the slowest replica after the best-effort budget.
+    drop(workers);
+    responses
+}
+
+fn send_direct_metadata_journal_fanout_blocking(
+    peer_transport: Arc<dyn DfsPeerTransport>,
+    prepared: Vec<DfsPreparedMetadataJournalBatchRpc>,
+    deadline: Instant,
+    worker_slots: Arc<StdAtomicUsize>,
+) -> Vec<(NodeId, DfsMetadataJournalBatchResponse)> {
+    let expected_results = prepared.len();
+    if expected_results == 0 {
+        return Vec::new();
+    }
+    let worker_count = expected_results.min(DFS_METADATA_JOURNAL_DIRECT_MAX_INFLIGHT);
+    let pending = Arc::new(std::sync::Mutex::new(VecDeque::from(prepared)));
+    let canceled = Arc::new(AtomicBool::new(false));
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+
+    struct BlockingFanoutWorkerSlot(Arc<StdAtomicUsize>);
+
+    impl BlockingFanoutWorkerSlot {
+        fn try_acquire(in_flight: Arc<StdAtomicUsize>) -> Option<Self> {
+            in_flight
+                .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |active| {
+                    (active < DFS_METADATA_JOURNAL_DIRECT_MAX_INFLIGHT).then_some(active + 1)
+                })
+                .ok()
+                .map(|_| Self(in_flight))
+        }
+    }
+
+    impl Drop for BlockingFanoutWorkerSlot {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, AtomicOrdering::AcqRel);
+        }
+    }
+
+    let mut spawned_workers = 0usize;
+    for worker_index in 0..worker_count {
+        let Some(worker_slot) = BlockingFanoutWorkerSlot::try_acquire(Arc::clone(&worker_slots))
+        else {
+            dfs_perf_trace(format_args!(
+                "direct-metadata-journal-fanout-blocking-worker-cap active={}",
+                worker_slots.load(AtomicOrdering::Acquire)
+            ));
+            break;
+        };
+        let pending = Arc::clone(&pending);
+        let canceled = Arc::clone(&canceled);
+        let peer_transport = Arc::clone(&peer_transport);
+        let completed_tx = completed_tx.clone();
+        if std::thread::Builder::new()
+            .name(format!("dfs-metadata-fanout-{worker_index}"))
+            .spawn(move || {
+                let _worker_slot = worker_slot;
+                loop {
+                    if canceled.load(AtomicOrdering::Acquire) || Instant::now() >= deadline {
+                        break;
+                    }
+                    let prepared = pending
+                        .lock()
+                        .ok()
+                        .and_then(|mut pending| pending.pop_front());
+                    let Some(prepared) = prepared else {
+                        break;
+                    };
+                    let rpc_response = peer_transport.call_object_rpc(
+                        &prepared.target_node_id,
+                        &prepared.request,
+                        prepared.options,
+                    );
+                    let outcome = prepared.finish(rpc_response);
+                    if canceled.load(AtomicOrdering::Acquire) || Instant::now() >= deadline {
+                        break;
+                    }
+                    if completed_tx.send(outcome).is_err() {
+                        break;
+                    }
+                }
+            })
+            .is_ok()
+        {
+            spawned_workers = spawned_workers.saturating_add(1);
+        }
+    }
+    drop(completed_tx);
+
+    let mut received_results = 0usize;
+    let mut responses = Vec::new();
+    while received_results < expected_results {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match completed_rx.recv_timeout(remaining) {
+            Ok(outcome) => {
+                received_results = received_results.saturating_add(1);
+                record_direct_metadata_journal_fanout_outcome(outcome, &mut responses);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    canceled.store(true, AtomicOrdering::Release);
+    if received_results < expected_results {
+        dfs_perf_trace(format_args!(
+            "direct-metadata-journal-fanout-blocking-budget-expired completed={} observed={} expected={} workers={}",
+            responses.len(),
+            received_results,
+            expected_results,
+            spawned_workers
+        ));
+    }
+    responses
 }
 
 impl DfsMessageTransport for DfsNodeTransport {
@@ -1582,6 +2633,79 @@ impl DfsMessageTransport for DfsNodeTransport {
         body: DfsOutboundBody,
     ) -> Result<(), NetworkError> {
         self.send_routed_message_body_to_peer(target_node_id, message, body, true)
+    }
+
+    fn send_routed_message_bodies_bounded(
+        &mut self,
+        requests: Vec<DfsRoutedBodySend>,
+        max_inflight: usize,
+    ) -> Result<Vec<DfsRoutedBodySendOutcome>, NetworkError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        if requests.len() == 1 {
+            let request = requests.into_iter().next().expect("one body request");
+            let result = self.send_routed_message_body_to_peer(
+                &request.target_node_id,
+                request.message,
+                request.body,
+                true,
+            );
+            return Ok(vec![DfsRoutedBodySendOutcome {
+                target_node_id: request.target_node_id,
+                result,
+            }]);
+        }
+        let worker_count = max_inflight.max(1).min(requests.len());
+        let pending = std::sync::Mutex::new(VecDeque::from_iter(requests.into_iter().enumerate()));
+        let completed = std::sync::Mutex::new(Vec::new());
+
+        std::thread::scope(|scope| -> Result<(), NetworkError> {
+            let mut workers = Vec::with_capacity(worker_count);
+            for _ in 0..worker_count {
+                let pending = &pending;
+                let completed = &completed;
+                let mut transport = self.fork_replica_body_send();
+                workers.push(scope.spawn(move || {
+                    loop {
+                        let Some((index, request)) =
+                            pending.lock().expect("DFS body fan-out queue").pop_front()
+                        else {
+                            break;
+                        };
+                        let result = transport.send_routed_message_body_to_peer(
+                            &request.target_node_id,
+                            request.message,
+                            request.body,
+                            true,
+                        );
+                        let returned_messages =
+                            transport.incoming_messages.drain(..).collect::<Vec<_>>();
+                        completed.lock().expect("DFS body fan-out results").push((
+                            index,
+                            DfsRoutedBodySendOutcome {
+                                target_node_id: request.target_node_id,
+                                result,
+                            },
+                            returned_messages,
+                        ));
+                    }
+                }));
+            }
+            for worker in workers {
+                worker.join().map_err(|_| NetworkError::Io {
+                    operation: "join DFS body fan-out".to_string(),
+                    detail: "DFS body fan-out worker panicked".to_string(),
+                })?;
+            }
+            Ok(())
+        })?;
+
+        let completed = completed.into_inner().map_err(|_| NetworkError::Io {
+            operation: "collect DFS body fan-out".to_string(),
+            detail: "DFS body fan-out result lock is poisoned".to_string(),
+        })?;
+        Ok(self.finish_replica_body_fanout(completed))
     }
 
     fn send_detached_routed_message(
@@ -1635,9 +2759,12 @@ impl DfsMessageTransport for DfsNodeTransport {
         &mut self,
         requests: &[(NodeId, DfsMetadataJournalBatchCommand)],
     ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
-        let Some(peer_transport) = self.peer_transport.as_ref().cloned() else {
+        let peer_transport = self.peer_transport.as_ref().cloned();
+        let async_peer_transport = self.async_peer_transport.as_ref().cloned();
+        if peer_transport.is_none() && async_peer_transport.is_none() {
             return Ok(None);
-        };
+        }
+        let deadline = Instant::now() + DFS_METADATA_JOURNAL_DIRECT_FANOUT_BUDGET;
         let mut prepared = Vec::with_capacity(requests.len());
         for (target_node_id, command) in requests {
             if target_node_id == &self.local_node_id
@@ -1647,57 +2774,53 @@ impl DfsMessageTransport for DfsNodeTransport {
                     node_id: target_node_id.clone(),
                 });
             }
-            prepared.push((
-                target_node_id.clone(),
-                command.request_id.clone(),
-                command.batch.shard_id.clone(),
-                command.batch.next_after_sequence,
-                dfs_metadata_journal_batch_rpc_request(command)?,
-                self.current_send_options(format!(
-                    "send direct DFS metadata journal batch to {target_node_id}"
-                ))?,
-            ));
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Ok(Some(Vec::new()));
+            };
+            let mut options = self.current_send_options(format!(
+                "send direct DFS metadata journal batch to {target_node_id}"
+            ))?;
+            options.overall_timeout = Some(
+                options
+                    .overall_timeout
+                    .map_or(remaining, |timeout| timeout.min(remaining)),
+            );
+            prepared.push(DfsPreparedMetadataJournalBatchRpc {
+                target_node_id: target_node_id.clone(),
+                request_id: command.request_id.clone(),
+                shard_id: command.batch.shard_id.clone(),
+                next_after_sequence: command.batch.next_after_sequence,
+                request: dfs_metadata_journal_batch_rpc_request(command)?,
+                options,
+            });
         }
-        let responses = std::thread::scope(|scope| {
-            let handles = prepared
-                .into_iter()
-                .map(|(target_node_id, request_id, shard_id, sequence, request, options)| {
-                    let peer_transport = Arc::clone(&peer_transport);
-                    scope.spawn(move || {
-                        let rpc_response = peer_transport
-                            .call_object_rpc(&target_node_id, &request, options)
-                            .map_err(|source| NetworkError::Io {
-                                operation: format!(
-                                    "send direct DFS metadata journal batch to {target_node_id}"
-                                ),
-                                detail: source.to_string(),
-                            })?;
-                        let response =
-                            decode_dfs_metadata_journal_batch_rpc_response(&rpc_response)?;
-                        if response.request_id != request_id
-                            || response.shard_id != shard_id
-                            || response.next_after_sequence != sequence
-                        {
-                            return Err(NetworkError::Serialization {
-                                detail: format!(
-                                    "{target_node_id} returned mismatched direct metadata journal response"
-                                ),
-                            });
-                        }
-                        Ok((target_node_id, response))
-                    })
-                })
-                .collect::<Vec<_>>();
-            let mut responses = Vec::with_capacity(handles.len());
-            for handle in handles {
-                let response = handle.join().map_err(|_| NetworkError::Io {
-                    operation: "join direct DFS metadata authority fan-out".to_string(),
-                    detail: "metadata authority worker panicked".to_string(),
-                })??;
-                responses.push(response);
-            }
-            Ok::<_, NetworkError>(responses)
-        })?;
+
+        if let (Some(async_peer_transport), Ok(runtime)) =
+            (async_peer_transport, tokio::runtime::Handle::try_current())
+            && matches!(
+                runtime.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            )
+        {
+            let responses = tokio::task::block_in_place(|| {
+                runtime.block_on(send_direct_metadata_journal_fanout_async(
+                    async_peer_transport,
+                    prepared,
+                    deadline,
+                ))
+            });
+            return Ok(Some(responses));
+        }
+
+        let Some(peer_transport) = peer_transport else {
+            return Ok(None);
+        };
+        let responses = send_direct_metadata_journal_fanout_blocking(
+            peer_transport,
+            prepared,
+            deadline,
+            Arc::clone(&self.blocking_metadata_fanout_workers),
+        );
         Ok(Some(responses))
     }
 
@@ -1744,11 +2867,11 @@ mod tests {
     use super::*;
     use crate::{
         DfsDistributedWriteCommand, DfsNamespaceCommand, DfsNamespaceOperation, DfsObjectId,
-        DfsReadResult, DfsReplicationPolicy, DfsVersion, sifs_file_system_id,
+        DfsReadResult, DfsReplicationPolicy, DfsStageBlobCommand, DfsVersion, sifs_file_system_id,
     };
     use sinomo_core::DfsWriteRequest;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
 
     fn node_id(name: &str) -> NodeId {
         NodeId::from_legacy_named(name).expect("node id")
@@ -1781,11 +2904,79 @@ mod tests {
                 requesting_node_id: source.clone(),
                 include_metadata_journal_batches: true,
                 metadata_journal_after_sequences: Vec::new(),
+                authority_shards: Vec::new(),
                 operation: DfsNamespaceOperation::Mkdir {
                     path: format!("/namespace-{frame_id}"),
                 },
             }),
         }
+    }
+
+    fn test_commit_version_message(
+        source: &NodeId,
+        target: &NodeId,
+        frame_id: u64,
+    ) -> DfsRoutedMessage {
+        DfsRoutedMessage {
+            source_node_id: source.clone(),
+            target_node_id: target.clone(),
+            frame_id,
+            message_id: frame_id,
+            message: DfsNetworkMessage::CommitVersion(crate::DfsCommitVersionCommand {
+                request_id: format!("commit_request_{frame_id}"),
+                intent_id: format!("intent_{frame_id}"),
+                file_system_id: sifs_file_system_id(),
+                object_id: DfsObjectId::from_legacy_named(format!("commit_object_{frame_id}"))
+                    .expect("object id"),
+                expected_base_version: None,
+                version: DfsVersion::from_legacy_named(format!("commit_version_{frame_id}"))
+                    .expect("version"),
+                content_hash: format!("blake3:commit-{frame_id}"),
+                object_metadata: None,
+                authority_shard: None,
+            }),
+        }
+    }
+
+    fn test_commit_version_rpc_response(
+        command: &DfsMessageCommand,
+        result: DfsBlobTransferResult,
+    ) -> DfsMessageResponse {
+        let DfsNetworkMessage::CommitVersion(commit) = &command.routed_message.message else {
+            panic!("test response requires CommitVersion")
+        };
+        DfsMessageResponse {
+            request_id: command.request_id.clone(),
+            outbound_messages: vec![DfsRoutedMessage {
+                source_node_id: command.routed_message.target_node_id.clone(),
+                target_node_id: command.routed_message.source_node_id.clone(),
+                frame_id: command.routed_message.frame_id.saturating_add(100),
+                message_id: command.routed_message.message_id.saturating_add(100),
+                message: DfsNetworkMessage::CommitVersionResponse(
+                    crate::DfsCommitVersionResponse {
+                        request_id: commit.request_id.clone(),
+                        intent_id: commit.intent_id.clone(),
+                        file_system_id: commit.file_system_id.clone(),
+                        object_id: commit.object_id.clone(),
+                        version: commit.version.clone(),
+                        replica_node_id: command.routed_message.target_node_id.clone(),
+                        result,
+                    },
+                ),
+            }],
+        }
+    }
+
+    fn test_committed_promotion_rpc_response(command: &DfsMessageCommand) -> DfsMessageResponse {
+        let DfsNetworkMessage::CommitVersion(commit) = &command.routed_message.message else {
+            panic!("test response requires CommitVersion")
+        };
+        test_commit_version_rpc_response(
+            command,
+            DfsBlobTransferResult::Committed {
+                content_hash: commit.content_hash.clone(),
+            },
+        )
     }
 
     fn test_distributed_write_message(
@@ -1817,11 +3008,563 @@ mod tests {
                 desired_replica_nodes: vec![source.clone()],
                 policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
                 object_metadata: None,
+                authority_shard: None,
                 touch_parent_on_create: true,
                 foreground_replica_repair: false,
                 exclusive_create: false,
             }),
         }
+    }
+
+    fn test_distributed_write_response_message(
+        source: &NodeId,
+        target: &NodeId,
+        frame_id: u64,
+    ) -> DfsRoutedMessage {
+        let object_id =
+            DfsObjectId::from_legacy_named(format!("write_object_{frame_id}")).expect("object id");
+        DfsRoutedMessage {
+            source_node_id: source.clone(),
+            target_node_id: target.clone(),
+            frame_id,
+            message_id: frame_id,
+            message: DfsNetworkMessage::DistributedWriteResponse(
+                crate::DfsDistributedWriteResponse {
+                    request_id: format!("write_request_{frame_id}"),
+                    object_id,
+                    result: crate::DfsDistributedWriteResult::Rejected {
+                        reason: "test completed response".to_string(),
+                        current_primary_node_id: None,
+                    },
+                    metadata_journal_batches: Vec::new(),
+                },
+            ),
+        }
+    }
+
+    fn test_stage_body_send(
+        source: &NodeId,
+        target: &NodeId,
+        frame_id: u64,
+        request_id: &str,
+    ) -> DfsRoutedBodySend {
+        let bytes = vec![u8::try_from(frame_id).unwrap_or_default(); 64];
+        let content_hash = crate::content_hash(&bytes);
+        DfsRoutedBodySend::new(
+            target.clone(),
+            DfsRoutedMessage {
+                source_node_id: source.clone(),
+                target_node_id: target.clone(),
+                frame_id,
+                message_id: frame_id,
+                message: DfsNetworkMessage::StageBlob(DfsStageBlobCommand {
+                    request_id: request_id.to_string(),
+                    intent_id: format!("intent-{frame_id}"),
+                    file_system_id: sifs_file_system_id(),
+                    object_id: DfsObjectId::from_legacy_named(format!("object-{frame_id}"))
+                        .expect("object id"),
+                    expected_base_version: None,
+                    version: DfsVersion::from_legacy_named(format!("version-{frame_id}"))
+                        .expect("version"),
+                    content_hash: content_hash.clone(),
+                    bytes: Vec::new(),
+                    object_metadata: None,
+                    authority_shard: None,
+                }),
+            },
+            DfsOutboundBody::from_bytes(bytes, content_hash),
+        )
+    }
+
+    fn stage_body_rpc_response(
+        request: &ObjectRpcRequest,
+        calls: &Mutex<Vec<(NodeId, String)>>,
+        target_node_id: &NodeId,
+    ) -> Result<ObjectRpcResponse, DfsPeerTransportError> {
+        let command: DfsMessageCommand = request
+            .decode_body()
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+        let request_id = match &command.routed_message.message {
+            DfsNetworkMessage::StageBlob(command) => command.request_id.clone(),
+            other => {
+                return Err(DfsPeerTransportError::new(format!(
+                    "expected stage body request, got {other:?}"
+                )));
+            }
+        };
+        calls
+            .lock()
+            .expect("body calls")
+            .push((target_node_id.clone(), request_id));
+        ObjectRpcResponse::encode_body(
+            &request.route,
+            &DfsMessageResponse {
+                request_id: command.request_id,
+                outbound_messages: Vec::new(),
+            },
+        )
+        .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+    }
+
+    struct ConcurrentAsyncBodyPeerTransport {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        first_pair: tokio::sync::Barrier,
+        failed_target: NodeId,
+        paired_target: NodeId,
+        calls: Mutex<Vec<(NodeId, String)>>,
+    }
+
+    impl DfsPeerTransport for ConcurrentAsyncBodyPeerTransport {
+        fn call_object_rpc(
+            &self,
+            target_node_id: &NodeId,
+            request: &ObjectRpcRequest,
+            _options: DfsObjectRpcSendOptions,
+        ) -> Result<ObjectRpcResponse, DfsPeerTransportError> {
+            stage_body_rpc_response(request, &self.calls, target_node_id)
+        }
+    }
+
+    impl AsyncDfsPeerTransport for ConcurrentAsyncBodyPeerTransport {
+        fn call_object_rpc_async<'a>(
+            &'a self,
+            target_node_id: &'a NodeId,
+            request: &'a ObjectRpcRequest,
+            _options: DfsObjectRpcSendOptions,
+        ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResponse, DfsPeerTransportError>> {
+            Box::pin(async move {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_active.fetch_max(active, Ordering::SeqCst);
+                if target_node_id == &self.failed_target || target_node_id == &self.paired_target {
+                    self.first_pair.wait().await;
+                }
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                if target_node_id == &self.failed_target {
+                    // Record the exact request before returning its isolated
+                    // transport failure.
+                    let _ = stage_body_rpc_response(request, &self.calls, target_node_id)?;
+                    return Err(DfsPeerTransportError::new("injected N2 transfer failure"));
+                }
+                stage_body_rpc_response(request, &self.calls, target_node_id)
+            })
+        }
+    }
+
+    struct ConcurrentSyncBodyPeerTransport {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        entered: Mutex<usize>,
+        both_entered: Condvar,
+        failed_target: NodeId,
+        paired_target: NodeId,
+        calls: Mutex<Vec<(NodeId, String)>>,
+    }
+
+    impl DfsPeerTransport for ConcurrentSyncBodyPeerTransport {
+        fn call_object_rpc(
+            &self,
+            target_node_id: &NodeId,
+            request: &ObjectRpcRequest,
+            _options: DfsObjectRpcSendOptions,
+        ) -> Result<ObjectRpcResponse, DfsPeerTransportError> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            if target_node_id == &self.failed_target || target_node_id == &self.paired_target {
+                let mut entered = self.entered.lock().expect("sync body entries");
+                *entered += 1;
+                self.both_entered.notify_all();
+                if *entered < 2 {
+                    let (guard, _) = self
+                        .both_entered
+                        .wait_timeout_while(entered, Duration::from_secs(1), |entered| *entered < 2)
+                        .expect("sync body overlap wait");
+                    entered = guard;
+                }
+                drop(entered);
+            }
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            if target_node_id == &self.failed_target {
+                let _ = stage_body_rpc_response(request, &self.calls, target_node_id)?;
+                return Err(DfsPeerTransportError::new("injected N2 transfer failure"));
+            }
+            stage_body_rpc_response(request, &self.calls, target_node_id)
+        }
+    }
+
+    impl AsyncDfsPeerTransport for ConcurrentSyncBodyPeerTransport {
+        fn call_object_rpc_async<'a>(
+            &'a self,
+            target_node_id: &'a NodeId,
+            request: &'a ObjectRpcRequest,
+            options: DfsObjectRpcSendOptions,
+        ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResponse, DfsPeerTransportError>> {
+            Box::pin(async move { self.call_object_rpc(target_node_id, request, options) })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_replica_body_fanout_overlaps_n2_n3_and_isolates_one_failure() {
+        let local = node_id("node_body_fanout_async_n1");
+        let n2 = node_id("node_body_fanout_async_n2");
+        let n3 = node_id("node_body_fanout_async_n3");
+        let n4 = node_id("node_body_fanout_async_n4");
+        let peer = Arc::new(ConcurrentAsyncBodyPeerTransport {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            first_pair: tokio::sync::Barrier::new(2),
+            failed_target: n2.clone(),
+            paired_target: n3.clone(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+        let async_peer: Arc<dyn AsyncDfsPeerTransport> = peer.clone();
+        let mut transport = DfsNodeTransport::with_peer_transports_for_nodes(
+            local.clone(),
+            vec![n2.clone(), n3.clone(), n4.clone()],
+            Duration::from_secs(2),
+            sync_peer,
+            async_peer,
+        );
+
+        let outcomes = tokio::time::timeout(
+            Duration::from_secs(2),
+            transport.send_routed_message_bodies_bounded_async(
+                vec![
+                    test_stage_body_send(&local, &n2, 1, "stage-n2"),
+                    test_stage_body_send(&local, &n3, 2, "stage-n3"),
+                    test_stage_body_send(&local, &n4, 3, "stage-n4"),
+                ],
+                2,
+            ),
+        )
+        .await
+        .expect("N2 and N3 should enter concurrently")
+        .expect("fan-out orchestration");
+
+        assert_eq!(peer.max_active.load(Ordering::SeqCst), 2);
+        assert_eq!(outcomes.len(), 3);
+        assert_eq!(outcomes[0].target_node_id, n2);
+        assert!(outcomes[0].result.is_err());
+        assert_eq!(outcomes[1].target_node_id, n3);
+        assert!(outcomes[1].result.is_ok());
+        assert_eq!(outcomes[2].target_node_id, n4);
+        assert!(outcomes[2].result.is_ok());
+        let mut calls = peer.calls.lock().expect("body calls").clone();
+        calls.sort();
+        let mut expected_calls = vec![
+            (n2, "stage-n2".to_string()),
+            (n3, "stage-n3".to_string()),
+            (n4, "stage-n4".to_string()),
+        ];
+        expected_calls.sort();
+        assert_eq!(calls, expected_calls);
+    }
+
+    #[test]
+    fn sync_replica_body_fanout_overlaps_n2_n3_and_isolates_one_failure() {
+        let local = node_id("node_body_fanout_sync_n1");
+        let n2 = node_id("node_body_fanout_sync_n2");
+        let n3 = node_id("node_body_fanout_sync_n3");
+        let n4 = node_id("node_body_fanout_sync_n4");
+        let peer = Arc::new(ConcurrentSyncBodyPeerTransport {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            entered: Mutex::new(0),
+            both_entered: Condvar::new(),
+            failed_target: n2.clone(),
+            paired_target: n3.clone(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+        let async_peer: Arc<dyn AsyncDfsPeerTransport> = peer.clone();
+        let mut transport = DfsNodeTransport::with_peer_transports_for_nodes(
+            local.clone(),
+            vec![n2.clone(), n3.clone(), n4.clone()],
+            Duration::from_secs(2),
+            sync_peer,
+            async_peer,
+        );
+
+        let outcomes = transport
+            .send_routed_message_bodies_bounded(
+                vec![
+                    test_stage_body_send(&local, &n2, 1, "stage-n2"),
+                    test_stage_body_send(&local, &n3, 2, "stage-n3"),
+                    test_stage_body_send(&local, &n4, 3, "stage-n4"),
+                ],
+                2,
+            )
+            .expect("fan-out orchestration");
+
+        assert_eq!(peer.max_active.load(Ordering::SeqCst), 2);
+        assert_eq!(outcomes.len(), 3);
+        assert_eq!(outcomes[0].target_node_id, n2);
+        assert!(outcomes[0].result.is_err());
+        assert_eq!(outcomes[1].target_node_id, n3);
+        assert!(outcomes[1].result.is_ok());
+        assert_eq!(outcomes[2].target_node_id, n4);
+        assert!(outcomes[2].result.is_ok());
+        let mut calls = peer.calls.lock().expect("body calls").clone();
+        calls.sort();
+        let mut expected_calls = vec![
+            (n2, "stage-n2".to_string()),
+            (n3, "stage-n3".to_string()),
+            (n4, "stage-n4".to_string()),
+        ];
+        expected_calls.sort();
+        assert_eq!(calls, expected_calls);
+    }
+
+    struct MetadataFanoutActiveGuard<'a>(&'a AtomicUsize);
+
+    impl Drop for MetadataFanoutActiveGuard<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    struct MetadataFanoutPeerTransport {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        failed_target: Option<NodeId>,
+        slow_target: Option<NodeId>,
+        fast_delay: Duration,
+        slow_delay: Duration,
+    }
+
+    impl MetadataFanoutPeerTransport {
+        fn enter(&self) -> MetadataFanoutActiveGuard<'_> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            MetadataFanoutActiveGuard(&self.active)
+        }
+
+        fn delay_for(&self, target_node_id: &NodeId) -> Duration {
+            if self.slow_target.as_ref() == Some(target_node_id) {
+                self.slow_delay
+            } else {
+                self.fast_delay
+            }
+        }
+
+        fn finish_call(
+            &self,
+            target_node_id: &NodeId,
+            request: &ObjectRpcRequest,
+        ) -> Result<ObjectRpcResponse, DfsPeerTransportError> {
+            if self.failed_target.as_ref() == Some(target_node_id) {
+                return Err(DfsPeerTransportError::new(format!(
+                    "injected metadata fan-out failure for {target_node_id}"
+                )));
+            }
+            let command: DfsMetadataJournalBatchCommand = request
+                .decode_body()
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            ObjectRpcResponse::encode_body(
+                &request.route,
+                &DfsMetadataJournalBatchResponse {
+                    request_id: command.request_id,
+                    shard_id: command.batch.shard_id,
+                    next_after_sequence: command.batch.next_after_sequence,
+                    applied_entries: command.batch.entries.len(),
+                    verified_prefix_only: command.verify_prefix_only,
+                    verified_authority_probe_id: None,
+                    result: crate::DfsMetadataJournalBatchResult::Applied,
+                },
+            )
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+        }
+    }
+
+    impl DfsPeerTransport for MetadataFanoutPeerTransport {
+        fn call_object_rpc(
+            &self,
+            target_node_id: &NodeId,
+            request: &ObjectRpcRequest,
+            _options: DfsObjectRpcSendOptions,
+        ) -> Result<ObjectRpcResponse, DfsPeerTransportError> {
+            let _active = self.enter();
+            std::thread::sleep(self.delay_for(target_node_id));
+            self.finish_call(target_node_id, request)
+        }
+    }
+
+    impl AsyncDfsPeerTransport for MetadataFanoutPeerTransport {
+        fn call_object_rpc_async<'a>(
+            &'a self,
+            target_node_id: &'a NodeId,
+            request: &'a ObjectRpcRequest,
+            _options: DfsObjectRpcSendOptions,
+        ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResponse, DfsPeerTransportError>> {
+            Box::pin(async move {
+                let _active = self.enter();
+                tokio::time::sleep(self.delay_for(target_node_id)).await;
+                self.finish_call(target_node_id, request)
+            })
+        }
+    }
+
+    fn test_metadata_fanout_requests(
+        local_node_id: &NodeId,
+        targets: &[NodeId],
+    ) -> Vec<(NodeId, DfsMetadataJournalBatchCommand)> {
+        let shard_id = crate::DfsMetadataShardId::new("root");
+        targets
+            .iter()
+            .enumerate()
+            .map(|(index, target_node_id)| {
+                (
+                    target_node_id.clone(),
+                    DfsMetadataJournalBatchCommand {
+                        request_id: format!("metadata-fanout-{index}"),
+                        source_node_id: Some(local_node_id.clone()),
+                        file_system_id: None,
+                        authority_epoch: None,
+                        verify_prefix_only: false,
+                        prefix_probe: None,
+                        authority_probe: None,
+                        batch: crate::DfsMetadataJournalBatch {
+                            shard_id: shard_id.clone(),
+                            entries: Vec::new(),
+                            next_after_sequence: 7,
+                        },
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn blocking_metadata_journal_fanout_caps_overlap_and_preserves_partial_success() {
+        let local = node_id("node_metadata_fanout_blocking_n1");
+        let targets = (2..=5)
+            .map(|index| node_id(&format!("node_metadata_fanout_blocking_n{index}")))
+            .collect::<Vec<_>>();
+        let peer = Arc::new(MetadataFanoutPeerTransport {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            failed_target: Some(targets[0].clone()),
+            slow_target: None,
+            fast_delay: Duration::from_millis(25),
+            slow_delay: Duration::from_secs(2),
+        });
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+        let mut transport = DfsNodeServedMessageTransport::new_with_peer_transport_for_nodes(
+            local.clone(),
+            targets.clone(),
+            sync_peer,
+            Duration::from_secs(2),
+        );
+
+        let responses = transport
+            .send_metadata_journal_batches_direct(&test_metadata_fanout_requests(&local, &targets))
+            .expect("blocking metadata fan-out")
+            .expect("blocking peer retained");
+
+        assert_eq!(peer.max_active.load(Ordering::SeqCst), 2);
+        assert_eq!(responses.len(), targets.len() - 1);
+        assert!(
+            responses
+                .iter()
+                .all(|(target_node_id, _)| target_node_id != &targets[0]),
+            "one failed peer must not discard successful sibling responses"
+        );
+    }
+
+    #[test]
+    fn blocking_metadata_journal_fanout_does_not_accumulate_stalled_threads() {
+        let local = node_id("node_metadata_fanout_stalled_n1");
+        let targets = (2..=3)
+            .map(|index| node_id(&format!("node_metadata_fanout_stalled_n{index}")))
+            .collect::<Vec<_>>();
+        let peer = Arc::new(MetadataFanoutPeerTransport {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            failed_target: None,
+            slow_target: None,
+            fast_delay: Duration::from_secs(2),
+            slow_delay: Duration::from_secs(2),
+        });
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+        let mut transport = DfsNodeServedMessageTransport::new_with_peer_transport_for_nodes(
+            local.clone(),
+            targets.clone(),
+            sync_peer,
+            Duration::from_secs(2),
+        );
+        let requests = test_metadata_fanout_requests(&local, &targets);
+
+        let first_started = Instant::now();
+        let first = transport
+            .send_metadata_journal_batches_direct(&requests)
+            .expect("first stalled blocking metadata fan-out")
+            .expect("blocking peer retained");
+        assert!(first.is_empty());
+        assert!(first_started.elapsed() < Duration::from_millis(600));
+        assert_eq!(
+            transport
+                .node_transport
+                .blocking_metadata_fanout_workers
+                .load(AtomicOrdering::Acquire),
+            DFS_METADATA_JOURNAL_DIRECT_MAX_INFLIGHT
+        );
+
+        let second_started = Instant::now();
+        let second = transport
+            .send_metadata_journal_batches_direct(&requests)
+            .expect("second stalled blocking metadata fan-out")
+            .expect("blocking peer retained");
+        assert!(second.is_empty());
+        assert!(
+            second_started.elapsed() < Duration::from_millis(200),
+            "a saturated compatibility fallback must not spawn more detached threads"
+        );
+        assert_eq!(peer.max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn async_metadata_journal_fanout_caps_overlap_and_drops_slow_sibling() {
+        let local = node_id("node_metadata_fanout_async_n1");
+        let targets = (2..=5)
+            .map(|index| node_id(&format!("node_metadata_fanout_async_n{index}")))
+            .collect::<Vec<_>>();
+        let peer = Arc::new(MetadataFanoutPeerTransport {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            failed_target: Some(targets[1].clone()),
+            slow_target: Some(targets[2].clone()),
+            fast_delay: Duration::from_millis(20),
+            slow_delay: Duration::from_secs(2),
+        });
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+        let async_peer: Arc<dyn AsyncDfsPeerTransport> = peer.clone();
+        let mut transport = DfsNodeServedMessageTransport::new_with_peer_transports_for_nodes(
+            local.clone(),
+            targets.clone(),
+            sync_peer,
+            async_peer,
+            Duration::from_secs(2),
+        );
+        let started = Instant::now();
+
+        let mut response_targets = transport
+            .send_metadata_journal_batches_direct(&test_metadata_fanout_requests(&local, &targets))
+            .expect("async metadata fan-out")
+            .expect("async peer retained")
+            .into_iter()
+            .map(|(target_node_id, _)| target_node_id)
+            .collect::<Vec<_>>();
+        response_targets.sort();
+        let mut expected_targets = vec![targets[0].clone(), targets[3].clone()];
+        expected_targets.sort();
+
+        assert_eq!(peer.max_active.load(Ordering::SeqCst), 2);
+        assert_eq!(response_targets, expected_targets);
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "slow sibling must be canceled at the total fan-out budget"
+        );
     }
 
     #[test]
@@ -2099,11 +3842,7 @@ mod tests {
             .flush_detached_sends()
             .expect_err("first detached send should fail");
         assert_eq!(
-            transport
-                .detached_sends
-                .lock()
-                .expect("queued suffix")
-                .len(),
+            transport.detached_send_count(),
             1,
             "the unattempted send must remain queued"
         );
@@ -2115,13 +3854,1217 @@ mod tests {
             calls.lock().expect("calls").as_slice(),
             &[first_remote, second_remote]
         );
-        assert!(
-            transport
-                .detached_sends
-                .lock()
-                .expect("empty detached queue")
-                .is_empty()
+        assert_eq!(transport.detached_send_count(), 0);
+    }
+
+    #[test]
+    fn detached_completed_write_response_retries_ambiguous_failure_with_fresh_budget() {
+        let local = node_id("node_detached_write_response_local");
+        let first_requester = node_id("node_detached_write_response_first_requester");
+        let second_requester = node_id("node_detached_write_response_second_requester");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sender_calls = Arc::clone(&calls);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            let call = sender_calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return Err(DfsPeerTransportError::new(
+                    "ambiguous completed write response failure",
+                ));
+            }
+            Ok(DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: Vec::new(),
+            })
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            Vec::<NodeId>::new(),
+            Duration::from_secs(1),
+            sender,
         );
+        transport.set_operation_deadline(Some(Instant::now() + Duration::from_millis(20)));
+        transport
+            .send_detached_routed_message(
+                &first_requester,
+                test_distributed_write_response_message(&local, &first_requester, 1),
+            )
+            .expect("queue completed write response");
+        transport
+            .send_detached_routed_message(
+                &second_requester,
+                test_distributed_write_response_message(&local, &second_requester, 2),
+            )
+            .expect("queue second completed write response");
+        std::thread::sleep(Duration::from_millis(30));
+
+        let retry_started = Instant::now();
+        transport
+            .flush_detached_peer_sends_with_now(&|| retry_started)
+            .expect_err("first completed response send should fail ambiguously");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            transport.detached_send_frame_ids(),
+            vec![1],
+            "healthy suffix work must run before the attempted response is retried"
+        );
+
+        transport
+            .flush_detached_peer_sends_with_now(&|| retry_started)
+            .expect("cooling response must not be retried immediately");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            transport
+                .detached_send_scheduling_snapshot_at_for_test(retry_started)
+                .1,
+            Some(retry_started + DFS_DETACHED_SEND_RETRY_DELAY)
+        );
+
+        transport
+            .flush_detached_peer_sends_with_now(&|| retry_started + DFS_DETACHED_SEND_RETRY_DELAY)
+            .expect("completed response replay should succeed");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(transport.detached_send_count(), 0);
+    }
+
+    #[test]
+    fn detached_poison_completed_response_does_not_starve_healthy_response_or_promotion() {
+        let local = node_id("node_detached_poison_response_local");
+        let poison_requester = node_id("node_detached_poison_response_requester");
+        let healthy_requester = node_id("node_detached_healthy_response_requester");
+        let replica = node_id("node_detached_healthy_promotion_replica");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sender_calls = Arc::clone(&calls);
+        let sender_poison_requester = poison_requester.clone();
+        let sender: DfsMessageSender = Arc::new(move |target, command, _options| {
+            sender_calls
+                .lock()
+                .expect("detached send calls")
+                .push(target.clone());
+            if target == &sender_poison_requester {
+                return Err(DfsPeerTransportError::new(
+                    "permanently offline response requester",
+                ));
+            }
+            if matches!(
+                &command.routed_message.message,
+                DfsNetworkMessage::CommitVersion(_)
+            ) {
+                Ok(test_committed_promotion_rpc_response(command))
+            } else {
+                Ok(DfsMessageResponse {
+                    request_id: command.request_id.clone(),
+                    outbound_messages: Vec::new(),
+                })
+            }
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            Vec::<NodeId>::new(),
+            Duration::from_secs(1),
+            sender,
+        );
+        transport
+            .send_detached_routed_message(
+                &poison_requester,
+                test_distributed_write_response_message(&local, &poison_requester, 1),
+            )
+            .expect("queue poison response");
+        transport
+            .send_detached_routed_message(
+                &healthy_requester,
+                test_distributed_write_response_message(&local, &healthy_requester, 2),
+            )
+            .expect("queue healthy response");
+        transport
+            .send_detached_routed_message(
+                &replica,
+                test_commit_version_message(&local, &replica, 3),
+            )
+            .expect("queue healthy promotion");
+
+        transport
+            .flush_detached_sends()
+            .expect_err("poison response must remain retryable");
+
+        assert_eq!(
+            calls.lock().expect("detached send calls").as_slice(),
+            &[poison_requester.clone(), healthy_requester, replica,],
+            "poison response stopped ready detached work"
+        );
+        assert_eq!(transport.detached_send_targets(), vec![poison_requester]);
+        assert_eq!(transport.pending_commit_promotion_count(), 0);
+        assert_eq!(transport.settled_commit_promotion_count(), 1);
+    }
+
+    #[test]
+    fn detached_cooling_retries_report_earliest_deadline_without_spinning() {
+        let local = node_id("node_detached_retry_schedule_local");
+        let first = node_id("node_detached_retry_schedule_first");
+        let second = node_id("node_detached_retry_schedule_second");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sender_calls = Arc::clone(&calls);
+        let sender: DfsMessageSender = Arc::new(move |_target, _command, _options| {
+            sender_calls.fetch_add(1, Ordering::SeqCst);
+            Err(DfsPeerTransportError::new(
+                "cooling response target offline",
+            ))
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            Vec::<NodeId>::new(),
+            Duration::from_secs(1),
+            sender,
+        );
+        let started = Instant::now();
+        transport
+            .send_detached_routed_message(
+                &first,
+                test_distributed_write_response_message(&local, &first, 1),
+            )
+            .expect("queue first response");
+        transport
+            .flush_detached_peer_sends_with_now(&|| started)
+            .expect_err("first response should enter cooling");
+
+        let second_started = started + Duration::from_secs(2);
+        transport
+            .send_detached_routed_message(
+                &second,
+                test_distributed_write_response_message(&local, &second, 2),
+            )
+            .expect("queue second response");
+        transport
+            .flush_detached_peer_sends_with_now(&|| second_started)
+            .expect_err("second response should enter cooling");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            transport
+                .detached_send_scheduling_snapshot_at_for_test(second_started)
+                .1,
+            Some(started + DFS_DETACHED_SEND_RETRY_DELAY),
+            "the earliest per-send eligibility must drive the wakeup"
+        );
+
+        for _ in 0..4 {
+            transport
+                .flush_detached_peer_sends_with_now(&|| second_started)
+                .expect("cooling-only drain is idle, not an error");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "cooling-only drain attempts must not spin on the sender"
+        );
+
+        let first_due = started + DFS_DETACHED_SEND_RETRY_DELAY;
+        transport
+            .flush_detached_peer_sends_with_now(&|| first_due)
+            .expect_err("first retry remains offline");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            transport
+                .detached_send_scheduling_snapshot_at_for_test(first_due)
+                .1,
+            Some(second_started + DFS_DETACHED_SEND_RETRY_DELAY),
+            "the next independent deadline must become the earliest wakeup"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_ready_enqueue_wakes_cooling_worker_without_retrying_poison() {
+        let local = node_id("node_detached_retry_wake_local");
+        let poison = node_id("node_detached_retry_wake_poison");
+        let healthy = node_id("node_detached_retry_wake_healthy");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sender_calls = Arc::clone(&calls);
+        let sender_poison = poison.clone();
+        let sender: DfsMessageSender = Arc::new(move |target, command, _options| {
+            sender_calls
+                .lock()
+                .expect("send calls")
+                .push(target.clone());
+            if target == &sender_poison {
+                return Err(DfsPeerTransportError::new("poison promotion target"));
+            }
+            Ok(DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: Vec::new(),
+            })
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            Vec::<NodeId>::new(),
+            Duration::from_secs(1),
+            sender,
+        );
+        let started = Instant::now() + Duration::from_secs(60);
+        transport
+            .send_detached_routed_message(&poison, test_commit_version_message(&local, &poison, 1))
+            .expect("queue poison promotion");
+        transport
+            .flush_detached_peer_sends_with_now(&|| started)
+            .expect_err("poison promotion enters cooling");
+
+        let worker = transport.fork_detached_send_worker();
+        let (ready, retry_not_before, generation) =
+            worker.scheduling_snapshot().expect("cooling schedule");
+        assert!(!ready);
+        let retry_not_before = retry_not_before.expect("cooling deadline");
+        let waiter = tokio::spawn(async move {
+            worker
+                .wait_for_ready_or_retry(generation, retry_not_before)
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        transport
+            .send_detached_routed_message(
+                &healthy,
+                test_distributed_write_response_message(&local, &healthy, 2),
+            )
+            .expect("queue healthy response");
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("ready enqueue must wake waiter")
+            .expect("waiter task")
+            .expect("wait schedule");
+        transport
+            .flush_detached_peer_sends_with_now(&|| started)
+            .expect("healthy response should bypass cooling promotion");
+        assert_eq!(
+            calls.lock().expect("send calls").as_slice(),
+            &[poison.clone(), healthy],
+            "wakeup must not make the poison retry immediately eligible"
+        );
+        assert_eq!(transport.detached_send_targets(), vec![poison]);
+    }
+
+    #[test]
+    fn detached_commit_promotions_overlap_with_cap_two() {
+        let local = node_id("node_commit_promotion_cap_local");
+        let n2 = node_id("node_commit_promotion_cap_n2");
+        let n3 = node_id("node_commit_promotion_cap_n3");
+        let n4 = node_id("node_commit_promotion_cap_n4");
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new((Mutex::new(0usize), Condvar::new()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sender_active = Arc::clone(&active);
+        let sender_max_active = Arc::clone(&max_active);
+        let sender_entered = Arc::clone(&entered);
+        let sender_calls = Arc::clone(&calls);
+        let paired_n2 = n2.clone();
+        let paired_n3 = n3.clone();
+        let sender: DfsMessageSender = Arc::new(move |target, command, _options| {
+            let active = sender_active.fetch_add(1, Ordering::SeqCst) + 1;
+            sender_max_active.fetch_max(active, Ordering::SeqCst);
+            sender_calls
+                .lock()
+                .expect("promotion calls")
+                .push(target.clone());
+            if target == &paired_n2 || target == &paired_n3 {
+                let (entered, both_entered) = sender_entered.as_ref();
+                let mut entered = entered.lock().expect("promotion entries");
+                *entered += 1;
+                both_entered.notify_all();
+                if *entered < 2 {
+                    let (guard, _) = both_entered
+                        .wait_timeout_while(entered, Duration::from_secs(1), |entered| *entered < 2)
+                        .expect("promotion overlap wait");
+                    entered = guard;
+                }
+                drop(entered);
+            }
+            sender_active.fetch_sub(1, Ordering::SeqCst);
+            Ok(test_committed_promotion_rpc_response(command))
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![n2.clone(), n3.clone(), n4.clone()],
+            Duration::from_secs(2),
+            sender,
+        );
+        for (frame_id, target) in [(1, &n2), (2, &n3), (3, &n4)] {
+            transport
+                .send_detached_routed_message(
+                    target,
+                    test_commit_version_message(&local, target, frame_id),
+                )
+                .expect("queue detached commit promotion");
+        }
+
+        transport
+            .flush_detached_sends()
+            .expect("flush detached commit promotions");
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+        let mut calls = calls.lock().expect("promotion calls").clone();
+        calls.sort();
+        let mut expected = vec![n2, n3, n4];
+        expected.sort();
+        assert_eq!(calls, expected);
+    }
+
+    #[test]
+    fn detached_due_commit_promotion_retries_preserve_cap_two() {
+        let local = node_id("node_due_commit_promotion_cap_local");
+        let remotes = [
+            node_id("node_due_commit_promotion_cap_one"),
+            node_id("node_due_commit_promotion_cap_two"),
+            node_id("node_due_commit_promotion_cap_three"),
+        ];
+        let retry_phase = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new((Mutex::new(0usize), Condvar::new()));
+        let sender_retry_phase = Arc::clone(&retry_phase);
+        let sender_calls = Arc::clone(&calls);
+        let sender_active = Arc::clone(&active);
+        let sender_max_active = Arc::clone(&max_active);
+        let sender_entered = Arc::clone(&entered);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            sender_calls.fetch_add(1, Ordering::SeqCst);
+            if !sender_retry_phase.load(Ordering::SeqCst) {
+                return Err(DfsPeerTransportError::new("initial promotion failure"));
+            }
+            let active = sender_active.fetch_add(1, Ordering::SeqCst) + 1;
+            sender_max_active.fetch_max(active, Ordering::SeqCst);
+            let (entered, changed) = sender_entered.as_ref();
+            let mut entered = entered.lock().expect("due retry entries");
+            *entered += 1;
+            changed.notify_all();
+            if *entered < DFS_COMMIT_PROMOTION_MAX_INFLIGHT {
+                let (guard, timeout) = changed
+                    .wait_timeout_while(entered, Duration::from_secs(1), |entered| {
+                        *entered < DFS_COMMIT_PROMOTION_MAX_INFLIGHT
+                    })
+                    .expect("due retry overlap wait");
+                assert!(!timeout.timed_out(), "due retries did not fill cap two");
+                entered = guard;
+            }
+            drop(entered);
+            sender_active.fetch_sub(1, Ordering::SeqCst);
+            Ok(test_committed_promotion_rpc_response(command))
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            remotes.iter().cloned(),
+            Duration::from_secs(1),
+            sender,
+        );
+        for (index, remote) in remotes.iter().enumerate() {
+            transport
+                .send_detached_routed_message(
+                    remote,
+                    test_commit_version_message(&local, remote, index as u64 + 1),
+                )
+                .expect("queue promotion");
+        }
+        let started = Instant::now();
+        transport
+            .flush_detached_peer_sends_with_now(&|| started)
+            .expect_err("initial promotion attempts enter cooling");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(transport.detached_send_count(), 3);
+
+        retry_phase.store(true, Ordering::SeqCst);
+        transport
+            .flush_detached_peer_sends_with_now(&|| started + DFS_DETACHED_SEND_RETRY_DELAY)
+            .expect("due retries should settle");
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+        assert_eq!(transport.detached_send_count(), 0);
+    }
+
+    #[test]
+    fn detached_commit_promotion_failure_retries_failed_target_without_replaying_success() {
+        let local = node_id("node_commit_promotion_suffix_local");
+        let first_remote = node_id("node_commit_promotion_suffix_first");
+        let second_remote = node_id("node_commit_promotion_suffix_second");
+        let third_remote = node_id("node_commit_promotion_suffix_third");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sender_calls = Arc::clone(&calls);
+        let failed_target = first_remote.clone();
+        let failed_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sender_failed_once = Arc::clone(&failed_once);
+        let sender: DfsMessageSender = Arc::new(move |target, command, _options| {
+            sender_calls
+                .lock()
+                .expect("promotion calls")
+                .push(target.clone());
+            if target == &failed_target && !sender_failed_once.swap(true, Ordering::SeqCst) {
+                return Err(DfsPeerTransportError::new(
+                    "first detached commit promotion failed",
+                ));
+            }
+            Ok(test_committed_promotion_rpc_response(command))
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![
+                first_remote.clone(),
+                second_remote.clone(),
+                third_remote.clone(),
+            ],
+            Duration::from_secs(1),
+            sender,
+        );
+        for (frame_id, target) in [(1, &first_remote), (2, &second_remote), (3, &third_remote)] {
+            transport
+                .send_detached_routed_message(
+                    target,
+                    test_commit_version_message(&local, target, frame_id),
+                )
+                .expect("queue detached commit promotion");
+        }
+
+        let retry_started = Instant::now();
+        transport
+            .flush_detached_peer_sends_with_now(&|| retry_started)
+            .expect_err("first commit-promotion wave should report failure");
+        assert_eq!(
+            transport.detached_send_count(),
+            1,
+            "only the failed promotion must remain queued"
+        );
+        let mut first_wave_calls = calls.lock().expect("promotion calls").clone();
+        first_wave_calls.sort();
+        let mut expected_first_wave = vec![
+            first_remote.clone(),
+            second_remote.clone(),
+            third_remote.clone(),
+        ];
+        expected_first_wave.sort();
+        assert_eq!(first_wave_calls, expected_first_wave);
+
+        transport
+            .flush_detached_peer_sends_with_now(&|| retry_started)
+            .expect("cooling promotion must not be retried immediately");
+        assert_eq!(
+            calls
+                .lock()
+                .expect("promotion calls")
+                .iter()
+                .filter(|target| *target == &first_remote)
+                .count(),
+            1
+        );
+
+        transport
+            .flush_detached_peer_sends_with_now(&|| retry_started + DFS_DETACHED_SEND_RETRY_DELAY)
+            .expect("failed promotion should flush on retry");
+        let all_calls = calls.lock().expect("promotion calls").clone();
+        assert_eq!(
+            all_calls
+                .iter()
+                .filter(|target| *target == &first_remote)
+                .count(),
+            2,
+            "the failed promotion must be replayed exactly once"
+        );
+        assert_eq!(
+            all_calls
+                .iter()
+                .filter(|target| *target == &second_remote)
+                .count(),
+            1,
+            "the successful sibling must not be replayed"
+        );
+        assert_eq!(all_calls.len(), 4);
+        assert!(all_calls.contains(&third_remote));
+        assert_eq!(transport.detached_send_count(), 0);
+    }
+
+    #[test]
+    fn detached_commit_promotion_poison_targets_do_not_starve_later_waves() {
+        let local = node_id("node_commit_promotion_poison_local");
+        let poison_one = node_id("node_commit_promotion_poison_one");
+        let poison_two = node_id("node_commit_promotion_poison_two");
+        let healthy_one = node_id("node_commit_promotion_healthy_one");
+        let healthy_two = node_id("node_commit_promotion_healthy_two");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sender_calls = Arc::clone(&calls);
+        let sender_poison_one = poison_one.clone();
+        let sender_poison_two = poison_two.clone();
+        let sender: DfsMessageSender = Arc::new(move |target, command, _options| {
+            sender_calls
+                .lock()
+                .expect("promotion calls")
+                .push(target.clone());
+            if target == &sender_poison_one || target == &sender_poison_two {
+                return Err(DfsPeerTransportError::new("poison promotion target"));
+            }
+            Ok(test_committed_promotion_rpc_response(command))
+        });
+        let targets = vec![
+            poison_one.clone(),
+            poison_two.clone(),
+            healthy_one.clone(),
+            healthy_two.clone(),
+        ];
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            targets.clone(),
+            Duration::from_secs(1),
+            sender,
+        );
+        for (index, target) in targets.iter().enumerate() {
+            transport
+                .send_detached_routed_message(
+                    target,
+                    test_commit_version_message(&local, target, index as u64 + 1),
+                )
+                .expect("queue commit promotion");
+        }
+
+        transport
+            .flush_detached_sends()
+            .expect_err("poison targets should remain retryable");
+
+        let mut observed = calls.lock().expect("promotion calls").clone();
+        observed.sort();
+        let mut expected = targets;
+        expected.sort();
+        assert_eq!(observed, expected, "later promotion wave was starved");
+        assert_eq!(
+            transport.detached_send_targets(),
+            vec![poison_one, poison_two],
+            "only failed promotions should remain, at the retry tail"
+        );
+        assert_eq!(transport.pending_commit_promotion_count(), 2);
+        assert_eq!(transport.settled_commit_promotion_count(), 2);
+    }
+
+    #[test]
+    fn detached_commit_promotion_retry_stays_behind_concurrently_queued_work() {
+        let local = node_id("node_commit_promotion_concurrent_local");
+        let failing = node_id("node_commit_promotion_concurrent_failing");
+        let healthy = node_id("node_commit_promotion_concurrent_healthy");
+        let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let sender_gate = Arc::clone(&gate);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sender_calls = Arc::clone(&calls);
+        let failed_once = Arc::new(AtomicBool::new(false));
+        let sender_failed_once = Arc::clone(&failed_once);
+        let sender_failing = failing.clone();
+        let sender: DfsMessageSender = Arc::new(move |target, command, _options| {
+            sender_calls
+                .lock()
+                .expect("promotion calls")
+                .push(target.clone());
+            if target == &sender_failing && !sender_failed_once.swap(true, Ordering::SeqCst) {
+                let (state, ready) = sender_gate.as_ref();
+                let mut state = state.lock().expect("promotion gate");
+                state.0 = true;
+                ready.notify_all();
+                let (state, timeout) = ready
+                    .wait_timeout_while(state, Duration::from_secs(2), |state| !state.1)
+                    .expect("promotion gate wait");
+                assert!(!timeout.timed_out(), "promotion release timed out");
+                drop(state);
+                return Err(DfsPeerTransportError::new("first promotion failed"));
+            }
+            Ok(test_committed_promotion_rpc_response(command))
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![failing.clone(), healthy.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        transport
+            .send_detached_routed_message(
+                &failing,
+                test_commit_version_message(&local, &failing, 1),
+            )
+            .expect("queue failing promotion");
+        let retry_started = Instant::now();
+        let mut worker = transport.fork_detached_send_worker();
+        let worker_handle = std::thread::spawn(move || worker.drain_at(retry_started));
+
+        let (state, ready) = gate.as_ref();
+        let state = state.lock().expect("promotion gate");
+        let (mut state, timeout) = ready
+            .wait_timeout_while(state, Duration::from_secs(2), |state| !state.0)
+            .expect("promotion entry wait");
+        assert!(!timeout.timed_out(), "promotion did not enter sender");
+        transport
+            .send_detached_routed_message(
+                &healthy,
+                test_commit_version_message(&local, &healthy, 2),
+            )
+            .expect("queue concurrent healthy promotion");
+        state.1 = true;
+        ready.notify_all();
+        drop(state);
+
+        worker_handle
+            .join()
+            .expect("detached worker join")
+            .expect_err("first promotion attempt should fail");
+        assert_eq!(
+            transport.detached_send_targets(),
+            vec![failing.clone()],
+            "only the cooling retry should remain after ready work drains"
+        );
+        assert_eq!(
+            calls.lock().expect("promotion calls").as_slice(),
+            &[failing.clone(), healthy.clone()],
+            "concurrent ready work must drain before the worker returns"
+        );
+
+        transport
+            .flush_detached_peer_sends_with_now(&|| retry_started)
+            .expect("cooling retry must not run immediately");
+        transport
+            .flush_detached_peer_sends_with_now(&|| retry_started + DFS_DETACHED_SEND_RETRY_DELAY)
+            .expect("failed retry should settle once eligible");
+        assert_eq!(
+            calls.lock().expect("promotion calls").as_slice(),
+            &[failing.clone(), healthy, failing]
+        );
+    }
+
+    #[test]
+    fn detached_commit_promotion_inflight_identity_suppresses_duplicate_enqueue() {
+        let local = node_id("node_commit_promotion_inflight_local");
+        let remote = node_id("node_commit_promotion_inflight_remote");
+        let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let sender_gate = Arc::clone(&gate);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sender_calls = Arc::clone(&calls);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            sender_calls.fetch_add(1, Ordering::SeqCst);
+            let (state, ready) = sender_gate.as_ref();
+            let mut state = state.lock().expect("promotion gate");
+            state.0 = true;
+            ready.notify_all();
+            let (state, timeout) = ready
+                .wait_timeout_while(state, Duration::from_secs(2), |state| !state.1)
+                .expect("promotion gate wait");
+            assert!(!timeout.timed_out(), "promotion release timed out");
+            drop(state);
+            Ok(test_committed_promotion_rpc_response(command))
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![remote.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        let promotion = test_commit_version_message(&local, &remote, 1);
+        transport
+            .send_detached_routed_message(&remote, promotion.clone())
+            .expect("queue promotion");
+        let mut worker = transport.fork_detached_send_worker();
+        let worker_handle = std::thread::spawn(move || worker.drain());
+
+        let (state, ready) = gate.as_ref();
+        let state = state.lock().expect("promotion gate");
+        let (mut state, timeout) = ready
+            .wait_timeout_while(state, Duration::from_secs(2), |state| !state.0)
+            .expect("promotion entry wait");
+        assert!(!timeout.timed_out(), "promotion did not enter sender");
+        transport
+            .send_detached_routed_message(&remote, promotion)
+            .expect("duplicate enqueue should be suppressed");
+        assert_eq!(transport.detached_send_count(), 0);
+        assert_eq!(transport.pending_commit_promotion_count(), 1);
+        state.1 = true;
+        ready.notify_all();
+        drop(state);
+
+        worker_handle
+            .join()
+            .expect("detached worker join")
+            .expect("promotion should settle");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.detached_send_count(), 0);
+        assert_eq!(transport.pending_commit_promotion_count(), 0);
+        assert_eq!(transport.settled_commit_promotion_count(), 1);
+    }
+
+    #[test]
+    fn detached_commit_promotion_cooling_identity_suppresses_duplicate_enqueue() {
+        let local = node_id("node_commit_promotion_cooling_dedupe_local");
+        let remote = node_id("node_commit_promotion_cooling_dedupe_remote");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sender_calls = Arc::clone(&calls);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            if sender_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(DfsPeerTransportError::new("first promotion attempt failed"))
+            } else {
+                Ok(test_committed_promotion_rpc_response(command))
+            }
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![remote.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        let promotion = test_commit_version_message(&local, &remote, 1);
+        transport
+            .send_detached_routed_message(&remote, promotion.clone())
+            .expect("queue promotion");
+        let started = Instant::now();
+        transport
+            .flush_detached_peer_sends_with_now(&|| started)
+            .expect_err("promotion enters cooling");
+
+        transport
+            .send_detached_routed_message(&remote, promotion)
+            .expect("cooling duplicate should be suppressed");
+        transport
+            .flush_detached_peer_sends_with_now(&|| started)
+            .expect("cooling promotion is not immediately eligible");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.detached_send_count(), 1);
+        assert_eq!(transport.pending_commit_promotion_count(), 1);
+
+        transport
+            .flush_detached_peer_sends_with_now(&|| started + DFS_DETACHED_SEND_RETRY_DELAY)
+            .expect("eligible promotion settles");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(transport.detached_send_count(), 0);
+        assert_eq!(transport.pending_commit_promotion_count(), 0);
+        assert_eq!(transport.settled_commit_promotion_count(), 1);
+    }
+
+    #[test]
+    fn detached_commit_promotion_durable_ack_retries_until_committed() {
+        let local = node_id("node_commit_promotion_durable_local");
+        let remote = node_id("node_commit_promotion_durable_remote");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let sender_attempts = Arc::clone(&attempts);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            if sender_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                let DfsNetworkMessage::CommitVersion(commit) = &command.routed_message.message
+                else {
+                    panic!("test response requires CommitVersion")
+                };
+                Ok(test_commit_version_rpc_response(
+                    command,
+                    DfsBlobTransferResult::Durable {
+                        content_hash: commit.content_hash.clone(),
+                    },
+                ))
+            } else {
+                Ok(test_committed_promotion_rpc_response(command))
+            }
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![remote.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        transport
+            .send_detached_routed_message(&remote, test_commit_version_message(&local, &remote, 1))
+            .expect("queue promotion");
+
+        let retry_started = Instant::now();
+        transport
+            .flush_detached_peer_sends_with_now(&|| retry_started)
+            .expect_err("Durable does not prove visible version promotion");
+        assert_eq!(transport.detached_send_count(), 1);
+        assert_eq!(transport.pending_commit_promotion_count(), 1);
+        assert_eq!(transport.settled_commit_promotion_count(), 0);
+        transport
+            .flush_detached_peer_sends_with_now(&|| retry_started + DFS_DETACHED_SEND_RETRY_DELAY)
+            .expect("Committed acknowledgement should settle promotion");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(transport.pending_commit_promotion_count(), 0);
+        assert_eq!(transport.settled_commit_promotion_count(), 1);
+    }
+
+    #[test]
+    fn detached_commit_promotion_settlement_is_bounded_per_replica_object() {
+        let local = node_id("node_commit_promotion_bounded_local");
+        let remote = node_id("node_commit_promotion_bounded_remote");
+        let shared_object_id =
+            DfsObjectId::from_legacy_named("bounded_promotion_object").expect("object id");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sender_calls = Arc::clone(&calls);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            sender_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(test_committed_promotion_rpc_response(command))
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![remote.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        let mut last_promotion = None;
+        for frame_id in 1..=32 {
+            let mut promotion = test_commit_version_message(&local, &remote, frame_id);
+            let DfsNetworkMessage::CommitVersion(command) = &mut promotion.message else {
+                panic!("test promotion")
+            };
+            command.object_id = shared_object_id.clone();
+            last_promotion = Some(promotion.clone());
+            transport
+                .send_detached_routed_message(&remote, promotion)
+                .expect("queue promotion version");
+            transport
+                .flush_detached_sends()
+                .expect("settle promotion version");
+            assert_eq!(transport.settled_commit_promotion_count(), 1);
+        }
+        assert_eq!(transport.pending_commit_promotion_count(), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 32);
+
+        transport
+            .send_detached_routed_message(&remote, last_promotion.expect("last promotion identity"))
+            .expect("settled duplicate should be suppressed");
+        assert_eq!(transport.detached_send_count(), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 32);
+    }
+
+    #[test]
+    fn shared_detached_send_state_enforces_global_promotion_cap_two() {
+        let local = node_id("node_shared_promotion_cap_local");
+        let a_one = node_id("node_shared_promotion_cap_a_one");
+        let a_two = node_id("node_shared_promotion_cap_a_two");
+        let b_one = node_id("node_shared_promotion_cap_b_one");
+        let b_two = node_id("node_shared_promotion_cap_b_two");
+        let detached_send_state = DfsNodeDetachedSendState::new();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let a_gate = Arc::new((Mutex::new((0usize, false)), Condvar::new()));
+        let a_sender_active = Arc::clone(&active);
+        let a_sender_max_active = Arc::clone(&max_active);
+        let a_sender_gate = Arc::clone(&a_gate);
+        let a_sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            let active = a_sender_active.fetch_add(1, Ordering::SeqCst) + 1;
+            a_sender_max_active.fetch_max(active, Ordering::SeqCst);
+            let (state, ready) = a_sender_gate.as_ref();
+            let mut state = state.lock().expect("lane A promotion gate");
+            state.0 += 1;
+            ready.notify_all();
+            let (state, timeout) = ready
+                .wait_timeout_while(state, Duration::from_secs(2), |state| !state.1)
+                .expect("lane A promotion gate wait");
+            assert!(!timeout.timed_out(), "lane A promotion release timed out");
+            drop(state);
+            a_sender_active.fetch_sub(1, Ordering::SeqCst);
+            Ok(test_committed_promotion_rpc_response(command))
+        });
+        let (b_sender_entered, b_sender_entries) = mpsc::sync_channel(2);
+        let b_sender_active = Arc::clone(&active);
+        let b_sender_max_active = Arc::clone(&max_active);
+        let b_sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            let active = b_sender_active.fetch_add(1, Ordering::SeqCst) + 1;
+            b_sender_max_active.fetch_max(active, Ordering::SeqCst);
+            b_sender_entered
+                .send(())
+                .expect("record lane B promotion entry");
+            b_sender_active.fetch_sub(1, Ordering::SeqCst);
+            Ok(test_committed_promotion_rpc_response(command))
+        });
+        let mut lane_a = DfsNodeServedMessageTransport::new_with_message_sender_and_detached_state(
+            local.clone(),
+            vec![a_one.clone(), a_two.clone()],
+            a_sender,
+            Duration::from_secs(1),
+            detached_send_state.clone(),
+        );
+        let mut lane_b = DfsNodeServedMessageTransport::new_with_message_sender_and_detached_state(
+            local.clone(),
+            vec![b_one.clone(), b_two.clone()],
+            b_sender,
+            Duration::from_secs(1),
+            detached_send_state,
+        );
+        for (frame_id, target) in [(1, &a_one), (2, &a_two)] {
+            lane_a
+                .node_transport
+                .send_detached_routed_message(
+                    target,
+                    test_commit_version_message(&local, target, frame_id),
+                )
+                .expect("queue lane A promotion");
+        }
+        let mut worker_a = lane_a.node_transport.fork_detached_send_worker();
+        let worker_a_handle = std::thread::spawn(move || worker_a.drain());
+
+        let (state, ready) = a_gate.as_ref();
+        let state = state.lock().expect("lane A promotion gate");
+        let (mut state, timeout) = ready
+            .wait_timeout_while(state, Duration::from_secs(2), |state| state.0 < 2)
+            .expect("lane A promotion entry wait");
+        assert!(!timeout.timed_out(), "lane A did not fill the cap-two wave");
+        for (frame_id, target) in [(3, &b_one), (4, &b_two)] {
+            lane_b
+                .node_transport
+                .send_detached_routed_message(
+                    target,
+                    test_commit_version_message(&local, target, frame_id),
+                )
+                .expect("queue lane B promotion");
+        }
+        let mut worker_b = lane_b.node_transport.fork_detached_send_worker();
+        let (worker_b_started, worker_b_start) = mpsc::sync_channel(0);
+        let worker_b_handle = std::thread::spawn(move || {
+            worker_b_started.send(()).expect("start lane B worker");
+            worker_b.drain()
+        });
+        worker_b_start
+            .recv_timeout(Duration::from_secs(2))
+            .expect("lane B worker did not start");
+        assert_eq!(
+            b_sender_entries.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "a second shared-state worker exceeded the aggregate cap"
+        );
+
+        state.1 = true;
+        ready.notify_all();
+        drop(state);
+        worker_a_handle
+            .join()
+            .expect("lane A worker join")
+            .expect("lane A drain");
+        b_sender_entries
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first lane B promotion did not run after release");
+        b_sender_entries
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second lane B promotion did not run after release");
+        worker_b_handle
+            .join()
+            .expect("lane B worker join")
+            .expect("lane B drain");
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+        assert_eq!(lane_a.node_transport.detached_send_count(), 0);
+    }
+
+    #[test]
+    fn detached_send_state_is_shared_without_replacing_origin_routing_capability() {
+        let local = node_id("node_detached_shared_state_local");
+        let remote = node_id("node_detached_shared_state_remote");
+        let state = DfsNodeDetachedSendState::new();
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let sender_primary_calls = Arc::clone(&primary_calls);
+        let primary_sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            sender_primary_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(test_committed_promotion_rpc_response(command))
+        });
+        let recovery_calls = Arc::new(AtomicUsize::new(0));
+        let sender_recovery_calls = Arc::clone(&recovery_calls);
+        let recovery_sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            sender_recovery_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(test_committed_promotion_rpc_response(command))
+        });
+        let mut primary = DfsNodeServedMessageTransport::new_with_message_sender_and_detached_state(
+            local.clone(),
+            vec![remote.clone()],
+            primary_sender,
+            Duration::from_secs(1),
+            state.clone(),
+        );
+        let recovery = DfsNodeServedMessageTransport::new_with_message_sender_and_detached_state(
+            local.clone(),
+            vec![remote.clone()],
+            recovery_sender,
+            Duration::from_secs(1),
+            state,
+        );
+        assert_eq!(
+            primary
+                .detached_send_state()
+                .inner
+                .lock()
+                .expect("state")
+                .ready_sends
+                .len(),
+            0
+        );
+        primary
+            .node_transport
+            .send_detached_routed_message(&remote, test_commit_version_message(&local, &remote, 1))
+            .expect("queue shared promotion");
+        assert_eq!(recovery.node_transport.detached_send_count(), 1);
+
+        let mut worker = recovery.node_transport.fork_detached_send_worker();
+        worker.drain().expect("shared worker should drain outbox");
+        assert_eq!(primary.node_transport.detached_send_count(), 0);
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(recovery_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn detached_commit_promotion_rejection_is_requeued_until_positive_ack() {
+        let local = node_id("node_commit_promotion_reject_local");
+        let remote = node_id("node_commit_promotion_reject_remote");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let sender_attempts = Arc::clone(&attempts);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            if sender_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(test_commit_version_rpc_response(
+                    command,
+                    DfsBlobTransferResult::Rejected {
+                        reason: "replica not ready".to_string(),
+                    },
+                ))
+            } else {
+                Ok(test_committed_promotion_rpc_response(command))
+            }
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![remote.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        transport
+            .send_detached_routed_message(&remote, test_commit_version_message(&local, &remote, 1))
+            .expect("queue commit promotion");
+
+        let retry_started = Instant::now();
+        transport
+            .flush_detached_peer_sends_with_now(&|| retry_started)
+            .expect_err("negative acknowledgement must retain promotion");
+        assert_eq!(transport.detached_send_count(), 1);
+        transport
+            .flush_detached_peer_sends_with_now(&|| retry_started + DFS_DETACHED_SEND_RETRY_DELAY)
+            .expect("positive acknowledgement should settle promotion");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(transport.detached_send_count(), 0);
+    }
+
+    #[test]
+    fn detached_commit_promotion_missing_ack_is_requeued() {
+        let local = node_id("node_commit_promotion_missing_ack_local");
+        let remote = node_id("node_commit_promotion_missing_ack_remote");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let sender_attempts = Arc::clone(&attempts);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            if sender_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(DfsMessageResponse {
+                    request_id: command.request_id.clone(),
+                    outbound_messages: Vec::new(),
+                })
+            } else {
+                Ok(test_committed_promotion_rpc_response(command))
+            }
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![remote.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        transport
+            .send_detached_routed_message(&remote, test_commit_version_message(&local, &remote, 1))
+            .expect("queue commit promotion");
+
+        let retry_started = Instant::now();
+        transport
+            .flush_detached_peer_sends_with_now(&|| retry_started)
+            .expect_err("missing acknowledgement must retain promotion");
+        assert_eq!(transport.detached_send_count(), 1);
+        transport
+            .flush_detached_peer_sends_with_now(&|| retry_started + DFS_DETACHED_SEND_RETRY_DELAY)
+            .expect("matching acknowledgement should settle promotion");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn detached_commit_promotion_mismatched_ack_is_requeued() {
+        let local = node_id("node_commit_promotion_mismatch_local");
+        let remote = node_id("node_commit_promotion_mismatch_remote");
+        let wrong_replica = node_id("node_commit_promotion_mismatch_wrong");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let sender_attempts = Arc::clone(&attempts);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            let mut response = test_committed_promotion_rpc_response(command);
+            if sender_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                let DfsNetworkMessage::CommitVersionResponse(ack) =
+                    &mut response.outbound_messages[0].message
+                else {
+                    panic!("commit acknowledgement")
+                };
+                ack.replica_node_id = wrong_replica.clone();
+            }
+            Ok(response)
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![remote.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        transport
+            .send_detached_routed_message(&remote, test_commit_version_message(&local, &remote, 1))
+            .expect("queue commit promotion");
+
+        let retry_started = Instant::now();
+        transport
+            .flush_detached_peer_sends_with_now(&|| retry_started)
+            .expect_err("mismatched acknowledgement must retain promotion");
+        assert_eq!(transport.detached_send_count(), 1);
+        transport
+            .flush_detached_peer_sends_with_now(&|| retry_started + DFS_DETACHED_SEND_RETRY_DELAY)
+            .expect("matching acknowledgement should settle promotion");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn detached_commit_promotion_does_not_inherit_completed_request_deadline() {
+        let local = node_id("node_commit_promotion_deadline_local");
+        let remote = node_id("node_commit_promotion_deadline_remote");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sender_calls = Arc::clone(&calls);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            sender_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(test_committed_promotion_rpc_response(command))
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![remote.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        transport.set_operation_deadline(Some(Instant::now() + Duration::from_millis(10)));
+        transport
+            .send_detached_routed_message(&remote, test_commit_version_message(&local, &remote, 1))
+            .expect("queue commit promotion");
+        std::thread::sleep(Duration::from_millis(20));
+
+        transport
+            .flush_detached_sends()
+            .expect("background promotion should use a fresh RPC budget");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn detached_commit_promotion_retains_temporarily_unknown_target() {
+        let local = node_id("node_commit_promotion_unknown_local");
+        let remote = node_id("node_commit_promotion_unknown_remote");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sender_calls = Arc::clone(&calls);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            sender_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(test_committed_promotion_rpc_response(command))
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            Vec::<NodeId>::new(),
+            Duration::from_secs(1),
+            sender,
+        );
+
+        transport
+            .send_detached_routed_message(&remote, test_commit_version_message(&local, &remote, 1))
+            .expect("unknown promotion target must remain queueable");
+        assert_eq!(transport.detached_send_count(), 1);
+        transport
+            .flush_detached_sends()
+            .expect("dynamically routable promotion should settle");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -2177,13 +5120,68 @@ impl DfsNodeServedMessageTransport {
         peer_transport: Arc<dyn DfsPeerTransport>,
         connect_timeout: Duration,
     ) -> Self {
+        Self::new_with_peer_transport_for_nodes_and_detached_state(
+            local_node_id,
+            peer_node_ids,
+            peer_transport,
+            connect_timeout,
+            DfsNodeDetachedSendState::default(),
+        )
+    }
+
+    pub fn new_with_peer_transport_for_nodes_and_detached_state(
+        local_node_id: NodeId,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
+        peer_transport: Arc<dyn DfsPeerTransport>,
+        connect_timeout: Duration,
+        detached_send_state: DfsNodeDetachedSendState,
+    ) -> Self {
         let message_peer_transport = Arc::clone(&peer_transport);
-        Self::new_with_message_sender_for_nodes(
+        Self::new_with_message_sender_for_nodes_and_detached_state(
             local_node_id,
             peer_node_ids,
             dfs_message_sender_from_peer_transport(message_peer_transport),
             Some(peer_transport),
+            None,
             connect_timeout,
+            detached_send_state,
+        )
+    }
+
+    pub fn new_with_peer_transports_for_nodes(
+        local_node_id: NodeId,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
+        peer_transport: Arc<dyn DfsPeerTransport>,
+        async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+        connect_timeout: Duration,
+    ) -> Self {
+        Self::new_with_peer_transports_for_nodes_and_detached_state(
+            local_node_id,
+            peer_node_ids,
+            peer_transport,
+            async_peer_transport,
+            connect_timeout,
+            DfsNodeDetachedSendState::default(),
+        )
+    }
+
+    pub fn new_with_peer_transports_for_nodes_and_detached_state(
+        local_node_id: NodeId,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
+        peer_transport: Arc<dyn DfsPeerTransport>,
+        async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+        connect_timeout: Duration,
+        detached_send_state: DfsNodeDetachedSendState,
+    ) -> Self {
+        let message_peer_transport = Arc::clone(&peer_transport);
+        Self::new_with_message_sender_for_nodes_and_detached_state(
+            local_node_id,
+            peer_node_ids,
+            dfs_message_sender_from_peer_transport(message_peer_transport),
+            Some(peer_transport),
+            Some(async_peer_transport),
+            connect_timeout,
+            detached_send_state,
         )
     }
 
@@ -2203,6 +5201,26 @@ impl DfsNodeServedMessageTransport {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_with_message_sender_and_detached_state(
+        local_node_id: NodeId,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
+        sender: DfsMessageSender,
+        connect_timeout: Duration,
+        detached_send_state: DfsNodeDetachedSendState,
+    ) -> Self {
+        Self::new_with_message_sender_for_nodes_and_detached_state(
+            local_node_id,
+            peer_node_ids,
+            sender,
+            None,
+            None,
+            connect_timeout,
+            detached_send_state,
+        )
+    }
+
+    #[cfg(test)]
     fn new_with_message_sender_for_nodes(
         local_node_id: NodeId,
         peer_node_ids: impl IntoIterator<Item = NodeId>,
@@ -2210,7 +5228,27 @@ impl DfsNodeServedMessageTransport {
         peer_transport: Option<Arc<dyn DfsPeerTransport>>,
         connect_timeout: Duration,
     ) -> Self {
-        let node_transport = DfsNodeTransport::with_senders_for_nodes(
+        Self::new_with_message_sender_for_nodes_and_detached_state(
+            local_node_id,
+            peer_node_ids,
+            sender,
+            peer_transport,
+            None,
+            connect_timeout,
+            DfsNodeDetachedSendState::default(),
+        )
+    }
+
+    fn new_with_message_sender_for_nodes_and_detached_state(
+        local_node_id: NodeId,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
+        sender: DfsMessageSender,
+        peer_transport: Option<Arc<dyn DfsPeerTransport>>,
+        async_peer_transport: Option<Arc<dyn AsyncDfsPeerTransport>>,
+        connect_timeout: Duration,
+        detached_send_state: DfsNodeDetachedSendState,
+    ) -> Self {
+        let node_transport = DfsNodeTransport::with_senders_for_nodes_and_detached_state(
             local_node_id.clone(),
             peer_node_ids,
             connect_timeout,
@@ -2220,7 +5258,8 @@ impl DfsNodeServedMessageTransport {
             None,
             None,
             peer_transport,
-            None,
+            async_peer_transport,
+            detached_send_state,
         );
         Self {
             local_node_id,
@@ -2230,6 +5269,10 @@ impl DfsNodeServedMessageTransport {
             outbound_body: None,
             node_transport,
         }
+    }
+
+    pub fn detached_send_state(&self) -> DfsNodeDetachedSendState {
+        self.node_transport.detached_send_state.clone()
     }
 
     pub fn begin_message(&mut self, message: &DfsRoutedMessage) -> Result<(), NetworkError> {
@@ -2301,6 +5344,15 @@ impl DfsMessageTransport for DfsNodeServedMessageTransport {
             .send_routed_message_to_peer(target_node_id, message, true)
     }
 
+    fn send_detached_routed_message(
+        &mut self,
+        target_node_id: &NodeId,
+        message: DfsRoutedMessage,
+    ) -> Result<(), NetworkError> {
+        self.node_transport
+            .send_routed_message_to_peer_detached(target_node_id, message, true)
+    }
+
     fn send_routed_message_with_body(
         &mut self,
         target_node_id: &NodeId,
@@ -2333,6 +5385,79 @@ impl DfsMessageTransport for DfsNodeServedMessageTransport {
             .send_routed_message_body_to_peer(target_node_id, message, body, true)
     }
 
+    fn send_routed_message_bodies_bounded(
+        &mut self,
+        requests: Vec<DfsRoutedBodySend>,
+        max_inflight: usize,
+    ) -> Result<Vec<DfsRoutedBodySendOutcome>, NetworkError> {
+        let request_count = requests.len();
+        let mut outcomes = std::iter::repeat_with(|| None)
+            .take(request_count)
+            .collect::<Vec<Option<DfsRoutedBodySendOutcome>>>();
+        let mut peer_requests = Vec::new();
+
+        for (index, request) in requests.into_iter().enumerate() {
+            let returns_to_caller = self
+                .return_node_id
+                .as_ref()
+                .is_some_and(|return_node_id| &request.target_node_id == return_node_id)
+                && dfs_network_message_can_return_to_served_caller(&request.message.message);
+            if returns_to_caller {
+                let target_node_id = request.target_node_id;
+                let result = self.send_routed_message_with_body(
+                    &target_node_id,
+                    request.message,
+                    request.body,
+                );
+                outcomes[index] = Some(DfsRoutedBodySendOutcome {
+                    target_node_id,
+                    result,
+                });
+            } else {
+                peer_requests.push((index, request));
+            }
+        }
+
+        if !peer_requests.is_empty() {
+            let peer_indexes = peer_requests
+                .iter()
+                .map(|(index, request)| (*index, request.target_node_id.clone()))
+                .collect::<Vec<_>>();
+            let peer_outcomes = self.node_transport.send_routed_message_bodies_bounded(
+                peer_requests
+                    .into_iter()
+                    .map(|(_, request)| request)
+                    .collect(),
+                max_inflight,
+            )?;
+            if peer_outcomes.len() != peer_indexes.len() {
+                return Err(NetworkError::Serialization {
+                    detail: "DFS served body fan-out returned the wrong outcome count".to_string(),
+                });
+            }
+            for ((index, expected_target), outcome) in peer_indexes.into_iter().zip(peer_outcomes) {
+                if outcome.target_node_id != expected_target {
+                    return Err(NetworkError::Serialization {
+                        detail: format!(
+                            "DFS served body fan-out expected target {expected_target}, got {}",
+                            outcome.target_node_id
+                        ),
+                    });
+                }
+                outcomes[index] = Some(outcome);
+            }
+        }
+
+        outcomes
+            .into_iter()
+            .map(|outcome| {
+                outcome.ok_or_else(|| NetworkError::Serialization {
+                    detail: "DFS served body fan-out omitted an outcome".to_string(),
+                })
+            })
+            .collect()
+    }
+
     fn send_metadata_journal_batch_direct(
         &mut self,
         target_node_id: &NodeId,
@@ -2356,6 +5481,10 @@ impl DfsMessageTransport for DfsNodeServedMessageTransport {
         Ok(messages)
     }
 
+    fn flush_detached_sends(&mut self) -> Result<(), NetworkError> {
+        self.node_transport.flush_detached_peer_sends()
+    }
+
     fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
         let nested = self
             .node_transport
@@ -2366,6 +5495,12 @@ impl DfsMessageTransport for DfsNodeServedMessageTransport {
 
     fn can_return_committed_foreground_response_before_replica_repair(&self) -> bool {
         true
+    }
+
+    fn should_detach_completed_response(&self, target_node_id: &NodeId) -> bool {
+        self.return_node_id
+            .as_ref()
+            .is_some_and(|return_node_id| return_node_id != target_node_id)
     }
 }
 
@@ -2396,8 +5531,24 @@ impl NetworkedDfsService<DfsNodeServedMessageTransport> {
         self.transport.replace_peer_nodes(peer_node_ids);
     }
 
-    pub fn drain_message_deferred_work(&mut self) {
+    pub fn prepare_message_deferred_work(&mut self) -> DfsNodeDetachedSendWorker {
         self.drain_deferred_routed_create_parent_touches();
+        self.transport.node_transport.fork_detached_send_worker()
+    }
+
+    pub fn message_deferred_work_pending(&self) -> Result<bool, DfsError> {
+        if !self.deferred_routed_create_parent_touches.is_empty() {
+            return Ok(true);
+        }
+        self.transport
+            .node_transport
+            .fork_detached_send_worker()
+            .has_pending()
+    }
+
+    pub fn drain_message_deferred_work(&mut self) -> Result<(), DfsError> {
+        let mut worker = self.prepare_message_deferred_work();
+        worker.drain()
     }
 
     pub fn process_message_command(

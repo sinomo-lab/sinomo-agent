@@ -24,6 +24,7 @@ mod kv_local_store;
 mod kv_read_model;
 mod kv_semantics;
 mod kv_snapshot;
+mod kv_snapshot_observer;
 mod kv_txn_quorum;
 mod local_membership;
 mod local_state_store;
@@ -143,6 +144,9 @@ pub use kv_snapshot::{
     refresh_current_cluster_kv_store_with_host,
     refresh_current_cluster_kv_store_with_local_storage_and_transport,
     refresh_current_cluster_kv_store_with_outcome,
+};
+pub use kv_snapshot_observer::{
+    ClusterKvCommittedSnapshotSubscription, subscribe_cluster_kv_committed_snapshots,
 };
 pub use kv_txn_quorum::{
     ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost,

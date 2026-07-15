@@ -21,6 +21,13 @@ The default filter is intentionally modest. Hot paths should emit `trace!` or
 `debug!` events only behind the normal tracing level checks, and expensive field
 construction should stay outside packet forwarding and storage commit loops.
 
+For DFS algorithm measurements, a truthy `SINOMO_DFS_PERF_TRACE` value (`1`,
+`true`, `yes`, or `on`) adds `sinomo.dfs.perf=trace` to the process-start filter.
+An exact `sinomo.dfs.perf` directive already present in
+`SINOMO_OBSERVE_FILTER` wins, including an explicit lower level or `off`, so the
+convenience flag never overwrites operator intent. Runtime `/observe/control`
+updates remain authoritative after startup.
+
 ## Cluster Interface
 
 Observation is exposed as ordinary object RPC:
@@ -87,3 +94,93 @@ from observation:
 
 This keeps normal packet forwarding independent from graph scans, metrics
 exporter scans, and human-facing diagnostics.
+
+`docker/measure-dfs-shards.sh` resolves the main daemon's container PID to one
+host PID in the node cgroup and records process CPU separately from whole-cgroup
+CPU, pressure, I/O, throttling, and network counters. Its utilization gates use
+only main-daemon CPU. The sampled CPU ownership is exact, while the beginning
+and end of a workload window remain approximate because client process liveness
+plus a warmup interval bracket the remote server operation; DFS performance
+traces are the finer-grained source for those launch edges.
+
+The same timeline records daemon thread states, voluntary and involuntary
+context switches, process I/O when the kernel exposes it, and interval deltas
+for cgroup pressure, block I/O, and network traffic. A low-CPU sample is gated
+as avoidable only when daemon work is runnable while no CPU pressure, I/O
+pressure or progress, or network progress is observed; sleeping or externally
+progressing samples remain diagnostic evidence rather than automatic failures.
+The optional tmpfs compose overlay may remove durable-disk cost for an
+algorithm-only measurement, but it is not a substitute for the disk-backed
+restart, damage, or convergence gates.
+
+The shard gate measures the serial metadata boundary, not every CPU in the
+machine. One hot metadata-shard primary is expected to use roughly one core;
+the default root, services, and users lanes have three distinct primaries and
+target about three aggregate metadata cores under concurrent writes. Additional
+hardware is used through more shards and writes or through content hashing,
+replica transfer, and transport work. Passing the configurable utilization
+floor means that this bounded target stayed work-conserving; it is not a claim
+that one shard saturated the entire host.
+
+The crate-level `network-blob` benchmark is a complementary tmpfs-backed,
+in-process measurement when its root is under `/dev/shm`:
+
+```sh
+cargo bench -p sinomo-dfs --bench scale -- \
+  --scenario network-blob --preset smoke \
+  --root /dev/shm/sinomo-dfs-algorithm-bench \
+  --network-blob-bytes 128MiB \
+  --network-blob-desired-replicas 5 \
+  --network-blob-write-quorum 1
+```
+
+It uses `InProcessNetwork`, but its `LocalContentStore` and metadata backends
+still exercise filesystem calls against tmpfs; it is not a pure heap-only
+filesystem. Reported effective cores are process-wide across the owner, replica
+workers, and benchmark driver. The `W` duration is an upper bound at POSIX write
+return, while the all-`N` duration ends at the latest replica commit. One-
+millisecond sleeps in the benchmark are driver polling between
+`process_incoming` calls, not DFS hot-path waits. Remove the explicit benchmark
+root after collecting its JSONL output.
+
+Use two separate Docker projects or fully tear down the first project between
+the durability and algorithm measurements. The disk-backed suite remains the
+correctness, restart, damage, and convergence gate:
+
+```sh
+SINOMO_TEST_BUILD=0 SINOMO_TEST_FORMATION_WAIT=120 \
+  SINOMO_DFS_PERF_TRACE=1 docker/test-cluster.sh
+```
+
+After it has stopped, form a fresh tmpfs-backed cluster whose network/KV
+baselines, DFS readiness, stable shard layout, and live daemon mutation lanes
+have all passed, measure the three live shard primaries, and tear it down with
+the same compose files:
+
+```sh
+SINOMO_TEST_BUILD=0 SINOMO_TEST_FORMATION_WAIT=120 \
+  SINOMO_TEST_COMPOSE_OVERRIDE=docker/docker-compose.dfs-tmpfs.yml \
+  SINOMO_TEST_NETWORK_ONLY=1 SINOMO_TEST_KEEP=1 SINOMO_DFS_PERF_TRACE=1 \
+  docker/test-cluster.sh
+
+SINOMO_DFS_PERF_COMPOSE_OVERRIDE=docker/docker-compose.dfs-tmpfs.yml \
+  docker/measure-dfs-shards.sh
+
+docker compose -p sinomo-dfs-test -f docker/docker-compose.dev.yml \
+  -f docker/docker-compose.dfs-tmpfs.yml down -v
+```
+
+Do not record a Docker acceptance result until those commands have actually
+run. Preserve the disk suite under `target/cluster-test-artifacts/<run>/` and
+the algorithm evidence under `target/dfs-shard-perf/<run>/`, especially
+`timeline.csv`, `isolated-primary-summary.csv`, `aggregate-summary.tsv`,
+`sample-classification-summary.csv`, `workloads.tsv`,
+`main-daemon-stderr-workload.tsv`, the per-node
+`main-daemon-<node>.workload.stderr.log` files, and the before/after health,
+doctor, DFS-status, and shard-layout files. The daemon-stderr manifest records
+the exact appended byte range or a best-effort full-log fallback when the file
+was reset or an offset was unavailable. The timeline gate fails a runnable
+low-CPU streak with no resource wait or progress; sleeping samples with no
+observed external progress remain diagnostic, so inspect that class alongside
+the preserved `sinomo.dfs.perf` traces before concluding that the hot path has
+no unnecessary wait.

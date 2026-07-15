@@ -447,6 +447,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<bool, DfsError> {
         let mut request_ids = Vec::with_capacity(targets.len());
         let mut request_targets = Vec::with_capacity(targets.len());
+        let prepared_prefix = self
+            .metadata_backend
+            .as_deref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "metadata authority probe has no durable metadata backend".to_string(),
+            })?
+            .metadata_prefix_proof(&prepared_batch.shard_id)?;
+        let Some(prepared_prefix) = prepared_prefix.filter(|prefix| {
+            prefix.is_well_formed() && prefix.journal_sequence == prepared_batch.next_after_sequence
+        }) else {
+            // The fast path is optional. A missing or moving exact prefix
+            // cannot authorize an operation-only acknowledgement; the caller
+            // obtains the normal cluster-quorum permit instead.
+            return Ok(false);
+        };
         let result = (|| {
             let mut authority_requests = Vec::with_capacity(targets.len());
             for target_node_id in targets {
@@ -467,12 +482,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let command = DfsMetadataJournalBatchCommand {
                     request_id: request_id.clone(),
                     source_node_id: Some(self.node_id.clone()),
+                    file_system_id: Some(shard.file_system_id.clone()),
+                    authority_epoch: Some(shard.epoch),
                     verify_prefix_only: false,
                     prefix_probe: None,
                     authority_probe: Some(DfsMetadataAuthorityProbe {
                         probe_id: probe_id.clone(),
                         expected_shard: shard.clone(),
                         operation: operation.clone(),
+                        prepared_prefix: Some(prepared_prefix.clone()),
                     }),
                     // Include every entry the target has not yet acknowledged,
                     // through the exact prepare. The receiver refuses gaps;
@@ -497,12 +515,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         else {
                             return Ok(false);
                         };
-                        let expected_probe_id = command
+                        let expected_confirmation_id = command
                             .authority_probe
                             .as_ref()
-                            .map(|probe| probe.probe_id.as_str());
+                            .and_then(metadata_authority_probe_confirmation_id);
                         if response.result != DfsMetadataJournalBatchResult::Applied
-                            || response.verified_authority_probe_id.as_deref() != expected_probe_id
+                            || response.verified_authority_probe_id.as_deref()
+                                != expected_confirmation_id.as_deref()
                         {
                             return Ok(false);
                         }
@@ -519,17 +538,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             for (target_node_id, command) in authority_requests {
                 let request_id = command.request_id.clone();
-                let probe_id = command
-                    .authority_probe
-                    .as_ref()
-                    .expect("authority request carries probe")
-                    .probe_id
-                    .clone();
+                let confirmation_id = metadata_authority_probe_confirmation_id(
+                    command
+                        .authority_probe
+                        .as_ref()
+                        .expect("authority request carries probe"),
+                )
+                .expect("prepared authority probe has an exact prefix confirmation");
                 self.pending_metadata_authority_probes.insert(
                     request_id.clone(),
                     PendingMetadataAuthorityProbe {
                         target_node_id: target_node_id.clone(),
-                        probe_id: probe_id.clone(),
+                        confirmation_id,
                         expected_shard: shard.clone(),
                     },
                 );
@@ -1184,6 +1204,56 @@ pub(crate) fn metadata_authority_operation_is_well_formed_for_shard(
 /// Verify that the exact operation named by an authority acknowledgement is
 /// durably present in the DFS metadata backend. This is deliberately a DFS
 /// metadata check: ordinary writes do not put file metadata into cluster KV.
+pub(crate) fn metadata_authority_probe_confirmation_id(
+    probe: &DfsMetadataAuthorityProbe,
+) -> Option<String> {
+    let prefix = probe.prepared_prefix.as_ref()?;
+    if probe.probe_id.is_empty()
+        || !prefix.is_well_formed()
+        || prefix.journal_sequence
+            != metadata_authority_operation_prepare_sequence(&probe.operation)
+    {
+        return None;
+    }
+    Some(format!(
+        "dfs-authority-prefix-v1:{}:{}:{}",
+        probe.probe_id, prefix.journal_sequence, prefix.digest
+    ))
+}
+
+pub(crate) fn verify_persisted_metadata_authority_probe(
+    backend: &dyn DfsMetadataBackend,
+    shard: &DfsMetadataShardConfig,
+    probe: &DfsMetadataAuthorityProbe,
+) -> Result<String, DfsError> {
+    verify_persisted_metadata_authority_operation(backend, shard, &probe.operation)?;
+    let confirmation_id = metadata_authority_probe_confirmation_id(probe).ok_or_else(|| {
+        DfsError::Metadata {
+            message: format!(
+                "metadata authority probe has no well-formed exact prepared prefix for shard {} epoch {}",
+                shard.shard_id, shard.epoch
+            ),
+        }
+    })?;
+    let local_prefix = backend
+        .metadata_prefix_proof(&DfsMetadataShardId::new(shard.shard_id.clone()))?
+        .ok_or_else(|| DfsError::Metadata {
+            message: format!(
+                "metadata authority probe cannot read an exact local prefix for shard {}",
+                shard.shard_id
+            ),
+        })?;
+    if probe.prepared_prefix.as_ref() != Some(&local_prefix) {
+        return Err(DfsError::Metadata {
+            message: format!(
+                "metadata authority operation is present but shard {} prefix does not match the primary's exact prepared history",
+                shard.shard_id
+            ),
+        });
+    }
+    Ok(confirmation_id)
+}
+
 pub(crate) fn verify_persisted_metadata_authority_operation(
     backend: &dyn DfsMetadataBackend,
     shard: &DfsMetadataShardConfig,
@@ -1462,7 +1532,9 @@ mod authority_probe_tests {
                         next_after_sequence: command.batch.next_after_sequence,
                         applied_entries: 0,
                         verified_prefix_only: false,
-                        verified_authority_probe_id: accepted.then_some(probe.probe_id),
+                        verified_authority_probe_id: accepted
+                            .then(|| metadata_authority_probe_confirmation_id(&probe))
+                            .flatten(),
                         result: if accepted {
                             DfsMetadataJournalBatchResult::Applied
                         } else {
@@ -1950,6 +2022,8 @@ mod authority_probe_tests {
         let command = DfsMetadataJournalBatchCommand {
             request_id: "request-stale-authority-probe".to_string(),
             source_node_id: Some(primary.clone()),
+            file_system_id: Some(stale_shard.file_system_id.clone()),
+            authority_epoch: Some(stale_shard.epoch),
             verify_prefix_only: false,
             prefix_probe: None,
             authority_probe: Some(DfsMetadataAuthorityProbe {
@@ -1961,6 +2035,7 @@ mod authority_probe_tests {
                     prepare_sequence: 1,
                     payload_digest: content_hash(b"stale-authority"),
                 },
+                prepared_prefix: None,
             }),
             batch: DfsMetadataJournalBatch {
                 shard_id: DfsMetadataShardId::new(stale_shard.shard_id.clone()),

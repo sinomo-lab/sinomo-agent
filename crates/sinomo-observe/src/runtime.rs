@@ -21,6 +21,8 @@ pub const OBSERVE_DEFAULT_BASE_FILTER: &str = "warn,sinomo=info";
 pub const OBSERVE_DEFAULT_FILTER: &str = "warn,sinomo=info,iroh::net_report::report=error";
 pub const OBSERVE_DEFAULT_QUIET_FILTER_DIRECTIVES: &[&str] = &["iroh::net_report::report=error"];
 pub const OBSERVE_BUILT_IN_QUIET_FILTER_DIRECTIVES: &[&str] = &["iroh::net_report::report=error"];
+const DFS_PERF_TRACE_TARGET: &str = "sinomo.dfs.perf";
+const DFS_PERF_TRACE_DIRECTIVE: &str = "sinomo.dfs.perf=trace";
 const TRACE_BUFFER_LIMIT: usize = 4096;
 const CAPTURE_ID_MAX_BYTES: usize = 128;
 const CAPTURE_LEASE: Duration = Duration::from_secs(10 * 60);
@@ -39,12 +41,20 @@ impl ObserveRuntimeConfig {
     }
 
     /// Config for any Sinomo process role (daemon, graphical app, tooling), with the
-    /// filter taken from `SINOMO_OBSERVE_FILTER` when set.
+    /// filter taken from `SINOMO_OBSERVE_FILTER` when set. A truthy
+    /// `SINOMO_DFS_PERF_TRACE` adds `sinomo.dfs.perf=trace` unless the configured
+    /// filter already has an explicit directive for that exact target.
     pub fn process(label: impl Into<String>, node_id: Option<String>) -> Self {
         let configured_filter = std::env::var("SINOMO_OBSERVE_FILTER")
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| OBSERVE_DEFAULT_BASE_FILTER.to_string());
+        let configured_filter = observe_filter_with_dfs_perf_trace(
+            &configured_filter,
+            std::env::var("SINOMO_DFS_PERF_TRACE")
+                .ok()
+                .is_some_and(|value| observe_env_value_is_truthy(&value)),
+        );
         Self {
             process_role: label.into(),
             node_id,
@@ -542,6 +552,25 @@ pub fn update_observe_control(
 
 pub fn observe_filter_with_builtin_quiet_directives(filter: &str) -> String {
     observe_filter_with_quiet_directives(filter, OBSERVE_DEFAULT_QUIET_FILTER_DIRECTIVES)
+}
+
+fn observe_filter_with_dfs_perf_trace(filter: &str, enabled: bool) -> String {
+    let filter = filter.trim();
+    if !enabled || observe_filter_mentions_target(filter, DFS_PERF_TRACE_TARGET) {
+        return filter.to_string();
+    }
+    if filter.is_empty() {
+        DFS_PERF_TRACE_DIRECTIVE.to_string()
+    } else {
+        format!("{filter},{DFS_PERF_TRACE_DIRECTIVE}")
+    }
+}
+
+fn observe_env_value_is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 pub fn observe_filter_with_quiet_directives(
@@ -1252,6 +1281,56 @@ mod tests {
             observe_filter_with_builtin_quiet_directives("debug,sinomo_network=trace"),
             "debug,sinomo_network=trace,iroh::net_report::report=error"
         );
+    }
+
+    #[test]
+    fn dfs_perf_trace_env_adds_exact_trace_target() {
+        let filter = observe_filter_with_dfs_perf_trace("warn,sinomo=info", true);
+        assert_eq!(filter, "warn,sinomo=info,sinomo.dfs.perf=trace");
+        assert_eq!(
+            observe_filter_with_dfs_perf_trace("warn,sinomo=info", false),
+            "warn,sinomo=info"
+        );
+
+        let observed = Arc::new(AtomicUsize::new(0));
+        let subscriber = Registry::default()
+            .with(EnvFilter::try_new(filter).expect("DFS performance filter parses"))
+            .with(CountingLayer {
+                observed: Arc::clone(&observed),
+            });
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(target: "sinomo.dfs.perf", "enabled DFS performance event");
+            tracing::debug!(target: "unrelated", "filtered unrelated event");
+        });
+        assert_eq!(observed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn dfs_perf_trace_env_preserves_explicit_target_directive() {
+        assert_eq!(
+            observe_filter_with_dfs_perf_trace("warn,sinomo.dfs.perf=debug", true),
+            "warn,sinomo.dfs.perf=debug"
+        );
+        assert_eq!(
+            observe_filter_with_dfs_perf_trace("warn,sinomo.dfs.perf=off", true),
+            "warn,sinomo.dfs.perf=off"
+        );
+    }
+
+    #[test]
+    fn dfs_perf_trace_env_uses_explicit_truthy_values() {
+        for value in ["1", "true", "TRUE", " yes ", "On"] {
+            assert!(
+                observe_env_value_is_truthy(value),
+                "{value:?} should be truthy"
+            );
+        }
+        for value in ["", "0", "false", "no", "off", "trace"] {
+            assert!(
+                !observe_env_value_is_truthy(value),
+                "{value:?} should not be truthy"
+            );
+        }
     }
 
     #[test]
