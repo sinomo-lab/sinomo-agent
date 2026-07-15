@@ -13,6 +13,8 @@
 
 use crate::internal::*;
 
+const SIMPLE_NATIVE_RUNTIME_BINDING: &str = "simple_sandbox";
+
 /// Error surfaced by a [`SandboxBackend`] operation. Wraps the store/filesystem errors and
 /// adds a policy-denial case (clustered backends evaluate node policy) plus an escape
 /// hatch for host-specific failures a backend cannot express as the above.
@@ -148,6 +150,53 @@ pub trait SandboxBackend: Send {
     }
 }
 
+/// Result of applying an optional full mount-set replacement to a sandbox
+/// manifest. Mount identity includes source, target, and mode, so changing any
+/// of those fields is represented as one removal and one addition.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SandboxMountReconciliation {
+    pub replacement_requested: bool,
+    pub changed: bool,
+    pub added: Vec<SandboxMount>,
+    pub removed: Vec<SandboxMount>,
+}
+
+/// Apply the wire-level mount replacement semantics without persisting the
+/// manifest. Callers validate the resulting manifest before saving it.
+pub fn reconcile_sandbox_mounts(
+    current: &mut Vec<SandboxMount>,
+    replacement: Option<Vec<SandboxMount>>,
+) -> SandboxMountReconciliation {
+    let Some(replacement) = replacement else {
+        return SandboxMountReconciliation::default();
+    };
+    let previous = std::mem::replace(current, replacement);
+    let removed = sandbox_mount_multiset_difference(&previous, current);
+    let added = sandbox_mount_multiset_difference(current, &previous);
+    SandboxMountReconciliation {
+        replacement_requested: true,
+        changed: previous != *current,
+        added,
+        removed,
+    }
+}
+
+fn sandbox_mount_multiset_difference(
+    candidates: &[SandboxMount],
+    retained: &[SandboxMount],
+) -> Vec<SandboxMount> {
+    let mut unmatched = retained.to_vec();
+    let mut difference = Vec::new();
+    for candidate in candidates {
+        if let Some(index) = unmatched.iter().position(|mount| mount == candidate) {
+            unmatched.remove(index);
+        } else {
+            difference.push(candidate.clone());
+        }
+    }
+    difference
+}
+
 /// Daemonless sandbox backend backed by the local filesystem store. Works with no cluster
 /// (and no daemon); resource limits recorded in the manifest are still enforced on writes.
 /// Cluster-only concerns (node policy, cross-node replica placement, the cluster event
@@ -268,33 +317,54 @@ impl SandboxBackend for LocalSandboxBackend {
         &mut self,
         request: SandboxUpdateInstanceRequest,
     ) -> Result<SandboxUpdateInstanceResponse, SandboxBackendError> {
-        let _lease = self.settle_local_execution(&request.sandbox_id)?;
-        let (mut manifest, layout) = self.store.load(&request.sandbox_id)?;
-        for key in request.env_set.keys().chain(request.env_unset.iter()) {
+        let SandboxUpdateInstanceRequest {
+            sandbox_id,
+            cwd,
+            mounts,
+            env_set,
+            env_unset,
+        } = request;
+        let _lease = self.settle_local_execution(&sandbox_id)?;
+        let (mut manifest, layout) = self.store.load(&sandbox_id)?;
+        for key in env_set.keys().chain(env_unset.iter()) {
             if !sandbox_env_name_is_valid(key) {
                 return Err(SandboxBackendError::Other(format!(
                     "invalid sandbox env name `{key}`"
                 )));
             }
         }
-        for (key, value) in &request.env_set {
+        for (key, value) in &env_set {
             if value.contains('\0') {
                 return Err(SandboxBackendError::Other(format!(
                     "sandbox env `{key}` contains an embedded NUL byte"
                 )));
             }
         }
-        if let Some(cwd) = request.cwd.as_ref() {
+        let mounts_reconciliation = reconcile_sandbox_mounts(&mut manifest.mounts, mounts);
+        let effective_cwd = cwd.as_ref().unwrap_or(&manifest.cwd);
+        // The simple-native adapter records its real host cwd in the manifest.
+        // A mount-only update must preserve that runtime-owned value instead
+        // of interpreting it through the guest VFS. Explicit cwd changes (and
+        // every other runtime) continue through normal guest validation.
+        let preserves_simple_native_host_cwd = cwd.is_none()
+            && mounts_reconciliation.replacement_requested
+            && manifest
+                .runtime_binding
+                .as_ref()
+                .is_some_and(|binding| binding.runtime == SIMPLE_NATIVE_RUNTIME_BINDING);
+        if (cwd.is_some() || mounts_reconciliation.replacement_requested)
+            && !preserves_simple_native_host_cwd
+        {
             let fs = LocalSandboxFileSystem::new(layout);
-            validate_sandbox_working_directory(&fs, cwd)?;
+            validate_sandbox_working_directory(&fs, effective_cwd)?;
         }
-        if let Some(cwd) = request.cwd {
+        if let Some(cwd) = cwd {
             manifest.cwd = cwd;
         }
-        for key in request.env_unset {
+        for key in env_unset {
             manifest.env.remove(&key);
         }
-        manifest.env.extend(request.env_set);
+        manifest.env.extend(env_set);
         manifest
             .advance_generation()
             .map_err(SandboxStoreError::from)?;
@@ -509,7 +579,10 @@ impl SandboxBackend for LocalSandboxBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalSandboxBackend, SandboxBackend};
+    use super::{
+        LocalSandboxBackend, SIMPLE_NATIVE_RUNTIME_BINDING, SandboxBackend, SandboxBackendError,
+        reconcile_sandbox_mounts,
+    };
     use crate::internal::*;
 
     fn seed_guest_active_local_journal(
@@ -609,6 +682,236 @@ mod tests {
             backend.status(SandboxStatusRequest { sandbox_id }).is_err(),
             "status should fail after destroy"
         );
+    }
+
+    #[test]
+    fn local_backend_update_replaces_preserves_and_clears_mounts() {
+        let root = sinomo_testdir::TestDir::new("sinomo-local-sandbox-update-mounts");
+        let mut backend = LocalSandboxBackend::new(&root);
+        let initial_mount = SandboxMount {
+            source_sifs_path: "/services/sandbox-shared/initial".to_string(),
+            mount_path: SandboxPath::new("/work/initial").expect("initial mount path"),
+            mode: SandboxMountMode::ReadOnly,
+        };
+        let replacement_mount = SandboxMount {
+            source_sifs_path: "/services/sandbox-shared/replacement".to_string(),
+            mount_path: SandboxPath::new("/work/replacement").expect("replacement mount path"),
+            mode: SandboxMountMode::ReadWrite,
+        };
+        let created = backend
+            .create(SandboxCreateInstanceRequest {
+                sandbox_id: None,
+                toolchain_id: SandboxToolchainId::from_legacy_named("mount_update_toolchain")
+                    .expect("toolchain id"),
+                temp_policy: SandboxTempPolicy::RetainAcrossSessions,
+                memory_mb: None,
+                wall_time_ms: None,
+                max_input_bytes: None,
+                max_output_bytes: None,
+                max_workspace_bytes: None,
+                max_written_bytes_per_command: None,
+                max_file_count: None,
+                mounts: vec![initial_mount.clone()],
+            })
+            .expect("create sandbox");
+        let sandbox_id = created.manifest.sandbox_id;
+
+        let preserved = backend
+            .update(SandboxUpdateInstanceRequest {
+                sandbox_id: sandbox_id.clone(),
+                cwd: None,
+                mounts: None,
+                env_set: BTreeMap::new(),
+                env_unset: Vec::new(),
+            })
+            .expect("preserve mounts");
+        assert_eq!(preserved.manifest.mounts, vec![initial_mount.clone()]);
+
+        let replaced = backend
+            .update(SandboxUpdateInstanceRequest {
+                sandbox_id: sandbox_id.clone(),
+                cwd: None,
+                mounts: Some(vec![replacement_mount.clone()]),
+                env_set: BTreeMap::new(),
+                env_unset: Vec::new(),
+            })
+            .expect("replace mounts");
+        assert_eq!(replaced.manifest.mounts, vec![replacement_mount]);
+        assert_eq!(
+            replaced.manifest.generation,
+            preserved.manifest.generation + 1
+        );
+
+        let cleared = backend
+            .update(SandboxUpdateInstanceRequest {
+                sandbox_id,
+                cwd: None,
+                mounts: Some(Vec::new()),
+                env_set: BTreeMap::new(),
+                env_unset: Vec::new(),
+            })
+            .expect("clear mounts");
+        assert!(cleared.manifest.mounts.is_empty());
+        assert_eq!(
+            cleared.manifest.generation,
+            replaced.manifest.generation + 1
+        );
+    }
+
+    #[test]
+    fn local_backend_mount_update_preserves_simple_native_host_cwd() {
+        let root = sinomo_testdir::TestDir::new("sinomo-local-sandbox-simple-native-cwd");
+        let runtime_root = root.join("runtime");
+        let host_workspace = root.join("host-workspace");
+        std::fs::create_dir_all(&host_workspace).expect("host workspace");
+        let store = LocalSandboxInstanceStore::new(&runtime_root);
+        let mut backend = LocalSandboxBackend::with_store(store.clone());
+        let created = backend
+            .create(SandboxCreateInstanceRequest {
+                sandbox_id: None,
+                toolchain_id: SandboxToolchainId::from_legacy_named(
+                    "simple_native_cwd_update_toolchain",
+                )
+                .expect("toolchain id"),
+                temp_policy: SandboxTempPolicy::RetainAcrossSessions,
+                memory_mb: None,
+                wall_time_ms: None,
+                max_input_bytes: None,
+                max_output_bytes: None,
+                max_workspace_bytes: None,
+                max_written_bytes_per_command: None,
+                max_file_count: None,
+                mounts: Vec::new(),
+            })
+            .expect("create sandbox");
+        let sandbox_id = created.manifest.sandbox_id.clone();
+        let mut manifest = created.manifest;
+        manifest.cwd = SandboxPath::new(host_workspace.display().to_string()).expect("host cwd");
+        manifest.runtime_binding = Some(SandboxRuntimeBinding {
+            runtime: SIMPLE_NATIVE_RUNTIME_BINDING.to_string(),
+            node_id: NodeId::from_legacy_named("simple-native-cwd-node").expect("node id"),
+            portability: SandboxInstancePortability::NonPortable,
+        });
+        store.save_manifest(&manifest).expect("persist runtime cwd");
+
+        let mount = SandboxMount {
+            source_sifs_path: "/conversations/test/workspaces/project".to_string(),
+            mount_path: SandboxPath::new("/work").expect("mount path"),
+            mode: SandboxMountMode::ReadWrite,
+        };
+        let updated = backend
+            .update(SandboxUpdateInstanceRequest {
+                sandbox_id: sandbox_id.clone(),
+                cwd: None,
+                mounts: Some(vec![mount.clone()]),
+                env_set: BTreeMap::new(),
+                env_unset: Vec::new(),
+            })
+            .expect("replace mounts while preserving simple-native host cwd");
+        assert_eq!(updated.manifest.cwd, manifest.cwd);
+        assert_eq!(updated.manifest.mounts, vec![mount]);
+
+        let invalid_guest_cwd = SandboxPath::new("/missing-guest-cwd").expect("invalid guest cwd");
+        let explicit_cwd_error = backend
+            .update(SandboxUpdateInstanceRequest {
+                sandbox_id: sandbox_id.clone(),
+                cwd: Some(invalid_guest_cwd.clone()),
+                mounts: None,
+                env_set: BTreeMap::new(),
+                env_unset: Vec::new(),
+            })
+            .expect_err("explicit cwd update must use guest filesystem validation");
+        assert!(
+            matches!(
+                &explicit_cwd_error,
+                SandboxBackendError::Fs(SandboxFsError::NotFound { path })
+                    if path == &invalid_guest_cwd
+            ),
+            "unexpected explicit cwd error: {explicit_cwd_error}"
+        );
+
+        let (mut non_simple_manifest, _) = store.load(&sandbox_id).expect("reload manifest");
+        non_simple_manifest
+            .runtime_binding
+            .as_mut()
+            .expect("runtime binding")
+            .runtime = "wasix".to_string();
+        store
+            .save_manifest(&non_simple_manifest)
+            .expect("persist non-simple runtime binding");
+        let mount_only_error = backend
+            .update(SandboxUpdateInstanceRequest {
+                sandbox_id,
+                cwd: None,
+                mounts: Some(Vec::new()),
+                env_set: BTreeMap::new(),
+                env_unset: Vec::new(),
+            })
+            .expect_err("other runtimes must validate a preserved cwd as a guest path");
+        assert!(
+            matches!(
+                &mount_only_error,
+                SandboxBackendError::Fs(SandboxFsError::NotFound { path })
+                    if path == &manifest.cwd
+            ),
+            "unexpected non-simple mount update error: {mount_only_error}"
+        );
+    }
+
+    #[test]
+    fn mount_reconciliation_reports_exact_additions_and_removals() {
+        let retained = SandboxMount {
+            source_sifs_path: "/services/sandbox-shared/retained".to_string(),
+            mount_path: SandboxPath::new("/retained").expect("retained path"),
+            mode: SandboxMountMode::ReadOnly,
+        };
+        let removed = SandboxMount {
+            source_sifs_path: "/services/sandbox-shared/changed".to_string(),
+            mount_path: SandboxPath::new("/changed").expect("changed path"),
+            mode: SandboxMountMode::ReadOnly,
+        };
+        let added = SandboxMount {
+            mode: SandboxMountMode::ReadWrite,
+            ..removed.clone()
+        };
+        let mut current = vec![retained.clone(), removed.clone()];
+
+        let report =
+            reconcile_sandbox_mounts(&mut current, Some(vec![retained.clone(), added.clone()]));
+
+        assert!(report.replacement_requested);
+        assert!(report.changed);
+        assert_eq!(report.removed, vec![removed]);
+        assert_eq!(report.added, vec![added.clone()]);
+        assert_eq!(current, vec![retained, added]);
+    }
+
+    #[test]
+    fn mount_reconciliation_preserves_order_only_and_duplicate_evidence() {
+        let first = SandboxMount {
+            source_sifs_path: "/services/sandbox-shared/first".to_string(),
+            mount_path: SandboxPath::new("/first").expect("first path"),
+            mode: SandboxMountMode::ReadOnly,
+        };
+        let second = SandboxMount {
+            source_sifs_path: "/services/sandbox-shared/second".to_string(),
+            mount_path: SandboxPath::new("/second").expect("second path"),
+            mode: SandboxMountMode::ReadOnly,
+        };
+        let mut current = vec![first.clone(), second.clone()];
+
+        let reordered =
+            reconcile_sandbox_mounts(&mut current, Some(vec![second.clone(), first.clone()]));
+        assert!(reordered.changed);
+        assert!(reordered.added.is_empty());
+        assert!(reordered.removed.is_empty());
+
+        current = vec![first.clone(), first.clone()];
+        let deduplicated = reconcile_sandbox_mounts(&mut current, Some(vec![first.clone()]));
+        assert!(deduplicated.changed);
+        assert_eq!(deduplicated.removed, vec![first.clone()]);
+        assert!(deduplicated.added.is_empty());
+        assert_eq!(current, vec![first]);
     }
 
     #[test]

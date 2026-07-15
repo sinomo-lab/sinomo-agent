@@ -72,7 +72,7 @@ impl AgentTool for SearchFilesTool {
             "matches": matches,
         });
         let evidence =
-            AgentToolEvidence::availability_only(true, "path resolved inside workspace root")
+            AgentToolEvidence::availability_only(true, "path resolved inside workspace grants")
                 .with_output_value(&payload, truncated);
         AgentToolResult::succeeded(format!("found {} match(es)", matches.len()), payload)
             .with_evidence(evidence)
@@ -87,7 +87,10 @@ pub(super) fn descriptor() -> AgentToolDescriptor {
             "required": ["query"],
             "properties": {
                 "query": { "type": "string" },
-                "path": { "type": "string" },
+                "path": {
+                    "type": "string",
+                    "description": "Search root. Relative paths use the primary workspace; absolute paths may address any granted workspace."
+                },
                 "case_sensitive": { "type": "boolean" },
                 "max_matches": { "type": "integer", "minimum": 1 }
             }

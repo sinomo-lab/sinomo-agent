@@ -32,7 +32,7 @@ use sinomo_runtime::sandbox::{
     SandboxInstanceLifecycleStatus, SandboxInstanceManifest, SandboxInstancePortability,
     SandboxLocalExecutionLease, SandboxMount, SandboxPath, SandboxPolicy, SandboxRuntimeBinding,
     SandboxStoreError, SandboxTempPolicy, SandboxToolchainId, SandboxTrackedProcess,
-    SandboxTrackedProcessStatus, SandboxWasiError,
+    SandboxTrackedProcessStatus, SandboxUpdateInstanceRequest, SandboxWasiError,
     recover_sandbox_local_execution_journal_with_lease, sandbox_execution_placement_for_node,
     try_acquire_sandbox_local_execution_lease,
 };
@@ -57,7 +57,12 @@ const SIMPLE_SANDBOX_RUNTIME: &str = "simple_sandbox";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalWorkspaceAgentConfig {
+    /// Default workspace and resolution base for every relative tool path.
     pub root: PathBuf,
+    /// Additional workspace grants in conversation order. Relative paths never
+    /// resolve against these roots; read tools and command cwd selection may
+    /// address them with absolute paths.
+    pub additional_workspace_roots: Vec<PathBuf>,
     pub evidence_dir: Option<PathBuf>,
     pub sifs_evidence: Option<LocalWorkspaceSifsEvidenceConfig>,
     pub command_runtime: LocalWorkspaceCommandRuntime,
@@ -135,6 +140,7 @@ impl LocalWorkspaceAgentConfig {
         let root = root.into();
         Self {
             root,
+            additional_workspace_roots: Vec::new(),
             evidence_dir: None,
             sifs_evidence: None,
             command_runtime: LocalWorkspaceCommandRuntime::SimpleSandbox,
@@ -163,6 +169,22 @@ impl LocalWorkspaceAgentConfig {
 
     pub fn with_command_runtime(mut self, command_runtime: LocalWorkspaceCommandRuntime) -> Self {
         self.command_runtime = command_runtime;
+        self
+    }
+
+    /// Append one additional workspace grant after the primary workspace.
+    pub fn with_additional_workspace_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.additional_workspace_roots.push(root.into());
+        self
+    }
+
+    /// Replace the ordered additional workspace grants.
+    pub fn with_additional_workspace_roots<I, P>(mut self, roots: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.additional_workspace_roots = roots.into_iter().map(Into::into).collect();
         self
     }
 
@@ -317,7 +339,23 @@ pub fn provision_default_agent_session_sandbox(
         .map_err(|source| format!("invalid agent sandbox toolchain id: {source}"))?;
     let store = LocalSandboxInstanceStore::new(&config.sandbox_runtime_root);
     match store.load(&sandbox_id) {
-        Ok(_) => return Ok(sandbox_id),
+        Ok((manifest, _)) => {
+            if manifest.mounts != mounts {
+                let mut backend = LocalSandboxBackend::with_store(store);
+                backend
+                    .update(SandboxUpdateInstanceRequest {
+                        sandbox_id: sandbox_id.clone(),
+                        cwd: None,
+                        env_set: BTreeMap::new(),
+                        env_unset: Vec::new(),
+                        mounts: Some(mounts),
+                    })
+                    .map_err(|source| {
+                        format!("reconcile sandbox `{sandbox_id}` workspace mounts: {source}")
+                    })?;
+            }
+            return Ok(sandbox_id);
+        }
         Err(SandboxStoreError::NotFound { .. }) => {}
         Err(source) => return Err(format!("load attached sandbox `{sandbox_id}`: {source}")),
     }
@@ -821,7 +859,7 @@ fn execute_simple_sandbox_command(
         "recover pending simple sandbox execution",
     ))?;
     let agent_home_host_path = agent_home_live_host_path(config);
-    let (_manifest, layout) = prepare_agent_sandbox_manifest(
+    let (manifest, layout) = prepare_agent_sandbox_manifest(
         config,
         &store,
         &sandbox_id,
@@ -837,6 +875,7 @@ fn execute_simple_sandbox_command(
         allow_unenforced: config.sandbox_allow_unenforced,
         host_sifs_root: config.sandbox_sifs_mount_root.clone(),
         extra_read_paths: sandbox_extra_read_paths(
+            config,
             &root,
             &cwd,
             &prepared.path_prefixes,
@@ -844,11 +883,15 @@ fn execute_simple_sandbox_command(
         ),
         // Shell execution is a generic host capability. Structured file-tool
         // authorization must not silently turn it into a read-only command.
-        extra_write_paths: sandbox_extra_write_paths(&root, agent_home_host_path.as_deref()),
+        extra_write_paths: sandbox_extra_write_paths(
+            config,
+            &root,
+            agent_home_host_path.as_deref(),
+        ),
         extra_execute_paths: sandbox_extra_execute_paths(&prepared.path_prefixes),
     });
     let toolchain_store = LocalSandboxToolchainStore::new(layout.toolchain_runtime_cache_root());
-    let policy = agent_sandbox_policy();
+    let policy = agent_sandbox_policy(&manifest);
     let command_text = std::iter::once(program.to_string())
         .chain(args.iter().cloned())
         .collect::<Vec<_>>()
@@ -1527,7 +1570,7 @@ fn sandbox_store_failure(
     }
 }
 
-fn agent_sandbox_policy() -> SandboxPolicy {
+fn agent_sandbox_policy(manifest: &SandboxInstanceManifest) -> SandboxPolicy {
     let mut policy = SandboxPolicy::default();
     policy.allow_read_write_sifs_mounts = true;
     if !policy
@@ -1538,6 +1581,22 @@ fn agent_sandbox_policy() -> SandboxPolicy {
         policy
             .allowed_mount_prefixes
             .push(AGENT_HOME_SIFS_ROOT.to_string());
+    }
+    // The attached manifest is the management-plane authority for this
+    // session's sandbox resources: orchestration materializes conversation
+    // grants there, while tool calls cannot add mounts. Admit those exact SIFS
+    // sources for this command instead of limiting execution to the
+    // sandbox-shared and agent-home namespaces.
+    for mount in &manifest.mounts {
+        if !policy
+            .allowed_mount_prefixes
+            .iter()
+            .any(|prefix| prefix == &mount.source_sifs_path)
+        {
+            policy
+                .allowed_mount_prefixes
+                .push(mount.source_sifs_path.clone());
+        }
     }
     policy
 }
@@ -1587,12 +1646,14 @@ fn sandbox_environment(
 }
 
 fn sandbox_extra_read_paths(
+    config: &LocalWorkspaceAgentConfig,
     root: &Path,
     cwd: &Path,
     path_prefixes: &[PathBuf],
     agent_home_host_path: Option<&Path>,
 ) -> Vec<PathBuf> {
     let mut paths = vec![root.to_path_buf(), cwd.to_path_buf()];
+    paths.extend(config.additional_workspace_roots.iter().cloned());
     paths.extend(path_prefixes.iter().cloned());
     if let Some(home) = agent_home_host_path {
         paths.push(home.to_path_buf());
@@ -1601,8 +1662,13 @@ fn sandbox_extra_read_paths(
     dedup_pathbufs(paths)
 }
 
-fn sandbox_extra_write_paths(root: &Path, agent_home_host_path: Option<&Path>) -> Vec<PathBuf> {
+fn sandbox_extra_write_paths(
+    config: &LocalWorkspaceAgentConfig,
+    root: &Path,
+    agent_home_host_path: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut paths = vec![root.to_path_buf()];
+    paths.extend(config.additional_workspace_roots.iter().cloned());
     if let Some(home) = agent_home_host_path {
         paths.push(home.to_path_buf());
     }
@@ -2084,13 +2150,13 @@ fn validate_local_workspace_file_access(
     let agent_home_host_path = agent_home_live_host_path(config);
     let allowed_paths = match access {
         LocalWorkspaceFileAccess::Read => {
-            sandbox_extra_read_paths(root, root, &[], agent_home_host_path.as_deref())
+            sandbox_extra_read_paths(config, root, root, &[], agent_home_host_path.as_deref())
         }
         LocalWorkspaceFileAccess::Write => {
             if !config.allow_file_writes {
                 Vec::new()
             } else {
-                sandbox_extra_write_paths(root, agent_home_host_path.as_deref())
+                sandbox_extra_write_paths(config, root, agent_home_host_path.as_deref())
             }
         }
     };
@@ -2238,16 +2304,22 @@ fn resolve_workspace_cwd(
         return Ok((root.clone(), root));
     };
     let requested_path = Path::new(requested);
-    let joined = if requested_path.is_absolute() {
+    let absolute_request = requested_path.is_absolute();
+    let joined = if absolute_request {
         requested_path.to_path_buf()
     } else {
         root.join(requested_path)
     };
     let resolved = fs::canonicalize(&joined)
         .map_err(|source| format!("cwd {} is not accessible: {source}", joined.display()))?;
-    if !resolved.starts_with(&root) {
+    let allowed = if absolute_request {
+        path_is_in_workspace_grants(config, &root, &resolved)
+    } else {
+        resolved.starts_with(&root)
+    };
+    if !allowed {
         return Err(format!(
-            "cwd {} escapes workspace root {}",
+            "cwd {} is outside granted workspace roots (primary: {})",
             resolved.display(),
             root.display()
         ));
@@ -2264,22 +2336,40 @@ fn resolve_existing_workspace_path(
 ) -> Result<PathBuf, String> {
     let root = canonical_workspace_root(config)?;
     let requested_path = Path::new(requested);
-    let joined = if requested_path.is_absolute() {
+    let absolute_request = requested_path.is_absolute();
+    let joined = if absolute_request {
         requested_path.to_path_buf()
     } else {
         root.join(requested_path)
     };
     let resolved = fs::canonicalize(&joined)
         .map_err(|source| format!("path {} is not accessible: {source}", joined.display()))?;
-    if resolved.starts_with(&root) {
+    let allowed = if absolute_request {
+        path_is_in_workspace_grants(config, &root, &resolved)
+    } else {
+        resolved.starts_with(&root)
+    };
+    if allowed {
         Ok(resolved)
     } else {
         Err(format!(
-            "path {} escapes workspace root {}",
+            "path {} is outside granted workspace roots (primary: {})",
             resolved.display(),
             root.display()
         ))
     }
+}
+
+fn path_is_in_workspace_grants(
+    config: &LocalWorkspaceAgentConfig,
+    canonical_primary_root: &Path,
+    canonical_path: &Path,
+) -> bool {
+    canonical_path.starts_with(canonical_primary_root)
+        || config
+            .additional_workspace_roots
+            .iter()
+            .any(|root| fs::canonicalize(root).is_ok_and(|root| canonical_path.starts_with(root)))
 }
 
 fn display_workspace_path(config: &LocalWorkspaceAgentConfig, path: &Path) -> String {
@@ -2331,8 +2421,14 @@ fn collect_workspace_search_matches(
     if matches.len() >= max_matches {
         return Ok(true);
     }
-    let metadata = fs::metadata(path)
+    let metadata = fs::symlink_metadata(path)
         .map_err(|source| format!("failed to stat {}: {source}", path.display()))?;
+    // The initial search root is canonicalized and grant-checked. Do not
+    // follow symlinks discovered during recursion, because their targets may
+    // leave every granted workspace after that check.
+    if metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
     if metadata.is_dir() {
         let mut dir_entries = fs::read_dir(path)
             .map_err(|source| format!("failed to list {}: {source}", path.display()))?
@@ -2445,6 +2541,205 @@ mod tests {
     }
 
     #[test]
+    fn ordered_additional_workspace_roots_expand_read_access_but_not_relative_resolution() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-ordered-workspaces");
+        let primary = root.join("primary");
+        let additional_a = root.join("additional-a");
+        let additional_b = root.join("additional-b");
+        let outside = root.join("outside");
+        for directory in [&primary, &additional_a, &additional_b, &outside] {
+            fs::create_dir_all(directory).expect("workspace directory");
+        }
+        fs::write(primary.join("shared.txt"), "primary content\n").expect("primary file");
+        fs::write(additional_a.join("shared.txt"), "additional alpha\n").expect("additional file");
+        fs::write(
+            additional_b.join("search.txt"),
+            "ordered workspace needle\n",
+        )
+        .expect("search file");
+        fs::write(outside.join("secret.txt"), "outside grant\n").expect("outside file");
+
+        let primary = fs::canonicalize(primary).expect("canonical primary");
+        let additional_a = fs::canonicalize(additional_a).expect("canonical additional a");
+        let additional_b = fs::canonicalize(additional_b).expect("canonical additional b");
+        let outside = fs::canonicalize(outside).expect("canonical outside");
+        let config = LocalWorkspaceAgentConfig::new(&primary)
+            .with_additional_workspace_roots([additional_a.clone(), additional_b.clone()])
+            .allowing_file_writes(true);
+        assert_eq!(
+            config.additional_workspace_roots,
+            vec![additional_a.clone(), additional_b.clone()]
+        );
+        let registry = AgentToolRegistry::local_workspace_with_config(config);
+        let session = test_session("ordered-workspace-reads");
+        let execute = |call_index: usize, tool: &str, input: serde_json::Value| {
+            registry.execute(
+                &session,
+                0,
+                call_index,
+                &AgentToolCall {
+                    call_id: None,
+                    tool: tool.to_string(),
+                    input,
+                    r#async: false,
+                    summary: format!("test {tool}"),
+                },
+            )
+        };
+
+        let relative_read = execute(0, "read_file", serde_json::json!({ "path": "shared.txt" }));
+        assert_eq!(relative_read.status, AgentToolStatus::Succeeded);
+        assert_eq!(relative_read.output["content"], "primary content\n");
+
+        let additional_read = execute(
+            1,
+            "read_file",
+            serde_json::json!({ "path": additional_a.join("shared.txt") }),
+        );
+        assert_eq!(additional_read.status, AgentToolStatus::Succeeded);
+        assert_eq!(additional_read.output["content"], "additional alpha\n");
+
+        let relative_escape = execute(
+            2,
+            "read_file",
+            serde_json::json!({ "path": "../additional-a/shared.txt" }),
+        );
+        assert_eq!(relative_escape.status, AgentToolStatus::Blocked);
+        assert_eq!(relative_escape.output["error"], "path_not_allowed");
+
+        let additional_list = execute(3, "list_files", serde_json::json!({ "path": additional_a }));
+        assert_eq!(additional_list.status, AgentToolStatus::Succeeded);
+        assert!(
+            additional_list.output["entries"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|entry| {
+                    entry["path"]
+                        == serde_json::Value::String(
+                            additional_a.join("shared.txt").display().to_string(),
+                        )
+                }))
+        );
+
+        let additional_search = execute(
+            4,
+            "search",
+            serde_json::json!({
+                "path": additional_b,
+                "query": "needle",
+            }),
+        );
+        assert_eq!(additional_search.status, AgentToolStatus::Succeeded);
+        assert_eq!(
+            additional_search.output["matches"].as_array().map(Vec::len),
+            Some(1)
+        );
+
+        let outside_read = execute(
+            5,
+            "read_file",
+            serde_json::json!({ "path": outside.join("secret.txt") }),
+        );
+        assert_eq!(outside_read.status, AgentToolStatus::Blocked);
+        assert_eq!(outside_read.output["error"], "path_not_allowed");
+
+        let additional_write = execute(
+            6,
+            "write_file",
+            serde_json::json!({
+                "path": additional_a.join("structured-write.txt"),
+                "content": "must remain primary-only",
+            }),
+        );
+        assert_eq!(additional_write.status, AgentToolStatus::Failed);
+        assert_eq!(additional_write.output["error"], "path_not_allowed");
+        assert!(!additional_a.join("structured-write.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn simple_sandbox_commands_default_to_primary_and_accept_absolute_additional_cwd() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-ordered-workspace-command");
+        let primary = root.join("primary");
+        let additional = root.join("additional");
+        let outside = root.join("outside");
+        let runtime_root = root.join("sandbox-runtime");
+        for directory in [&primary, &additional, &outside] {
+            fs::create_dir_all(directory).expect("workspace directory");
+        }
+        fs::write(additional.join("granted.txt"), "granted").expect("additional input");
+        let primary = fs::canonicalize(primary).expect("canonical primary");
+        let additional = fs::canonicalize(additional).expect("canonical additional");
+        let outside = fs::canonicalize(outside).expect("canonical outside");
+        let session = test_session("ordered-workspace-command");
+        let config = LocalWorkspaceAgentConfig::new(&primary)
+            .with_additional_workspace_root(&additional)
+            .with_sandbox_runtime_root(runtime_root)
+            .allowing_shell_commands(true);
+        let config = provision_test_agent_sandbox(config, &session);
+
+        let read_paths = sandbox_extra_read_paths(&config, &primary, &primary, &[], None);
+        let write_paths = sandbox_extra_write_paths(&config, &primary, None);
+        assert!(read_paths.iter().any(|path| path == &additional));
+        assert!(write_paths.iter().any(|path| path == &additional));
+
+        let registry = AgentToolRegistry::local_workspace_with_config(config);
+        let execute = |call_index: usize, input: serde_json::Value| {
+            registry.execute(
+                &session,
+                0,
+                call_index,
+                &AgentToolCall {
+                    call_id: None,
+                    tool: "run_command".to_string(),
+                    input,
+                    r#async: false,
+                    summary: "test ordered workspace command".to_string(),
+                },
+            )
+        };
+
+        let primary_cwd = execute(0, serde_json::json!({ "command": "pwd" }));
+        assert_eq!(
+            primary_cwd.status,
+            AgentToolStatus::Succeeded,
+            "{primary_cwd:#?}"
+        );
+        let primary_display = primary.display().to_string();
+        assert_eq!(
+            primary_cwd.output["stdout"].as_str().map(str::trim),
+            Some(primary_display.as_str())
+        );
+
+        let additional_cwd = execute(
+            1,
+            serde_json::json!({
+                "command": "cat granted.txt; printf updated > command-write.txt",
+                "cwd": additional,
+            }),
+        );
+        assert_eq!(
+            additional_cwd.status,
+            AgentToolStatus::Succeeded,
+            "{additional_cwd:#?}"
+        );
+        assert_eq!(additional_cwd.output["stdout"], "granted");
+        assert_eq!(
+            fs::read_to_string(additional.join("command-write.txt")).expect("command write"),
+            "updated"
+        );
+
+        let outside_cwd = execute(
+            2,
+            serde_json::json!({
+                "command": "pwd",
+                "cwd": outside,
+            }),
+        );
+        assert_eq!(outside_cwd.status, AgentToolStatus::Blocked);
+        assert_eq!(outside_cwd.output["error"], "workspace_root_not_allowed");
+    }
+
+    #[test]
     fn tool_call_never_creates_a_missing_sandbox() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-tool-no-sandbox-create");
         let workspace = root.join("workspace");
@@ -2477,6 +2772,68 @@ mod tests {
             LocalSandboxInstanceStore::new(runtime_root).load(&sandbox_id),
             Err(SandboxStoreError::NotFound { .. })
         ));
+    }
+
+    #[test]
+    fn orchestration_reconciles_mounts_on_an_existing_agent_sandbox() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-sandbox-mount-reconcile");
+        let workspace = root.join("workspace");
+        let runtime_root = root.join("sandbox-runtime");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let session = test_session("sandbox-mount-reconcile");
+        let sandbox_id = agent_sandbox_id_for_session(&session.session_id);
+        let config = LocalWorkspaceAgentConfig::new(&workspace)
+            .with_sandbox_runtime_root(&runtime_root)
+            .with_sandbox_instance_id(sandbox_id.clone())
+            .allowing_shell_commands(true);
+        let primary = SandboxMount {
+            source_sifs_path: "/workspaces/primary".to_string(),
+            mount_path: SandboxPath::new("/work").expect("primary mount path"),
+            mode: SandboxMountMode::ReadWrite,
+        };
+        provision_default_agent_session_sandbox(&config, Vec::new())
+            .expect("create default sandbox");
+        let registry = AgentToolRegistry::local_workspace_with_config(config.clone());
+        let command = registry.execute(
+            &session,
+            0,
+            0,
+            &AgentToolCall {
+                call_id: None,
+                tool: "run_command".to_string(),
+                input: serde_json::json!({ "command": "true" }),
+                r#async: false,
+                summary: "persist simple-native host cwd".to_string(),
+            },
+        );
+        assert_eq!(command.status, AgentToolStatus::Succeeded, "{command:#?}");
+        let initial_generation = LocalSandboxInstanceStore::new(&runtime_root)
+            .load(&sandbox_id)
+            .expect("load initial sandbox")
+            .0
+            .generation;
+
+        let secondary = SandboxMount {
+            source_sifs_path: "/workspaces/secondary".to_string(),
+            mount_path: SandboxPath::new("/workspaces/2").expect("secondary mount path"),
+            mode: SandboxMountMode::ReadOnly,
+        };
+        provision_default_agent_session_sandbox(&config, vec![primary.clone(), secondary.clone()])
+            .expect("reconcile existing sandbox mounts");
+
+        let (manifest, _) = LocalSandboxInstanceStore::new(&runtime_root)
+            .load(&sandbox_id)
+            .expect("load reconciled sandbox");
+        assert_eq!(manifest.mounts, vec![primary, secondary]);
+        assert_eq!(manifest.generation, initial_generation + 1);
+
+        provision_default_agent_session_sandbox(&config, Vec::new())
+            .expect("revoke every workspace mount");
+        let (revoked, _) = LocalSandboxInstanceStore::new(runtime_root)
+            .load(&sandbox_id)
+            .expect("load sandbox after mount revocation");
+        assert!(revoked.mounts.is_empty());
+        assert_eq!(revoked.generation, manifest.generation + 1);
     }
 
     #[test]
@@ -3011,8 +3368,7 @@ mod tests {
     }
 
     #[test]
-    fn simple_sandbox_policy_admits_live_read_write_agent_home_mount() {
-        let policy = agent_sandbox_policy();
+    fn simple_sandbox_policy_admits_manifest_workspace_and_agent_home_mounts() {
         let node_id = NodeId::from_legacy_named("agent-home-policy-node").expect("node");
         let mut manifest = SandboxInstanceManifest::new(
             SandboxId::from_legacy_named("agent-home-policy-sandbox").expect("sandbox"),
@@ -3026,6 +3382,12 @@ mod tests {
             mount_path: SandboxPath::new("/home").expect("mount path"),
             mode: SandboxMountMode::ReadWrite,
         });
+        manifest.mounts.push(SandboxMount {
+            source_sifs_path: "/conversations/test-channel/workspaces/project".to_string(),
+            mount_path: SandboxPath::new("/work").expect("workspace mount path"),
+            mode: SandboxMountMode::ReadWrite,
+        });
+        let policy = agent_sandbox_policy(&manifest);
 
         assert!(policy.allow_read_write_sifs_mounts);
         assert!(
@@ -3034,9 +3396,15 @@ mod tests {
                 .iter()
                 .any(|prefix| prefix == "/sinomo/agents")
         );
+        assert!(
+            policy
+                .allowed_mount_prefixes
+                .iter()
+                .any(|prefix| { prefix == "/conversations/test-channel/workspaces/project" })
+        );
         policy
             .validate_manifest(&manifest, &node_id)
-            .expect("agent home live read-write mount admitted");
+            .expect("manifest-declared workspace and agent home mounts admitted");
     }
 
     #[test]

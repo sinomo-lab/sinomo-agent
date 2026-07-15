@@ -2685,6 +2685,7 @@ pub(crate) fn handle_daemon_sandbox_create_on_runtime(
         &mut dfs,
         &manifest,
         &execution_node_id,
+        "sandbox-create-resolved-source",
     )?;
 
     let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
@@ -2773,18 +2774,24 @@ pub(crate) fn handle_daemon_sandbox_update_on_runtime(
     request: sinomo_sandbox::SandboxUpdateInstanceRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxUpdateInstanceResponse, DaemonError> {
-    let lifecycle_lease =
-        acquire_daemon_sandbox_mutation_lease(paths, &request.sandbox_id, runtime)?;
+    let sinomo_sandbox::SandboxUpdateInstanceRequest {
+        sandbox_id,
+        cwd,
+        mounts,
+        env_set,
+        env_unset,
+    } = request;
+    let lifecycle_lease = acquire_daemon_sandbox_mutation_lease(paths, &sandbox_id, runtime)?;
     let config = load_daemon_sandbox_policy_config(paths)?;
     let dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)?;
     let node_id = dfs.node_id().clone();
     let replica_candidates = daemon_sandbox_replica_candidates(paths, &node_id);
     let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
-        .with_replica_candidates(replica_candidates);
-    let mut manifest = store.load(&request.sandbox_id)?;
-    let cwd_changed = request.cwd.is_some();
-    let mut env_set_keys = request.env_set.keys().cloned().collect::<Vec<_>>();
-    let mut env_unset_keys = request.env_unset.clone();
+        .with_replica_candidates(replica_candidates.clone());
+    let mut manifest = store.load(&sandbox_id)?;
+    let cwd_changed = cwd.is_some();
+    let mut env_set_keys = env_set.keys().cloned().collect::<Vec<_>>();
+    let mut env_unset_keys = env_unset.clone();
     for key in env_set_keys.iter().chain(env_unset_keys.iter()) {
         if !sinomo_sandbox::sandbox_env_name_is_valid(key) {
             return Err(DaemonError::Parse {
@@ -2792,7 +2799,7 @@ pub(crate) fn handle_daemon_sandbox_update_on_runtime(
             });
         }
     }
-    for (key, value) in &request.env_set {
+    for (key, value) in &env_set {
         if value.contains('\0') {
             return Err(DaemonError::Parse {
                 detail: format!("sandbox env `{key}` contains an embedded NUL byte"),
@@ -2802,63 +2809,77 @@ pub(crate) fn handle_daemon_sandbox_update_on_runtime(
     env_set_keys.sort();
     env_unset_keys.sort();
     env_unset_keys.dedup();
-    if let Some(cwd) = request.cwd.as_ref() {
-        let fs = sinomo_sandbox::SifsSandboxFileSystem::new(store.into_inner(), &manifest);
-        sinomo_sandbox::validate_sandbox_working_directory(&fs, cwd)?;
-        store = sinomo_sandbox::SifsSandboxInstanceStore::new(fs.into_inner())
-            .with_replica_candidates(daemon_sandbox_replica_candidates(paths, &node_id));
-    }
-    if let Some(cwd) = request.cwd {
+    let mounts_reconciliation =
+        sinomo_sandbox::reconcile_sandbox_mounts(&mut manifest.mounts, mounts);
+    if let Some(cwd) = cwd {
         manifest.cwd = cwd;
     }
-    for key in request.env_unset {
+    for key in env_unset {
         manifest.env.remove(&key);
     }
-    manifest.env.extend(request.env_set);
+    manifest.env.extend(env_set);
+    validate_daemon_sandbox_manifest_policy(
+        paths,
+        &config.policy,
+        &node_id,
+        &manifest,
+        "sandbox-update",
+    )?;
+    if mounts_reconciliation.replacement_requested {
+        let mut dfs = store.into_inner();
+        validate_daemon_sandbox_resolved_mount_policy(
+            paths,
+            &config.policy,
+            &mut dfs,
+            &manifest,
+            &node_id,
+            "sandbox-update-resolved-source",
+        )?;
+        store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
+            .with_replica_candidates(replica_candidates.clone());
+    }
+    if cwd_changed || mounts_reconciliation.replacement_requested {
+        let fs = sinomo_sandbox::SifsSandboxFileSystem::new(store.into_inner(), &manifest);
+        sinomo_sandbox::validate_sandbox_working_directory(&fs, &manifest.cwd)?;
+        store = sinomo_sandbox::SifsSandboxInstanceStore::new(fs.into_inner())
+            .with_replica_candidates(replica_candidates);
+    }
     manifest
         .advance_generation()
         .map_err(|source| DaemonError::Parse {
             detail: source.to_string(),
         })?;
     manifest.updated_at = OffsetDateTime::now_utc();
-    if let Err(denial) = config.policy.validate_manifest(&manifest, &node_id) {
-        append_daemon_sandbox_event(
-            paths,
-            sinomo_sandbox::sandbox_policy_denied_event(
-                node_id.clone(),
-                Some(&manifest.sandbox_id),
-                "sandbox-update",
-                &denial,
-            ),
-        )?;
-        if denial.code.starts_with("mount-") {
-            append_daemon_sandbox_event(
-                paths,
-                sinomo_sandbox::sandbox_mount_denied_event(
-                    node_id,
-                    Some(&manifest.sandbox_id),
-                    "sandbox-update",
-                    &denial,
-                ),
-            )?;
-        }
-        return Err(DaemonError::Parse {
-            detail: denial.to_string(),
-        });
-    }
-    ensure_daemon_sandbox_mutation_lease(&lifecycle_lease, &request.sandbox_id, "before update")?;
+    ensure_daemon_sandbox_mutation_lease(&lifecycle_lease, &sandbox_id, "before update")?;
     store.save_manifest(&manifest)?;
-    ensure_daemon_sandbox_mutation_lease(&lifecycle_lease, &request.sandbox_id, "after update")?;
+    ensure_daemon_sandbox_mutation_lease(&lifecycle_lease, &sandbox_id, "after update")?;
     append_daemon_sandbox_event(
         paths,
         sinomo_sandbox::sandbox_instance_updated_event(
-            node_id,
+            node_id.clone(),
             &manifest,
             cwd_changed,
             &env_set_keys,
             &env_unset_keys,
+            mounts_reconciliation.replacement_requested,
+            mounts_reconciliation.changed,
+            &mounts_reconciliation.added,
+            &mounts_reconciliation.removed,
         ),
     )?;
+    for mount in &mounts_reconciliation.removed {
+        append_daemon_sandbox_event(
+            paths,
+            sinomo_sandbox::sandbox_mount_removed_event(node_id.clone(), &manifest, mount),
+        )?;
+    }
+    for mount in &mounts_reconciliation.added {
+        append_daemon_sandbox_event(
+            paths,
+            sinomo_sandbox::sandbox_mount_added_event(node_id.clone(), &manifest, mount),
+        )?;
+    }
+    ensure_daemon_sandbox_mutation_lease(&lifecycle_lease, &sandbox_id, "after update audit")?;
     Ok(sinomo_sandbox::SandboxUpdateInstanceResponse { manifest })
 }
 
@@ -4258,6 +4279,7 @@ fn validate_daemon_sandbox_resolved_mount_policy(
     dfs: &mut sinomo_dfs::NetworkedDfsService<sinomo_dfs::DfsNodeTransport>,
     manifest: &sinomo_sandbox::SandboxInstanceManifest,
     node_id: &sinomo_core::node::NodeId,
+    phase: &str,
 ) -> Result<(), DaemonError> {
     for mount in &manifest.mounts {
         let resolved = dfs.posix_resolve_path_distributed(&mount.source_sifs_path, true)?;
@@ -4269,7 +4291,7 @@ fn validate_daemon_sandbox_resolved_mount_policy(
                 sinomo_sandbox::sandbox_mount_denied_event(
                     node_id.clone(),
                     Some(&manifest.sandbox_id),
-                    "sandbox-create-resolved-source",
+                    phase,
                     &denial,
                 ),
             )?;

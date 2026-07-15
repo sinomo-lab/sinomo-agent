@@ -40,7 +40,7 @@ pub(super) fn descriptor() -> AgentToolDescriptor {
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "Optional workspace-relative directory. Omit this to run at the workspace root; do not use evidence artifact paths."
+                    "description": "Optional command directory. Relative paths use the primary workspace; an absolute path may select any granted workspace. Omit this to run at the primary workspace root; do not use evidence artifact paths."
                 },
                 "timeout_ms": {
                     "type": "integer",

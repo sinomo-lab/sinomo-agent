@@ -14800,6 +14800,31 @@ fn main_agent_tool_registry_exposes_config_catalog_and_workspace_tools() {
 }
 
 #[test]
+fn ordered_sifs_workspace_grants_map_to_stable_sandbox_mount_aliases() {
+    let grants = vec![
+        sinomo_agent::WorkspaceRef::sifs("primary", "/teams/primary"),
+        // A local-only grant still occupies its conversation position even
+        // though it does not need a sandbox mount.
+        sinomo_agent::WorkspaceRef::local_path("/host/local-only"),
+        sinomo_agent::WorkspaceRef::sifs("secondary", "/teams/secondary"),
+    ];
+
+    let mounts = super::sandbox_mounts_for_workspace_grants(&grants, true)
+        .expect("ordered workspace mounts");
+
+    assert_eq!(mounts.len(), 2);
+    assert_eq!(mounts[0].source_sifs_path, "/teams/primary");
+    assert_eq!(mounts[0].mount_path.as_str(), "/work");
+    assert_eq!(mounts[1].source_sifs_path, "/teams/secondary");
+    assert_eq!(mounts[1].mount_path.as_str(), "/workspaces/3");
+    assert!(
+        mounts
+            .iter()
+            .all(|mount| { mount.mode == sinomo_runtime::sandbox::SandboxMountMode::ReadWrite })
+    );
+}
+
+#[test]
 fn background_agent_cluster_status_tool_reads_the_selected_data_dir() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-cluster-status");
     let data_dir = SinomoDataDir::new(&root);

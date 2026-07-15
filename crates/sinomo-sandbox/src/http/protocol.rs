@@ -261,6 +261,11 @@ pub struct SandboxUpdateInstanceRequest {
     pub sandbox_id: SandboxId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<SandboxPath>,
+    /// Replace the complete mount set when present. `None` preserves the
+    /// current mounts, while `Some(Vec::new())` explicitly removes every
+    /// mount.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mounts: Option<Vec<SandboxMount>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env_set: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -626,4 +631,38 @@ fn sandbox_http_header_is_sensitive(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_update_mount_replacement_is_wire_compatible_and_distinguishes_clear() {
+        let sandbox_id =
+            SandboxId::from_legacy_named("sandbox_update_wire_compat").expect("sandbox id");
+        let preserve = SandboxUpdateInstanceRequest {
+            sandbox_id: sandbox_id.clone(),
+            cwd: None,
+            mounts: None,
+            env_set: BTreeMap::new(),
+            env_unset: Vec::new(),
+        };
+
+        let preserve_json = serde_json::to_value(&preserve).expect("serialize update");
+        assert!(preserve_json.get("mounts").is_none());
+        let decoded: SandboxUpdateInstanceRequest =
+            serde_json::from_value(preserve_json).expect("decode legacy-shaped update");
+        assert_eq!(decoded.mounts, None);
+
+        let clear = SandboxUpdateInstanceRequest {
+            sandbox_id,
+            cwd: None,
+            mounts: Some(Vec::new()),
+            env_set: BTreeMap::new(),
+            env_unset: Vec::new(),
+        };
+        let clear_json = serde_json::to_value(&clear).expect("serialize mount clear");
+        assert_eq!(clear_json["mounts"], serde_json::json!([]));
+    }
 }

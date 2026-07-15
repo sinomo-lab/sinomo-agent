@@ -18,6 +18,8 @@ pub const AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub const AGENT_CHANNEL_APP_USER_ID: &str = "user.app.local";
 pub const AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT: usize = 400;
 pub const AGENT_CHANNEL_MESSAGE_RECONCILIATION_VERSION: u32 = 1;
+pub const AGENT_CHANNEL_WORKSPACE_PROJECTION_VERSION: u32 = 1;
+pub const AGENT_CHANNEL_WORKSPACE_CAUSAL_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentChannel {
@@ -39,6 +41,32 @@ pub struct AgentChannel {
     /// conversation. The first workspace is the default sandbox cwd.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspaces: Vec<WorkspaceRef>,
+    /// Distinguishes a current, intentionally empty grant set from legacy
+    /// snapshots written before channels owned workspace grants.
+    #[serde(default)]
+    pub workspace_projection_version: u32,
+    /// Conversation-local diagnostic counter for workspace grant mutations.
+    /// Authorization merge order is carried by `workspace_causal_tokens`, not
+    /// this replica-local scalar.
+    #[serde(default)]
+    pub workspace_revision: u64,
+    /// Diagnostic last-add/update counters retained for compatibility with
+    /// snapshots written before causal projection tokens were introduced.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspace_grant_revisions: BTreeMap<String, u64>,
+    /// Grow-only causal context for exact workspace-projection mutations.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub workspace_causal_tokens: BTreeSet<TaskId>,
+    /// Maximal exact projection values in the workspace multi-value register.
+    /// Keeping every concurrent head makes merge associative; `workspaces` is
+    /// the deterministic least-privilege materialization of these values.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspace_causal_heads: BTreeMap<TaskId, Vec<WorkspaceRef>>,
+    /// Protocol marker for interpreting the causal context and heads.
+    /// Tokenless snapshots from older writers use zero and are normalized as
+    /// one opaque head rather than trusted as observed causal ancestors.
+    #[serde(default)]
+    pub workspace_causal_version: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transcript: Vec<AgentChannelMessage>,
     #[serde(default = "default_next_channel_sequence")]
@@ -58,6 +86,12 @@ impl AgentChannel {
             users: vec![AgentChannelUser::app_local()],
             participants: Vec::new(),
             workspaces: Vec::new(),
+            workspace_projection_version: AGENT_CHANNEL_WORKSPACE_PROJECTION_VERSION,
+            workspace_revision: 0,
+            workspace_grant_revisions: BTreeMap::new(),
+            workspace_causal_tokens: BTreeSet::new(),
+            workspace_causal_heads: BTreeMap::new(),
+            workspace_causal_version: AGENT_CHANNEL_WORKSPACE_CAUSAL_VERSION,
             transcript: Vec::new(),
             next_sequence: 1,
         }
@@ -193,48 +227,123 @@ impl AgentChannel {
         self.workspaces.first()
     }
 
+    pub fn has_authoritative_workspace_projection(&self) -> bool {
+        self.workspace_projection_version > 0 || !self.workspaces.is_empty()
+    }
+
+    pub fn mark_workspace_projection_authoritative(&mut self) -> bool {
+        if self.workspace_projection_version >= AGENT_CHANNEL_WORKSPACE_PROJECTION_VERSION {
+            return false;
+        }
+        self.ensure_workspace_causal_register();
+        self.workspace_projection_version = AGENT_CHANNEL_WORKSPACE_PROJECTION_VERSION;
+        self.record_workspace_mutation();
+        self.touch();
+        true
+    }
+
     pub fn add_workspace(&mut self, workspace: WorkspaceRef) -> bool {
+        let projection_changed = self.mark_workspace_projection_authoritative();
+        let register_changed = self.ensure_workspace_causal_register();
+        let workspace_id = workspace.id.clone();
         if let Some(existing) = self
             .workspaces
             .iter_mut()
             .find(|existing| existing.id == workspace.id)
         {
             if existing == &workspace {
-                return false;
+                if register_changed {
+                    self.touch();
+                }
+                return projection_changed || register_changed;
             }
             *existing = workspace;
         } else {
             self.workspaces.push(workspace);
         }
+        self.record_workspace_mutation();
+        self.workspace_grant_revisions
+            .insert(workspace_id, self.workspace_revision);
         self.touch();
         true
     }
 
     pub fn remove_workspace(&mut self, workspace_id: &str) -> bool {
+        let projection_changed = self.mark_workspace_projection_authoritative();
+        let register_changed = self.ensure_workspace_causal_register();
         let previous_len = self.workspaces.len();
         self.workspaces
             .retain(|workspace| workspace.id != workspace_id);
         if self.workspaces.len() == previous_len {
-            return false;
+            if register_changed {
+                self.touch();
+            }
+            return projection_changed || register_changed;
         }
+        self.record_workspace_mutation();
+        self.workspace_grant_revisions.remove(workspace_id);
+        self.touch();
+        true
+    }
+
+    /// Replace the conversation's workspace projection with an authoritative
+    /// empty grant set. This is deliberately distinct from a legacy snapshot
+    /// where the workspace projection field was absent.
+    pub fn clear_workspaces(&mut self) -> bool {
+        self.mark_workspace_projection_authoritative();
+        self.ensure_workspace_causal_register();
+        self.workspaces.clear();
+        self.workspace_grant_revisions.clear();
+        self.record_workspace_mutation();
+        self.touch();
+        true
+    }
+
+    /// Atomically replace the ordered conversation workspace grant set.
+    /// Duplicate ids are collapsed to the first occurrence so the projection
+    /// remains a deterministic ordered set.
+    pub fn replace_workspaces(&mut self, workspaces: Vec<WorkspaceRef>) -> bool {
+        self.mark_workspace_projection_authoritative();
+        self.ensure_workspace_causal_register();
+        let mut seen = BTreeSet::new();
+        let workspaces = workspaces
+            .into_iter()
+            .filter(|workspace| seen.insert(workspace.id.clone()))
+            .collect::<Vec<_>>();
+        self.workspaces = workspaces;
+        self.record_workspace_mutation();
+        self.workspace_grant_revisions = self
+            .workspaces
+            .iter()
+            .map(|workspace| (workspace.id.clone(), self.workspace_revision))
+            .collect();
         self.touch();
         true
     }
 
     pub fn move_workspace(&mut self, workspace_id: &str, target_index: usize) -> bool {
+        let projection_changed = self.mark_workspace_projection_authoritative();
+        let register_changed = self.ensure_workspace_causal_register();
         let Some(current_index) = self
             .workspaces
             .iter()
             .position(|workspace| workspace.id == workspace_id)
         else {
-            return false;
+            if register_changed {
+                self.touch();
+            }
+            return projection_changed || register_changed;
         };
         let workspace = self.workspaces.remove(current_index);
         let target_index = target_index.min(self.workspaces.len());
         self.workspaces.insert(target_index, workspace);
         if current_index == target_index {
-            return false;
+            if register_changed {
+                self.touch();
+            }
+            return projection_changed || register_changed;
         }
+        self.record_workspace_mutation();
         self.touch();
         true
     }
@@ -380,6 +489,86 @@ impl AgentChannel {
     fn touch(&mut self) {
         self.updated_at = time::OffsetDateTime::now_utc();
     }
+
+    /// Normalize legacy, unknown, or malformed causal metadata into one opaque
+    /// head for the exact currently materialized projection. The deterministic
+    /// head id makes this upgrade stable across replicas. An empty head set with
+    /// retained causal tokens is canonical: it records that every known head was
+    /// superseded and must survive incremental joins without re-normalization.
+    pub fn ensure_workspace_causal_register(&mut self) -> bool {
+        if self.workspace_causal_version == AGENT_CHANNEL_WORKSPACE_CAUSAL_VERSION
+            && self
+                .workspace_causal_heads
+                .keys()
+                .all(|head| self.workspace_causal_tokens.contains(head))
+            && ((!self.workspace_causal_heads.is_empty()
+                && self.materialized_workspace_projection() == self.workspaces)
+                || (self.workspace_causal_heads.is_empty() && self.workspaces.is_empty()))
+        {
+            return false;
+        }
+
+        let fingerprint = serde_json::to_vec(&(
+            &self.channel_id,
+            self.workspace_projection_version,
+            self.workspace_revision,
+            &self.workspace_grant_revisions,
+            &self.workspaces,
+            self.workspace_causal_version,
+            &self.workspace_causal_tokens,
+            &self.workspace_causal_heads,
+        ))
+        .expect("workspace projection metadata is serializable");
+        let head = TaskId::derived("agent-channel-workspace-legacy-head", fingerprint);
+        self.workspace_causal_tokens.clear();
+        self.workspace_causal_tokens.insert(head.clone());
+        self.workspace_causal_heads.clear();
+        self.workspace_causal_heads
+            .insert(head, self.workspaces.clone());
+        self.workspace_causal_version = AGENT_CHANNEL_WORKSPACE_CAUSAL_VERSION;
+        true
+    }
+
+    pub fn materialized_workspace_projection(&self) -> Vec<WorkspaceRef> {
+        materialize_workspace_causal_heads(&self.workspace_causal_heads)
+    }
+
+    fn record_workspace_mutation(&mut self) {
+        self.workspace_revision = self.workspace_revision.saturating_add(1);
+        self.workspace_causal_version = AGENT_CHANNEL_WORKSPACE_CAUSAL_VERSION;
+        self.workspace_causal_tokens
+            .extend(self.workspace_causal_heads.keys().cloned());
+        self.workspace_causal_heads.clear();
+        let head = TaskId::generate();
+        self.workspace_causal_tokens.insert(head.clone());
+        self.workspace_causal_heads
+            .insert(head, self.workspaces.clone());
+    }
+}
+
+fn materialize_workspace_causal_heads(
+    heads: &BTreeMap<TaskId, Vec<WorkspaceRef>>,
+) -> Vec<WorkspaceRef> {
+    let Some(first) = heads.values().next() else {
+        return Vec::new();
+    };
+    if heads.values().all(|projection| projection == first) {
+        return first.clone();
+    }
+    first
+        .iter()
+        .filter(|workspace| {
+            heads.values().all(|projection| {
+                projection
+                    .iter()
+                    .any(|candidate| candidate.id == workspace.id && candidate == *workspace)
+            })
+        })
+        .cloned()
+        .map(|workspace| (workspace.id.clone(), workspace))
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
+        .collect()
 }
 
 fn default_next_channel_sequence() -> u64 {
@@ -1867,12 +2056,53 @@ mod tests {
         let second = WorkspaceRef::sifs("shared", "/teams/shared");
 
         assert!(channel.add_workspace(first.clone()));
+        assert_eq!(channel.workspace_revision, 1);
+        assert_eq!(channel.workspace_causal_tokens.len(), 1);
+        assert_eq!(channel.workspace_causal_heads.len(), 1);
         assert!(channel.add_workspace(second.clone()));
+        assert_eq!(channel.workspace_revision, 2);
+        assert_eq!(channel.workspace_causal_tokens.len(), 2);
         assert_eq!(channel.primary_workspace(), Some(&first));
         assert!(channel.move_workspace(&second.id, 0));
+        assert_eq!(channel.workspace_revision, 3);
+        assert_eq!(channel.workspace_causal_tokens.len(), 3);
         assert_eq!(channel.primary_workspace(), Some(&second));
         assert!(channel.remove_workspace(&second.id));
+        assert_eq!(channel.workspace_revision, 4);
+        assert_eq!(channel.workspace_causal_tokens.len(), 4);
         assert_eq!(channel.primary_workspace(), Some(&first));
+        assert!(channel.clear_workspaces());
+        assert_eq!(channel.workspace_revision, 5);
+        assert_eq!(channel.workspace_causal_tokens.len(), 5);
+        assert!(channel.workspaces.is_empty());
+        assert!(channel.workspace_grant_revisions.is_empty());
+        assert!(channel.has_authoritative_workspace_projection());
+        assert!(channel.clear_workspaces());
+        assert_eq!(channel.workspace_revision, 6);
+        assert_eq!(channel.workspace_causal_tokens.len(), 6);
+        assert_eq!(channel.workspace_causal_heads.len(), 1);
+    }
+
+    #[test]
+    fn legacy_channel_without_workspace_projection_marker_is_not_authoritative() {
+        let channel_id = SessionId::generate();
+        let value = serde_json::json!({
+            "channel_id": channel_id,
+            "title": "Legacy",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "deleted_at": null,
+            "next_sequence": 1
+        });
+        let channel: AgentChannel = serde_json::from_value(value).expect("legacy channel");
+
+        assert_eq!(channel.workspace_projection_version, 0);
+        assert_eq!(channel.workspace_revision, 0);
+        assert!(channel.workspace_grant_revisions.is_empty());
+        assert!(channel.workspace_causal_tokens.is_empty());
+        assert!(channel.workspace_causal_heads.is_empty());
+        assert_eq!(channel.workspace_causal_version, 0);
+        assert!(!channel.has_authoritative_workspace_projection());
     }
 
     #[derive(Clone, Default)]

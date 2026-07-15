@@ -18,22 +18,24 @@ use std::time::{Duration, Instant};
 use sinomo_agent::AgentChannelUser;
 use sinomo_agent::{
     AGENT_CHANNEL_APP_USER_ID, AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT,
-    AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION, AGENT_SESSION_SNAPSHOT_SCHEMA_VERSION, AgentCatalog,
-    AgentChannel, AgentChannelAttachment, AgentChannelAuthor, AgentChannelExecutorError,
-    AgentChannelKind, AgentChannelLoopConfig, AgentChannelMessage, AgentChannelMessageKind,
-    AgentChannelParticipant, AgentChannelRuntime, AgentChannelRuntimeEvent, AgentChannelSource,
-    AgentChannelSpeakDecision, AgentChannelStore, AgentChannelStoreError, AgentChannelTurn,
-    AgentChannelTurnExecutor, AgentContextAttachment, AgentDefinition, AgentEvent,
-    AgentEventPayload, AgentItem, AgentModelEvent, AgentRuntimeControlHost,
-    AgentRuntimeControlRegistry, AgentRuntimeEvent, AgentRuntimeEventPayload, AgentSession,
-    AgentSessionControlResult, AgentSessionFollowUpRequest, AgentSessionInterruptRequest,
-    AgentSessionReattachState, AgentSessionRemoveQueuedInputRequest, AgentSessionResumeRequest,
-    AgentSessionResumeResponse, AgentSessionSnapshot, AgentSessionSteerRequest, AgentSessionStore,
-    AgentTaskLifecycleStatus, AgentTaskSnapshot, AgentToolProgressEvent, ContextAssemblyReport,
-    FileAgentSessionStore, InteractionOutput, InteractionSession, InteractionSurface,
-    InteractionSurfaceKind, SkillActivationScope, SkillCatalogEntry, SkillCatalogSifsStore,
-    SkillCatalogSource, SkillCatalogStore, SkillCatalogWrite, TaskId,
-    channel_message_agent_item_id, mark_participant_message_observed, render_common_skill_markdown,
+    AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION, AGENT_CHANNEL_WORKSPACE_CAUSAL_VERSION,
+    AGENT_CHANNEL_WORKSPACE_PROJECTION_VERSION, AGENT_SESSION_SNAPSHOT_SCHEMA_VERSION,
+    AgentCatalog, AgentChannel, AgentChannelAttachment, AgentChannelAuthor,
+    AgentChannelExecutorError, AgentChannelKind, AgentChannelLoopConfig, AgentChannelMessage,
+    AgentChannelMessageKind, AgentChannelParticipant, AgentChannelRuntime,
+    AgentChannelRuntimeEvent, AgentChannelSource, AgentChannelSpeakDecision, AgentChannelStore,
+    AgentChannelStoreError, AgentChannelTurn, AgentChannelTurnExecutor, AgentContextAttachment,
+    AgentDefinition, AgentEvent, AgentEventPayload, AgentItem, AgentModelEvent,
+    AgentRuntimeControlHost, AgentRuntimeControlRegistry, AgentRuntimeEvent,
+    AgentRuntimeEventPayload, AgentSession, AgentSessionControlResult, AgentSessionFollowUpRequest,
+    AgentSessionInterruptRequest, AgentSessionReattachState, AgentSessionRemoveQueuedInputRequest,
+    AgentSessionResumeRequest, AgentSessionResumeResponse, AgentSessionSnapshot,
+    AgentSessionSteerRequest, AgentSessionStore, AgentTaskLifecycleStatus, AgentTaskSnapshot,
+    AgentToolProgressEvent, ContextAssemblyReport, FileAgentSessionStore, InteractionOutput,
+    InteractionSession, InteractionSurface, InteractionSurfaceKind, SkillActivationScope,
+    SkillCatalogEntry, SkillCatalogSifsStore, SkillCatalogSource, SkillCatalogStore,
+    SkillCatalogWrite, TaskId, WorkspaceRef, channel_message_agent_item_id,
+    mark_participant_message_observed, render_common_skill_markdown,
     safe_agent_channel_attachment_file_name, sync_participant_session,
 };
 use sinomo_lm::{
@@ -1635,20 +1637,7 @@ fn merge_channel_snapshot(
     }
     merged.users = users.into_values().collect();
 
-    // Workspace order is user intent, so retain the newer snapshot's order
-    // and append concurrently added entries from the older snapshot. Identity
-    // is the stable WorkspaceRef id; metadata from the newer snapshot wins.
-    let mut workspaces = newer.workspaces.clone();
-    let mut workspace_ids = workspaces
-        .iter()
-        .map(|workspace| workspace.id.clone())
-        .collect::<BTreeSet<_>>();
-    for workspace in &older.workspaces {
-        if workspace_ids.insert(workspace.id.clone()) {
-            workspaces.push(workspace.clone());
-        }
-    }
-    merged.workspaces = workspaces;
+    reconcile_channel_workspace_projection(&mut merged, &existing, &candidate, newer)?;
 
     let mut participants = newer
         .participants
@@ -1696,6 +1685,108 @@ fn merge_channel_snapshot(
         .max(candidate.next_sequence)
         .max(merged.transcript.len() as u64 + 1);
     Ok(merged)
+}
+
+fn reconcile_channel_workspace_projection(
+    merged: &mut AgentChannel,
+    left: &AgentChannel,
+    right: &AgentChannel,
+    newer: &AgentChannel,
+) -> Result<(), AgentChannelStoreError> {
+    let left_authoritative = left.has_authoritative_workspace_projection();
+    let right_authoritative = right.has_authoritative_workspace_projection();
+    match (left_authoritative, right_authoritative) {
+        (false, false) => {
+            copy_channel_workspace_projection(merged, newer);
+        }
+        (true, false) => copy_channel_workspace_projection(merged, left),
+        (false, true) => copy_channel_workspace_projection(merged, right),
+        (true, true) => {
+            let mut left = left.clone();
+            let mut right = right.clone();
+            left.ensure_workspace_causal_register();
+            right.ensure_workspace_causal_register();
+
+            let head_ids = left
+                .workspace_causal_heads
+                .keys()
+                .chain(right.workspace_causal_heads.keys())
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let mut heads = BTreeMap::new();
+            for head_id in head_ids {
+                match (
+                    left.workspace_causal_heads.get(&head_id),
+                    right.workspace_causal_heads.get(&head_id),
+                ) {
+                    (Some(left_value), Some(right_value)) if left_value == right_value => {
+                        heads.insert(head_id, left_value.clone());
+                    }
+                    (Some(_), Some(_)) => {
+                        // A valid generated head id cannot carry two values.
+                        // Treat a malformed/colliding head as exact empty so it
+                        // remains conservatively sticky in later joins.
+                        heads.insert(head_id, Vec::new());
+                    }
+                    (Some(left_value), None)
+                        if !right.workspace_causal_tokens.contains(&head_id) =>
+                    {
+                        heads.insert(head_id, left_value.clone());
+                    }
+                    (None, Some(right_value))
+                        if !left.workspace_causal_tokens.contains(&head_id) =>
+                    {
+                        heads.insert(head_id, right_value.clone());
+                    }
+                    (Some(_), None) | (None, Some(_)) | (None, None) => {}
+                }
+            }
+
+            merged.workspace_causal_tokens = left
+                .workspace_causal_tokens
+                .union(&right.workspace_causal_tokens)
+                .cloned()
+                .collect();
+            merged.workspace_causal_heads = heads;
+            merged.workspace_causal_version = AGENT_CHANNEL_WORKSPACE_CAUSAL_VERSION;
+            merged.workspaces = merged.materialized_workspace_projection();
+            merged.workspace_revision = left.workspace_revision.max(right.workspace_revision);
+            merged.workspace_grant_revisions = merged
+                .workspaces
+                .iter()
+                .map(|workspace| {
+                    let revision = left
+                        .workspace_grant_revisions
+                        .get(&workspace.id)
+                        .copied()
+                        .unwrap_or_default()
+                        .max(
+                            right
+                                .workspace_grant_revisions
+                                .get(&workspace.id)
+                                .copied()
+                                .unwrap_or_default(),
+                        );
+                    (workspace.id.clone(), revision)
+                })
+                .collect();
+            merged.workspace_projection_version = left
+                .workspace_projection_version
+                .max(right.workspace_projection_version)
+                .max(AGENT_CHANNEL_WORKSPACE_PROJECTION_VERSION);
+        }
+    }
+    Ok(())
+}
+
+fn copy_channel_workspace_projection(target: &mut AgentChannel, source: &AgentChannel) {
+    target.workspaces = source.workspaces.clone();
+    target.workspace_projection_version = source.workspace_projection_version;
+    target.workspace_revision = source.workspace_revision;
+    target.workspace_grant_revisions = source.workspace_grant_revisions.clone();
+    target.workspace_causal_tokens = source.workspace_causal_tokens.clone();
+    target.workspace_causal_heads = source.workspace_causal_heads.clone();
+    target.workspace_causal_version = source.workspace_causal_version;
 }
 
 fn canonicalize_channel_messages(
@@ -2087,14 +2178,20 @@ fn select_resumable_agent_session(
         (Some(key), _) | (_, Some(key)) => Some(key.to_string()),
         (None, None) => None,
     };
-    if local.workspace_binding != roaming.workspace_binding {
-        return Err(format!(
-            "local and roaming agent sessions disagree on workspace binding for {}",
-            local.session_id
-        ));
-    }
-    if local == roaming {
-        return Ok(Some(roaming));
+    // Workspace authority belongs to the channel. Ignore this legacy shadow
+    // while comparing private session state, but retain the shadow from the
+    // complete snapshot selected below. Splicing a local binding into a newer
+    // roaming snapshot would pair state that never existed together.
+    let mut comparable_local = local.clone();
+    let mut comparable_roaming = roaming.clone();
+    comparable_local.agent_definition_key = reconciled_agent_key.clone();
+    comparable_roaming.agent_definition_key = reconciled_agent_key.clone();
+    comparable_local.workspace_binding = None;
+    comparable_roaming.workspace_binding = None;
+    if comparable_local == comparable_roaming {
+        let mut selected = roaming;
+        selected.agent_definition_key = reconciled_agent_key;
+        return Ok(Some(selected));
     }
     let local_items = local
         .raw_transcript
@@ -2325,10 +2422,15 @@ impl AgentChat {
         let (mut channel, loaded_existing_channel) =
             match self.channel_store.load_channel(&session.session_id) {
                 Ok(Some(channel)) => (channel, true),
-                Ok(None) => (
-                    AgentChannel::with_default_title(session.session_id.clone()),
-                    false,
-                ),
+                Ok(None) => {
+                    let mut channel = AgentChannel::with_default_title(session.session_id.clone());
+                    // This is a compatibility shell for a standalone session,
+                    // not a newly-created conversation. Leave its empty grant
+                    // projection unmarked so it can migrate the legacy session
+                    // shadow exactly once.
+                    channel.workspace_projection_version = 0;
+                    (channel, false)
+                }
                 Err(error) => {
                     return Err(CliError::Parse {
                         detail: format!("load chat channel failed: {error}"),
@@ -2483,7 +2585,6 @@ impl AgentChat {
                                 ),
                             })?;
                     sync_participant_session(&channel_view, channel_participant, &mut persisted);
-                    participant = channel_participant.clone();
                 } else {
                     sync_participant_session(&channel_view, &mut participant, &mut persisted);
                 }
@@ -2492,15 +2593,6 @@ impl AgentChat {
                     .map_err(|source| CliError::Parse {
                         detail: format!("persist reconciled chat session failed: {source}"),
                     })?;
-                if session_participant_id.is_some()
-                    && let Err(detail) =
-                        self.session_checkpoint_store
-                            .publish(&channel, &participant, &persisted)
-                {
-                    self.resume_sync_warnings.push(format!(
-                        "publish reconciled agent session checkpoint failed: {detail}"
-                    ));
-                }
                 tui::app_prepare_agent(
                     self.runtime.handler_mut(),
                     &self.data_dir,
@@ -2557,11 +2649,31 @@ impl AgentChat {
         }
         self.channel = channel;
         self.configure_tool_runtime_for_session(&session.session_id)?;
-        if loaded_existing_channel && self.channel != channel_before_resume {
+        if !loaded_existing_channel || self.channel != channel_before_resume {
             if let Err(error) = self.save_channel() {
                 self.resume_sync_warnings
                     .push(format!("save reconciled chat channel failed: {error}"));
             }
+        }
+        if let Some(projected_session) = self.runtime.handler().agent_session_snapshot()?
+            && let Some(projected_agent_key) = projected_session
+                .agent_definition_key
+                .as_deref()
+                .filter(|key| !key.trim().is_empty())
+            && let Some(projected_participant) = self.channel.participants.iter().find(|entry| {
+                entry.enabled
+                    && entry.agent_session_id == projected_session.session_id
+                    && entry.agent_key == projected_agent_key
+            })
+            && let Err(detail) = self.session_checkpoint_store.publish(
+                &self.channel,
+                projected_participant,
+                &projected_session,
+            )
+        {
+            self.resume_sync_warnings.push(format!(
+                "publish projected agent session checkpoint failed: {detail}"
+            ));
         }
         Ok(())
     }
@@ -2600,12 +2712,40 @@ impl AgentChat {
         }
         let mut selection = self.tool_runtime.clone();
         selection.sandbox_node_id = normalized;
+        selection.workspace_root = None;
         self.set_tool_runtime(selection)
     }
 
     pub fn set_tool_runtime(
         &mut self,
+        selection: ChatToolRuntimeSelection,
+    ) -> Result<ChatToolRuntimeSelection, CliError> {
+        self.set_tool_runtime_with_workspace_replacement(selection, None)
+    }
+
+    /// Replace the chat/channel's complete ordered workspace grant set. This
+    /// is the explicit authority-changing API; `set_tool_runtime(None)` keeps
+    /// the durable projection so reconnect and node-only updates cannot revoke
+    /// or recreate grants from stale UI state.
+    pub fn replace_workspaces(
+        &mut self,
+        workspaces: Vec<WorkspaceRef>,
+    ) -> Result<ChatToolRuntimeSelection, CliError> {
+        let mut selection = self.tool_runtime.clone();
+        selection.workspace_root = None;
+        self.set_tool_runtime_with_workspace_replacement(selection, Some(workspaces))
+    }
+
+    /// Revoke every workspace from this conversation while retaining the
+    /// session's sandbox attachment and other tool-runtime placement settings.
+    pub fn clear_workspaces(&mut self) -> Result<ChatToolRuntimeSelection, CliError> {
+        self.replace_workspaces(Vec::new())
+    }
+
+    fn set_tool_runtime_with_workspace_replacement(
+        &mut self,
         mut selection: ChatToolRuntimeSelection,
+        workspace_replacement: Option<Vec<WorkspaceRef>>,
     ) -> Result<ChatToolRuntimeSelection, CliError> {
         selection.sandbox_node_id = selection
             .sandbox_node_id
@@ -2624,23 +2764,10 @@ impl AgentChat {
 
         let session_id = self.runtime.session().session_id.clone();
         let sandbox_node_id = parse_chat_tool_runtime_selection(&selection)?;
-        let conversation_workspace =
-            channel_primary_workspace_root(&self.data_dir, &self.channel, &session_id)?;
-        let requested_workspace_root = selection
-            .workspace_root
-            .as_deref()
-            .or(conversation_workspace.as_deref());
-        let selected_root = self
-            .runtime
-            .handler_mut()
-            .configure_app_tool_runtime_for_session(
-                &self.data_dir,
-                &session_id,
-                sandbox_node_id,
-                requested_workspace_root,
-                self.daemon_connected,
-            )?;
-        if let Some(root) = selected_root.as_ref() {
+        let previous_channel = self.channel.clone();
+        if let Some(workspaces) = workspace_replacement {
+            self.channel.replace_workspaces(workspaces);
+        } else if let Some(root) = selection.workspace_root.as_ref() {
             let workspace = workspace_ref_for_selected_root(&self.data_dir, root)?
                 .binding()
                 .clone();
@@ -2648,6 +2775,47 @@ impl AgentChat {
             self.channel.add_workspace(workspace);
             self.channel.move_workspace(&workspace_id, 0);
         }
+        let conversation_workspace =
+            match channel_primary_workspace_root(&self.data_dir, &self.channel, &session_id) {
+                Ok(workspace) => workspace,
+                Err(error) => {
+                    self.channel = previous_channel;
+                    return Err(error);
+                }
+            };
+        let requested_workspace_root = conversation_workspace
+            .as_deref()
+            .or(selection.workspace_root.as_deref());
+        let workspace_projection = self
+            .channel
+            .has_authoritative_workspace_projection()
+            .then_some(self.channel.workspaces.as_slice());
+        let selected_root = match self
+            .runtime
+            .handler_mut()
+            .configure_app_tool_runtime_for_session(
+                &self.data_dir,
+                &session_id,
+                sandbox_node_id,
+                workspace_projection,
+                requested_workspace_root,
+                self.daemon_connected,
+            ) {
+            Ok(root) => root,
+            Err(error) => {
+                self.channel = previous_channel;
+                return Err(error);
+            }
+        };
+        if self.channel.workspaces.is_empty()
+            && let Some(root) = selected_root.as_ref()
+        {
+            let workspace = workspace_ref_for_selected_root(&self.data_dir, root)?
+                .binding()
+                .clone();
+            self.channel.add_workspace(workspace);
+        }
+        self.channel.mark_workspace_projection_authoritative();
         selection.workspace_root = selected_root;
         self.tool_runtime = selection;
         self.tool_runtime_explicit_override = true;
@@ -2662,10 +2830,10 @@ impl AgentChat {
             set_participant_tool_runtime(&mut self.channel, participant_id, &tool_runtime);
         }
         // A group channel's outer runtime is not necessarily a member runtime.
-        // Persist its local workspace binding, but publish a roaming member
-        // checkpoint only when the session has an exact durable member identity.
-        // Empty/all-disabled groups deliberately leave membership untouched.
-        self.persist_current_session_checkpoint(participant_id.is_some())?;
+        // Workspace grants belong to the channel and must be persisted even
+        // when this group runtime is not an exact member. The checkpoint helper
+        // independently skips roaming publication when no member matches.
+        self.persist_current_session_checkpoint(true)?;
         Ok(self.tool_runtime())
     }
 
@@ -2679,6 +2847,10 @@ impl AgentChat {
         let requested_workspace_root = conversation_workspace
             .as_deref()
             .or(self.tool_runtime.workspace_root.as_deref());
+        let workspace_projection = self
+            .channel
+            .has_authoritative_workspace_projection()
+            .then_some(self.channel.workspaces.as_slice());
         let selected_root = self
             .runtime
             .handler_mut()
@@ -2686,6 +2858,7 @@ impl AgentChat {
                 &self.data_dir,
                 session_id,
                 sandbox_node_id,
+                workspace_projection,
                 requested_workspace_root,
                 self.daemon_connected,
             )?;
@@ -2698,6 +2871,7 @@ impl AgentChat {
                     .clone(),
             );
         }
+        self.channel.mark_workspace_projection_authoritative();
         self.tool_runtime.workspace_root = selected_root;
         Ok(())
     }
@@ -3504,13 +3678,7 @@ impl AgentChannelTurnExecutor for AppAgentChannelExecutor<'_> {
                 channel,
                 &participant.agent_session_id,
             )
-            .map_err(channel_executor_cli_error)?
-            .or_else(|| {
-                session
-                    .workspace_binding
-                    .as_ref()
-                    .and_then(|binding| binding.local_root.clone())
-            });
+            .map_err(channel_executor_cli_error)?;
         }
         let sandbox_node_id =
             parse_chat_tool_runtime_selection(&tool_runtime).map_err(channel_executor_cli_error)?;
@@ -3520,12 +3688,16 @@ impl AgentChannelTurnExecutor for AppAgentChannelExecutor<'_> {
             .handler_mut()
             .replace_full_agent_session(&interaction_session, session.clone())
             .map_err(channel_executor_cli_error)?;
+        let workspace_projection = channel
+            .has_authoritative_workspace_projection()
+            .then_some(channel.workspaces.as_slice());
         self.runtime
             .handler_mut()
             .configure_app_tool_runtime_for_session(
                 self.data_dir,
                 &interaction_session.session_id,
                 sandbox_node_id,
+                workspace_projection,
                 tool_runtime.workspace_root.as_deref(),
                 self.daemon_connected,
             )
@@ -7480,7 +7652,7 @@ mod tests {
     }
 
     #[test]
-    fn roaming_session_reconciliation_rejects_identity_and_workspace_drift() {
+    fn roaming_session_reconciliation_rejects_identity_and_ignores_legacy_workspace_drift() {
         let session_id = SessionId::generate();
         let local = AgentSession::new(session_id.clone(), AgentRole::Deliberation)
             .with_agent_definition_key("coding-agent");
@@ -7494,9 +7666,13 @@ mod tests {
         local.workspace_binding = Some(sinomo_agent::WorkspaceRef::local_path("/workspace/a"));
         let mut roaming = local.clone();
         roaming.workspace_binding = Some(sinomo_agent::WorkspaceRef::local_path("/workspace/b"));
-        let workspace_error = select_resumable_agent_session(Some(local), Some(roaming))
-            .expect_err("workspace drift must be rejected");
-        assert!(workspace_error.contains("disagree on workspace binding"));
+        let reconciled = select_resumable_agent_session(Some(local), Some(roaming))
+            .expect("legacy workspace drift is not session identity drift")
+            .expect("reconciled session");
+        assert_eq!(
+            reconciled.workspace_binding,
+            Some(sinomo_agent::WorkspaceRef::local_path("/workspace/b"))
+        );
     }
 
     #[test]
@@ -7529,7 +7705,9 @@ mod tests {
         let mut roaming = AgentSession::new(session_id, AgentRole::Deliberation)
             .with_agent_definition_key("main-agent");
         roaming.state_revision = 1;
+        roaming.workspace_binding = Some(sinomo_agent::WorkspaceRef::local_path("/workspace/b"));
         let mut local = roaming.clone();
+        local.workspace_binding = Some(sinomo_agent::WorkspaceRef::local_path("/workspace/a"));
         local
             .steering_queue
             .push(sinomo_agent::AgentSteeringMessage::new(
@@ -7541,6 +7719,7 @@ mod tests {
             .expect("select locally newer control state")
             .expect("session");
         assert_eq!(selected.steering_queue, local.steering_queue);
+        assert_eq!(selected.workspace_binding, local.workspace_binding);
 
         roaming
             .follow_up_queue
@@ -7550,6 +7729,7 @@ mod tests {
             .expect("select roaming newer control state")
             .expect("session");
         assert_eq!(selected.follow_up_queue, roaming.follow_up_queue);
+        assert_eq!(selected.workspace_binding, roaming.workspace_binding);
 
         let mut divergent = roaming.clone();
         divergent
@@ -7810,6 +7990,9 @@ mod tests {
 
         for all_disabled in [false, true] {
             let channel_id = SessionId::generate();
+            let workspace = root.join(format!("workspace-{channel_id}"));
+            fs::create_dir_all(&workspace).expect("create group workspace");
+            let workspace = fs::canonicalize(workspace).expect("canonical group workspace");
             let mut channel = AgentChannel::new_channel(channel_id.clone(), "Quiet team");
             channel.ensure_user(AgentChannelUser::app_local());
             if all_disabled {
@@ -7822,19 +8005,37 @@ mod tests {
             let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
             chat.resume_session(&channel_id.to_string(), &[])
                 .expect("resume quiet group channel");
-            chat.set_tool_runtime_node(Some("outer-node".to_string()))
-                .expect("update outer runtime without a member");
+            chat.set_tool_runtime(ChatToolRuntimeSelection {
+                sandbox_node_id: Some("outer-node".to_string()),
+                workspace_root: Some(workspace.clone()),
+            })
+            .expect("update outer runtime without a member");
 
             assert_eq!(chat.channel.participants, durable_participants);
+            let saved = store
+                .load_channel(&channel_id)
+                .expect("reload durable channel")
+                .expect("durable channel");
             assert_eq!(
-                store
-                    .load_channel(&channel_id)
-                    .expect("reload durable channel")
-                    .expect("durable channel")
-                    .participants,
-                durable_participants,
+                saved.participants, durable_participants,
                 "tool runtime selection must not create or re-enable group membership"
             );
+            assert_eq!(
+                saved
+                    .primary_workspace()
+                    .and_then(|workspace| workspace.local_root.as_deref()),
+                Some(workspace.as_path()),
+                "workspace authority persists without an exact group member"
+            );
+            chat.clear_workspaces()
+                .expect("revoke group workspace without a member");
+            let cleared = store
+                .load_channel(&channel_id)
+                .expect("reload cleared durable channel")
+                .expect("cleared durable channel");
+            assert!(cleared.workspaces.is_empty());
+            assert!(cleared.has_authoritative_workspace_projection());
+            assert_eq!(cleared.participants, durable_participants);
             let outer_session = chat
                 .runtime
                 .handler()
@@ -8051,6 +8252,7 @@ mod tests {
 
         let channel_store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let mut channel = AgentChannel::new(session_id.clone(), "Coding chat");
+        channel.workspace_projection_version = 0;
         channel.ensure_user(AgentChannelUser::app_local());
         let participant_id = channel.ensure_participant("coding-agent", "Coding agent");
         channel
@@ -8087,6 +8289,140 @@ mod tests {
             Some("coding-agent")
         );
         assert_eq!(resumed.workspace_binding, persisted.workspace_binding);
+    }
+
+    #[test]
+    fn app_chat_resume_uses_conversation_workspace_over_legacy_session_shadow() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-workspace-authority");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let conversation_workspace = root.join("conversation-workspace");
+        let stale_session_workspace = root.join("stale-session-workspace");
+        fs::create_dir_all(&conversation_workspace).expect("create conversation workspace");
+        fs::create_dir_all(&stale_session_workspace).expect("create stale session workspace");
+        let conversation_workspace =
+            fs::canonicalize(conversation_workspace).expect("canonical conversation workspace");
+        let stale_session_workspace =
+            fs::canonicalize(stale_session_workspace).expect("canonical stale session workspace");
+        let session_id = SessionId::generate();
+
+        let channel_store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let mut channel = AgentChannel::new(session_id.clone(), "Coding chat");
+        channel.ensure_user(AgentChannelUser::app_local());
+        channel.add_workspace(sinomo_agent::WorkspaceRef::local_path(
+            conversation_workspace.clone(),
+        ));
+        let participant_id = channel.ensure_participant("coding-agent", "Coding agent");
+        channel
+            .participant_mut(&participant_id)
+            .expect("coding participant")
+            .agent_session_id = session_id.clone();
+        channel_store.save_channel(&channel).expect("save channel");
+
+        let mut persisted = AgentSession::new(session_id.clone(), AgentRole::Deliberation)
+            .with_agent_definition_key("coding-agent");
+        persisted.workspace_binding = Some(sinomo_agent::WorkspaceRef::local_path(
+            stale_session_workspace,
+        ));
+        FileAgentSessionStore::for_data_dir(&data_dir)
+            .save_session(&persisted)
+            .expect("save coding session");
+
+        let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        chat.resume_session(&session_id.to_string(), &[])
+            .expect("resume coding session");
+
+        assert_eq!(
+            chat.tool_runtime().workspace_root.as_deref(),
+            Some(conversation_workspace.as_path())
+        );
+        assert_eq!(
+            chat.workspaces()
+                .first()
+                .and_then(|workspace| workspace.local_root.as_deref()),
+            Some(conversation_workspace.as_path())
+        );
+        let resumed = chat
+            .runtime
+            .handler()
+            .agent_session_snapshot()
+            .expect("runtime snapshot")
+            .expect("runtime attached");
+        assert_eq!(
+            resumed.workspace_binding,
+            Some(sinomo_agent::WorkspaceRef::local_path(
+                conversation_workspace.clone()
+            ))
+        );
+        let checkpoint = FileAgentSessionStore::for_data_dir(&data_dir)
+            .load_session(&session_id)
+            .expect("load session checkpoint")
+            .expect("session checkpoint");
+        assert_eq!(checkpoint.workspace_binding, resumed.workspace_binding);
+        let participant = chat
+            .primary_participant()
+            .expect("primary participant")
+            .clone();
+        let roaming_checkpoint = chat
+            .session_checkpoint_store
+            .load_latest(&chat.channel, &participant)
+            .expect("load roaming checkpoint")
+            .expect("roaming checkpoint");
+        assert_eq!(
+            roaming_checkpoint.workspace_binding, resumed.workspace_binding,
+            "resume publishes the post-projection compatibility shadow"
+        );
+    }
+
+    #[test]
+    fn app_chat_resume_preserves_authoritative_empty_workspace_revocation() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-empty-workspace-authority");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let session_id = SessionId::generate();
+        let channel_store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let mut channel = AgentChannel::new(session_id.clone(), "Main chat");
+        let participant_id = channel.ensure_participant("main-agent", "Main agent");
+        channel
+            .participant_mut(&participant_id)
+            .expect("main participant")
+            .agent_session_id = session_id.clone();
+        channel_store.save_channel(&channel).expect("save channel");
+
+        let mut persisted = AgentSession::new(session_id.clone(), AgentRole::Main)
+            .with_agent_definition_key("main-agent");
+        persisted.workspace_binding = Some(sinomo_agent::WorkspaceRef::local_path(
+            "/stale/legacy/workspace",
+        ));
+        FileAgentSessionStore::for_data_dir(&data_dir)
+            .save_session(&persisted)
+            .expect("save stale session shadow");
+
+        let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        chat.resume_session(&session_id.to_string(), &[])
+            .expect("resume authoritative empty channel");
+
+        assert!(chat.workspaces().is_empty());
+        let resumed = chat
+            .runtime
+            .handler()
+            .agent_session_snapshot()
+            .expect("runtime snapshot")
+            .expect("runtime attached");
+        assert_eq!(resumed.workspace_binding, None);
+        let local_checkpoint = FileAgentSessionStore::for_data_dir(&data_dir)
+            .load_session(&session_id)
+            .expect("load local checkpoint")
+            .expect("local checkpoint");
+        assert_eq!(local_checkpoint.workspace_binding, None);
+        let participant = chat
+            .primary_participant()
+            .expect("primary participant")
+            .clone();
+        let roaming_checkpoint = chat
+            .session_checkpoint_store
+            .load_latest(&chat.channel, &participant)
+            .expect("load roaming checkpoint")
+            .expect("roaming checkpoint");
+        assert_eq!(roaming_checkpoint.workspace_binding, None);
     }
 
     #[test]
@@ -8404,6 +8740,132 @@ mod tests {
     }
 
     #[test]
+    fn app_chat_explicit_workspace_clear_revokes_durable_and_runtime_authority() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-workspace-clear");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let workspace = root.join("selected-directory");
+        fs::create_dir_all(&workspace).expect("create selected directory");
+        let workspace = fs::canonicalize(workspace).expect("canonical workspace");
+
+        let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        chat.set_agent("coding-agent").expect("select coding agent");
+        chat.set_tool_runtime(ChatToolRuntimeSelection {
+            workspace_root: Some(workspace.clone()),
+            ..ChatToolRuntimeSelection::default()
+        })
+        .expect("bind workspace");
+        let preserved = chat
+            .set_tool_runtime(ChatToolRuntimeSelection::default())
+            .expect("node-only style update preserves workspace authority");
+        assert_eq!(
+            preserved.workspace_root.as_deref(),
+            Some(workspace.as_path())
+        );
+        let attached = chat
+            .runtime
+            .handler()
+            .agent_session_snapshot()
+            .expect("runtime snapshot")
+            .expect("attached session");
+        let sandbox_id =
+            sinomo_agent::local_workspace::agent_sandbox_id_for_session(&attached.session_id);
+        assert_eq!(
+            attached
+                .sandbox_attachment
+                .as_ref()
+                .expect("sandbox attachment")
+                .sandbox_id,
+            sandbox_id.to_string()
+        );
+
+        let cleared = chat.clear_workspaces().expect("clear workspace authority");
+        assert_eq!(cleared.workspace_root, None);
+        assert!(chat.workspaces().is_empty());
+        assert!(chat.channel.has_authoritative_workspace_projection());
+        chat.tool_runtime.workspace_root = Some(workspace);
+        let node_only = chat
+            .set_tool_runtime_node(None)
+            .expect("node-only update ignores stale cached workspace");
+        assert_eq!(node_only.workspace_root, None);
+        assert!(chat.workspaces().is_empty());
+
+        let session = chat
+            .runtime
+            .handler()
+            .agent_session_snapshot()
+            .expect("runtime snapshot")
+            .expect("attached session");
+        assert_eq!(session.workspace_binding, None);
+        assert_eq!(session.sandbox_attachment, attached.sandbox_attachment);
+        let persisted = FileAgentSessionStore::for_data_dir(&data_dir)
+            .load_session(&session.session_id)
+            .expect("load session")
+            .expect("persisted session");
+        assert_eq!(persisted.workspace_binding, None);
+        let saved_channel = chat
+            .channel_store
+            .load_channel(&chat.channel.channel_id)
+            .expect("load channel")
+            .expect("saved channel");
+        assert!(saved_channel.workspaces.is_empty());
+        assert!(saved_channel.has_authoritative_workspace_projection());
+
+        let (manifest, _) = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(
+            data_dir.root().join("sandbox/runtime"),
+        )
+        .load(&sandbox_id)
+        .expect("load attached sandbox");
+        assert!(manifest.mounts.iter().all(|mount| {
+            mount.mount_path.as_str() != "/work"
+                && !mount.mount_path.as_str().starts_with("/workspaces/")
+        }));
+    }
+
+    #[test]
+    fn rejected_remote_sandbox_selection_does_not_mutate_session_or_channel_authority() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-remote-sandbox-rollback");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let workspace = root.join("selected-directory");
+        fs::create_dir_all(&workspace).expect("create selected directory");
+        let workspace = fs::canonicalize(workspace).expect("canonical workspace");
+        let remote_node = NodeId::from_legacy_named("remote-sandbox-node").expect("remote node");
+
+        let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        chat.set_agent("coding-agent").expect("select coding agent");
+        ensure_single_node_cluster(&data_dir, "Local node").expect("initialize local cluster");
+        let cluster = read_cli_cluster_state(&ClusterPaths::new(&data_dir)).expect("cluster state");
+        assert_ne!(remote_node, cluster.local_node_id);
+        let session_before = chat
+            .runtime
+            .handler()
+            .agent_session_snapshot()
+            .expect("runtime snapshot")
+            .expect("attached session");
+        let channel_before = chat.channel.clone();
+
+        let error = chat
+            .set_tool_runtime(ChatToolRuntimeSelection {
+                sandbox_node_id: Some(remote_node.to_string()),
+                workspace_root: Some(workspace),
+            })
+            .expect_err("remote automatic provisioning must use the sandbox service");
+        assert!(
+            error
+                .to_string()
+                .contains("must be routed through the sandbox service")
+        );
+
+        let session_after = chat
+            .runtime
+            .handler()
+            .agent_session_snapshot()
+            .expect("runtime snapshot")
+            .expect("attached session");
+        assert_eq!(session_after, session_before);
+        assert_eq!(chat.channel, channel_before);
+    }
+
+    #[test]
     fn portable_sifs_workspace_binding_remaps_across_device_mounts() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-portable-sifs-workspace");
         let mount_a = root.join("device-a/data/mounts/sifs/by-process/111");
@@ -8631,7 +9093,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_snapshot_merge_preserves_concurrent_distinct_participants_and_users() {
+    fn channel_snapshot_merge_preserves_identity_and_resolves_concurrent_grants_least_privilege() {
         let channel_id = SessionId::generate();
         let base = time::OffsetDateTime::now_utc();
         let mut left = AgentChannel::new_channel(channel_id.clone(), "Shared channel");
@@ -8669,9 +9131,281 @@ mod tests {
                 .iter()
                 .any(|participant| participant.agent_key == "right-agent")
         );
-        assert_eq!(merged.workspaces.len(), 2);
-        assert_eq!(merged.workspaces[0].id, "/work/left");
-        assert_eq!(merged.workspaces[1].id, "right");
+        assert!(
+            merged.workspaces.is_empty(),
+            "equal-revision divergent grants reconcile to their exact intersection"
+        );
+    }
+
+    #[test]
+    fn channel_snapshot_merge_does_not_resurrect_revoked_workspace_access() {
+        let channel_id = SessionId::generate();
+        let base = time::OffsetDateTime::now_utc();
+        let mut original = AgentChannel::new_channel(channel_id, "Workspace revocation");
+        original.add_workspace(sinomo_agent::WorkspaceRef::local_path("/work/primary"));
+        original.add_workspace(sinomo_agent::WorkspaceRef::local_path("/work/revoked"));
+        original.updated_at = base;
+        let mut revoked = original.clone();
+        assert!(revoked.remove_workspace("/work/revoked"));
+        assert!(revoked.remove_workspace("/work/primary"));
+        revoked.updated_at = base + time::Duration::seconds(1);
+
+        let merged =
+            merge_channel_snapshot(original.clone(), revoked).expect("merge workspace revocation");
+        assert!(merged.workspaces.is_empty());
+        assert!(merged.has_authoritative_workspace_projection());
+
+        let merged_again = merge_channel_snapshot(merged, original.clone())
+            .expect("merge stale snapshot after workspace revocation");
+        assert!(merged_again.workspaces.is_empty());
+
+        let mut stale_renamed = original.clone();
+        stale_renamed.rename("Renamed from stale replica");
+        stale_renamed.updated_at = base + time::Duration::seconds(10);
+        let merged_after_stale_rename = merge_channel_snapshot(merged_again, stale_renamed)
+            .expect("merge later unrelated stale update after workspace revocation");
+        assert!(
+            merged_after_stale_rename.workspaces.is_empty(),
+            "unrelated newer channel metadata must not resurrect older workspace grants"
+        );
+    }
+
+    #[test]
+    fn channel_snapshot_merge_fences_repeated_edits_from_a_stale_grant_base() {
+        let channel_id = SessionId::generate();
+        let mut base = AgentChannel::new_channel(channel_id, "Causal workspace merge");
+        let original = sinomo_agent::WorkspaceRef::local_path("/work/shared");
+        assert!(base.add_workspace(original.clone()));
+
+        let mut revoked = base.clone();
+        assert!(revoked.clear_workspaces());
+
+        let mut stale_edited = base.clone();
+        let first_edit = original.clone().with_owner_node("stale-owner");
+        assert!(stale_edited.add_workspace(first_edit));
+        let second_edit = original
+            .clone()
+            .with_owner_node("stale-owner")
+            .with_write_policy("stale-write-policy");
+        assert!(stale_edited.add_workspace(second_edit.clone()));
+        assert!(
+            stale_edited.workspace_revision > revoked.workspace_revision,
+            "the regression requires a stale branch with the larger local counter"
+        );
+
+        let merged = merge_channel_snapshot(revoked, stale_edited.clone())
+            .expect("merge stale grant edits with revocation");
+        assert!(
+            merged.workspaces.is_empty(),
+            "an incomparable stale edit cannot resurrect revoked access"
+        );
+        assert!(
+            merged
+                .workspace_causal_tokens
+                .is_superset(&stale_edited.workspace_causal_tokens),
+            "the safe merge retains the stale branch's causal context"
+        );
+
+        let mut explicitly_regranted = merged;
+        assert!(explicitly_regranted.add_workspace(second_edit.clone()));
+        let remerged = merge_channel_snapshot(explicitly_regranted, stale_edited)
+            .expect("merge observed explicit regrant");
+        assert_eq!(remerged.workspaces, vec![second_edit]);
+    }
+
+    #[test]
+    fn channel_snapshot_merge_honors_explicit_empty_against_an_unseen_concurrent_grant() {
+        let channel_id = SessionId::generate();
+        let base = AgentChannel::new_channel(channel_id, "Concurrent empty projection");
+        let workspace = sinomo_agent::WorkspaceRef::local_path("/work/concurrent");
+
+        let mut added = base.clone();
+        assert!(added.add_workspace(workspace));
+        let mut explicitly_empty = base;
+        assert!(explicitly_empty.clear_workspaces());
+        assert!(
+            explicitly_empty.workspaces.is_empty()
+                && !explicitly_empty.workspace_causal_tokens.is_empty()
+        );
+
+        let merged = merge_channel_snapshot(explicitly_empty, added)
+            .expect("merge explicit empty with unseen grant");
+        assert!(
+            merged.workspaces.is_empty(),
+            "an explicit exact clear must fence a concurrent unseen grant"
+        );
+    }
+
+    #[test]
+    fn channel_snapshot_merge_treats_tokenless_authoritative_writer_as_mixed_version() {
+        let channel_id = SessionId::generate();
+        let mut base = AgentChannel::new_channel(channel_id, "Mixed writer workspace merge");
+        let workspace = sinomo_agent::WorkspaceRef::local_path("/work/mixed-writer");
+        assert!(base.add_workspace(workspace.clone()));
+
+        // Simulate an older writer that understood authoritative channel
+        // workspaces but dropped the newer causal fields while revoking access.
+        let mut tokenless_revocation = base.clone();
+        tokenless_revocation.workspaces.clear();
+        tokenless_revocation.workspace_grant_revisions.clear();
+        tokenless_revocation.workspace_causal_tokens.clear();
+        tokenless_revocation.workspace_causal_heads.clear();
+        tokenless_revocation.workspace_causal_version = 0;
+        tokenless_revocation.workspace_revision =
+            tokenless_revocation.workspace_revision.saturating_add(1);
+
+        let mut stale_current_writer = base;
+        assert!(
+            stale_current_writer.add_workspace(
+                workspace
+                    .with_owner_node("stale-current-writer")
+                    .with_write_policy("stale-current-write-policy"),
+            )
+        );
+
+        let left_first =
+            merge_channel_snapshot(tokenless_revocation.clone(), stale_current_writer.clone())
+                .expect("merge tokenless revocation with current stale edit");
+        let right_first = merge_channel_snapshot(stale_current_writer, tokenless_revocation)
+            .expect("reverse mixed-version merge");
+        assert!(left_first.workspaces.is_empty());
+        assert!(right_first.workspaces.is_empty());
+        assert_eq!(left_first.workspaces, right_first.workspaces);
+        assert!(left_first.workspace_causal_version > 0);
+    }
+
+    #[test]
+    fn channel_snapshot_workspace_register_is_associative_for_observed_regrant() {
+        let channel_id = SessionId::generate();
+        let workspace = sinomo_agent::WorkspaceRef::local_path("/work/associative");
+        let mut base = AgentChannel::new_channel(channel_id, "Associative workspace merge");
+        assert!(base.add_workspace(workspace.clone()));
+
+        let mut revoked = base.clone();
+        assert!(revoked.clear_workspaces());
+        let mut concurrent_grant = base;
+        assert!(concurrent_grant.replace_workspaces(vec![workspace.clone()]));
+        let mut observed_regrant = revoked.clone();
+        assert!(observed_regrant.add_workspace(workspace.clone()));
+
+        let left_grouped = merge_channel_snapshot(
+            merge_channel_snapshot(revoked.clone(), concurrent_grant.clone())
+                .expect("merge revoke and concurrent grant"),
+            observed_regrant.clone(),
+        )
+        .expect("merge observed regrant into conflict");
+        let right_grouped = merge_channel_snapshot(
+            revoked.clone(),
+            merge_channel_snapshot(concurrent_grant.clone(), observed_regrant.clone())
+                .expect("merge concurrent and observed grants"),
+        )
+        .expect("merge revoke into grant heads");
+        let permuted = merge_channel_snapshot(
+            merge_channel_snapshot(observed_regrant, revoked)
+                .expect("merge observed regrant and revoke"),
+            concurrent_grant,
+        )
+        .expect("merge final concurrent grant");
+
+        assert_eq!(left_grouped.workspaces, vec![workspace.clone()]);
+        assert_eq!(right_grouped.workspaces, vec![workspace.clone()]);
+        assert_eq!(permuted.workspaces, vec![workspace]);
+        assert_eq!(left_grouped.workspaces, right_grouped.workspaces);
+        assert_eq!(left_grouped.workspaces, permuted.workspaces);
+    }
+
+    #[test]
+    fn channel_snapshot_workspace_register_is_associative_for_cyclic_causal_claims() {
+        let channel_id = SessionId::generate();
+        let workspace = WorkspaceRef::local_path("/work/cyclic-causal-claims");
+        let head_a = TaskId::generate();
+        let head_b = TaskId::generate();
+        let head_c = TaskId::generate();
+
+        let mut left = AgentChannel::new_channel(channel_id.clone(), "Cyclic causal claims");
+        left.workspace_causal_tokens = BTreeSet::from([head_a.clone(), head_b.clone()]);
+        left.workspace_causal_heads = BTreeMap::from([(head_a.clone(), vec![workspace.clone()])]);
+        left.workspaces = vec![workspace.clone()];
+
+        let mut right = left.clone();
+        right.workspace_causal_heads = BTreeMap::from([(head_b, Vec::new())]);
+        right.workspaces.clear();
+
+        let mut independent = left.clone();
+        independent.workspace_causal_tokens = BTreeSet::from([head_c.clone()]);
+        independent.workspace_causal_heads =
+            BTreeMap::from([(head_c.clone(), vec![workspace.clone()])]);
+
+        let left_grouped = merge_channel_snapshot(
+            merge_channel_snapshot(left.clone(), right.clone())
+                .expect("merge cyclic causal claims"),
+            independent.clone(),
+        )
+        .expect("merge independent head after cyclic claims");
+        let right_grouped = merge_channel_snapshot(
+            left,
+            merge_channel_snapshot(right, independent).expect("merge independent and cyclic claim"),
+        )
+        .expect("merge remaining cyclic claim");
+
+        assert_eq!(left_grouped.workspaces, vec![workspace]);
+        assert_eq!(left_grouped.workspaces, right_grouped.workspaces);
+        assert_eq!(
+            left_grouped.workspace_causal_tokens,
+            right_grouped.workspace_causal_tokens
+        );
+        assert_eq!(
+            left_grouped.workspace_causal_heads,
+            right_grouped.workspace_causal_heads
+        );
+        assert_eq!(
+            left_grouped
+                .workspace_causal_heads
+                .keys()
+                .collect::<Vec<_>>(),
+            vec![&head_c]
+        );
+    }
+
+    #[test]
+    fn channel_snapshot_merge_never_trusts_unknown_equal_causal_versions() {
+        let channel_id = SessionId::generate();
+        let workspace = sinomo_agent::WorkspaceRef::local_path("/work/unknown-protocol");
+        let mut empty = AgentChannel::new_channel(channel_id, "Unknown causal protocol");
+        assert!(empty.clear_workspaces());
+        empty.workspace_causal_version = 999;
+
+        let mut granted = empty.clone();
+        granted.workspaces = vec![workspace];
+        granted.workspace_causal_version = 999;
+
+        let merged = merge_channel_snapshot(empty, granted)
+            .expect("merge equal unknown causal protocols conservatively");
+        assert!(merged.workspaces.is_empty());
+        assert_eq!(
+            merged.workspace_causal_version,
+            AGENT_CHANNEL_WORKSPACE_CAUSAL_VERSION
+        );
+    }
+
+    #[test]
+    fn channel_snapshot_merge_legacy_empty_does_not_erase_authoritative_grants() {
+        let channel_id = SessionId::generate();
+        let base = time::OffsetDateTime::now_utc();
+        let mut authoritative =
+            AgentChannel::new_channel(channel_id.clone(), "Workspace migration");
+        authoritative.add_workspace(sinomo_agent::WorkspaceRef::local_path("/work/current"));
+        authoritative.updated_at = base;
+
+        let mut legacy_empty = AgentChannel::new_channel(channel_id, "Workspace migration");
+        legacy_empty.workspace_projection_version = 0;
+        legacy_empty.updated_at = base + time::Duration::seconds(1);
+
+        let merged = merge_channel_snapshot(authoritative, legacy_empty)
+            .expect("merge legacy empty workspace snapshot");
+        assert_eq!(merged.workspaces.len(), 1);
+        assert_eq!(merged.workspaces[0].id, "/work/current");
+        assert!(merged.has_authoritative_workspace_projection());
     }
 
     #[test]

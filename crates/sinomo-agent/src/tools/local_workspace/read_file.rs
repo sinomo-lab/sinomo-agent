@@ -90,7 +90,7 @@ impl AgentTool for ReadFileTool {
             "line_range": selected.line_range_payload(),
         });
         let mut evidence =
-            AgentToolEvidence::availability_only(true, "path resolved inside workspace root")
+            AgentToolEvidence::availability_only(true, "path resolved inside workspace grants")
                 .with_output_value(&payload, truncated);
         if let Some(full_output_ref) = full_output_ref {
             evidence = evidence.with_artifact(
@@ -115,7 +115,7 @@ pub(super) fn descriptor() -> AgentToolDescriptor {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Workspace-relative path to read."
+                    "description": "Path to read. Relative paths use the primary workspace; absolute paths may address any granted workspace."
                 },
                 "max_bytes": {
                     "type": "integer",

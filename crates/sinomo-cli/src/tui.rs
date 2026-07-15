@@ -39,6 +39,7 @@ const RUST_MINICPM_V46_PROVIDER_ID: &str = "sinomo-models";
 #[cfg(feature = "native-models")]
 const DEFAULT_RUST_MINICPM_V46_CACHE_SUBDIR: &str = "openbmb--MiniCPM-V-4_6";
 const TUI_SESSION_SCHEMA_VERSION: u32 = 1;
+const TUI_WORKSPACE_PROJECTION_VERSION: u32 = 1;
 const TUI_MOUSE_SCROLL_LINES: isize = 4;
 
 pub fn run_tui() -> Result<(), CliError> {
@@ -457,6 +458,7 @@ fn submit_tui_input<H: TuiAgentRuntimeControl>(
         data_dir,
         &session,
         sandbox_node_id,
+        state.workspace_projection(),
         state.daemon_connected,
     )?;
 
@@ -618,6 +620,17 @@ enum TuiViewMode {
 struct TuiSessionRecord {
     schema_version: u32,
     session: InteractionSession,
+    /// Conversation-owned ordered workspace grants. The first grant is the
+    /// sandbox cwd; the agent session's legacy binding is only a migration
+    /// source for records written before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    workspaces: Vec<WorkspaceRef>,
+    /// Zero identifies a legacy record where an empty `workspaces` field means
+    /// "not projected yet". Current records write this even for an intentional
+    /// empty grant set, so revoking the last workspace cannot resurrect the
+    /// agent session's compatibility shadow.
+    #[serde(default)]
+    workspace_projection_version: u32,
     #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -749,6 +762,8 @@ impl TuiSessionStore {
         let record = TuiSessionRecord {
             schema_version: TUI_SESSION_SCHEMA_VERSION,
             session: session.clone(),
+            workspaces: state.workspaces.clone(),
+            workspace_projection_version: TUI_WORKSPACE_PROJECTION_VERSION,
             created_at,
             updated_at: now,
             title: tui_session_title(&state.messages),
@@ -1088,10 +1103,12 @@ trait TuiAgentRuntimeControl: InteractionEventHandler {
         &mut self,
         data_dir: &SinomoDataDir,
         session: &InteractionSession,
+        workspaces: Option<&[WorkspaceRef]>,
         daemon_connected: bool,
         definition: AgentDefinition,
     ) -> Result<TuiAgentRuntimeInfo, CliError> {
         let _ = session;
+        let _ = workspaces;
         self.switch_tui_agent(data_dir, daemon_connected, definition)
     }
 
@@ -1124,6 +1141,7 @@ trait TuiAgentRuntimeControl: InteractionEventHandler {
         _data_dir: &SinomoDataDir,
         _session: &InteractionSession,
         _sandbox_node_id: Option<NodeId>,
+        _workspaces: Option<&[WorkspaceRef]>,
         _daemon_connected: bool,
     ) -> Result<(), CliError> {
         Ok(())
@@ -1165,6 +1183,8 @@ struct TuiRuntimeActivity {
 #[derive(Clone, Debug)]
 struct TuiState {
     session_id: String,
+    workspaces: Vec<WorkspaceRef>,
+    workspace_projection_version: u32,
     daemon_connected: bool,
     cluster_label: Option<String>,
     runtime_info: TuiAgentRuntimeInfo,
@@ -1201,6 +1221,8 @@ impl TuiState {
             .map(|cluster| format!("cluster {}", cluster.cluster_id));
         let mut state = Self {
             session_id: session.session_id.to_string(),
+            workspaces: initial_tui_conversation_workspaces(),
+            workspace_projection_version: TUI_WORKSPACE_PROJECTION_VERSION,
             daemon_connected: daemon.is_some(),
             cluster_label,
             tool_runtime_node_id: runtime_info.tool_runtime.sandbox_node_id.clone(),
@@ -1227,6 +1249,14 @@ impl TuiState {
         };
         state.push_message(TuiMessageKind::System, "main agent session started");
         state
+    }
+
+    fn workspace_projection(&self) -> Option<&[WorkspaceRef]> {
+        if self.workspace_projection_version > 0 || !self.workspaces.is_empty() {
+            Some(&self.workspaces)
+        } else {
+            None
+        }
     }
 
     fn apply_key_event(&mut self, key: KeyEvent) -> TuiInputAction {
@@ -2235,6 +2265,8 @@ impl TuiState {
     fn replace_session(
         &mut self,
         session: &InteractionSession,
+        workspaces: Vec<WorkspaceRef>,
+        workspace_projection_version: u32,
         runtime_info: TuiAgentRuntimeInfo,
         mut messages: Vec<TuiMessage>,
         last_model_usage: Option<TuiTokenUsage>,
@@ -2247,6 +2279,8 @@ impl TuiState {
             });
         }
         self.session_id = session.session_id.to_string();
+        self.workspaces = workspaces;
+        self.workspace_projection_version = workspace_projection_version;
         self.runtime_info = runtime_info;
         self.runtime_activity = TuiRuntimeActivity::default();
         self.last_model_usage = last_model_usage;
@@ -2946,6 +2980,15 @@ impl TuiState {
     }
 }
 
+fn initial_tui_conversation_workspaces() -> Vec<WorkspaceRef> {
+    std::env::current_dir()
+        .ok()
+        .and_then(|root| fs::canonicalize(root).ok())
+        .map(WorkspaceRef::local_path)
+        .into_iter()
+        .collect()
+}
+
 fn tui_file_previewers() -> Vec<Arc<dyn FileManagerPreviewer>> {
     vec![Arc::new(SobjFilePreviewer)]
 }
@@ -3121,6 +3164,7 @@ fn apply_tui_slash_command<H: TuiAgentRuntimeControl>(
             let info = runtime.handler.switch_tui_agent_for_session(
                 data_dir,
                 &session,
+                state.workspace_projection(),
                 state.daemon_connected,
                 definition,
             )?;
@@ -3170,6 +3214,7 @@ fn apply_tui_slash_command<H: TuiAgentRuntimeControl>(
                 data_dir,
                 &session,
                 None,
+                state.workspace_projection(),
                 state.daemon_connected,
             )?;
             Ok(vec![InteractionOutput::Line(
@@ -3183,6 +3228,7 @@ fn apply_tui_slash_command<H: TuiAgentRuntimeControl>(
                 data_dir,
                 &session,
                 Some(parsed_node_id),
+                state.workspace_projection(),
                 state.daemon_connected,
             )?;
             state.tool_runtime_node_id = Some(node_id.clone());
@@ -3297,6 +3343,16 @@ fn resume_tui_session<H: TuiAgentRuntimeControl>(
         .persist_tui_agent_session(data_dir, &current_session)?;
     let record = session_store.load_session(&session_id)?;
     let mut persisted_agent_session = runtime.handler.load_tui_agent_session(&session_id)?;
+    let mut conversation_workspaces = record.workspaces.clone();
+    let workspace_projection_is_authoritative =
+        record.workspace_projection_version > 0 || !conversation_workspaces.is_empty();
+    if !workspace_projection_is_authoritative
+        && let Some(legacy_workspace) = persisted_agent_session
+            .as_ref()
+            .and_then(|session| session.workspace_binding.clone())
+    {
+        conversation_workspaces.push(legacy_workspace);
+    }
     let mut outputs = Vec::new();
     let resume_agent_key = match persisted_agent_session
         .as_ref()
@@ -3339,13 +3395,17 @@ fn resume_tui_session<H: TuiAgentRuntimeControl>(
         ),
         None => (Vec::new(), None, TuiTokenUsage::default()),
     };
-    if let Some(persisted) = persisted_agent_session.as_mut()
-        && persisted
+    if let Some(persisted) = persisted_agent_session.as_mut() {
+        // The conversation record is authoritative. Keep the legacy session
+        // field synchronized only so older readers see the same primary grant.
+        persisted.workspace_binding = conversation_workspaces.first().cloned();
+        if persisted
             .agent_definition_key
             .as_deref()
             .is_none_or(|key| key.trim().is_empty())
-    {
-        persisted.agent_definition_key = Some(resume_agent_key);
+        {
+            persisted.agent_definition_key = Some(resume_agent_key);
+        }
     }
     runtime.handler.restore_tui_agent_session(
         data_dir,
@@ -3355,6 +3415,8 @@ fn resume_tui_session<H: TuiAgentRuntimeControl>(
     )?;
     state.replace_session(
         &record.session,
+        conversation_workspaces,
+        TUI_WORKSPACE_PROJECTION_VERSION,
         restored_info,
         messages,
         last_model_usage,
@@ -4811,6 +4873,8 @@ mod tui_tests {
                 NodeId::from_legacy_named("node_mouse").expect("node"),
                 InteractionSurface::new("surface.mouse", InteractionSurfaceKind::CommandLine),
             ),
+            workspaces: Vec::new(),
+            workspace_projection_version: TUI_WORKSPACE_PROJECTION_VERSION,
             created_at: OffsetDateTime::now_utc(),
             updated_at: OffsetDateTime::now_utc(),
             title: title.to_string(),
@@ -6028,6 +6092,10 @@ mod tui_tests {
             InteractionSurface::new("surface.test", InteractionSurfaceKind::CommandLine),
         );
         let mut state = TuiState::new(&session, None, TuiAgentRuntimeInfo::default());
+        state.workspaces = vec![
+            WorkspaceRef::local_path(root.join("workspace-primary")),
+            WorkspaceRef::sifs("shared", "/shared/workspace"),
+        ];
         state.push_message(TuiMessageKind::User, "continue previous work");
         state.push_message(TuiMessageKind::Agent, "ok");
         state.apply_output(InteractionOutput::ModelUsage {
@@ -6045,6 +6113,7 @@ mod tui_tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session.session_id, session.session_id);
         assert_eq!(sessions[0].title, "continue previous work");
+        assert_eq!(sessions[0].workspaces, state.workspaces);
         let transcript = store
             .load_transcript(&session.session_id)
             .expect("load")
@@ -6107,6 +6176,8 @@ mod tui_tests {
                     NodeId::from_legacy_named("node_a").expect("node"),
                     InteractionSurface::new("surface.a", InteractionSurfaceKind::CommandLine),
                 ),
+                workspaces: Vec::new(),
+                workspace_projection_version: TUI_WORKSPACE_PROJECTION_VERSION,
                 created_at: OffsetDateTime::now_utc(),
                 updated_at: OffsetDateTime::now_utc(),
                 title: "first".to_string(),
@@ -6121,6 +6192,8 @@ mod tui_tests {
                     NodeId::from_legacy_named("node_b").expect("node"),
                     InteractionSurface::new("surface.b", InteractionSurfaceKind::CommandLine),
                 ),
+                workspaces: Vec::new(),
+                workspace_projection_version: TUI_WORKSPACE_PROJECTION_VERSION,
                 created_at: OffsetDateTime::now_utc(),
                 updated_at: OffsetDateTime::now_utc(),
                 title: "second".to_string(),
@@ -6306,14 +6379,18 @@ mod tui_tests {
         let root = temp_file_browser_root("durable-agent-switch");
         let data_dir = SinomoDataDir::new(root.join("data"));
         let workspace = root.join("plain-workspace");
+        let stale_process_workspace = root.join("stale-process-workspace");
         fs::create_dir_all(&workspace).expect("create generic workspace");
+        fs::create_dir_all(&stale_process_workspace).expect("create stale process workspace");
         let workspace = fs::canonicalize(workspace).expect("canonical generic workspace");
         let mut handler = RuntimeMainAgentInteractionHandler::from_runtime_config(
             &data_dir,
             ModelRuntimeConfig::default(),
         )
         .expect("handler");
-        handler.workspace_root = workspace.clone();
+        handler.workspace_root = Some(
+            fs::canonicalize(stale_process_workspace).expect("canonical stale process workspace"),
+        );
         let session = InteractionSession::new(
             SessionId::generate(),
             NodeId::from_legacy_named("node_tui_durable_switch").expect("node"),
@@ -6324,7 +6401,13 @@ mod tui_tests {
         );
 
         let info = handler
-            .switch_tui_agent_for_session(&data_dir, &session, false, AgentDefinition::coding())
+            .switch_tui_agent_for_session(
+                &data_dir,
+                &session,
+                Some(&[WorkspaceRef::local_path(workspace.clone())]),
+                false,
+                AgentDefinition::coding(),
+            )
             .expect("switch coding agent");
 
         assert_eq!(info.agent, "coding-agent");
@@ -6395,12 +6478,17 @@ mod tui_tests {
     }
 
     #[test]
-    fn tui_resume_prefers_canonical_agent_identity_over_stale_ui_metadata() {
+    fn tui_resume_prefers_canonical_agent_identity_and_conversation_workspaces() {
         let root = temp_file_browser_root("canonical-agent-resume");
         let data_dir = SinomoDataDir::new(root.join("data"));
-        let workspace = root.join("canonical-workspace");
-        fs::create_dir_all(&workspace).expect("create canonical workspace");
-        let workspace = fs::canonicalize(workspace).expect("canonical workspace");
+        let conversation_workspace = root.join("conversation-workspace");
+        let stale_session_workspace = root.join("stale-session-workspace");
+        fs::create_dir_all(&conversation_workspace).expect("create conversation workspace");
+        fs::create_dir_all(&stale_session_workspace).expect("create stale session workspace");
+        let conversation_workspace =
+            fs::canonicalize(conversation_workspace).expect("canonical conversation workspace");
+        let stale_session_workspace =
+            fs::canonicalize(stale_session_workspace).expect("canonical stale session workspace");
         let session_store = TuiSessionStore::for_data_dir(&data_dir);
         let target_session = InteractionSession::new(
             SessionId::generate(),
@@ -6411,6 +6499,7 @@ mod tui_tests {
             ),
         );
         let mut target_state = TuiState::new(&target_session, None, TuiAgentRuntimeInfo::default());
+        target_state.workspaces = vec![WorkspaceRef::local_path(conversation_workspace.clone())];
         target_state.push_message(TuiMessageKind::User, "resume this coding session");
         session_store
             .save_state(&target_session, &target_state)
@@ -6418,7 +6507,7 @@ mod tui_tests {
         let mut canonical =
             AgentSession::new(target_session.session_id.clone(), AgentRole::Deliberation)
                 .with_agent_definition_key("coding-agent");
-        canonical.workspace_binding = Some(WorkspaceRef::local_path(workspace.clone()));
+        canonical.workspace_binding = Some(WorkspaceRef::local_path(stale_session_workspace));
         FileAgentSessionStore::for_data_dir(&data_dir)
             .save_session(&canonical)
             .expect("save canonical coding session");
@@ -6456,7 +6545,169 @@ mod tui_tests {
             resumed.agent_definition_key.as_deref(),
             Some("coding-agent")
         );
-        assert_eq!(resumed.workspace_binding, canonical.workspace_binding);
+        assert_eq!(state.workspaces, target_state.workspaces);
+        assert_eq!(
+            resumed.workspace_binding,
+            Some(WorkspaceRef::local_path(conversation_workspace.clone()))
+        );
+        let resumed_interaction = runtime.session().clone();
+        runtime
+            .handler
+            .configure_tui_tool_runtime_for_session(
+                &data_dir,
+                &resumed_interaction,
+                None,
+                state.workspace_projection(),
+                false,
+            )
+            .expect("project conversation workspaces into tool runtime");
+        assert_eq!(
+            runtime.handler.workspace_root.as_deref(),
+            Some(conversation_workspace.as_path())
+        );
+    }
+
+    #[test]
+    fn tui_resume_backfills_legacy_session_workspace_into_conversation_record() {
+        let root = temp_file_browser_root("legacy-workspace-resume");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let workspace = root.join("legacy-workspace");
+        fs::create_dir_all(&workspace).expect("create legacy workspace");
+        let workspace = fs::canonicalize(workspace).expect("canonical legacy workspace");
+        let session_store = TuiSessionStore::for_data_dir(&data_dir);
+        let target_session = InteractionSession::new(
+            SessionId::generate(),
+            NodeId::from_legacy_named("node_tui_legacy_workspace_resume").expect("node"),
+            InteractionSurface::new(
+                "surface.tui-legacy-workspace-resume",
+                InteractionSurfaceKind::CommandLine,
+            ),
+        );
+        let mut target_state = TuiState::new(&target_session, None, TuiAgentRuntimeInfo::default());
+        target_state.workspaces.clear();
+        target_state.push_message(TuiMessageKind::User, "resume legacy workspace session");
+        session_store
+            .save_state(&target_session, &target_state)
+            .expect("save legacy TUI record");
+        let mut legacy_record = session_store
+            .load_session(&target_session.session_id)
+            .expect("load legacy TUI record");
+        legacy_record.workspace_projection_version = 0;
+        write_tui_json_atomic(
+            &session_store.record_path_for_session(&target_session.session_id),
+            &legacy_record,
+        )
+        .expect("remove workspace projection marker from legacy record");
+        let mut canonical =
+            AgentSession::new(target_session.session_id.clone(), AgentRole::Deliberation)
+                .with_agent_definition_key("coding-agent");
+        canonical.workspace_binding = Some(WorkspaceRef::local_path(workspace.clone()));
+        FileAgentSessionStore::for_data_dir(&data_dir)
+            .save_session(&canonical)
+            .expect("save legacy coding session");
+
+        let handler = RuntimeMainAgentInteractionHandler::from_runtime_config(
+            &data_dir,
+            ModelRuntimeConfig::default(),
+        )
+        .expect("handler");
+        let mut runtime =
+            new_tui_interaction_runtime(handler, None, &session_store).expect("runtime");
+        let mut state = TuiState::new(
+            runtime.session(),
+            None,
+            runtime.handler.tui_agent_runtime_info(),
+        );
+
+        resume_tui_session(
+            &mut runtime,
+            &mut state,
+            &session_store,
+            &data_dir,
+            None,
+            target_session.session_id.clone(),
+        )
+        .expect("resume legacy workspace session");
+
+        assert_eq!(
+            state.workspaces,
+            vec![WorkspaceRef::local_path(workspace.clone())]
+        );
+        session_store
+            .save_state(runtime.session(), &state)
+            .expect("persist migrated conversation workspace");
+        let migrated_record = session_store
+            .load_session(&target_session.session_id)
+            .expect("load migrated TUI record");
+        assert_eq!(
+            migrated_record.workspaces,
+            vec![WorkspaceRef::local_path(workspace)]
+        );
+        assert_eq!(
+            migrated_record.workspace_projection_version,
+            TUI_WORKSPACE_PROJECTION_VERSION
+        );
+    }
+
+    #[test]
+    fn tui_resume_does_not_backfill_authoritative_empty_workspace_grants() {
+        let root = temp_file_browser_root("empty-workspace-resume");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let session_store = TuiSessionStore::for_data_dir(&data_dir);
+        let target_session = InteractionSession::new(
+            SessionId::generate(),
+            NodeId::from_legacy_named("node_tui_empty_workspace_resume").expect("node"),
+            InteractionSurface::new(
+                "surface.tui-empty-workspace-resume",
+                InteractionSurfaceKind::CommandLine,
+            ),
+        );
+        let mut target_state = TuiState::new(&target_session, None, TuiAgentRuntimeInfo::default());
+        target_state.workspaces.clear();
+        target_state.push_message(TuiMessageKind::User, "resume without workspace grants");
+        session_store
+            .save_state(&target_session, &target_state)
+            .expect("save authoritative empty TUI record");
+        let mut canonical = AgentSession::new(target_session.session_id.clone(), AgentRole::Main)
+            .with_agent_definition_key("main-agent");
+        canonical.workspace_binding = Some(WorkspaceRef::local_path("/stale/legacy/workspace"));
+        FileAgentSessionStore::for_data_dir(&data_dir)
+            .save_session(&canonical)
+            .expect("save canonical session with stale shadow");
+
+        let handler = RuntimeMainAgentInteractionHandler::from_runtime_config(
+            &data_dir,
+            ModelRuntimeConfig::default(),
+        )
+        .expect("handler");
+        let mut runtime =
+            new_tui_interaction_runtime(handler, None, &session_store).expect("runtime");
+        let mut state = TuiState::new(
+            runtime.session(),
+            None,
+            runtime.handler.tui_agent_runtime_info(),
+        );
+
+        resume_tui_session(
+            &mut runtime,
+            &mut state,
+            &session_store,
+            &data_dir,
+            None,
+            target_session.session_id.clone(),
+        )
+        .expect("resume authoritative empty workspace session");
+
+        assert!(state.workspaces.is_empty());
+        assert_eq!(
+            runtime
+                .handler
+                .agent_session_snapshot()
+                .expect("snapshot")
+                .expect("session")
+                .workspace_binding,
+            None
+        );
     }
 
     #[test]
@@ -6861,7 +7112,9 @@ where
     account: Option<String>,
     reasoning_effort: Option<ProviderReasoningEffort>,
     reasoning_budget_tokens: Option<u32>,
-    workspace_root: PathBuf,
+    /// Conversation-projected primary workspace. `None` is a real revocation,
+    /// not an instruction to fall back to the process cwd.
+    workspace_root: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -6955,7 +7208,7 @@ where
             account: None,
             reasoning_effort: None,
             reasoning_budget_tokens: None,
-            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            workspace_root: Some(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
         }
     }
 
@@ -7007,11 +7260,14 @@ where
     }
 
     fn build_runtime(&self, model: M, session: AgentSession) -> AgentSessionRuntime<M> {
-        let config = sinomo_agent::AgentConfig::new(self.provider.clone(), self.model_name.clone())
-            .with_agent_definition(self.agent_definition.clone())
-            .with_workspace_root(self.workspace_root.clone())
-            .with_skill_catalog(self.skill_catalog.clone())
-            .with_skill_catalog_texts(self.skill_catalog_texts.clone());
+        let mut config =
+            sinomo_agent::AgentConfig::new(self.provider.clone(), self.model_name.clone())
+                .with_agent_definition(self.agent_definition.clone())
+                .with_skill_catalog(self.skill_catalog.clone())
+                .with_skill_catalog_texts(self.skill_catalog_texts.clone());
+        if let Some(workspace_root) = self.workspace_root.as_ref() {
+            config = config.with_workspace_root(workspace_root.clone());
+        }
         let agent = Agent::new(model, self.provider.clone(), self.model_name.clone())
             .with_config(config)
             .with_tool_registry(self.tool_registry.clone());
@@ -7410,6 +7666,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         &mut self,
         data_dir: &SinomoDataDir,
         interaction_session: &InteractionSession,
+        workspaces: Option<&[WorkspaceRef]>,
         definition: AgentDefinition,
         daemon_connected: bool,
     ) -> Result<TuiAgentRuntimeInfo, CliError> {
@@ -7435,27 +7692,33 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         let mut candidate = previous_session.clone();
         candidate.role = definition.role.clone();
         candidate.agent_definition_key = Some(definition.key().to_string());
+        if let Some(workspaces) = workspaces {
+            candidate.workspace_binding = workspaces.first().cloned();
+        }
         if agent_definition_has_coding_authority(&definition)
             && candidate.workspace_binding.is_none()
+            && workspaces.is_none()
         {
-            let metadata =
-                std::fs::metadata(&self.workspace_root).map_err(|source| CliError::Io {
-                    path: self.workspace_root.display().to_string(),
-                    detail: format!("workspace directory is unavailable: {source}"),
-                })?;
-            if !metadata.is_dir() {
-                return Err(CliError::Parse {
-                    detail: format!(
-                        "workspace path is not a directory: {}",
-                        self.workspace_root.display()
-                    ),
-                });
+            if let Some(workspace_root) = self.workspace_root.as_ref() {
+                let metadata =
+                    std::fs::metadata(workspace_root).map_err(|source| CliError::Io {
+                        path: workspace_root.display().to_string(),
+                        detail: format!("workspace directory is unavailable: {source}"),
+                    })?;
+                if !metadata.is_dir() {
+                    return Err(CliError::Parse {
+                        detail: format!(
+                            "workspace path is not a directory: {}",
+                            workspace_root.display()
+                        ),
+                    });
+                }
+                candidate.workspace_binding = Some(
+                    coding_agent_workspace_binding(data_dir, workspace_root)?
+                        .binding()
+                        .clone(),
+                );
             }
-            candidate.workspace_binding = Some(
-                coding_agent_workspace_binding(data_dir, &self.workspace_root)?
-                    .binding()
-                    .clone(),
-            );
         }
 
         let store = FileAgentSessionStore::for_data_dir(data_dir);
@@ -7606,6 +7869,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         data_dir: &SinomoDataDir,
         session: &InteractionSession,
         sandbox_node_id: Option<NodeId>,
+        workspaces: Option<&[WorkspaceRef]>,
         daemon_connected: bool,
     ) -> Result<(), CliError> {
         // The TUI configures tools before the first model turn, while the
@@ -7621,10 +7885,11 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
                     session.session_id
                 ),
             })?;
-        let requested_workspace_root = if snapshot.workspace_binding.is_none()
+        let requested_workspace_root = if workspaces.is_none()
+            && snapshot.workspace_binding.is_none()
             && agent_definition_has_coding_authority(&self.agent_definition)
         {
-            Some(self.workspace_root.clone())
+            self.workspace_root.clone()
         } else {
             None
         };
@@ -7632,6 +7897,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
             data_dir,
             &session.session_id,
             sandbox_node_id,
+            workspaces,
             requested_workspace_root.as_deref(),
             daemon_connected,
         )?;
@@ -7643,6 +7909,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         data_dir: &SinomoDataDir,
         session_id: &SessionId,
         sandbox_node_id: Option<NodeId>,
+        conversation_workspaces: Option<&[WorkspaceRef]>,
         requested_workspace_root: Option<&Path>,
         daemon_connected: bool,
     ) -> Result<Option<PathBuf>, CliError> {
@@ -7659,37 +7926,60 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
                 ),
             });
         }
-
-        let requested_workspace = requested_workspace_root
-            .map(|root| {
-                let metadata = std::fs::metadata(root).map_err(|source| CliError::Io {
-                    path: root.display().to_string(),
-                    detail: format!("workspace directory is unavailable: {source}"),
-                })?;
-                if !metadata.is_dir() {
-                    return Err(CliError::Parse {
-                        detail: format!("workspace path is not a directory: {}", root.display()),
-                    });
-                }
-                if agent_definition_has_coding_authority(&self.agent_definition) {
-                    coding_agent_workspace_binding(data_dir, root)
-                } else {
-                    workspace_ref_for_selected_root(data_dir, root)
-                }
-            })
-            .transpose()?;
-        let requested_binding = requested_workspace
-            .as_ref()
-            .map(|workspace| workspace.binding());
-
-        if let (Some(existing), Some(requested)) =
-            (session.workspace_binding.as_ref(), requested_binding)
+        if let Some(runtime) = self.ready_runtime()
+            && runtime.active_turn()?.is_some()
         {
-            validate_agent_session_workspace_binding(session_id, existing, requested)?;
+            return Err(CliError::Parse {
+                detail: format!(
+                    "cannot reconfigure workspace or sandbox grants for agent session `{session_id}` while a turn is active"
+                ),
+            });
         }
-        if session.workspace_binding.is_none() {
-            session.workspace_binding = requested_binding.cloned();
-        }
+
+        let requested_binding =
+            if conversation_workspaces.is_none() && session.workspace_binding.is_none() {
+                requested_workspace_root
+                    .map(|root| {
+                        let metadata = std::fs::metadata(root).map_err(|source| CliError::Io {
+                            path: root.display().to_string(),
+                            detail: format!("workspace directory is unavailable: {source}"),
+                        })?;
+                        if !metadata.is_dir() {
+                            return Err(CliError::Parse {
+                                detail: format!(
+                                    "workspace path is not a directory: {}",
+                                    root.display()
+                                ),
+                            });
+                        }
+                        if agent_definition_has_coding_authority(&self.agent_definition) {
+                            coding_agent_workspace_binding(data_dir, root)
+                        } else {
+                            workspace_ref_for_selected_root(data_dir, root)
+                        }
+                    })
+                    .transpose()?
+                    .map(|workspace| workspace.binding().clone())
+            } else {
+                None
+            };
+        let workspace_bindings = if let Some(conversation_workspaces) = conversation_workspaces {
+            conversation_workspaces.to_vec()
+        } else if let Some(legacy_workspace) = session.workspace_binding.clone() {
+            // A legacy conversation has no grant projection yet. Its canonical
+            // session shadow belongs to this chat and takes precedence over a
+            // process-local selection retained from another chat/device.
+            vec![legacy_workspace]
+        } else if let Some(requested) = requested_binding {
+            vec![requested]
+        } else {
+            Vec::new()
+        };
+
+        // Keep the legacy field as a compatibility snapshot only. It mirrors
+        // the conversation's primary grant and never vetoes a conversation
+        // workspace change.
+        session.workspace_binding = workspace_bindings.first().cloned();
 
         if session.sandbox_attachment.is_none() {
             let sandbox_server_id = sandbox_node_id
@@ -7715,29 +8005,23 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
                 })?;
         }
 
-        let selected_workspace = session
-            .workspace_binding
-            .as_ref()
+        let resolved_workspaces = workspace_bindings
+            .iter()
             .map(|binding| workspace_binding_root_for_data_dir(data_dir, session_id, binding))
-            .transpose()?;
-        let selected_root = selected_workspace
-            .as_ref()
-            .map(|workspace| workspace.root().to_path_buf());
-        if agent_definition_has_coding_authority(&self.agent_definition) && selected_root.is_none()
-        {
-            return Err(CliError::Parse {
-                detail: "coding-agent needs a workspace directory before it can use coding tools"
-                    .to_string(),
-            });
-        }
+            .collect::<Result<Vec<_>, _>>()?;
+        let resolved_workspace_roots = resolved_workspaces
+            .iter()
+            .map(|workspace| workspace.root().to_path_buf())
+            .collect::<Vec<_>>();
+        let selected_root = resolved_workspace_roots.first().cloned();
+        let registry_adapter_root = selected_root
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| empty_workspace_context_root(session_id))?;
 
-        if let Some(runtime) = self.ready_runtime() {
-            runtime.replace_session(session)?;
-        }
-        if let Some(root) = selected_root.as_ref()
-            && &self.workspace_root != root
-        {
-            let previous_root = std::mem::replace(&mut self.workspace_root, root.clone());
+        let mut previous_workspace_root = None;
+        if self.workspace_root != selected_root {
+            let previous_root = std::mem::replace(&mut self.workspace_root, selected_root.clone());
             let selection = TuiModelSelection {
                 provider: self.provider.clone(),
                 model: self.model_name.clone(),
@@ -7747,20 +8031,50 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
                 self.workspace_root = previous_root;
                 return Err(error);
             }
+            previous_workspace_root = Some(previous_root);
         }
-        let registry_root = selected_root.as_deref().unwrap_or(&self.workspace_root);
-        configure_agent_tool_registry_for_workspace(
+        if let Err(error) = configure_agent_tool_registry_for_workspace_projection(
             &self.tool_registry,
             data_dir,
-            registry_root,
+            &registry_adapter_root,
+            &workspace_bindings,
+            &resolved_workspace_roots,
             &self.agent_definition,
             Some(session_id),
             sandbox_node_id,
             agent_definition_has_coding_authority(&self.agent_definition),
-        )?;
+        ) {
+            if let Some(previous_root) = previous_workspace_root {
+                self.workspace_root = previous_root;
+            }
+            return Err(error);
+        }
+        if let Some(runtime) = self.ready_runtime()
+            && let Err(error) = runtime.replace_session(session)
+        {
+            if let Some(previous_root) = previous_workspace_root {
+                self.workspace_root = previous_root;
+            }
+            return Err(error.into());
+        }
         self.persist_attached_agent_session(data_dir, session_id)?;
         Ok(selected_root)
     }
+}
+
+fn empty_workspace_context_root(session_id: &SessionId) -> Result<PathBuf, CliError> {
+    let root = env::temp_dir()
+        .join("sinomo-agent")
+        .join("empty-workspace-context")
+        .join(session_id.to_string());
+    fs::create_dir_all(&root).map_err(|source| CliError::Io {
+        path: root.display().to_string(),
+        detail: format!("create empty workspace context: {source}"),
+    })?;
+    fs::canonicalize(&root).map_err(|source| CliError::Io {
+        path: root.display().to_string(),
+        detail: format!("resolve empty workspace context: {source}"),
+    })
 }
 
 /// Plain-data view of the active runtime selection, for the GUI app.
@@ -7879,7 +8193,7 @@ fn tui_grants_workspace_mutation_only_to_the_builtin_coding_agent() {
     let workspace = fs::canonicalize(workspace).expect("canonical workspace");
     let (mut handler, _) =
         runtime_main_agent_handler_for_tui_with_data_dir(None, &data_dir).expect("TUI handler");
-    handler.workspace_root = workspace.clone();
+    handler.workspace_root = Some(workspace.clone());
     handler
         .set_agent_definition(AgentDefinition::coding())
         .expect("select coding agent");
@@ -7890,7 +8204,7 @@ fn tui_grants_workspace_mutation_only_to_the_builtin_coding_agent() {
     );
 
     handler
-        .configure_tui_tool_runtime_for_session(&data_dir, &session, None, false)
+        .configure_tui_tool_runtime_for_session(&data_dir, &session, None, None, false)
         .expect("configure coding tools");
     let write = execute_tui_workspace_tool(
         &handler,
@@ -7951,7 +8265,7 @@ fn tui_grants_workspace_mutation_only_to_the_builtin_coding_agent() {
         .set_agent_definition(AgentDefinition::main())
         .expect("select non-coding agent");
     handler
-        .configure_tui_tool_runtime_for_session(&data_dir, &session, None, false)
+        .configure_tui_tool_runtime_for_session(&data_dir, &session, None, None, false)
         .expect("configure non-coding tools");
     for (call_index, tool, input) in [
         (
@@ -7983,7 +8297,7 @@ fn tui_grants_workspace_mutation_only_to_the_builtin_coding_agent() {
 
 #[cfg(test)]
 #[test]
-fn tui_resume_uses_the_session_workspace_binding() {
+fn tui_tool_runtime_legacy_fallback_uses_the_session_workspace_binding() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-tui-resume-workspace");
     let data_dir = SinomoDataDir::new(root.join("data"));
     let original_workspace = root.join("original-workspace");
@@ -7996,7 +8310,7 @@ fn tui_resume_uses_the_session_workspace_binding() {
         fs::canonicalize(process_workspace).expect("canonical process workspace");
     let (mut handler, _) =
         runtime_main_agent_handler_for_tui_with_data_dir(None, &data_dir).expect("TUI handler");
-    handler.workspace_root = process_workspace;
+    handler.workspace_root = Some(process_workspace.clone());
     handler
         .set_agent_definition(AgentDefinition::coding())
         .expect("select coding agent");
@@ -8016,10 +8330,20 @@ fn tui_resume_uses_the_session_workspace_binding() {
         .expect("restore workspace-bound session");
 
     handler
-        .configure_tui_tool_runtime_for_session(&data_dir, &interaction_session, None, false)
+        .configure_app_tool_runtime_for_session(
+            &data_dir,
+            &interaction_session.session_id,
+            None,
+            None,
+            Some(&process_workspace),
+            false,
+        )
         .expect("configure resumed coding tools");
 
-    assert_eq!(handler.workspace_root, original_workspace);
+    assert_eq!(
+        handler.workspace_root.as_deref(),
+        Some(original_workspace.as_path())
+    );
     let write = execute_tui_workspace_tool(
         &handler,
         &interaction_session,
@@ -8031,6 +8355,161 @@ fn tui_resume_uses_the_session_workspace_binding() {
     assert_eq!(
         fs::read_to_string(original_workspace.join("resumed.txt")).expect("resumed write"),
         "resumed\n"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn tui_tool_runtime_ignores_stale_requested_root_when_conversation_is_authoritative() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-tui-conversation-workspace-authority");
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    let conversation_workspace = root.join("conversation-workspace");
+    let stale_requested_workspace = root.join("missing-stale-workspace");
+    fs::create_dir_all(&conversation_workspace).expect("create conversation workspace");
+    let conversation_workspace =
+        fs::canonicalize(conversation_workspace).expect("canonical conversation workspace");
+    let (mut handler, _) =
+        runtime_main_agent_handler_for_tui_with_data_dir(None, &data_dir).expect("TUI handler");
+    handler
+        .set_agent_definition(AgentDefinition::coding())
+        .expect("select coding agent");
+    let interaction_session = InteractionSession::new(
+        SessionId::generate(),
+        NodeId::from_legacy_named("node_tui_workspace_authority").expect("node id"),
+        InteractionSurface::new("test.tui", InteractionSurfaceKind::CommandLine),
+    );
+    handler
+        .replace_agent_session(&interaction_session, sinomo_agent::AgentTranscript::new())
+        .expect("attach agent session");
+    let workspaces = vec![WorkspaceRef::local_path(conversation_workspace.clone())];
+
+    let selected = handler
+        .configure_app_tool_runtime_for_session(
+            &data_dir,
+            &interaction_session.session_id,
+            None,
+            Some(&workspaces),
+            Some(&stale_requested_workspace),
+            false,
+        )
+        .expect("conversation workspace must bypass stale requested root");
+
+    assert_eq!(selected.as_deref(), Some(conversation_workspace.as_path()));
+    assert_eq!(
+        handler.workspace_root.as_deref(),
+        Some(conversation_workspace.as_path())
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn tui_tool_runtime_projects_ordered_additional_workspace_access() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-tui-ordered-workspaces");
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    let primary = root.join("primary");
+    let secondary = root.join("secondary");
+    fs::create_dir_all(&primary).expect("create primary workspace");
+    fs::create_dir_all(&secondary).expect("create secondary workspace");
+    fs::write(secondary.join("secondary.txt"), "additional workspace\n")
+        .expect("write additional workspace file");
+    let primary = fs::canonicalize(primary).expect("canonical primary workspace");
+    let secondary = fs::canonicalize(secondary).expect("canonical secondary workspace");
+    let (mut handler, _) =
+        runtime_main_agent_handler_for_tui_with_data_dir(None, &data_dir).expect("TUI handler");
+    handler
+        .set_agent_definition(AgentDefinition::coding())
+        .expect("select coding agent");
+    let interaction_session = InteractionSession::new(
+        SessionId::generate(),
+        NodeId::from_legacy_named("node_tui_ordered_workspaces").expect("node id"),
+        InteractionSurface::new("test.tui", InteractionSurfaceKind::CommandLine),
+    );
+    handler
+        .replace_agent_session(&interaction_session, sinomo_agent::AgentTranscript::new())
+        .expect("attach agent session");
+    let workspaces = vec![
+        WorkspaceRef::local_path(primary.clone()),
+        WorkspaceRef::local_path(secondary.clone()),
+    ];
+
+    handler
+        .configure_app_tool_runtime_for_session(
+            &data_dir,
+            &interaction_session.session_id,
+            None,
+            Some(&workspaces),
+            None,
+            false,
+        )
+        .expect("project ordered workspaces");
+    let read = execute_tui_workspace_tool(
+        &handler,
+        &interaction_session,
+        0,
+        "read_file",
+        serde_json::json!({ "path": secondary.join("secondary.txt") }),
+    );
+
+    assert_eq!(handler.workspace_root.as_deref(), Some(primary.as_path()));
+    assert_eq!(read.status, sinomo_agent::AgentToolStatus::Succeeded);
+    assert_eq!(
+        read.output
+            .get("content")
+            .and_then(serde_json::Value::as_str),
+        Some("additional workspace\n")
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn tui_tool_runtime_treats_authoritative_empty_workspaces_as_revocation() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-tui-empty-workspace-authority");
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    let stale_requested_workspace = root.join("missing-stale-workspace");
+    let (mut handler, _) =
+        runtime_main_agent_handler_for_tui_with_data_dir(None, &data_dir).expect("TUI handler");
+    handler
+        .set_agent_definition(AgentDefinition::coding())
+        .expect("select coding agent");
+    let interaction_session = InteractionSession::new(
+        SessionId::generate(),
+        NodeId::from_legacy_named("node_tui_empty_workspace_authority").expect("node id"),
+        InteractionSurface::new("test.tui", InteractionSurfaceKind::CommandLine),
+    );
+    let mut agent_session = AgentSession::new(
+        interaction_session.session_id.clone(),
+        AgentRole::Deliberation,
+    )
+    .with_agent_definition_key("coding-agent");
+    agent_session.workspace_binding = Some(WorkspaceRef::local_path("/legacy/workspace"));
+    handler
+        .replace_full_agent_session(&interaction_session, agent_session)
+        .expect("restore legacy workspace shadow");
+
+    let selected = handler
+        .configure_app_tool_runtime_for_session(
+            &data_dir,
+            &interaction_session.session_id,
+            None,
+            Some(&[]),
+            Some(&stale_requested_workspace),
+            false,
+        )
+        .expect("empty authoritative projection must ignore legacy and requested roots");
+
+    assert_eq!(selected, None);
+    assert_eq!(handler.workspace_root, None);
+    assert!(
+        !handler.tool_registry.contains("read_file"),
+        "revoking the last workspace removes workspace tools instead of retaining the old root"
+    );
+    assert_eq!(
+        handler
+            .agent_session_snapshot()
+            .expect("snapshot")
+            .expect("session")
+            .workspace_binding,
+        None
     );
 }
 
@@ -8076,10 +8555,17 @@ impl TuiAgentRuntimeControl for RuntimeMainAgentInteractionHandler<DefaultMainAg
         &mut self,
         data_dir: &SinomoDataDir,
         session: &InteractionSession,
+        workspaces: Option<&[WorkspaceRef]>,
         daemon_connected: bool,
         definition: AgentDefinition,
     ) -> Result<TuiAgentRuntimeInfo, CliError> {
-        self.switch_agent_definition_for_session(data_dir, session, definition, daemon_connected)
+        self.switch_agent_definition_for_session(
+            data_dir,
+            session,
+            workspaces,
+            definition,
+            daemon_connected,
+        )
     }
 
     fn prepare_tui_agent(
@@ -8112,12 +8598,14 @@ impl TuiAgentRuntimeControl for RuntimeMainAgentInteractionHandler<DefaultMainAg
         data_dir: &SinomoDataDir,
         session: &InteractionSession,
         sandbox_node_id: Option<NodeId>,
+        workspaces: Option<&[WorkspaceRef]>,
         daemon_connected: bool,
     ) -> Result<(), CliError> {
         self.configure_tui_tool_runtime_for_session(
             data_dir,
             session,
             sandbox_node_id,
+            workspaces,
             daemon_connected,
         )
     }

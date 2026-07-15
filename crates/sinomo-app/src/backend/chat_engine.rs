@@ -128,6 +128,11 @@ pub enum ChatCommand {
     SetToolRuntime {
         selection: ChatToolRuntimeSelection,
     },
+    /// Patch only sandbox placement. Used during backend rebind so cached UI
+    /// workspace state cannot overwrite the resumed channel's grant authority.
+    SetToolRuntimeNode {
+        sandbox_node_id: Option<String>,
+    },
     /// Ask sinomo-lm for the provider's available models (fetched off the worker so the
     /// blocking API call never stalls chat turns); the result arrives as [`ChatEvent::Models`].
     FetchModels {
@@ -922,6 +927,19 @@ fn worker(
                     });
                 }
             },
+            ChatCommand::SetToolRuntimeNode { sandbox_node_id } => {
+                match chat.set_tool_runtime_node(sandbox_node_id) {
+                    Ok(selection) => {
+                        let _ = evt_tx.send(ChatEvent::ToolRuntime(selection));
+                    }
+                    Err(error) => {
+                        let _ = evt_tx.send(ChatEvent::Error {
+                            session_id: Some(chat.session_id()),
+                            error: format!("tool runtime node update failed: {error}"),
+                        });
+                    }
+                }
+            }
             ChatCommand::FetchModels { provider } => {
                 // Fetch off-thread: the provider API call blocks, and chat turns must not.
                 let tx = evt_tx.clone();
@@ -1128,6 +1146,46 @@ mod tests {
             info,
             ChatEvent::RuntimeInfo(info) if info.agent == "coding-agent"
         ));
+    }
+
+    #[test]
+    fn chat_worker_node_only_rebind_does_not_replay_workspace_authority() {
+        let temp = TempDataDir::new("chat-worker-node-only-rebind");
+        let workspace = temp.path.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        let workspace = std::fs::canonicalize(workspace).expect("canonical workspace");
+        let runtime_control = AgentRuntimeControlRegistry::new();
+        let handle = ChatHandle::spawn(temp.data_dir.clone(), false, runtime_control, None, None);
+        wait_for_event(&handle, |event| matches!(event, ChatEvent::Ready { .. }))
+            .expect("ready event");
+
+        handle.send_command(ChatCommand::SetToolRuntime {
+            selection: ChatToolRuntimeSelection {
+                workspace_root: Some(workspace.clone()),
+                ..ChatToolRuntimeSelection::default()
+            },
+        });
+        wait_for_event(&handle, |event| {
+            matches!(
+                event,
+                ChatEvent::ToolRuntime(selection)
+                    if selection.workspace_root.as_deref() == Some(workspace.as_path())
+            )
+        })
+        .expect("workspace selection event");
+
+        handle.send_command(ChatCommand::SetToolRuntimeNode {
+            sandbox_node_id: None,
+        });
+        let rebound = wait_for_event(&handle, |event| {
+            matches!(
+                event,
+                ChatEvent::ToolRuntime(selection)
+                    if selection.workspace_root.as_deref() == Some(workspace.as_path())
+            )
+        })
+        .expect("node-only rebind event");
+        assert!(matches!(rebound, ChatEvent::ToolRuntime(_)));
     }
 
     #[test]

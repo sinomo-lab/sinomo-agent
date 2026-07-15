@@ -452,6 +452,10 @@ fn sandbox_instance_lifecycle_events_report_manifest_shape() {
         true,
         &["PATH".to_string()],
         &["OLD_VAR".to_string()],
+        false,
+        false,
+        &[],
+        &[],
     );
     assert_eq!(updated.kind.as_str(), "sandbox.instance.updated");
     assert_eq!(updated.payload["sandbox_id"], sandbox_id.to_string());
@@ -459,6 +463,8 @@ fn sandbox_instance_lifecycle_events_report_manifest_shape() {
     assert_eq!(updated.payload["cwd_changed"], true);
     assert_eq!(updated.payload["env_set_keys"][0], "PATH");
     assert_eq!(updated.payload["env_unset_keys"][0], "OLD_VAR");
+    assert_eq!(updated.payload["mounts_replaced"], false);
+    assert_eq!(updated.payload["mounts_changed"], false);
 
     let checkpoint = SandboxCheckpoint {
         checkpoint_id: SandboxCheckpointId::from_legacy_named("checkpoint_lifecycle")

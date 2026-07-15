@@ -269,6 +269,10 @@ pub fn sandbox_instance_updated_event(
     cwd_changed: bool,
     env_set_keys: &[String],
     env_unset_keys: &[String],
+    mounts_replaced: bool,
+    mounts_changed: bool,
+    mounts_added: &[SandboxMount],
+    mounts_removed: &[SandboxMount],
 ) -> EventEnvelope {
     sandbox_instance_lifecycle_event(
         node_id,
@@ -278,6 +282,10 @@ pub fn sandbox_instance_updated_event(
             "cwd_changed": cwd_changed,
             "env_set_keys": env_set_keys,
             "env_unset_keys": env_unset_keys,
+            "mounts_replaced": mounts_replaced,
+            "mounts_changed": mounts_changed,
+            "mounts_added": sandbox_mount_payload(mounts_added),
+            "mounts_removed": sandbox_mount_payload(mounts_removed),
         }),
     )
 }
@@ -397,17 +405,30 @@ pub fn sandbox_mount_added_event(
     manifest: &SandboxInstanceManifest,
     mount: &SandboxMount,
 ) -> EventEnvelope {
+    sandbox_mount_change_event(node_id, manifest, mount, "sandbox.mount.added")
+}
+
+pub fn sandbox_mount_removed_event(
+    node_id: NodeId,
+    manifest: &SandboxInstanceManifest,
+    mount: &SandboxMount,
+) -> EventEnvelope {
+    sandbox_mount_change_event(node_id, manifest, mount, "sandbox.mount.removed")
+}
+
+fn sandbox_mount_change_event(
+    node_id: NodeId,
+    manifest: &SandboxInstanceManifest,
+    mount: &SandboxMount,
+    kind: &'static str,
+) -> EventEnvelope {
     EventEnvelope::new(
-        sandbox_authoritative_mutation_event_id(
-            manifest,
-            "sandbox.mount.added",
-            mount.mount_path.as_str(),
-        )
-        .unwrap_or_else(EventId::generate),
+        sandbox_authoritative_mutation_event_id(manifest, kind, mount.mount_path.as_str())
+            .unwrap_or_else(EventId::generate),
         OffsetDateTime::now_utc(),
         node_id,
         Source::new("sandbox.mount").expect("valid source"),
-        EventKind::new("sandbox.mount.added").expect("valid event kind"),
+        EventKind::new(kind).expect("valid event kind"),
         Salience::new(0.58).expect("valid salience"),
         Confidence::new(0.98).expect("valid confidence"),
         RoutingMetadata::new(
@@ -740,5 +761,57 @@ mod command_event_id_tests {
         assert_eq!(first_output.event_id, second_output.event_id);
         assert_ne!(first_started.event_id, first_terminal.event_id);
         assert_ne!(first_started.event_id, first_output.event_id);
+    }
+
+    #[test]
+    fn sandbox_update_event_records_full_mount_reconciliation() {
+        let mut manifest = SandboxInstanceManifest::new(
+            SandboxId::from_legacy_named("event_mount_update_sandbox").expect("sandbox"),
+            SandboxToolchainId::from_legacy_named("event_mount_update_toolchain")
+                .expect("toolchain"),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .expect("manifest");
+        let removed = SandboxMount {
+            source_sifs_path: "/services/sandbox-shared/old".to_string(),
+            mount_path: SandboxPath::new("/work").expect("mount path"),
+            mode: SandboxMountMode::ReadOnly,
+        };
+        let added = SandboxMount {
+            source_sifs_path: "/services/sandbox-shared/new".to_string(),
+            mount_path: SandboxPath::new("/work").expect("mount path"),
+            mode: SandboxMountMode::ReadWrite,
+        };
+        manifest.mounts = vec![added.clone()];
+        let node = NodeId::from_legacy_named("event_mount_update_node").expect("node");
+
+        let updated = sandbox_instance_updated_event(
+            node.clone(),
+            &manifest,
+            false,
+            &[],
+            &[],
+            true,
+            true,
+            std::slice::from_ref(&added),
+            std::slice::from_ref(&removed),
+        );
+        assert_eq!(updated.payload["mounts_replaced"], true);
+        assert_eq!(updated.payload["mounts_changed"], true);
+        assert_eq!(
+            updated.payload["mounts_added"][0]["source_sifs_path"],
+            added.source_sifs_path
+        );
+        assert_eq!(
+            updated.payload["mounts_removed"][0]["source_sifs_path"],
+            removed.source_sifs_path
+        );
+
+        let removed_event = sandbox_mount_removed_event(node, &manifest, &removed);
+        assert_eq!(removed_event.kind.as_str(), "sandbox.mount.removed");
+        assert_eq!(
+            removed_event.payload["source_sifs_path"],
+            removed.source_sifs_path
+        );
     }
 }

@@ -7083,6 +7083,7 @@ pub fn sandbox_config_with_store(
     let response = backend.update(crate::SandboxUpdateInstanceRequest {
         sandbox_id: options.sandbox_id,
         cwd: options.cwd,
+        mounts: None,
         env_set: options.env_set,
         env_unset: options.env_unset,
     })?;
@@ -7103,6 +7104,7 @@ pub fn sandbox_config_with_daemon(options: SandboxConfigOptions) -> Result<(), C
     let request = crate::SandboxUpdateInstanceRequest {
         sandbox_id: options.sandbox_id,
         cwd: options.cwd,
+        mounts: None,
         env_set: options.env_set,
         env_unset: options.env_unset,
     };

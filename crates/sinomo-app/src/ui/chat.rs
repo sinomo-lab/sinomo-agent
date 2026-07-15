@@ -1816,8 +1816,8 @@ impl ChatState {
                 account,
             });
         }
-        self.handle.send_command(ChatCommand::SetToolRuntime {
-            selection: tool_runtime,
+        self.handle.send_command(ChatCommand::SetToolRuntimeNode {
+            sandbox_node_id: tool_runtime.sandbox_node_id,
         });
         self.replace_activity(
             "connection",
@@ -4410,10 +4410,8 @@ impl ChatState {
     }
 
     pub fn set_tool_runtime_node(&mut self, sandbox_node_id: Option<String>) {
-        let mut selection = self.tool_runtime.clone();
-        selection.sandbox_node_id = sandbox_node_id;
         self.handle
-            .send_command(ChatCommand::SetToolRuntime { selection });
+            .send_command(ChatCommand::SetToolRuntimeNode { sandbox_node_id });
     }
 
     fn apply_event(&mut self, event: ChatEvent) -> bool {

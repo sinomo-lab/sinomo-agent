@@ -4857,8 +4857,36 @@ pub(crate) fn configure_agent_tool_registry_for_workspace(
     sandbox_node_id: Option<NodeId>,
     allow_coding_mutation: bool,
 ) -> Result<(), CliError> {
+    let workspace = workspace_ref_for_selected_root(data_dir, workspace_root)?
+        .binding()
+        .clone();
+    configure_agent_tool_registry_for_workspace_projection(
+        registry,
+        data_dir,
+        workspace_root,
+        &[workspace],
+        &[workspace_root.to_path_buf()],
+        definition,
+        session_id,
+        sandbox_node_id,
+        allow_coding_mutation,
+    )
+}
+
+pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
+    registry: &AgentToolRegistry,
+    data_dir: &SinomoDataDir,
+    workspace_root: &Path,
+    workspace_grants: &[WorkspaceRef],
+    resolved_workspace_roots: &[PathBuf],
+    definition: &AgentDefinition,
+    session_id: Option<&SessionId>,
+    sandbox_node_id: Option<NodeId>,
+    allow_coding_mutation: bool,
+) -> Result<(), CliError> {
     let store = main_agent_config_store()?;
-    let mut config = LocalWorkspaceAgentConfig::new(workspace_root);
+    let mut config = LocalWorkspaceAgentConfig::new(workspace_root)
+        .with_additional_workspace_roots(resolved_workspace_roots.iter().skip(1).cloned());
     let requested_sandbox_node_id = sandbox_node_id.clone();
     let coding_authority = agent_definition_has_coding_authority(definition);
     let live_sifs_mount = match ensure_simple_sandbox_sifs_mount(data_dir) {
@@ -4875,16 +4903,20 @@ pub(crate) fn configure_agent_tool_registry_for_workspace(
         Err(error) => return Err(error),
     };
     if allow_coding_mutation && coding_authority {
-        validate_mutating_workspace_root_with_live_mount(
-            data_dir,
-            workspace_root,
-            live_sifs_mount
-                .as_ref()
-                .map(SimpleSandboxSifsMount::mount_root),
-        )?;
-        config = config
-            .allowing_shell_commands(true)
-            .allowing_file_writes(true);
+        for root in resolved_workspace_roots {
+            validate_mutating_workspace_root_with_live_mount(
+                data_dir,
+                root,
+                live_sifs_mount
+                    .as_ref()
+                    .map(SimpleSandboxSifsMount::mount_root),
+            )?;
+        }
+        if !resolved_workspace_roots.is_empty() {
+            config = config
+                .allowing_shell_commands(true)
+                .allowing_file_writes(true);
+        }
     }
     let mut provision_default_sandbox = session_id.is_some();
     if let Some(session_id) = session_id {
@@ -4955,23 +4987,10 @@ pub(crate) fn configure_agent_tool_registry_for_workspace(
                 ),
             });
         }
-        let mut mounts = Vec::new();
-        let workspace = workspace_ref_for_selected_root(data_dir, workspace_root)?;
-        if let Some(sifs_root) = workspace.binding().sifs_root.as_ref() {
-            mounts.push(sinomo_runtime::sandbox::SandboxMount {
-                source_sifs_path: sifs_root.clone(),
-                mount_path: sinomo_runtime::sandbox::SandboxPath::new("/work").map_err(
-                    |source| CliError::Parse {
-                        detail: format!("invalid default sandbox workspace mount: {source}"),
-                    },
-                )?,
-                mode: if allow_coding_mutation && coding_authority {
-                    sinomo_runtime::sandbox::SandboxMountMode::ReadWrite
-                } else {
-                    sinomo_runtime::sandbox::SandboxMountMode::ReadOnly
-                },
-            });
-        }
+        let mut mounts = sandbox_mounts_for_workspace_grants(
+            workspace_grants,
+            allow_coding_mutation && coding_authority,
+        )?;
         if let Some(home_sifs_path) = config.agent_home_sifs_path.as_ref() {
             mounts.push(sinomo_runtime::sandbox::SandboxMount {
                 source_sifs_path: home_sifs_path.clone(),
@@ -4990,7 +5009,13 @@ pub(crate) fn configure_agent_tool_registry_for_workspace(
     if let Some(mount) = live_sifs_mount.as_ref() {
         mount.retain_for_registry(registry);
     }
-    sinomo_agent::local_workspace::register_tools(registry, config);
+    // An authoritative empty conversation projection is a complete revocation,
+    // not permission to keep using the handler's previous compatibility root.
+    // The root is still needed above to reconcile the persistent sandbox and
+    // model configuration, but no workspace tool may retain it as authority.
+    if !resolved_workspace_roots.is_empty() {
+        sinomo_agent::local_workspace::register_tools(registry, config);
+    }
     sinomo_agent::config::register_tools(
         registry,
         ConfigAgentToolConfig::new(data_dir.clone(), store),
@@ -5001,6 +5026,42 @@ pub(crate) fn configure_agent_tool_registry_for_workspace(
     );
     registry.register(CliClusterStatusAgentTool::new(data_dir.clone()));
     Ok(())
+}
+
+fn sandbox_mounts_for_workspace_grants(
+    workspace_grants: &[WorkspaceRef],
+    read_write: bool,
+) -> Result<Vec<sinomo_runtime::sandbox::SandboxMount>, CliError> {
+    workspace_grants
+        .iter()
+        .enumerate()
+        .filter_map(|(index, workspace)| {
+            workspace
+                .sifs_root
+                .as_ref()
+                .map(|sifs_root| (index, sifs_root))
+        })
+        .map(|(index, sifs_root)| {
+            let mount_path = if index == 0 {
+                "/work".to_string()
+            } else {
+                format!("/workspaces/{}", index + 1)
+            };
+            Ok(sinomo_runtime::sandbox::SandboxMount {
+                source_sifs_path: sifs_root.clone(),
+                mount_path: sinomo_runtime::sandbox::SandboxPath::new(&mount_path).map_err(
+                    |source| CliError::Parse {
+                        detail: format!("invalid sandbox workspace mount `{mount_path}`: {source}"),
+                    },
+                )?,
+                mode: if read_write {
+                    sinomo_runtime::sandbox::SandboxMountMode::ReadWrite
+                } else {
+                    sinomo_runtime::sandbox::SandboxMountMode::ReadOnly
+                },
+            })
+        })
+        .collect()
 }
 
 #[cfg(unix)]

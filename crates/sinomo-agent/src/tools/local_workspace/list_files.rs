@@ -70,7 +70,7 @@ impl AgentTool for ListFilesTool {
             "entries": entries,
         });
         let evidence =
-            AgentToolEvidence::availability_only(true, "path resolved inside workspace root")
+            AgentToolEvidence::availability_only(true, "path resolved inside workspace grants")
                 .with_output_value(&payload, truncated);
         AgentToolResult::succeeded(format!("listed {} entrie(s)", entries.len()), payload)
             .with_evidence(evidence)
@@ -85,7 +85,7 @@ pub(super) fn descriptor() -> AgentToolDescriptor {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Workspace-relative directory or file to list. Defaults to the workspace root."
+                    "description": "Directory or file to list. Relative paths use the primary workspace; absolute paths may address any granted workspace. Defaults to the primary workspace root."
                 },
                 "recursive": {
                     "type": "boolean",
