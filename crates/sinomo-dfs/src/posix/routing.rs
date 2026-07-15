@@ -273,6 +273,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     Ok(Some(object)) => return Ok((resolved, Some(object))),
                     Ok(None) => return Ok((resolved, None)),
+                    Err(error) if namespace_lookup_error_is_uncorroborated_redirect(&error) => {
+                        // The response was discarded, so refresh membership
+                        // again and use no response-derived state. A current
+                        // replica may preserve availability only for an
+                        // already-live local hit; outsiders and missing or
+                        // tombstoned local state must surface the integrity
+                        // error rather than laundering it into NotFound.
+                        let current_shard =
+                            self.select_sifs_metadata_shard_for_path_fresh(&resolved)?;
+                        if current_shard.as_ref().is_some_and(|current| {
+                            self.is_local_metadata_replica_for_shard(current)
+                        }) && local_object
+                            .as_ref()
+                            .is_some_and(|object| object.kind != DfsObjectKind::Tombstone)
+                        {
+                            return Ok((resolved, local_object));
+                        }
+                        return Err(error.into());
+                    }
                     Err(error)
                         if self.is_local_metadata_replica_for_shard(&shard)
                             && !namespace_lookup_error_allows_local_replica_fallback(&error) =>
@@ -464,7 +483,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         {
             return Ok(());
         }
-        let Some(path) = namespace_operation_routing_path(operation) else {
+        let Some(path) = operation.routing_path() else {
             return Ok(());
         };
         self.sync_remote_namespace_path_until_quiet(path)
@@ -542,7 +561,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation: &DfsNamespaceOperation,
         primary: &mut NodeId,
     ) -> Result<RoutedNamespaceNetworkRecovery> {
-        let Some(path) = namespace_operation_routing_path(operation) else {
+        let Some(path) = operation.routing_path() else {
             return Ok(RoutedNamespaceNetworkRecovery::Unchanged);
         };
         let Some(shard) = self.select_sifs_metadata_shard_for_path_fresh(path)? else {
@@ -887,6 +906,14 @@ fn namespace_lookup_error_allows_local_replica_fallback(error: &DfsError) -> boo
     )
 }
 
+fn namespace_lookup_error_is_uncorroborated_redirect(error: &DfsError) -> bool {
+    matches!(
+        error,
+        DfsError::Distributed { message }
+            if message.starts_with("routed namespace authority redirect is uncorroborated:")
+    )
+}
+
 fn validate_advisory_lock_migration_receipt(
     operation: &DfsNamespaceOperation,
     result: Option<&DfsPosixCoordinationResult>,
@@ -949,40 +976,6 @@ fn validate_advisory_lock_migration_receipt(
             object.object_id
         ),
     }))
-}
-
-fn namespace_operation_routing_path(operation: &DfsNamespaceOperation) -> Option<&str> {
-    match operation {
-        DfsNamespaceOperation::Mkdir { path }
-        | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
-        | DfsNamespaceOperation::MkdirAll { path }
-        | DfsNamespaceOperation::Rmdir { path }
-        | DfsNamespaceOperation::Unlink { path }
-        | DfsNamespaceOperation::SetMode { path, .. }
-        | DfsNamespaceOperation::SetOwner { path, .. }
-        | DfsNamespaceOperation::SetSymlinkOwner { path, .. }
-        | DfsNamespaceOperation::SetTimes { path, .. }
-        | DfsNamespaceOperation::TouchDirectoryModified { path }
-        | DfsNamespaceOperation::ClearDirRecursive { path }
-        | DfsNamespaceOperation::SyncPath { path }
-        | DfsNamespaceOperation::LookupPath { path }
-        | DfsNamespaceOperation::AdvisoryLock { path, .. }
-        | DfsNamespaceOperation::FileSync { path, .. }
-        | DfsNamespaceOperation::DirectorySync { path, .. }
-        | DfsNamespaceOperation::ResumeNamespaceJobBounded { path, .. } => Some(path.as_str()),
-        DfsNamespaceOperation::AdvisoryLockMigrationPrepare { path, .. } => Some(path.as_str()),
-        DfsNamespaceOperation::LookupPaths { paths } => paths.first().map(String::as_str),
-        DfsNamespaceOperation::Rename { from, .. }
-        | DfsNamespaceOperation::RenameSingleNamespaceAtomic { from, .. }
-        | DfsNamespaceOperation::RenameDirectoryBounded { from, .. } => Some(from.as_str()),
-        DfsNamespaceOperation::Hardlink { existing_path, .. } => Some(existing_path.as_str()),
-        DfsNamespaceOperation::ApplyTransaction { transaction } => transaction
-            .objects
-            .first()
-            .map(|object| object.path.as_str()),
-        DfsNamespaceOperation::AdoptObjectAtPath { object, .. } => Some(object.path.as_str()),
-        DfsNamespaceOperation::AdoptHardlinkAlias { alias, .. } => Some(alias.path.as_str()),
-    }
 }
 
 #[cfg(test)]

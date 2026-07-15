@@ -1291,7 +1291,7 @@ impl AsyncInProcessTransport {
     }
 
     pub async fn send_object_rpc_request_async(
-        &mut self,
+        &self,
         target_node_id: &NodeId,
         request: ObjectRpcRequest,
         options: AsyncNetworkSendOptions,

@@ -15,7 +15,9 @@ use crate::advisory_lock::{
 };
 use crate::control_plane::{DfsMetadataShardConfig, select_metadata_shard_config_for_path};
 use crate::intent::write_intent_status_is_active;
-use crate::metadata_api::{DfsMetadataBackend, DfsMetadataShardWriteFreeze};
+use crate::metadata_api::{
+    DfsMetadataBackend, DfsMetadataReplicaIngestPermit, DfsMetadataShardWriteFreeze,
+};
 use crate::metadata_backend::LocalSobjMetadataBackend;
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_hardlink::sort_hardlinks_by_path;
@@ -232,6 +234,29 @@ impl LocalShardedMetadataBackend {
         })
     }
 
+    fn require_replica_ingest_permit_for_shard(
+        &self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<()> {
+        let shard = self.shard_configs.get(&shard_id.0).ok_or_else(|| {
+            MetadataBackendError::Serde(format!(
+                "unknown configured DFS metadata shard: {}",
+                shard_id.0
+            ))
+        })?;
+        if permit.file_system_id() != &shard.file_system_id || permit.shard_id() != shard_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata replica ingest permit for filesystem {} shard {} does not match configured filesystem {} shard {}",
+                permit.file_system_id(),
+                permit.shard_id().0,
+                shard.file_system_id,
+                shard.shard_id,
+            )));
+        }
+        Ok(())
+    }
+
     fn shard_configs_for_file_system(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -280,28 +305,35 @@ impl LocalShardedMetadataBackend {
 
     fn shard_id_for_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsMetadataShardId>> {
         if let Some(index) = self.read_object_shard_index(object_id)? {
-            if self.shards.contains_key(&index.shard_id) {
+            if self.object_shard_index_is_corroborated(object_id, &index)? {
                 return Ok(Some(index.shard_id));
             }
         }
-        // Without an index record (replicas never write one), the same object
-        // id can appear in several shards after a cross-shard move: the live
-        // record in the destination shard and the eviction tombstone left in
-        // the source shard. The live record must win regardless of shard
-        // iteration order; tombstone-only matches are returned as a fallback
-        // so deleted objects still resolve.
-        let mut tombstone_shard = None;
-        for (shard_id, backend) in &self.shards {
-            if let Some(object) = backend.get_object(object_id)? {
-                if object.kind != DfsObjectKind::Tombstone {
-                    return Ok(Some(shard_id.clone()));
-                }
-                if tombstone_shard.is_none() {
-                    tombstone_shard = Some(shard_id.clone());
-                }
-            }
+        // The object-to-shard record is a rebuildable accelerator. A replica
+        // may have no record or may retain the source shard after ingesting a
+        // cross-shard move. Fall back to physical/routing authority instead of
+        // allowing that derived state to select the source eviction tombstone.
+        Ok(self
+            .authoritative_object_placement(object_id)?
+            .map(|(shard_id, _)| shard_id))
+    }
+
+    fn object_shard_index_is_corroborated(
+        &self,
+        object_id: &DfsObjectId,
+        index: &DfsObjectShardIndexRecord,
+    ) -> Result<bool> {
+        if !self.shards.contains_key(&index.shard_id) {
+            return Ok(false);
         }
-        Ok(tombstone_shard)
+        let Some(object) = self.shard_backend(&index.shard_id)?.get_object(object_id)? else {
+            return Ok(false);
+        };
+        Ok(object.file_system_id == index.file_system_id
+            && normalize_path(&object.path) == index.path
+            && self
+                .select_shard_id_for_path(&object.file_system_id, &object.path)
+                .is_ok_and(|selected| selected == index.shard_id))
     }
 
     /// Resolve physical object authority for merged scans without letting a
@@ -480,16 +512,41 @@ impl LocalShardedMetadataBackend {
         object: &DfsObjectMetadata,
         shard_id: &DfsMetadataShardId,
     ) -> Result<bool> {
-        if object.kind == DfsObjectKind::Tombstone {
+        let selected_shard_id =
+            self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
+        if selected_shard_id == *shard_id {
+            if object.kind == DfsObjectKind::Tombstone {
+                return Ok(true);
+            }
+            // A failed source cleanup can leave the old path's live row behind
+            // after a move to a different routed path. Hide that residue only
+            // when the derived index is corroborated by the complete physical
+            // destination record and current routing. A stale replica index
+            // that points at a retired shard cannot veto this selected row.
+            if let Some(index) = self.read_object_shard_index(&object.object_id)?
+                && index.shard_id != *shard_id
+                && self.object_shard_index_is_corroborated(&object.object_id, &index)?
+            {
+                return Ok(false);
+            }
             return Ok(true);
         }
-        let Some(index) = self.read_object_shard_index(&object.object_id)? else {
-            return Ok(true);
-        };
-        if !self.shards.contains_key(&index.shard_id) {
-            return Ok(true);
+
+        // A current path-selected record is the namespace authority. A live
+        // destination therefore hides the historical source record even when
+        // the replica-local object index is stale or absent. If a newly
+        // activated target has not received the object yet, preserve the old
+        // source fallback until migration installs the routed copy.
+        if self
+            .shard_backend(&selected_shard_id)?
+            .get_object_by_path(&object.file_system_id, &object.path)?
+            .is_some()
+        {
+            return Ok(false);
         }
-        Ok(index.shard_id == *shard_id)
+        Ok(self
+            .authoritative_object_placement(&object.object_id)?
+            .is_some_and(|(authoritative_shard_id, _)| authoritative_shard_id == *shard_id))
     }
 
     fn object_is_listable_from_shard(
@@ -497,13 +554,7 @@ impl LocalShardedMetadataBackend {
         object: &DfsObjectMetadata,
         shard_id: &DfsMetadataShardId,
     ) -> Result<bool> {
-        if let Some(index) = self.read_object_shard_index(&object.object_id)?
-            && self.shards.contains_key(&index.shard_id)
-            && index.shard_id != *shard_id
-        {
-            return Ok(false);
-        }
-        Ok(true)
+        self.object_is_visible_from_shard(object, shard_id)
     }
 
     fn intent_is_listable_from_shard(
@@ -1018,6 +1069,19 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             .get_object_by_path(file_system_id, path)
     }
 
+    fn namespace_prepare_expectations(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        transaction: &DfsNamespaceTransaction,
+    ) -> Result<(
+        Vec<DfsNamespaceObjectVersionExpectation>,
+        Vec<DfsNamespacePathOccupantExpectation>,
+        BTreeSet<String>,
+    )> {
+        self.shard_backend(shard_id)?
+            .namespace_prepare_expectations(shard_id, transaction)
+    }
+
     fn objects_for_file_system(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -1031,9 +1095,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                     OBJECT_LOCAL_METADATA_PAGE_SIZE,
                 )?;
                 for object in page.objects {
-                    if let Some(index) = self.read_object_shard_index(&object.object_id)?
-                        && index.shard_id != *shard_id
-                    {
+                    if !self.object_is_listable_from_shard(&object, shard_id)? {
                         continue;
                     }
                     objects.insert(object.object_id.clone(), object);
@@ -2478,12 +2540,51 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             .map(Some)
     }
 
+    fn refresh_metadata_shard_durable_view(&mut self, shard_id: &DfsMetadataShardId) -> Result<()> {
+        let mut affected_object_ids = self
+            .shard_backend(shard_id)?
+            .export_table_snapshot()
+            .tables
+            .into_iter()
+            .flat_map(|tables| tables.objects)
+            .map(|object| object.object_id)
+            .collect::<BTreeSet<_>>();
+        self.shard_backend_mut(shard_id)?
+            .refresh_metadata_shard_durable_view(shard_id)?;
+        affected_object_ids.extend(
+            self.shard_backend(shard_id)?
+                .export_table_snapshot()
+                .tables
+                .into_iter()
+                .flat_map(|tables| tables.objects)
+                .map(|object| object.object_id),
+        );
+        self.reconcile_object_shard_indexes(affected_object_ids.iter())
+    }
+
     fn metadata_shard_write_freeze(
         &self,
         shard_id: &DfsMetadataShardId,
     ) -> Result<Option<DfsMetadataShardWriteFreeze>> {
         self.shard_backend(shard_id)?
             .metadata_shard_write_freeze(shard_id)
+    }
+
+    fn has_any_metadata_shard_write_freeze(&self) -> Result<bool> {
+        for (shard_id, backend) in &self.shards {
+            if backend.metadata_shard_write_freeze(shard_id)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn metadata_shard_authoritative_writes_frozen(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<bool> {
+        self.shard_backend(shard_id)?
+            .metadata_shard_authoritative_writes_frozen(shard_id)
     }
 
     fn freeze_metadata_shard_for_membership_handoff(
@@ -2494,6 +2595,16 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     ) -> Result<Option<DfsMetadataShardWriteFreeze>> {
         self.shard_backend_mut(shard_id)?
             .freeze_metadata_shard_for_membership_handoff(shard_id, handoff_id, retiring_epoch)
+    }
+
+    fn mark_metadata_shard_membership_handoff_activated(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        handoff_id: &str,
+        activated_epoch: u64,
+    ) -> Result<bool> {
+        self.shard_backend_mut(shard_id)?
+            .mark_metadata_shard_membership_handoff_activated(shard_id, handoff_id, activated_epoch)
     }
 
     fn clear_metadata_shard_membership_handoff_freeze(
@@ -2649,6 +2760,24 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         Ok(applied)
     }
 
+    fn apply_journal_batch_with_replica_permit(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+    ) -> Result<usize> {
+        self.require_replica_ingest_permit_for_shard(permit, &batch.shard_id)?;
+        let affected_object_ids = batch
+            .entries
+            .iter()
+            .flat_map(|entry| entry.mutation.affected_object_ids())
+            .collect::<BTreeSet<_>>();
+        let applied = self
+            .shard_backend_mut(&batch.shard_id)?
+            .apply_journal_batch_with_replica_permit(permit, batch)?;
+        self.reconcile_object_shard_indexes(affected_object_ids.iter())?;
+        Ok(applied)
+    }
+
     fn replace_with_replicated_snapshot(
         &mut self,
         source_shard_id: DfsMetadataShardId,
@@ -2670,6 +2799,38 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let archived = self
             .shard_backend_mut(&source_shard_id)?
             .replace_with_replicated_snapshot(
+                source_shard_id,
+                replayed_through_sequence,
+                snapshot,
+            )?;
+        self.reconcile_object_shard_indexes(affected_object_ids.iter())?;
+        Ok(archived)
+    }
+
+    fn replace_with_replicated_snapshot_with_replica_permit(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        source_shard_id: DfsMetadataShardId,
+        replayed_through_sequence: u64,
+        snapshot: DfsMetadataTableSnapshot,
+    ) -> Result<bool> {
+        self.require_replica_ingest_permit_for_shard(permit, &source_shard_id)?;
+        let mut affected_object_ids = self
+            .shard_backend(&source_shard_id)?
+            .export_table_snapshot()
+            .tables
+            .into_iter()
+            .flat_map(|tables| tables.objects)
+            .map(|object| object.object_id)
+            .collect::<BTreeSet<_>>();
+        if let Some(tables) = snapshot.tables.as_ref() {
+            affected_object_ids
+                .extend(tables.objects.iter().map(|object| object.object_id.clone()));
+        }
+        let archived = self
+            .shard_backend_mut(&source_shard_id)?
+            .replace_with_replicated_snapshot_with_replica_permit(
+                permit,
                 source_shard_id,
                 replayed_through_sequence,
                 snapshot,

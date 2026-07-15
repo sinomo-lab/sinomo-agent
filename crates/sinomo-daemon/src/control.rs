@@ -1624,6 +1624,7 @@ pub(crate) async fn handle_daemon_object_rpc_stream_async(
                     daemon_cluster_network_ping_response(&paths, request.request)?,
                 ),
                 false,
+                route.clone(),
             ))
         } else if route == sinomo_core::network::CLUSTER_RELAY_ROUTE {
             handle_daemon_cluster_relay_session_async(
@@ -1643,6 +1644,7 @@ pub(crate) async fn handle_daemon_object_rpc_stream_async(
             Ok((
                 daemon_sandbox_stream_session_response(&paths, request.request, &service_runtime)?,
                 false,
+                route.clone(),
             ))
         } else {
             crate::service_adapter::dispatch_rpc_via_registry_to_session_response_async(
@@ -1653,22 +1655,29 @@ pub(crate) async fn handle_daemon_object_rpc_stream_async(
                 None,
             )
             .await
+            .map(|(response, stop)| (response, stop, route.clone()))
         }
     }
     .await;
-    let (response, stop) = match dispatch {
+    let (response, stop, effective_route) = match dispatch {
         Ok(response) => response,
         Err(error) => (
             sinomo_core::network::ObjectRpcSessionResponse::buffered(
                 sinomo_core::network::ObjectRpcResponse::encode_error(&route, error.to_string())?,
             ),
             false,
+            route.clone(),
         ),
     };
     responder
         .respond(response)
         .await
         .map_err(DaemonError::from)?;
+    crate::service_adapter::mark_cluster_identity_restart_after_response(
+        &effective_route,
+        stop,
+        Some(&paths),
+    );
     Ok(stop)
 }
 
@@ -1784,7 +1793,7 @@ async fn handle_daemon_cluster_relay_session_async(
     service_host: &crate::service_adapter::DaemonServiceRegistryHost,
     service_runtime: &tokio::runtime::Handle,
     request: sinomo_core::network::ObjectRpcSessionRequest,
-) -> Result<(sinomo_core::network::ObjectRpcSessionResponse, bool), DaemonError> {
+) -> Result<(sinomo_core::network::ObjectRpcSessionResponse, bool, String), DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .map_err(DaemonError::from)?;
@@ -1792,6 +1801,10 @@ async fn handle_daemon_cluster_relay_session_async(
         .map_err(DaemonError::from)?
     {
         sinomo_core::network::ClusterRelaySessionRequestAction::DeliverLocal(inner_request) => {
+            let effective_route = daemon_object_rpc_effective_route(
+                sinomo_core::network::CLUSTER_RELAY_ROUTE,
+                Some(&inner_request.route),
+            );
             let request = request
                 .bind_signed_inner_request(inner_request)
                 .map_err(DaemonError::from)?;
@@ -1804,6 +1817,7 @@ async fn handle_daemon_cluster_relay_session_async(
                 None,
             )
             .await
+            .map(|(response, stop)| (response, stop, effective_route))
         }
         sinomo_core::network::ClusterRelaySessionRequestAction::Forward => {
             let mut host =
@@ -1828,6 +1842,7 @@ async fn handle_daemon_cluster_relay_session_async(
                         sinomo_core::network::ObjectRpcBodySource::from_incoming_body(result.body),
                     ),
                     false,
+                    sinomo_core::network::CLUSTER_RELAY_ROUTE.to_string(),
                 )),
                 Err(error) => Ok((
                     sinomo_core::network::ObjectRpcSessionResponse::buffered(
@@ -1838,10 +1853,18 @@ async fn handle_daemon_cluster_relay_session_async(
                         .map_err(DaemonError::from)?,
                     ),
                     false,
+                    sinomo_core::network::CLUSTER_RELAY_ROUTE.to_string(),
                 )),
             }
         }
     }
+}
+
+fn daemon_object_rpc_effective_route(
+    outer_route: &str,
+    delivered_inner_route: Option<&str>,
+) -> String {
+    delivered_inner_route.unwrap_or(outer_route).to_string()
 }
 
 async fn try_handle_loopback_daemon_status_request_pre_auth(
@@ -5039,6 +5062,37 @@ mod tests {
             }
             other => panic!("unexpected sandbox response frame: {other:?}"),
         }
+    }
+
+    #[test]
+    fn local_relay_identity_route_marks_supervisor_restart_after_response() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-local-relay-restart-route");
+        let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let marker = root.join("rollout").join("supervised-main-restart.request");
+        let effective_route = daemon_object_rpc_effective_route(
+            sinomo_core::network::CLUSTER_RELAY_ROUTE,
+            Some(sinomo_core::cluster::CLUSTER_CONTROL_JOIN_ROUTE),
+        );
+
+        assert_eq!(
+            effective_route,
+            sinomo_core::cluster::CLUSTER_CONTROL_JOIN_ROUTE
+        );
+        crate::service_adapter::mark_cluster_identity_restart_after_response(
+            &effective_route,
+            true,
+            Some(&paths),
+        );
+        assert_eq!(
+            std::fs::read_to_string(marker).expect("local relay restart marker"),
+            format!("{}\n", std::process::id())
+        );
+        assert_eq!(
+            daemon_object_rpc_effective_route(sinomo_core::network::CLUSTER_RELAY_ROUTE, None,),
+            sinomo_core::network::CLUSTER_RELAY_ROUTE,
+            "a forwarded relay keeps the non-stopping outer route"
+        );
     }
 
     #[test]

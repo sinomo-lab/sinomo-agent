@@ -551,7 +551,10 @@ pub(crate) fn archive_metadata_backend_state(root: &Path) -> Result<bool> {
     if journal.exists() {
         for entry in read_dir(&journal)? {
             let source = entry.path();
-            if source.file_name().and_then(|name| name.to_str()) == Some("write.lock") {
+            if matches!(
+                source.file_name().and_then(|name| name.to_str()),
+                Some("write.lock" | "membership-handoff-write-freeze.sobj")
+            ) {
                 continue;
             }
             if !archived {

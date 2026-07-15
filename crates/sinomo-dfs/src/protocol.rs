@@ -1,8 +1,8 @@
 use crate::{
     DfsAdvisoryLockCommand, DfsAdvisoryLockOutcome, DfsAdvisoryLockStateRecord, DfsConflictRecord,
-    DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataShardConfig, DfsMetadataShardId,
-    DfsMetadataTableSnapshot, DfsNamespaceJobRecord, DfsNamespaceTransaction, DfsObjectId,
-    DfsObjectMetadata, DfsObjectVersionRecord, DfsPosixCreateAttrs,
+    DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataPrefixProof, DfsMetadataShardConfig,
+    DfsMetadataShardId, DfsMetadataTableSnapshot, DfsNamespaceJobRecord, DfsNamespaceTransaction,
+    DfsObjectId, DfsObjectMetadata, DfsObjectVersionRecord, DfsPosixCreateAttrs,
     DfsPosixDirectorySyncCertificate, DfsPosixDirectorySyncTarget, DfsPosixFileSyncCertificate,
     DfsPosixFileSyncTarget, DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsVersion,
     DfsWriteIntentRecord, NetworkedDfsWriteOutcome,
@@ -157,6 +157,14 @@ pub struct DfsDistributedWriteCommand {
     pub policy: DfsReplicationPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
+    /// Exact metadata authority selected by the sender for this path.
+    ///
+    /// This additive stamp lets the daemon admit independent authority-shard
+    /// requests concurrently. The receiver validates the complete committed
+    /// assignment before mutating; missing stamps retain the serial rolling-
+    /// upgrade path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_shard: Option<DfsMetadataShardConfig>,
     #[serde(default = "default_true")]
     pub touch_parent_on_create: bool,
     #[serde(default = "default_true")]
@@ -215,6 +223,13 @@ pub struct DfsNamespaceCommand {
     /// so the response batches replay exactly the missing entries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metadata_journal_after_sequences: Vec<DfsNamespaceShardCursor>,
+    /// Complete metadata-shard configurations used by the requester to route
+    /// this operation. New peers use a single stamped shard as a safe daemon
+    /// concurrency identity; receivers always recompute and validate the full
+    /// stamp before mutating namespace state. Empty preserves compatibility
+    /// with requests sent by older peers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authority_shards: Vec<DfsMetadataShardConfig>,
     pub operation: DfsNamespaceOperation,
 }
 
@@ -394,6 +409,45 @@ pub enum DfsNamespaceOperation {
 }
 
 impl DfsNamespaceOperation {
+    /// The path whose shard authority selects the routed coordinator. For
+    /// compound operations this is the source/first path; other involved
+    /// shards remain independently authoritative for their own journal lanes.
+    pub(crate) fn routing_path(&self) -> Option<&str> {
+        match self {
+            DfsNamespaceOperation::Mkdir { path }
+            | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
+            | DfsNamespaceOperation::MkdirAll { path }
+            | DfsNamespaceOperation::Rmdir { path }
+            | DfsNamespaceOperation::Unlink { path }
+            | DfsNamespaceOperation::SetMode { path, .. }
+            | DfsNamespaceOperation::SetOwner { path, .. }
+            | DfsNamespaceOperation::SetSymlinkOwner { path, .. }
+            | DfsNamespaceOperation::SetTimes { path, .. }
+            | DfsNamespaceOperation::TouchDirectoryModified { path }
+            | DfsNamespaceOperation::ClearDirRecursive { path }
+            | DfsNamespaceOperation::SyncPath { path }
+            | DfsNamespaceOperation::LookupPath { path }
+            | DfsNamespaceOperation::AdvisoryLock { path, .. }
+            | DfsNamespaceOperation::FileSync { path, .. }
+            | DfsNamespaceOperation::DirectorySync { path, .. }
+            | DfsNamespaceOperation::ResumeNamespaceJobBounded { path, .. }
+            | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { path, .. } => {
+                Some(path.as_str())
+            }
+            DfsNamespaceOperation::LookupPaths { paths } => paths.first().map(String::as_str),
+            DfsNamespaceOperation::Rename { from, .. }
+            | DfsNamespaceOperation::RenameSingleNamespaceAtomic { from, .. }
+            | DfsNamespaceOperation::RenameDirectoryBounded { from, .. } => Some(from.as_str()),
+            DfsNamespaceOperation::Hardlink { existing_path, .. } => Some(existing_path.as_str()),
+            DfsNamespaceOperation::ApplyTransaction { transaction } => transaction
+                .objects
+                .first()
+                .map(|object| object.path.as_str()),
+            DfsNamespaceOperation::AdoptObjectAtPath { object, .. } => Some(object.path.as_str()),
+            DfsNamespaceOperation::AdoptHardlinkAlias { alias, .. } => Some(alias.path.as_str()),
+        }
+    }
+
     /// The normalized paths whose metadata shards this operation may mutate
     /// (the targets themselves; parents share a prefix shard with their
     /// children except at shard-boundary anchors, which the handler also
@@ -687,6 +741,17 @@ pub struct DfsMetadataJournalBatchCommand {
     pub request_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_node_id: Option<NodeId>,
+    /// Exact filesystem whose committed shard assignment authorizes this
+    /// journal stream. Optional on the wire for rolling compatibility, but
+    /// required at clustered admission for ordinary batches that mutate the
+    /// receiver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_system_id: Option<DfsFileSystemId>,
+    /// Exact committed shard epoch that authorizes this journal stream.
+    /// Optional on the wire for rolling compatibility; clustered receivers
+    /// reject ordinary applied batches when it is absent or stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_epoch: Option<u64>,
     /// Verify that the receiver already has the exact materialized metadata
     /// state described by `prefix_probe`, without applying `batch`. The batch
     /// must be empty so an older peer that ignores this flag cannot skip or
@@ -717,17 +782,26 @@ pub struct DfsMetadataPrefixProbe {
     pub shard_id: DfsMetadataShardId,
     pub journal_sequence: u64,
     pub state_fingerprint: String,
+    /// Present only for the existing replica being promoted by a pending
+    /// primary-only handoff. The receiver may echo this identity only after it
+    /// durably installs the matching local freeze marker. Older peers omit the
+    /// echo and therefore cannot accidentally authorize promotion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_handoff_id: Option<String>,
 }
 
 /// Fresh, request-bound identity for an ordinary-write authority probe.
-/// Unlike a prefix probe, this does not fingerprint or persist metadata state.
-/// The operation identity prevents a reachability acknowledgement from being
-/// replayed as authority for a different write or namespace transition.
+/// The operation identity prevents replay across mutations; `prepared_prefix`
+/// additionally binds an acknowledgement to the primary's complete exact
+/// history through that operation. Older peers omit the prefix-bound response
+/// identity and therefore force the safe cluster-quorum fallback.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsMetadataAuthorityProbe {
     pub probe_id: String,
     pub expected_shard: DfsMetadataShardConfig,
     pub operation: DfsMetadataAuthorityOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_prefix: Option<DfsMetadataPrefixProof>,
 }
 
 /// Exact canonical mutation covered by a metadata-shard authority probe.
@@ -791,8 +865,9 @@ pub struct DfsMetadataJournalBatchResponse {
     /// accidentally satisfying the stronger durability certificate.
     #[serde(default)]
     pub verified_prefix_only: bool,
-    /// Echoed only after the receiver validates the exact authority probe.
-    /// Missing on older peers, which forces the sender onto the quorum path.
+    /// Echoed only after the receiver validates an exact write-authority probe
+    /// or durably installs the marker named by a primary-handoff prefix probe.
+    /// Missing on older peers, which forces the sender onto the safe path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_authority_probe_id: Option<String>,
     pub result: DfsMetadataJournalBatchResult,

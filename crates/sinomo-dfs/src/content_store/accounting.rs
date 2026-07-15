@@ -179,11 +179,31 @@ impl LocalContentStore {
 
     pub fn stats(&self) -> Result<ContentStoreStats> {
         let _lock = self.lock_stats_snapshot()?;
-        if let Some(stats) = self.read_stats_snapshot_unlocked()? {
-            return Ok(stats);
+        if self.quota.is_some() {
+            return self.quota_stats_unlocked();
         }
+
+        // Without quota, stats are rebuildable observability state. Always
+        // derive them from durable content so a legacy or lagging snapshot can
+        // neither return stale usage nor become write-path authority.
         let stats = self.scan_stats()?;
         self.write_stats_snapshot_unlocked(&stats)?;
+        Ok(stats)
+    }
+
+    fn quota_stats_unlocked(&self) -> Result<ContentStoreStats> {
+        if self.quota_stats_initialized.load(Ordering::Acquire)
+            && let Some(stats) = self.read_stats_snapshot_unlocked()?
+        {
+            return Ok(stats);
+        }
+
+        // Entering quota mode never trusts a snapshot that may predate
+        // no-quota writes. The first admission rebuilds authoritative usage;
+        // later quota mutations update it synchronously through deltas.
+        let stats = self.scan_stats()?;
+        self.write_stats_snapshot_unlocked(&stats)?;
+        self.quota_stats_initialized.store(true, Ordering::Release);
         Ok(stats)
     }
 
@@ -290,38 +310,45 @@ impl LocalContentStore {
             stats: stats.clone(),
         };
         let bytes = encode_stats_snapshot(&snapshot)?;
-        write_file_atomic(&self.stats_snapshot_path(), &bytes)?;
-        self.stats_snapshot_active.store(true, Ordering::Relaxed);
-        Ok(())
+        write_file_atomic(&self.stats_snapshot_path(), &bytes)
     }
 
     pub(super) fn replace_stats_snapshot(&self, stats: &ContentStoreStats) -> Result<()> {
         let _lock = self.lock_stats_snapshot()?;
-        self.write_stats_snapshot_unlocked(stats)
+        self.write_stats_snapshot_unlocked(stats)?;
+        if self.quota.is_some() {
+            self.quota_stats_initialized.store(true, Ordering::Release);
+        }
+        Ok(())
     }
 
     pub(super) fn apply_stats_delta(&self, delta: ContentStoreStatsDelta) -> Result<()> {
         if delta.is_zero() {
             return Ok(());
         }
-        if !self.tracks_stats_deltas() {
+        if self.quota.is_none() {
             return Ok(());
         }
         let _lock = self.lock_stats_snapshot()?;
-        if let Some(mut stats) = self.read_stats_snapshot_unlocked()? {
+        if self.quota_stats_initialized.load(Ordering::Acquire)
+            && let Some(mut stats) = self.read_stats_snapshot_unlocked()?
+        {
             delta.apply_to(&mut stats);
             self.write_stats_snapshot_unlocked(&stats)?;
             return Ok(());
         }
-        if self.quota.is_none() {
-            return Ok(());
-        }
+
+        // If no authoritative in-process quota snapshot exists, the mutation
+        // has already happened. Scan the resulting durable state instead of
+        // applying its delta twice or trusting a legacy snapshot.
         let stats = self.scan_stats()?;
-        self.write_stats_snapshot_unlocked(&stats)
+        self.write_stats_snapshot_unlocked(&stats)?;
+        self.quota_stats_initialized.store(true, Ordering::Release);
+        Ok(())
     }
 
     pub(super) fn tracks_stats_deltas(&self) -> bool {
-        self.quota.is_some() || self.stats_snapshot_active.load(Ordering::Relaxed)
+        self.quota.is_some()
     }
 
     pub(super) fn write_tracked_blob_bytes(

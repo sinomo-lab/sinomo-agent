@@ -23,8 +23,8 @@ use crate::{
     DfsMetadataJournalPublisherHost, DfsMetadataJournalReplicationOptions,
     DfsMetadataJournalReplicationReport, DfsMetadataJournalReplicationTransport,
     DfsMetadataNodeTransport, DfsMetadataShardConfig, DfsMetadataShardId,
-    DfsMetadataSnapshotInstallSender, DfsNamespaceJobMaintenanceReport, DfsObjectId,
-    DfsObjectPageCursor, DfsPeerTransport, DfsTombstoneCompactionOptions,
+    DfsMetadataSnapshotInstallSender, DfsNamespaceJobMaintenanceReport, DfsNodeDetachedSendState,
+    DfsObjectId, DfsObjectPageCursor, DfsPeerTransport, DfsTombstoneCompactionOptions,
     DfsTombstoneCompactionReport, DfsTransportIdentity, DfsVersion, DistributedRepairJob,
     LocalDfsMetadataJournalPublisherHost, NetworkedDfsService, NetworkedDfsServiceEvent,
     async_dfs_metadata_journal_batch_sender_from_peer_transport,
@@ -35,6 +35,7 @@ use crate::{
     dfs_now_unix_nanos, dfs_path_safe_segment, distributed_sifs,
     open_cluster_dfs_service_with_message_sender,
     open_cluster_dfs_service_with_peer_transports_for_nodes,
+    open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state,
     publish_dfs_metadata_journal_with_async_host, publish_dfs_metadata_journal_with_host,
     refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_transport,
 };
@@ -118,6 +119,61 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport(
     control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
     options: DfsMaintenanceTickOptions,
 ) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
+    run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional_detached_state(
+        runtime,
+        data_dir,
+        cluster_paths,
+        sync_peer_transport,
+        peer_transport,
+        None,
+        control_plane,
+        options,
+    )
+    .await
+}
+
+/// Run cluster DFS maintenance while rebuilding durable post-response work
+/// into a caller-owned detached outbox.
+///
+/// The normal service hydrate and promotion recovery share one backend scan;
+/// the supplied state may also be held by served-message lanes, allowing the
+/// maintenance worker to reconstruct crash-window work without moving full
+/// hydration or replica RPC latency onto their hot path.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state(
+    runtime: &tokio::runtime::Handle,
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    sync_peer_transport: Arc<dyn DfsPeerTransport>,
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    detached_send_state: DfsNodeDetachedSendState,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    options: DfsMaintenanceTickOptions,
+) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
+    run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional_detached_state(
+        runtime,
+        data_dir,
+        cluster_paths,
+        sync_peer_transport,
+        peer_transport,
+        Some(detached_send_state),
+        control_plane,
+        options,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional_detached_state(
+    runtime: &tokio::runtime::Handle,
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    sync_peer_transport: Arc<dyn DfsPeerTransport>,
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    detached_send_state: Option<DfsNodeDetachedSendState>,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    options: DfsMaintenanceTickOptions,
+) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
     data_dir
         .ensure_root_layout()
         .map_err(|source| DfsError::Metadata {
@@ -139,15 +195,29 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport(
     let file_system = distributed_sifs(local_node_id.clone());
     let metadata_shards = cluster_dfs_metadata_shards(&cluster_paths, &file_system.file_system_id)?;
     let peer_node_ids = cluster_dfs_peer_node_ids(&state);
-    let mut service = open_cluster_dfs_service_with_peer_transports_for_nodes(
-        &data_dir,
-        &cluster_paths,
-        local_node_id.clone(),
-        peer_node_ids.clone(),
-        sync_peer_transport,
-        Arc::clone(&peer_transport),
-        control_plane,
-    )?;
+    let mut service = match detached_send_state {
+        Some(detached_send_state) => {
+            open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state(
+                &data_dir,
+                &cluster_paths,
+                local_node_id.clone(),
+                peer_node_ids.clone(),
+                sync_peer_transport,
+                Arc::clone(&peer_transport),
+                detached_send_state,
+                control_plane,
+            )?
+        }
+        None => open_cluster_dfs_service_with_peer_transports_for_nodes(
+            &data_dir,
+            &cluster_paths,
+            local_node_id.clone(),
+            peer_node_ids.clone(),
+            sync_peer_transport,
+            Arc::clone(&peer_transport),
+            control_plane,
+        )?,
+    };
     let mut maintenance_host = LocalDfsMaintenanceHost::new(data_dir.clone());
     let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     let mut metadata_transport = AsyncDfsMetadataNodeTransport::new(
@@ -1219,9 +1289,18 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
         &metadata_shards,
         options.metadata_replication.target_timeout,
     )?;
+    // A cluster KV snapshot can become visible before its DFS shard topology
+    // is bootstrapped. Scanning with a zero execution budget preserves durable
+    // running jobs for the first tick that observes committed authority instead
+    // of converting that transient startup state into a permanent failure.
+    let namespace_job_max_jobs = if metadata_shards.is_empty() {
+        0
+    } else {
+        options.namespace_job_max_jobs
+    };
     let namespace_jobs = service
         .posix_resume_namespace_jobs_bounded(
-            options.namespace_job_max_jobs,
+            namespace_job_max_jobs,
             options.namespace_job_max_steps_per_job,
         )
         .map_err(|error| DfsError::Metadata {
@@ -1284,9 +1363,17 @@ where
         &metadata_shards,
         options.metadata_replication.target_timeout,
     )?;
+    // Keep the asynchronous production path identical to the synchronous
+    // path: an absent committed topology is retryable startup state, not a
+    // reason to fail durable namespace work.
+    let namespace_job_max_jobs = if metadata_shards.is_empty() {
+        0
+    } else {
+        options.namespace_job_max_jobs
+    };
     let namespace_jobs = service
         .posix_resume_namespace_jobs_bounded(
-            options.namespace_job_max_jobs,
+            namespace_job_max_jobs,
             options.namespace_job_max_steps_per_job,
         )
         .map_err(|error| DfsError::Metadata {

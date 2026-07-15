@@ -22,7 +22,7 @@ use crate::{
     DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
     DfsPeerTransportFuture, DfsPosixError, NetworkedDfsService, cluster_dfs_peer_node_ids,
     content_services_prefix, fallback_dfs_node_id, object_rpc_request_from_kv_payload,
-    open_cluster_dfs_service_with_peer_transports_for_nodes, sifs_file_system_id,
+    open_cluster_dfs_service_with_peer_transports_for_nodes,
 };
 
 pub type MountedSifsService = NetworkedDfsService<DfsNodeTransport>;
@@ -252,7 +252,6 @@ fn open_mounted_sifs_service_from_context(
         control_plane,
     )?;
     service.set_cancellation(cancellation);
-    service.rebind_completed_local_metadata_shard_membership_handoffs(&sifs_file_system_id())?;
     service
         .bootstrap_distributed_sifs()
         .map_err(|source| match source {

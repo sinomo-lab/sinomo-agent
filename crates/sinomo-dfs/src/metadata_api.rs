@@ -52,6 +52,116 @@ pub struct DfsMetadataShardWriteFreeze {
     pub state_fingerprint: String,
 }
 
+/// Capability for one replica ingest from an already validated active source.
+///
+/// The metadata replication boundary mints this only after matching the
+/// request's filesystem, shard, source node, and authority epoch to the exact
+/// committed shard assignment. Before taking its write lock, the durable
+/// backend rechecks the filesystem on every journal payload or on the complete
+/// canonical snapshot state. It then rechecks the shard and, when an author
+/// fence exists, the activated epoch while holding its write lock. Keeping
+/// construction crate-private prevents external backend callers from bypassing
+/// that source-validation boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsMetadataReplicaIngestPermit {
+    file_system_id: DfsFileSystemId,
+    shard_id: DfsMetadataShardId,
+    source_node_id: NodeId,
+    source_epoch: u64,
+}
+
+impl DfsMetadataReplicaIngestPermit {
+    /// Mint evidence only after the caller has validated all four values
+    /// against the same exact committed shard assignment.
+    pub(crate) fn new_validated(
+        file_system_id: DfsFileSystemId,
+        shard_id: DfsMetadataShardId,
+        source_node_id: NodeId,
+        source_epoch: u64,
+    ) -> Self {
+        Self {
+            file_system_id,
+            shard_id,
+            source_node_id,
+            source_epoch,
+        }
+    }
+
+    pub(crate) fn file_system_id(&self) -> &DfsFileSystemId {
+        &self.file_system_id
+    }
+
+    pub(crate) fn shard_id(&self) -> &DfsMetadataShardId {
+        &self.shard_id
+    }
+
+    pub(crate) fn source_node_id(&self) -> &NodeId {
+        &self.source_node_id
+    }
+
+    pub(crate) fn source_epoch(&self) -> u64 {
+        self.source_epoch
+    }
+}
+
+pub(crate) fn namespace_prepare_expectations_from_lookups(
+    transaction: &DfsNamespaceTransaction,
+    mut object_lookup: impl FnMut(&DfsObjectId) -> Result<Option<DfsObjectMetadata>>,
+    mut path_lookup: impl FnMut(&DfsFileSystemId, &str) -> Result<Option<DfsObjectMetadata>>,
+) -> Result<(
+    Vec<DfsNamespaceObjectVersionExpectation>,
+    Vec<DfsNamespacePathOccupantExpectation>,
+    BTreeSet<String>,
+)> {
+    let mut object_ids = transaction
+        .objects
+        .iter()
+        .map(|object| object.object_id.clone())
+        .chain(
+            transaction
+                .versions
+                .iter()
+                .map(|version| version.object_id.clone()),
+        )
+        .chain(
+            transaction
+                .advisory_lock_states
+                .iter()
+                .map(|state| state.object_id.clone()),
+        )
+        .collect::<BTreeSet<_>>();
+    let mut paths = transaction
+        .objects
+        .iter()
+        .map(|object| object.path.clone())
+        .collect::<BTreeSet<_>>();
+    for object_id in &object_ids {
+        if let Some(object) = object_lookup(object_id)? {
+            paths.insert(object.path);
+        }
+    }
+    let mut expected_path_occupants = Vec::with_capacity(paths.len());
+    for path in &paths {
+        let occupant = path_lookup(&transaction.file_system_id, path)?;
+        if let Some(occupant) = occupant.as_ref() {
+            object_ids.insert(occupant.object_id.clone());
+        }
+        expected_path_occupants.push(DfsNamespacePathOccupantExpectation {
+            path: path.clone(),
+            expected_object_id: occupant.map(|object| object.object_id),
+        });
+    }
+    let mut expected_object_versions = Vec::with_capacity(object_ids.len());
+    for object_id in object_ids {
+        let current = object_lookup(&object_id)?;
+        expected_object_versions.push(DfsNamespaceObjectVersionExpectation {
+            object_id,
+            expected_version: current.map(|object| object.version),
+        });
+    }
+    Ok((expected_object_versions, expected_path_occupants, paths))
+}
+
 /// Durable DFS metadata store interface.
 ///
 /// Implementations own authoritative filesystem/object metadata, object
@@ -190,6 +300,30 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         path: &str,
     ) -> Result<Option<DfsObjectMetadata>> {
         self.get_object_by_path(file_system_id, path)
+    }
+
+    /// Capture every object-version and path-occupant precondition for one
+    /// namespace prepare on an exact shard.
+    ///
+    /// The compatibility implementation uses the existing point-read API.
+    /// Backends that expose immutable table snapshots should override this so
+    /// discovery of current object paths, path occupants, and occupant versions
+    /// all observe one table generation. Prepare and commit still revalidate
+    /// the returned values while holding the metadata write lock.
+    fn namespace_prepare_expectations(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        transaction: &DfsNamespaceTransaction,
+    ) -> Result<(
+        Vec<DfsNamespaceObjectVersionExpectation>,
+        Vec<DfsNamespacePathOccupantExpectation>,
+        BTreeSet<String>,
+    )> {
+        namespace_prepare_expectations_from_lookups(
+            transaction,
+            |object_id| self.get_object_on_shard(shard_id, object_id),
+            |file_system_id, path| self.get_object_by_path_on_shard(shard_id, file_system_id, path),
+        )
     }
 
     /// Compatibility helper that drains all object pages for a filesystem.
@@ -1170,12 +1304,40 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(None)
     }
 
+    /// Refresh one shard's in-memory metadata view from its durable tables and
+    /// journal before a cold-path exact-prefix attestation. Implementations
+    /// with no cached durable state may retain the no-op default.
+    fn refresh_metadata_shard_durable_view(
+        &mut self,
+        _shard_id: &DfsMetadataShardId,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Return the durable membership-handoff write freeze for one shard.
     fn metadata_shard_write_freeze(
         &self,
         _shard_id: &DfsMetadataShardId,
     ) -> Result<Option<DfsMetadataShardWriteFreeze>> {
         Ok(None)
+    }
+
+    /// Whether any shard opened by this backend has a durable membership
+    /// handoff marker. Cached service lanes use this bounded local check to
+    /// avoid a cluster control-plane refresh on the marker-free cold path.
+    fn has_any_metadata_shard_write_freeze(&self) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Whether this backend instance is currently fenced from authoritative
+    /// shard mutations. An activated durable marker still fences an
+    /// independently opened lane until exact completion evidence rebinds that
+    /// process-local instance.
+    fn metadata_shard_authoritative_writes_frozen(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     /// Atomically freeze authoritative mutations and capture the exact current
@@ -1187,6 +1349,21 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         _retiring_epoch: u64,
     ) -> Result<Option<DfsMetadataShardWriteFreeze>> {
         Ok(None)
+    }
+
+    /// Durably mark the exact matching freeze as activated without binding
+    /// this backend instance to the successor authority generation. This lets
+    /// a retiring instance record control-plane completion while remaining
+    /// fenced. A fresh authority observer must separately call
+    /// [`clear_metadata_shard_membership_handoff_freeze`](Self::clear_metadata_shard_membership_handoff_freeze)
+    /// after proving the active assignment and completion evidence.
+    fn mark_metadata_shard_membership_handoff_activated(
+        &mut self,
+        _shard_id: &DfsMetadataShardId,
+        _handoff_id: &str,
+        _activated_epoch: u64,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     /// Advance the exact matching freeze to a durable active generation after
@@ -1317,6 +1494,19 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// Persist and materialize a replicated journal batch.
     fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize>;
 
+    /// Persist a replicated batch using exact source evidence validated by the
+    /// metadata replication boundary. Implementations with no membership
+    /// author fence may retain the ordinary mutation path; local durable
+    /// backends override this to admit only an exact activated generation when
+    /// the ordinary path is fenced.
+    fn apply_journal_batch_with_replica_permit(
+        &mut self,
+        _permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+    ) -> Result<usize> {
+        self.apply_journal_batch(batch)
+    }
+
     /// Replace local metadata tables with a replicated snapshot.
     fn replace_with_replicated_snapshot(
         &mut self,
@@ -1324,6 +1514,20 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         replayed_through_sequence: u64,
         snapshot: DfsMetadataTableSnapshot,
     ) -> Result<bool>;
+
+    /// Replace local metadata tables using exact source evidence validated by
+    /// the metadata replication boundary. The local durable implementation
+    /// preserves any activated author fence and never binds authority through
+    /// this path.
+    fn replace_with_replicated_snapshot_with_replica_permit(
+        &mut self,
+        _permit: &DfsMetadataReplicaIngestPermit,
+        source_shard_id: DfsMetadataShardId,
+        replayed_through_sequence: u64,
+        snapshot: DfsMetadataTableSnapshot,
+    ) -> Result<bool> {
+        self.replace_with_replicated_snapshot(source_shard_id, replayed_through_sequence, snapshot)
+    }
 
     /// Create a subscription cursor for journal polling.
     fn subscribe(&self, after_sequence: u64) -> DfsMetadataSubscription;

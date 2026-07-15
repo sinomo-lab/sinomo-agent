@@ -13,6 +13,9 @@
 //!   default; dirty DFS status may still poll for convergence.
 //! - `cluster.dfs.remote-shard-write` — choose a metadata shard whose primary is
 //!   not this node, then write through that routed mutation path.
+//! - `cluster.dfs.shard-layout` — resolve representative paths for the default
+//!   root, services, and users lanes through live cluster KV and report their
+//!   current shard primaries for external performance orchestration.
 //! - `cluster.dfs.service-advertisements` — verify DFS service discovery
 //!   records advertise node identities instead of concrete network routes.
 //! - `cluster.dfs.invariants` — operational-metric sweep: no open conflicts,
@@ -79,6 +82,7 @@ const DEFAULT_PROTOCOL_CODEC_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_PROTOCOL_CODEC_ITERATIONS: usize = 8;
 const EXPECT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_ROUNDTRIP_BASE: &str = "/services/cluster-tests";
+const MAX_RECORDED_BULK_RETRY_REASONS: usize = 8;
 
 pub fn register_dfs_cluster_test_cases(
     builder: SinomoTestRegistryBuilder,
@@ -87,6 +91,7 @@ pub fn register_dfs_cluster_test_cases(
         .register(dfs_read_your_write())
         .register(dfs_routed_status())
         .register(dfs_remote_shard_write())
+        .register(dfs_shard_layout())
         .register(dfs_service_advertisements())
         .register(dfs_concurrent_file_race())
         .register(dfs_concurrent_dir_race())
@@ -141,6 +146,18 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_remote_shard_write(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_shard_layout(ctx) {
+        id: "cluster.dfs.shard-layout",
+        summary: "Resolve the live root, services, and users metadata-shard primaries",
+        tags: ["cluster-dfs", "probe", "performance"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_shard_layout(ctx)
         }
     }
 }
@@ -900,6 +917,117 @@ fn run_remote_shard_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         payload.len(),
         target.0,
         target.1
+    )))
+}
+
+#[derive(serde::Serialize)]
+struct DfsShardLayoutProbe {
+    lane: &'static str,
+    base_prefix: &'static str,
+    shard_id: String,
+    file_system_id: String,
+    primary_node_id: String,
+    replica_node_ids: Vec<String>,
+    epoch: u64,
+}
+
+fn run_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    const PROBES: [(&str, &str, &str); 3] = [
+        (
+            "root",
+            "/cluster-tests/dfs-perf",
+            "/cluster-tests/dfs-perf/layout-probe",
+        ),
+        (
+            "services",
+            "/services/cluster-tests/dfs-perf",
+            "/services/cluster-tests/dfs-perf/layout-probe",
+        ),
+        (
+            "users",
+            "/users/cluster-tests/dfs-perf",
+            "/users/cluster-tests/dfs-perf/layout-probe",
+        ),
+    ];
+
+    let expected_replica_count = optional_usize_parameter(ctx, "expected-replica-count", 0)?;
+    let expected_distinct_primary_count =
+        optional_usize_parameter(ctx, "expected-distinct-primary-count", 0)?;
+    let backend = open_backend(ctx)?;
+    let node = backend.node_label();
+    let mut layouts = Vec::with_capacity(PROBES.len());
+    for (lane, base_prefix, candidate_path) in PROBES {
+        let shard = backend
+            .metadata_shard_for_path(candidate_path)
+            .map_err(SinomoTestError::failed)?
+            .ok_or_else(|| {
+                SinomoTestError::failed(format!(
+                    "no live SIFS metadata shard controls {candidate_path} for the {lane} performance lane"
+                ))
+            })?;
+        layouts.push(DfsShardLayoutProbe {
+            lane,
+            base_prefix,
+            shard_id: shard.shard_id.to_string(),
+            file_system_id: shard.file_system_id.to_string(),
+            primary_node_id: shard.primary_node_id.to_string(),
+            replica_node_ids: shard
+                .replica_node_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            epoch: shard.epoch,
+        });
+    }
+
+    let distinct_shard_ids = layouts
+        .iter()
+        .map(|layout| layout.shard_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let distinct_primary_node_ids = layouts
+        .iter()
+        .map(|layout| layout.primary_node_id.as_str())
+        .collect::<BTreeSet<_>>();
+    ctx.record("node", &node);
+    ctx.record("shards", &layouts);
+    ctx.record("distinct_shard_count", distinct_shard_ids.len());
+    ctx.record(
+        "distinct_primary_node_count",
+        distinct_primary_node_ids.len(),
+    );
+    if distinct_shard_ids.len() != layouts.len() {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "live SIFS routing resolved {} performance lanes to only {} distinct metadata shards",
+            layouts.len(),
+            distinct_shard_ids.len()
+        )));
+    }
+    if expected_replica_count > 0
+        && layouts
+            .iter()
+            .any(|layout| layout.replica_node_ids.len() != expected_replica_count)
+    {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "live SIFS metadata-shard layout has not converged to {expected_replica_count} replicas per shard: {}",
+            layouts
+                .iter()
+                .map(|layout| format!("{}={}", layout.shard_id, layout.replica_node_ids.len()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    if expected_distinct_primary_count > 0
+        && distinct_primary_node_ids.len() != expected_distinct_primary_count
+    {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "live SIFS metadata-shard layout has {} distinct primaries; expected {expected_distinct_primary_count}",
+            distinct_primary_node_ids.len()
+        )));
+    }
+
+    Ok(SinomoTestOutcome::passed(format!(
+        "resolved {} live SIFS metadata-shard performance lanes from node {node}",
+        layouts.len()
     )))
 }
 
@@ -1806,10 +1934,10 @@ fn run_protocol_codec_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult 
 
 fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let timeout = expect_timeout(ctx)?;
-    let backend = open_backend(ctx)?;
+    let deadline = Instant::now() + timeout;
+    let backend = open_backend_with_deadline(ctx, deadline)?;
     let node = backend.node_label();
     ctx.record("node", &node);
-    let deadline = Instant::now() + timeout;
     loop {
         let metrics = backend
             .operational_metrics()
@@ -1839,6 +1967,59 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 metrics.pending_routed_write_count
             ));
         }
+        if metrics.authoritative_write_frozen_shard_count != 0 {
+            violations.push(format!(
+                "authoritative_write_frozen_shard_count={}",
+                metrics.authoritative_write_frozen_shard_count
+            ));
+        }
+        let operator_status = backend
+            .operator_status()
+            .map_err(SinomoTestError::failed)?
+            .ok_or_else(|| {
+                SinomoTestError::failed(
+                    "cluster DFS invariants require local operator status".to_string(),
+                )
+            })?;
+        let local_primary_shards = operator_status
+            .metadata_shards
+            .iter()
+            .filter(|shard| {
+                shard
+                    .primary_node_id
+                    .as_ref()
+                    .is_some_and(|primary| primary.as_str() == node.as_str())
+            })
+            .collect::<Vec<_>>();
+        let local_primary_replica_count = local_primary_shards
+            .iter()
+            .map(|shard| shard.replica_lag.len())
+            .sum::<usize>();
+        let configured_local_primary_replica_count = local_primary_shards
+            .iter()
+            .map(|shard| shard.replica_node_ids.len())
+            .sum::<usize>();
+        let lagging_local_primary_replica_count = local_primary_shards
+            .iter()
+            .flat_map(|shard| shard.replica_lag.iter())
+            .filter(|lag| lag.lag_entries != 0)
+            .count();
+        let max_local_primary_replica_lag_entries = local_primary_shards
+            .iter()
+            .flat_map(|shard| shard.replica_lag.iter())
+            .map(|lag| lag.lag_entries)
+            .max()
+            .unwrap_or(0);
+        if local_primary_replica_count != configured_local_primary_replica_count {
+            violations.push(format!(
+                "local_primary_replica_status_count={local_primary_replica_count}, configured={configured_local_primary_replica_count}"
+            ));
+        }
+        if lagging_local_primary_replica_count != 0 {
+            violations.push(format!(
+                "lagging_local_primary_replica_count={lagging_local_primary_replica_count}, max_lag_entries={max_local_primary_replica_lag_entries}"
+            ));
+        }
         if violations.is_empty() {
             ctx.record("object_count", metrics.object_count);
             ctx.record("repair_job_count", metrics.repair_job_count);
@@ -1847,6 +2028,20 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             ctx.record(
                 "pending_metadata_replication_count",
                 metrics.pending_metadata_replication_count,
+            );
+            ctx.record(
+                "authoritative_write_frozen_shard_count",
+                metrics.authoritative_write_frozen_shard_count,
+            );
+            ctx.record("local_primary_shard_count", local_primary_shards.len());
+            ctx.record("local_primary_replica_count", local_primary_replica_count);
+            ctx.record(
+                "lagging_local_primary_replica_count",
+                lagging_local_primary_replica_count,
+            );
+            ctx.record(
+                "max_local_primary_replica_lag_entries",
+                max_local_primary_replica_lag_entries,
             );
             return Ok(SinomoTestOutcome::passed(format!(
                 "DFS operational invariants hold on node {node}"
@@ -2133,12 +2328,14 @@ fn run_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let path = ctx.required_parameter("path")?.to_string();
     let payload = required_payload_bytes(ctx)?;
     let foreground_repair = optional_bool_parameter(ctx, "foreground-repair", false)?;
+    let max_retries = optional_usize_parameter(ctx, "max-retries", usize::MAX)?;
     let timeout = expect_timeout(ctx)?;
     let started = Instant::now();
     let deadline = started + timeout;
     let backend = open_backend(ctx)?;
     let node = backend.node_label();
-    retry_bulk_mutation(
+    let mut retry_metrics = DfsMutationRetryMetrics::default();
+    retry_bulk_mutation_with_metrics(
         deadline,
         || {
             if foreground_repair {
@@ -2149,12 +2346,23 @@ fn run_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             }
         },
         || format!("cannot write SIFS file {path}"),
+        &mut retry_metrics,
     )?;
     ctx.record("node", &node);
     ctx.record("path", &path);
     ctx.record("bytes", payload.len());
     ctx.record("foreground_repair", foreground_repair);
+    ctx.record("retry_count", retry_metrics.retry_count);
+    ctx.record("retry_reasons", &retry_metrics.retry_reasons);
+    ctx.record("max_retries", max_retries);
     ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
+    if retry_metrics.retry_count > max_retries {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "wrote {} bytes to {path} on node {node}, but required at most {max_retries} retries and observed {}",
+            payload.len(),
+            retry_metrics.retry_count
+        )));
+    }
     Ok(SinomoTestOutcome::passed(format!(
         "wrote {} bytes to {path} on node {node}",
         payload.len()
@@ -2545,20 +2753,26 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let max_proc_write_bytes_amplification =
         optional_f64_parameter(ctx, "max-proc-write-bytes-amplification", 0.0)?;
     let max_proc_syscw_per_file = optional_f64_parameter(ctx, "max-proc-syscw-per-file", 0.0)?;
+    let max_proc_syscw_fixed = optional_u64_parameter(ctx, "max-proc-syscw-fixed")?.unwrap_or(0);
     require_positive("files", files)?;
     require_positive("bytes", bytes)?;
 
     let backend = open_backend(ctx)?;
     let node = backend.node_label();
     let proc_io_before = current_proc_io();
+    let mut mkdir_retries = DfsMutationRetryMetrics::default();
+    let mut write_retries = DfsMutationRetryMetrics::default();
 
     let started = Instant::now();
     let deadline = started + timeout;
-    retry_bulk_mutation(
+    let mkdir_result = retry_bulk_mutation_with_metrics(
         deadline,
         || backend.create_dir_all_deferred_local_replay_until(&base, deadline),
         || format!("cannot create SIFS directory {base}"),
-    )?;
+        &mut mkdir_retries,
+    );
+    record_bulk_retry_metrics(ctx, &mkdir_retries, &write_retries);
+    mkdir_result?;
     let mkdir_elapsed = started.elapsed();
     let proc_io_after_mkdir = current_proc_io();
     let batch_started = Instant::now();
@@ -2567,11 +2781,14 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         .collect::<Vec<_>>();
     let batch_build_elapsed = batch_started.elapsed();
     let write_started = Instant::now();
-    retry_bulk_mutation(
+    let write_result = retry_bulk_mutation_with_metrics(
         deadline,
         || backend.write_files_with_known_parents_deferred_publish_until(&batch, deadline),
         || format!("cannot write SIFS bulk batch under {base}"),
-    )?;
+        &mut write_retries,
+    );
+    record_bulk_retry_metrics(ctx, &mkdir_retries, &write_retries);
+    write_result?;
     let write_elapsed = write_started.elapsed();
     let proc_io_after_write = current_proc_io();
     let publish_started = Instant::now();
@@ -2624,6 +2841,11 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         max_proc_write_bytes_amplification,
     );
     ctx.record("max_proc_syscw_per_file", max_proc_syscw_per_file);
+    ctx.record("max_proc_syscw_fixed", max_proc_syscw_fixed);
+    ctx.record(
+        "proc_syscw_bulk_write_budget",
+        bulk_write_syscw_budget(files, max_proc_syscw_per_file, max_proc_syscw_fixed),
+    );
     if let Some(proc_io_delta) = proc_io_delta {
         let proc_wchar_amplification =
             amplification_ratio(proc_io_delta.wchar, total_bytes).unwrap_or(0.0);
@@ -2637,25 +2859,6 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             proc_write_bytes_amplification,
         );
         ctx.record("proc_syscw_per_file", proc_syscw_per_file);
-        if let Some(delta) = proc_io_mkdir_delta {
-            ctx.record("proc_write_bytes_after_mkdir_delta", delta.write_bytes);
-            ctx.record("proc_wchar_after_mkdir_delta", delta.wchar);
-            ctx.record("proc_syscw_after_mkdir_delta", delta.syscw);
-        }
-        if let Some(delta) = proc_io_write_delta {
-            ctx.record("proc_write_bytes_bulk_write_delta", delta.write_bytes);
-            ctx.record("proc_wchar_bulk_write_delta", delta.wchar);
-            ctx.record("proc_syscw_bulk_write_delta", delta.syscw);
-            ctx.record(
-                "proc_syscw_bulk_write_per_file",
-                per_file(delta.syscw, files).unwrap_or(0.0),
-            );
-        }
-        if let Some(delta) = proc_io_publish_delta {
-            ctx.record("proc_write_bytes_publish_delta", delta.write_bytes);
-            ctx.record("proc_wchar_publish_delta", delta.wchar);
-            ctx.record("proc_syscw_publish_delta", delta.syscw);
-        }
         if max_proc_wchar_amplification > 0.0
             && proc_wchar_amplification > max_proc_wchar_amplification
         {
@@ -2670,11 +2873,40 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 "bulk write on node {node} wrote {files} files with proc write_bytes amplification {proc_write_bytes_amplification:.2}x, above allowed {max_proc_write_bytes_amplification:.2}x"
             )));
         }
-        if max_proc_syscw_per_file > 0.0 && proc_syscw_per_file > max_proc_syscw_per_file {
+    }
+    if let Some(delta) = proc_io_mkdir_delta {
+        ctx.record("proc_write_bytes_after_mkdir_delta", delta.write_bytes);
+        ctx.record("proc_wchar_after_mkdir_delta", delta.wchar);
+        ctx.record("proc_syscw_after_mkdir_delta", delta.syscw);
+    }
+    if let Some(delta) = proc_io_write_delta {
+        ctx.record("proc_write_bytes_bulk_write_delta", delta.write_bytes);
+        ctx.record("proc_wchar_bulk_write_delta", delta.wchar);
+        ctx.record("proc_syscw_bulk_write_delta", delta.syscw);
+        ctx.record(
+            "proc_syscw_bulk_write_per_file",
+            per_file(delta.syscw, files).unwrap_or(0.0),
+        );
+        if max_proc_syscw_per_file > 0.0
+            && !bulk_write_syscw_within_budget(
+                delta.syscw,
+                files,
+                max_proc_syscw_per_file,
+                max_proc_syscw_fixed,
+            )
+        {
+            let budget =
+                bulk_write_syscw_budget(files, max_proc_syscw_per_file, max_proc_syscw_fixed);
             return Ok(SinomoTestOutcome::failed(format!(
-                "bulk write on node {node} wrote {files} files with proc syscw/file {proc_syscw_per_file:.2}, above allowed {max_proc_syscw_per_file:.2}"
+                "bulk data write on node {node} wrote {files} files with {} proc syscw, above affine budget {budget:.2} ({max_proc_syscw_per_file:.2}/file * {files} + {max_proc_syscw_fixed} fixed)",
+                delta.syscw
             )));
         }
+    }
+    if let Some(delta) = proc_io_publish_delta {
+        ctx.record("proc_write_bytes_publish_delta", delta.write_bytes);
+        ctx.record("proc_wchar_publish_delta", delta.wchar);
+        ctx.record("proc_syscw_publish_delta", delta.syscw);
     }
 
     if min_files_per_second > 0.0 && files_per_second < min_files_per_second {
@@ -2863,6 +3095,8 @@ fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let bytes = optional_usize_parameter(ctx, "bytes", DEFAULT_LARGE_FILE_BYTES)?;
     let timeout = expect_timeout(ctx)?;
     let min_bytes_per_second = optional_f64_parameter(ctx, "min-bytes-per-second", 0.0)?;
+    let measure_raw_write_baseline =
+        optional_bool_parameter(ctx, "measure-raw-write-baseline", false)?;
     let min_raw_write_ratio = optional_f64_parameter(ctx, "min-raw-write-ratio", 0.0)?;
     let raw_sync_write = optional_bool_parameter(ctx, "raw-sync-write", true)?;
     let max_proc_wchar_amplification =
@@ -2916,7 +3150,7 @@ fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let proc_io_publish_delta = proc_io_after_write
         .zip(proc_io_after_publish)
         .map(|(before, after)| after.saturating_delta(before));
-    let raw_baseline = if min_raw_write_ratio > 0.0 {
+    let raw_baseline = if measure_raw_write_baseline || min_raw_write_ratio > 0.0 {
         Some(raw_disk_baseline(
             ctx,
             bytes,
@@ -2944,6 +3178,7 @@ fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("bytes_per_second", bytes_per_second);
     ctx.record("data_write_bytes_per_second", data_write_bytes_per_second);
     ctx.record("min_bytes_per_second", min_bytes_per_second);
+    ctx.record("measure_raw_write_baseline", measure_raw_write_baseline);
     ctx.record("min_raw_write_ratio", min_raw_write_ratio);
     if let Some(raw_baseline) = raw_baseline.as_ref() {
         record_raw_disk_baseline(ctx, raw_baseline, "raw_disk");
@@ -3059,6 +3294,8 @@ fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let mut attempts = 0_u64;
     let mut mismatch_attempts = 0_u64;
     let mut error_attempts = 0_u64;
+    let mut first_error = None::<String>;
+    let mut unique_errors = BTreeSet::<String>::new();
 
     loop {
         attempts = attempts.saturating_add(1);
@@ -3082,6 +3319,10 @@ fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                         ctx.record("mismatch_attempts", mismatch_attempts);
                         ctx.record("error_attempts", error_attempts);
                         ctx.record("last_state_elapsed_ms", last_state_elapsed_ms);
+                        if let Some(first_error) = first_error.as_ref() {
+                            ctx.record("first_error", first_error);
+                        }
+                        ctx.record("unique_errors", &unique_errors);
                         ctx.record("last_state", &last_state);
                         return Ok(SinomoTestOutcome::failed(format!(
                             "large expect on node {node} did not read matching {bytes} byte file at {path} within {}s: {last_state}",
@@ -3118,6 +3359,10 @@ fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 ctx.record("mismatch_attempts", mismatch_attempts);
                 ctx.record("error_attempts", error_attempts);
                 ctx.record("last_state_elapsed_ms", last_state_elapsed_ms);
+                if let Some(first_error) = first_error.as_ref() {
+                    ctx.record("first_error", first_error);
+                }
+                ctx.record("unique_errors", &unique_errors);
                 if attempts > 1 {
                     ctx.record("last_state_before_success", &last_state);
                 }
@@ -3177,6 +3422,10 @@ fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             Err(error) => {
                 error_attempts = error_attempts.saturating_add(1);
                 last_state = format!("{path}: {error}");
+                first_error.get_or_insert_with(|| last_state.clone());
+                if unique_errors.len() < MAX_RECORDED_BULK_RETRY_REASONS {
+                    unique_errors.insert(last_state.clone());
+                }
                 last_state_elapsed_ms = measurement_started.elapsed().as_millis() as u64;
             }
         }
@@ -3189,6 +3438,10 @@ fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             ctx.record("mismatch_attempts", mismatch_attempts);
             ctx.record("error_attempts", error_attempts);
             ctx.record("last_state_elapsed_ms", last_state_elapsed_ms);
+            if let Some(first_error) = first_error.as_ref() {
+                ctx.record("first_error", first_error);
+            }
+            ctx.record("unique_errors", &unique_errors);
             ctx.record("last_state", &last_state);
             return Ok(SinomoTestOutcome::failed(format!(
                 "large expect on node {node} did not read matching {bytes} byte file at {path} within {}s: {last_state}",
@@ -3276,15 +3529,103 @@ fn retry_backend_open_until<T>(
     }
 }
 
+#[derive(Default)]
+struct DfsMutationRetryMetrics {
+    retry_count: usize,
+    retry_reasons: Vec<String>,
+}
+
+impl DfsMutationRetryMetrics {
+    fn record_retry(&mut self, reason: &str) {
+        self.retry_count = self.retry_count.saturating_add(1);
+        if self.retry_reasons.len() < MAX_RECORDED_BULK_RETRY_REASONS {
+            self.retry_reasons.push(reason.to_string());
+        }
+    }
+
+    fn truncated_reason_count(&self) -> usize {
+        self.retry_count.saturating_sub(self.retry_reasons.len())
+    }
+}
+
+fn record_bulk_retry_metrics(
+    ctx: &mut SinomoTestContext,
+    mkdir: &DfsMutationRetryMetrics,
+    write: &DfsMutationRetryMetrics,
+) {
+    let retry_count = mkdir.retry_count.saturating_add(write.retry_count);
+    let retry_reasons = mkdir
+        .retry_reasons
+        .iter()
+        .map(|reason| format!("mkdir: {reason}"))
+        .chain(
+            write
+                .retry_reasons
+                .iter()
+                .map(|reason| format!("write: {reason}")),
+        )
+        .take(MAX_RECORDED_BULK_RETRY_REASONS)
+        .collect::<Vec<_>>();
+    ctx.record("retry_count", retry_count);
+    ctx.record(
+        "retry_reasons_truncated",
+        retry_count.saturating_sub(retry_reasons.len()),
+    );
+    ctx.record("retry_reasons", retry_reasons);
+    ctx.record("mkdir_retry_count", mkdir.retry_count);
+    ctx.record("mkdir_retry_reasons", &mkdir.retry_reasons);
+    ctx.record(
+        "mkdir_retry_reasons_truncated",
+        mkdir.truncated_reason_count(),
+    );
+    ctx.record("write_retry_count", write.retry_count);
+    ctx.record("write_retry_reasons", &write.retry_reasons);
+    ctx.record(
+        "write_retry_reasons_truncated",
+        write.truncated_reason_count(),
+    );
+}
+
 fn retry_bulk_mutation<T, E, F, A>(
     deadline: Instant,
-    mut operation: F,
+    operation: F,
     action: A,
 ) -> Result<T, SinomoTestError>
 where
     F: FnMut() -> Result<T, E>,
     E: ToString,
     A: Fn() -> String,
+{
+    retry_bulk_mutation_observed(deadline, operation, action, |_| {})
+}
+
+fn retry_bulk_mutation_with_metrics<T, E, F, A>(
+    deadline: Instant,
+    operation: F,
+    action: A,
+    metrics: &mut DfsMutationRetryMetrics,
+) -> Result<T, SinomoTestError>
+where
+    F: FnMut() -> Result<T, E>,
+    E: ToString,
+    A: Fn() -> String,
+{
+    retry_bulk_mutation_observed(deadline, operation, action, |reason| {
+        metrics.record_retry(reason);
+    })
+}
+
+fn retry_bulk_mutation_observed<T, E, F, A, O>(
+    deadline: Instant,
+    mut operation: F,
+    action: A,
+    mut on_retry: O,
+) -> Result<T, SinomoTestError>
+where
+    F: FnMut() -> Result<T, E>,
+    E: ToString,
+    A: Fn() -> String,
+    O: FnMut(&str),
 {
     loop {
         match operation() {
@@ -3294,6 +3635,7 @@ where
                 if Instant::now() >= deadline || !is_retryable_dfs_probe_error(&error) {
                     return Err(SinomoTestError::failed(format!("{}: {error}", action())));
                 }
+                on_retry(&error);
                 std::thread::sleep(EXPECT_POLL_INTERVAL);
             }
         }
@@ -4085,6 +4427,19 @@ fn per_file(count: u64, files: usize) -> Option<f64> {
     Some(count as f64 / files as f64)
 }
 
+fn bulk_write_syscw_budget(files: usize, max_per_file: f64, fixed: u64) -> f64 {
+    max_per_file * files as f64 + fixed as f64
+}
+
+fn bulk_write_syscw_within_budget(
+    observed: u64,
+    files: usize,
+    max_per_file: f64,
+    fixed: u64,
+) -> bool {
+    observed as f64 <= bulk_write_syscw_budget(files, max_per_file, fixed)
+}
+
 fn expect_payload_now(
     backend: &SifsFileManagerBackend,
     path: &str,
@@ -4166,6 +4521,72 @@ mod tests {
         ClusterEndpointSource, ClusterMemberRecord, ClusterTransportKind,
     };
     use sinomo_runtime::node::ClusterId;
+
+    #[test]
+    fn bulk_write_syscw_affine_budget_accepts_boundary_and_rejects_excess() {
+        let files = 64;
+        let max_per_file = 4.0;
+        let fixed = 16;
+
+        assert_eq!(bulk_write_syscw_budget(files, max_per_file, fixed), 272.0);
+        assert!(bulk_write_syscw_within_budget(
+            272,
+            files,
+            max_per_file,
+            fixed
+        ));
+        assert!(!bulk_write_syscw_within_budget(
+            273,
+            files,
+            max_per_file,
+            fixed
+        ));
+    }
+
+    #[test]
+    fn bulk_retry_metrics_count_retries_and_keep_bounded_reasons() {
+        let mut metrics = DfsMutationRetryMetrics::default();
+        for index in 0..(MAX_RECORDED_BULK_RETRY_REASONS + 3) {
+            metrics.record_retry(&format!("retry-{index}"));
+        }
+
+        assert_eq!(metrics.retry_count, MAX_RECORDED_BULK_RETRY_REASONS + 3);
+        assert_eq!(metrics.retry_reasons.len(), MAX_RECORDED_BULK_RETRY_REASONS);
+        assert_eq!(metrics.truncated_reason_count(), 3);
+        assert_eq!(
+            metrics.retry_reasons.first().map(String::as_str),
+            Some("retry-0")
+        );
+    }
+
+    #[test]
+    fn observed_bulk_retry_records_the_retry_that_precedes_success() {
+        let mut attempts = 0usize;
+        let mut metrics = DfsMutationRetryMetrics::default();
+        let result = retry_bulk_mutation_with_metrics(
+            Instant::now() + Duration::from_secs(2),
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err("DFS error: network error: routed write timed out")
+                } else {
+                    Ok("committed")
+                }
+            },
+            || "write test batch".to_string(),
+            &mut metrics,
+        )
+        .expect("second attempt succeeds");
+
+        assert_eq!(result, "committed");
+        assert_eq!(attempts, 2);
+        assert_eq!(metrics.retry_count, 1);
+        assert_eq!(
+            metrics.retry_reasons,
+            vec!["DFS error: network error: routed write timed out"]
+        );
+        assert_eq!(metrics.truncated_reason_count(), 0);
+    }
 
     #[test]
     fn dfs_protocol_codec_uses_body_heads_without_inline_attachment_bytes() {

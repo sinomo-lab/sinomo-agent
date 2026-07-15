@@ -1404,6 +1404,24 @@ fn cluster_control_service_restart_required(route: &str) -> bool {
     )
 }
 
+/// Mark a completed identity-changing response so a clean main-daemon exit is
+/// classified as an intentional supervisor restart. Call this only after the
+/// response has been delivered; otherwise a failed response could leave a
+/// stale PID-scoped restart marker behind.
+pub(crate) fn mark_cluster_identity_restart_after_response(
+    route: &str,
+    stop: bool,
+    paths: Option<&DaemonPaths>,
+) {
+    if stop
+        && cluster_control_service_restart_required(route)
+        && let Some(paths) = paths
+        && let Err(error) = crate::rollout::request_supervised_main_restart(paths)
+    {
+        tracing::error!(%error, "could not mark cluster identity restart for the shadow supervisor");
+    }
+}
+
 /// Dispatches one `/cluster/control/*` request to the daemon-side operation
 /// and encodes the typed response.
 fn handle_daemon_cluster_control_request(
@@ -4849,7 +4867,7 @@ async fn dispatch_via_registry_async(
     paths: Option<&DaemonPaths>,
     replay_key: Option<Vec<u8>>,
 ) -> Result<bool, DaemonError> {
-    let supervisor_restart_required = cluster_control_service_restart_required(&request.route);
+    let route = request.route.clone();
     let (response, stop) = dispatch_rpc_via_registry_to_response_async(
         service_host,
         authenticated,
@@ -4859,13 +4877,8 @@ async fn dispatch_via_registry_async(
     )
     .await?;
     write_async_daemon_rpc_response_frame(stream, stream_address, response).await?;
+    mark_cluster_identity_restart_after_response(&route, stop, paths);
     if stop {
-        if supervisor_restart_required
-            && let Some(paths) = paths
-            && let Err(error) = crate::rollout::request_supervised_main_restart(paths)
-        {
-            tracing::error!(%error, "could not mark cluster identity restart for the shadow supervisor");
-        }
         stream
             .shutdown_write(stream_address)
             .await
@@ -6026,6 +6039,44 @@ mod tests {
                 "{route} does not replace the local daemon cluster identity"
             );
         }
+    }
+
+    #[test]
+    fn completed_cluster_identity_response_marks_clean_exit_for_supervisor_restart() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-cluster-restart-marker");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let marker = root.join("rollout").join("supervised-main-restart.request");
+
+        mark_cluster_identity_restart_after_response(
+            sinomo_core::cluster::CLUSTER_CONTROL_JOIN_ROUTE,
+            false,
+            Some(&paths),
+        );
+        assert!(
+            !marker.exists(),
+            "a response that did not stop must not mark a restart"
+        );
+
+        mark_cluster_identity_restart_after_response(
+            sinomo_core::cluster::CLUSTER_CONTROL_RENAME_ROUTE,
+            true,
+            Some(&paths),
+        );
+        assert!(
+            !marker.exists(),
+            "a non-identity stop must not mark a restart"
+        );
+
+        mark_cluster_identity_restart_after_response(
+            sinomo_core::cluster::CLUSTER_CONTROL_JOIN_ROUTE,
+            true,
+            Some(&paths),
+        );
+        assert_eq!(
+            std::fs::read_to_string(marker).expect("supervisor restart marker"),
+            format!("{}\n", std::process::id())
+        );
     }
 
     #[test]

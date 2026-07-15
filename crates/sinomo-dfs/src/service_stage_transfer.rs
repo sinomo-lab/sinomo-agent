@@ -465,6 +465,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &response.replica_node_id,
                     content_hash,
                 )?;
+                let intent_was_committed = self
+                    .coordinator
+                    .intent(&response.intent_id)
+                    .is_some_and(|intent| matches!(intent.state, DfsWriteIntentState::Committed));
                 let updated_intent = self.coordinator.record_durable_receipt(
                     &response.intent_id,
                     response.replica_node_id.clone(),
@@ -476,7 +480,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     replica_node_id: response.replica_node_id.clone(),
                     content_hash: content_hash.clone(),
                 };
-                self.try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
+                if intent_was_committed {
+                    self.finalize_late_committed_stage_receipt(
+                        &updated_intent.intent_id,
+                        &response.replica_node_id,
+                    )?;
+                } else {
+                    self.try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
+                }
                 self.send_untracked_completed_routed_write_response_if_committed(
                     &updated_intent.intent_id,
                     &response.object_id,
@@ -501,6 +512,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             &response.intent_id,
                             &response.replica_node_id,
                         );
+                        let object_metadata = self.current_object_for_write(&response.object_id)?;
+                        self.stage_missing_desired_replicas_for_intent(
+                            &response.intent_id,
+                            object_metadata,
+                        )?;
                         Ok(Some(NetworkedDfsServiceEvent::BlobStageRejected {
                             intent_id: response.intent_id,
                             object_id: response.object_id,
@@ -547,6 +563,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 });
             }
             return Ok(());
+        }
+        if pending
+            .stage_retries
+            .contains_key(&response.replica_node_id)
+        {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "expired or superseded DFS stage response for intent {} from {}: {}",
+                    response.intent_id, response.replica_node_id, response.request_id
+                ),
+            });
         }
         if !pending.stage_inflight_request_ids.is_empty() {
             return Err(DfsError::Distributed {

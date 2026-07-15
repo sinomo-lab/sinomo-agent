@@ -17,19 +17,22 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 
 use crate::control_plane::topology_preserving_metadata_shard_replicas;
+use crate::service_sync::rebind_completed_metadata_shard_membership_handoff;
 use crate::{
     AsyncDfsControlPlaneKvClient, DfsControlPlaneAsyncStore, DfsControlPlaneKvClient,
     DfsControlPlaneStore, DfsError, DfsFileSystem, DfsFileSystemConfig, DfsFileSystemId,
     DfsMessageSender, DfsMetadataBackend, DfsMetadataJournalBatchSender,
     DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardHeadWatermark,
-    DfsMetadataShardId, DfsMetadataSnapshotInstallSender, DfsNodeAdvertisement, DfsPeerTransport,
-    DfsSmokeOptions, DfsSmokeReport, DfsSubtreePolicy, SIFS_SERVICES_PATH, SIFS_USERS_PATH,
-    content_service_key, default_dfs_metadata_shards_root, dfs_message_sender_from_peer_transport,
+    DfsMetadataShardId, DfsMetadataShardMembershipHandoff, DfsMetadataShardMembershipHandoffProof,
+    DfsMetadataSnapshotInstallSender, DfsNodeAdvertisement, DfsPeerTransport, DfsSmokeOptions,
+    DfsSmokeReport, DfsSubtreePolicy, SIFS_SERVICES_PATH, SIFS_USERS_PATH, content_service_key,
+    default_dfs_metadata_shards_root, dfs_message_sender_from_peer_transport,
     dfs_metadata_journal_batch_sender_from_peer_transport,
     dfs_metadata_snapshot_install_sender_from_peer_transport, distributed_sifs,
     file_system_config_key, local_dfs_metadata_shard_path, materialize_default_sifs_metadata,
     materialize_default_sifs_metadata_on_shards, metadata_service_key,
-    metadata_shard_head_watermark_key, metadata_shard_key, open_cluster_aware_dfs_metadata_backend,
+    metadata_shard_head_watermark_key, metadata_shard_key, metadata_shard_membership_handoff_key,
+    metadata_shard_membership_handoff_proof_key, open_cluster_aware_dfs_metadata_backend,
     open_local_metadata_shard_backend, open_local_sharded_metadata_backend,
     run_cluster_dfs_smoke_with_message_sender, sifs_node_files_path,
 };
@@ -233,37 +236,12 @@ impl DfsControlPlaneDefaultClusterBootstrapHost {
         if current.as_ref() == Some(desired) {
             return Ok(());
         }
-        if let Some(current) = current.as_ref()
-            && current.primary_node_id != desired.primary_node_id
-        {
-            let transferred = control.transfer_metadata_shard_primary(
-                &current.file_system_id,
-                &current.shard_id,
-                current.epoch,
-                desired.primary_node_id.clone(),
-            )?;
-            return match transferred {
-                Some(transferred) if transferred == *desired => Ok(()),
-                Some(transferred) => Err(DfsError::Distributed {
-                    message: format!(
-                        "metadata shard {} transferred with topology {:?}, expected {:?}; retry topology reconciliation",
-                        desired.shard_id, transferred.replica_node_ids, desired.replica_node_ids
-                    ),
-                }),
-                None => Err(DfsError::Distributed {
-                    message: format!(
-                        "metadata shard {} primary transfer lacks an unchanged certified head acknowledged by target {}; retry after catch-up",
-                        desired.shard_id, desired.primary_node_id
-                    ),
-                }),
-            };
-        }
         if let Some(current) = current.as_ref() {
             let pending = control.begin_metadata_shard_membership_handoff(current, desired)?;
             return Err(DfsError::Distributed {
                 message: if pending.is_some() {
                     format!(
-                        "metadata shard {} membership change from epoch {} to {} is fenced and parked pending exact DFS catch-up of every retiring and desired member",
+                        "metadata shard {} membership or primary-role change from epoch {} to {} is fenced and parked pending exact DFS catch-up of every retiring and desired member",
                         desired.shard_id, current.epoch, desired.epoch
                     )
                 } else {
@@ -341,33 +319,6 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
         if current.as_ref() == Some(desired) {
             return Ok(());
         }
-        if let Some(current) = current.as_ref()
-            && current.primary_node_id != desired.primary_node_id
-        {
-            let transferred = DfsControlPlaneAsyncStore::new(self.control_plane.as_mut())
-                .transfer_metadata_shard_primary(
-                    &current.file_system_id,
-                    &current.shard_id,
-                    current.epoch,
-                    desired.primary_node_id.clone(),
-                )
-                .await?;
-            return match transferred {
-                Some(transferred) if transferred == *desired => Ok(()),
-                Some(transferred) => Err(DfsError::Distributed {
-                    message: format!(
-                        "metadata shard {} transferred with topology {:?}, expected {:?}; retry topology reconciliation",
-                        desired.shard_id, transferred.replica_node_ids, desired.replica_node_ids
-                    ),
-                }),
-                None => Err(DfsError::Distributed {
-                    message: format!(
-                        "metadata shard {} primary transfer lacks an unchanged certified head acknowledged by target {}; retry after catch-up",
-                        desired.shard_id, desired.primary_node_id
-                    ),
-                }),
-            };
-        }
         if let Some(current) = current.as_ref() {
             let pending = DfsControlPlaneAsyncStore::new(self.control_plane.as_mut())
                 .begin_metadata_shard_membership_handoff(current, desired)
@@ -375,7 +326,7 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
             return Err(DfsError::Distributed {
                 message: if pending.is_some() {
                     format!(
-                        "metadata shard {} membership change from epoch {} to {} is fenced and parked pending exact DFS catch-up of every retiring and desired member",
+                        "metadata shard {} membership or primary-role change from epoch {} to {} is fenced and parked pending exact DFS catch-up of every retiring and desired member",
                         desired.shard_id, current.epoch, desired.epoch
                     )
                 } else {
@@ -511,8 +462,24 @@ impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHo
     ) -> Result<(), DfsError> {
         let mut backend = open_local_sharded_metadata_backend(
             default_dfs_metadata_shards_root(&self.data_dir),
-            shards,
+            shards.clone(),
         )?;
+        for active in &shards {
+            let store = DfsControlPlaneStore::new(self.control_plane.as_mut());
+            let pending = store
+                .get_metadata_shard_membership_handoff(&active.file_system_id, &active.shard_id)?;
+            let proof = store.get_metadata_shard_membership_handoff_proof(
+                &active.file_system_id,
+                &active.shard_id,
+            )?;
+            rebind_completed_metadata_shard_membership_handoff(
+                &mut backend,
+                &self.local_node_id,
+                active,
+                pending.as_ref(),
+                proof.as_ref(),
+            )?;
+        }
         materialize_default_sifs_metadata_on_shards(
             &mut backend,
             file_system,
@@ -657,10 +624,41 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
         fallback_owner_node_id: NodeId,
     ) -> DfsDefaultClusterBootstrapFuture<'a, ()> {
         Box::pin(async move {
+            let mut completion_evidence = Vec::with_capacity(shards.len());
+            for active in &shards {
+                let pending = self
+                    .control_plane
+                    .get_async(&metadata_shard_membership_handoff_key(
+                        &active.file_system_id,
+                        &active.shard_id,
+                    ))
+                    .await?
+                    .map(|entry| entry.decode::<DfsMetadataShardMembershipHandoff>())
+                    .transpose()?;
+                let proof = self
+                    .control_plane
+                    .get_async(&metadata_shard_membership_handoff_proof_key(
+                        &active.file_system_id,
+                        &active.shard_id,
+                    ))
+                    .await?
+                    .map(|entry| entry.decode::<DfsMetadataShardMembershipHandoffProof>())
+                    .transpose()?;
+                completion_evidence.push((pending, proof));
+            }
             let mut backend = open_local_sharded_metadata_backend(
                 default_dfs_metadata_shards_root(&self.data_dir),
                 shards.clone(),
             )?;
+            for (active, (pending, proof)) in shards.iter().zip(&completion_evidence) {
+                rebind_completed_metadata_shard_membership_handoff(
+                    &mut backend,
+                    &self.local_node_id,
+                    active,
+                    pending.as_ref(),
+                    proof.as_ref(),
+                )?;
+            }
             materialize_default_sifs_metadata_on_shards(
                 &mut backend,
                 &file_system,
@@ -713,15 +711,40 @@ pub fn metadata_shard_primary_transfer_ready_from_local_backend(
         .find(|status| status.shard_id == shard_id)
         .map(|status| status.journal_last_sequence)
         .unwrap_or(0);
-    if watermark.journal_sequence == 0 || journal_last_sequence != watermark.journal_sequence {
+    if watermark.journal_sequence == 0 || journal_last_sequence < watermark.journal_sequence {
         return Ok(false);
     }
-    let fingerprint = crate::service_sync::metadata_shard_state_fingerprint_at(
-        &backend,
-        &shard_id,
-        journal_last_sequence,
-    )?;
-    Ok(fingerprint == watermark.state_fingerprint)
+    if journal_last_sequence == watermark.journal_sequence {
+        let fingerprint = crate::service_sync::metadata_shard_state_fingerprint_at(
+            &backend,
+            &shard_id,
+            journal_last_sequence,
+        )?;
+        return Ok(fingerprint == watermark.state_fingerprint);
+    }
+
+    // A membership-expansion handoff publishes an exact watermark for the
+    // expanded ring. Ordinary writes can advance the primary immediately
+    // afterward, while healthy journal replication advances only the durable
+    // sender cursor and intentionally avoids another KV watermark write. Use
+    // that cursor solely as admission to begin the next fenced handoff. It is
+    // not activation evidence: the handoff still freezes the current primary
+    // head and requires a fresh exact-prefix acknowledgement from every member
+    // before its control-plane CAS can promote the target.
+    let target_cursor = backend.metadata_replication_cursor(target_primary_node_id, &shard_id)?;
+    let cursor_covers_current_head = target_cursor >= journal_last_sequence;
+    if cursor_covers_current_head {
+        tracing::trace!(
+            target: "sinomo.dfs.perf",
+            shard = %current.shard_id,
+            target_primary = %target_primary_node_id,
+            certified_sequence = watermark.journal_sequence,
+            journal_last_sequence,
+            target_cursor,
+            "metadata-primary-handoff cursor preflight admitted stale certified head"
+        );
+    }
+    Ok(cursor_covers_current_head)
 }
 
 fn validate_bootstrap_metadata_shard_transition(
@@ -1686,7 +1709,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_bootstrap_host_cas_rejects_same_epoch_overwrite() {
+    fn control_plane_bootstrap_host_parks_primary_rotation_handoff() {
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-bootstrap-shard-cas");
         let data_dir = SinomoDataDir::new(root.join("data"));
         let cluster_paths = ClusterPaths::new(&data_dir);
@@ -1745,14 +1768,20 @@ mod tests {
         assert!(matches!(
             host.put_metadata_shard(&next_epoch),
             Err(DfsError::Distributed { message })
-                if message.contains("current operation-bound DFS prefix fence")
-                    && message.contains("latest healthy full-shard write")
+                if message.contains("membership or primary-role change")
+                    && message.contains("fenced and parked")
+                    && message.contains("exact DFS catch-up")
         ));
         assert_eq!(
             host.current_metadata_shard(&file_system_id, "root")
                 .expect("read shard"),
             Some(initial)
         );
+        let pending = DfsControlPlaneStore::new(host.control_plane.as_mut())
+            .get_metadata_shard_membership_handoff(&file_system_id, "root")
+            .expect("read primary-role handoff")
+            .expect("primary-role handoff parked");
+        assert_eq!(pending.desired_shard, next_epoch);
     }
 
     #[test]
@@ -1793,7 +1822,7 @@ mod tests {
         assert!(matches!(
             host.put_metadata_shard(&desired),
             Err(DfsError::Distributed { message })
-                if message.contains("membership change")
+                if message.contains("membership or primary-role change")
                     && message.contains("fenced and parked")
                     && message.contains("exact DFS catch-up")
         ));
@@ -1811,7 +1840,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn async_control_plane_bootstrap_host_uses_metadata_shard_cas() {
+    async fn async_control_plane_bootstrap_host_parks_primary_rotation_handoff() {
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-bootstrap-shard-async-cas");
         let data_dir = SinomoDataDir::new(root.join("data"));
         let cluster_paths = ClusterPaths::new(&data_dir);
@@ -1872,17 +1901,24 @@ mod tests {
             ..initial.clone()
         };
         assert!(matches!(
-            host.put_metadata_shard_async(next_epoch).await,
+            host.put_metadata_shard_async(next_epoch.clone()).await,
             Err(DfsError::Distributed { message })
-                if message.contains("current operation-bound DFS prefix fence")
-                    && message.contains("latest healthy full-shard write")
+                if message.contains("membership or primary-role change")
+                    && message.contains("fenced and parked")
+                    && message.contains("exact DFS catch-up")
         ));
         assert_eq!(
-            host.current_metadata_shard_async(file_system_id, "root".to_string())
+            host.current_metadata_shard_async(file_system_id.clone(), "root".to_string())
                 .await
                 .expect("read shard"),
             Some(initial)
         );
+        let pending = DfsControlPlaneAsyncStore::new(host.control_plane.as_mut())
+            .get_metadata_shard_membership_handoff(&file_system_id, "root")
+            .await
+            .expect("read async primary-role handoff")
+            .expect("async primary-role handoff parked");
+        assert_eq!(pending.desired_shard, next_epoch);
     }
 
     #[test]

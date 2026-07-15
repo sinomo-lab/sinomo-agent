@@ -45,6 +45,73 @@ fn routed_exclusive_create_event_id(command: &DfsDistributedWriteCommand) -> Opt
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    fn validate_routed_write_command_authority(
+        &mut self,
+        command: &DfsDistributedWriteCommand,
+    ) -> Result<(), DfsError> {
+        let Some(expected) = command.authority_shard.as_ref() else {
+            // Rolling-upgrade requests without the additive authority stamp
+            // are admitted through the daemon's global compatibility lane.
+            return Ok(());
+        };
+        let Some(object) = command.object_metadata.as_ref() else {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "authority-scoped routed write {} has no object metadata",
+                    command.request_id
+                ),
+            });
+        };
+        if object.object_id != command.request.object_id
+            || object.file_system_id != command.request.file_system_id
+            || expected.file_system_id != command.request.file_system_id
+        {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "authority-scoped routed write metadata mismatch for object {}",
+                    command.request.object_id
+                ),
+            });
+        }
+        let mut current = self.select_metadata_shard_for_object(object)?;
+        if current
+            .as_ref()
+            .is_none_or(|current| current != expected || current.primary_node_id != self.node_id)
+        {
+            // A sender can have observed a newer committed assignment than
+            // this long-lived lane. Refresh once before rejecting so an epoch
+            // bump, a newly added shard, or a primary move does not turn a
+            // valid stamped request into a terminal stale-view failure.
+            self.refresh_control_plane_latest()?;
+            current = self.select_metadata_shard_for_object(object)?;
+        }
+        let Some(current) = current else {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "routed write for {} has no refreshed metadata shard assignment",
+                    command.request.object_id
+                ),
+            });
+        };
+        if current.shard_id != expected.shard_id {
+            // A stale path/hardlink rebase can cross shard boundaries. Do not
+            // redirect while the daemon still owns the old lane; surface the
+            // existing retry class so the caller re-resolves and re-stamps.
+            return Err(DfsError::Busy {
+                path: object.path.clone(),
+            });
+        }
+        if current != *expected || current.primary_node_id != self.node_id {
+            return Err(DfsError::StaleOwnerEpoch {
+                file_system_id: current.file_system_id,
+                local_node_id: self.node_id.clone(),
+                primary_node_id: current.primary_node_id,
+                epoch: current.epoch,
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn replayed_routed_write_outcome_if_known(
         &mut self,
         requester_node_id: &NodeId,
@@ -75,7 +142,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         if let Some(intent) = self
             .coordinator
-            .intent_for_target(
+            .claimed_intent_for_target(
                 &command.request.file_system_id,
                 &command.request.object_id,
                 &command.request.target_version,
@@ -234,12 +301,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
                 current_primary_node_id: None,
             }
+        } else if let Err(error) = self.validate_routed_write_command_authority(&command) {
+            let current_primary_node_id = distributed_write_rejection_current_primary(&error);
+            DfsDistributedWriteResult::Rejected {
+                reason: error.to_string(),
+                current_primary_node_id,
+            }
         } else if let Some(outcome) =
             self.replayed_routed_write_outcome_if_known(&requester_node_id, &command)?
         {
             DfsDistributedWriteResult::Outcome { outcome }
         } else {
-            self.rebase_routed_path_write_if_current(&mut command)?;
+            let authority_validation = self
+                .rebase_routed_path_write_if_current(&mut command)
+                .and_then(|()| self.validate_routed_write_command_authority(&command));
             let write_foreground_replica_repair = foreground_replica_repair
                 && !self
                     .transport
@@ -268,7 +343,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 None => Ok(None),
             };
-            match manifest.and_then(|manifest| {
+            match authority_validation.and_then(|()| manifest).and_then(|manifest| {
                 let exclusive_create_event_id = routed_exclusive_create_event_id(&command);
                 self
                 .ensure_routed_write_object_metadata(
@@ -360,7 +435,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Err(error) => {
                     let failed_intent = self
                         .coordinator
-                        .intent_for_target(
+                        .claimed_intent_for_target(
                             &file_system_id,
                             &object_id,
                             &target_version,
@@ -603,7 +678,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // Late, duplicate, or mismatched responses (a request that already
         // settled, timed out, or was retried against another primary) are
         // discarded; a stray frame must never fail the whole event loop.
-        {
+        let expected_authority_shard = {
             let Some(pending) = self.pending_routed_writes.get(&response.request_id) else {
                 return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
                     request_id: response.request_id,
@@ -633,28 +708,60 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     reason,
                 });
             }
-        }
-        for batch in &response.metadata_journal_batches {
-            if self.routed_response_journal_batch_targets_local_primary(batch)? {
-                continue;
-            }
-            if let Err(error) =
-                self.apply_routed_write_metadata_journal_batch(&primary_node_id, batch)
-            {
-                // A replay failure is this requester's problem (for example a
-                // forked local journal); fail the request with the cause
-                // instead of poisoning the whole event loop.
-                let reason = format!("routed write journal replay failed: {error}");
-                if let Some(pending) = self.pending_routed_writes.get_mut(&response.request_id) {
-                    pending.result = Some(Err(DfsError::Distributed {
-                        message: reason.clone(),
-                    }));
+            pending.authority_shard.clone()
+        };
+        let validated_authority_shard =
+            if matches!(&response.result, DfsDistributedWriteResult::Outcome { .. }) {
+                match self.validate_routed_write_response_authority(
+                    &primary_node_id,
+                    &expected_authority_shard,
+                ) {
+                    Ok(validated) => Some(validated),
+                    Err(error) => {
+                        let reason = format!("routed write response authority is stale: {error}");
+                        if let Some(pending) =
+                            self.pending_routed_writes.get_mut(&response.request_id)
+                        {
+                            pending.result = Some(Err(DfsError::Distributed {
+                                message: reason.clone(),
+                            }));
+                        }
+                        return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
+                            request_id: response.request_id,
+                            source_node_id: primary_node_id,
+                            reason,
+                        });
+                    }
                 }
-                return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
-                    request_id: response.request_id,
-                    source_node_id: primary_node_id,
-                    reason,
-                });
+            } else {
+                None
+            };
+        // Rejections carry no authoritative journal. Keeping their payload out
+        // of replica replay also lets the corroborated redirect path below
+        // refresh and evaluate the response's explicit authority claim.
+        if let Some(validated_authority_shard) = validated_authority_shard.as_ref() {
+            for batch in &response.metadata_journal_batches {
+                if let Err(error) = self.apply_routed_write_metadata_journal_batch(
+                    &primary_node_id,
+                    validated_authority_shard,
+                    batch,
+                ) {
+                    // A replay failure is this requester's problem (for example a
+                    // forked local journal); fail the request with the cause
+                    // instead of poisoning the whole event loop.
+                    let reason = format!("routed write journal replay failed: {error}");
+                    if let Some(pending) = self.pending_routed_writes.get_mut(&response.request_id)
+                    {
+                        pending.result = Some(Err(DfsError::Distributed {
+                            message: reason.clone(),
+                        }));
+                    }
+                    return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
+                        request_id: response.request_id,
+                        source_node_id: primary_node_id,
+                        reason,
+                    });
+                }
             }
         }
         if let DfsDistributedWriteResult::Rejected {
@@ -665,16 +772,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let redirect = self
                 .pending_routed_writes
                 .get(&response.request_id)
-                .and_then(|pending| {
-                    (current_primary_node_id != &pending.primary_node_id).then(|| {
-                        (
-                            current_primary_node_id.clone(),
-                            pending.command.clone(),
-                            pending.authority_redirects_remaining,
-                        )
-                    })
+                .map(|pending| {
+                    (
+                        current_primary_node_id.clone(),
+                        pending.command.clone(),
+                        pending.authority_shard.clone(),
+                        pending.authority_redirects_remaining,
+                    )
                 });
-            if let Some((current_primary_node_id, command, redirects_remaining)) = redirect {
+            if let Some((
+                current_primary_node_id,
+                mut command,
+                previous_authority,
+                redirects_remaining,
+            )) = redirect
+            {
                 if redirects_remaining == 0 {
                     if let Some(pending) = self.pending_routed_writes.get_mut(&response.request_id)
                     {
@@ -691,6 +803,109 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         result: response.result,
                     });
                 } else {
+                    if let Err(error) = self.refresh_control_plane_latest() {
+                        let reason = format!(
+                            "distributed write authority redirect could not refresh the committed shard assignment: {error}"
+                        );
+                        if let Some(pending) =
+                            self.pending_routed_writes.get_mut(&response.request_id)
+                        {
+                            pending.result = Some(Err(DfsError::Distributed {
+                                message: reason.clone(),
+                            }));
+                        }
+                        return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
+                            request_id: response.request_id,
+                            source_node_id: primary_node_id,
+                            reason,
+                        });
+                    }
+                    let redirected_authority = self
+                        .control_plane
+                        .as_mut()
+                        .map(|control_plane| {
+                            DfsControlPlaneStore::new(control_plane.as_mut()).get_metadata_shard(
+                                &previous_authority.file_system_id,
+                                &previous_authority.shard_id,
+                            )
+                        })
+                        .transpose();
+                    let redirected_authority = match redirected_authority {
+                        Ok(authority) => authority.flatten(),
+                        Err(error) => {
+                            let reason = format!(
+                                "distributed write authority redirect could not read the committed shard assignment: {error}"
+                            );
+                            if let Some(pending) =
+                                self.pending_routed_writes.get_mut(&response.request_id)
+                            {
+                                pending.result = Some(Err(DfsError::Distributed {
+                                    message: reason.clone(),
+                                }));
+                            }
+                            return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
+                                request_id: response.request_id,
+                                source_node_id: primary_node_id,
+                                reason,
+                            });
+                        }
+                    };
+                    let Some(redirected_authority) = redirected_authority else {
+                        if let Some(pending) =
+                            self.pending_routed_writes.get_mut(&response.request_id)
+                        {
+                            pending.result = Some(Err(DfsError::Distributed {
+                                message: format!(
+                                    "redirected distributed write has no current shard assignment for {}",
+                                    previous_authority.shard_id
+                                ),
+                            }));
+                        }
+                        return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
+                            request_id: response.request_id,
+                            source_node_id: primary_node_id,
+                            reason: "distributed write authority redirect could not be bound to a current shard assignment"
+                                .to_string(),
+                            });
+                    };
+                    if redirected_authority == previous_authority {
+                        // A rejection that still names the exact assignment
+                        // already used for dispatch is not a topology redirect.
+                        // Retrying it recursively would only burn the redirect
+                        // budget against an identical command.
+                        if let Some(pending) =
+                            self.pending_routed_writes.get_mut(&response.request_id)
+                        {
+                            pending.result = Some(Err(routed_write_rejection_error(reason)));
+                        }
+                        return Ok(NetworkedDfsServiceEvent::RemoteWriteCompleted {
+                            request_id: response.request_id,
+                            object_id: response.object_id,
+                            primary_node_id,
+                            result: response.result,
+                        });
+                    }
+                    if redirected_authority.primary_node_id != current_primary_node_id {
+                        if let Some(pending) =
+                            self.pending_routed_writes.get_mut(&response.request_id)
+                        {
+                            pending.result = Some(Err(DfsError::Distributed {
+                                message: format!(
+                                    "distributed write redirect named primary {current_primary_node_id} but current shard {} epoch {} names {}",
+                                    redirected_authority.shard_id,
+                                    redirected_authority.epoch,
+                                    redirected_authority.primary_node_id
+                                ),
+                            }));
+                        }
+                        return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
+                            request_id: response.request_id,
+                            source_node_id: primary_node_id,
+                            reason: "distributed write authority redirect does not match the current committed assignment"
+                                .to_string(),
+                            });
+                    }
+                    command.authority_shard = Some(redirected_authority.clone());
                     let message = if command.exclusive_create {
                         DfsNetworkMessage::ExclusiveCreateRequest(command.clone())
                     } else {
@@ -701,6 +916,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             self.pending_routed_writes.get_mut(&response.request_id)
                         {
                             pending.primary_node_id = current_primary_node_id.clone();
+                            pending.authority_shard = redirected_authority;
                             pending.command = command;
                             pending.authority_redirects_remaining = redirects_remaining - 1;
                             pending.remote_intent_id = None;
@@ -850,10 +1066,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                 }
             };
-            let committed_foreground_with_repairs = self
-                .pending_remote_write_responses
-                .get(&intent_id)
-                .is_some_and(|pending| pending.foreground_replica_repair)
+            let Some(pending) = self.pending_remote_write_responses.get(&intent_id).cloned() else {
+                continue;
+            };
+            let committed_foreground_with_repairs = pending.foreground_replica_repair
                 && matches!(
                     &result,
                     DfsDistributedWriteResult::Outcome {
@@ -871,9 +1087,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // committed the intent. Remaining repair jobs stay in the normal
             // repair backlog so a slow desired replica does not consume the
             // caller's data-plane deadline after the write is durable.
-            let Some(pending) = self.pending_remote_write_responses.remove(&intent_id) else {
-                continue;
-            };
             let metadata_journal_batches = self.routed_write_response_metadata_journal_batches(
                 &pending.object_id,
                 &result,
@@ -884,15 +1097,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     DFS_ROUTED_WRITE_RESPONSE_JOURNAL_BATCH_LIMIT
                 },
             )?;
-            self.send_dfs_message_if_routable(
-                &pending.requester_node_id,
+            let response =
                 DfsNetworkMessage::DistributedWriteResponse(DfsDistributedWriteResponse {
                     request_id: pending.request_id.clone(),
                     object_id: pending.object_id.clone(),
                     result: result.clone(),
                     metadata_journal_batches,
-                }),
-            )?;
+                });
+            let sent = if self
+                .transport
+                .should_detach_completed_response(&pending.requester_node_id)
+            {
+                self.send_dfs_message_if_routable_detached(&pending.requester_node_id, response)?
+            } else {
+                self.send_dfs_message_if_routable(&pending.requester_node_id, response)?
+            };
+            if !sent {
+                // Keep ownership in the pending map until the response is
+                // either returned to the current caller or accepted by the
+                // detached outbox.
+                continue;
+            }
+            self.pending_remote_write_responses.remove(&intent_id);
             events.push(NetworkedDfsServiceEvent::RemoteWriteServed {
                 request_id: pending.request_id,
                 object_id: pending.object_id,
@@ -1008,29 +1234,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if exclusive_create {
             let path_key = crate::posix_path::normalized_posix_path_key(&object.path)
                 .unwrap_or_else(|| object.path.clone());
-            let metadata_key = crate::namespace::metadata_path(&path_key);
-            let memory_object = self
-                .metadata
-                .object_by_normalized_posix_path(&object.file_system_id, &path_key)
-                .cloned();
-            let backend_object = self
-                .metadata_backend
-                .as_ref()
-                .map(|backend| backend.get_object_by_path(&object.file_system_id, &metadata_key))
-                .transpose()?
-                .flatten();
-            let current = match (memory_object.as_ref(), backend_object.as_ref()) {
-                (Some(memory_object), Some(backend_object)) => {
-                    Some(self.resolve_authoritative_object_metadata(
-                        &backend_object.object_id,
-                        Some(memory_object),
-                        Some(backend_object),
-                    )?)
-                }
-                (_, Some(backend_object)) => Some(backend_object.clone()),
-                (Some(memory_object), None) => Some(memory_object.clone()),
-                (None, None) => None,
-            };
+            let current =
+                self.authoritative_metadata_object_for_path(&object.file_system_id, &path_key)?;
             if let Some(current) = current
                 && current.kind != DfsObjectKind::Tombstone
             {
@@ -1067,38 +1272,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let parent_key = crate::posix_path::normalized_posix_path_key(&parent_path)
             .unwrap_or_else(|| parent_path.clone());
-        let metadata_key = crate::namespace::metadata_path(&parent_key);
-        if let Some(tombstone) = self
-            .tombstones_by_metadata_path
-            .get(&(object.file_system_id.clone(), metadata_key.clone()))
-            && tombstone.kind == DfsObjectKind::Tombstone
-        {
-            return Err(DfsError::Distributed {
-                message: format!("parent directory does not exist: {parent_path}"),
-            });
-        }
-        let memory_parent = self
-            .metadata
-            .object_by_normalized_posix_path(&object.file_system_id, &parent_key)
-            .cloned();
-        let backend_parent = self
-            .metadata_backend
-            .as_ref()
-            .map(|backend| backend.get_object_by_path(&object.file_system_id, &metadata_key))
-            .transpose()?
-            .flatten();
-        let parent = match (memory_parent.as_ref(), backend_parent.as_ref()) {
-            (Some(memory_parent), Some(backend_parent)) => {
-                Some(self.resolve_authoritative_object_metadata(
-                    &backend_parent.object_id,
-                    Some(memory_parent),
-                    Some(backend_parent),
-                )?)
-            }
-            (_, Some(backend_parent)) => Some(backend_parent.clone()),
-            (Some(memory_parent), None) => Some(memory_parent.clone()),
-            (None, None) => None,
-        };
+        let parent =
+            self.authoritative_metadata_object_for_path(&object.file_system_id, &parent_key)?;
         match parent {
             Some(parent) if parent.kind == DfsObjectKind::Directory => Ok(Some(parent)),
             Some(parent) if parent.kind == DfsObjectKind::Tombstone => Err(DfsError::Distributed {

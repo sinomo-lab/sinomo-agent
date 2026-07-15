@@ -495,6 +495,10 @@ pub struct DfsOperationalMetrics {
     pub pending_remote_write_response_count: usize,
     pub pending_routed_namespace_op_count: usize,
     pub cross_shard_namespace_lock_count: usize,
+    /// Local metadata shards whose current backend instance remains fenced
+    /// from authoritative mutations by a membership-handoff marker.
+    #[serde(default)]
+    pub authoritative_write_frozen_shard_count: usize,
     pub metadata_backend_configured: bool,
     pub content: ContentStoreStats,
 }

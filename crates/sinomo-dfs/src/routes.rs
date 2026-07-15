@@ -1,10 +1,11 @@
 //! DFS object-RPC route constants and typed route/message conversion helpers.
 
 use crate::{
-    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMessageCommand, DfsMessageResponse,
-    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
-    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse, DfsNetworkMessage,
-    DfsOperatorStatus, DfsRoutedMessage, DfsSmokeReport,
+    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsFileSystemId, DfsMessageCommand,
+    DfsMessageResponse, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
+    DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataSnapshotInstallCommand,
+    DfsMetadataSnapshotInstallResponse, DfsNetworkMessage, DfsOperatorStatus, DfsRoutedMessage,
+    DfsSmokeReport,
 };
 use sinomo_core::network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_core::node::NodeId;
@@ -231,6 +232,162 @@ fn dfs_message_route_for_network_message(message: &DfsNetworkMessage) -> &'stati
     }
 }
 
+/// Conservative concurrency identity for one decoded DFS request.
+///
+/// This is admission metadata only; it is never serialized on the DFS wire.
+/// A command is scoped more narrowly than [`GlobalExclusive`](Self::GlobalExclusive)
+/// only when the request itself carries enough stable identity to prove that
+/// narrower scope without consulting mutable daemon state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DfsMessageExecutionScope {
+    /// The request does not mutate DFS state and may execute alongside other
+    /// admitted requests.
+    ReadOnly,
+    /// The request carries an exact filesystem and metadata-shard identity.
+    ExactShard {
+        file_system_id: DfsFileSystemId,
+        shard_id: DfsMetadataShardId,
+    },
+    /// Candidate path footprint for a namespace request. A scheduler may
+    /// resolve and acquire the involved shards atomically, or conservatively
+    /// route this scope through its global compatibility lane.
+    NamespacePaths {
+        file_system_id: DfsFileSystemId,
+        paths: Vec<String>,
+    },
+    /// The request is a response, a legacy write, or otherwise lacks a stable
+    /// concurrency identity and must retain the serial compatibility path.
+    GlobalExclusive,
+}
+
+fn exact_shard_execution_scope(
+    file_system_id: Option<&DfsFileSystemId>,
+    shard_id: &DfsMetadataShardId,
+) -> DfsMessageExecutionScope {
+    let Some(file_system_id) = file_system_id else {
+        return DfsMessageExecutionScope::GlobalExclusive;
+    };
+    if shard_id.0.trim().is_empty() {
+        return DfsMessageExecutionScope::GlobalExclusive;
+    }
+    DfsMessageExecutionScope::ExactShard {
+        file_system_id: file_system_id.clone(),
+        shard_id: shard_id.clone(),
+    }
+}
+
+fn authority_shard_execution_scope(
+    authority_shard: Option<&DfsMetadataShardConfig>,
+    expected_file_system_id: Option<&DfsFileSystemId>,
+) -> DfsMessageExecutionScope {
+    let Some(authority_shard) = authority_shard else {
+        return DfsMessageExecutionScope::GlobalExclusive;
+    };
+    if expected_file_system_id.is_some_and(|expected| expected != &authority_shard.file_system_id)
+        || authority_shard.shard_id.trim().is_empty()
+    {
+        return DfsMessageExecutionScope::GlobalExclusive;
+    }
+    DfsMessageExecutionScope::ExactShard {
+        file_system_id: authority_shard.file_system_id.clone(),
+        shard_id: DfsMetadataShardId::new(authority_shard.shard_id.clone()),
+    }
+}
+
+/// Classify a direct or routed metadata journal command using its explicit
+/// filesystem and batch-shard identity. Rolling-upgrade commands that omit the
+/// filesystem remain on the conservative global path.
+pub fn dfs_metadata_journal_batch_execution_scope(
+    command: &DfsMetadataJournalBatchCommand,
+) -> DfsMessageExecutionScope {
+    exact_shard_execution_scope(command.file_system_id.as_ref(), &command.batch.shard_id)
+}
+
+/// Classify a direct or routed metadata snapshot install using its explicit
+/// filesystem and shard identity.
+pub fn dfs_metadata_snapshot_install_execution_scope(
+    command: &DfsMetadataSnapshotInstallCommand,
+) -> DfsMessageExecutionScope {
+    exact_shard_execution_scope(command.file_system_id.as_ref(), &command.shard_id)
+}
+
+fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessageExecutionScope {
+    match message {
+        DfsNetworkMessage::ReadRequest(_) | DfsNetworkMessage::BulkReadRequest(_) => {
+            DfsMessageExecutionScope::ReadOnly
+        }
+        DfsNetworkMessage::NamespaceRequest(command) => {
+            if command.authority_shards.len() == 1 {
+                let stamped = &command.authority_shards[0];
+                if stamped.file_system_id == command.file_system_id
+                    && !stamped.shard_id.trim().is_empty()
+                {
+                    return DfsMessageExecutionScope::ExactShard {
+                        file_system_id: command.file_system_id.clone(),
+                        shard_id: DfsMetadataShardId::new(stamped.shard_id.clone()),
+                    };
+                }
+            }
+            let paths = command
+                .operation
+                .involved_paths()
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if paths.is_empty() || paths.iter().any(|path| path.trim().is_empty()) {
+                DfsMessageExecutionScope::GlobalExclusive
+            } else {
+                DfsMessageExecutionScope::NamespacePaths {
+                    file_system_id: command.file_system_id.clone(),
+                    paths,
+                }
+            }
+        }
+        DfsNetworkMessage::DistributedWriteRequest(command)
+        | DfsNetworkMessage::ExclusiveCreateRequest(command) => authority_shard_execution_scope(
+            command.authority_shard.as_ref(),
+            Some(&command.request.file_system_id),
+        ),
+        // Replica-transfer authority stamps are authorization evidence, not a
+        // receiver-validated current routing identity. Keep them on the global
+        // compatibility lane so a stale or forged stamp cannot split one
+        // object's mutations across different scheduler lanes. Routed writes
+        // and namespaces above perform a refreshed full-config comparison
+        // before mutation and are therefore safe exact-lane inputs.
+        DfsNetworkMessage::StageBlob(_)
+        | DfsNetworkMessage::StagePatch(_)
+        | DfsNetworkMessage::CommitVersion(_)
+        | DfsNetworkMessage::RepairReplica(_)
+        | DfsNetworkMessage::FetchBlob(_) => DfsMessageExecutionScope::GlobalExclusive,
+        DfsNetworkMessage::MetadataJournalBatch(command) => {
+            dfs_metadata_journal_batch_execution_scope(command)
+        }
+        DfsNetworkMessage::MetadataSnapshotInstall(command) => {
+            dfs_metadata_snapshot_install_execution_scope(command)
+        }
+        DfsNetworkMessage::ReadResponse(_)
+        | DfsNetworkMessage::BulkReadResponse(_)
+        | DfsNetworkMessage::WriteRequest(_)
+        | DfsNetworkMessage::WriteResponse(_)
+        | DfsNetworkMessage::DistributedWriteResponse(_)
+        | DfsNetworkMessage::NamespaceResponse(_)
+        | DfsNetworkMessage::StageBlobResponse(_)
+        | DfsNetworkMessage::CommitVersionResponse(_)
+        | DfsNetworkMessage::RepairReplicaResponse(_)
+        | DfsNetworkMessage::FetchBlobResponse(_)
+        | DfsNetworkMessage::MetadataJournalBatchResponse(_)
+        | DfsNetworkMessage::MetadataSnapshotInstallResponse(_) => {
+            DfsMessageExecutionScope::GlobalExclusive
+        }
+    }
+}
+
+/// Return the conservative execution scope used to admit one typed DFS
+/// message RPC into the daemon's concurrent scheduler.
+pub fn dfs_message_execution_scope(command: &DfsMessageCommand) -> DfsMessageExecutionScope {
+    dfs_network_message_execution_scope(&command.routed_message.message)
+}
+
 fn dfs_network_message_is_read_only_request(message: &DfsNetworkMessage) -> bool {
     matches!(
         message,
@@ -275,7 +432,10 @@ fn dfs_network_message_uses_full_response_budget(message: &DfsNetworkMessage) ->
 fn dfs_network_message_response_retry_safe(message: &DfsNetworkMessage) -> bool {
     matches!(
         message,
-        DfsNetworkMessage::DistributedWriteRequest(_) | DfsNetworkMessage::RepairReplica(_)
+        DfsNetworkMessage::DistributedWriteRequest(_)
+            | DfsNetworkMessage::DistributedWriteResponse(_)
+            | DfsNetworkMessage::CommitVersion(_)
+            | DfsNetworkMessage::RepairReplica(_)
     )
 }
 
@@ -395,14 +555,16 @@ pub fn dfs_message_rpc_request(
     }
     if dfs_network_message_response_retry_safe(&command.routed_message.message) {
         // Ordinary distributed writes carry a stable request identity and their outcome
-        // is durably reconciled at the metadata primary. Repair writes are
-        // content-addressed and replay-identifiable; completed duplicate
-        // requests take idempotent durable fast paths. If a transport loses
-        // only the response, sinomo-network may therefore safely redispatch
-        // these commands instead of surfacing an ambiguous timeout. Exclusive
-        // creates are intentionally excluded until their success response is
-        // durably replayable: redispatching one after commit would turn success
-        // into AlreadyExists.
+        // is durably reconciled at the metadata primary. Their completed
+        // response is also requester-idempotent: a duplicate either settles
+        // the same pending request or is discarded after it already settled.
+        // Repair writes are content-addressed and replay-identifiable;
+        // completed duplicate requests take idempotent durable fast paths. If
+        // a transport loses only the response, sinomo-network may therefore
+        // safely redispatch these commands instead of surfacing an ambiguous
+        // timeout. Exclusive creates are intentionally excluded until their
+        // success response is durably replayable: redispatching one after
+        // commit would turn success into AlreadyExists.
         request = request.with_response_retry_safe();
     }
     if let Some(traceparent) = crate::current_dfs_traceparent() {
@@ -417,4 +579,312 @@ pub fn decode_dfs_message_rpc_response(
     response: &ObjectRpcResponse,
 ) -> Result<DfsMessageResponse, NetworkError> {
     response.decode_body()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        DfsDistributedWriteCommand, DfsMetadataJournalBatch, DfsMetadataShardAssignment,
+        DfsMetadataTableSnapshot, DfsNamespaceCommand, DfsNamespaceOperation, DfsObjectId,
+        DfsReadRequest, DfsReplicationPolicy, DfsStageBlobCommand, DfsVersion,
+    };
+    use sinomo_core::node::NodeId;
+    use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
+
+    fn fs_id(value: &str) -> DfsFileSystemId {
+        DfsFileSystemId::from_legacy_named(value).expect("filesystem id")
+    }
+
+    fn object_id(value: &str) -> DfsObjectId {
+        DfsObjectId::from_legacy_named(value).expect("object id")
+    }
+
+    fn version(value: &str) -> DfsVersion {
+        DfsVersion::from_legacy_named(value).expect("version")
+    }
+
+    fn node_id(value: &str) -> NodeId {
+        NodeId::from_legacy_named(value).expect("node id")
+    }
+
+    fn message_command(message: DfsNetworkMessage) -> DfsMessageCommand {
+        DfsMessageCommand {
+            request_id: "scope-rpc".to_string(),
+            routed_message: DfsRoutedMessage {
+                source_node_id: node_id("scope-source"),
+                target_node_id: node_id("scope-target"),
+                frame_id: 1,
+                message_id: 2,
+                message,
+            },
+        }
+    }
+
+    fn authority_shard(file_system_id: &DfsFileSystemId, shard_id: &str) -> DfsMetadataShardConfig {
+        DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: shard_id.to_string(),
+            primary_node_id: node_id("scope-primary"),
+            replica_node_ids: Vec::new(),
+            epoch: 7,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        }
+    }
+
+    fn empty_journal_command(
+        file_system_id: Option<DfsFileSystemId>,
+    ) -> DfsMetadataJournalBatchCommand {
+        DfsMetadataJournalBatchCommand {
+            request_id: "scope-journal".to_string(),
+            source_node_id: Some(node_id("scope-primary")),
+            file_system_id,
+            authority_epoch: Some(7),
+            verify_prefix_only: false,
+            prefix_probe: None,
+            authority_probe: None,
+            batch: DfsMetadataJournalBatch {
+                shard_id: DfsMetadataShardId::new("scope-shard"),
+                entries: Vec::new(),
+                next_after_sequence: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn read_requests_are_read_only() {
+        let command = message_command(DfsNetworkMessage::ReadRequest(DfsReadRequest {
+            request_id: "scope-read".to_string(),
+            object_id: object_id("scope-read-object"),
+            version: None,
+            content_hash: None,
+            content_size_bytes: None,
+            range_offset: None,
+            range_max_bytes: None,
+        }));
+
+        assert_eq!(
+            dfs_message_execution_scope(&command),
+            DfsMessageExecutionScope::ReadOnly
+        );
+    }
+
+    #[test]
+    fn namespace_requests_expose_every_involved_path() {
+        let file_system_id = fs_id("scope-namespace-fs");
+        let command = message_command(DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+            request_id: "scope-rename".to_string(),
+            file_system_id: file_system_id.clone(),
+            requesting_node_id: node_id("scope-source"),
+            include_metadata_journal_batches: true,
+            metadata_journal_after_sequences: Vec::new(),
+            authority_shards: Vec::new(),
+            operation: DfsNamespaceOperation::Rename {
+                from: "/source/file".to_string(),
+                to: "/destination/file".to_string(),
+            },
+        }));
+
+        assert_eq!(
+            dfs_message_execution_scope(&command),
+            DfsMessageExecutionScope::NamespacePaths {
+                file_system_id,
+                paths: vec!["/source/file".to_string(), "/destination/file".to_string()],
+            }
+        );
+
+        let empty_lookup =
+            message_command(DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                request_id: "scope-empty-lookup".to_string(),
+                file_system_id: fs_id("scope-empty-fs"),
+                requesting_node_id: node_id("scope-source"),
+                include_metadata_journal_batches: false,
+                metadata_journal_after_sequences: Vec::new(),
+                authority_shards: Vec::new(),
+                operation: DfsNamespaceOperation::LookupPaths { paths: Vec::new() },
+            }));
+        assert_eq!(
+            dfs_message_execution_scope(&empty_lookup),
+            DfsMessageExecutionScope::GlobalExclusive
+        );
+    }
+
+    #[test]
+    fn namespace_requests_use_only_one_complete_matching_authority_stamp() {
+        let file_system_id = fs_id("scope-stamped-namespace-fs");
+        let shard = authority_shard(&file_system_id, "services");
+        let namespace_command = |authority_shards| {
+            message_command(DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                request_id: "scope-stamped-mkdir".to_string(),
+                file_system_id: file_system_id.clone(),
+                requesting_node_id: node_id("scope-source"),
+                include_metadata_journal_batches: false,
+                metadata_journal_after_sequences: Vec::new(),
+                authority_shards,
+                operation: DfsNamespaceOperation::Mkdir {
+                    path: "/services/new".to_string(),
+                },
+            }))
+        };
+
+        assert_eq!(
+            dfs_message_execution_scope(&namespace_command(vec![shard.clone()])),
+            DfsMessageExecutionScope::ExactShard {
+                file_system_id: file_system_id.clone(),
+                shard_id: DfsMetadataShardId::new("services"),
+            }
+        );
+        assert!(matches!(
+            dfs_message_execution_scope(&namespace_command(vec![
+                shard.clone(),
+                authority_shard(&file_system_id, "root"),
+            ])),
+            DfsMessageExecutionScope::NamespacePaths { .. }
+        ));
+
+        let mut wrong_file_system = shard.clone();
+        wrong_file_system.file_system_id = fs_id("scope-other-namespace-fs");
+        assert!(matches!(
+            dfs_message_execution_scope(&namespace_command(vec![wrong_file_system])),
+            DfsMessageExecutionScope::NamespacePaths { .. }
+        ));
+
+        let mut malformed = shard;
+        malformed.shard_id = "  ".to_string();
+        assert!(matches!(
+            dfs_message_execution_scope(&namespace_command(vec![malformed])),
+            DfsMessageExecutionScope::NamespacePaths { .. }
+        ));
+    }
+
+    #[test]
+    fn metadata_replication_requires_an_explicit_filesystem_and_shard() {
+        let file_system_id = fs_id("scope-metadata-fs");
+        let journal = empty_journal_command(Some(file_system_id.clone()));
+        assert_eq!(
+            dfs_metadata_journal_batch_execution_scope(&journal),
+            DfsMessageExecutionScope::ExactShard {
+                file_system_id: file_system_id.clone(),
+                shard_id: DfsMetadataShardId::new("scope-shard"),
+            }
+        );
+
+        let legacy_journal = empty_journal_command(None);
+        assert_eq!(
+            dfs_metadata_journal_batch_execution_scope(&legacy_journal),
+            DfsMessageExecutionScope::GlobalExclusive
+        );
+
+        let snapshot = DfsMetadataSnapshotInstallCommand {
+            request_id: "scope-snapshot".to_string(),
+            source_node_id: node_id("scope-primary"),
+            file_system_id: Some(file_system_id.clone()),
+            authority_epoch: Some(7),
+            shard_id: DfsMetadataShardId::new("scope-snapshot-shard"),
+            next_after_sequence: 0,
+            snapshot: DfsMetadataTableSnapshot {
+                format_version: 0,
+                materialized_through_sequence: None,
+                tables: None,
+                ops: Vec::new(),
+                semantic_state_fingerprint: None,
+                prefix_proof: None,
+            },
+            reason: "scope test".to_string(),
+        };
+        assert_eq!(
+            dfs_metadata_snapshot_install_execution_scope(&snapshot),
+            DfsMessageExecutionScope::ExactShard {
+                file_system_id,
+                shard_id: DfsMetadataShardId::new("scope-snapshot-shard"),
+            }
+        );
+    }
+
+    #[test]
+    fn replica_transfer_commands_remain_global_despite_authority_stamp() {
+        let file_system_id = fs_id("scope-transfer-fs");
+        let mut stage = DfsStageBlobCommand {
+            request_id: "scope-stage".to_string(),
+            intent_id: "scope-intent".to_string(),
+            file_system_id: file_system_id.clone(),
+            object_id: object_id("scope-stage-object"),
+            expected_base_version: None,
+            version: version("scope-stage-version"),
+            content_hash: "blake3:scope".to_string(),
+            bytes: Vec::new(),
+            object_metadata: None,
+            authority_shard: Some(authority_shard(&file_system_id, "scope-transfer-shard")),
+        };
+
+        assert_eq!(
+            dfs_message_execution_scope(&message_command(DfsNetworkMessage::StageBlob(
+                stage.clone()
+            ))),
+            DfsMessageExecutionScope::GlobalExclusive
+        );
+
+        stage.authority_shard = None;
+        assert_eq!(
+            dfs_message_execution_scope(&message_command(DfsNetworkMessage::StageBlob(
+                stage.clone()
+            ))),
+            DfsMessageExecutionScope::GlobalExclusive
+        );
+
+        stage.authority_shard = Some(authority_shard(
+            &fs_id("scope-other-fs"),
+            "scope-transfer-shard",
+        ));
+        assert_eq!(
+            dfs_message_execution_scope(&message_command(DfsNetworkMessage::StageBlob(stage))),
+            DfsMessageExecutionScope::GlobalExclusive
+        );
+    }
+
+    #[test]
+    fn distributed_writes_are_exact_only_with_matching_authority() {
+        let file_system_id = fs_id("scope-distributed-fs");
+        let requester = node_id("scope-requester");
+        let mut write = DfsDistributedWriteCommand {
+            request_id: "scope-distributed-write".to_string(),
+            request: DfsWriteRequest {
+                file_system_id: file_system_id.clone(),
+                object_id: object_id("scope-distributed-object"),
+                target_version: version("scope-distributed-version"),
+                requesting_node_id: requester.clone(),
+            },
+            expected_base_version: None,
+            metadata_journal_after_sequence: None,
+            bytes: Vec::new(),
+            content_hash: Some("blake3:scope".to_string()),
+            content_size_bytes: Some(0),
+            desired_replica_nodes: vec![requester],
+            policy: DfsReplicationPolicy::new(1, 1).expect("replication policy"),
+            object_metadata: None,
+            authority_shard: None,
+            touch_parent_on_create: true,
+            foreground_replica_repair: true,
+            exclusive_create: false,
+        };
+
+        assert_eq!(
+            dfs_message_execution_scope(&message_command(
+                DfsNetworkMessage::DistributedWriteRequest(write.clone())
+            )),
+            DfsMessageExecutionScope::GlobalExclusive
+        );
+
+        write.authority_shard = Some(authority_shard(&file_system_id, "scope-distributed-shard"));
+        assert_eq!(
+            dfs_message_execution_scope(&message_command(
+                DfsNetworkMessage::DistributedWriteRequest(write)
+            )),
+            DfsMessageExecutionScope::ExactShard {
+                file_system_id,
+                shard_id: DfsMetadataShardId::new("scope-distributed-shard"),
+            }
+        );
+    }
 }

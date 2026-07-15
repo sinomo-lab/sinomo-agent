@@ -2419,14 +2419,13 @@ fn networked_dfs_applies_metadata_journal_batches_from_peer() {
     let version = DfsVersion::from_legacy_named("version_1").expect("version");
     let root = temp_root("networked_metadata_journal_batches");
     let network = InProcessNetwork::new();
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     let owner_backend =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("owner-meta"))
             .expect("owner metadata");
-    let replica_backend = LocalSobjMetadataBackend::new(
-        DfsMetadataShardId::new("replica"),
-        root.join("replica-meta"),
-    )
-    .expect("replica metadata");
+    let replica_backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("replica-meta"))
+            .expect("replica metadata");
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
@@ -2474,6 +2473,21 @@ fn networked_dfs_applies_metadata_journal_batches_from_peer() {
     owner_dfs
         .add_object_metadata(metadata.clone())
         .expect("owner metadata");
+    control_plane.with_client(|kv| {
+        DfsControlPlaneStore::new(kv)
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "root".to_string(),
+                primary_node_id: owner.clone(),
+                replica_node_ids: vec![replica.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("metadata shard");
+    });
+    owner_dfs = owner_dfs.with_control_plane(control_plane.clone());
+    replica_dfs = replica_dfs.with_control_plane(control_plane.clone());
     assert!(
         replica_dfs
             .metadata_backend()
@@ -2489,16 +2503,19 @@ fn networked_dfs_applies_metadata_journal_batches_from_peer() {
         .expect("nonempty batch");
     assert_eq!(batch.entries.len(), 3);
     let events = replica_dfs.process_incoming().expect("replica incoming");
-    assert!(events.iter().any(|event| {
-        matches!(
-            event,
-            NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
-                source_node_id,
-                applied_entries: 3,
-                ..
-            } if source_node_id == &owner
-        )
-    }));
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
+                    source_node_id,
+                    applied_entries: 3,
+                    ..
+                } if source_node_id == &owner
+            )
+        }),
+        "unexpected metadata journal events: {events:#?}"
+    );
     assert_eq!(
         replica_dfs
             .metadata_backend()
@@ -2548,14 +2565,13 @@ fn networked_dfs_applies_metadata_journal_incrementally_without_full_hydrate() {
     let version = DfsVersion::from_legacy_named("version_metadata_incremental").expect("version");
     let root = temp_root("networked_metadata_incremental");
     let network = InProcessNetwork::new();
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     let owner_backend =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("owner-meta"))
             .expect("owner metadata");
-    let replica_backend = LocalSobjMetadataBackend::new(
-        DfsMetadataShardId::new("replica"),
-        root.join("replica-meta"),
-    )
-    .expect("replica metadata");
+    let replica_backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("replica-meta"))
+            .expect("replica metadata");
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
@@ -2638,6 +2654,21 @@ fn networked_dfs_applies_metadata_journal_incrementally_without_full_hydrate() {
     owner_dfs
         .add_object_metadata(replicated_metadata.clone())
         .expect("owner metadata");
+    control_plane.with_client(|kv| {
+        DfsControlPlaneStore::new(kv)
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "root".to_string(),
+                primary_node_id: owner.clone(),
+                replica_node_ids: vec![replica.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("metadata shard");
+    });
+    owner_dfs = owner_dfs.with_control_plane(control_plane.clone());
+    replica_dfs = replica_dfs.with_control_plane(control_plane.clone());
 
     owner_dfs
         .send_metadata_journal_since(&replica, 0)
@@ -3070,7 +3101,7 @@ fn networked_dfs_strict_routed_write_completion_resolves_remote_intent_alias() {
 }
 
 #[test]
-fn routed_write_response_does_not_fail_when_requester_becomes_metadata_primary() {
+fn routed_write_response_from_retired_primary_fails_closed_after_requester_becomes_primary() {
     let writer = NodeId::from_legacy_named("node_route_flip_writer").expect("node");
     let primary = NodeId::from_legacy_named("node_route_flip_primary").expect("node");
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
@@ -3212,28 +3243,21 @@ fn routed_write_response_does_not_fail_when_requester_becomes_metadata_primary()
     let writer_events = writer_dfs
         .process_incoming()
         .expect("writer incoming after authority flip");
-    assert!(writer_events.iter().any(|event| {
-        matches!(
-            event,
-            NetworkedDfsServiceEvent::RemoteWriteCompleted {
-                primary_node_id,
-                result:
-                    DfsDistributedWriteResult::Outcome {
-                        outcome: NetworkedDfsWriteOutcome::Committed { .. },
-                    },
-                ..
-            } if primary_node_id == &primary
-        )
-    }));
     assert!(
-        !writer_events.iter().any(|event| {
+        writer_events.iter().any(|event| {
             matches!(
                 event,
                 NetworkedDfsServiceEvent::RemoteResponseDiscarded { reason, .. }
-                    if reason.contains("metadata primary must not apply a replica journal batch")
+                    if reason.contains("no longer current")
             )
         }),
-        "authority transfer race should not fail the completed routed write: {writer_events:?}"
+        "an unproven response from the retired dispatch primary must fail closed: {writer_events:?}"
+    );
+    assert!(
+        !writer_events.iter().any(|event| {
+            matches!(event, NetworkedDfsServiceEvent::RemoteWriteCompleted { .. })
+        }),
+        "a retired-primary response must not settle the routed write: {writer_events:?}"
     );
 
     cleanup(&root);
@@ -3448,6 +3472,7 @@ fn networked_dfs_configured_metadata_replication_drains_bounded_batches() {
         network.add_node(replica.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("replica-content")).expect("replica content"),
     )
+    .with_control_plane(control_plane.clone())
     .with_metadata_backend(replica_backend)
     .expect("replica metadata backend");
     let file_system = DfsFileSystem {
@@ -4693,7 +4718,7 @@ fn networked_dfs_persists_committed_metadata_through_backend() {
 }
 
 #[test]
-fn networked_dfs_threshold_commit_stages_missing_desired_replica() {
+fn networked_dfs_threshold_commit_repairs_missing_desired_replica() {
     let owner = NodeId::from_legacy_named("node_owner").expect("node");
     let replica = NodeId::from_legacy_named("node_replica").expect("node");
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
@@ -4773,17 +4798,19 @@ fn networked_dfs_threshold_commit_stages_missing_desired_replica() {
         NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } if repair_jobs.len() == 1
     ));
 
-    let stage_events = replica_dfs.process_incoming().expect("stage");
-    assert!(stage_events.iter().any(|event| {
+    let repair_events = replica_dfs.process_incoming().expect("repair");
+    assert!(repair_events.iter().any(|event| {
         matches!(
             event,
-            sinomo_dfs::NetworkedDfsServiceEvent::BlobStaged { .. }
+            sinomo_dfs::NetworkedDfsServiceEvent::ReplicaRepaired { .. }
         )
     }));
-    owner_dfs.process_incoming().expect("stage response");
+    owner_dfs.process_incoming().expect("repair response");
     let owner_metrics = owner_dfs.operational_metrics().expect("owner metrics");
     assert_eq!(owner_metrics.repair_job_count, 0);
-    assert_eq!(owner_metrics.pending_write_count, 1);
+    assert_eq!(owner_metrics.pending_write_count, 0);
+    assert_eq!(owner_metrics.repair_attempt_count, 0);
+    assert_eq!(owner_metrics.repair_retry_count, 0);
     let read = replica_dfs
         .read_local_object(&object_id)
         .expect("read")
@@ -9296,9 +9323,9 @@ fn networked_dfs_retries_offline_repair_when_replica_appears() {
         .operational_metrics()
         .expect("owner metrics after repair");
     assert_eq!(owner_metrics.repair_job_count, 0);
-    assert_eq!(owner_metrics.pending_write_count, 1);
-    assert_eq!(owner_metrics.repair_attempt_count, 1);
-    assert_eq!(owner_metrics.repair_retry_count, 1);
+    assert_eq!(owner_metrics.pending_write_count, 0);
+    assert_eq!(owner_metrics.repair_attempt_count, 0);
+    assert_eq!(owner_metrics.repair_retry_count, 0);
     assert_eq!(owner_metrics.repair_inflight_count, 0);
     assert!(
         owner_dfs

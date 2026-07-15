@@ -1,5 +1,6 @@
 use crate::connectivity_publish::cluster_connectivity_publish_record_matches;
 use crate::keyspace::cluster_connectivity_key;
+use crate::kv_snapshot_observer::notify_cluster_kv_committed_snapshot_observers;
 use crate::local_state_store::read_cluster_state_without_kv;
 #[allow(unused_imports)]
 use sinomo_kv::KvError;
@@ -198,7 +199,7 @@ pub fn write_cluster_kv_snapshot(
     let wrote =
         sinomo_kv::write_cluster_kv_materialized_snapshot_if_changed(&paths.kv_paths(), snapshot)
             .map_err(kv_err)?;
-    observe_cluster_kv_snapshot_write(paths, wrote);
+    observe_cluster_kv_snapshot_write(paths, wrote, Some(snapshot));
     Ok(())
 }
 
@@ -217,11 +218,15 @@ pub fn write_imported_cluster_kv_snapshot_if_changed(
         )
         .map_err(kv_err)?
     };
-    observe_cluster_kv_snapshot_write(paths, wrote);
+    observe_cluster_kv_snapshot_write(paths, wrote, Some(snapshot));
     Ok(wrote)
 }
 
-pub(crate) fn observe_cluster_kv_snapshot_write(paths: &ClusterPaths, wrote: bool) {
+pub(crate) fn observe_cluster_kv_snapshot_write(
+    paths: &ClusterPaths,
+    wrote: bool,
+    snapshot: Option<&KvSnapshot>,
+) {
     if wrote {
         sinomo_network::invalidate_cluster_delivery_routing_table_cache(paths);
         sinomo_network::invalidate_cluster_route_graph_cache(paths);
@@ -235,6 +240,9 @@ pub(crate) fn observe_cluster_kv_snapshot_write(paths: &ClusterPaths, wrote: boo
         } else {
             observer.on_kv_snapshot_skipped_write();
         }
+    }
+    if let Some(snapshot) = snapshot {
+        notify_cluster_kv_committed_snapshot_observers(paths, snapshot);
     }
 }
 
@@ -481,10 +489,15 @@ pub fn cache_cluster_kv_snapshot_if_newer_than_raft(
     node_id: &NodeId,
     snapshot: KvSnapshot,
 ) -> Result<bool, NetworkError> {
-    paths
+    let observed = snapshot.clone();
+    let changed = paths
         .kv_paths()
         .cache_snapshot_if_newer_than_raft_and_notify(node_id, snapshot)
-        .map_err(kv_err)
+        .map_err(kv_err)?;
+    if changed {
+        notify_cluster_kv_committed_snapshot_observers(paths, &observed);
+    }
+    Ok(changed)
 }
 
 pub(crate) fn locked_cache_cluster_kv_snapshot_if_newer_than_raft(
@@ -492,10 +505,15 @@ pub(crate) fn locked_cache_cluster_kv_snapshot_if_newer_than_raft(
     node_id: &NodeId,
     snapshot: KvSnapshot,
 ) -> Result<bool, NetworkError> {
-    paths
+    let observed = snapshot.clone();
+    let changed = paths
         .kv_paths()
         .locked_cache_snapshot_if_newer_than_raft_and_notify(node_id, snapshot)
-        .map_err(kv_err)
+        .map_err(kv_err)?;
+    if changed {
+        notify_cluster_kv_committed_snapshot_observers(paths, &observed);
+    }
+    Ok(changed)
 }
 
 pub(crate) fn locked_kv_state_authority_id(
@@ -590,7 +608,7 @@ pub(crate) fn append_cluster_raft_ops_in_batches(
             sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
         .map_err(kv_err)?;
-    observe_cluster_kv_snapshot_write(paths, wrote);
+    observe_cluster_kv_snapshot_write(paths, wrote, Some(&snapshot));
     Ok(snapshot)
 }
 
@@ -607,7 +625,7 @@ pub fn append_cluster_raft_command_with_response(
             sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
         .map_err(kv_err)?;
-    observe_cluster_kv_snapshot_write(paths, wrote);
+    observe_cluster_kv_snapshot_write(paths, wrote, Some(&snapshot));
     Ok((snapshot, txn_response))
 }
 
@@ -697,7 +715,12 @@ pub fn apply_cluster_raft_append(
             sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
         .map_err(kv_err)?;
-    observe_cluster_kv_snapshot_write(paths, wrote);
+    let observed = sinomo_kv::read_cluster_kv_current_snapshot_arc_for_node(
+        &paths.kv_paths(),
+        node_id.clone(),
+    )
+    .ok();
+    observe_cluster_kv_snapshot_write(paths, wrote, observed.as_deref());
     Ok(response)
 }
 
@@ -728,9 +751,9 @@ impl<'a> LocalClusterRaftCommandStorage<'a> {
         }
     }
 
-    fn observe_last_snapshot_publish(&mut self) {
+    fn observe_last_snapshot_publish(&mut self, snapshot: &KvSnapshot) {
         if let Some(wrote) = self.inner.take_last_snapshot_publish_wrote() {
-            observe_cluster_kv_snapshot_write(self.paths, wrote);
+            observe_cluster_kv_snapshot_write(self.paths, wrote, Some(snapshot));
         }
     }
 
@@ -750,7 +773,7 @@ impl<'a> LocalClusterRaftCommandStorage<'a> {
             .inner
             .discard_uncommitted_tail_and_clear_leader()
             .map_err(kv_err)?;
-        self.observe_last_snapshot_publish();
+        self.observe_last_snapshot_publish(&snapshot);
         Ok(snapshot)
     }
 
@@ -763,7 +786,7 @@ impl<'a> LocalClusterRaftCommandStorage<'a> {
         index: u64,
     ) -> Result<ClusterKvRaftCommitResult, NetworkError> {
         let result = self.inner.commit_index_with_events(index).map_err(kv_err)?;
-        self.observe_last_snapshot_publish();
+        self.observe_last_snapshot_publish(&result.snapshot);
         Ok(result)
     }
 }

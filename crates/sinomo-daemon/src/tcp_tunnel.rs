@@ -655,7 +655,7 @@ impl TcpTunnelHandle {
         }
     }
 
-    fn deliver_stream_data(&self, id: u64, bytes: Vec<u8>) {
+    async fn deliver_stream_data(&self, id: u64, bytes: Vec<u8>) {
         if bytes.is_empty() || bytes.len() > TCP_TUNNEL_STREAM_FRAME_BYTES {
             self.abort_stream(
                 id,
@@ -683,21 +683,58 @@ impl TcpTunnelHandle {
             self.abort_stream(id, "tcp tunnel stream sent data after finish");
             return;
         }
+        let permit_count = bytes.len() as u32;
         let queued_bytes =
-            Arc::clone(&self.stream_queued_bytes).try_acquire_many_owned(bytes.len() as u32);
-        let Ok(queued_bytes) = queued_bytes else {
-            self.abort_stream(id, "tcp tunnel aggregate stream receive window exhausted");
+            match Arc::clone(&self.stream_queued_bytes).try_acquire_many_owned(permit_count) {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let wait_started = std::time::Instant::now();
+                    let Ok(permit) = Arc::clone(&self.stream_queued_bytes)
+                        .acquire_many_owned(permit_count)
+                        .await
+                    else {
+                        self.abort_stream(id, "tcp tunnel aggregate stream receive window closed");
+                        return;
+                    };
+                    tracing::debug!(
+                        target: "sinomo.network.tcp_tunnel",
+                        stream_id = id,
+                        frame_bytes = permit_count,
+                        wait_us = wait_started.elapsed().as_micros() as u64,
+                        "tcp tunnel stream data waited for aggregate receive capacity"
+                    );
+                    permit
+                }
+            };
+        if *active.reset.borrow() {
             return;
+        }
+        if active.remote_finished.load(Ordering::Acquire) {
+            self.abort_stream(id, "tcp tunnel stream sent data after finish");
+            return;
+        }
+        let event = TcpTunnelStreamEvent::Data {
+            bytes,
+            _queued_bytes: queued_bytes,
         };
-        if active
-            .tx
-            .try_send(TcpTunnelStreamEvent::Data {
-                bytes,
-                _queued_bytes: queued_bytes,
-            })
-            .is_err()
-        {
-            self.abort_stream(id, "tcp tunnel per-stream receive window exhausted");
+        match active.tx.try_send(event) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                let wait_started = std::time::Instant::now();
+                if active.tx.send(event).await.is_err() {
+                    self.abort_stream(id, "tcp tunnel stream receiver closed during admission");
+                    return;
+                }
+                tracing::debug!(
+                    target: "sinomo.network.tcp_tunnel",
+                    stream_id = id,
+                    wait_us = wait_started.elapsed().as_micros() as u64,
+                    "tcp tunnel stream data waited for per-stream receive capacity"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.abort_stream(id, "tcp tunnel stream receiver closed during admission");
+            }
         }
     }
 
@@ -1777,7 +1814,7 @@ async fn tcp_tunnel_reader_loop(
                 handle.accept_stream_open(id);
             }
             ClusterTcpTunnelFrame::StreamData { id, bytes } => {
-                handle.deliver_stream_data(id, bytes);
+                handle.deliver_stream_data(id, bytes).await;
             }
             ClusterTcpTunnelFrame::StreamFinish { id } => {
                 handle.deliver_stream_finish(id);
@@ -2921,7 +2958,7 @@ mod tests {
                     bytes,
                 } => {
                     assert_eq!(frame_id, id);
-                    server_handle.deliver_stream_data(id, bytes);
+                    server_handle.deliver_stream_data(id, bytes).await;
                 }
                 ClusterTcpTunnelFrame::StreamFinish { id: frame_id } => {
                     assert_eq!(frame_id, id);
@@ -2948,7 +2985,7 @@ mod tests {
                     bytes,
                 } => {
                     assert_eq!(frame_id, id);
-                    client_handle.deliver_stream_data(id, bytes);
+                    client_handle.deliver_stream_data(id, bytes).await;
                 }
                 ClusterTcpTunnelFrame::StreamFinish { id: frame_id } => {
                     assert_eq!(frame_id, id);
@@ -3065,7 +3102,9 @@ mod tests {
         ));
 
         let request_bytes = vec![0x31; 3 * 1024 * 1024 + 17];
-        let response_bytes = vec![0x72; 4 * 1024 * 1024 + 29];
+        // Exceed the tunnel-wide queued-byte window so the regression covers
+        // bounded receive backpressure instead of only the uncontended path.
+        let response_bytes = vec![0x72; 12 * 1024 * 1024 + 29];
         let expected_request = request_bytes.clone();
         let expected_response = response_bytes.clone();
         let (server_result_tx, server_result_rx) = oneshot::channel();
@@ -3162,7 +3201,7 @@ mod tests {
                             .expect("send stream accept");
                     }
                     ClusterTcpTunnelFrame::StreamData { id, bytes } => {
-                        client_to_server_handle.deliver_stream_data(id, bytes);
+                        client_to_server_handle.deliver_stream_data(id, bytes).await;
                     }
                     ClusterTcpTunnelFrame::StreamFinish { id } => {
                         client_to_server_handle.deliver_stream_finish(id);
@@ -3191,7 +3230,7 @@ mod tests {
                         server_to_client_handle.accept_stream_open(id);
                     }
                     ClusterTcpTunnelFrame::StreamData { id, bytes } => {
-                        server_to_client_handle.deliver_stream_data(id, bytes);
+                        server_to_client_handle.deliver_stream_data(id, bytes).await;
                     }
                     ClusterTcpTunnelFrame::StreamFinish { id } => {
                         server_to_client_handle.deliver_stream_finish(id);
@@ -3252,7 +3291,7 @@ mod tests {
         );
         let actual_response = result
             .body
-            .collect_to_vec(8 * 1024 * 1024)
+            .collect_to_vec(16 * 1024 * 1024)
             .await
             .expect("response body");
         let actual_request = server_result_rx
@@ -3328,7 +3367,7 @@ mod tests {
     async fn tcp_tunnel_saturated_stream_reset_isolated_and_releases_lifetime() {
         let (handle, _control_rx, _stream_rx) =
             test_stream_tunnel_handle("tcp_tunnel_backpressure_peer", 0);
-        let (stalled_tx, stalled_rx) =
+        let (stalled_tx, mut stalled_rx) =
             mpsc::channel::<TcpTunnelStreamEvent>(TCP_TUNNEL_STREAM_CHANNEL_CAPACITY);
         let (stalled_reset, _) = watch::channel(false);
         let active = ActiveTcpTunnelStream {
@@ -3358,6 +3397,34 @@ mod tests {
             !*active.reset.borrow(),
             "the bounded window itself must not reset a stream"
         );
+
+        let waiting_handle = Arc::clone(&handle);
+        let mut waiting_delivery = tokio::spawn(async move {
+            waiting_handle
+                .deliver_stream_data(2, vec![0x55; TCP_TUNNEL_STREAM_FRAME_BYTES])
+                .await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting_delivery)
+                .await
+                .is_err(),
+            "saturated data admission must wait instead of resetting the stream"
+        );
+        assert!(
+            !*active.reset.borrow(),
+            "waiting for bounded capacity must keep the stream healthy"
+        );
+        drop(stalled_rx.recv().await.expect("release one receive slot"));
+        tokio::time::timeout(Duration::from_secs(1), waiting_delivery)
+            .await
+            .expect("waiting frame enters after capacity release")
+            .expect("waiting delivery task");
+        assert_eq!(active.tx.capacity(), 0, "waiting frame refills the queue");
+        assert!(
+            !*active.reset.borrow(),
+            "capacity release and admission must not reset the stream"
+        );
+
         handle.deliver_stream_reset(2, "peer reset saturated stream".to_string());
         assert!(
             *active.reset.borrow(),
@@ -3367,7 +3434,7 @@ mod tests {
         handle.streams.lock().expect("stream registry").remove(&2);
 
         let mut healthy = handle.create_stream(4).expect("create healthy stream");
-        handle.deliver_stream_data(4, b"healthy".to_vec());
+        handle.deliver_stream_data(4, b"healthy".to_vec()).await;
         handle.deliver_stream_finish(4);
         let mut healthy_bytes = Vec::new();
         healthy

@@ -1,0 +1,31 @@
+# Measurement-only overlay for isolating DFS algorithm and network overhead
+# from host block-device latency. Apply it only to a fresh compose project:
+#
+#   SINOMO_TEST_COMPOSE_OVERRIDE=docker/docker-compose.dfs-tmpfs.yml \
+#     SINOMO_TEST_NETWORK_ONLY=1 SINOMO_TEST_KEEP=1 docker/test-cluster.sh
+#
+# The local-volume tmpfs contents are not a durability test surface. Do not use
+# this overlay for restart, crash-recovery, rollout, or disk-damage acceptance.
+
+volumes:
+  node1-data:
+    driver: local
+    driver_opts: &dfs-tmpfs
+      type: tmpfs
+      device: tmpfs
+      o: "size=${SINOMO_DFS_TMPFS_SIZE:-2g},mode=1777"
+  node2-data:
+    driver: local
+    driver_opts: *dfs-tmpfs
+  node3-data:
+    driver: local
+    driver_opts: *dfs-tmpfs
+  node4-data:
+    driver: local
+    driver_opts: *dfs-tmpfs
+  node5-data:
+    driver: local
+    driver_opts: *dfs-tmpfs
+  node6-data:
+    driver: local
+    driver_opts: *dfs-tmpfs

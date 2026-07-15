@@ -73,14 +73,6 @@ fn create_visible_path_is_available(
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn apply_committed_intent(&mut self, intent_id: &str) -> Result<(), DfsError> {
-        self.apply_committed_intent_with_repair_mode(intent_id, true)
-    }
-
-    fn apply_committed_intent_with_repair_mode(
-        &mut self,
-        intent_id: &str,
-        foreground_replica_repair: bool,
-    ) -> Result<(), DfsError> {
         let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
             return Err(DfsError::Distributed {
                 message: format!("unknown committed intent: {intent_id}"),
@@ -102,6 +94,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .ok_or_else(|| DfsError::Distributed {
                     message: format!("missing pending write for committed intent: {intent_id}"),
                 })?;
+        // PendingNetworkedWrite retains the effective primary execution mode.
+        // Every path that crosses W, including fetch completion and recovery,
+        // must use this same value rather than supplying a call-site default.
+        let foreground_replica_repair = pending.foreground_replica_repair;
         if intent.object_id != pending.object_id || intent.target_version != pending.version {
             return Err(DfsError::Distributed {
                 message: format!(
@@ -295,7 +291,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.command_authority_shard_for_object(committed_metadata.as_ref())?;
         for replica_node_id in commit_targets {
             let request_id = self.next_request_id();
-            self.send_best_effort_message_if_routable(
+            self.send_best_effort_message_if_routable_detached(
                 &replica_node_id,
                 DfsNetworkMessage::CommitVersion(DfsCommitVersionCommand {
                     request_id,
@@ -326,8 +322,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.suppress_repair_retries_for_lost_authority(intent_id, None, true);
             return Ok(());
         }
+        let mut full_repair_targets = Vec::new();
+        let pending_blob_available = self.open_pending_write_blob_stream(&pending).is_ok();
         for job in repair_jobs {
             let replica_node_id = job.missing_replica_node_id.clone();
+            // A pre-commit StageBlob already owns this target's full-body
+            // transfer. Let that exact request finish (or expire in the normal
+            // maintenance loop) instead of sending a duplicate RepairReplica.
+            if self.stage_request_is_active(intent_id, &replica_node_id) {
+                continue;
+            }
             if !self.repair_retry_is_due(intent_id, &replica_node_id) {
                 continue;
             }
@@ -358,7 +362,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 continue;
             }
-            if self.open_pending_write_blob_stream(&pending).is_err() {
+            if !pending_blob_available {
                 let fetch_outcome = self.request_repair_blob_from_alternate(&job, &pending)?;
                 if !fetch_outcome.requested {
                     self.record_repair_retry_scheduled_with_error(
@@ -374,18 +378,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .get(&replica_node_id)
                 .cloned()
                 .unwrap_or_else(|| self.next_request_id());
-            let outcome = self.send_repair_replica_body_if_routable(
-                &replica_node_id,
-                request_id.clone(),
-                intent_id,
-                &intent.file_system_id,
-                &pending.object_id,
-                intent.base_version.clone(),
-                &pending.version,
-                &pending.content_hash,
-                pending.size_bytes,
-                committed_metadata.clone(),
-            )?;
+            full_repair_targets.push((replica_node_id, request_id));
+        }
+        let outcomes = self.send_repair_replica_bodies_if_routable(
+            &full_repair_targets,
+            intent_id,
+            &intent.file_system_id,
+            &pending.object_id,
+            intent.base_version.clone(),
+            &pending.version,
+            &pending.content_hash,
+            pending.size_bytes,
+            committed_metadata,
+        )?;
+        for ((replica_node_id, request_id), outcome) in
+            full_repair_targets.into_iter().zip(outcomes)
+        {
             if outcome.sent {
                 self.record_repair_inflight(intent_id, &replica_node_id, request_id);
             } else {
@@ -403,17 +411,57 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         intent_id: &str,
     ) -> Result<(), DfsError> {
-        self.try_apply_committed_intent_if_ready_with_repair_mode(intent_id, true)
+        if self.coordinator.is_commit_ready(intent_id)? {
+            self.apply_committed_intent(intent_id)?;
+        }
+        Ok(())
     }
 
-    pub(crate) fn try_apply_committed_intent_if_ready_with_repair_mode(
+    /// A foreground W<N write can commit while another pre-commit StageBlob is
+    /// still in flight. When that exact sibling later becomes durable, publish
+    /// its location and promote the staged replica without re-running the
+    /// already-completed visible commit.
+    pub(crate) fn finalize_late_committed_stage_receipt(
         &mut self,
         intent_id: &str,
-        foreground_replica_repair: bool,
+        replica_node_id: &NodeId,
     ) -> Result<(), DfsError> {
-        if self.coordinator.is_commit_ready(intent_id)? {
-            self.apply_committed_intent_with_repair_mode(intent_id, foreground_replica_repair)?;
+        let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
+            return Ok(());
+        };
+        if !matches!(intent.state, DfsWriteIntentState::Committed) {
+            return Ok(());
         }
+        let Some(pending) = self.pending_writes.get(intent_id).cloned() else {
+            return Ok(());
+        };
+        self.mark_repaired_location(
+            &pending.object_id,
+            &pending.version,
+            replica_node_id,
+            &pending.content_hash,
+        )?;
+        if replica_node_id == &self.node_id || replica_node_id == &intent.requesting_node_id {
+            return Ok(());
+        }
+        let committed_metadata = Some(self.current_read_object_metadata(&pending.object_id)?);
+        let authority_shard =
+            self.command_authority_shard_for_object(committed_metadata.as_ref())?;
+        let request_id = self.next_request_id();
+        self.send_best_effort_message_if_routable_detached(
+            replica_node_id,
+            DfsNetworkMessage::CommitVersion(DfsCommitVersionCommand {
+                request_id,
+                intent_id: intent_id.to_string(),
+                file_system_id: intent.file_system_id,
+                object_id: pending.object_id,
+                expected_base_version: intent.base_version,
+                version: pending.version,
+                content_hash: pending.content_hash,
+                object_metadata: committed_metadata,
+                authority_shard,
+            }),
+        )?;
         Ok(())
     }
 
@@ -604,7 +652,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 record.target_version,
                 content_hash,
                 size_bytes,
-            ),
+            )
+            .with_foreground_replica_repair(false),
         );
         Ok(())
     }
@@ -1223,6 +1272,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_intent_id = intent.intent_id.clone();
         let trace_object_id = intent.object_id.clone();
         let trace_version = intent.target_version.clone();
+        let mut expectations_ms = 0;
         if !self.coordinator.is_commit_ready(&intent.intent_id)? {
             return Err(DfsError::Distributed {
                 message: format!("intent {} is not ready to commit", intent.intent_id),
@@ -1491,12 +1541,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         message: "clustered canonical create requires a durable metadata backend"
                             .to_string(),
                     })?;
+                let expectations_started = Instant::now();
                 let (expected_object_versions, expected_path_occupants, _) =
                     crate::service_metadata::namespace_prepare_expectations(
                         backend.as_ref(),
                         &DfsMetadataShardId::new(shard.shard_id.clone()),
                         transaction,
                     )?;
+                expectations_ms = expectations_started.elapsed().as_millis();
                 let mut prepare = DfsNamespacePrepareRecord {
                     operation_id: format!("namespace:create:{}", intent.intent_id),
                     file_system_id: transaction.file_system_id.clone(),
@@ -1636,12 +1688,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.clear_active_replica_stage(&intent.object_id, &intent.target_version);
         let memory_ms = memory_started.elapsed().as_millis();
         dfs_perf_trace(format_args!(
-            "ready-intent-commit-batched intent={} object={} version={} create={} receipts={} prepare_ms={} backend_ms={} coordinator_ms={} memory_ms={} total_ms={}",
+            "ready-intent-commit-batched intent={} object={} version={} create={} receipts={} expectations_ms={} prepare_ms={} backend_ms={} coordinator_ms={} memory_ms={} total_ms={}",
             trace_intent_id,
             trace_object_id,
             trace_version,
             intent.touch_parent_on_create,
             receipts.len(),
+            expectations_ms,
             prepare_ms,
             backend_ms,
             coordinator_ms,

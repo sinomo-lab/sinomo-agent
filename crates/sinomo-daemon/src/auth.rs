@@ -579,6 +579,8 @@ fn authorize_daemon_signer(
     envelope: &SignedDaemonCommand,
     request: &sinomo_core::network::ObjectRpcRequest,
 ) -> Result<DaemonSignerAuthority, DaemonError> {
+    let require_exact_member_identity =
+        daemon_route_requires_exact_member_identity(request.route.as_str());
     let envelope_public_key =
         sinomo_core::network::daemon_auth_encode_public_key(&envelope.public_key);
     let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
@@ -586,11 +588,16 @@ fn authorize_daemon_signer(
         detail: "daemon paths have no data directory parent".to_string(),
     })?;
     let verifier = cached_daemon_auth_verifier_context(data_dir)?;
-    if envelope_public_key == verifier.main_public_key
+    let local_identity_key = envelope_public_key == verifier.main_public_key
         || verifier
             .shadow_public_key
             .as_ref()
-            .is_some_and(|public_key| envelope_public_key == *public_key)
+            .is_some_and(|public_key| envelope_public_key == *public_key);
+    if local_identity_key
+        && (!require_exact_member_identity
+            || verifier
+                .members_by_node_and_key
+                .contains_key(&(envelope.node_id.clone(), envelope_public_key.clone())))
     {
         return Ok(DaemonSignerAuthority::Local);
     }
@@ -601,8 +608,10 @@ fn authorize_daemon_signer(
     {
         return Ok(authority.clone());
     }
-    if let Some(authority) = verifier.members_by_key.get(&envelope_public_key) {
-        return Ok(authority.clone());
+    if !require_exact_member_identity {
+        if let Some(authority) = verifier.members_by_key.get(&envelope_public_key) {
+            return Ok(authority.clone());
+        }
     }
 
     if request.route == sinomo_core::network::CLUSTER_JOIN_REGISTER_ROUTE {
@@ -612,9 +621,12 @@ fn authorize_daemon_signer(
     if request.route == crate::DAEMON_STATUS_ROUTE {
         return Ok(DaemonSignerAuthority::StatusProbe);
     }
-    if let Some(authority) =
-        authorize_daemon_signer_after_membership_refresh(data_dir, envelope, &envelope_public_key)
-    {
+    if let Some(authority) = authorize_daemon_signer_after_membership_refresh(
+        data_dir,
+        envelope,
+        &envelope_public_key,
+        require_exact_member_identity,
+    ) {
         return Ok(authority);
     }
     if let Some(authority) =
@@ -625,27 +637,44 @@ fn authorize_daemon_signer(
     Err(DaemonError::AuthDenied)
 }
 
+fn daemon_route_requires_exact_member_identity(route: &str) -> bool {
+    route == sinomo_dfs::DFS_METADATA_JOURNAL_BATCH_ROUTE
+        || route == sinomo_dfs::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE
+        || sinomo_dfs::dfs_route_is_message_data_plane(route)
+}
+
 fn verifier_authority_for_signer(
     verifier: &CachedDaemonAuthVerifierContext,
     node_id: &str,
     public_key: &str,
+    require_exact_member_identity: bool,
 ) -> Option<DaemonSignerAuthority> {
-    verifier
+    let exact = verifier
         .members_by_node_and_key
         .get(&(node_id.to_string(), public_key.to_string()))
-        .cloned()
-        .or_else(|| verifier.members_by_key.get(public_key).cloned())
+        .cloned();
+    if require_exact_member_identity {
+        exact
+    } else {
+        exact.or_else(|| verifier.members_by_key.get(public_key).cloned())
+    }
 }
 
 fn authorize_daemon_signer_after_membership_refresh(
     data_dir: &Path,
     envelope: &SignedDaemonCommand,
     envelope_public_key: &str,
+    require_exact_member_identity: bool,
 ) -> Option<DaemonSignerAuthority> {
     if let Some(authority) = load_uncached_daemon_auth_verifier_context(data_dir)
         .ok()
         .and_then(|verifier| {
-            verifier_authority_for_signer(&verifier, &envelope.node_id, envelope_public_key)
+            verifier_authority_for_signer(
+                &verifier,
+                &envelope.node_id,
+                envelope_public_key,
+                require_exact_member_identity,
+            )
         })
     {
         replace_cached_daemon_auth_verifier_context(data_dir, None);
@@ -655,7 +684,12 @@ fn authorize_daemon_signer_after_membership_refresh(
     refresh_daemon_auth_membership_snapshot(data_dir).ok()?;
     replace_cached_daemon_auth_verifier_context(data_dir, None);
     let verifier = cached_daemon_auth_verifier_context(data_dir).ok()?;
-    verifier_authority_for_signer(&verifier, &envelope.node_id, envelope_public_key)
+    verifier_authority_for_signer(
+        &verifier,
+        &envelope.node_id,
+        envelope_public_key,
+        require_exact_member_identity,
+    )
 }
 
 fn authorize_join_relay_signer_from_local_state(
@@ -1611,11 +1645,13 @@ mod tests {
     }
 
     #[test]
-    fn authorized_same_key_member_survives_node_id_drift() {
+    fn authorized_same_key_member_survives_node_id_drift_only_on_non_authority_routes() {
         let data_root = unique_auth_test_root("sinomo-daemon-auth-same-key-drift");
         let data_dir = SinomoDataDir::new(&data_root);
         let daemon_paths = DaemonPaths::with_root(data_root.join("daemon"));
         let local_identity = load_or_create_main_node_identity(&data_root).expect("local identity");
+        let local_public_key =
+            daemon_auth_decode_public_key(&local_identity.public_key).expect("local public key");
         let peer_root = unique_auth_test_root("sinomo-daemon-auth-same-key-drift-peer");
         let peer_identity = load_or_create_main_node_identity(&peer_root).expect("peer identity");
         let peer_public_key =
@@ -1633,14 +1669,14 @@ mod tests {
         let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
             cluster_id.clone(),
             "auth-same-key-drift",
-            local_node,
+            local_node.clone(),
             "local",
             local_identity.public_key,
             now,
         );
         let mut peer = ClusterMemberRecord::pending_learner(
             cluster_id,
-            stored_peer,
+            stored_peer.clone(),
             "peer",
             peer_identity.public_key,
             now,
@@ -1678,6 +1714,58 @@ mod tests {
             authorize_daemon_signer(&daemon_paths, &envelope, &request)
                 .expect("authorize accepted same-key member"),
             DaemonSignerAuthority::Member
+        );
+
+        for route in [
+            sinomo_dfs::DFS_DATA_WRITE_ROUTE,
+            sinomo_dfs::DFS_METADATA_JOURNAL_BATCH_ROUTE,
+            sinomo_dfs::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
+        ] {
+            let authority_request = sinomo_core::network::ObjectRpcRequest::encode_body(
+                route,
+                sinomo_dfs::DFS_RPC_CATEGORY,
+                &(),
+            )
+            .expect("authority rpc request");
+            assert!(matches!(
+                authorize_daemon_signer(&daemon_paths, &envelope, &authority_request),
+                Err(DaemonError::AuthDenied)
+            ));
+
+            let exact_envelope = SignedDaemonCommand {
+                node_id: stored_peer.to_string(),
+                ..envelope.clone()
+            };
+            assert_eq!(
+                authorize_daemon_signer(&daemon_paths, &exact_envelope, &authority_request,)
+                    .expect("authorize exact member identity"),
+                DaemonSignerAuthority::Member
+            );
+        }
+
+        let authority_request = sinomo_core::network::ObjectRpcRequest::encode_body(
+            sinomo_dfs::DFS_DATA_WRITE_ROUTE,
+            sinomo_dfs::DFS_RPC_CATEGORY,
+            &(),
+        )
+        .expect("local authority rpc request");
+        let local_drift_envelope = SignedDaemonCommand {
+            node_id: drifted_peer.to_string(),
+            public_key: local_public_key,
+            ..envelope.clone()
+        };
+        assert!(matches!(
+            authorize_daemon_signer(&daemon_paths, &local_drift_envelope, &authority_request),
+            Err(DaemonError::AuthDenied)
+        ));
+        let exact_local_envelope = SignedDaemonCommand {
+            node_id: local_node.to_string(),
+            ..local_drift_envelope
+        };
+        assert_eq!(
+            authorize_daemon_signer(&daemon_paths, &exact_local_envelope, &authority_request)
+                .expect("authorize exact local member identity"),
+            DaemonSignerAuthority::Local
         );
     }
 

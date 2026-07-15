@@ -197,7 +197,11 @@ pub struct DistributedRepairJob {
 pub struct DistributedEventualCoordinator {
     next_intent_id: u64,
     intents: BTreeMap<String, DistributedWriteIntent>,
-    receipts: BTreeMap<(String, NodeId), DistributedReplicaReceipt>,
+    awaiting_intent_id_by_object: BTreeMap<ObjectKey, String>,
+    awaiting_intent_ids_by_object_id: BTreeMap<DfsObjectId, BTreeSet<String>>,
+    claimed_intent_ids_by_target: BTreeMap<IntentTargetKey, BTreeSet<String>>,
+    receipts: BTreeMap<String, BTreeMap<NodeId, DistributedReplicaReceipt>>,
+    receipt_count: usize,
     committed_versions: BTreeMap<ObjectKey, DfsVersion>,
     repair_jobs: Vec<DistributedRepairJob>,
 }
@@ -314,7 +318,7 @@ impl DistributedEventualCoordinator {
             create_predecessor_object_id,
             state: DfsWriteIntentState::AwaitingReceipts,
         };
-        self.intents.insert(intent_id, intent.clone());
+        self.replace_indexed_intent(intent.clone());
         Ok(intent)
     }
 
@@ -340,26 +344,24 @@ impl DistributedEventualCoordinator {
             });
         }
 
-        if self.intents.values().any(|intent| {
-            intent.file_system_id == *file_system_id
-                && intent.object_id == *object_id
-                && intent.target_version == *target_version
-                && matches!(
-                    intent.state,
-                    DfsWriteIntentState::AwaitingReceipts | DfsWriteIntentState::Committed
-                )
-        }) {
+        let target_key = IntentTargetKey::from_refs(file_system_id, object_id, target_version);
+        if self
+            .claimed_intent_ids_by_target
+            .get(&target_key)
+            .is_some_and(|intent_ids| !intent_ids.is_empty())
+        {
             return Err(DfsDistributedError::DuplicateIntent {
                 object_id: object_id.clone(),
                 target_version: target_version.clone(),
             });
         }
 
-        if let Some(pending) = self.intents.values().find(|intent| {
-            intent.file_system_id == *file_system_id
-                && intent.object_id == *object_id
-                && matches!(intent.state, DfsWriteIntentState::AwaitingReceipts)
-        }) {
+        if let Some(pending) = self
+            .awaiting_intent_id_by_object
+            .get(&key)
+            .and_then(|intent_id| self.intents.get(intent_id))
+            .filter(|intent| matches!(intent.state, DfsWriteIntentState::AwaitingReceipts))
+        {
             return Err(DfsDistributedError::PendingIntentConflict {
                 object_id: object_id.clone(),
                 pending_intent_id: pending.intent_id.clone(),
@@ -380,11 +382,15 @@ impl DistributedEventualCoordinator {
         object_id: &DfsObjectId,
         target_version: &DfsVersion,
     ) -> bool {
-        self.intents.values().any(|intent| {
-            intent.object_id == *object_id
-                && intent.target_version == *target_version
-                && matches!(intent.state, DfsWriteIntentState::AwaitingReceipts)
-        })
+        self.awaiting_intent_ids_by_object_id
+            .get(object_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|intent_id| self.intents.get(intent_id))
+            .any(|intent| {
+                intent.target_version == *target_version
+                    && matches!(intent.state, DfsWriteIntentState::AwaitingReceipts)
+            })
     }
 
     pub fn intent_for_target(
@@ -400,14 +406,34 @@ impl DistributedEventualCoordinator {
         })
     }
 
+    /// Return the live awaiting/committed claim for an exact write target.
+    /// Terminal history deliberately does not participate: an aborted claim
+    /// releases the target, and routed replay/cleanup must find a later live
+    /// claim rather than the first historical row with the same identity.
+    pub fn claimed_intent_for_target(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        target_version: &DfsVersion,
+    ) -> Option<&DistributedWriteIntent> {
+        self.claimed_intent_ids_by_target
+            .get(&IntentTargetKey::from_refs(
+                file_system_id,
+                object_id,
+                target_version,
+            ))
+            .into_iter()
+            .flatten()
+            .find_map(|intent_id| self.intents.get(intent_id))
+    }
+
     /// Whether any write intent for the object is still awaiting receipts.
     /// Cross-shard moves fence on this: a half-finished write must settle
     /// before its object may change shard authority.
     pub fn has_open_intent_for_object(&self, object_id: &DfsObjectId) -> bool {
-        self.intents.values().any(|intent| {
-            intent.object_id == *object_id
-                && matches!(intent.state, DfsWriteIntentState::AwaitingReceipts)
-        })
+        self.awaiting_intent_ids_by_object_id
+            .get(object_id)
+            .is_some_and(|intent_ids| !intent_ids.is_empty())
     }
 
     pub fn restore_intent(
@@ -458,7 +484,7 @@ impl DistributedEventualCoordinator {
                 intent.target_version.clone(),
             );
         }
-        self.intents.insert(intent.intent_id.clone(), intent);
+        self.replace_indexed_intent(intent);
         Ok(())
     }
 
@@ -499,17 +525,14 @@ impl DistributedEventualCoordinator {
                 replica_node_id,
             });
         }
-        self.receipts.insert(
-            (intent_id.to_string(), replica_node_id.clone()),
-            DistributedReplicaReceipt {
-                intent_id: intent_id.to_string(),
-                file_system_id: intent.file_system_id,
-                object_id: intent.object_id,
-                version: intent.target_version,
-                replica_node_id,
-                state: DfsReplicaReceiptState::Durable,
-            },
-        );
+        self.replace_indexed_receipt(DistributedReplicaReceipt {
+            intent_id: intent_id.to_string(),
+            file_system_id: intent.file_system_id,
+            object_id: intent.object_id,
+            version: intent.target_version,
+            replica_node_id,
+            state: DfsReplicaReceiptState::Durable,
+        });
         Ok(matches!(intent.state, DfsWriteIntentState::Committed))
     }
 
@@ -521,15 +544,19 @@ impl DistributedEventualCoordinator {
 
     pub fn receipts_for_intent(&self, intent_id: &str) -> Vec<&DistributedReplicaReceipt> {
         self.receipts
-            .iter()
-            .filter_map(|((receipt_intent_id, _), receipt)| {
-                (receipt_intent_id == intent_id).then_some(receipt)
-            })
+            .get(intent_id)
+            .into_iter()
+            .flat_map(|receipts| receipts.values())
             .collect()
     }
 
     pub fn durable_receipt_count(&self, intent_id: &str) -> usize {
-        self.durable_receipt_nodes(intent_id).len()
+        self.receipts
+            .get(intent_id)
+            .into_iter()
+            .flat_map(|receipts| receipts.values())
+            .filter(|receipt| receipt.state == DfsReplicaReceiptState::Durable)
+            .count()
     }
 
     pub fn is_commit_ready(&self, intent_id: &str) -> Result<bool, DfsDistributedError> {
@@ -582,8 +609,7 @@ impl DistributedEventualCoordinator {
             replica_node_id: replica_node_id.clone(),
             state: DfsReplicaReceiptState::Durable,
         };
-        self.receipts
-            .insert((intent_id.to_string(), replica_node_id.clone()), receipt);
+        self.replace_indexed_receipt(receipt);
         // A newly durable receipt can only retire this node's repair job for this
         // intent; it never introduces new missing replicas. Removing exactly that
         // job is the complete update, so a full `rebuild_repair_jobs` scan would
@@ -609,7 +635,7 @@ impl DistributedEventualCoordinator {
     }
 
     pub fn receipt_count(&self) -> usize {
-        self.receipts.len()
+        self.receipt_count
     }
 
     pub fn committed_version_count(&self) -> usize {
@@ -620,12 +646,11 @@ impl DistributedEventualCoordinator {
         &mut self,
         intent_id: &str,
     ) -> Result<DistributedWriteIntent, DfsDistributedError> {
-        let intent =
-            self.intents
-                .get_mut(intent_id)
-                .ok_or_else(|| DfsDistributedError::UnknownIntent {
-                    intent_id: intent_id.to_string(),
-                })?;
+        let mut intent = self.intents.get(intent_id).cloned().ok_or_else(|| {
+            DfsDistributedError::UnknownIntent {
+                intent_id: intent_id.to_string(),
+            }
+        })?;
         if !matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) {
             return Err(DfsDistributedError::IntentClosed {
                 intent_id: intent_id.to_string(),
@@ -633,8 +658,9 @@ impl DistributedEventualCoordinator {
             });
         }
         intent.state = DfsWriteIntentState::Aborted;
+        self.replace_indexed_intent(intent.clone());
         self.repair_jobs.retain(|job| job.intent_id != intent_id);
-        Ok(intent.clone())
+        Ok(intent)
     }
 
     pub fn downgrade_intent_policy(
@@ -703,18 +729,18 @@ impl DistributedEventualCoordinator {
 
     pub(crate) fn commit_intent(&mut self, intent_id: &str) -> Result<(), DfsDistributedError> {
         let durable_nodes = self.durable_receipt_nodes(intent_id);
-        let intent =
-            self.intents
-                .get_mut(intent_id)
-                .ok_or_else(|| DfsDistributedError::UnknownIntent {
-                    intent_id: intent_id.to_string(),
-                })?;
+        let mut intent = self.intents.get(intent_id).cloned().ok_or_else(|| {
+            DfsDistributedError::UnknownIntent {
+                intent_id: intent_id.to_string(),
+            }
+        })?;
 
         if matches!(intent.state, DfsWriteIntentState::Committed) {
             return Ok(());
         }
 
         intent.state = DfsWriteIntentState::Committed;
+        self.replace_indexed_intent(intent.clone());
         self.committed_versions.insert(
             ObjectKey::new(intent.file_system_id.clone(), intent.object_id.clone()),
             intent.target_version.clone(),
@@ -737,11 +763,95 @@ impl DistributedEventualCoordinator {
         Ok(())
     }
 
+    /// Replace the canonical intent row and update both sparse views as one
+    /// in-memory transition. The coordinator is rebuilt from durable metadata
+    /// on hydration, so these indexes never enter the journal or snapshot
+    /// format.
+    fn replace_indexed_intent(&mut self, intent: DistributedWriteIntent) {
+        if let Some(previous) = self.intents.remove(&intent.intent_id) {
+            self.unindex_intent(&previous);
+        }
+        self.index_intent(&intent);
+        self.intents.insert(intent.intent_id.clone(), intent);
+    }
+
+    fn index_intent(&mut self, intent: &DistributedWriteIntent) {
+        if matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) {
+            self.awaiting_intent_id_by_object.insert(
+                ObjectKey::from_refs(&intent.file_system_id, &intent.object_id),
+                intent.intent_id.clone(),
+            );
+            self.awaiting_intent_ids_by_object_id
+                .entry(intent.object_id.clone())
+                .or_default()
+                .insert(intent.intent_id.clone());
+        }
+        if matches!(
+            intent.state,
+            DfsWriteIntentState::AwaitingReceipts | DfsWriteIntentState::Committed
+        ) {
+            self.claimed_intent_ids_by_target
+                .entry(IntentTargetKey::from_intent(intent))
+                .or_default()
+                .insert(intent.intent_id.clone());
+        }
+    }
+
+    fn unindex_intent(&mut self, intent: &DistributedWriteIntent) {
+        if matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) {
+            let object_key = ObjectKey::from_refs(&intent.file_system_id, &intent.object_id);
+            if self.awaiting_intent_id_by_object.get(&object_key) == Some(&intent.intent_id) {
+                self.awaiting_intent_id_by_object.remove(&object_key);
+            }
+            let remove_object_entry = self
+                .awaiting_intent_ids_by_object_id
+                .get_mut(&intent.object_id)
+                .is_some_and(|intent_ids| {
+                    intent_ids.remove(&intent.intent_id);
+                    intent_ids.is_empty()
+                });
+            if remove_object_entry {
+                self.awaiting_intent_ids_by_object_id
+                    .remove(&intent.object_id);
+            }
+        }
+        if matches!(
+            intent.state,
+            DfsWriteIntentState::AwaitingReceipts | DfsWriteIntentState::Committed
+        ) {
+            let target_key = IntentTargetKey::from_intent(intent);
+            let remove_target_entry = self
+                .claimed_intent_ids_by_target
+                .get_mut(&target_key)
+                .is_some_and(|intent_ids| {
+                    intent_ids.remove(&intent.intent_id);
+                    intent_ids.is_empty()
+                });
+            if remove_target_entry {
+                self.claimed_intent_ids_by_target.remove(&target_key);
+            }
+        }
+    }
+
+    fn replace_indexed_receipt(&mut self, receipt: DistributedReplicaReceipt) {
+        let replaced = self
+            .receipts
+            .entry(receipt.intent_id.clone())
+            .or_default()
+            .insert(receipt.replica_node_id.clone(), receipt)
+            .is_some();
+        if !replaced {
+            self.receipt_count = self.receipt_count.saturating_add(1);
+        }
+    }
+
     fn durable_receipt_nodes(&self, intent_id: &str) -> BTreeSet<NodeId> {
         self.receipts
-            .iter()
-            .filter_map(|((receipt_intent_id, replica_node_id), receipt)| {
-                (receipt_intent_id == intent_id && receipt.state == DfsReplicaReceiptState::Durable)
+            .get(intent_id)
+            .into_iter()
+            .flat_map(|receipts| receipts.iter())
+            .filter_map(|(replica_node_id, receipt)| {
+                (receipt.state == DfsReplicaReceiptState::Durable)
                     .then_some(replica_node_id.clone())
             })
             .collect()
@@ -785,31 +895,20 @@ impl DistributedEventualCoordinator {
 
     fn rebuild_repair_jobs(&mut self) {
         self.repair_jobs.clear();
-        // One pass over receipts, one over intents. The previous shape scanned
-        // the whole receipt map once per committed intent, which made rebuilds
-        // quadratic on data dirs that accumulated an unsettled-write backlog
-        // while the cluster link was degraded.
-        let mut durable_by_intent: BTreeMap<&str, BTreeSet<&NodeId>> = BTreeMap::new();
-        for ((receipt_intent_id, replica_node_id), receipt) in &self.receipts {
-            if receipt.state == DfsReplicaReceiptState::Durable {
-                durable_by_intent
-                    .entry(receipt_intent_id.as_str())
-                    .or_default()
-                    .insert(replica_node_id);
-            }
-        }
         let mut jobs = Vec::new();
         for intent in self
             .intents
             .values()
             .filter(|intent| matches!(intent.state, DfsWriteIntentState::Committed))
         {
-            let durable_nodes = durable_by_intent.get(intent.intent_id.as_str());
-            for missing_replica_node_id in intent
-                .desired_replica_nodes
-                .iter()
-                .filter(|node_id| !durable_nodes.is_some_and(|durable| durable.contains(node_id)))
-            {
+            let durable_receipts = self.receipts.get(intent.intent_id.as_str());
+            for missing_replica_node_id in intent.desired_replica_nodes.iter().filter(|node_id| {
+                !durable_receipts.is_some_and(|receipts| {
+                    receipts
+                        .get(*node_id)
+                        .is_some_and(|receipt| receipt.state == DfsReplicaReceiptState::Durable)
+                })
+            }) {
                 jobs.push(DistributedRepairJob {
                     intent_id: intent.intent_id.clone(),
                     file_system_id: intent.file_system_id.clone(),
@@ -827,6 +926,33 @@ impl DistributedEventualCoordinator {
 struct ObjectKey {
     file_system_id: DfsFileSystemId,
     object_id: DfsObjectId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct IntentTargetKey {
+    object: ObjectKey,
+    target_version: DfsVersion,
+}
+
+impl IntentTargetKey {
+    fn from_intent(intent: &DistributedWriteIntent) -> Self {
+        Self::from_refs(
+            &intent.file_system_id,
+            &intent.object_id,
+            &intent.target_version,
+        )
+    }
+
+    fn from_refs(
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        target_version: &DfsVersion,
+    ) -> Self {
+        Self {
+            object: ObjectKey::from_refs(file_system_id, object_id),
+            target_version: target_version.clone(),
+        }
+    }
 }
 
 impl ObjectKey {
@@ -998,6 +1124,386 @@ mod tests {
                 policy,
             )
             .expect("intent")
+    }
+
+    fn assert_intent_indexes_match_history(coordinator: &DistributedEventualCoordinator) {
+        let mut awaiting_by_object = BTreeMap::new();
+        let mut awaiting_by_object_id: BTreeMap<DfsObjectId, BTreeSet<String>> = BTreeMap::new();
+        let mut claimed_by_target: BTreeMap<IntentTargetKey, BTreeSet<String>> = BTreeMap::new();
+
+        for (intent_id, intent) in &coordinator.intents {
+            if matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) {
+                assert!(
+                    awaiting_by_object
+                        .insert(
+                            ObjectKey::from_refs(&intent.file_system_id, &intent.object_id),
+                            intent_id.clone(),
+                        )
+                        .is_none(),
+                    "reference history contains competing awaiting intents"
+                );
+                awaiting_by_object_id
+                    .entry(intent.object_id.clone())
+                    .or_default()
+                    .insert(intent_id.clone());
+            }
+            if matches!(
+                intent.state,
+                DfsWriteIntentState::AwaitingReceipts | DfsWriteIntentState::Committed
+            ) {
+                claimed_by_target
+                    .entry(IntentTargetKey::from_intent(intent))
+                    .or_default()
+                    .insert(intent_id.clone());
+            }
+        }
+
+        assert_eq!(coordinator.awaiting_intent_id_by_object, awaiting_by_object);
+        assert_eq!(
+            coordinator.awaiting_intent_ids_by_object_id,
+            awaiting_by_object_id
+        );
+        assert_eq!(coordinator.claimed_intent_ids_by_target, claimed_by_target);
+    }
+
+    #[test]
+    fn sparse_intent_indexes_preserve_validation_and_restore_transitions() {
+        let mut coordinator = DistributedEventualCoordinator::new();
+        let mut intent = create_intent(&mut coordinator, policy(2, 3));
+        assert_intent_indexes_match_history(&coordinator);
+        assert!(coordinator.has_open_intent_for_object(&intent.object_id));
+        assert!(
+            coordinator.has_awaiting_intent_targeting(&intent.object_id, &intent.target_version)
+        );
+        assert_eq!(
+            coordinator
+                .claimed_intent_for_target(
+                    &intent.file_system_id,
+                    &intent.object_id,
+                    &intent.target_version,
+                )
+                .map(|found| found.intent_id.as_str()),
+            Some(intent.intent_id.as_str())
+        );
+
+        let exact_error = coordinator
+            .validate_new_intent(
+                &intent.file_system_id,
+                &intent.object_id,
+                intent.base_version.as_ref(),
+                &intent.target_version,
+                &intent.desired_replica_nodes,
+                &intent.policy,
+            )
+            .expect_err("exact target must win over the pending-object conflict");
+        assert!(matches!(
+            exact_error,
+            DfsDistributedError::DuplicateIntent { .. }
+        ));
+
+        let different_target_error = coordinator
+            .validate_new_intent(
+                &intent.file_system_id,
+                &intent.object_id,
+                intent.base_version.as_ref(),
+                &version("version_3"),
+                &intent.desired_replica_nodes,
+                &intent.policy,
+            )
+            .expect_err("different target must retain pending-object classification");
+        assert!(matches!(
+            different_target_error,
+            DfsDistributedError::PendingIntentConflict { .. }
+        ));
+
+        coordinator
+            .commit_intent(&intent.intent_id)
+            .expect("commit intent");
+        assert_intent_indexes_match_history(&coordinator);
+        assert!(!coordinator.has_open_intent_for_object(&intent.object_id));
+        assert!(
+            !coordinator.has_awaiting_intent_targeting(&intent.object_id, &intent.target_version)
+        );
+        assert!(matches!(
+            coordinator.validate_new_intent(
+                &intent.file_system_id,
+                &intent.object_id,
+                Some(&intent.target_version),
+                &intent.target_version,
+                &intent.desired_replica_nodes,
+                &intent.policy,
+            ),
+            Err(DfsDistributedError::DuplicateIntent { .. })
+        ));
+        assert_eq!(
+            coordinator
+                .claimed_intent_for_target(
+                    &intent.file_system_id,
+                    &intent.object_id,
+                    &intent.target_version,
+                )
+                .map(|found| &found.state),
+            Some(&DfsWriteIntentState::Committed)
+        );
+
+        intent.state = DfsWriteIntentState::Aborted;
+        coordinator
+            .restore_intent(intent.clone())
+            .expect("replace committed restore with aborted history");
+        assert_intent_indexes_match_history(&coordinator);
+        assert!(
+            coordinator
+                .claimed_intent_for_target(
+                    &intent.file_system_id,
+                    &intent.object_id,
+                    &intent.target_version,
+                )
+                .is_none(),
+            "aborted history must not remain a replayable target claim"
+        );
+        coordinator
+            .validate_new_intent(
+                &intent.file_system_id,
+                &intent.object_id,
+                Some(&intent.target_version),
+                &intent.target_version,
+                &intent.desired_replica_nodes,
+                &intent.policy,
+            )
+            .expect("aborted replacement must release the target claim");
+
+        intent.base_version = Some(intent.target_version.clone());
+        intent.state = DfsWriteIntentState::AwaitingReceipts;
+        coordinator
+            .restore_intent(intent.clone())
+            .expect("replace aborted history with awaiting intent");
+        assert_intent_indexes_match_history(&coordinator);
+        assert!(coordinator.has_open_intent_for_object(&intent.object_id));
+    }
+
+    #[test]
+    fn sparse_target_claims_keep_all_restored_committed_duplicates() {
+        let mut seed = DistributedEventualCoordinator::new();
+        let mut first = create_intent(&mut seed, policy(1, 3));
+        first.state = DfsWriteIntentState::Committed;
+        let mut second = first.clone();
+        second.intent_id = "dfs_intent_restored_duplicate_42".to_string();
+
+        let mut coordinator = DistributedEventualCoordinator::new();
+        coordinator
+            .restore_intent(first.clone())
+            .expect("first committed restore");
+        coordinator
+            .restore_intent(second.clone())
+            .expect("second committed restore for the same target");
+        assert_intent_indexes_match_history(&coordinator);
+        let target_key = IntentTargetKey::from_intent(&first);
+        assert_eq!(
+            coordinator
+                .claimed_intent_ids_by_target
+                .get(&target_key)
+                .map(BTreeSet::len),
+            Some(2)
+        );
+
+        first.state = DfsWriteIntentState::Aborted;
+        coordinator
+            .restore_intent(first.clone())
+            .expect("terminalize first restored claim");
+        assert_intent_indexes_match_history(&coordinator);
+        assert_eq!(
+            coordinator
+                .claimed_intent_ids_by_target
+                .get(&target_key)
+                .map(BTreeSet::len),
+            Some(1)
+        );
+        assert!(matches!(
+            coordinator.validate_new_intent(
+                &second.file_system_id,
+                &second.object_id,
+                Some(&second.target_version),
+                &second.target_version,
+                &second.desired_replica_nodes,
+                &second.policy,
+            ),
+            Err(DfsDistributedError::DuplicateIntent { .. })
+        ));
+
+        second.state = DfsWriteIntentState::Aborted;
+        coordinator
+            .restore_intent(second.clone())
+            .expect("terminalize final restored claim");
+        assert_intent_indexes_match_history(&coordinator);
+        assert!(
+            !coordinator
+                .claimed_intent_ids_by_target
+                .contains_key(&target_key)
+        );
+        coordinator
+            .validate_new_intent(
+                &second.file_system_id,
+                &second.object_id,
+                Some(&second.target_version),
+                &second.target_version,
+                &second.desired_replica_nodes,
+                &second.policy,
+            )
+            .expect("last terminalized claim must release the target");
+    }
+
+    #[test]
+    fn claimed_target_lookup_skips_older_aborted_history() {
+        let mut coordinator = DistributedEventualCoordinator::new();
+        let first = create_intent(&mut coordinator, policy(2, 3));
+        coordinator
+            .abort_intent(&first.intent_id)
+            .expect("abort first target claim");
+        let second = coordinator
+            .create_intent(
+                first.file_system_id.clone(),
+                first.object_id.clone(),
+                first.base_version.clone(),
+                first.target_version.clone(),
+                first.requesting_node_id.clone(),
+                first.desired_replica_nodes.clone(),
+                first.policy.clone(),
+            )
+            .expect("aborted claim releases the exact target");
+
+        assert_ne!(first.intent_id, second.intent_id);
+        assert_eq!(coordinator.intent_count(), 2);
+        assert_eq!(
+            coordinator
+                .claimed_intent_for_target(
+                    &second.file_system_id,
+                    &second.object_id,
+                    &second.target_version,
+                )
+                .map(|intent| intent.intent_id.as_str()),
+            Some(second.intent_id.as_str())
+        );
+        assert_intent_indexes_match_history(&coordinator);
+    }
+
+    #[test]
+    fn awaiting_index_keeps_filesystems_separate_for_shared_object_ids() {
+        let mut coordinator = DistributedEventualCoordinator::new();
+        let shared_object_id = object_id();
+        let first_file_system = file_system_id();
+        let second_file_system =
+            DfsFileSystemId::from_legacy_named("other_sifs").expect("filesystem");
+        for file_system_id in [first_file_system, second_file_system] {
+            coordinator
+                .create_intent(
+                    file_system_id,
+                    shared_object_id.clone(),
+                    None,
+                    version("version_2"),
+                    node("node_writer"),
+                    vec![node("node_a")],
+                    policy(1, 1),
+                )
+                .expect("one awaiting intent per filesystem/object key");
+        }
+
+        assert_intent_indexes_match_history(&coordinator);
+        assert_eq!(
+            coordinator
+                .awaiting_intent_ids_by_object_id
+                .get(&shared_object_id)
+                .map(BTreeSet::len),
+            Some(2)
+        );
+        assert!(coordinator.has_open_intent_for_object(&shared_object_id));
+    }
+
+    #[test]
+    fn receipt_buckets_preserve_order_idempotency_and_intent_isolation() {
+        let mut coordinator = DistributedEventualCoordinator::new();
+        let first = create_intent(&mut coordinator, policy(2, 3));
+        let second = coordinator
+            .create_intent(
+                file_system_id(),
+                DfsObjectId::from_legacy_named("obj_second_file").expect("object"),
+                None,
+                version("version_second_1"),
+                node("node_writer"),
+                vec![node("node_a"), node("node_b"), node("node_c")],
+                policy(2, 3),
+            )
+            .expect("second intent");
+
+        coordinator
+            .record_durable_receipt(&first.intent_id, node("node_b"))
+            .expect("first intent node b receipt");
+        coordinator
+            .record_durable_receipt(&first.intent_id, node("node_a"))
+            .expect("first intent node a receipt");
+        coordinator
+            .record_durable_receipt(&second.intent_id, node("node_c"))
+            .expect("second intent receipt");
+        coordinator
+            .record_durable_receipt(&first.intent_id, node("node_a"))
+            .expect("duplicate receipt");
+
+        let first_nodes = coordinator
+            .receipts_for_intent(&first.intent_id)
+            .into_iter()
+            .map(|receipt| receipt.replica_node_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(first_nodes, vec![node("node_a"), node("node_b")]);
+        assert_eq!(coordinator.durable_receipt_count(&first.intent_id), 2);
+        assert_eq!(coordinator.durable_receipt_count(&second.intent_id), 1);
+        assert_eq!(coordinator.receipt_count(), 3);
+    }
+
+    #[test]
+    fn closed_intent_restore_keeps_receipts_but_runtime_record_rejects() {
+        let mut coordinator = DistributedEventualCoordinator::new();
+        let intent = create_intent(&mut coordinator, policy(2, 3));
+        coordinator
+            .record_durable_receipt(&intent.intent_id, node("node_a"))
+            .expect("initial receipt");
+        coordinator
+            .abort_intent(&intent.intent_id)
+            .expect("abort intent");
+
+        assert!(matches!(
+            coordinator.record_durable_receipt(&intent.intent_id, node("node_b")),
+            Err(DfsDistributedError::IntentClosed {
+                state: DfsWriteIntentState::Aborted,
+                ..
+            })
+        ));
+        assert_eq!(coordinator.receipt_count(), 1);
+
+        coordinator
+            .restore_durable_receipt(&intent.intent_id, node("node_b"))
+            .expect("hydration accepts a retained closed intent receipt");
+        assert_eq!(coordinator.receipt_count(), 2);
+        assert_eq!(coordinator.durable_receipt_count(&intent.intent_id), 2);
+    }
+
+    #[test]
+    fn same_id_intent_restore_does_not_prune_historical_receipt_bucket() {
+        let mut coordinator = DistributedEventualCoordinator::new();
+        let mut intent = create_intent(&mut coordinator, policy(2, 3));
+        coordinator
+            .record_durable_receipt(&intent.intent_id, node("node_a"))
+            .expect("historical receipt");
+
+        intent.state = DfsWriteIntentState::Aborted;
+        intent.desired_replica_nodes = vec![node("node_b")];
+        intent.policy = policy(1, 1);
+        coordinator
+            .restore_intent(intent.clone())
+            .expect("same-id restore with a changed desired set");
+
+        let receipts = coordinator.receipts_for_intent(&intent.intent_id);
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].replica_node_id, node("node_a"));
+        assert_eq!(coordinator.receipt_count(), 1);
     }
 
     #[test]

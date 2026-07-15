@@ -93,6 +93,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn hydrate_from_metadata_backend(&mut self) -> Result<(), DfsError> {
+        self.hydrate_from_metadata_backend_with_promotion_recovery(false)
+    }
+
+    /// Hydrate durable service state and reconstruct post-response replica
+    /// promotions in the same object/receipt/intent scan.
+    ///
+    /// This is deliberately separate from ordinary node-transport hydration:
+    /// a maintenance service may share the served lanes' detached outbox
+    /// without claiming that its own foreground writes can respond before
+    /// replica repair. Keeping recovery in this one pass also avoids opening a
+    /// normally hydrated service and then scanning the full backend again.
+    pub(crate) fn hydrate_from_metadata_backend_for_commit_promotion_recovery(
+        &mut self,
+    ) -> Result<(), DfsError> {
+        self.hydrate_from_metadata_backend_with_promotion_recovery(true)
+    }
+
+    fn hydrate_from_metadata_backend_with_promotion_recovery(
+        &mut self,
+        reconstruct_commit_promotions: bool,
+    ) -> Result<(), DfsError> {
         if self.metadata_backend.is_none() {
             return Ok(());
         };
@@ -196,6 +217,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
         let durable_write_intent_shards = self.durable_write_intent_shards()?;
         let mut pending_write_records = Vec::new();
+        let mut recovered_commit_promotion_records = Vec::new();
         try_walk_metadata_pages(|intent_scan_cursor| {
             let intent_page = self
                 .metadata_backend
@@ -295,6 +317,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 receipts,
                                 false,
                             )?;
+                            recovered_commit_promotion_records.push(intent_record.clone());
                             continue;
                         }
                         self.mark_replayed_intent_as_rejected(&intent_record)?;
@@ -318,6 +341,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     receipts,
                     false,
                 )?;
+                if matches!(intent_record.status, DfsWriteIntentStatus::Committed) {
+                    recovered_commit_promotion_records.push(intent_record.clone());
+                }
                 if matches!(
                     intent_record.status,
                     DfsWriteIntentStatus::Staging
@@ -330,6 +356,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Ok(intent_page.next_cursor)
         })?;
         self.coordinator.rebuild_repair_jobs_after_bulk_restore();
+        if reconstruct_commit_promotions {
+            for intent_record in &recovered_commit_promotion_records {
+                self.queue_recovered_commit_promotions(intent_record)?;
+            }
+        }
 
         let repair_intent_ids: BTreeSet<String> = self
             .coordinator
@@ -406,7 +437,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         intent_record.target_version.clone(),
                         content_hash,
                         size_hint.unwrap_or(0),
-                    ),
+                    )
+                    .with_foreground_replica_repair(false),
                 );
                 if matches!(
                     intent_record.status,
@@ -423,6 +455,84 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
 
         self.seed_local_metadata_journal_cursors_from_backend()?;
+        Ok(())
+    }
+
+    /// Reconstruct post-response CommitVersion work from durable committed
+    /// intents and receipts. The transport outbox deduplicates successful
+    /// identities for this process; after a restart, replaying an already
+    /// applied exact version/hash is safe and closes the crash window between
+    /// visible metadata commit and the original detached notification.
+    fn queue_recovered_commit_promotions(
+        &mut self,
+        intent_record: &DfsWriteIntentRecord,
+    ) -> Result<(), DfsError> {
+        if !matches!(intent_record.status, DfsWriteIntentStatus::Committed) {
+            return Ok(());
+        }
+        // This runs only after the hydration pass has rebuilt `metadata` from
+        // the authoritative object scan and merged the already-materialized
+        // global receipt scan into its locations. Going back through
+        // `current_read_object_metadata` here would repeat a per-version
+        // receipt lookup for every recovered promotion, defeating the
+        // one-pass recovery algorithm this path exists to provide.
+        let object = match self.metadata.object(&intent_record.object_id).cloned() {
+            Some(object)
+                if object.owner_node_id == self.node_id
+                    && object.file_system_id == intent_record.file_system_id
+                    && object.version == intent_record.target_version =>
+            {
+                object
+            }
+            _ => return Ok(()),
+        };
+        let Some(content_hash) = object
+            .content_hash
+            .as_deref()
+            .or(intent_record.content_hash.as_deref())
+            .map(str::to_string)
+        else {
+            return Ok(());
+        };
+        if intent_record
+            .content_hash
+            .as_deref()
+            .is_some_and(|expected| object.content_hash.as_deref() != Some(expected))
+        {
+            return Ok(());
+        }
+        let targets = self
+            .coordinator
+            .receipts_for_intent(&intent_record.intent_id)
+            .into_iter()
+            .filter(|receipt| {
+                receipt.replica_node_id != self.node_id
+                    && receipt.replica_node_id != intent_record.coordinator_node_id
+            })
+            .map(|receipt| receipt.replica_node_id.clone())
+            .collect::<BTreeSet<_>>();
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let object_metadata = Some(object);
+        let authority_shard = self.command_authority_shard_for_object(object_metadata.as_ref())?;
+        for target_node_id in targets {
+            let request_id = self.next_request_id();
+            self.send_best_effort_message_if_routable_detached(
+                &target_node_id,
+                DfsNetworkMessage::CommitVersion(DfsCommitVersionCommand {
+                    request_id,
+                    intent_id: intent_record.intent_id.clone(),
+                    file_system_id: intent_record.file_system_id.clone(),
+                    object_id: intent_record.object_id.clone(),
+                    expected_base_version: intent_record.base_version.clone(),
+                    version: intent_record.target_version.clone(),
+                    content_hash: content_hash.clone(),
+                    object_metadata: object_metadata.clone(),
+                    authority_shard: authority_shard.clone(),
+                }),
+            )?;
+        }
         Ok(())
     }
 
@@ -1146,7 +1256,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     intent_record.target_version.clone(),
                     content_hash,
                     size_bytes,
-                ),
+                )
+                .with_foreground_replica_repair(false),
             );
         }
         Ok(())

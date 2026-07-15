@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
 use sinomo_core::storage::durable_file;
 
-use crate::metadata_cursor;
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_io::{
     create_dir_all, metadata_durable_file_error, read_dir, read_sobj, read_sobj_optional,
@@ -41,11 +40,11 @@ pub(crate) fn recover_next_journal_sequence(root: &Path) -> Result<u64> {
     let head_path = journal_dir.join("head.sobj");
     let head_next_sequence =
         read_sobj_optional::<DfsMetadataJournalHead>(&head_path)?.map(|head| head.next_sequence);
-    if let Some(head_next_sequence) = head_next_sequence
-        && journal_head_matches_local_materialization_cursor(root, head_next_sequence)?
-    {
-        return Ok(head_next_sequence);
-    }
+    // `head.sobj` and the local materialization cursor are deferred hints.
+    // They may agree while both lag a fully durable append, so agreement is
+    // not proof that the highest journal segment contains no later entry.
+    // Reopen is a cold path: inspect the bounded highest segment and repair
+    // the hint before admitting a sequence that could otherwise be reused.
     let mut max_sequence = head_next_sequence
         .map(|next_sequence| next_sequence.saturating_sub(1))
         .unwrap_or(0);
@@ -72,20 +71,6 @@ pub(crate) fn read_next_journal_sequence_lenient(root: &Path) -> Result<u64> {
         max_sequence = max_sequence.max(sequence);
     }
     Ok(max_sequence.saturating_add(1).max(1))
-}
-
-fn journal_head_matches_local_materialization_cursor(
-    root: &Path,
-    head_next_sequence: u64,
-) -> Result<bool> {
-    if head_next_sequence <= 1 {
-        return Ok(false);
-    }
-    let cursor_path = metadata_cursor::local_materialization_cursor_path(root);
-    let Some(cursor) = read_sobj_optional::<DfsMetadataReplayCursor>(&cursor_path)? else {
-        return Ok(false);
-    };
-    Ok(cursor.last_sequence == head_next_sequence.saturating_sub(1))
 }
 
 fn highest_segmented_journal_path(root: &Path) -> Result<Option<PathBuf>> {
@@ -404,14 +389,6 @@ pub(crate) fn persist_replayed_journal_entries(
         append_segmented_journal_entries(root, &missing)?;
     }
     Ok((max_sequence > 0).then_some(max_sequence))
-}
-
-pub(crate) fn journal_entries_since_limited(
-    root: &Path,
-    after_sequence: u64,
-    max_entries: usize,
-) -> Result<Vec<DfsMetadataJournalEntry>> {
-    segmented_journal_entries_since_limited(root, after_sequence, max_entries, None)
 }
 
 pub(crate) fn journal_entries_since_limited_with_next_sequence(

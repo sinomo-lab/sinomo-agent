@@ -23,6 +23,27 @@ fn dfs_error_from_posix_namespace_sync(error: posix_model::DfsPosixError) -> Dfs
     }
 }
 
+fn namespace_authority_shards_match(
+    stamped: &[DfsMetadataShardConfig],
+    current: &[DfsMetadataShardConfig],
+) -> bool {
+    if stamped.len() != current.len() {
+        return false;
+    }
+    let mut matched = vec![false; current.len()];
+    for stamped_shard in stamped {
+        let Some((index, _)) = current
+            .iter()
+            .enumerate()
+            .find(|(index, current_shard)| !matched[*index] && *current_shard == stamped_shard)
+        else {
+            return false;
+        };
+        matched[index] = true;
+    }
+    true
+}
+
 fn metadata_path_is_direct_child_of_posix_dir(directory_path: &str, metadata_path: &str) -> bool {
     let child_path = if metadata_path.is_empty() {
         "/".to_string()
@@ -255,33 +276,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Some(path) => path,
             None => return Ok(None),
         };
-        if let Some(tombstone) = self
-            .tombstones_by_metadata_path
-            .get(&(file_system_id.clone(), metadata_path(&normalized_path)))
-        {
-            return Ok(Some(tombstone.clone()));
-        }
-        let memory_object = self
-            .metadata
-            .object_by_normalized_posix_path(file_system_id, &normalized_path)
-            .cloned();
-        let Some(backend) = self.metadata_backend.as_ref() else {
-            return Ok(memory_object);
-        };
-        let backend_object = backend.get_object_by_path(file_system_id, &metadata_path(path))?;
-        let object = match (memory_object.as_ref(), backend_object.as_ref()) {
-            (Some(memory_object), Some(backend_object)) => {
-                Some(self.resolve_authoritative_object_metadata(
-                    &backend_object.object_id,
-                    Some(memory_object),
-                    Some(backend_object),
-                )?)
-            }
-            (Some(memory_object), None) => Some(memory_object.clone()),
-            (_, Some(backend_object)) => Some(backend_object.clone()),
-            (None, None) => None,
-        };
-        object
+        self.authoritative_metadata_object_for_path(file_system_id, &normalized_path)?
             .map(|object| self.object_metadata_with_receipt_locations(object))
             .transpose()
     }
@@ -297,6 +292,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         command: DfsNamespaceCommand,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let request_id = command.request_id.clone();
+        // Command equality includes the authority stamp. Returning the cached
+        // response for an exact completed retry is safe across later topology
+        // changes because this branch never executes or journals the mutation
+        // a second time.
         if !namespace_operation_requires_fresh_authority(&command.operation)
             && let Some(replay) = self
                 .served_namespace_replays
@@ -374,107 +373,147 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         current_primary_node_id: None,
                     }
                 }
-                Ok(shards) => {
+                Ok(mut shards) => {
                     trace_affected_ms = affected_started.elapsed().as_millis();
                     trace_affected_shards = shards.len();
-                    // Response batches may only carry shards this node is
-                    // primary for; foreign halves of coordinated operations
-                    // are synced from their own primaries.
-                    affected_shard_ids = shards
-                        .iter()
-                        .filter(|shard| shard.primary_node_id == self.node_id)
-                        .map(|shard| DfsMetadataShardId::new(shard.shard_id.clone()))
-                        .collect();
-                    let foreign_shard = shards
-                        .iter()
-                        .find(|shard| shard.primary_node_id != self.node_id)
-                        .cloned();
-                    let execute_started = Instant::now();
-                    let outcome = match (&foreign_shard, &command.operation) {
-                        (None, DfsNamespaceOperation::ApplyTransaction { transaction }) => {
-                            if !transaction.advisory_lock_states.is_empty() {
-                                Err(posix_model::DfsPosixError::Dfs(DfsError::Distributed {
-                                    message: "generic namespace transactions may not install advisory-lock state; use the typed migration protocol"
-                                        .to_string(),
-                                }))
-                            } else if self.control_plane.is_some() && shards.len() != 1 {
-                                let shard_ids = shards
-                                    .iter()
-                                    .map(|shard| shard.shard_id.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                Err(posix_model::DfsPosixError::Dfs(DfsError::Distributed {
-                                    message: format!(
-                                        "clustered namespace transaction {} must resolve to exactly one metadata shard, found [{}]",
-                                        transaction.transaction_id, shard_ids
-                                    ),
-                                }))
-                            } else {
-                                self.apply_namespace_transaction_with_selected_shard(
-                                    transaction.clone(),
-                                    shards.first().cloned(),
+                    if !command.authority_shards.is_empty()
+                        && !namespace_authority_shards_match(&command.authority_shards, &shards)
+                        && self.refresh_control_plane_latest().is_ok()
+                        && let Ok(refreshed) = self
+                            .affected_namespace_shards(&command.file_system_id, &command.operation)
+                    {
+                        // A long-lived lane can trail the sender's committed
+                        // view. Refresh once before rejecting; matching stamps
+                        // stay on the no-refresh hot path.
+                        shards = refreshed;
+                        trace_affected_ms = affected_started.elapsed().as_millis();
+                        trace_affected_shards = shards.len();
+                    }
+                    if !command.authority_shards.is_empty()
+                        && !namespace_authority_shards_match(&command.authority_shards, &shards)
+                    {
+                        let current_primary_node_id = command
+                            .operation
+                            .routing_path()
+                            .and_then(|routing_path| {
+                                crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                                    &command.file_system_id,
+                                    &shards,
+                                    routing_path,
+                                )
+                                .ok()
+                                .flatten()
+                                .map(|shard| shard.primary_node_id)
+                            });
+                        DfsNamespaceResult::Rejected {
+                            reason: format!(
+                                "namespace authority shard stamp does not match the receiver's current affected shard configurations: stamped {:?}, current {:?}",
+                                command.authority_shards, shards
+                            ),
+                            posix_error: None,
+                            current_primary_node_id,
+                        }
+                    } else {
+                        // Response batches may only carry shards this node is
+                        // primary for; foreign halves of coordinated operations
+                        // are synced from their own primaries.
+                        affected_shard_ids = shards
+                            .iter()
+                            .filter(|shard| shard.primary_node_id == self.node_id)
+                            .map(|shard| DfsMetadataShardId::new(shard.shard_id.clone()))
+                            .collect();
+                        let foreign_shard = shards
+                            .iter()
+                            .find(|shard| shard.primary_node_id != self.node_id)
+                            .cloned();
+                        let execute_started = Instant::now();
+                        let outcome = match (&foreign_shard, &command.operation) {
+                            (None, DfsNamespaceOperation::ApplyTransaction { transaction }) => {
+                                if !transaction.advisory_lock_states.is_empty() {
+                                    let message = "generic namespace transactions may not install advisory-lock state; use the typed migration protocol"
+                                        .to_string();
+                                    Err(posix_model::DfsPosixError::Dfs(DfsError::Distributed {
+                                        message,
+                                    }))
+                                } else if self.control_plane.is_some() && shards.len() != 1 {
+                                    let shard_ids = shards
+                                        .iter()
+                                        .map(|shard| shard.shard_id.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    Err(posix_model::DfsPosixError::Dfs(DfsError::Distributed {
+                                        message: format!(
+                                            "clustered namespace transaction {} must resolve to exactly one metadata shard, found [{}]",
+                                            transaction.transaction_id, shard_ids
+                                        ),
+                                    }))
+                                } else {
+                                    self.apply_namespace_transaction_with_selected_shard(
+                                        transaction.clone(),
+                                        shards.first().cloned(),
+                                    )
+                                    .map(|()| None)
+                                    .map_err(posix_model::DfsPosixError::from)
+                                }
+                            }
+                            (None, _) => {
+                                self.execute_posix_coordination_operation_local(&command.operation)
+                            }
+                            // Operations spanning another primary's shard run
+                            // through the cross-shard coordinator when this node
+                            // owns the source side.
+                            (Some(_), DfsNamespaceOperation::Rename { from, to }) => {
+                                let from = from.clone();
+                                let to = to.clone();
+                                self.namespace_coordinator_dispatch_rename(
+                                    &command.file_system_id,
+                                    &from,
+                                    &to,
                                 )
                                 .map(|()| None)
-                                .map_err(posix_model::DfsPosixError::from)
                             }
-                        }
-                        (None, _) => {
-                            self.execute_posix_coordination_operation_local(&command.operation)
-                        }
-                        // Operations spanning another primary's shard run
-                        // through the cross-shard coordinator when this node
-                        // owns the source side.
-                        (Some(_), DfsNamespaceOperation::Rename { from, to }) => {
-                            let from = from.clone();
-                            let to = to.clone();
-                            self.namespace_coordinator_dispatch_rename(
-                                &command.file_system_id,
-                                &from,
-                                &to,
-                            )
-                            .map(|()| None)
-                        }
-                        (
-                            Some(_),
-                            DfsNamespaceOperation::Hardlink {
-                                existing_path,
-                                link_path,
+                            (
+                                Some(_),
+                                DfsNamespaceOperation::Hardlink {
+                                    existing_path,
+                                    link_path,
+                                },
+                            ) => {
+                                let existing_path = existing_path.clone();
+                                let link_path = link_path.clone();
+                                self.namespace_coordinator_dispatch_hardlink(
+                                    &command.file_system_id,
+                                    &existing_path,
+                                    &link_path,
+                                )
+                                .map(|()| None)
+                            }
+                            (Some(shard), _) => {
+                                authority_redirect = Some(shard.primary_node_id.clone());
+                                Err(posix_model::DfsPosixError::Dfs(DfsError::Distributed {
+                                    message: format!(
+                                        "node {} is not the metadata primary for shard {} (primary {}, epoch {})",
+                                        self.node_id,
+                                        shard.shard_id,
+                                        shard.primary_node_id,
+                                        shard.epoch
+                                    ),
+                                }))
+                            }
+                        };
+                        trace_execute_ms = execute_started.elapsed().as_millis();
+                        match outcome {
+                            Ok(coordination_result) => {
+                                posix_coordination_result = coordination_result;
+                                DfsNamespaceResult::Applied
+                            }
+                            Err(error) => DfsNamespaceResult::Rejected {
+                                current_primary_node_id: authority_redirect
+                                    .or_else(|| namespace_rejection_current_primary(&error)),
+                                posix_error: posix_model::namespace_posix_error_for(&error),
+                                reason: error.to_string(),
                             },
-                        ) => {
-                            let existing_path = existing_path.clone();
-                            let link_path = link_path.clone();
-                            self.namespace_coordinator_dispatch_hardlink(
-                                &command.file_system_id,
-                                &existing_path,
-                                &link_path,
-                            )
-                            .map(|()| None)
                         }
-                        (Some(shard), _) => {
-                            authority_redirect = Some(shard.primary_node_id.clone());
-                            Err(posix_model::DfsPosixError::Dfs(DfsError::Distributed {
-                                message: format!(
-                                    "node {} is not the metadata primary for shard {} (primary {}, epoch {})",
-                                    self.node_id,
-                                    shard.shard_id,
-                                    shard.primary_node_id,
-                                    shard.epoch
-                                ),
-                            }))
-                        }
-                    };
-                    trace_execute_ms = execute_started.elapsed().as_millis();
-                    match outcome {
-                        Ok(coordination_result) => {
-                            posix_coordination_result = coordination_result;
-                            DfsNamespaceResult::Applied
-                        }
-                        Err(error) => DfsNamespaceResult::Rejected {
-                            current_primary_node_id: authority_redirect
-                                .or_else(|| namespace_rejection_current_primary(&error)),
-                            posix_error: posix_model::namespace_posix_error_for(&error),
-                            reason: error.to_string(),
-                        },
                     }
                 }
             }
@@ -591,7 +630,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         // Late, duplicate, or mismatched responses are discarded; a stray
         // frame must never fail the whole event loop.
-        let (replay_journal_batches, apply_synced_path_object) = {
+        let (
+            replay_journal_batches,
+            apply_synced_path_object,
+            dispatch_authority_shard,
+            authority_shards,
+        ) = {
             let Some(pending) = self.pending_routed_namespace_ops.get(&response.request_id) else {
                 return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
                     request_id: response.request_id,
@@ -613,13 +657,99 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             (
                 pending.replay_journal_batches,
                 pending.apply_synced_path_object,
+                pending.dispatch_authority_shard.clone(),
+                pending.authority_shards.clone(),
             )
         };
-        if replay_journal_batches {
+        let response_applied = matches!(response.result, DfsNamespaceResult::Applied);
+        if let DfsNamespaceResult::Rejected {
+            current_primary_node_id: Some(redirected_primary),
+            ..
+        } = &response.result
+            && let Err(error) = self.validate_routed_namespace_authority_redirect(
+                &primary_node_id,
+                dispatch_authority_shard.as_ref(),
+                &authority_shards,
+                redirected_primary,
+            )
+        {
+            let reason = format!("routed namespace authority redirect is uncorroborated: {error}");
+            if let Some(pending) = self
+                .pending_routed_namespace_ops
+                .get_mut(&response.request_id)
+            {
+                pending.result = Some(PendingRoutedNamespaceResult {
+                    result: DfsNamespaceResult::Rejected {
+                        reason: reason.clone(),
+                        posix_error: None,
+                        current_primary_node_id: None,
+                    },
+                    posix_coordination_result: None,
+                    synced_path_object: None,
+                    synced_path_objects: Vec::new(),
+                    journal_batch_limit_reached: false,
+                });
+            }
+            return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
+                request_id: response.request_id,
+                source_node_id: primary_node_id,
+                reason,
+            });
+        }
+        if response_applied
+            && let Err(error) = self.validate_routed_namespace_response_authority(
+                &primary_node_id,
+                dispatch_authority_shard.as_ref(),
+                &authority_shards,
+            )
+        {
+            let reason = format!("routed namespace response authority is stale: {error}");
+            if let Some(pending) = self
+                .pending_routed_namespace_ops
+                .get_mut(&response.request_id)
+            {
+                pending.result = Some(PendingRoutedNamespaceResult {
+                    result: DfsNamespaceResult::Rejected {
+                        reason: reason.clone(),
+                        posix_error: None,
+                        current_primary_node_id: None,
+                    },
+                    posix_coordination_result: None,
+                    synced_path_object: None,
+                    synced_path_objects: Vec::new(),
+                    journal_batch_limit_reached: false,
+                });
+            }
+            return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
+                request_id: response.request_id,
+                source_node_id: primary_node_id,
+                reason,
+            });
+        }
+        // A rejection carries no authoritative metadata. Ignore any attached
+        // journal or path payload before the caller evaluates a corroborated
+        // authority redirect.
+        if response_applied && replay_journal_batches {
             for batch in &response.metadata_journal_batches {
-                if let Err(error) =
-                    self.apply_routed_write_metadata_journal_batch(&primary_node_id, batch)
-                {
+                let batch_file_system_id = metadata_journal_batch_file_system_id(batch);
+                let expected_authority = authority_shards.iter().find(|shard| {
+                    batch_file_system_id.as_ref() == Some(&shard.file_system_id)
+                        && batch.shard_id.0 == shard.shard_id
+                });
+                let apply_result = match expected_authority {
+                    Some(expected_authority) => self.apply_routed_write_metadata_journal_batch(
+                        &primary_node_id,
+                        expected_authority,
+                        batch,
+                    ),
+                    None => Err(DfsError::Distributed {
+                        message: format!(
+                            "routed namespace response journal for shard {} does not match any dispatch authority assignment",
+                            batch.shard_id.0
+                        ),
+                    }),
+                };
+                if let Err(error) = apply_result {
                     let reason = format!("routed namespace journal replay failed: {error}");
                     if let Some(pending) = self
                         .pending_routed_namespace_ops
@@ -645,7 +775,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
         }
-        if apply_synced_path_object
+        if response_applied
+            && apply_synced_path_object
             && let Some(object) = response.synced_path_object.as_ref()
             && let Err(error) = self.apply_metadata_object_to_service_state(object.clone())
         {
@@ -672,7 +803,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 reason,
             });
         }
-        if apply_synced_path_object {
+        if response_applied && apply_synced_path_object {
             for object in &response.synced_path_objects {
                 if let Err(error) = self.apply_metadata_object_to_service_state(object.clone()) {
                     let reason = format!("routed namespace path sync failed: {error}");
@@ -704,19 +835,175 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .pending_routed_namespace_ops
             .get_mut(&response.request_id)
             .expect("pending routed namespace op was validated before metadata replay");
+        let (
+            posix_coordination_result,
+            synced_path_object,
+            synced_path_objects,
+            journal_batch_limit_reached,
+        ) = if response_applied {
+            (
+                response.posix_coordination_result.clone(),
+                response.synced_path_object.clone(),
+                response.synced_path_objects.clone(),
+                response.metadata_journal_batches.len()
+                    >= DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT,
+            )
+        } else {
+            (None, None, Vec::new(), false)
+        };
         pending.result = Some(PendingRoutedNamespaceResult {
             result: response.result.clone(),
-            posix_coordination_result: response.posix_coordination_result.clone(),
-            synced_path_object: response.synced_path_object.clone(),
-            synced_path_objects: response.synced_path_objects.clone(),
-            journal_batch_limit_reached: response.metadata_journal_batches.len()
-                >= DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT,
+            posix_coordination_result,
+            synced_path_object,
+            synced_path_objects,
+            journal_batch_limit_reached,
         });
         Ok(NetworkedDfsServiceEvent::RemoteNamespaceCompleted {
             request_id: response.request_id,
             primary_node_id,
             result: response.result,
         })
+    }
+
+    /// Verify that a successful namespace response still comes from the
+    /// exact committed authority snapshot used to dispatch it. Namespace
+    /// reads and coordination responses can legitimately contain no journal
+    /// batches, so authority validation cannot live only in batch replay.
+    fn validate_routed_namespace_response_authority(
+        &mut self,
+        primary_node_id: &NodeId,
+        dispatch_authority_shard: Option<&DfsMetadataShardConfig>,
+        expected_authority_shards: &[DfsMetadataShardConfig],
+    ) -> Result<(), DfsError> {
+        // Standalone/local services have no cluster authority view. A
+        // clustered dispatch without an affected assignment cannot prove who
+        // may complete the request and therefore fails closed.
+        if expected_authority_shards.is_empty() {
+            return if self.control_plane.is_none() {
+                Ok(())
+            } else {
+                Err(DfsError::Distributed {
+                    message: "clustered namespace response has no dispatch shard assignment"
+                        .to_string(),
+                })
+            };
+        }
+        let Some(dispatch_authority_shard) = dispatch_authority_shard else {
+            return Err(DfsError::Distributed {
+                message: "clustered namespace response has no exact dispatch authority shard"
+                    .to_string(),
+            });
+        };
+        if &dispatch_authority_shard.primary_node_id != primary_node_id {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "response source {primary_node_id} was not dispatch authority {} for routing shard {}",
+                    dispatch_authority_shard.primary_node_id, dispatch_authority_shard.shard_id
+                ),
+            });
+        }
+        let Some(control_plane) = self.control_plane.as_mut() else {
+            return Err(DfsError::Distributed {
+                message: "routed namespace response requires a committed control-plane shard view"
+                    .to_string(),
+            });
+        };
+        for expected in expected_authority_shards {
+            let Some(current) = DfsControlPlaneStore::new(control_plane.as_mut())
+                .get_metadata_shard(&expected.file_system_id, &expected.shard_id)?
+            else {
+                return Err(DfsError::Distributed {
+                    message: format!(
+                        "affected namespace shard {} has no current committed assignment",
+                        expected.shard_id
+                    ),
+                });
+            };
+            if current != *expected {
+                return Err(DfsError::Distributed {
+                    message: format!(
+                        "dispatch authority for namespace shard {} epoch {} is no longer current (current primary {}, epoch {})",
+                        expected.shard_id, expected.epoch, current.primary_node_id, current.epoch
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Refresh and bind a rejected response's redirect claim to the exact
+    /// shard authority that selected the dispatch target. Other shards may be
+    /// involved in a coordinated operation and legitimately have different
+    /// primaries; they must not be mistaken for successors of the dispatch
+    /// authority. Doing this while settling the response protects every
+    /// caller, including branches that execute locally when the corroborated
+    /// new primary is this node.
+    fn validate_routed_namespace_authority_redirect(
+        &mut self,
+        attempted_primary: &NodeId,
+        dispatch_authority_shard: Option<&DfsMetadataShardConfig>,
+        expected_authority_shards: &[DfsMetadataShardConfig],
+        redirected_primary: &NodeId,
+    ) -> Result<(), DfsError> {
+        let Some(dispatch_authority_shard) = dispatch_authority_shard else {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "redirect from {attempted_primary} to {redirected_primary} has no exact dispatch shard assignment to refresh"
+                ),
+            });
+        };
+        if &dispatch_authority_shard.primary_node_id != attempted_primary {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "redirect source {attempted_primary} was not dispatch authority {} for routing shard {}",
+                    dispatch_authority_shard.primary_node_id, dispatch_authority_shard.shard_id
+                ),
+            });
+        }
+        let expected_dispatch_authorities = expected_authority_shards
+            .iter()
+            .filter(|shard| &shard.primary_node_id == attempted_primary)
+            .collect::<Vec<_>>();
+        if !expected_dispatch_authorities
+            .iter()
+            .any(|expected| *expected == dispatch_authority_shard)
+        {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "routing shard {} is missing from the immutable affected-shard authority snapshot",
+                    dispatch_authority_shard.shard_id
+                ),
+            });
+        }
+        self.refresh_control_plane_latest()?;
+        let Some(control_plane) = self.control_plane.as_mut() else {
+            return Err(DfsError::Distributed {
+                message:
+                    "namespace authority redirect requires a committed control-plane shard view"
+                        .to_string(),
+            });
+        };
+        for expected in expected_dispatch_authorities {
+            let Some(current) = DfsControlPlaneStore::new(control_plane.as_mut())
+                .get_metadata_shard(&expected.file_system_id, &expected.shard_id)?
+            else {
+                return Err(DfsError::Distributed {
+                    message: format!(
+                        "redirected dispatch namespace shard {} has no current committed assignment",
+                        expected.shard_id
+                    ),
+                });
+            };
+            if &current.primary_node_id != redirected_primary {
+                return Err(DfsError::Distributed {
+                    message: format!(
+                        "response named primary {redirected_primary}, but current dispatch namespace shard {} epoch {} names {}",
+                        current.shard_id, current.epoch, current.primary_node_id
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The requester's last applied journal sequence per locally known shard,
@@ -896,32 +1183,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         redirected_primary: NodeId,
     ) -> Result<NodeId, DfsError> {
         self.refresh_control_plane_latest()?;
-        Ok(
-            match self
-                .refreshed_single_primary_for_namespace_operation(file_system_id, operation)?
-            {
-                Some(refreshed_primary) if refreshed_primary != *attempted_primary => {
-                    refreshed_primary
-                }
-                _ => redirected_primary,
-            },
-        )
-    }
-
-    fn refreshed_single_primary_for_namespace_operation(
-        &mut self,
-        file_system_id: &DfsFileSystemId,
-        operation: &DfsNamespaceOperation,
-    ) -> Result<Option<NodeId>, DfsError> {
         let shards = self.affected_namespace_shards(file_system_id, operation)?;
-        let Some(first) = shards.first().map(|shard| shard.primary_node_id.clone()) else {
-            return Ok(None);
+        let routing_path = operation.routing_path().ok_or_else(|| DfsError::Distributed {
+            message: format!(
+                "namespace authority redirect from {attempted_primary} to {redirected_primary} has no routing path"
+            ),
+        })?;
+        let Some(dispatch_shard) =
+            crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                file_system_id,
+                &shards,
+                routing_path,
+            )
+            .map_err(DfsError::from)?
+        else {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "namespace authority redirect from {attempted_primary} to {redirected_primary} has no current routing-shard assignment"
+                ),
+            });
         };
-        if shards.iter().all(|shard| shard.primary_node_id == first) {
-            Ok(Some(first))
-        } else {
-            Ok(None)
+        if dispatch_shard.primary_node_id != redirected_primary {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "namespace authority redirect from {attempted_primary} named {redirected_primary}, but current routing shard {} names {}",
+                    dispatch_shard.shard_id, dispatch_shard.primary_node_id
+                ),
+            });
         }
+        Ok(redirected_primary)
     }
 
     pub(crate) fn route_namespace_operation_to_metadata_primary_with_timeout_and_options(
@@ -971,14 +1261,55 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             Vec::new()
         };
+        let authority_shards = if self.control_plane.is_some() {
+            self.affected_namespace_shards(&file_system_id, &operation)?
+        } else {
+            if replay_journal_batches {
+                return Err(DfsError::Distributed {
+                    message: "routed namespace journal replay requires a committed control-plane shard view"
+                        .to_string(),
+                });
+            }
+            Vec::new()
+        };
+        let dispatch_authority_shard = if self.control_plane.is_some() {
+            let routing_path = operation
+                .routing_path()
+                .ok_or_else(|| DfsError::Distributed {
+                    message: "clustered routed namespace operation has no routing path".to_string(),
+                })?;
+            let dispatch = crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                &file_system_id,
+                &authority_shards,
+                routing_path,
+            )
+            .map_err(DfsError::from)?
+            .ok_or_else(|| DfsError::Distributed {
+                message: format!(
+                    "clustered routed namespace path {routing_path} has no dispatch shard assignment"
+                ),
+            })?;
+            if dispatch.primary_node_id != primary_node_id {
+                return Err(DfsError::Distributed {
+                    message: format!(
+                        "routed namespace target {primary_node_id} is not current dispatch authority {} for routing shard {} epoch {}",
+                        dispatch.primary_node_id, dispatch.shard_id, dispatch.epoch
+                    ),
+                });
+            }
+            Some(dispatch)
+        } else {
+            None
+        };
         let sent = match self.send_dfs_message_if_routable(
             &primary_node_id,
             DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
                 request_id: request_id.clone(),
-                file_system_id,
+                file_system_id: file_system_id.clone(),
                 requesting_node_id: self.node_id.clone(),
                 include_metadata_journal_batches: replay_journal_batches,
                 metadata_journal_after_sequences,
+                authority_shards: authority_shards.clone(),
                 operation,
             }),
         ) {
@@ -1009,6 +1340,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             request_id.clone(),
             PendingRoutedNamespaceOp {
                 primary_node_id,
+                dispatch_authority_shard,
+                authority_shards,
                 replay_journal_batches,
                 apply_synced_path_object,
                 result: None,

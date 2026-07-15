@@ -12,6 +12,10 @@ pub(crate) struct PendingNetworkedWrite {
     pub(crate) version: DfsVersion,
     pub(crate) content_hash: String,
     pub(crate) size_bytes: u64,
+    /// Effective repair mode at the metadata primary. This is retained across
+    /// asynchronous stage responses so crossing W cannot silently turn a
+    /// background write into synchronous N-W repair.
+    pub(crate) foreground_replica_repair: bool,
     pub(crate) patch: Option<PendingNetworkedWritePatch>,
     pub(crate) stage_retries: BTreeMap<NodeId, RepairRetryState>,
     pub(crate) repair_retries: BTreeMap<NodeId, RepairRetryState>,
@@ -45,6 +49,7 @@ impl PendingNetworkedWrite {
             version,
             content_hash,
             size_bytes,
+            foreground_replica_repair: true,
             patch,
             stage_retries: BTreeMap::new(),
             repair_retries: BTreeMap::new(),
@@ -55,6 +60,14 @@ impl PendingNetworkedWrite {
             fetch_inflight_started_ticks: BTreeMap::new(),
             fetch_failed_from: BTreeSet::new(),
         }
+    }
+
+    pub(crate) fn with_foreground_replica_repair(
+        mut self,
+        foreground_replica_repair: bool,
+    ) -> Self {
+        self.foreground_replica_repair = foreground_replica_repair;
+        self
     }
 }
 

@@ -47,4 +47,5 @@ tower-service = "0.3"
 tracing.workspace = true
 
 [dev-dependencies]
+sinomo-core = { path = "../sinomo-core", features = ["cluster-test-support"] }
 sinomo-testdir = { path = "../sinomo-testdir" }

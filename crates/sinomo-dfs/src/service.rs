@@ -4,10 +4,10 @@
 //! from the request's [`ServiceContext::data_dir`] using public `sinomo-dfs`/
 //! `sinomo-network` APIs, so DFS runs with no daemon and no live cluster (limited to
 //! whatever is materialized locally on disk). Route names are owned by `sinomo-dfs`;
-//! `sinomo-network` only provides the object-RPC framing. Cluster-replica routes read the local
-//! cluster-KV snapshot to validate shard roles; with no cluster state present they
-//! either apply locally (journal batch) or reject gracefully (snapshot install), the
-//! same way the daemon's handlers do.
+//! `sinomo-network` only provides the object-RPC framing. Cluster-replica routes bind the
+//! authenticated service signer to the claimed metadata source and read the local cluster-KV
+//! snapshot to validate the exact shard role and epoch. They fail closed without that cluster
+//! context.
 //!
 //! Covers the host-agnostic DFS control-plane routes. Smoke and typed message
 //! data-plane routes bind to a [`DfsDataPlaneHost`], so `sinomo-dfs` still owns
@@ -40,6 +40,7 @@ use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
     ClusterPaths, ObjectRpcBodySource, ObjectRpcRequest, ObjectRpcResponse,
 };
+use sinomo_core::node::NodeId;
 
 use sinomo_core::service::{
     Service, ServiceBodyMode, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
@@ -107,6 +108,7 @@ fn dfs_route_accepts_request_body(route: &str) -> bool {
         route,
         crate::DFS_DATA_WRITE_ROUTE
             | crate::DFS_DATA_DISTRIBUTED_WRITE_ROUTE
+            | crate::DFS_DATA_NAMESPACE_ROUTE
             | crate::DFS_DATA_STAGE_BLOB_ROUTE
             | crate::DFS_DATA_STAGE_PATCH_ROUTE
             | crate::DFS_DATA_REPAIR_REPLICA_ROUTE
@@ -277,9 +279,17 @@ impl Service for DfsService {
                 }
                 DFS_METADATA_JOURNAL_BATCH_ROUTE => {
                     let command: DfsMetadataJournalBatchCommand = request.decode_body()?;
+                    let authenticated_source_node_id = authenticated_dfs_cluster_source_node_id(
+                        &ctx,
+                        DFS_METADATA_JOURNAL_BATCH_ROUTE,
+                    )?;
                     let data_dir = Arc::clone(&ctx.data_dir);
                     let response = tokio::task::spawn_blocking(move || {
-                        dfs_metadata_journal_batch(&data_dir, command)
+                        dfs_metadata_journal_batch(
+                            &data_dir,
+                            &authenticated_source_node_id,
+                            command,
+                        )
                     })
                     .await
                     .map_err(|source| {
@@ -289,9 +299,17 @@ impl Service for DfsService {
                 }
                 DFS_METADATA_SNAPSHOT_INSTALL_ROUTE => {
                     let command: DfsMetadataSnapshotInstallCommand = request.decode_body()?;
+                    let authenticated_source_node_id = authenticated_dfs_cluster_source_node_id(
+                        &ctx,
+                        DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
+                    )?;
                     let data_dir = Arc::clone(&ctx.data_dir);
                     let response = tokio::task::spawn_blocking(move || {
-                        dfs_metadata_snapshot_install(&data_dir, command)
+                        dfs_metadata_snapshot_install(
+                            &data_dir,
+                            &authenticated_source_node_id,
+                            command,
+                        )
                     })
                     .await
                     .map_err(|source| {
@@ -345,6 +363,8 @@ impl Service for DfsDataPlaneService {
                     ObjectRpcResponse::encode_body(DFS_SMOKE_ROUTE, &report)?
                 }
                 route if dfs_route_is_message_data_plane(route) => {
+                    let authenticated_source_node_id =
+                        authenticated_dfs_cluster_source_node_id(&ctx, route)?;
                     let traceparent = request.traceparent().map(ToString::to_string);
                     let request_body = ctx.take_request_body();
                     let command = if request_body.is_empty() {
@@ -360,6 +380,12 @@ impl Service for DfsDataPlaneService {
                         let bytes = request_body.collect_to_vec(max_bytes).await?;
                         crate::body_rpc::attach_dfs_message_request_body(head, bytes)?
                     };
+                    if command.routed_message.source_node_id != authenticated_source_node_id {
+                        return Err(ServiceError::Service(format!(
+                            "authenticated DFS message caller {authenticated_source_node_id} does not match claimed source {} for route {route}",
+                            command.routed_message.source_node_id
+                        )));
+                    }
                     let message_response = service
                         .host
                         .handle_message(command, traceparent)
@@ -588,20 +614,48 @@ fn dfs_expose_config(data_dir: &SinomoDataDir) -> Result<String, ServiceError> {
 
 fn dfs_metadata_journal_batch(
     data_dir: &SinomoDataDir,
+    authenticated_source_node_id: &NodeId,
     command: DfsMetadataJournalBatchCommand,
 ) -> Result<DfsMetadataJournalBatchResponse, ServiceError> {
     let cluster_paths = ClusterPaths::new(data_dir);
-    crate::process_cluster_dfs_metadata_journal_batch(data_dir, &cluster_paths, command)
-        .map_err(service_error)
+    crate::process_cluster_dfs_metadata_journal_batch(
+        data_dir,
+        &cluster_paths,
+        authenticated_source_node_id,
+        command,
+    )
+    .map_err(service_error)
 }
 
 fn dfs_metadata_snapshot_install(
     data_dir: &SinomoDataDir,
+    authenticated_source_node_id: &NodeId,
     command: DfsMetadataSnapshotInstallCommand,
 ) -> Result<DfsMetadataSnapshotInstallResponse, ServiceError> {
     let cluster_paths = ClusterPaths::new(data_dir);
-    crate::process_cluster_dfs_metadata_snapshot_install(data_dir, &cluster_paths, command)
-        .map_err(service_error)
+    crate::process_cluster_dfs_metadata_snapshot_install(
+        data_dir,
+        &cluster_paths,
+        authenticated_source_node_id,
+        command,
+    )
+    .map_err(service_error)
+}
+
+fn authenticated_dfs_cluster_source_node_id(
+    ctx: &ServiceContext,
+    route: &str,
+) -> Result<NodeId, ServiceError> {
+    let Some((node_id, _)) = ctx.signer.cluster_identity() else {
+        return Err(ServiceError::Service(format!(
+            "DFS cluster route {route} requires an authenticated cluster signer identity"
+        )));
+    };
+    node_id.parse::<NodeId>().map_err(|source| {
+        ServiceError::Service(format!(
+            "DFS cluster route {route} has invalid authenticated signer node id {node_id}: {source}"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -713,26 +767,38 @@ mod tests {
         route: &str,
         body: &B,
     ) -> (ServiceDisposition, ObjectRpcResponse) {
+        dispatch_with_signer(registry, data_dir, route, body, ServiceSigner::Local)
+            .await
+            .expect("dispatch")
+    }
+
+    async fn dispatch_with_signer<B: serde::Serialize>(
+        registry: &ServiceRegistry,
+        data_dir: Arc<SinomoDataDir>,
+        route: &str,
+        body: &B,
+        signer: ServiceSigner,
+    ) -> Result<(ServiceDisposition, ObjectRpcResponse), ServiceError> {
         let sink = VecSink::default();
         let frames = Arc::clone(&sink.frames);
         let ctx = ServiceContext::new(
             data_dir,
             None,
-            ServiceSigner::Local,
+            signer,
             sinomo_core::network::ObjectRpcIncomingBody::empty(),
             Box::new(sink),
         );
         let request = ObjectRpcRequest::encode_body(route, DFS_RPC_CATEGORY, body)
             .expect("encode")
             .with_traceparent("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01");
-        let disposition = registry.dispatch(ctx, request).await.expect("dispatch");
+        let disposition = registry.dispatch(ctx, request).await?;
         let response = frames
             .lock()
             .expect("frames")
             .pop()
             .expect("a response frame")
             .response;
-        (disposition, response)
+        Ok((disposition, response))
     }
 
     async fn dispatch_body_local(
@@ -813,6 +879,94 @@ mod tests {
             snapshot_install.request_body_mode,
             ServiceBodyMode::Optional,
             "compacted metadata checkpoints must use the streamed RPC body"
+        );
+
+        let namespace = service_routes
+            .get(crate::DFS_DATA_NAMESPACE_ROUTE)
+            .expect("namespace route");
+        assert_eq!(
+            namespace.request_body_mode,
+            ServiceBodyMode::Optional,
+            "small namespace commands stay inline while oversized atomic transactions use the streamed RPC body"
+        );
+    }
+
+    #[tokio::test]
+    async fn dfs_namespace_route_accepts_streamed_atomic_transaction_body() {
+        let host = Arc::new(StubDfsDataPlaneHost::default());
+        let registry =
+            register_data_plane_services(ServiceRegistry::builder(), host.clone()).build();
+        let source = NodeId::from_legacy_named("namespace-body-service-source")
+            .expect("namespace body source");
+        let target = NodeId::from_legacy_named("namespace-body-service-target")
+            .expect("namespace body target");
+        let file_system_id = sifs_file_system_id();
+        let transaction = crate::DfsNamespaceTransaction {
+            transaction_id: "namespace-body-service-transaction".to_string(),
+            file_system_id: file_system_id.clone(),
+            objects: Vec::new(),
+            versions: Vec::new(),
+            advisory_lock_states: Vec::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let command = DfsMessageCommand {
+            request_id: "namespace-body-service-request".to_string(),
+            routed_message: crate::DfsRoutedMessage {
+                source_node_id: source.clone(),
+                target_node_id: target,
+                frame_id: 41,
+                message_id: 43,
+                message: crate::DfsNetworkMessage::NamespaceRequest(crate::DfsNamespaceCommand {
+                    request_id: "namespace-body-service-apply".to_string(),
+                    file_system_id,
+                    requesting_node_id: source.clone(),
+                    include_metadata_journal_batches: false,
+                    metadata_journal_after_sequences: Vec::new(),
+                    authority_shards: Vec::new(),
+                    operation: crate::DfsNamespaceOperation::ApplyTransaction { transaction },
+                }),
+            },
+        };
+        let inline_request = crate::dfs_message_rpc_request(&command).expect("inline request");
+        let (head, descriptor, bytes) = crate::body_rpc::split_dfs_message_request_body(&command)
+            .expect("split namespace body")
+            .expect("namespace transaction body");
+        let request =
+            crate::body_rpc::encode_dfs_body_message_rpc_request(&inline_request, head, descriptor)
+                .expect("body-aware namespace request");
+        let sink = VecSink::default();
+        let frames = Arc::clone(&sink.frames);
+        let (_root, data_dir) = temp_data_dir();
+        let ctx = ServiceContext::new(
+            data_dir,
+            None,
+            ServiceSigner::LocalNode {
+                node_id: source.to_string(),
+                public_key: "pk-namespace-body-service-source".to_string(),
+            },
+            sinomo_core::network::ObjectRpcIncomingBody::bytes(bytes),
+            Box::new(sink),
+        );
+
+        let disposition = registry
+            .dispatch(ctx, request)
+            .await
+            .expect("streamed namespace request dispatch");
+        assert_eq!(disposition, ServiceDisposition::Continue);
+        let response = frames
+            .lock()
+            .expect("response frames")
+            .pop()
+            .expect("namespace response")
+            .response;
+        let decoded: DfsMessageResponse = response.decode_body().expect("namespace response body");
+        assert_eq!(decoded.request_id, command.request_id);
+        assert_eq!(
+            host.message_request_ids
+                .lock()
+                .expect("message request ids")
+                .as_slice(),
+            ["namespace-body-service-request"]
         );
     }
 
@@ -1053,11 +1207,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dfs_metadata_journal_batch_applies_locally_without_a_cluster() {
+    async fn dfs_metadata_journal_batch_requires_authenticated_cluster_signer() {
         let registry = register_services(ServiceRegistry::builder()).build();
         let command = DfsMetadataJournalBatchCommand {
             request_id: "req-journal-1".to_string(),
             source_node_id: None,
+            file_system_id: None,
+            authority_epoch: None,
             verify_prefix_only: false,
             prefix_probe: None,
             authority_probe: None,
@@ -1068,23 +1224,24 @@ mod tests {
             },
         };
         let (_test_root, test_data_dir) = temp_data_dir();
-        let (disposition, response) = dispatch_local(
+        let error = dispatch_with_signer(
             &registry,
             test_data_dir.clone(),
             DFS_METADATA_JOURNAL_BATCH_ROUTE,
             &command,
+            ServiceSigner::Local,
         )
-        .await;
-        assert_eq!(disposition, ServiceDisposition::Continue);
-        // No cluster state on disk ⇒ source validation is skipped and the (empty) batch
-        // is applied to a fresh local backend; the route returns a well-formed response.
-        let result: DfsMetadataJournalBatchResponse = response.decode_body().expect("decode");
-        assert_eq!(result.request_id, "req-journal-1");
-        assert_eq!(result.shard_id.0, "shard-local");
+        .await
+        .expect_err("bare local signer must not enter a replica ingest route");
+        assert!(
+            error
+                .to_string()
+                .contains("requires an authenticated cluster signer identity")
+        );
     }
 
     #[tokio::test]
-    async fn dfs_metadata_snapshot_install_rejects_without_local_shard_config() {
+    async fn dfs_metadata_snapshot_install_requires_authenticated_cluster_signer() {
         let registry = register_services(ServiceRegistry::builder()).build();
         let (_root, data_dir) = temp_data_dir();
         let snapshot = LocalSobjMetadataBackend::new(
@@ -1105,24 +1262,97 @@ mod tests {
             reason: "service test".to_string(),
         };
 
-        let (disposition, response) = dispatch_local(
+        let error = dispatch_with_signer(
             &registry,
             data_dir,
             DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
             &command,
+            ServiceSigner::Local,
         )
-        .await;
+        .await
+        .expect_err("bare local signer must not enter a replica ingest route");
+        assert!(
+            error
+                .to_string()
+                .contains("requires an authenticated cluster signer identity")
+        );
+    }
 
+    #[tokio::test]
+    async fn dfs_replica_routes_bind_authenticated_caller_to_claimed_source() {
+        let registry = register_services(ServiceRegistry::builder()).build();
+        let (_root, data_dir) = temp_data_dir();
+        let claimed = NodeId::from_legacy_named("node_dfs_replica_claimed").expect("claimed");
+        let authenticated =
+            NodeId::from_legacy_named("node_dfs_replica_authenticated").expect("authenticated");
+        let signer = ServiceSigner::Remote {
+            node_id: authenticated.to_string(),
+            public_key: "pk-dfs-replica-authenticated".to_string(),
+        };
+        let journal = DfsMetadataJournalBatchCommand {
+            request_id: "req-journal-caller-mismatch".to_string(),
+            source_node_id: Some(claimed.clone()),
+            file_system_id: None,
+            authority_epoch: None,
+            verify_prefix_only: false,
+            prefix_probe: None,
+            authority_probe: None,
+            batch: DfsMetadataJournalBatch {
+                shard_id: DfsMetadataShardId::new("root"),
+                entries: Vec::new(),
+                next_after_sequence: 0,
+            },
+        };
+        let (disposition, response) = dispatch_with_signer(
+            &registry,
+            Arc::clone(&data_dir),
+            DFS_METADATA_JOURNAL_BATCH_ROUTE,
+            &journal,
+            signer.clone(),
+        )
+        .await
+        .expect("journal mismatch response");
         assert_eq!(disposition, ServiceDisposition::Continue);
-        let result: DfsMetadataSnapshotInstallResponse =
-            response.decode_body().expect("decode snapshot response");
-        assert_eq!(result.request_id, "req-snapshot-1");
-        assert_eq!(result.shard_id.0, "shard-snapshot-local");
-        assert_eq!(result.next_after_sequence, 7);
+        let response: DfsMetadataJournalBatchResponse = response.decode_body().expect("decode");
         assert!(matches!(
-            result.result,
+            response.result,
+            crate::DfsMetadataJournalBatchResult::Rejected { ref reason }
+                if reason.contains("authenticated metadata journal caller")
+                    && reason.contains(claimed.as_str())
+        ));
+
+        let snapshot_backend = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("snapshot-source"),
+            data_dir.root().join("snapshot-source-mismatch"),
+        )
+        .expect("source metadata");
+        let snapshot = DfsMetadataSnapshotInstallCommand {
+            request_id: "req-snapshot-caller-mismatch".to_string(),
+            source_node_id: claimed.clone(),
+            file_system_id: None,
+            authority_epoch: None,
+            shard_id: DfsMetadataShardId::new("root"),
+            next_after_sequence: 0,
+            snapshot: snapshot_backend.export_table_snapshot(),
+            reason: "service caller identity test".to_string(),
+        };
+        let (disposition, response) = dispatch_with_signer(
+            &registry,
+            data_dir,
+            DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
+            &snapshot,
+            signer,
+        )
+        .await
+        .expect("snapshot mismatch response");
+        assert_eq!(disposition, ServiceDisposition::Continue);
+        let response: DfsMetadataSnapshotInstallResponse =
+            response.decode_body().expect("decode snapshot response");
+        assert!(matches!(
+            response.result,
             DfsMetadataSnapshotInstallResult::Rejected { ref reason }
-                if reason.contains("no local shard config")
+                if reason.contains("authenticated metadata snapshot caller")
+                    && reason.contains(claimed.as_str())
         ));
     }
 
@@ -1183,13 +1413,18 @@ mod tests {
             },
         };
         let (_test_root, test_data_dir) = temp_data_dir();
-        let (disposition, message_response) = dispatch_local(
+        let (disposition, message_response) = dispatch_with_signer(
             &registry,
             test_data_dir.clone(),
             crate::DFS_DATA_READ_ROUTE,
             &typed_command,
+            ServiceSigner::LocalNode {
+                node_id: local.to_string(),
+                public_key: "pk-dfs-service-data-plane-local".to_string(),
+            },
         )
-        .await;
+        .await
+        .expect("authenticated data-plane dispatch");
         assert_eq!(disposition, ServiceDisposition::Continue);
         let message: crate::DfsMessageResponse =
             message_response.decode_body().expect("decode message");
@@ -1213,5 +1448,54 @@ mod tests {
             )]
         );
         assert!(!registry.owns("/dfs/protocol/frame"));
+    }
+
+    #[tokio::test]
+    async fn dfs_data_plane_route_binds_authenticated_caller_to_routed_source() {
+        let host = Arc::new(StubDfsDataPlaneHost::default());
+        let registry =
+            register_data_plane_services(ServiceRegistry::builder(), host.clone()).build();
+        let claimed = NodeId::from_legacy_named("node_dfs_data_plane_claimed").expect("claimed");
+        let authenticated =
+            NodeId::from_legacy_named("node_dfs_data_plane_authenticated").expect("authenticated");
+        let command = DfsMessageCommand {
+            request_id: "message-route-source-mismatch".to_string(),
+            routed_message: crate::DfsRoutedMessage {
+                source_node_id: claimed.clone(),
+                target_node_id: authenticated.clone(),
+                frame_id: 3,
+                message_id: 3,
+                message: crate::DfsNetworkMessage::ReadRequest(crate::DfsReadRequest {
+                    request_id: "message-read-source-mismatch".to_string(),
+                    object_id: DfsObjectId::generate(),
+                    version: None,
+                    content_hash: None,
+                    content_size_bytes: None,
+                    range_offset: None,
+                    range_max_bytes: None,
+                }),
+            },
+        };
+        let (_root, data_dir) = temp_data_dir();
+        let error = dispatch_with_signer(
+            &registry,
+            data_dir,
+            crate::DFS_DATA_READ_ROUTE,
+            &command,
+            ServiceSigner::Remote {
+                node_id: authenticated.to_string(),
+                public_key: "pk-dfs-data-plane-authenticated".to_string(),
+            },
+        )
+        .await
+        .expect_err("mismatched routed source must be rejected before host dispatch");
+        assert!(error.to_string().contains("does not match claimed source"));
+        assert!(
+            host.message_request_ids
+                .lock()
+                .expect("message request ids")
+                .is_empty(),
+            "an impersonated routed source must not reach the DFS message host"
+        );
     }
 }

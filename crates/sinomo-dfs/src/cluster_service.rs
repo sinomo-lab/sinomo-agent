@@ -10,10 +10,16 @@ use sinomo_core::node::NodeId;
 use std::sync::Arc;
 
 use crate::{
-    AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsError, DfsMessageSender, DfsNodeTransport,
-    DfsPeerTransport, LocalContentStore, NetworkedDfsService,
-    open_cluster_aware_dfs_metadata_backend,
+    AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsError, DfsMessageSender,
+    DfsNodeDetachedSendState, DfsNodeTransport, DfsPeerTransport, LocalContentStore,
+    NetworkedDfsService, open_cluster_aware_dfs_metadata_backend,
 };
+
+#[derive(Clone, Copy)]
+enum ClusterDfsServiceHydration {
+    Foreground,
+    CommitPromotionRecovery,
+}
 
 pub fn cluster_dfs_peer_node_ids(state: &ClusterBootstrapState) -> Vec<NodeId> {
     state
@@ -83,14 +89,87 @@ pub(crate) fn open_cluster_dfs_service_with_peer_transports_for_nodes(
     async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
     control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
 ) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsError> {
+    open_cluster_dfs_service_with_peer_transports_for_nodes_and_detached_state(
+        data_dir,
+        cluster_paths,
+        local_node_id,
+        peer_node_ids,
+        peer_transport,
+        async_peer_transport,
+        DfsNodeDetachedSendState::default(),
+        control_plane,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn open_cluster_dfs_service_with_peer_transports_for_nodes_and_detached_state(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    local_node_id: NodeId,
+    peer_node_ids: Vec<NodeId>,
+    peer_transport: Arc<dyn DfsPeerTransport>,
+    async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    detached_send_state: DfsNodeDetachedSendState,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsError> {
+    open_cluster_dfs_service_with_peer_transports_for_nodes_and_state(
+        data_dir,
+        cluster_paths,
+        local_node_id,
+        peer_node_ids,
+        peer_transport,
+        async_peer_transport,
+        detached_send_state,
+        control_plane,
+        ClusterDfsServiceHydration::Foreground,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    local_node_id: NodeId,
+    peer_node_ids: Vec<NodeId>,
+    peer_transport: Arc<dyn DfsPeerTransport>,
+    async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    detached_send_state: DfsNodeDetachedSendState,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsError> {
+    open_cluster_dfs_service_with_peer_transports_for_nodes_and_state(
+        data_dir,
+        cluster_paths,
+        local_node_id,
+        peer_node_ids,
+        peer_transport,
+        async_peer_transport,
+        detached_send_state,
+        control_plane,
+        ClusterDfsServiceHydration::CommitPromotionRecovery,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_cluster_dfs_service_with_peer_transports_for_nodes_and_state(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    local_node_id: NodeId,
+    peer_node_ids: Vec<NodeId>,
+    peer_transport: Arc<dyn DfsPeerTransport>,
+    async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    detached_send_state: DfsNodeDetachedSendState,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    hydration: ClusterDfsServiceHydration,
+) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsError> {
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
     let mut service = NetworkedDfsService::new(
-        DfsNodeTransport::with_peer_transports_for_nodes(
+        DfsNodeTransport::with_peer_transports_for_nodes_and_detached_state(
             local_node_id,
             peer_node_ids,
             sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
             peer_transport,
             async_peer_transport,
+            detached_send_state,
         ),
         content,
     );
@@ -98,7 +177,12 @@ pub(crate) fn open_cluster_dfs_service_with_peer_transports_for_nodes(
         service = service.with_boxed_control_plane(control_plane);
     }
     let metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
-    service.with_boxed_metadata_backend(metadata)
+    match hydration {
+        ClusterDfsServiceHydration::Foreground => service.with_boxed_metadata_backend(metadata),
+        ClusterDfsServiceHydration::CommitPromotionRecovery => {
+            service.with_boxed_metadata_backend_for_commit_promotion_recovery(metadata)
+        }
+    }
 }
 
 pub(crate) fn object_rpc_request_from_kv_payload(

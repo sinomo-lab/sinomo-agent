@@ -4,8 +4,10 @@
 //! typed DFS message plane. Higher-level DFS services depend on these traits,
 //! not on a concrete transport implementation.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use sinomo_core::network::{NetworkError, ObjectRpcBodySource};
@@ -22,6 +24,34 @@ use crate::{
 pub struct DfsOutboundBody {
     pub descriptor: DfsRpcBodyDescriptor,
     pub source: ObjectRpcBodySource,
+}
+
+/// One independently routable DFS request body in a bounded replica fan-out.
+///
+/// The target is retained alongside the routed frame so transports can return
+/// one ordered outcome per replica without conflating a failed peer with the
+/// rest of the fan-out.
+#[derive(Debug)]
+pub struct DfsRoutedBodySend {
+    pub target_node_id: NodeId,
+    pub message: DfsRoutedMessage,
+    pub body: DfsOutboundBody,
+}
+
+impl DfsRoutedBodySend {
+    pub fn new(target_node_id: NodeId, message: DfsRoutedMessage, body: DfsOutboundBody) -> Self {
+        Self {
+            target_node_id,
+            message,
+            body,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct DfsRoutedBodySendOutcome {
+    pub target_node_id: NodeId,
+    pub result: Result<(), NetworkError>,
 }
 
 impl DfsOutboundBody {
@@ -104,6 +134,36 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         self.send_routed_message(target_node_id, message)
     }
 
+    /// Sends independent replica bodies with at most `max_inflight` sends
+    /// active at once. A zero limit is normalized to one. The compatibility
+    /// implementation is sequential; node transports override it when their
+    /// underlying routing handles can be forked without sharing mutable
+    /// response queues.
+    ///
+    /// Outcomes remain in request order and a peer-level failure is isolated
+    /// to that request. The outer error is reserved for fan-out orchestration
+    /// failures where ordered per-peer outcomes cannot be produced.
+    fn send_routed_message_bodies_bounded(
+        &mut self,
+        requests: Vec<DfsRoutedBodySend>,
+        _max_inflight: usize,
+    ) -> Result<Vec<DfsRoutedBodySendOutcome>, NetworkError> {
+        Ok(requests
+            .into_iter()
+            .map(|request| {
+                let result = self.send_routed_message_with_body(
+                    &request.target_node_id,
+                    request.message,
+                    request.body,
+                );
+                DfsRoutedBodySendOutcome {
+                    target_node_id: request.target_node_id,
+                    result,
+                }
+            })
+            .collect())
+    }
+
     fn send_detached_routed_message(
         &mut self,
         target_node_id: &NodeId,
@@ -158,6 +218,14 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
     }
 
     fn can_return_committed_foreground_response_before_replica_repair(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when a completed routed-write response belongs to a
+    /// different caller than the request currently attached to this
+    /// transport. Served transports use this to move unrelated response RPCs
+    /// into their detached outbox instead of holding the service lane.
+    fn should_detach_completed_response(&self, _target_node_id: &NodeId) -> bool {
         false
     }
 
@@ -224,6 +292,32 @@ pub trait AsyncDfsMessageTransport: Send {
                 crate::body_rpc::attach_dfs_routed_message_body(message, body.descriptor, bytes)?;
             self.send_routed_message_async(target_node_id, message)
                 .await
+        })
+    }
+
+    /// Async counterpart of
+    /// [`DfsMessageTransport::send_routed_message_bodies_bounded`].
+    fn send_routed_message_bodies_bounded_async<'a>(
+        &'a mut self,
+        requests: Vec<DfsRoutedBodySend>,
+        _max_inflight: usize,
+    ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedBodySendOutcome>, NetworkError>> {
+        Box::pin(async move {
+            let mut outcomes = Vec::with_capacity(requests.len());
+            for request in requests {
+                let result = self
+                    .send_routed_message_with_body_async(
+                        &request.target_node_id,
+                        request.message,
+                        request.body,
+                    )
+                    .await;
+                outcomes.push(DfsRoutedBodySendOutcome {
+                    target_node_id: request.target_node_id,
+                    result,
+                });
+            }
+            Ok(outcomes)
         })
     }
 
@@ -301,6 +395,80 @@ impl DfsMessageTransport for sinomo_core::network::InProcessTransport {
         self.send_object_rpc_request(target_node_id, request)
     }
 
+    fn send_routed_message_bodies_bounded(
+        &mut self,
+        requests: Vec<DfsRoutedBodySend>,
+        max_inflight: usize,
+    ) -> Result<Vec<DfsRoutedBodySendOutcome>, NetworkError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        if requests.len() == 1 {
+            let request = requests.into_iter().next().expect("one body request");
+            let result = self.send_routed_message_with_body(
+                &request.target_node_id,
+                request.message,
+                request.body,
+            );
+            return Ok(vec![DfsRoutedBodySendOutcome {
+                target_node_id: request.target_node_id,
+                result,
+            }]);
+        }
+        let worker_count = max_inflight.max(1).min(requests.len());
+        let pending = Mutex::new(VecDeque::from_iter(requests.into_iter().enumerate()));
+        let completed = Mutex::new(Vec::new());
+
+        std::thread::scope(|scope| -> Result<(), NetworkError> {
+            let mut workers = Vec::with_capacity(worker_count);
+            for _ in 0..worker_count {
+                let pending = &pending;
+                let completed = &completed;
+                let mut transport = self.clone();
+                workers.push(scope.spawn(move || {
+                    loop {
+                        let Some((index, request)) = pending
+                            .lock()
+                            .expect("in-process DFS body fan-out queue")
+                            .pop_front()
+                        else {
+                            break;
+                        };
+                        let result = transport.send_routed_message_with_body(
+                            &request.target_node_id,
+                            request.message,
+                            request.body,
+                        );
+                        completed
+                            .lock()
+                            .expect("in-process DFS body fan-out results")
+                            .push((
+                                index,
+                                DfsRoutedBodySendOutcome {
+                                    target_node_id: request.target_node_id,
+                                    result,
+                                },
+                            ));
+                    }
+                }));
+            }
+            for worker in workers {
+                worker.join().map_err(|_| NetworkError::Io {
+                    operation: "join in-process DFS body fan-out".to_string(),
+                    detail: "in-process DFS body fan-out worker panicked".to_string(),
+                })?;
+            }
+            Ok(())
+        })?;
+
+        let mut completed = completed.into_inner().map_err(|_| NetworkError::Io {
+            operation: "collect in-process DFS body fan-out".to_string(),
+            detail: "in-process DFS body fan-out result lock is poisoned".to_string(),
+        })?;
+        completed.sort_by_key(|(index, _)| *index);
+        Ok(completed.into_iter().map(|(_, outcome)| outcome).collect())
+    }
+
     fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
         Ok(self
             .drain_incoming_object_rpc_requests()?
@@ -339,6 +507,81 @@ impl AsyncDfsMessageTransport for sinomo_core::network::AsyncInProcessTransport 
         })
     }
 
+    fn send_routed_message_bodies_bounded_async<'a>(
+        &'a mut self,
+        requests: Vec<DfsRoutedBodySend>,
+        max_inflight: usize,
+    ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedBodySendOutcome>, NetworkError>> {
+        Box::pin(async move {
+            if requests.is_empty() {
+                return Ok(Vec::new());
+            }
+            if requests.len() == 1 {
+                let request = requests.into_iter().next().expect("one body request");
+                let result = self
+                    .send_routed_message_with_body_async(
+                        &request.target_node_id,
+                        request.message,
+                        request.body,
+                    )
+                    .await;
+                return Ok(vec![DfsRoutedBodySendOutcome {
+                    target_node_id: request.target_node_id,
+                    result,
+                }]);
+            }
+
+            let max_inflight = max_inflight.max(1).min(requests.len());
+            // The transport owns its receive queue and is therefore not cloned. Its outbound
+            // object-RPC path only borrows shared channel handles, so locally polling borrowed
+            // send futures gives the same bounded overlap without splitting receive ownership.
+            let transport = &*self;
+            let mut pending = VecDeque::from_iter(requests.into_iter().enumerate());
+            let mut active: Vec<DfsMessageTransportFuture<'_, (usize, DfsRoutedBodySendOutcome)>> =
+                Vec::with_capacity(max_inflight);
+            let mut completed = Vec::with_capacity(pending.len());
+
+            while !pending.is_empty() || !active.is_empty() {
+                while active.len() < max_inflight {
+                    let Some((index, request)) = pending.pop_front() else {
+                        break;
+                    };
+                    active.push(Box::pin(async move {
+                        let result = send_async_in_process_routed_body(
+                            transport,
+                            &request.target_node_id,
+                            request.message,
+                            request.body,
+                        )
+                        .await;
+                        (
+                            index,
+                            DfsRoutedBodySendOutcome {
+                                target_node_id: request.target_node_id,
+                                result,
+                            },
+                        )
+                    }));
+                }
+
+                let (active_index, completion) = std::future::poll_fn(|context| {
+                    for (active_index, future) in active.iter_mut().enumerate() {
+                        if let std::task::Poll::Ready(completion) = future.as_mut().poll(context) {
+                            return std::task::Poll::Ready((active_index, completion));
+                        }
+                    }
+                    std::task::Poll::Pending
+                })
+                .await;
+                drop(active.swap_remove(active_index));
+                completed.push(completion);
+            }
+
+            completed.sort_by_key(|(index, _)| *index);
+            Ok(completed.into_iter().map(|(_, outcome)| outcome).collect())
+        })
+    }
+
     fn drain_incoming_messages_async<'a>(
         &'a mut self,
     ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedMessage>, NetworkError>> {
@@ -363,5 +606,211 @@ impl AsyncDfsMessageTransport for sinomo_core::network::AsyncInProcessTransport 
         timeout: Duration,
     ) -> DfsMessageTransportFuture<'a, Result<bool, NetworkError>> {
         Box::pin(async move { self.wait_for_incoming_object_rpc_request(timeout).await })
+    }
+}
+
+async fn send_async_in_process_routed_body(
+    transport: &sinomo_core::network::AsyncInProcessTransport,
+    target_node_id: &NodeId,
+    message: DfsRoutedMessage,
+    body: DfsOutboundBody,
+) -> Result<(), NetworkError> {
+    let max_bytes = usize::try_from(body.descriptor.total_size_bytes).map_err(|_| {
+        NetworkError::FrameTooLarge {
+            actual_bytes: usize::MAX,
+            max_bytes: usize::MAX,
+        }
+    })?;
+    let bytes = body.source.collect_to_vec(max_bytes).await?;
+    let message = crate::body_rpc::attach_dfs_routed_message_body(message, body.descriptor, bytes)?;
+    let request = dfs_routed_message_rpc_request(&message)?;
+    transport
+        .send_object_rpc_request_async(
+            target_node_id,
+            request,
+            sinomo_core::network::AsyncNetworkSendOptions::default(),
+        )
+        .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        DfsFileSystemId, DfsNetworkMessage, DfsObjectId, DfsReadRequest, DfsStageBlobCommand,
+        DfsVersion, content_hash,
+    };
+    use sinomo_core::network::AsyncInProcessNetwork;
+
+    fn node_id(value: &str) -> NodeId {
+        NodeId::from_legacy_named(value).expect("node id")
+    }
+
+    fn read_message(
+        source_node_id: &NodeId,
+        target_node_id: &NodeId,
+        frame_id: u64,
+    ) -> DfsRoutedMessage {
+        DfsRoutedMessage {
+            source_node_id: source_node_id.clone(),
+            target_node_id: target_node_id.clone(),
+            frame_id,
+            message_id: frame_id,
+            message: DfsNetworkMessage::ReadRequest(DfsReadRequest {
+                request_id: format!("prefill-{frame_id}"),
+                object_id: DfsObjectId::from_legacy_named(format!("prefill-object-{frame_id}"))
+                    .expect("object id"),
+                version: None,
+                content_hash: None,
+                content_size_bytes: None,
+                range_offset: None,
+                range_max_bytes: None,
+            }),
+        }
+    }
+
+    fn body_send(
+        source_node_id: &NodeId,
+        target_node_id: &NodeId,
+        frame_id: u64,
+    ) -> DfsRoutedBodySend {
+        let bytes = vec![u8::try_from(frame_id).unwrap_or_default(); 16];
+        let hash = content_hash(&bytes);
+        DfsRoutedBodySend::new(
+            target_node_id.clone(),
+            DfsRoutedMessage {
+                source_node_id: source_node_id.clone(),
+                target_node_id: target_node_id.clone(),
+                frame_id,
+                message_id: frame_id,
+                message: DfsNetworkMessage::StageBlob(DfsStageBlobCommand {
+                    request_id: format!("stage-{frame_id}"),
+                    intent_id: format!("intent-{frame_id}"),
+                    file_system_id: DfsFileSystemId::from_legacy_named("fanout-test-sifs")
+                        .expect("file system id"),
+                    object_id: DfsObjectId::from_legacy_named(format!("fanout-object-{frame_id}"))
+                        .expect("object id"),
+                    expected_base_version: None,
+                    version: DfsVersion::from_legacy_named(format!("fanout-version-{frame_id}"))
+                        .expect("version"),
+                    content_hash: hash.clone(),
+                    bytes: Vec::new(),
+                    object_metadata: None,
+                    authority_shard: None,
+                }),
+            },
+            DfsOutboundBody::from_bytes(bytes, hash),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_in_process_body_fanout_honors_cap_and_preserves_ordered_failures() {
+        let network = AsyncInProcessNetwork::with_mailbox_capacity_and_per_target_send_limit(1, 1);
+        let local = node_id("async-body-fanout-local");
+        let blocked = node_id("async-body-fanout-blocked");
+        let releasable = node_id("async-body-fanout-releasable");
+        let next = node_id("async-body-fanout-next");
+        let missing = node_id("async-body-fanout-missing");
+        let mut sender = network.add_node(local.clone());
+        let mut blocked_receiver = network.add_node(blocked.clone());
+        let mut releasable_receiver = network.add_node(releasable.clone());
+        let mut next_receiver = network.add_node(next.clone());
+
+        AsyncDfsMessageTransport::send_routed_message_async(
+            &mut sender,
+            &blocked,
+            read_message(&local, &blocked, 1),
+        )
+        .await
+        .expect("prefill blocked mailbox");
+        AsyncDfsMessageTransport::send_routed_message_async(
+            &mut sender,
+            &releasable,
+            read_message(&local, &releasable, 2),
+        )
+        .await
+        .expect("prefill releasable mailbox");
+
+        let requests = vec![
+            body_send(&local, &blocked, 10),
+            body_send(&local, &releasable, 11),
+            body_send(&local, &next, 12),
+            body_send(&local, &missing, 13),
+        ];
+        let fanout = tokio::spawn(async move {
+            AsyncDfsMessageTransport::send_routed_message_bodies_bounded_async(
+                &mut sender,
+                requests,
+                2,
+            )
+            .await
+        });
+
+        assert!(
+            !AsyncDfsMessageTransport::wait_for_incoming_async(
+                &mut next_receiver,
+                Duration::from_millis(50),
+            )
+            .await
+            .expect("check capped third send"),
+            "the third send must not start while both permits are occupied"
+        );
+
+        let prefill = releasable_receiver
+            .drain_incoming_object_rpc_requests(1)
+            .await
+            .expect("release second mailbox");
+        assert_eq!(prefill.len(), 1);
+        assert!(
+            AsyncDfsMessageTransport::wait_for_incoming_async(
+                &mut next_receiver,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("wait for third send"),
+            "releasing the second send must let the third overlap the blocked first send"
+        );
+
+        let prefill = blocked_receiver
+            .drain_incoming_object_rpc_requests(1)
+            .await
+            .expect("release first mailbox");
+        assert_eq!(prefill.len(), 1);
+
+        let outcomes = tokio::time::timeout(Duration::from_secs(1), fanout)
+            .await
+            .expect("fan-out completion")
+            .expect("fan-out task")
+            .expect("fan-out orchestration");
+        assert_eq!(
+            outcomes
+                .iter()
+                .map(|outcome| outcome.target_node_id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                blocked.clone(),
+                releasable.clone(),
+                next.clone(),
+                missing.clone()
+            ]
+        );
+        assert!(outcomes[0].result.is_ok());
+        assert!(outcomes[1].result.is_ok());
+        assert!(outcomes[2].result.is_ok());
+        assert!(matches!(
+            &outcomes[3].result,
+            Err(NetworkError::UnknownNode { node_id }) if node_id == &missing
+        ));
+
+        for receiver in [
+            &mut blocked_receiver,
+            &mut releasable_receiver,
+            &mut next_receiver,
+        ] {
+            let messages = AsyncDfsMessageTransport::drain_incoming_messages_async(receiver)
+                .await
+                .expect("drain fan-out body message");
+            assert_eq!(messages.len(), 1);
+        }
     }
 }

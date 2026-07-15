@@ -85,13 +85,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn apply_routed_write_metadata_journal_batch(
         &mut self,
         primary_node_id: &NodeId,
+        validated_authority_shard: &DfsMetadataShardConfig,
         batch: &DfsMetadataJournalBatch,
     ) -> Result<(), DfsError> {
-        if let Some(reason) = self.validate_routed_response_journal_batch(batch)? {
-            return Err(DfsError::Distributed { message: reason });
-        }
+        let permit = self.validate_routed_response_journal_batch(
+            primary_node_id,
+            validated_authority_shard,
+            batch,
+        )?;
         if let Some(backend) = self.metadata_backend.as_mut() {
-            if let Err(error) = backend.apply_journal_batch(batch) {
+            if let Err(error) = backend.apply_journal_batch_with_replica_permit(&permit, batch) {
                 let reason = error.to_string();
                 if metadata_journal_rejection_allows_snapshot_repair(&reason) {
                     self.request_metadata_snapshot_repair_from_primary(
@@ -142,55 +145,109 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    /// Validate journal batches carried in a routed-operation response.
+    /// Validate a successful routed-write response against the exact committed
+    /// authority snapshot that selected its transport destination.
     ///
-    /// The responder was addressed as the shard authority, possibly through an
-    /// authority redirect the local shard view does not reflect yet, and the
-    /// response transport source was already verified against the addressed
-    /// node. The batch source is therefore not rechecked against the possibly
-    /// stale local shard config. The local node still refuses to overwrite a
-    /// shard it owns.
-    fn validate_routed_response_journal_batch(
+    /// This check is independent of journal replay because a valid response may
+    /// carry no journal batches. Rejected responses use their separate
+    /// corroborated-redirect path instead of this completion gate.
+    pub(crate) fn validate_routed_write_response_authority(
         &mut self,
-        batch: &DfsMetadataJournalBatch,
-    ) -> Result<Option<String>, DfsError> {
-        let Some(control_plane) = self.control_plane.as_mut() else {
-            return Ok(None);
-        };
-        let Some(file_system_id) = metadata_journal_batch_file_system_id(batch) else {
-            return Ok(None);
-        };
-        let Some(shard) = DfsControlPlaneStore::new(control_plane.as_mut())
-            .get_metadata_shard(&file_system_id, &batch.shard_id.0)?
-        else {
-            return Ok(Some(format!(
-                "metadata journal batch has no configured shard {}",
-                batch.shard_id.0
-            )));
-        };
-        if shard.primary_node_id == self.node_id {
-            return Ok(Some(
-                "metadata primary must not apply a replica journal batch".to_string(),
-            ));
+        primary_node_id: &NodeId,
+        expected_authority_shard: &DfsMetadataShardConfig,
+    ) -> Result<DfsMetadataShardConfig, DfsError> {
+        if primary_node_id != &expected_authority_shard.primary_node_id {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "routed response source {primary_node_id} does not match dispatch primary {} for shard {} epoch {}",
+                    expected_authority_shard.primary_node_id,
+                    expected_authority_shard.shard_id,
+                    expected_authority_shard.epoch
+                ),
+            });
         }
-        Ok(None)
+        let Some(control_plane) = self.control_plane.as_mut() else {
+            return Err(DfsError::Distributed {
+                message: "routed write response requires a committed control-plane shard view"
+                    .to_string(),
+            });
+        };
+        let Some(current) = DfsControlPlaneStore::new(control_plane.as_mut()).get_metadata_shard(
+            &expected_authority_shard.file_system_id,
+            &expected_authority_shard.shard_id,
+        )?
+        else {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "routed write response has no configured shard {}",
+                    expected_authority_shard.shard_id
+                ),
+            });
+        };
+        if current != *expected_authority_shard {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "routed write response dispatch authority for shard {} epoch {} is no longer current (current primary {}, epoch {})",
+                    expected_authority_shard.shard_id,
+                    expected_authority_shard.epoch,
+                    current.primary_node_id,
+                    current.epoch
+                ),
+            });
+        }
+        Ok(current)
     }
 
-    pub(crate) fn routed_response_journal_batch_targets_local_primary(
-        &mut self,
+    /// Validate journal batches carried in a routed-operation response.
+    ///
+    /// After the response authority check, bind the batch identity to that same
+    /// immutable assignment before minting the narrow replica-ingest permit.
+    fn validate_routed_response_journal_batch(
+        &self,
+        primary_node_id: &NodeId,
+        validated_authority_shard: &DfsMetadataShardConfig,
         batch: &DfsMetadataJournalBatch,
-    ) -> Result<bool, DfsError> {
-        let Some(control_plane) = self.control_plane.as_mut() else {
-            return Ok(false);
-        };
+    ) -> Result<DfsMetadataReplicaIngestPermit, DfsError> {
         let Some(file_system_id) = metadata_journal_batch_file_system_id(batch) else {
-            return Ok(false);
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "routed response journal batch for shard {} has no filesystem identity",
+                    batch.shard_id.0
+                ),
+            });
         };
-        let Some(shard) = DfsControlPlaneStore::new(control_plane.as_mut())
-            .get_metadata_shard(&file_system_id, &batch.shard_id.0)?
-        else {
-            return Ok(false);
-        };
-        Ok(shard.primary_node_id == self.node_id)
+        if file_system_id != validated_authority_shard.file_system_id
+            || batch.shard_id.0 != validated_authority_shard.shard_id
+        {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "routed response journal batch identity does not match dispatch authority filesystem {} shard {} epoch {}",
+                    validated_authority_shard.file_system_id,
+                    validated_authority_shard.shard_id,
+                    validated_authority_shard.epoch
+                ),
+            });
+        }
+        if primary_node_id != &validated_authority_shard.primary_node_id {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "routed response source {primary_node_id} does not match validated dispatch primary {} for shard {} epoch {}",
+                    validated_authority_shard.primary_node_id,
+                    validated_authority_shard.shard_id,
+                    validated_authority_shard.epoch
+                ),
+            });
+        }
+        if validated_authority_shard.primary_node_id == self.node_id {
+            return Err(DfsError::Distributed {
+                message: "metadata primary must not apply a replica journal batch".to_string(),
+            });
+        }
+        Ok(DfsMetadataReplicaIngestPermit::new_validated(
+            validated_authority_shard.file_system_id.clone(),
+            batch.shard_id.clone(),
+            primary_node_id.clone(),
+            validated_authority_shard.epoch,
+        ))
     }
 }

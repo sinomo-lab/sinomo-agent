@@ -63,9 +63,12 @@ for that assignment and epoch may replace the full-shard proof. This prevents a
 partition with only the content receipt threshold `W` from creating a second
 visible history while allowing the quorum side to change membership safely.
 
-Membership commitment is not itself authority activation. A direct shard
-membership CAS must retain the current primary, advance exactly one epoch, and
-compare the bounded quorum-operation floor. The resulting pending handoff is
+Reconfiguration commitment is not itself authority activation. A direct shard
+CAS cannot activate a changed configuration. A proof-carrying handoff may
+either change membership while retaining the primary, or rotate the primary to
+an existing replica while preserving the exact member ring; mixed primary and
+membership changes are rejected. Either form advances exactly one epoch and
+compares the bounded quorum-operation floor. The resulting pending handoff is
 not itself a retiring-primary fence because an isolated primary may not have
 observed it and may still complete a valid write. Once the retiring primary
 reconnects, it takes the same publication guard used by canonical commits,
@@ -79,26 +82,102 @@ and desired metadata assignments and requires an exact acknowledgement from
 every member of the union. The completion proof must equal the retiring
 primary's fence; a watermark taken only when the quorum side created the
 pending record is insufficient. Only then does the desired assignment become
-active. The local marker advances to that activated epoch and remains durable;
-the completing backend instance is explicitly rebound, while independently
-opened instances stay fenced until they separately prove and observe the exact
-active generation. Moving the primary additionally requires the promoted
-replica to acknowledge that same exact prefix. Thus the
-quorum side may record replacement replicas while the old shard is isolated,
-but it cannot activate a replacement writer until the retiring primary has
-handed off every write completed before its local fence. Healthy full-shard
-writes remain off Raft; exceptional quorum-authorized prepares advance only one
-bounded per-shard transfer floor in KV.
+active. For same-primary membership changes, the completing backend instance
+advances its local marker and explicitly rebinds. For a primary rotation, the
+retiring instance records completion without binding the successor epoch and
+therefore remains fenced. Before its exact-prefix acknowledgement can count,
+the promoted replica must durably install a marker bound to the handoff id,
+retiring epoch, sequence, and fingerprint, and echo that identity. It binds
+only after freshly observing the active successor configuration, no pending
+record, the exact completion proof, and a local prefix that either equals the
+marker or is a validated contiguous extension of it. This extension case is
+required because legitimate writes after activation may advance the durable
+prefix before another service lane opens. An equal-height or later divergent
+prefix cannot bind. Independently opened instances remain fenced until they
+perform the same proof. Thus the quorum side may record replacement replicas
+while the old shard is isolated, but it cannot activate a replacement writer
+until the retiring primary has handed off every write completed before its
+local fence. Healthy full-shard writes remain off Raft; exceptional quorum-
+authorized prepares advance only one bounded per-shard transfer floor in KV.
+
+Membership-handoff synchronization is therefore an exact-union operation, not
+an ordinary metadata quorum barrier. It must not take the ordinary POSIX
+cluster-quorum fallback when only part of the retiring-plus-desired union has
+acknowledged: a desired-only node is not valid evidence for a retiring-epoch
+watermark, and a retiring-only quorum is still not the exact handoff proof.
+Partial union progress stays pending and retry-enabled until every required
+member acknowledges or the bounded attempt times out without activation. A
+timed-out attempt returns to durable pending state, retains the retiring write
+fence, and is eligible for prompt rediscovery and retry.
+
+Daemon maintenance discovery includes a pending handoff only on its retiring
+primary. This allows a handoff committed immediately after one maintenance pass
+to request the prompt maintenance cadence instead of idling until the long
+periodic tick. A pending handoff owned by another node does not schedule a local
+coordinator. Triggered reconciliation retains the same write-fence and exact-
+union activation rules; the trigger changes scheduling, not authority.
+
+Every distributed SIFS bootstrap performs the completed-generation rebind
+check before its first authoritative namespace mutation. This closes the
+fresh-service-lane case where cluster activation and the durable marker survive
+but process-local authority binding does not. The marker remains immutable
+handoff evidence; later contiguous journal entries advance the current prefix
+without invalidating it.
+
+Author authority and replica maintenance use separate admission gates. A
+retiring lane with an activated marker remains unable to originate metadata,
+but it may consume a journal batch only after the receiver has matched the
+transport source to the exact current shard primary, or install a snapshot only
+after matching that source, filesystem, and authority epoch to the committed
+assignment. Batch replay still requires a contiguous authenticated prefix and
+snapshot install still requires the exact authoritative state proof. Neither
+path changes the process-local authority epoch. Snapshot replacement preserves
+the durable handoff marker outside the archived replica state, so repair cannot
+accidentally turn a retired lane back into an author.
+
+That exception is represented by a narrow replica-ingest permit bound to the
+validated filesystem, shard, source node, and authority epoch. Before taking
+the writer lock, journal replay checks every mutation's outer filesystem and
+every embedded record against that permit. Snapshot replacement first decodes
+the complete canonical resulting tables and applies the same check across every
+record family. A foreign or mixed-filesystem payload therefore rejects without
+partial mutation or backend refresh. Raw journal replay and raw snapshot
+replacement still enter the ordinary author gate and therefore remain frozen.
+Direct object-RPC admission binds the payload source to the authenticated
+cluster signer; in-service admission binds it to the transport source. Journal
+commands carry the filesystem and authority epoch so ordinary clustered replay
+fails closed when either identity is absent or stale. A journal returned with a
+routed operation is additionally checked against both the immutable dispatch-
+time shard assignment and the current committed assignment, rejecting late
+old-primary frames and earlier epochs of the same primary before a permit can
+be minted.
+
+Prefix attestation is purpose-separated. An ordinary exact-prefix handoff probe
+verifies the canonical direct backend that ordinary replication updates; a
+pre-opened routed service lane is not authoritative evidence for that purpose
+because its process-local view may lag the same durable files. A promoted-
+primary probe remains on the routed current lane because it must verify,
+persist, and echo the special promotion marker as well as the prefix. The
+ordinary direct path cannot substitute for that marker proof.
+
+Immediately before either attestation, the selected backend refreshes its
+prefix proof and marker state from the durable view. This is cold control-path
+work for synchronization, handoff, and recovery, not a read or wait added to
+the ordinary metadata mutation hot path.
 
 A replica counts toward the healthy proof only after it has replayed a
 contiguous journal prefix through the prepare, re-read the exact hidden
-operation from its DFS metadata tables, and durably recorded a monotonic local
-authority-acknowledgement floor before echoing the request nonce. A batch that
-skips unseen history is rejected rather than advancing the replay cursor.
-Snapshot repair must advance strictly beyond an ordinary authority floor, so
-an older in-flight snapshot cannot erase an acknowledged prepare. These floors
-are small replica-local DFS coordination records; they are not file metadata in
-cluster KV and do not require Raft.
+operation from its DFS metadata tables, and proved that its complete resulting
+sequence and fingerprint equal the primary's prepared prefix. Only then may it
+durably record a monotonic local authority-acknowledgement floor and echo the
+request nonce. Finding the named operation at the expected sequence is not
+sufficient when earlier history diverges. Such a receiver rejects without
+persisting the authority floor, leaving a later exact authoritative snapshot
+repair admissible. A batch that skips unseen history is rejected rather than
+advancing the replay cursor. Snapshot repair must advance strictly beyond an
+ordinary authority floor, so an older in-flight snapshot cannot erase an
+acknowledged prepare. These floors are small replica-local DFS coordination
+records; they are not file metadata in cluster KV and do not require Raft.
 
 The commit path must preserve these properties:
 
@@ -156,6 +235,23 @@ Shard rules:
 - Scans and hydration are cursor-based, so restart and listing do not require
   one unbounded allocation.
 - Large directories use fragments to keep lookup and pagination bounded.
+
+The persisted journal next-sequence head is a recovery cache, not allocation
+authority. On reopen, the allocator audits both the durable segment tail and
+the materialized table proof and promotes its next sequence to at least one
+beyond their maximum before admitting a mutation. A stale head at `N - 1`
+cannot cause sequence `N` to be reused when either durable source has already
+reached `N`.
+
+Directory tombstone validation is defined against the terminal namespace after
+the complete shard-local transaction is replayed in planner order: tombstones
+first, then live objects, with matching compacted tombstones skipped. The
+directory may be removed only when its terminal direct-child set is empty. A
+formally verified target optimization preserves this rule with a sparse overlay
+seeded from the candidate directory's current direct children, removing each
+transaction object's prior placement and adding only its final live placement.
+This avoids cloning or scanning unrelated metadata; it does not weaken the
+terminal emptiness precondition.
 
 The logical metadata model contains:
 
@@ -246,6 +342,95 @@ The metadata primary commits after the configured minimum number of durable
 receipts. Remaining desired replicas are repair work. The visible version is
 serialized even though placement convergence is asynchronous.
 
+The primary retains an effective repair mode after transport and deadline
+handling; this may differ from the caller's outer wait policy. In background
+mode it reserves only the exact missing `W` stage slots, publishes the response
+as soon as `W` is durable, and starts `N-W` repair afterward. In foreground
+mode it may stage toward every desired replica and visibly commit at `W`, but
+its own response waits until all `N` replicas are durable. This differs from
+replicated-confirmed policy, where the visible version itself waits for the
+complete required replica set.
+
+Full-body stage and repair transfers are work-conserving within those eligible
+sets under a fixed two-transfer fan-out cap. Stage and repair reservations are
+disjoint. Each target retains its own request identity and success or retry
+outcome, so one unavailable replica does not cancel a healthy sibling. A zero-
+or one-target operation stays direct. A bounded transport batch joins before
+its messages return to the service, but background scheduling never places an
+unneeded `N-W` sibling in the batch that establishes `W`. Inline blobs and
+patches retain their existing sequential path.
+
+A durable staged receipt may require a detached `CommitVersion` notification
+to promote the replica's visible cache. This notification is not durability
+evidence: it is queued after the write response is constructed and drained by
+a level-triggered worker with a separate fan-out cap of two. The worker claims
+the outbox after one blocking-pool lane acquisition, releases that lane, and
+performs every RPC wait outside it, so a slow replica cannot serialize later
+primary mutations and a busy lane does not create a one-millisecond poll/task
+loop. The scheduler wakes the exact lane returned by request processing; cache
+replacement cannot redirect that wake to a new empty lane. Primary, read, and
+dedicated recovery services share one detached identity state for the daemon
+data directory while retaining independent routing and response queues.
+
+Only a matching `Committed` `CommitVersionResponse` settles an entry;
+`Durable` proves staging only. Transport errors, durable-only, missing or
+mismatched acknowledgements, and explicit rejection retain the exact identity
+for idempotent backoff retry without replaying successful siblings. A drain
+attempts every ready identity once under the cap before returning its first
+error, then rotates failed identities behind unattempted or concurrently queued
+work, preventing permanent failures from head-of-line blocking healthy
+promotions. Settled bookkeeping retains one current version/hash frontier per
+target/filesystem/object key rather than every historical version.
+
+Durable committed intents and receipts reconstruct outstanding exact
+promotions in a dedicated background maintenance hydration after restart, so
+recovery does not wait for a namespace read or hold a cached service lane.
+Shared pending and settled indexes prevent the read-lane pool or periodic
+hydration from duplicating the same identity. Completed routed-write responses
+for a caller other than the request currently attached to a served transport
+use the same replay-safe detached boundary; the current caller's response stays
+inline, and unrelated requester latency no longer holds the service lane. The
+abstract formal
+`responsePublished` step refines the response-construction/enqueue boundary,
+not proof that client bytes reached the wire before the independent worker ran.
+Once every desired replica is durable, the write has no repair jobs, transfer
+reservations, retry or attempt records, or retained pending-write state. Queued
+promotion remains independent post-response work.
+
+The serial metadata portion of one hot shard is expected to occupy roughly one
+core because its primary orders that shard's namespace and version decisions.
+The default root, services, and users shards have three distinct primaries and
+can therefore use about three aggregate metadata cores under independent lane
+writes. More host parallelism comes from additional shards and concurrent
+writes, plus content hashing, replica transfer, and transport work; one metadata
+shard is not designed to consume every host CPU.
+
+Daemon object-RPC ingress remains Tokio-concurrent, while the synchronous DFS
+state machine runs on admitted blocking workers. Authority-scoped routed writes
+and single-shard namespace commands carry a full filesystem/shard authority
+stamp; direct journal and snapshot commands carry the exact backend identity.
+The daemon validates those identities in the DFS service, queues same-shard
+mutations before `spawn_blocking`, and gives disjoint current shards independent
+service lanes. An exact request reserves its shard before awaiting the global
+read fence. A same-shard backlog therefore holds no global read guards, and a
+queued global writer waits only for currently active exact owners. Neither kind
+of waiter consumes a blocking worker. The admission guard moves into the
+non-cancellable blocking closure, so disconnecting a caller cannot release
+shard ownership while its mutation is still running. Read-only requests bypass
+mutation admission and select the least-loaded service lane, growing the pool
+only when every existing lane is assigned. Replica-transfer authority stamps
+that are not yet compared with the receiver's complete current shard config,
+rolling-upgrade messages without a provable footprint, responses whose state
+owner is local, and multi-path namespace requests retain the global
+compatibility lane. Wire-derived gate state is bounded, and cached exact
+services are created only for shards present in the committed topology.
+
+The current Rust scheduler deliberately implements the exact single-shard and
+global subset of the formal model. Atomic multi-shard admission and explicit
+queued-request cancellation across topology generations remain target
+hardening; multi-path work stays globally exclusive until those refinements are
+implemented.
+
 If a live metadata authority and at least one current source remain reachable,
 and eligible nodes eventually reconnect, anti-entropy converges the desired
 replica set to the current version.
@@ -266,6 +451,24 @@ own change.
 
 Operations contained within one authority are atomic. Recursive work is split
 into bounded durable jobs that resume after restart.
+
+Retained namespace-prepare history requires transaction identity to bind the
+immutable mutation generation, not only the operation kind and stable
+object/path. A directory recreated from a selected tombstone may deliberately
+reuse the stable object id and path, but its newer object version changes the
+prepare payload. Its mkdir transaction id therefore includes that version. An
+exact retry of the same generation retains the same id and payload and replays
+without another mutation; a later resurrection receives a distinct id and does
+not collide with the original mkdir retained in history.
+
+Hidden namespace prepares reserve their normalized object/path footprint in
+filesystem-qualified active-owner indexes. Admission performs only direct
+lookups for the candidate footprint; it does not scan retained prepare history.
+An exact same-operation retry ignores its own ownership. Only `Prepared` rows
+own keys: `Committed` and `Aborted` rows remain durable for recovery and audit
+but release the footprint atomically. Structured-snapshot hydration and table-
+log replay derive the indexes from the same prepare table, so restart preserves
+active reservations without resurrecting terminal ones.
 
 A move or hardlink that crosses metadata primaries uses a durable handoff:
 
@@ -418,6 +621,16 @@ snapshot repair is rejected below that floor or at an equal sequence with a
 different state. The current `fdatasync` physical barrier is
 deliberately as strong as `fsync` because essential and ancillary file metadata
 share one journal transaction.
+
+Direct checkpoint journal requests use a work-conserving fan-out cap of two and
+one 250 ms operation-wide best-effort budget. On the production multithread
+Tokio runtime, sibling peer RPC futures run concurrently, each successful
+response is retained independently, and late siblings are aborted and dropped
+at the budget. The blocking compatibility path has the same two-worker cap and
+returns at the budget; a foreign blocking call already entered may outlive that
+return, so a per-transport worker-slot bound prevents repeated calls from
+accumulating detached threads. Direct fan-out is only an accelerator: quorum
+fallback and later catch-up retain correctness when a peer is slow or rejected.
 
 This is not yet a full refinement of the combined partition model. Rust can
 continue when the complete committed metadata shard acknowledges even if Raft
@@ -658,10 +871,11 @@ must not require unbounded scans in the foreground write path.
 
 Benchmarks and integration tests are the source of truth for supported scale and
 performance. Formal models cover authority, routing freshness, namespace
-publication, receipt policy, repair authorization, content validation, and the
-rule that normal operation does not create conflict histories. Network-session
-framing and body attestation are implementation-tested rather than modeled by
-the DFS specs. See the [formal verification guide](formal/cluster-verification.md).
+publication, receipt policy, quorum-aware replica fan-out and response
+scheduling, repair authorization, content validation, and the rule that normal
+operation does not create conflict histories. Network-session framing and body
+attestation are implementation-tested rather than modeled by the DFS specs. See
+the [formal verification guide](formal/cluster-verification.md).
 
 This architecture records required behavior. Exact Rust types, storage table
 names, protocol message variants, benchmark presets, and migration readers
