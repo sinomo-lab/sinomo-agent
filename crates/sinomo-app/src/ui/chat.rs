@@ -311,11 +311,6 @@ enum RecoveryCardAction {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChatQuickAction {
-    PlanChange,
-    CheckCluster,
-    DraftDocument,
-    ReasonImage,
-    RolePlay,
     ManageChannel,
     NewChannel,
 }
@@ -350,61 +345,19 @@ impl RecoveryCardAction {
 }
 
 impl ChatQuickAction {
-    const CHAT: [Self; 5] = [
-        Self::PlanChange,
-        Self::DraftDocument,
-        Self::ReasonImage,
-        Self::RolePlay,
-        Self::CheckCluster,
-    ];
-    const CHANNEL: [Self; 4] = [
-        Self::ManageChannel,
-        Self::PlanChange,
-        Self::DraftDocument,
-        Self::RolePlay,
-    ];
+    const CHAT: [Self; 0] = [];
+    const CHANNEL: [Self; 1] = [Self::ManageChannel];
     const CHANNEL_ONBOARDING: [Self; 1] = [Self::NewChannel];
 
     fn label(self) -> &'static str {
         match self {
-            Self::PlanChange => "Plan a change",
-            Self::CheckCluster => "Check cluster",
-            Self::DraftDocument => "Draft document",
-            Self::ReasonImage => "Inspect attachment",
-            Self::RolePlay => "Role play",
             Self::ManageChannel => "Manage channel",
             Self::NewChannel => "New channel",
         }
     }
 
-    fn prompt(self) -> Option<&'static str> {
-        match self {
-            Self::PlanChange => Some(
-                "Use the coding tools to inspect the selected workspace, then plan the next requested change. Return the safest first step, the files or commands you would check first, likely risks, and a focused verification command.",
-            ),
-            Self::CheckCluster => {
-                Some("Check the local cluster status and explain anything that needs attention.")
-            }
-            Self::DraftDocument => Some(
-                "Return a finished Markdown design note now. Start exactly with '# Chat and channel interaction design note'. Include sections: Assumptions, Audience, Goals, Non-goals, Workflow, Risks, Next steps. Do not describe what you will do.",
-            ),
-            Self::ReasonImage => Some(
-                "Inspect the attached file context available to you. If there is no attachment, ask me for the file first. Use the SIFS attachment metadata and any bounded text excerpt included in context. If I expect pixel-level image reasoning or full file contents, say that this chat does not yet send raw image pixels or complete large files as model input, then ask for a model-visible excerpt or description. Summarize concrete observations and uncertainties.",
-            ),
-            Self::RolePlay => Some(
-                "Role play as a skeptical product reviewer evaluating this chat and channel interface. Stay in character, critique the workflow, and propose specific improvements.",
-            ),
-            Self::ManageChannel | Self::NewChannel => None,
-        }
-    }
-
     fn icon(self) -> IconGlyph {
         match self {
-            Self::PlanChange => IconGlyph::Sparkles,
-            Self::CheckCluster => IconGlyph::Storage,
-            Self::DraftDocument => IconGlyph::File,
-            Self::ReasonImage => IconGlyph::Search,
-            Self::RolePlay => IconGlyph::Chat,
             Self::ManageChannel => IconGlyph::Chat,
             Self::NewChannel => IconGlyph::Add,
         }
@@ -412,30 +365,9 @@ impl ChatQuickAction {
 
     fn description(self) -> &'static str {
         match self {
-            Self::PlanChange => "Use coding agent to plan workspace work",
-            Self::CheckCluster => "Use background agent to inspect cluster status",
-            Self::DraftDocument => "Prepare a polished Markdown note",
-            Self::ReasonImage => "Open attachment controls for file context",
-            Self::RolePlay => "Prepare a role-playing prompt",
             Self::ManageChannel => "Open channel agents and settings",
             Self::NewChannel => "Create a shared channel",
         }
-    }
-
-    fn preferred_agent_key(self) -> Option<&'static str> {
-        match self {
-            Self::PlanChange => Some("coding-agent"),
-            Self::CheckCluster => Some("background-agent"),
-            Self::DraftDocument
-            | Self::ReasonImage
-            | Self::RolePlay
-            | Self::ManageChannel
-            | Self::NewChannel => None,
-        }
-    }
-
-    fn opens_attachment_controls(self) -> bool {
-        matches!(self, Self::ReasonImage)
     }
 }
 
@@ -5613,47 +5545,9 @@ impl ChatState {
     }
 
     fn apply_quick_action(&mut self, action: ChatQuickAction) {
-        if action == ChatQuickAction::NewChannel {
-            self.new_channel(None);
-            return;
-        }
-        if action == ChatQuickAction::ManageChannel {
-            self.begin_edit_current_session();
-            return;
-        }
-        self.select_quick_action_agent(action);
-        let Some(prompt) = action.prompt() else {
-            return;
-        };
-        self.input = prompt.to_string();
-        self.cursor = self.input.len();
-        if action.opens_attachment_controls() {
-            self.open_attachment_surface();
-        }
-        self.draft_revision = self.draft_revision.wrapping_add(1);
-    }
-
-    fn select_quick_action_agent(&mut self, action: ChatQuickAction) {
-        if self.current_is_channel() || self.visible_session_has_started() {
-            return;
-        }
-        let Some(agent_key) = action.preferred_agent_key() else {
-            return;
-        };
-        if self.info.agent == agent_key
-            || self
-                .agents
-                .iter()
-                .any(|agent| agent.name == self.info.agent && agent.key == agent_key)
-        {
-            return;
-        }
-        if let Some(index) = self
-            .agents
-            .iter()
-            .position(|agent| agent.key == agent_key || agent.name == agent_key)
-        {
-            self.select_agent(index);
+        match action {
+            ChatQuickAction::NewChannel => self.new_channel(None),
+            ChatQuickAction::ManageChannel => self.begin_edit_current_session(),
         }
     }
 
@@ -12529,11 +12423,6 @@ impl TranscriptView {
 
     fn quick_action_width(action: ChatQuickAction) -> f32 {
         match action {
-            ChatQuickAction::PlanChange => 176.0,
-            ChatQuickAction::CheckCluster => 178.0,
-            ChatQuickAction::DraftDocument => 176.0,
-            ChatQuickAction::ReasonImage => 190.0,
-            ChatQuickAction::RolePlay => 148.0,
             ChatQuickAction::ManageChannel => 176.0,
             ChatQuickAction::NewChannel => 176.0,
         }
@@ -14019,9 +13908,7 @@ impl TranscriptControls {
         let activation_shared = shared.clone();
         let primary = matches!(
             action,
-            ChatQuickAction::PlanChange
-                | ChatQuickAction::ManageChannel
-                | ChatQuickAction::NewChannel
+            ChatQuickAction::ManageChannel | ChatQuickAction::NewChannel
         );
         WidgetPod::new(
             sui::Button::new(action.label())
@@ -18896,25 +18783,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_change_quick_action_selects_coding_agent_for_fresh_chat() {
-        let backend = Backend::local_fallback();
-        let mut state = ChatState::new(&backend);
-        seed_test_agents(&mut state);
-        state.session_id = SessionId::generate().to_string();
-
-        state.apply_quick_action(ChatQuickAction::PlanChange);
-
-        let prompt = ChatQuickAction::PlanChange.prompt().expect("plan prompt");
-        assert_eq!(state.info.agent, "coding-agent");
-        assert_eq!(state.input, prompt);
-        assert_eq!(state.cursor, prompt.len());
-        assert!(
-            prompt.contains("Use the coding tools to inspect the selected workspace"),
-            "the coding preset should plan against the selected workspace"
-        );
-    }
-
-    #[test]
     fn workspace_runtime_events_update_the_selector_and_surface_errors() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
@@ -18941,26 +18809,6 @@ mod tests {
         assert_eq!(
             state.notice.as_deref(),
             Some("Workspace directory needs attention.")
-        );
-    }
-
-    #[test]
-    fn quick_action_agent_routing_keeps_started_chat_agent() {
-        let backend = Backend::local_fallback();
-        let mut state = ChatState::new(&backend);
-        seed_test_agents(&mut state);
-        state.session_id = SessionId::generate().to_string();
-        state.messages.push(ChatMessage::user("already started"));
-
-        state.apply_quick_action(ChatQuickAction::PlanChange);
-
-        assert_eq!(
-            state.info.agent, "main-agent",
-            "quick actions must not silently switch the agent of an existing transcript"
-        );
-        assert_eq!(
-            state.input,
-            ChatQuickAction::PlanChange.prompt().expect("plan prompt")
         );
     }
 
@@ -20228,7 +20076,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_empty_chat_quick_action_fills_composer_draft() -> sui::Result<()> {
+    fn rendered_empty_chat_has_no_predefined_templates() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -20245,88 +20093,45 @@ mod tests {
         let runtime = sui::Application::new()
             .window(
                 sui::WindowBuilder::new()
-                    .title("Chat quick actions")
+                    .title("Empty chat")
                     .root(view(shared.clone())),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 
-        assert_eq!(
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("Doc")
-                .count()?,
-            0,
-            "empty chats use the larger empty-state actions instead of duplicating compact composer presets"
-        );
-
-        let check_cluster = window
-            .get_by_role(SemanticsRole::Button)
-            .with_name("Check cluster")
-            .with_description("Use background agent to inspect cluster status");
-        check_cluster.click()?;
-
-        let chat = shared.chat();
-        let check_cluster_prompt = ChatQuickAction::CheckCluster
-            .prompt()
-            .expect("prompt action");
-        assert_eq!(chat.input, check_cluster_prompt);
-        assert_eq!(
-            chat.cursor,
-            check_cluster_prompt.len(),
-            "quick action should place the composer cursor at the end of the prepared draft"
-        );
-        assert!(
-            chat.draft_revision > 0,
-            "quick action should trigger exactly the programmatic composer refresh path"
-        );
-        let revision_after_quick_action = chat.draft_revision;
-        drop(chat);
-
-        check_cluster.press("Enter")?;
-        let revision_after_enter = shared.chat().draft_revision;
-        assert!(
-            revision_after_enter > revision_after_quick_action,
-            "the stock quick-action button should activate from Enter while focused"
-        );
-
-        check_cluster.press(" ")?;
-        let revision_after_space = shared.chat().draft_revision;
-        assert!(
-            revision_after_space > revision_after_enter,
-            "the stock quick-action button should activate from Space while focused"
-        );
-
-        // The Mesh composer keeps Send as its one action; clearing is a
-        // state-level affordance and must still ride the programmatic
-        // composer refresh path.
-        shared.chat_mut().clear_draft();
-
-        let chat = shared.chat();
-        assert!(
-            chat.input.is_empty(),
-            "clear draft should empty the composer"
-        );
-        assert_eq!(chat.cursor, 0, "clear draft should reset the cursor");
-        assert!(
-            chat.draft_revision > revision_after_space,
-            "clear draft should trigger the programmatic composer refresh path"
-        );
+        for label in [
+            "Plan a change",
+            "Draft document",
+            "Inspect attachment",
+            "Role play",
+            "Check cluster",
+        ] {
+            assert_eq!(
+                window
+                    .get_by_role(SemanticsRole::Button)
+                    .with_name(label)
+                    .count()?,
+                0,
+                "empty chats must not render the predefined `{label}` template"
+            );
+        }
+        assert!(shared.chat().input.is_empty());
 
         Ok(())
     }
 
     #[test]
     fn empty_state_quick_actions_stay_inside_transcript_area() {
+        let actions = [ChatQuickAction::ManageChannel, ChatQuickAction::NewChannel];
         for area in [
             Rect::new(0.0, 0.0, 700.0, 300.0),
             Rect::new(0.0, 0.0, 460.0, 300.0),
             Rect::new(0.0, 0.0, 320.0, 360.0),
         ] {
-            let rects = TranscriptView::quick_action_rects(area, &ChatQuickAction::CHAT);
+            let rects = TranscriptView::quick_action_rects(area, &actions);
 
-            assert_eq!(rects.len(), ChatQuickAction::CHAT.len());
+            assert_eq!(rects.len(), actions.len());
             for (action, rect) in rects {
                 assert!(
                     rect.x() >= area.x() + PAD - 0.5,
@@ -20665,25 +20470,6 @@ mod tests {
         );
 
         Ok(())
-    }
-
-    #[test]
-    fn attachment_quick_action_opens_controls_and_sets_metadata_prompt() {
-        let backend = Backend::local_fallback();
-        let mut state = ChatState::new(&backend);
-        state.attachment_controls_open = false;
-
-        state.apply_quick_action(ChatQuickAction::ReasonImage);
-
-        assert_eq!(
-            state.input,
-            ChatQuickAction::ReasonImage
-                .prompt()
-                .expect("image prompt action")
-        );
-        assert!(state.input.contains("SIFS attachment metadata"));
-        assert!(state.attachment_controls_visible());
-        assert_eq!(state.cursor, state.input.len());
     }
 
     #[test]
