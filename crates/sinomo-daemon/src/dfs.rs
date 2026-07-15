@@ -70,6 +70,15 @@ const DAEMON_DFS_METADATA_REPLICATION_TARGET_TIMEOUT: Duration = Duration::from_
 const DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS: usize = 3;
 const DAEMON_DFS_SMOKE_TIMEOUT: Duration = Duration::from_millis(9_500);
 const DAEMON_DFS_MUTATION_SHARD_GATE_LIMIT: usize = 256;
+const DAEMON_DFS_READ_SERVICE_POOL_DEFAULT: usize = 2;
+const DAEMON_DFS_READ_SERVICE_POOL_MAX: usize = 8;
+
+/// Bootstrap reconciliation and full maintenance both open and recover the
+/// local metadata tables. Keep those mandatory lifecycle paths single-flight
+/// so startup cannot retain multiple decoded table images at once.
+static DAEMON_DEFAULT_DFS_LIFECYCLE_GATES: OnceLock<
+    Mutex<BTreeMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>,
+> = OnceLock::new();
 
 type DaemonDfsMessageService = NetworkedDfsService<DfsNodeServedMessageTransport>;
 
@@ -1068,15 +1077,39 @@ fn daemon_dfs_mutation_scheduler(
     Ok(scheduler)
 }
 
+fn daemon_default_dfs_lifecycle_gate(
+    data_dir: &std::path::Path,
+) -> Result<Arc<tokio::sync::Mutex<()>>, DaemonError> {
+    let key = data_dir.to_path_buf();
+    let mut gates = DAEMON_DEFAULT_DFS_LIFECYCLE_GATES
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map_err(|_| DaemonError::Network {
+            address: "default DFS lifecycle".to_string(),
+            detail: "default DFS lifecycle gate map is poisoned".to_string(),
+        })?;
+    if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
+        return Ok(gate);
+    }
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    gates.insert(key, Arc::downgrade(&gate));
+    Ok(gate)
+}
+
 fn daemon_dfs_read_service_pool_size() -> usize {
-    const DEFAULT_POOL_SIZE: usize = 16;
-    const MAX_POOL_SIZE: usize = 64;
-    std::env::var("SINOMO_DAEMON_DFS_READ_SERVICE_POOL_SIZE")
-        .ok()
+    daemon_dfs_read_service_pool_size_for(
+        std::env::var("SINOMO_DAEMON_DFS_READ_SERVICE_POOL_SIZE")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn daemon_dfs_read_service_pool_size_for(value: Option<&str>) -> usize {
+    value
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_POOL_SIZE)
-        .clamp(1, MAX_POOL_SIZE)
+        .unwrap_or(DAEMON_DFS_READ_SERVICE_POOL_DEFAULT)
+        .clamp(1, DAEMON_DFS_READ_SERVICE_POOL_MAX)
 }
 
 fn daemon_dfs_least_loaded_read_service_index(
@@ -2047,6 +2080,46 @@ fn handle_daemon_dfs_message_on_runtime(
 
 pub(crate) async fn ensure_default_distributed_dfs_async_on_runtime(
     paths: &DaemonPaths,
+    options: &DaemonRunOptions,
+    publish_cluster_control: bool,
+    runtime: tokio::runtime::Handle,
+) -> Result<(), DaemonError> {
+    let data_dir = daemon_data_dir(paths)?;
+    let lifecycle_gate = daemon_default_dfs_lifecycle_gate(data_dir)?;
+    let Ok(lifecycle_guard) = lifecycle_gate.try_lock_owned() else {
+        tracing::debug!(
+            target: "sinomo.dfs.maintenance",
+            data_dir = %data_dir.display(),
+            "coalesced default DFS reconciliation with active lifecycle pass"
+        );
+        return Ok(());
+    };
+    // Own the permit inside the blocking task that polls the complete lifecycle
+    // future. Cluster phase timeouts drop their JoinHandle but cannot cancel a
+    // running blocking task, so synchronous metadata recovery cannot outlive
+    // its single-flight guard and overlap the next reconciliation pass.
+    let task_paths = paths.clone();
+    let task_options = options.clone();
+    let task_runtime = runtime.clone();
+    runtime
+        .spawn_blocking(move || {
+            let _lifecycle_guard = lifecycle_guard;
+            task_runtime.block_on(ensure_default_distributed_dfs_lifecycle_inner(
+                &task_paths,
+                &task_options,
+                publish_cluster_control,
+                task_runtime.clone(),
+            ))
+        })
+        .await
+        .map_err(|source| DaemonError::Network {
+            address: "default DFS lifecycle".to_string(),
+            detail: format!("default DFS lifecycle task failed: {source}"),
+        })?
+}
+
+async fn ensure_default_distributed_dfs_lifecycle_inner(
+    paths: &DaemonPaths,
     _options: &DaemonRunOptions,
     publish_cluster_control: bool,
     runtime: tokio::runtime::Handle,
@@ -2076,6 +2149,8 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     runtime: &tokio::runtime::Handle,
 ) -> Result<(), DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
+    let lifecycle_gate = daemon_default_dfs_lifecycle_gate(data_dir)?;
+    let _lifecycle_guard = lifecycle_gate.lock_owned().await;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
     if !cluster_paths.state.exists() {
@@ -2388,6 +2463,79 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn daemon_dfs_read_service_pool_is_memory_bounded_by_default() {
+        assert_eq!(daemon_dfs_read_service_pool_size_for(None), 2);
+        assert_eq!(daemon_dfs_read_service_pool_size_for(Some("")), 2);
+        assert_eq!(daemon_dfs_read_service_pool_size_for(Some("invalid")), 2);
+        assert_eq!(daemon_dfs_read_service_pool_size_for(Some("0")), 2);
+        assert_eq!(daemon_dfs_read_service_pool_size_for(Some("1")), 1);
+        assert_eq!(daemon_dfs_read_service_pool_size_for(Some("4")), 4);
+        assert_eq!(daemon_dfs_read_service_pool_size_for(Some("64")), 8);
+    }
+
+    #[test]
+    fn mandatory_default_dfs_lifecycle_is_single_flight_per_data_dir() {
+        let first_root = temp_root("lifecycle-single-flight-first");
+        let second_root = temp_root("lifecycle-single-flight-second");
+        let first_gate = daemon_default_dfs_lifecycle_gate(first_root.path()).expect("first gate");
+        let same_gate = daemon_default_dfs_lifecycle_gate(first_root.path()).expect("same gate");
+        let other_gate = daemon_default_dfs_lifecycle_gate(second_root.path()).expect("other gate");
+
+        assert!(Arc::ptr_eq(&first_gate, &same_gate));
+        assert!(!Arc::ptr_eq(&first_gate, &other_gate));
+
+        let first = first_gate.clone().try_lock_owned().expect("first pass");
+        assert!(
+            same_gate.try_lock_owned().is_err(),
+            "concurrent reconciliation must coalesce while a pass owns the gate"
+        );
+        assert!(
+            other_gate.try_lock_owned().is_ok(),
+            "independent data directories must not block each other"
+        );
+        drop(first);
+        assert!(first_gate.try_lock_owned().is_ok());
+    }
+
+    #[test]
+    fn mandatory_default_dfs_lifecycle_guard_survives_dropped_blocking_join() {
+        let root = temp_root("lifecycle-cancel-safety");
+        let gate = daemon_default_dfs_lifecycle_gate(root.path()).expect("lifecycle gate");
+        let guard = gate.clone().try_lock_owned().expect("lifecycle pass");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let task = runtime.spawn_blocking(move || {
+            let lifecycle_guard = guard;
+            started_tx.send(()).expect("signal lifecycle start");
+            release_rx.recv().expect("release lifecycle task");
+            drop(lifecycle_guard);
+            completed_tx.send(()).expect("signal lifecycle completion");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocking lifecycle task should start");
+        drop(task);
+        assert!(
+            gate.clone().try_lock_owned().is_err(),
+            "dropping a blocking JoinHandle must not release its owned lifecycle guard"
+        );
+
+        release_tx.send(()).expect("release lifecycle task");
+        completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocking lifecycle task should complete");
+        assert!(gate.try_lock_owned().is_ok());
+        runtime.shutdown_timeout(Duration::from_secs(1));
+    }
 
     fn test_dfs_lookup_routed_message(
         source_node_id: &NodeId,

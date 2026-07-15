@@ -719,7 +719,7 @@ pub fn run_daemon_control_loop_with_services(
         let bootstrap_options = options.clone();
         let bootstrap_label = label.to_string();
         let bootstrap_runtime = daemon_runtime_handle.clone();
-        daemon_runtime_handle.spawn(async move {
+        let bootstrap_task = daemon_runtime_handle.spawn(async move {
             if let Err(error) = ensure_default_distributed_dfs_async_on_runtime(
                 &bootstrap_paths,
                 &bootstrap_options,
@@ -733,6 +733,7 @@ pub fn run_daemon_control_loop_with_services(
                 );
             }
         });
+        runtime_tasks.push(("distributed DFS bootstrap", bootstrap_task));
     }
 
     let idle_stats = Arc::new(crate::IdleStatsAtomics::new());
@@ -843,7 +844,10 @@ fn daemon_runtime_task_join_timeout(label: &str) -> Duration {
 }
 
 fn daemon_runtime_task_abort_before_join(label: &str) -> bool {
-    matches!(label, "background maintenance")
+    matches!(
+        label,
+        "background maintenance" | "distributed DFS bootstrap"
+    )
 }
 
 fn drain_daemon_runtime_after_task_shutdown(runtime: &tokio::runtime::Runtime) {

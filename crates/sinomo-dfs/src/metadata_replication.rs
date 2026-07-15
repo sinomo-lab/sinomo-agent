@@ -49,6 +49,12 @@ use crate::{metadata_cursor, metadata_lock};
 type ClusterMetadataBackendCache =
     BTreeMap<(PathBuf, DfsMetadataShardId), Arc<Mutex<LocalSobjMetadataBackend>>>;
 
+/// A topology change may leave legacy objects on their former metadata shard.
+/// Limit cross-shard rewrites per mandatory pass while still scanning the full
+/// catalog: a scan cursor is not durable yet, so stopping the scan itself could
+/// permanently starve a misplaced object behind an already-correct prefix.
+const DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_MUTATION_LIMIT: usize = 256;
+
 fn cached_cluster_metadata_backend(
     data_dir: &SinomoDataDir,
     shard_id: &DfsMetadataShardId,
@@ -2996,7 +3002,10 @@ pub fn materialize_default_sifs_metadata_on_shards(
         fallback_owner_node_id,
         created_at,
     )?;
-    backend.migrate_objects_to_configured_shards(&file_system.file_system_id, usize::MAX)?;
+    backend.migrate_objects_to_configured_shards(
+        &file_system.file_system_id,
+        DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_MUTATION_LIMIT,
+    )?;
     Ok(())
 }
 
@@ -3764,6 +3773,16 @@ pub(crate) fn dfs_metadata_snapshot_install_sender_from_peer_transport(
 #[cfg(test)]
 mod cursor_update_tests {
     use super::*;
+
+    #[test]
+    fn default_sifs_bootstrap_shard_migration_is_bounded() {
+        assert_eq!(DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_MUTATION_LIMIT, 256);
+        let source = include_str!("metadata_replication.rs");
+        assert!(!source.contains(concat!(
+            "migrate_objects_to_configured_shards(&file_system.file_system_id, ",
+            "usize::MAX"
+        )));
+    }
 
     #[test]
     fn journal_discontinuity_rejection_allows_snapshot_repair() {
