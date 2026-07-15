@@ -58,7 +58,7 @@ use sinomo_runtime::dfs::{
     DfsVersion, SIFS_FILE_SYSTEM_ID,
 };
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::network::{self, ClusterPaths};
+use sinomo_runtime::network::{self, ClusterPaths, ObjectRpcRequest};
 use sinomo_runtime::node::NodeId;
 use sinomo_runtime::test::{
     SinomoTestContext, SinomoTestError, SinomoTestOutcome, SinomoTestRegistryBuilder,
@@ -68,10 +68,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_EXPECT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_ROUTED_STATUS_TIMEOUT_MS: u64 = 5_000;
+const MAX_ROUTED_STATUS_CONCURRENCY: usize = 16;
 const DEFAULT_BULK_FILE_COUNT: usize = 128;
 const DEFAULT_BULK_FILE_BYTES: usize = 4 * 1024;
 const DEFAULT_LIGHTWEIGHT_LATENCY_ITERATIONS: usize = 128;
@@ -477,6 +479,10 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         "targets",
         targets.iter().map(ToString::to_string).collect::<Vec<_>>(),
     );
+    ctx.record(
+        "probe_concurrency",
+        targets.len().min(MAX_ROUTED_STATUS_CONCURRENCY),
+    );
     if targets.len() < expected_targets {
         return Ok(SinomoTestOutcome::failed(format!(
             "DFS routed status saw {} remote main targets, expected at least {expected_targets}",
@@ -496,70 +502,39 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 
     let started = Instant::now();
     let deadline = started + timeout;
+    let wall_gate = gate.for_bounded_target_count(targets.len());
     let mut attempts = 0usize;
     let mut failure_history = Vec::new();
     let mut dirty_status_history = Vec::new();
     ctx.record("timeout_ms", timeout_ms);
     ctx.record("max_attempts", gate.max_attempts);
     ctx.record("max_elapsed_ms", gate.max_elapsed.as_millis() as u64);
+    ctx.record(
+        "wall_max_elapsed_ms",
+        wall_gate.max_elapsed.as_millis() as u64,
+    );
     loop {
         attempts = attempts.saturating_add(1);
-        let mut statuses = BTreeMap::new();
-        let mut repair_details = BTreeMap::new();
-        let mut failures = Vec::new();
-        for target in &targets {
-            match daemon_client.dfs_object_rpc_to_target(
-                target,
-                &request,
-                Duration::from_millis(timeout_ms),
-                true,
-            ) {
-                Ok(response) => match dfs::decode_dfs_status_rpc_response(&response) {
-                    Ok(status) => {
-                        let repairs = if routed_status_needs_repair_views(
-                            &status,
-                            &unavailable_repair_targets,
-                        ) {
-                            match fetch_dfs_repair_views_for_status(
-                                &daemon_client,
-                                target,
-                                Duration::from_millis(timeout_ms),
-                                status.pending_repair_count,
-                            ) {
-                                Ok(repairs) => repairs,
-                                Err(error) => {
-                                    failures.push(format!(
-                                        "{target}: repair inspection failed: {error}"
-                                    ));
-                                    continue;
-                                }
-                            }
-                        } else {
-                            Vec::new()
-                        };
-                        if !repairs.is_empty() {
-                            repair_details.insert(
-                                target.to_string(),
-                                repairs
-                                    .iter()
-                                    .map(dfs_repair_probe_summary)
-                                    .collect::<Vec<_>>(),
-                            );
-                        }
-                        statuses.insert(
-                            target.to_string(),
-                            dfs_status_probe_summary(
-                                &status,
-                                &repairs,
-                                &unavailable_repair_targets,
-                            ),
-                        );
-                    }
-                    Err(error) => failures.push(format!("{target}: decode failed: {error}")),
-                },
-                Err(error) => failures.push(format!("{target}: {error}")),
-            }
-        }
+        let attempt = match probe_dfs_routed_status_targets(
+            &daemon_client,
+            &request,
+            &targets,
+            Duration::from_millis(timeout_ms),
+            &unavailable_repair_targets,
+        ) {
+            Ok(probes) => aggregate_dfs_routed_status_probes(probes),
+            Err(error) => DfsRoutedStatusAttempt {
+                failures: vec![format!("probe worker failure: {error}")],
+                ..DfsRoutedStatusAttempt::default()
+            },
+        };
+        let DfsRoutedStatusAttempt {
+            statuses,
+            repair_details,
+            target_elapsed_ms,
+            failures,
+        } = attempt;
+        ctx.record("target_elapsed_ms", &target_elapsed_ms);
         let dirty_statuses = routed_status_dirty_summaries(
             &statuses,
             max_remote_open_conflicts,
@@ -593,20 +568,20 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             }
             if failure_history.is_empty()
                 && dirty_status_history.is_empty()
-                && gate.success_exceeded(attempts, elapsed)
+                && wall_gate.success_exceeded(attempts, elapsed)
             {
                 return Ok(SinomoTestOutcome::failed(format!(
                     "DFS routed status succeeded in {}ms, exceeding the {}ms route/RPC gate",
                     elapsed.as_millis(),
-                    gate.max_elapsed.as_millis()
+                    wall_gate.max_elapsed.as_millis()
                 )));
             }
-            if !failure_history.is_empty() && gate.success_exceeded(attempts, elapsed) {
+            if !failure_history.is_empty() && wall_gate.success_exceeded(attempts, elapsed) {
                 return Ok(SinomoTestOutcome::failed(format!(
                     "DFS routed status recovered from route/RPC failures after {attempts} attempt(s) in {}ms, exceeding the gate of {} attempt(s) in {}ms",
                     elapsed.as_millis(),
-                    gate.max_attempts,
-                    gate.max_elapsed.as_millis()
+                    wall_gate.max_attempts,
+                    wall_gate.max_elapsed.as_millis()
                 )));
             }
             return Ok(SinomoTestOutcome::passed(format!(
@@ -614,7 +589,8 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 targets.len()
             )));
         }
-        if (!failures.is_empty() && gate.exhausted(attempts, elapsed)) || Instant::now() >= deadline
+        if (!failures.is_empty() && wall_gate.exhausted(attempts, elapsed))
+            || Instant::now() >= deadline
         {
             ctx.record("statuses", &statuses);
             ctx.record("attempts", attempts);
@@ -641,6 +617,198 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         }
         std::thread::sleep(EXPECT_POLL_INTERVAL);
     }
+}
+
+#[derive(Debug)]
+struct DfsRoutedStatusTargetProbe {
+    target: NodeId,
+    elapsed_ms: u64,
+    status: Option<BTreeMap<&'static str, u64>>,
+    repair_details: Vec<BTreeMap<&'static str, String>>,
+    error: Option<String>,
+}
+
+impl DfsRoutedStatusTargetProbe {
+    fn failed(target: NodeId, started: Instant, error: impl Into<String>) -> Self {
+        Self {
+            target,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            status: None,
+            repair_details: Vec::new(),
+            error: Some(error.into()),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DfsRoutedStatusAttempt {
+    statuses: BTreeMap<String, BTreeMap<&'static str, u64>>,
+    repair_details: BTreeMap<String, Vec<BTreeMap<&'static str, String>>>,
+    target_elapsed_ms: BTreeMap<String, u64>,
+    failures: Vec<String>,
+}
+
+fn probe_dfs_routed_status_targets(
+    daemon_client: &DaemonApiClient,
+    request: &ObjectRpcRequest,
+    targets: &[NodeId],
+    timeout: Duration,
+    unavailable_repair_targets: &BTreeSet<NodeId>,
+) -> Result<Vec<DfsRoutedStatusTargetProbe>, String> {
+    run_bounded_dfs_routed_status_jobs(targets, MAX_ROUTED_STATUS_CONCURRENCY, &|target| {
+        let panic_target = target.clone();
+        let daemon_client = daemon_client.clone();
+        let request = request.clone();
+        let started = Instant::now();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            probe_dfs_routed_status_target(
+                &daemon_client,
+                &request,
+                target,
+                timeout,
+                unavailable_repair_targets,
+            )
+        }))
+        .unwrap_or_else(|_| {
+            DfsRoutedStatusTargetProbe::failed(panic_target, started, "probe worker panicked")
+        })
+    })
+}
+
+fn probe_dfs_routed_status_target(
+    daemon_client: &DaemonApiClient,
+    request: &ObjectRpcRequest,
+    target: NodeId,
+    timeout: Duration,
+    unavailable_repair_targets: &BTreeSet<NodeId>,
+) -> DfsRoutedStatusTargetProbe {
+    let started = Instant::now();
+    let result = (|| -> Result<_, String> {
+        let response = daemon_client
+            .dfs_object_rpc_to_target_with_options(
+                &target,
+                request,
+                dfs::DfsObjectRpcSendOptions::new(timeout)
+                    .with_overall_timeout(timeout)
+                    .with_observe_connectivity(true),
+            )
+            .map_err(|error| error.to_string())?;
+        let status = dfs::decode_dfs_status_rpc_response(&response)
+            .map_err(|error| format!("decode failed: {error}"))?;
+        let repairs = if routed_status_needs_repair_views(&status, unavailable_repair_targets) {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err("repair inspection exceeded the target probe budget".to_string());
+            }
+            fetch_dfs_repair_views_for_status(
+                daemon_client,
+                &target,
+                remaining,
+                status.pending_repair_count,
+            )
+            .map_err(|error| format!("repair inspection failed: {error}"))?
+        } else {
+            Vec::new()
+        };
+        let summary = dfs_status_probe_summary(&status, &repairs, unavailable_repair_targets);
+        let repair_details = repairs
+            .iter()
+            .map(dfs_repair_probe_summary)
+            .collect::<Vec<_>>();
+        Ok((summary, repair_details))
+    })();
+    match result {
+        Ok((status, repair_details)) => DfsRoutedStatusTargetProbe {
+            target,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            status: Some(status),
+            repair_details,
+            error: None,
+        },
+        Err(error) => DfsRoutedStatusTargetProbe::failed(target, started, error),
+    }
+}
+
+fn aggregate_dfs_routed_status_probes(
+    probes: Vec<DfsRoutedStatusTargetProbe>,
+) -> DfsRoutedStatusAttempt {
+    let mut attempt = DfsRoutedStatusAttempt::default();
+    for probe in probes {
+        let target = probe.target.to_string();
+        attempt
+            .target_elapsed_ms
+            .insert(target.clone(), probe.elapsed_ms);
+        if let Some(error) = probe.error {
+            attempt.failures.push(format!("{target}: {error}"));
+            continue;
+        }
+        let Some(status) = probe.status else {
+            attempt
+                .failures
+                .push(format!("{target}: probe returned no status"));
+            continue;
+        };
+        attempt.statuses.insert(target.clone(), status);
+        if !probe.repair_details.is_empty() {
+            attempt.repair_details.insert(target, probe.repair_details);
+        }
+    }
+    attempt
+}
+
+fn run_bounded_dfs_routed_status_jobs<T, R, F>(
+    items: &[T],
+    max_concurrency: usize,
+    probe: &F,
+) -> Result<Vec<R>, String>
+where
+    T: Clone + Send + Sync,
+    R: Send,
+    F: Fn(T) -> R + Sync,
+{
+    if max_concurrency == 0 {
+        return Err("probe concurrency must be greater than zero".to_string());
+    }
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let next = AtomicUsize::new(0);
+    let worker_count = items.len().min(max_concurrency);
+    let mut indexed = std::thread::scope(|scope| -> Result<Vec<(usize, R)>, String> {
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let next = &next;
+            workers.push(scope.spawn(move || {
+                let mut results = Vec::new();
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(index) else {
+                        break;
+                    };
+                    results.push((index, probe(item.clone())));
+                }
+                results
+            }));
+        }
+        let mut indexed = Vec::with_capacity(items.len());
+        for worker in workers {
+            indexed.extend(
+                worker
+                    .join()
+                    .map_err(|_| "bounded probe worker panicked".to_string())?,
+            );
+        }
+        Ok(indexed)
+    })?;
+    if indexed.len() != items.len() {
+        return Err(format!(
+            "bounded probe completed {} of {} jobs",
+            indexed.len(),
+            items.len()
+        ));
+    }
+    indexed.sort_by_key(|(index, _)| *index);
+    Ok(indexed.into_iter().map(|(_, result)| result).collect())
 }
 
 fn run_remote_shard_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
@@ -1074,6 +1242,15 @@ impl DfsRoutedStatusGate {
     fn success_exceeded(&self, attempts: usize, elapsed: Duration) -> bool {
         attempts > self.max_attempts || elapsed > self.max_elapsed
     }
+
+    fn for_bounded_target_count(self, target_count: usize) -> Self {
+        let wave_count = target_count.max(1).div_ceil(MAX_ROUTED_STATUS_CONCURRENCY);
+        let wave_count = u32::try_from(wave_count).unwrap_or(u32::MAX);
+        Self {
+            max_attempts: self.max_attempts,
+            max_elapsed: self.max_elapsed.saturating_mul(wave_count),
+        }
+    }
 }
 
 fn dfs_routed_status_targets_from_state(
@@ -1228,7 +1405,13 @@ fn fetch_dfs_repair_views_for_status(
     })
     .map_err(|error| error.to_string())?;
     let response = daemon_client
-        .dfs_object_rpc_to_target(target, &request, timeout, true)
+        .dfs_object_rpc_to_target_with_options(
+            target,
+            &request,
+            dfs::DfsObjectRpcSendOptions::new(timeout)
+                .with_overall_timeout(timeout)
+                .with_observe_connectivity(true),
+        )
         .map_err(|error| error.to_string())?;
     match dfs::decode_dfs_inspection_rpc_response(&response).map_err(|error| error.to_string())? {
         DaemonDfsInspectionResponse::Repair { repairs, .. } => Ok(repairs),
@@ -4830,6 +5013,113 @@ mod tests {
     }
 
     #[test]
+    fn bounded_routed_status_probes_start_targets_concurrently() {
+        let item_count = 3usize;
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let runner_release = std::sync::Arc::clone(&release);
+        let runner = std::thread::spawn(move || {
+            let items = (0..item_count).collect::<Vec<_>>();
+            run_bounded_dfs_routed_status_jobs(&items, item_count, &|item| {
+                started_tx.send(item).expect("record started probe");
+                let (released, wake) = &*runner_release;
+                let mut released = released.lock().expect("release lock");
+                while !*released {
+                    released = wake.wait(released).expect("release wait");
+                }
+                item
+            })
+        });
+
+        let mut started = Vec::new();
+        for _ in 0..item_count {
+            match started_rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(item) => started.push(item),
+                Err(_) => break,
+            }
+        }
+        let (released, wake) = &*release;
+        *released.lock().expect("release lock") = true;
+        wake.notify_all();
+        let results = runner
+            .join()
+            .expect("bounded probe runner")
+            .expect("bounded probe results");
+
+        started.sort_unstable();
+        assert_eq!(started, vec![0, 1, 2]);
+        assert_eq!(results, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn bounded_routed_status_probes_never_exceed_limit() {
+        let active = std::sync::Arc::new(AtomicUsize::new(0));
+        let max_active = std::sync::Arc::new(AtomicUsize::new(0));
+        let items = (0..8usize).collect::<Vec<_>>();
+        let results = run_bounded_dfs_routed_status_jobs(&items, 2, &|item| {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(current, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(20));
+            active.fetch_sub(1, Ordering::SeqCst);
+            item * 2
+        })
+        .expect("bounded probe results");
+
+        assert_eq!(results, vec![0, 2, 4, 6, 8, 10, 12, 14]);
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn routed_status_attempt_preserves_target_errors_and_elapsed_diagnostics() {
+        let successful_target =
+            NodeId::from_legacy_named("node_routed_status_success").expect("successful target");
+        let failed_target =
+            NodeId::from_legacy_named("node_routed_status_failure").expect("failed target");
+        let status = BTreeMap::from([("objects", 7_u64)]);
+        let repair_details = vec![BTreeMap::from([("intent_id", "repair-a".to_string())])];
+        let attempt = aggregate_dfs_routed_status_probes(vec![
+            DfsRoutedStatusTargetProbe {
+                target: successful_target.clone(),
+                elapsed_ms: 41,
+                status: Some(status.clone()),
+                repair_details: repair_details.clone(),
+                error: None,
+            },
+            DfsRoutedStatusTargetProbe {
+                target: failed_target.clone(),
+                elapsed_ms: 73,
+                status: None,
+                repair_details: Vec::new(),
+                error: Some("decode failed: fixture".to_string()),
+            },
+        ]);
+
+        assert_eq!(
+            attempt.statuses.get(&successful_target.to_string()),
+            Some(&status)
+        );
+        assert_eq!(
+            attempt.repair_details.get(&successful_target.to_string()),
+            Some(&repair_details)
+        );
+        assert_eq!(
+            attempt
+                .target_elapsed_ms
+                .get(&successful_target.to_string()),
+            Some(&41)
+        );
+        assert_eq!(
+            attempt.target_elapsed_ms.get(&failed_target.to_string()),
+            Some(&73)
+        );
+        assert_eq!(
+            attempt.failures,
+            vec![format!("{failed_target}: decode failed: fixture")]
+        );
+    }
+
+    #[test]
     fn dfs_routed_status_gate_defaults_to_single_five_second_attempt() {
         let ctx = SinomoTestContext::new("unused");
 
@@ -4869,6 +5159,34 @@ mod tests {
         assert!(!gate.exhausted(2, Duration::from_millis(6_999)));
         assert!(gate.exhausted(3, Duration::from_millis(1)));
         assert!(gate.exhausted(1, Duration::from_millis(7_000)));
+    }
+
+    #[test]
+    fn dfs_routed_status_gate_scales_wall_budget_for_bounded_probe_waves() {
+        let gate = DfsRoutedStatusGate {
+            max_attempts: 1,
+            max_elapsed: Duration::from_secs(5),
+        };
+
+        assert_eq!(
+            gate.for_bounded_target_count(0).max_elapsed,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            gate.for_bounded_target_count(MAX_ROUTED_STATUS_CONCURRENCY)
+                .max_elapsed,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            gate.for_bounded_target_count(MAX_ROUTED_STATUS_CONCURRENCY + 1)
+                .max_elapsed,
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            gate.for_bounded_target_count(MAX_ROUTED_STATUS_CONCURRENCY * 2 + 1)
+                .max_elapsed,
+            Duration::from_secs(15)
+        );
     }
 
     #[test]

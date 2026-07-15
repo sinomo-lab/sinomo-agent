@@ -374,13 +374,29 @@ data directory while retaining independent routing and response queues.
 
 Only a matching `Committed` `CommitVersionResponse` settles an entry;
 `Durable` proves staging only. Transport errors, durable-only, missing or
-mismatched acknowledgements, and explicit rejection retain the exact identity
-for idempotent backoff retry without replaying successful siblings. A drain
+mismatched acknowledgements, and retryable explicit rejection retain the exact
+identity for idempotent backoff retry without replaying successful siblings.
+Two authenticated rejection classes are terminal for the exact notification.
+A receiver whose durable intent excludes its local node cannot become
+authorized by replaying the identical command. A current metadata-shard primary
+that cannot open its exact local committed content first durably removes its
+stale receipt and visible location; its typed repair-pending rejection transfers
+convergence ownership to the ordinary committed-intent repair ledger. That
+acknowledgement proves the receipt/location prune is durable; it does not claim
+that content repair has completed. When no exact-version source is currently
+reachable, the repair remains pending under the existing bounded backoff. A
+non-authority cannot make the prune transition, so the same missing-content
+failure remains retryable. The sender emits a structured warning and retires
+either terminal identity without claiming a committed acknowledgement. A bounded
+terminal frontier retains one settled, undesired, or repair-pending
+intent/version/hash per target/filesystem/object key and suppresses exact
+duplicates while allowing a new intent identity for that key. Terminal
+classification must match the expected requester and intent or the exact repair
+object, version, and hash; wrapped or mismatched reasons stay retryable. A drain
 attempts every ready identity once under the cap before returning its first
-error, then rotates failed identities behind unattempted or concurrently queued
-work, preventing permanent failures from head-of-line blocking healthy
-promotions. Settled bookkeeping retains one current version/hash frontier per
-target/filesystem/object key rather than every historical version.
+retryable error, then rotates failed identities behind unattempted or
+concurrently queued work, preventing permanent failures from head-of-line
+blocking healthy promotions.
 
 Durable committed intents and receipts reconstruct outstanding exact
 promotions in a dedicated background maintenance hydration after restart, so

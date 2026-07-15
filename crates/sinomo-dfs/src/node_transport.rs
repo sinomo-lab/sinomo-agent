@@ -34,7 +34,8 @@ use crate::{
     dfs_direct_read_request_from_read_request, dfs_direct_read_response_from_rpc_session_result,
     dfs_direct_read_rpc_request, dfs_message_is_read_only_request, dfs_message_rpc_request,
     dfs_metadata_journal_batch_rpc_request, dfs_network_message_allows_write_repair_progress,
-    dfs_perf_trace, dfs_perf_trace_enabled, retained_networked_dfs_service_events,
+    dfs_perf_trace, dfs_perf_trace_enabled, dfs_rejection_is_commit_content_repair_pending,
+    dfs_rejection_is_replica_not_desired, retained_networked_dfs_service_events,
 };
 #[cfg(test)]
 use crate::{
@@ -526,6 +527,7 @@ struct DeferredDfsPeerSend {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct DfsCommitPromotionIdentity {
     target_node_id: NodeId,
+    intent_id: String,
     file_system_id: crate::DfsFileSystemId,
     object_id: crate::DfsObjectId,
     version: crate::DfsVersion,
@@ -539,10 +541,25 @@ struct DfsCommitPromotionSettlementKey {
     object_id: crate::DfsObjectId,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DfsCommitPromotionTerminalOutcome {
+    Committed,
+    RetiredNotDesired,
+    RepairPending,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct DfsSettledCommitPromotion {
+struct DfsTerminalCommitPromotion {
     identity: DfsCommitPromotionIdentity,
     enqueue_sequence: u64,
+    outcome: DfsCommitPromotionTerminalOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DfsCommitPromotionResponseDisposition {
+    Committed,
+    RetireNotDesired,
+    RepairPending,
 }
 
 #[derive(Default)]
@@ -550,7 +567,8 @@ struct DfsNodeDetachedSendOutbox {
     ready_sends: VecDeque<DeferredDfsPeerSend>,
     cooling_retries: BTreeMap<Instant, VecDeque<DeferredDfsPeerSend>>,
     pending_commit_promotions: BTreeSet<DfsCommitPromotionIdentity>,
-    settled_commit_promotions: BTreeMap<DfsCommitPromotionSettlementKey, DfsSettledCommitPromotion>,
+    terminal_commit_promotions:
+        BTreeMap<DfsCommitPromotionSettlementKey, DfsTerminalCommitPromotion>,
     next_promotion_sequence: u64,
 }
 
@@ -605,7 +623,34 @@ impl std::fmt::Debug for DfsNodeDetachedSendState {
                 )
                 .field(
                     "settled_commit_promotions",
-                    &outbox.settled_commit_promotions.len(),
+                    &outbox
+                        .terminal_commit_promotions
+                        .values()
+                        .filter(|promotion| {
+                            promotion.outcome == DfsCommitPromotionTerminalOutcome::Committed
+                        })
+                        .count(),
+                )
+                .field(
+                    "retired_not_desired_commit_promotions",
+                    &outbox
+                        .terminal_commit_promotions
+                        .values()
+                        .filter(|promotion| {
+                            promotion.outcome
+                                == DfsCommitPromotionTerminalOutcome::RetiredNotDesired
+                        })
+                        .count(),
+                )
+                .field(
+                    "repair_pending_commit_promotions",
+                    &outbox
+                        .terminal_commit_promotions
+                        .values()
+                        .filter(|promotion| {
+                            promotion.outcome == DfsCommitPromotionTerminalOutcome::RepairPending
+                        })
+                        .count(),
                 )
                 .finish(),
             Err(_) => formatter
@@ -640,6 +685,7 @@ impl DeferredDfsPeerSend {
         };
         Some(DfsCommitPromotionIdentity {
             target_node_id: self.target_node_id.clone(),
+            intent_id: command.intent_id.clone(),
             file_system_id: command.file_system_id.clone(),
             object_id: command.object_id.clone(),
             version: command.version.clone(),
@@ -1214,8 +1260,38 @@ impl DfsNodeTransport {
             .inner
             .lock()
             .expect("detached send outbox")
-            .settled_commit_promotions
-            .len()
+            .terminal_commit_promotions
+            .values()
+            .filter(|promotion| promotion.outcome == DfsCommitPromotionTerminalOutcome::Committed)
+            .count()
+    }
+
+    #[cfg(test)]
+    fn retired_not_desired_commit_promotion_count(&self) -> usize {
+        self.detached_send_state
+            .inner
+            .lock()
+            .expect("detached send outbox")
+            .terminal_commit_promotions
+            .values()
+            .filter(|promotion| {
+                promotion.outcome == DfsCommitPromotionTerminalOutcome::RetiredNotDesired
+            })
+            .count()
+    }
+
+    #[cfg(test)]
+    fn repair_pending_commit_promotion_count(&self) -> usize {
+        self.detached_send_state
+            .inner
+            .lock()
+            .expect("detached send outbox")
+            .terminal_commit_promotions
+            .values()
+            .filter(|promotion| {
+                promotion.outcome == DfsCommitPromotionTerminalOutcome::RepairPending
+            })
+            .count()
     }
 
     fn current_send_options(
@@ -1567,9 +1643,9 @@ impl DfsNodeTransport {
         if let Some(identity) = promotion_identity {
             let settlement_key = identity.settlement_key();
             if outbox
-                .settled_commit_promotions
+                .terminal_commit_promotions
                 .get(&settlement_key)
-                .is_some_and(|settled| settled.identity == identity)
+                .is_some_and(|terminal| terminal.identity == identity)
                 || outbox.pending_commit_promotions.contains(&identity)
             {
                 return Ok(());
@@ -1663,20 +1739,62 @@ impl DfsNodeTransport {
                                 &returned_messages,
                             )
                         });
-                        if result.is_ok()
-                            && let Err(error) = self.mark_commit_promotion_settled(&send)
-                        {
-                            replay_retries.push_back(send);
-                            if first_replay_error.is_none() {
-                                first_replay_error = Some(error);
+                        match result {
+                            Ok(disposition) => {
+                                let outcome = match disposition {
+                                    DfsCommitPromotionResponseDisposition::Committed => {
+                                        DfsCommitPromotionTerminalOutcome::Committed
+                                    }
+                                    DfsCommitPromotionResponseDisposition::RetireNotDesired => {
+                                        DfsCommitPromotionTerminalOutcome::RetiredNotDesired
+                                    }
+                                    DfsCommitPromotionResponseDisposition::RepairPending => {
+                                        DfsCommitPromotionTerminalOutcome::RepairPending
+                                    }
+                                };
+                                if let Err(error) =
+                                    self.mark_commit_promotion_terminal(&send, outcome)
+                                {
+                                    replay_retries.push_back(send);
+                                    if first_replay_error.is_none() {
+                                        first_replay_error = Some(error);
+                                    }
+                                } else if disposition
+                                    == DfsCommitPromotionResponseDisposition::RetireNotDesired
+                                    && let DfsNetworkMessage::CommitVersion(command) =
+                                        &send.routed_message.message
+                                {
+                                    tracing::warn!(
+                                        target_node_id = %send.target_node_id,
+                                        intent_id = %command.intent_id,
+                                        file_system_id = %command.file_system_id,
+                                        object_id = %command.object_id,
+                                        version = %command.version,
+                                        "retired detached DFS CommitVersion promotion because the target is not a desired replica"
+                                    );
+                                } else if disposition
+                                    == DfsCommitPromotionResponseDisposition::RepairPending
+                                    && let DfsNetworkMessage::CommitVersion(command) =
+                                        &send.routed_message.message
+                                {
+                                    tracing::warn!(
+                                        target_node_id = %send.target_node_id,
+                                        intent_id = %command.intent_id,
+                                        file_system_id = %command.file_system_id,
+                                        object_id = %command.object_id,
+                                        version = %command.version,
+                                        "retired detached DFS CommitVersion promotion after the target durably transitioned missing content to repair"
+                                    );
+                                }
                             }
-                        } else if let Err(error) = result {
-                            // CommitVersion is idempotent for the same
-                            // object/version/hash. Both transport failure and a
-                            // negative/missing ACK therefore stay in cooling.
-                            replay_retries.push_back(send);
-                            if first_replay_error.is_none() {
-                                first_replay_error = Some(error);
+                            Err(error) => {
+                                // CommitVersion is idempotent for the same
+                                // object/version/hash. Transport failure and a
+                                // retryable negative/missing ACK stay in cooling.
+                                replay_retries.push_back(send);
+                                if first_replay_error.is_none() {
+                                    first_replay_error = Some(error);
+                                }
                             }
                         }
                     }
@@ -1747,7 +1865,7 @@ impl DfsNodeTransport {
     fn validate_detached_commit_promotion_response(
         send: &DeferredDfsPeerSend,
         returned_messages: &[DfsRoutedMessage],
-    ) -> Result<(), NetworkError> {
+    ) -> Result<DfsCommitPromotionResponseDisposition, NetworkError> {
         let DfsNetworkMessage::CommitVersion(command) = &send.routed_message.message else {
             return Err(NetworkError::Serialization {
                 detail: "detached promotion validation received a non-CommitVersion message"
@@ -1773,7 +1891,7 @@ impl DfsNodeTransport {
             DfsBlobTransferResult::Committed { content_hash }
                 if content_hash == &command.content_hash =>
             {
-                Ok(())
+                Ok(DfsCommitPromotionResponseDisposition::Committed)
             }
             DfsBlobTransferResult::Committed { content_hash } => Err(NetworkError::Serialization {
                 detail: format!(
@@ -1790,6 +1908,25 @@ impl DfsNodeTransport {
                     "replica acknowledged durable content hash {content_hash} but has not committed the version"
                 ),
             }),
+            DfsBlobTransferResult::Rejected { reason }
+                if dfs_rejection_is_replica_not_desired(
+                    reason,
+                    &send.routed_message.source_node_id,
+                    &command.intent_id,
+                ) =>
+            {
+                Ok(DfsCommitPromotionResponseDisposition::RetireNotDesired)
+            }
+            DfsBlobTransferResult::Rejected { reason }
+                if dfs_rejection_is_commit_content_repair_pending(
+                    reason,
+                    &command.object_id,
+                    &command.version,
+                    &command.content_hash,
+                ) =>
+            {
+                Ok(DfsCommitPromotionResponseDisposition::RepairPending)
+            }
             DfsBlobTransferResult::Rejected { reason } => Err(NetworkError::Io {
                 operation: format!(
                     "promote DFS version {} on {}",
@@ -1800,9 +1937,10 @@ impl DfsNodeTransport {
         }
     }
 
-    fn mark_commit_promotion_settled(
+    fn mark_commit_promotion_terminal(
         &self,
         send: &DeferredDfsPeerSend,
+        outcome: DfsCommitPromotionTerminalOutcome,
     ) -> Result<(), NetworkError> {
         let Some(identity) = send.commit_version_promotion_identity() else {
             return Ok(());
@@ -1818,20 +1956,21 @@ impl DfsNodeTransport {
             .inner
             .lock()
             .map_err(|_| NetworkError::Io {
-                operation: "record settled DFS commit promotion".to_string(),
-                detail: "settled promotion lock is poisoned".to_string(),
+                operation: "record terminal DFS commit promotion".to_string(),
+                detail: "terminal promotion lock is poisoned".to_string(),
             })?;
         outbox.pending_commit_promotions.remove(&identity);
-        let should_advance_settlement = outbox
-            .settled_commit_promotions
+        let should_advance_terminal = outbox
+            .terminal_commit_promotions
             .get(&settlement_key)
-            .is_none_or(|settled| settled.enqueue_sequence <= enqueue_sequence);
-        if should_advance_settlement {
-            outbox.settled_commit_promotions.insert(
+            .is_none_or(|terminal| terminal.enqueue_sequence <= enqueue_sequence);
+        if should_advance_terminal {
+            outbox.terminal_commit_promotions.insert(
                 settlement_key,
-                DfsSettledCommitPromotion {
+                DfsTerminalCommitPromotion {
                     identity,
                     enqueue_sequence,
+                    outcome,
                 },
             );
         }
@@ -4933,6 +5072,257 @@ mod tests {
             .expect("positive acknowledgement should settle promotion");
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(transport.detached_send_count(), 0);
+    }
+
+    #[test]
+    fn detached_commit_promotion_not_desired_rejection_is_retired_boundedly() {
+        let local = node_id("node_commit_promotion_retire_local");
+        let remote = node_id("node_commit_promotion_retire_remote");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let sender_attempts = Arc::clone(&attempts);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            sender_attempts.fetch_add(1, Ordering::SeqCst);
+            let DfsNetworkMessage::CommitVersion(commit) = &command.routed_message.message else {
+                panic!("test response requires CommitVersion")
+            };
+            let reason = DfsError::UnauthorizedReplicaCommand {
+                source_node_id: command.routed_message.source_node_id.clone(),
+                reason: crate::dfs_replica_not_desired_reason(&commit.intent_id),
+            }
+            .to_string();
+            Ok(test_commit_version_rpc_response(
+                command,
+                DfsBlobTransferResult::Rejected { reason },
+            ))
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![remote.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        let promotion = test_commit_version_message(&local, &remote, 1);
+        transport
+            .send_detached_routed_message(&remote, promotion.clone())
+            .expect("queue commit promotion");
+
+        let started = Instant::now();
+        transport
+            .flush_detached_peer_sends_with_now(&|| started)
+            .expect("not-desired rejection should retire the exact promotion");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.detached_send_count(), 0);
+        assert_eq!(transport.pending_commit_promotion_count(), 0);
+        assert_eq!(transport.settled_commit_promotion_count(), 0);
+        assert_eq!(transport.retired_not_desired_commit_promotion_count(), 1);
+
+        transport
+            .flush_detached_peer_sends_with_now(&|| started + DFS_DETACHED_SEND_RETRY_DELAY)
+            .expect("retired promotion must not enter retry cooling");
+        transport
+            .send_detached_routed_message(&remote, promotion.clone())
+            .expect("exact retired duplicate should be suppressed");
+        transport
+            .flush_detached_peer_sends_with_now(&|| started + DFS_DETACHED_SEND_RETRY_DELAY)
+            .expect("exact retired duplicate must remain terminal");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        let mut superseding = promotion;
+        superseding.frame_id = 2;
+        superseding.message_id = 2;
+        let DfsNetworkMessage::CommitVersion(command) = &mut superseding.message else {
+            panic!("test promotion requires CommitVersion")
+        };
+        command.request_id = "commit_request_retire_superseding".to_string();
+        command.intent_id = "intent_retire_superseding".to_string();
+        transport
+            .send_detached_routed_message(&remote, superseding)
+            .expect("a new intent for the same version/hash must remain queueable");
+        assert_eq!(transport.detached_send_count(), 1);
+        transport
+            .flush_detached_peer_sends_with_now(&|| started + DFS_DETACHED_SEND_RETRY_DELAY)
+            .expect("superseding not-desired promotion should replace the retired frontier");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(transport.detached_send_count(), 0);
+        assert_eq!(
+            transport.retired_not_desired_commit_promotion_count(),
+            1,
+            "retired bookkeeping must remain bounded per target/filesystem/object key"
+        );
+    }
+
+    #[test]
+    fn detached_commit_promotion_not_desired_rejection_must_match_exact_command() {
+        let local = node_id("node_commit_promotion_retire_exact_local");
+        let remote = node_id("node_commit_promotion_retire_exact_remote");
+        let wrong_requester = node_id("node_commit_promotion_retire_wrong_requester");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let sender_attempts = Arc::clone(&attempts);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            let attempt = sender_attempts.fetch_add(1, Ordering::SeqCst);
+            let DfsNetworkMessage::CommitVersion(commit) = &command.routed_message.message else {
+                panic!("test response requires CommitVersion")
+            };
+            let exact_reason = DfsError::UnauthorizedReplicaCommand {
+                source_node_id: command.routed_message.source_node_id.clone(),
+                reason: crate::dfs_replica_not_desired_reason(&commit.intent_id),
+            }
+            .to_string();
+            let reason = match attempt {
+                0 => DfsError::UnauthorizedReplicaCommand {
+                    source_node_id: wrong_requester.clone(),
+                    reason: crate::dfs_replica_not_desired_reason(&commit.intent_id),
+                }
+                .to_string(),
+                1 => DfsError::UnauthorizedReplicaCommand {
+                    source_node_id: command.routed_message.source_node_id.clone(),
+                    reason: crate::dfs_replica_not_desired_reason("wrong_intent"),
+                }
+                .to_string(),
+                2 => format!("wrapped: {exact_reason}"),
+                _ => exact_reason,
+            };
+            Ok(test_commit_version_rpc_response(
+                command,
+                DfsBlobTransferResult::Rejected { reason },
+            ))
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![remote.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        transport
+            .send_detached_routed_message(&remote, test_commit_version_message(&local, &remote, 1))
+            .expect("queue commit promotion");
+
+        let started = Instant::now();
+        for step in 0..3 {
+            let now = started + DFS_DETACHED_SEND_RETRY_DELAY * step;
+            transport
+                .flush_detached_peer_sends_with_now(&|| now)
+                .expect_err("non-exact not-desired reason must remain retryable");
+            assert_eq!(transport.detached_send_count(), 1);
+            assert_eq!(transport.retired_not_desired_commit_promotion_count(), 0);
+        }
+        transport
+            .flush_detached_peer_sends_with_now(&|| started + DFS_DETACHED_SEND_RETRY_DELAY * 3)
+            .expect("exact requester and intent should retire the promotion");
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+        assert_eq!(transport.detached_send_count(), 0);
+        assert_eq!(transport.retired_not_desired_commit_promotion_count(), 1);
+    }
+
+    #[test]
+    fn detached_commit_promotion_repair_pending_rejection_is_terminal() {
+        let local = node_id("node_commit_promotion_repair_pending_local");
+        let remote = node_id("node_commit_promotion_repair_pending_remote");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let sender_attempts = Arc::clone(&attempts);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            sender_attempts.fetch_add(1, Ordering::SeqCst);
+            let DfsNetworkMessage::CommitVersion(commit) = &command.routed_message.message else {
+                panic!("test response requires CommitVersion")
+            };
+            let reason = DfsError::CommitContentRepairPending {
+                object_id: commit.object_id.clone(),
+                version: commit.version.clone(),
+                content_hash: commit.content_hash.clone(),
+            }
+            .to_string();
+            Ok(test_commit_version_rpc_response(
+                command,
+                DfsBlobTransferResult::Rejected { reason },
+            ))
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![remote.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        let promotion = test_commit_version_message(&local, &remote, 1);
+        transport
+            .send_detached_routed_message(&remote, promotion.clone())
+            .expect("queue commit promotion");
+
+        let started = Instant::now();
+        transport
+            .flush_detached_peer_sends_with_now(&|| started)
+            .expect("durable repair transition should retire the exact promotion");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.detached_send_count(), 0);
+        assert_eq!(transport.pending_commit_promotion_count(), 0);
+        assert_eq!(transport.settled_commit_promotion_count(), 0);
+        assert_eq!(transport.repair_pending_commit_promotion_count(), 1);
+
+        transport
+            .send_detached_routed_message(&remote, promotion)
+            .expect("exact repair-pending duplicate should be suppressed");
+        transport
+            .flush_detached_peer_sends_with_now(&|| started + DFS_DETACHED_SEND_RETRY_DELAY)
+            .expect("repair-pending promotion must not enter retry cooling");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn detached_commit_promotion_repair_pending_must_match_exact_content() {
+        let local = node_id("node_commit_promotion_repair_exact_local");
+        let remote = node_id("node_commit_promotion_repair_exact_remote");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let sender_attempts = Arc::clone(&attempts);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            let attempt = sender_attempts.fetch_add(1, Ordering::SeqCst);
+            let DfsNetworkMessage::CommitVersion(commit) = &command.routed_message.message else {
+                panic!("test response requires CommitVersion")
+            };
+            let exact_reason = DfsError::CommitContentRepairPending {
+                object_id: commit.object_id.clone(),
+                version: commit.version.clone(),
+                content_hash: commit.content_hash.clone(),
+            }
+            .to_string();
+            let reason = match attempt {
+                0 => DfsError::CommitContentRepairPending {
+                    object_id: commit.object_id.clone(),
+                    version: commit.version.clone(),
+                    content_hash: "blake3:wrong-repair-content".to_string(),
+                }
+                .to_string(),
+                1 => format!("wrapped: {exact_reason}"),
+                _ => exact_reason,
+            };
+            Ok(test_commit_version_rpc_response(
+                command,
+                DfsBlobTransferResult::Rejected { reason },
+            ))
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![remote.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        transport
+            .send_detached_routed_message(&remote, test_commit_version_message(&local, &remote, 1))
+            .expect("queue commit promotion");
+
+        let started = Instant::now();
+        for step in 0..2 {
+            let now = started + DFS_DETACHED_SEND_RETRY_DELAY * step;
+            transport
+                .flush_detached_peer_sends_with_now(&|| now)
+                .expect_err("non-exact repair-pending reason must remain retryable");
+            assert_eq!(transport.detached_send_count(), 1);
+            assert_eq!(transport.repair_pending_commit_promotion_count(), 0);
+        }
+        transport
+            .flush_detached_peer_sends_with_now(&|| started + DFS_DETACHED_SEND_RETRY_DELAY * 2)
+            .expect("exact object/version/hash should terminalize for repair");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(transport.detached_send_count(), 0);
+        assert_eq!(transport.repair_pending_commit_promotion_count(), 1);
     }
 
     #[test]

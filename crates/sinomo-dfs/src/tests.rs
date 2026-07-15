@@ -2,7 +2,7 @@ use super::*;
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::events::EventId;
-use sinomo_core::kv::InProcessKvStore;
+use sinomo_core::kv::{InProcessKvStore, KvEntry, KvError, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
     AsyncInProcessNetwork, ClusterPaths, InProcessNetwork, NetworkError, ObjectRpcRequest,
@@ -70,6 +70,77 @@ impl DfsMessageTransport for ReceiveOnlyTransport {
 
     fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
         Ok(self.incoming.drain(..).collect())
+    }
+}
+
+#[derive(Debug)]
+struct RangeSignalingControlPlaneKvClient {
+    inner: InProcessKvStore,
+    first_metadata_shard_range: std::sync::mpsc::SyncSender<()>,
+    armed: AtomicBool,
+    metadata_shard_range_count: AtomicUsize,
+}
+
+impl RangeSignalingControlPlaneKvClient {
+    fn new(first_metadata_shard_range: std::sync::mpsc::SyncSender<()>) -> Self {
+        Self {
+            inner: InProcessKvStore::new(),
+            first_metadata_shard_range,
+            armed: AtomicBool::new(false),
+            metadata_shard_range_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn arm(&self) {
+        self.metadata_shard_range_count.store(0, Ordering::SeqCst);
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn metadata_shard_range_count(&self) -> usize {
+        self.metadata_shard_range_count.load(Ordering::SeqCst)
+    }
+}
+
+impl Clone for RangeSignalingControlPlaneKvClient {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            first_metadata_shard_range: self.first_metadata_shard_range.clone(),
+            armed: AtomicBool::new(self.armed.load(Ordering::SeqCst)),
+            metadata_shard_range_count: AtomicUsize::new(
+                self.metadata_shard_range_count.load(Ordering::SeqCst),
+            ),
+        }
+    }
+}
+
+impl DfsControlPlaneKvClient for RangeSignalingControlPlaneKvClient {
+    fn refresh_latest(&mut self) -> Result<(), KvError> {
+        DfsControlPlaneKvClient::refresh_latest(&mut self.inner)
+    }
+
+    fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
+        DfsControlPlaneKvClient::get(&self.inner, key)
+    }
+
+    fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+        let entries = DfsControlPlaneKvClient::range_prefix(&self.inner, prefix)?;
+        if prefix.contains("/metadata-shards/") {
+            self.metadata_shard_range_count
+                .fetch_add(1, Ordering::SeqCst);
+            if self.armed.swap(false, Ordering::SeqCst) {
+                let _ = self.first_metadata_shard_range.send(());
+            }
+        }
+        Ok(entries)
+    }
+
+    fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
+        DfsControlPlaneKvClient::put(&mut self.inner, key, value)
+    }
+
+    fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+        DfsControlPlaneKvClient::txn(&mut self.inner, txn)
     }
 }
 
@@ -16674,6 +16745,10 @@ fn hydrate_from_metadata_backend_repairs_visible_target_pending_intent() {
 struct DurableCommitPromotionFixture {
     owner: NodeId,
     replica: NodeId,
+    object_id: DfsObjectId,
+    target_version: DfsVersion,
+    intent_id: String,
+    content_hash: String,
     metadata_root: PathBuf,
     content_root: PathBuf,
 }
@@ -16763,9 +16838,692 @@ fn seed_durable_commit_promotion_fixture(
     DurableCommitPromotionFixture {
         owner,
         replica,
+        object_id,
+        target_version,
+        intent_id: intent.intent_id,
+        content_hash: manifest.content_hash,
         metadata_root,
         content_root,
     }
+}
+
+#[test]
+fn missing_local_commit_content_transitions_stale_receipt_into_fetch_repair() {
+    let root = temp_root("missing-commit-content-fetch-repair");
+    let fixture = seed_durable_commit_promotion_fixture(&root, "missing-content-fetch");
+    let network = InProcessNetwork::new();
+    let mut owner_transport = network.add_node(fixture.owner.clone());
+    let target_content_root = root.join("target-content");
+    let target_backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &fixture.metadata_root)
+            .expect("target metadata backend");
+    let mut target = NetworkedDfsService::new(
+        network.add_node(fixture.replica.clone()),
+        LocalContentStore::new(&target_content_root).expect("empty target content"),
+    )
+    .with_metadata_backend(target_backend)
+    .expect("target metadata hydration");
+    assert!(target.coordinator().repair_jobs().is_empty());
+    assert!(
+        target
+            .content()
+            .read_manifest(fixture.object_id.as_str(), fixture.target_version.as_str())
+            .is_err(),
+        "the stale target receipt must begin without local content"
+    );
+    let object_metadata = target
+        .metadata()
+        .object(&fixture.object_id)
+        .cloned()
+        .expect("committed object metadata");
+
+    let event = target
+        .handle_commit_version(
+            fixture.owner.clone(),
+            DfsCommitVersionCommand {
+                request_id: "commit_missing_content_fetch_repair".to_string(),
+                intent_id: fixture.intent_id.clone(),
+                file_system_id: object_metadata.file_system_id.clone(),
+                object_id: fixture.object_id.clone(),
+                expected_base_version: None,
+                version: fixture.target_version.clone(),
+                content_hash: fixture.content_hash.clone(),
+                object_metadata: Some(object_metadata),
+                authority_shard: None,
+            },
+        )
+        .expect("missing commit content response");
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::RepairRejected { ref reason, .. }
+            if dfs_rejection_is_commit_content_repair_pending(
+                reason,
+                &fixture.object_id,
+                &fixture.target_version,
+                &fixture.content_hash,
+            )
+    ));
+    let response = drain_dfs_messages(&mut owner_transport)
+        .into_iter()
+        .find_map(|message| match message {
+            DfsNetworkMessage::CommitVersionResponse(response) => Some(response),
+            _ => None,
+        })
+        .expect("commit response");
+    assert!(matches!(
+        response.result,
+        DfsBlobTransferResult::Rejected { ref reason }
+            if dfs_rejection_is_commit_content_repair_pending(
+                reason,
+                &fixture.object_id,
+                &fixture.target_version,
+                &fixture.content_hash,
+            )
+    ));
+
+    let backend = target.metadata_backend().expect("target backend");
+    assert_eq!(
+        backend
+            .get_intent(&fixture.object_id, &fixture.intent_id)
+            .expect("committed intent")
+            .expect("committed intent")
+            .status,
+        DfsWriteIntentStatus::Committed,
+        "repair transition must preserve the committed intent"
+    );
+    assert!(
+        !backend
+            .receipts_for_version(&fixture.object_id, &fixture.target_version)
+            .expect("receipts after transition")
+            .iter()
+            .any(|receipt| receipt.replica_node_id == fixture.replica),
+        "the stale target receipt must be durably removed"
+    );
+    assert!(
+        !backend
+            .get_object(&fixture.object_id)
+            .expect("object after transition")
+            .expect("object after transition")
+            .current_locations
+            .contains(&fixture.replica),
+        "the stale target location must be durably removed"
+    );
+    drop(target);
+
+    let target_backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &fixture.metadata_root)
+            .expect("reopened target metadata backend");
+    let mut target = NetworkedDfsService::new(
+        network.add_node(fixture.replica.clone()),
+        LocalContentStore::new(&target_content_root).expect("reopened target content"),
+    )
+    .with_metadata_backend(target_backend)
+    .expect("reopened target hydration");
+    assert_eq!(target.coordinator().repair_jobs().len(), 1);
+    assert_eq!(
+        target.coordinator().repair_jobs()[0].missing_replica_node_id,
+        fixture.replica
+    );
+    let mut owner = NetworkedDfsService::new(
+        owner_transport,
+        LocalContentStore::new(&fixture.content_root).expect("owner source content"),
+    );
+
+    let scheduled = target
+        .retry_pending_repairs_bounded(1)
+        .expect("request exact content from durable source");
+    assert!(
+        scheduled.is_empty(),
+        "self-repair waits for the exact source fetch before committing"
+    );
+    owner.process_incoming().expect("serve exact source fetch");
+    target
+        .process_incoming()
+        .expect("accept fetched exact content");
+
+    assert!(target.coordinator().repair_jobs().is_empty());
+    assert!(
+        target
+            .metadata_backend()
+            .expect("repaired backend")
+            .receipts_for_version(&fixture.object_id, &fixture.target_version)
+            .expect("repaired receipts")
+            .iter()
+            .any(|receipt| receipt.replica_node_id == fixture.replica),
+        "fetch completion must restore the target durability receipt"
+    );
+    let manifest = target
+        .content()
+        .read_manifest(fixture.object_id.as_str(), fixture.target_version.as_str())
+        .expect("repaired target manifest");
+    assert_eq!(manifest.content_hash, fixture.content_hash);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn missing_local_commit_content_prunes_receipt_when_locations_are_already_absent() {
+    let root = temp_root("missing-commit-content-stale-receipt-only");
+    let fixture = seed_durable_commit_promotion_fixture(&root, "stale-receipt-only");
+    let mut backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &fixture.metadata_root)
+            .expect("metadata backend");
+    let mut object = backend
+        .get_object(&fixture.object_id)
+        .expect("object")
+        .expect("object");
+    object
+        .current_locations
+        .retain(|node_id| node_id != &fixture.replica);
+    let mut version = backend
+        .get_version(&fixture.object_id, &fixture.target_version)
+        .expect("version")
+        .expect("version");
+    version
+        .locations
+        .retain(|node_id| node_id != &fixture.replica);
+    backend
+        .put_object_and_version(&object, &version)
+        .expect("pre-pruned locations");
+    assert!(
+        backend
+            .receipts_for_version(&fixture.object_id, &fixture.target_version)
+            .expect("stale receipts")
+            .iter()
+            .any(|receipt| receipt.replica_node_id == fixture.replica),
+        "the fixture must retain only the stale durable receipt"
+    );
+
+    let network = InProcessNetwork::new();
+    let _owner_transport = network.add_node(fixture.owner.clone());
+    let mut target = NetworkedDfsService::new(
+        network.add_node(fixture.replica.clone()),
+        LocalContentStore::new(root.join("target-content")).expect("empty target content"),
+    )
+    .with_metadata_backend(backend)
+    .expect("target metadata hydration");
+    let object_metadata = target
+        .metadata()
+        .object(&fixture.object_id)
+        .cloned()
+        .expect("committed object metadata");
+
+    let event = target
+        .handle_commit_version(
+            fixture.owner,
+            DfsCommitVersionCommand {
+                request_id: "commit_missing_content_stale_receipt_only".to_string(),
+                intent_id: fixture.intent_id.clone(),
+                file_system_id: object_metadata.file_system_id.clone(),
+                object_id: fixture.object_id.clone(),
+                expected_base_version: None,
+                version: fixture.target_version.clone(),
+                content_hash: fixture.content_hash.clone(),
+                object_metadata: Some(object_metadata),
+                authority_shard: None,
+            },
+        )
+        .expect("repair-pending response");
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::RepairRejected { ref reason, .. }
+            if dfs_rejection_is_commit_content_repair_pending(
+                reason,
+                &fixture.object_id,
+                &fixture.target_version,
+                &fixture.content_hash,
+            )
+    ));
+    assert!(
+        !target
+            .metadata_backend()
+            .expect("target backend")
+            .receipts_for_version(&fixture.object_id, &fixture.target_version)
+            .expect("receipts after transition")
+            .iter()
+            .any(|receipt| receipt.replica_node_id == fixture.replica),
+        "terminal repair-pending requires the stale receipt to be durably absent"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn missing_local_commit_content_without_source_remains_pending_with_backoff() {
+    let root = temp_root("missing-commit-content-no-source");
+    let fixture = seed_durable_commit_promotion_fixture(&root, "missing-content-no-source");
+    let target_content_root = root.join("target-content");
+    let backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &fixture.metadata_root)
+            .expect("target metadata backend");
+    let mut target = NetworkedDfsService::new(
+        ReceiveOnlyTransport::new(fixture.replica.clone()),
+        LocalContentStore::new(&target_content_root).expect("empty target content"),
+    )
+    .with_metadata_backend(backend)
+    .expect("target metadata hydration");
+    let object_metadata = target
+        .metadata()
+        .object(&fixture.object_id)
+        .cloned()
+        .expect("committed object metadata");
+
+    let _ = target.handle_commit_version(
+        fixture.owner,
+        DfsCommitVersionCommand {
+            request_id: "commit_missing_content_no_source".to_string(),
+            intent_id: fixture.intent_id.clone(),
+            file_system_id: object_metadata.file_system_id.clone(),
+            object_id: fixture.object_id.clone(),
+            expected_base_version: None,
+            version: fixture.target_version.clone(),
+            content_hash: fixture.content_hash.clone(),
+            object_metadata: Some(object_metadata),
+            authority_shard: None,
+        },
+    );
+    drop(target);
+
+    let backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &fixture.metadata_root)
+            .expect("reopened target metadata backend");
+    let mut target = NetworkedDfsService::new(
+        ReceiveOnlyTransport::new(fixture.replica.clone()),
+        LocalContentStore::new(&target_content_root).expect("reopened target content"),
+    )
+    .with_metadata_backend(backend)
+    .expect("reopened target hydration");
+    assert_eq!(target.coordinator().repair_jobs().len(), 1);
+
+    assert!(
+        target
+            .retry_pending_repairs_bounded(1)
+            .expect("bounded missing-source repair")
+            .is_empty()
+    );
+    assert_eq!(target.coordinator().repair_jobs().len(), 1);
+    assert!(target.pending_writes.contains_key(&fixture.intent_id));
+    let attempts = target.active_repair_attempt_records();
+    assert_eq!(attempts.len(), 1);
+    assert!(!attempts[0].in_flight);
+    assert!(attempts[0].next_retry_unix_nanos > attempts[0].last_attempt_unix_nanos);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn missing_local_commit_content_on_non_authority_keeps_receipt_retryable() {
+    let root = temp_root("missing-commit-content-non-authority");
+    let fixture = seed_durable_commit_promotion_fixture(&root, "missing-content-non-authority");
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig {
+                file_system_id: sifs_file_system_id(),
+                display_name: "SIFS".to_string(),
+                owner_node_id: fixture.owner.clone(),
+                subtree_policies: Vec::new(),
+            })
+            .expect("filesystem config");
+        control
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: sifs_file_system_id(),
+                shard_id: "services".to_string(),
+                primary_node_id: fixture.owner.clone(),
+                replica_node_ids: vec![fixture.replica.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("services shard");
+    });
+    let network = InProcessNetwork::new();
+    let mut owner_transport = network.add_node(fixture.owner.clone());
+    let backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &fixture.metadata_root)
+            .expect("target metadata backend");
+    let mut target = NetworkedDfsService::new(
+        network.add_node(fixture.replica.clone()),
+        LocalContentStore::new(root.join("target-content")).expect("empty target content"),
+    )
+    .with_control_plane(shared_kv)
+    .with_metadata_backend(backend)
+    .expect("target metadata hydration");
+    let object_metadata = target
+        .metadata()
+        .object(&fixture.object_id)
+        .cloned()
+        .expect("committed object metadata");
+
+    let event = target
+        .handle_commit_version(
+            fixture.owner,
+            DfsCommitVersionCommand {
+                request_id: "commit_missing_content_non_authority".to_string(),
+                intent_id: fixture.intent_id.clone(),
+                file_system_id: object_metadata.file_system_id.clone(),
+                object_id: fixture.object_id.clone(),
+                expected_base_version: None,
+                version: fixture.target_version.clone(),
+                content_hash: fixture.content_hash.clone(),
+                object_metadata: Some(object_metadata),
+                authority_shard: None,
+            },
+        )
+        .expect("retryable missing-content response");
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::RepairRejected { ref reason, .. }
+            if !dfs_rejection_is_commit_content_repair_pending(
+                reason,
+                &fixture.object_id,
+                &fixture.target_version,
+                &fixture.content_hash,
+            )
+    ));
+    let response = drain_dfs_messages(&mut owner_transport)
+        .into_iter()
+        .find_map(|message| match message {
+            DfsNetworkMessage::CommitVersionResponse(response) => Some(response),
+            _ => None,
+        })
+        .expect("commit response");
+    assert!(matches!(
+        response.result,
+        DfsBlobTransferResult::Rejected { ref reason }
+            if !dfs_rejection_is_commit_content_repair_pending(
+                reason,
+                &fixture.object_id,
+                &fixture.target_version,
+                &fixture.content_hash,
+            )
+    ));
+    assert!(
+        target
+            .metadata_backend()
+            .expect("target backend")
+            .receipts_for_version(&fixture.object_id, &fixture.target_version)
+            .expect("unchanged receipts")
+            .iter()
+            .any(|receipt| receipt.replica_node_id == fixture.replica),
+        "a non-authority cannot retire or prune the durable receipt"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn missing_local_commit_content_on_retiring_primary_with_pending_handoff_stays_retryable() {
+    let root = temp_root("missing-commit-content-retiring-primary-handoff");
+    let fixture = seed_durable_commit_promotion_fixture(&root, "retiring-primary-handoff");
+    let retiring = DfsMetadataShardConfig {
+        file_system_id: sifs_file_system_id(),
+        shard_id: "services".to_string(),
+        primary_node_id: fixture.replica.clone(),
+        replica_node_ids: vec![fixture.owner.clone()],
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::PathPrefix {
+            prefix: "/services".to_string(),
+        },
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let desired = DfsMetadataShardConfig {
+        primary_node_id: fixture.owner.clone(),
+        replica_node_ids: vec![fixture.replica.clone()],
+        epoch: retiring.epoch + 1,
+        ..retiring.clone()
+    };
+    let (range_started_tx, range_started_rx) = std::sync::mpsc::sync_channel(1);
+    let shared_kv = SharedDfsControlPlaneKvClient::new(RangeSignalingControlPlaneKvClient::new(
+        range_started_tx,
+    ));
+    shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig {
+                file_system_id: sifs_file_system_id(),
+                display_name: "SIFS".to_string(),
+                owner_node_id: fixture.owner.clone(),
+                subtree_policies: Vec::new(),
+            })
+            .expect("filesystem config");
+        control
+            .put_metadata_shard(&retiring)
+            .expect("retiring services shard");
+    });
+
+    let network = InProcessNetwork::new();
+    let mut owner_transport = network.add_node(fixture.owner.clone());
+    let backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &fixture.metadata_root)
+            .expect("target metadata backend");
+    let mut target = NetworkedDfsService::new(
+        network.add_node(fixture.replica.clone()),
+        LocalContentStore::new(root.join("target-content")).expect("empty target content"),
+    )
+    .with_control_plane(shared_kv.clone())
+    .with_metadata_backend(backend)
+    .expect("target metadata hydration");
+    let object_metadata = target
+        .metadata()
+        .object(&fixture.object_id)
+        .cloned()
+        .expect("committed object metadata");
+
+    // Hold the shard publication guard so the transition can complete its
+    // initial shard selection but cannot certify authority yet. Beginning the
+    // handoff at that exact point proves that certification runs under the
+    // guard and observes the newly durable marker before any receipt prune.
+    let publication_guard = crate::service_replica::metadata_shard_publication_guard(
+        &retiring.file_system_id,
+        &retiring.shard_id,
+    );
+    shared_kv.with_client(|kv| kv.arm());
+    let transition_object_id = fixture.object_id.clone();
+    let transition_version = fixture.target_version.clone();
+    let transition_content_hash = fixture.content_hash.clone();
+    let transition = std::thread::spawn(move || {
+        let transitioned = target
+            .transition_missing_local_commit_content_to_repair(
+                &transition_object_id,
+                &transition_version,
+                &transition_content_hash,
+            )
+            .expect("missing-content transition");
+        (target, transitioned)
+    });
+    range_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("transition reached guarded shard selection");
+    shared_kv.with_client(|kv| {
+        DfsControlPlaneStore::new(kv)
+            .begin_metadata_shard_membership_handoff(&retiring, &desired)
+            .expect("begin primary handoff while transition is fenced")
+            .expect("pending primary handoff");
+    });
+    drop(publication_guard);
+    let (mut target, transitioned) = transition.join().expect("join guarded transition");
+    assert!(
+        !transitioned,
+        "a handoff that starts before certification must keep the transition retryable"
+    );
+
+    let event = target
+        .handle_commit_version(
+            fixture.owner.clone(),
+            DfsCommitVersionCommand {
+                request_id: "commit_missing_content_retiring_primary_handoff".to_string(),
+                intent_id: fixture.intent_id.clone(),
+                file_system_id: object_metadata.file_system_id.clone(),
+                object_id: fixture.object_id.clone(),
+                expected_base_version: None,
+                version: fixture.target_version.clone(),
+                content_hash: fixture.content_hash.clone(),
+                object_metadata: Some(object_metadata),
+                authority_shard: None,
+            },
+        )
+        .expect("retryable pending-handoff response");
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::RepairRejected { ref reason, .. }
+            if !dfs_rejection_is_commit_content_repair_pending(
+                reason,
+                &fixture.object_id,
+                &fixture.target_version,
+                &fixture.content_hash,
+            )
+    ));
+    let response = drain_dfs_messages(&mut owner_transport)
+        .into_iter()
+        .find_map(|message| match message {
+            DfsNetworkMessage::CommitVersionResponse(response) => Some(response),
+            _ => None,
+        })
+        .expect("commit response");
+    assert!(matches!(
+        response.result,
+        DfsBlobTransferResult::Rejected { ref reason }
+            if !dfs_rejection_is_commit_content_repair_pending(
+                reason,
+                &fixture.object_id,
+                &fixture.target_version,
+                &fixture.content_hash,
+            )
+    ));
+    assert!(
+        target
+            .metadata_backend()
+            .expect("target backend")
+            .receipts_for_version(&fixture.object_id, &fixture.target_version)
+            .expect("unchanged receipts")
+            .iter()
+            .any(|receipt| receipt.replica_node_id == fixture.replica),
+        "a pending handoff must fence the stale primary before it prunes the durable receipt"
+    );
+    assert!(
+        target
+            .metadata_backend()
+            .expect("target backend")
+            .get_object(&fixture.object_id)
+            .expect("object")
+            .expect("object")
+            .current_locations
+            .contains(&fixture.replica),
+        "a pending handoff must preserve the stale primary location until current authority repairs it"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn missing_local_commit_content_reselects_guard_when_object_moves_shards_before_certification() {
+    let root = temp_root("missing-commit-content-shard-reselection");
+    let fixture = seed_durable_commit_promotion_fixture(&root, "shard-reselection");
+    let initial_shard = DfsMetadataShardConfig {
+        file_system_id: sifs_file_system_id(),
+        shard_id: "services".to_string(),
+        primary_node_id: fixture.replica.clone(),
+        replica_node_ids: vec![fixture.owner.clone()],
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::PathPrefix {
+            prefix: "/services".to_string(),
+        },
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let (range_started_tx, range_started_rx) = std::sync::mpsc::sync_channel(1);
+    let shared_kv = SharedDfsControlPlaneKvClient::new(RangeSignalingControlPlaneKvClient::new(
+        range_started_tx,
+    ));
+    shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig {
+                file_system_id: sifs_file_system_id(),
+                display_name: "SIFS".to_string(),
+                owner_node_id: fixture.owner.clone(),
+                subtree_policies: Vec::new(),
+            })
+            .expect("filesystem config");
+        control
+            .put_metadata_shard(&initial_shard)
+            .expect("initial services shard");
+    });
+
+    let backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &fixture.metadata_root)
+            .expect("target metadata backend");
+    let mut target = NetworkedDfsService::new(
+        ReceiveOnlyTransport::new(fixture.replica.clone()),
+        LocalContentStore::new(root.join("target-content")).expect("empty target content"),
+    )
+    .with_control_plane(shared_kv.clone())
+    .with_metadata_backend(backend)
+    .expect("target metadata hydration");
+    let object_path = target
+        .metadata()
+        .object(&fixture.object_id)
+        .expect("committed object metadata")
+        .path
+        .clone();
+    let moved_shard = DfsMetadataShardConfig {
+        file_system_id: sifs_file_system_id(),
+        shard_id: "services-recovery-object".to_string(),
+        primary_node_id: fixture.replica.clone(),
+        replica_node_ids: vec![fixture.owner.clone()],
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::PathPrefix {
+            prefix: object_path,
+        },
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+
+    let initial_guard = crate::service_replica::metadata_shard_publication_guard(
+        &initial_shard.file_system_id,
+        &initial_shard.shard_id,
+    );
+    shared_kv.with_client(|kv| kv.arm());
+    let transition_object_id = fixture.object_id.clone();
+    let transition_version = fixture.target_version.clone();
+    let transition_content_hash = fixture.content_hash.clone();
+    let transition = std::thread::spawn(move || {
+        let transitioned = target
+            .transition_missing_local_commit_content_to_repair(
+                &transition_object_id,
+                &transition_version,
+                &transition_content_hash,
+            )
+            .expect("missing-content transition");
+        (target, transitioned)
+    });
+    range_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("transition selected the initial shard");
+    shared_kv.with_client(|kv| {
+        DfsControlPlaneStore::new(kv)
+            .put_metadata_shard(&moved_shard)
+            .expect("publish more-specific object shard");
+    });
+    drop(initial_guard);
+
+    let (target, transitioned) = transition.join().expect("join guarded transition");
+    assert!(
+        transitioned,
+        "stable current authority should complete after reacquiring the moved shard guard"
+    );
+    assert!(
+        shared_kv.with_client(|kv| kv.metadata_shard_range_count()) >= 4,
+        "a changed certified shard key must force guarded selection and certification to repeat"
+    );
+    assert!(
+        !target
+            .metadata_backend()
+            .expect("target backend")
+            .receipts_for_version(&fixture.object_id, &fixture.target_version)
+            .expect("receipts after transition")
+            .iter()
+            .any(|receipt| receipt.replica_node_id == fixture.replica),
+        "the receipt may be pruned only after the moved shard is guarded and certified"
+    );
+    std::fs::remove_dir_all(root).ok();
 }
 
 fn recovery_hydration_node_transport(

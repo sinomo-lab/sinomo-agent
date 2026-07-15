@@ -2,10 +2,12 @@
 ///
 /// The outbox is shared by all cached service lanes in one daemon generation.
 /// Each drain attempts every ready identity at most once with a cap of two,
-/// rotates ambiguous failures behind unattempted work, and accepts only an
-/// explicit Committed acknowledgement as settlement. Durable staged receipts
-/// are the restart source of truth; a dedicated recovery scan reconstructs the
-/// volatile outbox without waiting for a namespace read.
+/// rotates ambiguous failures behind unattempted work, accepts only an explicit
+/// Committed acknowledgement as settlement, and separately retires an exact
+/// target when durable intent says it is not desired or the metadata authority
+/// has durably pruned its stale receipt into ordinary repair. Durable staged
+/// evidence is the restart source of truth; a dedicated recovery scan
+/// reconstructs the volatile outbox without waiting for a namespace read.
 module dfs_replica_promotion_outbox {
   type Promotion = P1 | P2 | P3 | P4
   type PromotionKey = K1 | K2 | K3
@@ -19,6 +21,8 @@ module dfs_replica_promotion_outbox {
     | MaintenanceFailureScenario
     | TopologyChangeScenario
     | RetryPacingScenario
+    | NotDesiredRetirementScenario
+    | RepairPendingRetirementScenario
     | SettledReplacementScenario
   type OutboxTransition =
     | OutboxInitialized
@@ -27,6 +31,8 @@ module dfs_replica_promotion_outbox {
     | PromotionCommitted
     | PromotionDurableOnly
     | PromotionRejected
+    | PromotionRetiredNotDesired
+    | PromotionRepairPending
     | DrainRoundReset
     | VolatileStateLost
     | RecoveryQueued
@@ -52,6 +58,8 @@ module dfs_replica_promotion_outbox {
     durableOnlyAcks: Set[Promotion],
     committedAcks: Set[Promotion],
     settledCurrent: Set[Promotion],
+    retiredNotDesired: Set[Promotion],
+    repairPending: Set[Promotion],
     recoveryRequired: bool,
     recoveryRuns: int,
     authorityGeneration: int,
@@ -72,6 +80,8 @@ module dfs_replica_promotion_outbox {
     MaintenanceFailureScenario,
     TopologyChangeScenario,
     RetryPacingScenario,
+    NotDesiredRetirementScenario,
+    RepairPendingRetirementScenario,
     SettledReplacementScenario
   )
   pure val PromotionFanoutCap: int = 2
@@ -115,6 +125,8 @@ module dfs_replica_promotion_outbox {
     durableOnlyAcks: Set(),
     committedAcks: Set(),
     settledCurrent: Set(),
+    retiredNotDesired: Set(),
+    repairPending: Set(),
     recoveryRequired: false,
     recoveryRuns: 0,
     authorityGeneration: 0,
@@ -159,6 +171,8 @@ module dfs_replica_promotion_outbox {
         durableOnlyAcks: Set(),
         committedAcks: Set(),
         settledCurrent: Set(),
+        retiredNotDesired: Set(),
+        repairPending: Set(),
         recoveryRequired: false,
         recoveryRuns: 0,
         authorityGeneration: 1,
@@ -185,6 +199,12 @@ module dfs_replica_promotion_outbox {
     val priorForKey = outbox.settledCurrent.filter(settledPromotion =>
       samePromotionKey(settledPromotion, promotion)
     )
+    val priorRetiredForKey = outbox.retiredNotDesired.filter(retiredPromotion =>
+      samePromotionKey(retiredPromotion, promotion)
+    )
+    val priorRepairForKey = outbox.repairPending.filter(repairPromotion =>
+      samePromotionKey(repairPromotion, promotion)
+    )
     all {
       outbox.phase == OutboxActive,
       outbox.inflight.contains(promotion),
@@ -202,6 +222,18 @@ module dfs_replica_promotion_outbox {
           outbox.settledCurrent
             .filter(settledPromotion => not(priorForKey.contains(settledPromotion)))
             .union(Set(promotion))
+        )
+        .with(
+          "retiredNotDesired",
+          outbox.retiredNotDesired.filter(retiredPromotion =>
+            not(priorRetiredForKey.contains(retiredPromotion))
+          )
+        )
+        .with(
+          "repairPending",
+          outbox.repairPending.filter(repairPromotion =>
+            not(priorRepairForKey.contains(repairPromotion))
+          )
         )
         .with("lastTransition", PromotionCommitted),
     }
@@ -230,6 +262,99 @@ module dfs_replica_promotion_outbox {
       .with("retryPending", outbox.retryPending.union(Set(promotion)))
       .with("retryCooling", outbox.retryCooling.union(Set(promotion)))
       .with("lastTransition", PromotionRejected),
+  }
+
+  /// The receiver's durable intent excludes its local node. Replaying this
+  /// exact target/intent cannot change authorization, so it leaves retry state
+  /// without being counted as a committed acknowledgement.
+  action receiveNotDesiredRejection(promotion: Promotion): bool = {
+    val priorSettledForKey = outbox.settledCurrent.filter(settledPromotion =>
+      samePromotionKey(settledPromotion, promotion)
+    )
+    val priorRetiredForKey = outbox.retiredNotDesired.filter(retiredPromotion =>
+      samePromotionKey(retiredPromotion, promotion)
+    )
+    val priorRepairForKey = outbox.repairPending.filter(repairPromotion =>
+      samePromotionKey(repairPromotion, promotion)
+    )
+    all {
+      outbox.phase == OutboxActive,
+      outbox.inflight.contains(promotion),
+      outbox' = outbox
+        .with("inflight", outbox.inflight.filter(activePromotion => activePromotion != promotion))
+        .with("retryPending", outbox.retryPending.filter(retryPromotion => retryPromotion != promotion))
+        .with("retryCooling", outbox.retryCooling.filter(retryPromotion => retryPromotion != promotion))
+        .with(
+          "durableOnlyAcks",
+          outbox.durableOnlyAcks.filter(durablePromotion => durablePromotion != promotion)
+        )
+        .with(
+          "settledCurrent",
+          outbox.settledCurrent.filter(settledPromotion =>
+            not(priorSettledForKey.contains(settledPromotion))
+          )
+        )
+        .with(
+          "retiredNotDesired",
+          outbox.retiredNotDesired
+            .filter(retiredPromotion => not(priorRetiredForKey.contains(retiredPromotion)))
+            .union(Set(promotion))
+        )
+        .with(
+          "repairPending",
+          outbox.repairPending.filter(repairPromotion =>
+            not(priorRepairForKey.contains(repairPromotion))
+          )
+        )
+        .with("lastTransition", PromotionRetiredNotDesired),
+    }
+  }
+
+  /// The metadata authority has durably removed the target's stale receipt and
+  /// visible location. Replaying this exact notification cannot complete the
+  /// now-independent content repair, so it leaves retry state without being
+  /// counted as a committed acknowledgement.
+  action receiveRepairPendingRejection(promotion: Promotion): bool = {
+    val priorSettledForKey = outbox.settledCurrent.filter(settledPromotion =>
+      samePromotionKey(settledPromotion, promotion)
+    )
+    val priorRetiredForKey = outbox.retiredNotDesired.filter(retiredPromotion =>
+      samePromotionKey(retiredPromotion, promotion)
+    )
+    val priorRepairForKey = outbox.repairPending.filter(repairPromotion =>
+      samePromotionKey(repairPromotion, promotion)
+    )
+    all {
+      outbox.phase == OutboxActive,
+      outbox.inflight.contains(promotion),
+      outbox' = outbox
+        .with("inflight", outbox.inflight.filter(activePromotion => activePromotion != promotion))
+        .with("retryPending", outbox.retryPending.filter(retryPromotion => retryPromotion != promotion))
+        .with("retryCooling", outbox.retryCooling.filter(retryPromotion => retryPromotion != promotion))
+        .with(
+          "durableOnlyAcks",
+          outbox.durableOnlyAcks.filter(durablePromotion => durablePromotion != promotion)
+        )
+        .with(
+          "settledCurrent",
+          outbox.settledCurrent.filter(settledPromotion =>
+            not(priorSettledForKey.contains(settledPromotion))
+          )
+        )
+        .with(
+          "retiredNotDesired",
+          outbox.retiredNotDesired.filter(retiredPromotion =>
+            not(priorRetiredForKey.contains(retiredPromotion))
+          )
+        )
+        .with(
+          "repairPending",
+          outbox.repairPending
+            .filter(repairPromotion => not(priorRepairForKey.contains(repairPromotion)))
+            .union(Set(promotion))
+        )
+        .with("lastTransition", PromotionRepairPending),
+    }
   }
 
   action retryDelayElapsed(promotion: Promotion): bool = all {
@@ -267,6 +392,8 @@ module dfs_replica_promotion_outbox {
       .with("durableOnlyAcks", Set())
       .with("committedAcks", Set())
       .with("settledCurrent", Set())
+      .with("retiredNotDesired", Set())
+      .with("repairPending", Set())
       .with("recoveryRequired", true)
       .with("lastTransition", VolatileStateLost),
   }
@@ -280,6 +407,8 @@ module dfs_replica_promotion_outbox {
       .with("attemptedRound", Set())
       .with("recoveryRequired", false)
       .with("retryCooling", Set())
+      .with("retiredNotDesired", Set())
+      .with("repairPending", Set())
       .with("recoveryRuns", outbox.recoveryRuns + 1)
       .with("recoveryScanGeneration", outbox.authorityGeneration)
       .with("lastTransition", RecoveryQueued),
@@ -387,6 +516,8 @@ module dfs_replica_promotion_outbox {
         .with("durableOnlyAcks", Set())
         .with("committedAcks", Set())
         .with("settledCurrent", Set())
+        .with("retiredNotDesired", Set())
+        .with("repairPending", Set())
         .with("lastTransition", SupersedingPromotionQueued),
     }
   }
@@ -410,6 +541,8 @@ module dfs_replica_promotion_outbox {
         receiveCommitted(promotion),
         receiveDurableOnly(promotion),
         receiveRejected(promotion),
+        receiveNotDesiredRejection(promotion),
+        receiveRepairPendingRejection(promotion),
         retryDelayElapsed(promotion),
       }
     },
@@ -569,6 +702,28 @@ module dfs_replica_promotion_outbox {
       schedulerIdle
     }
 
+  action notDesiredRetirementCoverageStep =
+    if (outbox.phase == OutboxIdle) {
+      startCoverage(NotDesiredRetirementScenario)
+    } else if (outbox.inflight.contains(P1)) {
+      receiveNotDesiredRejection(P1)
+    } else if (outbox.queued.contains(P1)) {
+      dispatch(P1)
+    } else {
+      schedulerIdle
+    }
+
+  action repairPendingRetirementCoverageStep =
+    if (outbox.phase == OutboxIdle) {
+      startCoverage(RepairPendingRetirementScenario)
+    } else if (outbox.inflight.contains(P1)) {
+      receiveRepairPendingRejection(P1)
+    } else if (outbox.queued.contains(P1)) {
+      dispatch(P1)
+    } else {
+      schedulerIdle
+    }
+
   action coverageStep =
     if (outbox.phase == OutboxIdle) {
       nondet scenario = oneOf(CoverageScenarios)
@@ -587,6 +742,10 @@ module dfs_replica_promotion_outbox {
       topologyChangeCoverageStep
     } else if (outbox.coverageScenario == RetryPacingScenario) {
       retryPacingCoverageStep
+    } else if (outbox.coverageScenario == NotDesiredRetirementScenario) {
+      notDesiredRetirementCoverageStep
+    } else if (outbox.coverageScenario == RepairPendingRetirementScenario) {
+      repairPendingRetirementCoverageStep
     } else if (outbox.coverageScenario == SettledReplacementScenario) {
       settledReplacementCoverageStep
     } else {

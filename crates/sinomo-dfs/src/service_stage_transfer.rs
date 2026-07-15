@@ -261,7 +261,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         requester_node_id: NodeId,
         command: DfsCommitVersionCommand,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
-        let result = match self
+        let preflight = self
             .ensure_replica_command_authorized_with_metadata(
                 &requester_node_id,
                 &command.intent_id,
@@ -286,49 +286,45 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &command.version,
                     &command.content_hash,
                 )
-            })
-            .and_then(|()| {
-                self.content
-                    .read_manifest(command.object_id.as_str(), command.version.as_str())
-                    .map_err(DfsError::from)
-            })
-            .and_then(|manifest| {
-                if manifest.content_hash != command.content_hash {
-                    return Err(DfsError::ContentHashMismatch {
-                        expected: command.content_hash.clone(),
-                        actual: manifest.content_hash,
-                    });
-                }
-                if !self.content.manifest_content_available(&manifest)? {
-                    return Err(DfsError::ContentStore {
+            });
+        let commit = preflight.and_then(|()| {
+            if let Err(content_error) = self.ensure_commit_version_content_available(&command) {
+                return match self.transition_missing_local_commit_content_to_repair(
+                    &command.object_id,
+                    &command.version,
+                    &command.content_hash,
+                ) {
+                    Ok(true) => Err(DfsError::CommitContentRepairPending {
+                        object_id: command.object_id.clone(),
+                        version: command.version.clone(),
+                        content_hash: command.content_hash.clone(),
+                    }),
+                    Ok(false) => Err(content_error),
+                    Err(transition_error) => Err(DfsError::Metadata {
                         message: format!(
-                            "committed content bytes are missing for {} {}",
-                            command.object_id, command.version
+                            "{content_error}; failed to transition stale replica receipt to repair: {transition_error}"
                         ),
-                    });
-                }
-                Ok(())
-            })
-            .and_then(|()| {
-                self.ensure_command_base_matches_current(
-                    "commit",
-                    &command.object_id,
-                    command.expected_base_version.as_ref(),
-                    &command.version,
-                    &command.content_hash,
-                )
-            })
-            .and_then(|()| {
-                let local_node_id = self.node_id.clone();
-                self.commit_replica_metadata_cache(
-                    &command.file_system_id,
-                    &command.object_id,
-                    &command.version,
-                    &local_node_id,
-                    &command.content_hash,
-                    command.object_metadata.as_ref(),
-                )
-            }) {
+                    }),
+                };
+            }
+            self.ensure_command_base_matches_current(
+                "commit",
+                &command.object_id,
+                command.expected_base_version.as_ref(),
+                &command.version,
+                &command.content_hash,
+            )?;
+            let local_node_id = self.node_id.clone();
+            self.commit_replica_metadata_cache(
+                &command.file_system_id,
+                &command.object_id,
+                &command.version,
+                &local_node_id,
+                &command.content_hash,
+                command.object_metadata.as_ref(),
+            )
+        });
+        let result = match commit {
             Ok(()) => {
                 // The version is now durably committed on this replica, so the
                 // in-flight stage guard for it is no longer active.
@@ -351,6 +347,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             result.clone(),
         )?;
         Ok(self.commit_version_result_event(command, result))
+    }
+
+    fn ensure_commit_version_content_available(
+        &self,
+        command: &DfsCommitVersionCommand,
+    ) -> Result<(), DfsError> {
+        let manifest = self
+            .content
+            .read_manifest(command.object_id.as_str(), command.version.as_str())?;
+        if manifest.content_hash != command.content_hash {
+            return Err(DfsError::ContentHashMismatch {
+                expected: command.content_hash.clone(),
+                actual: manifest.content_hash,
+            });
+        }
+        if !self.content.manifest_content_available(&manifest)? {
+            return Err(DfsError::ContentStore {
+                message: format!(
+                    "committed content bytes are missing for {} {}",
+                    command.object_id, command.version
+                ),
+            });
+        }
+        Ok(())
     }
 
     fn send_commit_version_response(

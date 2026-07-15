@@ -13,24 +13,39 @@ module dfs_replica_promotion_outbox_safety {
     outbox.durableOnlyAcks.subseteq(outbox.durableEvidence),
     outbox.committedAcks.subseteq(outbox.durableEvidence),
     outbox.settledCurrent.subseteq(outbox.durableEvidence),
+    outbox.retiredNotDesired.subseteq(outbox.durableEvidence),
+    outbox.repairPending.subseteq(outbox.durableEvidence),
     outbox.queued.intersect(outbox.inflight) == Set(),
     outbox.queued.intersect(outbox.settledCurrent) == Set(),
+    outbox.queued.intersect(outbox.retiredNotDesired) == Set(),
+    outbox.queued.intersect(outbox.repairPending) == Set(),
     outbox.inflight.intersect(outbox.settledCurrent) == Set(),
+    outbox.inflight.intersect(outbox.retiredNotDesired) == Set(),
+    outbox.inflight.intersect(outbox.repairPending) == Set(),
+    outbox.settledCurrent.intersect(outbox.retiredNotDesired) == Set(),
+    outbox.settledCurrent.intersect(outbox.repairPending) == Set(),
+    outbox.retiredNotDesired.intersect(outbox.repairPending) == Set(),
     outbox.inflight.subseteq(outbox.attemptedRound),
     outbox.retryPending.subseteq(outbox.queued.union(outbox.inflight)),
     outbox.durableOnlyAcks.subseteq(outbox.retryPending),
     outbox.settledCurrent.subseteq(outbox.committedAcks),
     outbox.durableOnlyAcks.intersect(outbox.settledCurrent) == Set(),
+    outbox.retiredNotDesired.intersect(outbox.committedAcks) == Set(),
+    outbox.repairPending.intersect(outbox.committedAcks) == Set(),
     if (outbox.recoveryRequired) {
       all {
         outbox.queued == Set(),
         outbox.inflight == Set(),
         outbox.settledCurrent == Set(),
+        outbox.retiredNotDesired == Set(),
+        outbox.repairPending == Set(),
       }
     } else {
       outbox.queued
         .union(outbox.inflight)
-        .union(outbox.settledCurrent) == outbox.durableEvidence
+        .union(outbox.settledCurrent)
+        .union(outbox.retiredNotDesired)
+        .union(outbox.repairPending) == outbox.durableEvidence
     },
   }
 
@@ -62,11 +77,14 @@ module dfs_replica_promotion_outbox_safety {
   def coolingRetryNeverDispatches: bool =
     outbox.retryCooling.intersect(dispatchable(outbox)) == Set()
 
-  def settledBookkeepingHasOneVersionPerKey: bool =
+  def terminalBookkeepingHasOneVersionPerKey: bool =
     Promotions.forall(promotion =>
-      outbox.settledCurrent.filter(settledPromotion =>
-        samePromotionKey(settledPromotion, promotion)
-      ).size() <= 1
+      outbox.settledCurrent
+        .union(outbox.retiredNotDesired)
+        .union(outbox.repairPending)
+        .filter(terminalPromotion =>
+          samePromotionKey(terminalPromotion, promotion)
+        ).size() <= 1
     )
 
   /// Repeated daemon restarts may require repeated idempotent reconstruction;
@@ -211,6 +229,31 @@ module dfs_replica_promotion_outbox_safety {
     outbox.settledCurrent == Set(P1, P3),
   }
 
+  def witnessNotDesiredRejectionRetiresWithoutCommit: bool = all {
+    outbox.coverageScenario == NotDesiredRetirementScenario,
+    outbox.queued == Set(),
+    outbox.inflight == Set(),
+    outbox.retryPending == Set(),
+    outbox.retryCooling == Set(),
+    outbox.committedAcks == Set(),
+    outbox.settledCurrent == Set(),
+    outbox.retiredNotDesired == Set(P1),
+    outbox.lastTransition == PromotionRetiredNotDesired,
+  }
+
+  def witnessRepairPendingRejectionRetiresAfterDurablePrune: bool = all {
+    outbox.coverageScenario == RepairPendingRetirementScenario,
+    outbox.queued == Set(),
+    outbox.inflight == Set(),
+    outbox.retryPending == Set(),
+    outbox.retryCooling == Set(),
+    outbox.committedAcks == Set(),
+    outbox.settledCurrent == Set(),
+    outbox.retiredNotDesired == Set(),
+    outbox.repairPending == Set(P1),
+    outbox.lastTransition == PromotionRepairPending,
+  }
+
   def witnessSettledVersionIsReplaced: bool = all {
     outbox.coverageScenario == SettledReplacementScenario,
     outbox.durableEvidence == Set(P2),
@@ -226,7 +269,7 @@ module dfs_replica_promotion_outbox_safety {
     schedulerIdlesOnlyWithoutReadyWork,
     durableOnlyAckNeverSettles,
     coolingRetryNeverDispatches,
-    settledBookkeepingHasOneVersionPerKey,
+    terminalBookkeepingHasOneVersionPerKey,
     recoveryRunsStayMonotonicDomain,
   }
 }
