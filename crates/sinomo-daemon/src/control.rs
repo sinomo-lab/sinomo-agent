@@ -82,19 +82,11 @@ struct DaemonDfsMessageReplayEntry {
     updated_at: Instant,
 }
 
-fn background_dfs_maintenance_enabled() -> bool {
-    background_dfs_maintenance_enabled_for(
-        std::env::var("SINOMO_ENABLE_BACKGROUND_DFS_MAINTENANCE")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn background_dfs_maintenance_enabled_for(value: Option<&str>) -> bool {
-    !matches!(
-        value.map(|value| value.trim().to_ascii_lowercase()),
-        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off")
-    )
+/// The main daemon owns the mandatory default DFS lifecycle. The shadow daemon
+/// is a supervisor and never owns cluster data; there is intentionally no
+/// configuration or environment input to this decision.
+fn daemon_role_owns_default_dfs(label: &str) -> bool {
+    label == "daemon"
 }
 
 async fn daemon_optional_notify(notify: Option<Arc<tokio::sync::Notify>>) {
@@ -615,7 +607,7 @@ pub fn run_daemon_control_loop_with_services(
     if let Err(error) = prune_local_cluster_raft_uncommitted_tail(&paths) {
         tracing::warn!("sinomo {label} cluster raft startup repair skipped: {error}");
     }
-    if label == "daemon" && crate::dfs::default_distributed_dfs_enabled() {
+    if daemon_role_owns_default_dfs(label) {
         ensure_default_local_dfs_expose(&paths)?;
     }
     let daemon_runtime = crate::build_daemon_async_runtime(label)?;
@@ -722,7 +714,7 @@ pub fn run_daemon_control_loop_with_services(
         ),
     ));
 
-    if label == "daemon" && crate::dfs::default_distributed_dfs_enabled() {
+    if daemon_role_owns_default_dfs(label) {
         let bootstrap_paths = paths.clone();
         let bootstrap_options = options.clone();
         let bootstrap_label = label.to_string();
@@ -874,14 +866,9 @@ async fn run_daemon_background_maintenance_loop(
     let mut cluster_network = ClusterNetworkMaintenance::with_idle_stats(idle_stats.clone())
         .await
         .with_service_registry(service_registry);
-    let dfs_maintenance_enabled = background_dfs_maintenance_enabled();
     let maintenance_started = std::time::Instant::now();
     let mut last_dfs_maintenance = maintenance_started
-        .checked_sub(if dfs_maintenance_enabled {
-            DAEMON_DFS_MAINTENANCE_INTERVAL
-        } else {
-            Duration::ZERO
-        })
+        .checked_sub(DAEMON_DFS_MAINTENANCE_INTERVAL)
         .unwrap_or(maintenance_started);
     let mut last_dfs_maintenance_probe = maintenance_started
         .checked_sub(DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL)
@@ -977,8 +964,7 @@ async fn run_daemon_background_maintenance_loop(
             break;
         }
 
-        if dfs_maintenance_enabled
-            && label == "daemon"
+        if daemon_role_owns_default_dfs(&label)
             && !dfs_triggered_maintenance_requested
             && last_dfs_maintenance_probe.elapsed() >= DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL
         {
@@ -1006,8 +992,7 @@ async fn run_daemon_background_maintenance_loop(
             break;
         }
 
-        if dfs_maintenance_enabled
-            && label == "daemon"
+        if daemon_role_owns_default_dfs(&label)
             && (last_dfs_maintenance.elapsed() >= DAEMON_DFS_MAINTENANCE_INTERVAL
                 || (dfs_triggered_maintenance_requested
                     && last_dfs_maintenance.elapsed()
@@ -1142,21 +1127,18 @@ async fn run_daemon_background_maintenance_loop(
         } else {
             None
         };
-        let dfs_triggered_maintenance_due = if dfs_maintenance_enabled
-            && label == "daemon"
-            && dfs_triggered_maintenance_requested
-        {
-            Some(daemon_maintenance_interval_remaining(
-                sleep_started,
-                last_dfs_maintenance,
-                DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL,
-            ))
-        } else {
-            None
-        };
+        let dfs_triggered_maintenance_due =
+            if daemon_role_owns_default_dfs(&label) && dfs_triggered_maintenance_requested {
+                Some(daemon_maintenance_interval_remaining(
+                    sleep_started,
+                    last_dfs_maintenance,
+                    DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL,
+                ))
+            } else {
+                None
+            };
         let dfs_maintenance_probe_due =
-            if dfs_maintenance_enabled && label == "daemon" && !dfs_triggered_maintenance_requested
-            {
+            if daemon_role_owns_default_dfs(&label) && !dfs_triggered_maintenance_requested {
                 Some(daemon_maintenance_interval_remaining(
                     sleep_started,
                     last_dfs_maintenance_probe,
@@ -1185,8 +1167,8 @@ async fn run_daemon_background_maintenance_loop(
             shadow_finalization_due,
             sandbox_lifecycle_maintenance_due,
         );
-        let dfs_notify = (dfs_maintenance_enabled && label == "daemon")
-            .then(|| Arc::clone(&dfs_maintenance_notify));
+        let dfs_notify =
+            daemon_role_owns_default_dfs(&label).then(|| Arc::clone(&dfs_maintenance_notify));
         let network_notify = network_environment_watch
             .as_ref()
             .map(|watch| Arc::clone(&watch.notify));
@@ -6498,17 +6480,19 @@ mod tests {
     }
 
     #[test]
-    fn background_dfs_maintenance_defaults_on_with_disable_override() {
-        assert!(background_dfs_maintenance_enabled_for(None));
-        assert!(background_dfs_maintenance_enabled_for(Some("1")));
-        assert!(background_dfs_maintenance_enabled_for(Some("true")));
-        assert!(background_dfs_maintenance_enabled_for(Some(" yes ")));
-        assert!(background_dfs_maintenance_enabled_for(Some("unexpected")));
+    fn mandatory_default_dfs_has_no_environment_disable_path() {
+        for ignored_legacy_value in [None, Some("0"), Some("false"), Some("off")] {
+            assert!(
+                daemon_role_owns_default_dfs("daemon"),
+                "legacy value {ignored_legacy_value:?} must not disable the main daemon's DFS lifecycle"
+            );
+        }
+        assert!(!daemon_role_owns_default_dfs("shadow-daemon"));
 
-        assert!(!background_dfs_maintenance_enabled_for(Some("0")));
-        assert!(!background_dfs_maintenance_enabled_for(Some("false")));
-        assert!(!background_dfs_maintenance_enabled_for(Some(" no ")));
-        assert!(!background_dfs_maintenance_enabled_for(Some("OFF")));
+        let source = include_str!("control.rs");
+        assert!(!source.contains(concat!("SINOMO_ENABLE_BACKGROUND_DFS_", "MAINTENANCE")));
+        let dfs_source = include_str!("dfs.rs");
+        assert!(!dfs_source.contains(concat!("SINOMO_ENABLE_DEFAULT_DISTRIBUTED_", "DFS")));
     }
 
     #[test]

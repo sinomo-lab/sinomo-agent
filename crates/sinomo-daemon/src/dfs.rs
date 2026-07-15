@@ -481,15 +481,6 @@ fn daemon_dfs_now_unix_nanos() -> u64 {
         .unwrap_or(0)
 }
 
-pub(crate) fn default_distributed_dfs_enabled() -> bool {
-    matches!(
-        std::env::var("SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS")
-            .ok()
-            .as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    )
-}
-
 #[derive(Clone, Debug)]
 struct DaemonDfsControlPlaneKvClient {
     cluster_paths: ClusterPaths,

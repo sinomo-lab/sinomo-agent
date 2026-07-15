@@ -2494,14 +2494,13 @@ impl ClusterNetworkMaintenance {
             if cluster_is_solo {
                 // no-op: nothing to publish to absent peers
             } else if sinomo_core::kv::cluster_kv_raft_local_is_voter(&state) {
-                if crate::dfs::default_distributed_dfs_enabled()
-                    && let Err(error) = ensure_default_distributed_dfs_async_on_runtime(
-                        paths,
-                        options,
-                        true,
-                        runtime.clone(),
-                    )
-                    .await
+                if let Err(error) = ensure_default_distributed_dfs_async_on_runtime(
+                    paths,
+                    options,
+                    true,
+                    runtime.clone(),
+                )
+                .await
                 {
                     tracing::warn!("sinomo daemon distributed DFS control publish failed: {error}");
                     publish_failed = true;
