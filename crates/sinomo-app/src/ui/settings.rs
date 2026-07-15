@@ -3947,6 +3947,68 @@ fn value_row(
         .theme_when(clone_reader(reader))
 }
 
+/// Feedback changes frequently while editing. Keep it in a retained switch so an update never
+/// replaces sibling text controls and invalidates their focus or caret state.
+fn feedback_slot<E, S>(
+    shared: &Shared,
+    reader: &ThemeReader,
+    error_when: E,
+    status_when: S,
+) -> SwitchView
+where
+    E: Fn(&SettingsState) -> Option<String> + 'static,
+    S: Fn(&SettingsState) -> Option<String> + 'static,
+{
+    let error: Rc<dyn Fn() -> Option<String>> = {
+        let s = shared.clone();
+        Rc::new(move || error_when(&s.settings()))
+    };
+    let status: Rc<dyn Fn() -> Option<String>> = {
+        let s = shared.clone();
+        Rc::new(move || status_when(&s.settings()))
+    };
+    let error_label = Label::dynamic("Settings error", {
+        let error = Rc::clone(&error);
+        move || error().unwrap_or_default()
+    })
+    .style(settings_text_style(shared, shared.theme().text.base))
+    .color_when({
+        let s = shared.clone();
+        move || palette(&s).danger_text
+    });
+    let status_label = Label::dynamic("Settings status", {
+        let status = Rc::clone(&status);
+        move || status().unwrap_or_default()
+    })
+    .style(settings_text_style(shared, shared.theme().text.base))
+    .color_when({
+        let s = shared.clone();
+        move || palette(&s).text_muted
+    });
+
+    SwitchView::new()
+        .with_child(SizedBox::new().height(0.0))
+        .with_child(
+            FormRow::new("Error", error_label)
+                .inline()
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormRow::new("Status", status_label)
+                .inline()
+                .theme_when(clone_reader(reader)),
+        )
+        .selected_when(move || {
+            if error().is_some() {
+                1
+            } else if status().is_some() {
+                2
+            } else {
+                0
+            }
+        })
+}
+
 #[derive(Clone)]
 struct ConnectionIssue {
     title: &'static str,
@@ -4041,12 +4103,9 @@ fn cluster_section_key(shared: &Shared) -> String {
         })
         .unwrap_or_default();
     format!(
-        "clustered:{};summary:{:?};invite:{invite_key};join-draft:{};error:{:?};status:{:?};leave:{};join:{}",
+        "clustered:{};summary:{:?};invite:{invite_key};leave:{};join:{}",
         settings.clustered,
         settings.cluster_summary,
-        settings.join_invite.len(),
-        settings.cluster_action_error,
-        settings.cluster_action_status,
         settings.leave_confirming,
         settings.join_confirming
     )
@@ -4101,7 +4160,7 @@ fn skills_section_key(shared: &Shared) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "all:{};selected:{:?};detail:{:?};text:{};import:{};export:{};error:{:?};status:{:?}\n{}",
+        "all:{};selected:{:?};detail:{:?};text:{}\n{}",
         settings.skills_include_all,
         settings.skill_selected,
         settings
@@ -4109,10 +4168,6 @@ fn skills_section_key(shared: &Shared) -> String {
             .as_ref()
             .map(|detail| detail.summary.content_hash.as_str()),
         settings.skill_text_expanded,
-        settings.skill_import_path.len(),
-        settings.skill_export_path.len(),
-        settings.skill_action_error,
-        settings.skill_action_status,
         skill_key
     )
 }
@@ -4924,7 +4979,7 @@ fn section_cluster(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
 }
 
 fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (clustered, cluster_summary, invite_result, action_error, action_status, leave_confirming) = {
+    let (clustered, cluster_summary, invite_result, leave_confirming) = {
         let settings = shared.settings();
         (
             settings.clustered,
@@ -4933,8 +4988,6 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                 .clone()
                 .unwrap_or_else(|| "connected".to_string()),
             settings.invite_result.clone(),
-            settings.cluster_action_error.clone(),
-            settings.cluster_action_status.clone(),
             settings.leave_confirming,
         )
     };
@@ -5078,12 +5131,12 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
     }
 
     body = body.with_child(cluster_join_controls(shared, reader, clustered));
-
-    if let Some(error) = action_error {
-        body = body.with_child(value_row(shared, reader, "Error", error));
-    } else if let Some(status) = action_status {
-        body = body.with_child(value_row(shared, reader, "Status", status));
-    }
+    body = body.with_child(feedback_slot(
+        shared,
+        reader,
+        |settings| settings.cluster_action_error.clone(),
+        |settings| settings.cluster_action_status.clone(),
+    ));
 
     FormSection::new("Cluster", body).theme_when(clone_reader(reader))
 }
@@ -6322,7 +6375,6 @@ fn provider_section_signature(shared: &Shared) -> String {
     let mut parts = vec![
         format!("add:{}", settings.provider_add_open),
         format!("add-provider:{}", settings.provider_add_provider_index),
-        format!("error:{:?}", settings.provider_add_error),
         format!("action-error:{:?}", settings.provider_action_error),
         format!("action-status:{:?}", settings.provider_action_status),
         format!("remove:{:?}", settings.provider_remove_confirming),
@@ -6459,15 +6511,11 @@ fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
 }
 
 fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (selected_index, uses_device_login, error) = {
+    let (selected_index, uses_device_login) = {
         let settings = shared.settings();
         (
             settings.provider_add_provider_index,
             settings.provider_add_uses_device_login(),
-            settings
-                .provider_add_error
-                .clone()
-                .or_else(|| settings.provider_action_error.clone()),
         )
     };
     let provider_labels: Vec<String> = CONFIGURABLE_PROVIDERS
@@ -6559,9 +6607,22 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
             },
         ));
 
-    if let Some(error) = error {
-        body = body.with_child(value_row(shared, reader, "Error", error));
-    }
+    body = body.with_child(feedback_slot(
+        shared,
+        reader,
+        |settings| {
+            settings
+                .provider_add_error
+                .clone()
+                .or_else(|| settings.provider_action_error.clone())
+        },
+        |settings| {
+            settings
+                .provider_action_status
+                .as_ref()
+                .map(|status| status.message.clone())
+        },
+    ));
 
     let cancel = {
         let s = shared.clone();
@@ -6651,27 +6712,16 @@ fn agents_section_key(shared: &Shared) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "selected:{:?};error:{:?};status:{:?};delete:{:?};import:{};export:{};report:{:?};form:{}\n{agents}",
+        "selected:{:?};delete:{:?};report:{:?};editor:{:?}\n{agents}",
         settings.agent_selected_id,
-        settings.agent_action_error,
-        settings.agent_action_status,
         settings.agent_delete_confirming,
-        settings.agent_import_path,
-        settings.agent_export_path,
         settings.agent_validation_report,
-        agent_form_signature(&settings.agent_form)
+        settings.agent_form.previous_id,
     )
 }
 
 fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (snapshot, action_error, action_status) = {
-        let settings = shared.settings();
-        (
-            settings.agent_snapshot.clone(),
-            settings.agent_action_error.clone(),
-            settings.agent_action_status.clone(),
-        )
-    };
+    let snapshot = shared.settings().agent_snapshot.clone();
     let list = {
         let s = shared.clone();
         ListView::new("agent-config-list")
@@ -6774,11 +6824,12 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
     if let Some(error) = snapshot.error {
         summary_body = summary_body.with_child(value_row(shared, reader, "Catalog error", error));
     }
-    if let Some(error) = action_error {
-        summary_body = summary_body.with_child(value_row(shared, reader, "Error", error));
-    } else if let Some(status) = action_status {
-        summary_body = summary_body.with_child(value_row(shared, reader, "Status", status));
-    }
+    summary_body = summary_body.with_child(feedback_slot(
+        shared,
+        reader,
+        |settings| settings.agent_action_error.clone(),
+        |settings| settings.agent_action_status.clone(),
+    ));
 
     let mut stack = Stack::vertical()
         .spacing(14.0)
@@ -7554,29 +7605,6 @@ where
         .theme_when(clone_reader(reader))
 }
 
-fn agent_form_signature(form: &AgentForm) -> String {
-    format!(
-        "{:?}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-        form.previous_id,
-        form.id,
-        form.name,
-        form.description,
-        form.role_index,
-        form.system_prompt,
-        form.provider,
-        form.model,
-        form.temperature,
-        form.max_output_tokens,
-        form.max_steps,
-        form.max_tool_calls_per_step,
-        form.max_model_repair_attempts,
-        form.sandbox_node_id,
-        form.output_format_index,
-        form.skills_text,
-        form.allow_tools_text
-    )
-}
-
 fn agent_tools_summary(definition: &AgentDefinition) -> String {
     let tools = definition.tools.len();
     let visible = definition.tool_surface.visible_toolsets.len();
@@ -8231,24 +8259,13 @@ fn section_skills(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> 
 }
 
 fn section_skills_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (
-        skills,
-        include_all,
-        import_path,
-        export_path,
-        action_error,
-        action_status,
-        detail,
-        text_expanded,
-    ) = {
+    let (skills, include_all, import_path, export_path, detail, text_expanded) = {
         let settings = shared.settings();
         (
             settings.skills.clone(),
             settings.skills_include_all,
             settings.skill_import_path.clone(),
             settings.skill_export_path.clone(),
-            settings.skill_action_error.clone(),
-            settings.skill_action_status.clone(),
             settings.skill_detail.clone(),
             settings.skill_text_expanded,
         )
@@ -8356,11 +8373,12 @@ fn section_skills_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         .inline()
         .theme_when(clone_reader(reader)),
     );
-    if let Some(error) = action_error {
-        summary_body = summary_body.with_child(value_row(shared, reader, "Error", error));
-    } else if let Some(status) = action_status {
-        summary_body = summary_body.with_child(value_row(shared, reader, "Status", status));
-    }
+    summary_body = summary_body.with_child(feedback_slot(
+        shared,
+        reader,
+        |settings| settings.skill_action_error.clone(),
+        |settings| settings.skill_action_status.clone(),
+    ));
 
     let summary = FormSection::new("Skills", summary_body)
         .description("Manage imported and generated SKILL.md files used by agents.")
@@ -11008,6 +11026,112 @@ mod tests {
             rx: result_rx,
         });
         state.pump_operations()
+    }
+
+    #[test]
+    fn live_text_drafts_do_not_change_retained_section_keys() {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+
+        shared.settings_mut().cluster_action_status = Some("Ready".to_string());
+        let cluster_key = cluster_section_key(&shared);
+        shared
+            .settings_mut()
+            .set_join_invite("sinomo://cluster/join/test".to_string());
+        assert_eq!(
+            cluster_section_key(&shared),
+            cluster_key,
+            "typing a join link must not replace the focused cluster section"
+        );
+
+        shared.settings_mut().create_agent();
+        shared.settings_mut().agent_action_status = Some("Draft loaded".to_string());
+        let agents_key = agents_section_key(&shared);
+        {
+            let mut settings = shared.settings_mut();
+            settings.set_agent_name("Draft agent".to_string());
+            settings.set_agent_system_prompt("Keep the editor focused.".to_string());
+            settings.set_agent_import_path("agent.json".to_string());
+            settings.set_agent_export_path("exported-agent.json".to_string());
+        }
+        assert_eq!(
+            agents_section_key(&shared),
+            agents_key,
+            "agent form and package path drafts must not replace the focused agents section"
+        );
+
+        shared.settings_mut().skill_action_status = Some("Ready".to_string());
+        let skills_key = skills_section_key(&shared);
+        {
+            let mut settings = shared.settings_mut();
+            settings.set_skill_import_path("SKILL.md".to_string());
+            settings.set_skill_export_path("exported-SKILL.md".to_string());
+        }
+        assert_eq!(
+            skills_section_key(&shared),
+            skills_key,
+            "skill path drafts must not replace the focused skills section"
+        );
+
+        {
+            let mut settings = shared.settings_mut();
+            settings.open_provider_add();
+            settings.provider_add_error = Some("API key required".to_string());
+        }
+        let providers_key = provider_section_signature(&shared);
+        shared
+            .settings_mut()
+            .set_provider_add_api_key("secret".to_string());
+        assert_eq!(
+            provider_section_signature(&shared),
+            providers_key,
+            "clearing add-provider validation feedback must not replace its focused input"
+        );
+    }
+
+    #[test]
+    fn settings_text_input_keeps_focus_across_character_commits() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            let settings = &mut app.ready.as_mut().expect("ready state").settings;
+            settings.open(SettingsSection::Agents);
+            settings.agent_import_path.clear();
+            settings.agent_action_status = Some("Previous operation completed".to_string());
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings input focus")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let field = window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("agent-import-path");
+
+        window
+            .get_by_text("Previous operation completed")
+            .expect()
+            .to_be_visible()?;
+        field.focus()?;
+        field.fill("A")?;
+        field.expect().to_be_focused()?;
+        window
+            .get_by_text("Previous operation completed")
+            .expect()
+            .to_be_hidden()?;
+        field.fill("B")?;
+        field.expect().to_be_focused()?;
+        field.expect().to_have_value("AB")?;
+        assert_eq!(shared.settings().agent_import_path, "AB");
+
+        Ok(())
     }
 
     #[test]
