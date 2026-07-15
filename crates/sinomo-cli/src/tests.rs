@@ -14997,6 +14997,44 @@ fn workspace_tool_registry_grants_mutation_only_to_builtin_coding_agent() {
 }
 
 #[test]
+fn explicit_agent_sandbox_attachment_is_never_provisioned_by_tool_setup() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-explicit-agent-sandbox");
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace).expect("create workspace");
+    let session_id = SessionId::generate();
+    let sandbox_id = SandboxId::from_legacy_named("shared_explicit_sandbox").expect("sandbox id");
+    let mut agent_session =
+        sinomo_agent::AgentSession::new(session_id.clone(), sinomo_agent::AgentRole::Deliberation);
+    agent_session
+        .attach_sandbox(sinomo_agent::AgentSessionSandboxAttachment {
+            sandbox_id: sandbox_id.to_string(),
+            server_id: "local-daemon".to_string(),
+            attachment_kind: sinomo_agent::AgentSessionSandboxAttachmentKind::Explicit,
+        })
+        .expect("attach explicit sandbox");
+    let session_store = sinomo_agent::FileAgentSessionStore::for_data_dir(&data_dir);
+    sinomo_agent::AgentSessionStore::save_session(&session_store, &agent_session)
+        .expect("save session");
+
+    super::agent_tool_registry_for_workspace(
+        &data_dir,
+        &workspace,
+        &sinomo_agent::AgentDefinition::coding(),
+        Some(&session_id),
+        None,
+        true,
+    )
+    .expect("configure tool registry");
+
+    let sandbox_store = LocalSandboxInstanceStore::new(data_dir.root().join("sandbox/runtime"));
+    assert!(
+        sandbox_store.load(&sandbox_id).is_err(),
+        "tool setup must not create a sandbox for an explicit attachment"
+    );
+}
+
+#[test]
 fn coding_agent_rejects_unsafe_mutating_workspace_roots() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-unsafe-workspace");
     let data_dir = SinomoDataDir::new(root.join("data"));

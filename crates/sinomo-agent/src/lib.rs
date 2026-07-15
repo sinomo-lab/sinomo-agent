@@ -376,6 +376,8 @@ pub struct AgentDefinition {
         skip_serializing_if = "AgentRuntimeLimitsDefinition::is_default"
     )]
     pub runtime_limits: AgentRuntimeLimitsDefinition,
+    #[serde(default, skip_serializing_if = "AgentPlacementDefinition::is_default")]
+    pub placement: AgentPlacementDefinition,
     #[serde(
         default,
         skip_serializing_if = "AgentToolRuntimeDefinition::is_default"
@@ -586,6 +588,28 @@ impl AgentRuntimeLimitsDefinition {
     }
 }
 
+/// Preferred placement for new sessions of this agent.
+///
+/// The home server is a starting preference, not an ownership boundary. The
+/// active session host is recorded on [`AgentSession`] and can change only via
+/// explicit migration.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentPlacementDefinition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_server_node_id: Option<String>,
+}
+
+impl AgentPlacementDefinition {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub fn with_home_server_node_id(mut self, node_id: impl Into<String>) -> Self {
+        self.home_server_node_id = Some(node_id.into());
+        self
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct AgentToolRuntimeDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -720,6 +744,7 @@ impl AgentDefinition {
             compaction: AgentCompactionDefinition::default(),
             model_policy: AgentModelPolicy::default(),
             runtime_limits: AgentRuntimeLimitsDefinition::default(),
+            placement: AgentPlacementDefinition::default(),
             tool_runtime: AgentToolRuntimeDefinition::default(),
             output_format: AgentOutputFormat::JsonDecision,
             temperature: None,
@@ -749,6 +774,7 @@ impl AgentDefinition {
                 ..AgentModelPolicy::default()
             },
             runtime_limits: AgentRuntimeLimitsDefinition::default(),
+            placement: AgentPlacementDefinition::default(),
             tool_runtime: AgentToolRuntimeDefinition::default(),
             output_format: AgentOutputFormat::JsonDecision,
             temperature,
@@ -778,6 +804,7 @@ impl AgentDefinition {
                 ..AgentModelPolicy::default()
             },
             runtime_limits: AgentRuntimeLimitsDefinition::default(),
+            placement: AgentPlacementDefinition::default(),
             tool_runtime: AgentToolRuntimeDefinition::default(),
             output_format: AgentOutputFormat::JsonDecision,
             temperature,
@@ -806,6 +833,7 @@ impl AgentDefinition {
                 ..AgentModelPolicy::default()
             },
             runtime_limits: AgentRuntimeLimitsDefinition::default(),
+            placement: AgentPlacementDefinition::default(),
             tool_runtime: AgentToolRuntimeDefinition::default(),
             output_format: AgentOutputFormat::JsonDecision,
             temperature,
@@ -834,6 +862,7 @@ impl AgentDefinition {
                 ..AgentModelPolicy::default()
             },
             runtime_limits: AgentRuntimeLimitsDefinition::default(),
+            placement: AgentPlacementDefinition::default(),
             tool_runtime: AgentToolRuntimeDefinition::default(),
             output_format: AgentOutputFormat::JsonDecision,
             temperature,
@@ -880,6 +909,11 @@ impl AgentDefinition {
 
     pub fn with_tool_runtime(mut self, tool_runtime: AgentToolRuntimeDefinition) -> Self {
         self.tool_runtime = tool_runtime;
+        self
+    }
+
+    pub fn with_home_server_node_id(mut self, node_id: impl Into<String>) -> Self {
+        self.placement.home_server_node_id = Some(node_id.into());
         self
     }
 
@@ -965,6 +999,8 @@ pub enum AgentDefinitionValidationError {
     InvalidRuntimeLimit { id: String, field: String },
     #[error("agent definition `{id}` has invalid sandbox runtime node id `{node_id}`")]
     InvalidSandboxRuntimeNodeId { id: String, node_id: String },
+    #[error("agent definition `{id}` has invalid home server node id `{node_id}`")]
+    InvalidHomeServerNodeId { id: String, node_id: String },
     #[error("agent definition `{id}` module provenance is missing module id")]
     MissingProvenanceModuleId { id: String },
     #[error(
@@ -1156,6 +1192,14 @@ impl AgentDefinitionValidator {
                     node_id: node_id.to_string(),
                 },
             );
+        }
+        if let Some(node_id) = definition.placement.home_server_node_id.as_deref()
+            && !is_valid_agent_sandbox_runtime_node_id(node_id)
+        {
+            return Err(AgentDefinitionValidationError::InvalidHomeServerNodeId {
+                id: id.to_string(),
+                node_id: node_id.to_string(),
+            });
         }
         if !self
             .context_strategies
@@ -2946,12 +2990,21 @@ mod tests {
             error,
             AgentDefinitionValidationError::InvalidSandboxRuntimeNodeId { .. }
         ));
+
+        let definition = AgentDefinition::custom("bad-agent", AgentRole::Main, "Be helpful.")
+            .with_home_server_node_id("bad node");
+        let error = definition.validate().expect_err("invalid home server node");
+        assert!(matches!(
+            error,
+            AgentDefinitionValidationError::InvalidHomeServerNodeId { .. }
+        ));
     }
 
     #[test]
     fn agent_definition_serializes_tool_runtime_default() {
         let definition = AgentDefinition::custom("worker-agent", AgentRole::Main, "Be helpful.")
-            .with_sandbox_runtime_node_id("worker-node");
+            .with_sandbox_runtime_node_id("worker-node")
+            .with_home_server_node_id("home-node");
 
         definition.validate().expect("definition validates");
         let value = serde_json::to_value(&definition).expect("serialize definition");
@@ -2961,12 +3014,22 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("worker-node")
         );
+        assert_eq!(
+            value
+                .pointer("/placement/home_server_node_id")
+                .and_then(serde_json::Value::as_str),
+            Some("home-node")
+        );
 
         let round_trip: AgentDefinition =
             serde_json::from_value(value).expect("deserialize definition");
         assert_eq!(
             round_trip.tool_runtime.sandbox_node_id.as_deref(),
             Some("worker-node")
+        );
+        assert_eq!(
+            round_trip.placement.home_server_node_id.as_deref(),
+            Some("home-node")
         );
     }
 

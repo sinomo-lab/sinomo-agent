@@ -128,8 +128,19 @@ pub struct AgentSession {
     pub state_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_definition_key: Option<String>,
+    /// Legacy single-workspace execution snapshot. Chats and channels own the
+    /// authoritative ordered workspace list; this field remains readable so
+    /// older persisted sessions can resume during the migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_binding: Option<WorkspaceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_placement: Option<AgentSessionExecutionPlacement>,
+    /// Reference to one independently managed persistent sandbox resource.
+    /// The agent session never owns the sandbox lifecycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_attachment: Option<AgentSessionSandboxAttachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resource_bindings: Vec<AgentSessionResourceBinding>,
     pub transcript: AgentTranscript,
     #[serde(default, skip_serializing_if = "AgentTranscript::is_empty")]
     pub raw_transcript: AgentTranscript,
@@ -151,6 +162,9 @@ impl AgentSession {
             state_revision: 0,
             agent_definition_key: None,
             workspace_binding: None,
+            execution_placement: None,
+            sandbox_attachment: None,
+            resource_bindings: Vec::new(),
             transcript: AgentTranscript::new(),
             raw_transcript: AgentTranscript::new(),
             projection: None,
@@ -163,6 +177,80 @@ impl AgentSession {
     pub fn with_agent_definition_key(mut self, key: impl Into<String>) -> Self {
         self.agent_definition_key = Some(key.into());
         self
+    }
+
+    /// Select the host for a new session. An agent's configured home server is
+    /// preferred; otherwise the daemon processing the creation request owns
+    /// the session.
+    pub fn place_new_session(
+        &mut self,
+        definition: &AgentDefinition,
+        processing_server_id: impl Into<String>,
+    ) {
+        self.execution_placement = Some(AgentSessionExecutionPlacement::for_new_session(
+            definition,
+            processing_server_id,
+        ));
+        self.advance_state_revision();
+    }
+
+    /// Explicitly migrate the session host without attempting to copy
+    /// node-local resources or implicitly moving its sandbox.
+    pub fn migrate_to_server(
+        &mut self,
+        target_server_id: impl Into<String>,
+    ) -> AgentSessionMigrationReport {
+        let target_server_id = target_server_id.into();
+        let placement =
+            self.execution_placement
+                .get_or_insert_with(|| AgentSessionExecutionPlacement {
+                    active_server_id: target_server_id.clone(),
+                    generation: 0,
+                });
+        let source_server_id = placement.active_server_id.clone();
+        if source_server_id == target_server_id {
+            return AgentSessionMigrationReport {
+                source_server_id,
+                target_server_id,
+                placement_generation: placement.generation,
+                unavailable_resource_ids: Vec::new(),
+            };
+        }
+
+        placement.active_server_id = target_server_id.clone();
+        placement.generation = placement.generation.saturating_add(1);
+        let placement_generation = placement.generation;
+        let mut unavailable_resource_ids = Vec::new();
+        for binding in &mut self.resource_bindings {
+            if binding.mark_unavailable_after_session_migration(&target_server_id) {
+                unavailable_resource_ids.push(binding.resource_id.clone());
+            }
+        }
+        self.advance_state_revision();
+        AgentSessionMigrationReport {
+            source_server_id,
+            target_server_id,
+            placement_generation,
+            unavailable_resource_ids,
+        }
+    }
+
+    pub fn attach_sandbox(
+        &mut self,
+        attachment: AgentSessionSandboxAttachment,
+    ) -> Result<(), AgentSessionSandboxAttachmentError> {
+        if let Some(existing) = self.sandbox_attachment.as_ref() {
+            if existing == &attachment {
+                return Ok(());
+            }
+            return Err(AgentSessionSandboxAttachmentError::AlreadyAttached {
+                session_id: self.session_id.clone(),
+                sandbox_id: existing.sandbox_id.clone(),
+            });
+        }
+        self.sandbox_attachment = Some(attachment);
+        self.advance_state_revision();
+        Ok(())
     }
 
     pub fn append_run(&mut self, run: &AgentRun) {
@@ -390,6 +478,117 @@ impl WorkspaceRef {
         self.write_policy = Some(write_policy.into());
         self
     }
+}
+
+/// Durable routing record for the process that owns an active agent session.
+/// Chat ingress must be routed to `active_server_id`; receiving a message on a
+/// different device never changes this record.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentSessionExecutionPlacement {
+    pub active_server_id: String,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub generation: u64,
+}
+
+impl AgentSessionExecutionPlacement {
+    pub fn for_new_session(
+        definition: &AgentDefinition,
+        processing_server_id: impl Into<String>,
+    ) -> Self {
+        let processing_server_id = processing_server_id.into();
+        Self {
+            active_server_id: definition
+                .placement
+                .home_server_node_id
+                .clone()
+                .unwrap_or(processing_server_id),
+            generation: 0,
+        }
+    }
+}
+
+/// A session attachment to a sandbox resource managed through the sandbox
+/// service. Multiple sessions may attach the same sandbox, but one session has
+/// at most one sandbox attachment.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentSessionSandboxAttachment {
+    pub sandbox_id: String,
+    pub server_id: String,
+    #[serde(default)]
+    pub attachment_kind: AgentSessionSandboxAttachmentKind,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionSandboxAttachmentKind {
+    #[default]
+    Automatic,
+    Explicit,
+}
+
+#[derive(Clone, Debug, thiserror::Error, Eq, PartialEq)]
+pub enum AgentSessionSandboxAttachmentError {
+    #[error("agent session `{session_id}` is already attached to sandbox `{sandbox_id}`")]
+    AlreadyAttached {
+        session_id: SessionId,
+        sandbox_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentSessionResourceBinding {
+    pub resource_id: String,
+    pub kind: AgentSessionResourceKind,
+    pub location: AgentSessionResourceLocation,
+    #[serde(default)]
+    pub availability: AgentSessionResourceAvailability,
+}
+
+impl AgentSessionResourceBinding {
+    fn mark_unavailable_after_session_migration(&mut self, target_server_id: &str) -> bool {
+        let becomes_unavailable = matches!(
+            &self.location,
+            AgentSessionResourceLocation::SessionServerLocal { server_id, .. }
+                if server_id != target_server_id
+        );
+        if becomes_unavailable {
+            self.availability = AgentSessionResourceAvailability::UnavailableAfterMigration;
+        }
+        becomes_unavailable
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionResourceKind {
+    AgentHome,
+    Workspace,
+    Other,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentSessionResourceLocation {
+    Sifs { path: String },
+    SessionServerLocal { server_id: String, path: PathBuf },
+    SandboxLocal { sandbox_id: String, path: String },
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionResourceAvailability {
+    #[default]
+    Available,
+    UnavailableAfterMigration,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentSessionMigrationReport {
+    pub source_server_id: String,
+    pub target_server_id: String,
+    pub placement_generation: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable_resource_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -11103,6 +11302,85 @@ mod tests {
     use sinomo_runtime::node::NodeId;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn new_session_prefers_agent_home_server_and_migration_does_not_move_sandbox() {
+        let definition = AgentDefinition::custom("remote-agent", AgentRole::Main, "Help.")
+            .with_home_server_node_id("home-server");
+        let mut session = AgentSession::new(SessionId::generate(), AgentRole::Main);
+        session.place_new_session(&definition, "request-server");
+        session.resource_bindings = vec![
+            AgentSessionResourceBinding {
+                resource_id: "home".to_string(),
+                kind: AgentSessionResourceKind::AgentHome,
+                location: AgentSessionResourceLocation::Sifs {
+                    path: "/sinomo/agents/remote-agent/home".to_string(),
+                },
+                availability: AgentSessionResourceAvailability::Available,
+            },
+            AgentSessionResourceBinding {
+                resource_id: "local-workspace".to_string(),
+                kind: AgentSessionResourceKind::Workspace,
+                location: AgentSessionResourceLocation::SessionServerLocal {
+                    server_id: "home-server".to_string(),
+                    path: PathBuf::from("/srv/workspace"),
+                },
+                availability: AgentSessionResourceAvailability::Available,
+            },
+        ];
+        session
+            .attach_sandbox(AgentSessionSandboxAttachment {
+                sandbox_id: "sandbox-1".to_string(),
+                server_id: "sandbox-server".to_string(),
+                attachment_kind: AgentSessionSandboxAttachmentKind::Automatic,
+            })
+            .expect("attach sandbox");
+
+        let report = session.migrate_to_server("target-server");
+
+        let placement = session.execution_placement.as_ref().expect("placement");
+        assert_eq!(placement.active_server_id, "target-server");
+        assert_eq!(placement.generation, 1);
+        assert_eq!(
+            session
+                .sandbox_attachment
+                .as_ref()
+                .expect("sandbox")
+                .server_id,
+            "sandbox-server",
+            "session migration must not implicitly move the sandbox attachment"
+        );
+        assert_eq!(report.unavailable_resource_ids, ["local-workspace"]);
+        assert_eq!(
+            session.resource_bindings[0].availability,
+            AgentSessionResourceAvailability::Available,
+            "SIFS remains accessible after migration"
+        );
+        assert_eq!(
+            session.resource_bindings[1].availability,
+            AgentSessionResourceAvailability::UnavailableAfterMigration
+        );
+
+        let replacement = AgentSessionSandboxAttachment {
+            sandbox_id: "sandbox-2".to_string(),
+            server_id: "target-server".to_string(),
+            attachment_kind: AgentSessionSandboxAttachmentKind::Explicit,
+        };
+        assert!(matches!(
+            session.attach_sandbox(replacement),
+            Err(AgentSessionSandboxAttachmentError::AlreadyAttached { .. })
+        ));
+
+        let mut other_session = AgentSession::new(SessionId::generate(), AgentRole::Main);
+        other_session
+            .attach_sandbox(
+                session
+                    .sandbox_attachment
+                    .clone()
+                    .expect("shared attachment"),
+            )
+            .expect("a sandbox resource may be shared by another session");
+    }
 
     struct SequencedModel {
         responses: Mutex<VecDeque<String>>,

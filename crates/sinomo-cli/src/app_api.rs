@@ -57,6 +57,7 @@ use crate::error::CliError;
 use crate::tui::{
     self, DefaultMainAgentChatModel, InteractionRuntime, RuntimeMainAgentInteractionHandler,
 };
+use crate::{workspace_binding_root_for_data_dir, workspace_ref_for_selected_root};
 
 type Handler = RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>;
 const APP_CHAT_RUNTIME_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
@@ -202,8 +203,9 @@ impl From<tui::AppRuntimeInfo> for ChatRuntimeInfo {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ChatToolRuntimeSelection {
     pub sandbox_node_id: Option<String>,
-    /// Device-local directory used for this chat's tools. The canonical copy
-    /// is persisted in `AgentSession.workspace_binding` so resume is safe.
+    /// First workspace used as the sandbox cwd. The chat/channel's ordered
+    /// `workspaces` list is authoritative; the legacy session binding is read
+    /// only when resuming snapshots written before that list existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<PathBuf>,
 }
@@ -1114,7 +1116,13 @@ impl SifsAgentChannelStore {
                 detail: source.to_string(),
             }
         })?;
-        self.write_file(&Self::snapshot_path(&channel.channel_id), &bytes)
+        match self.write_file(&Self::snapshot_path(&channel.channel_id), &bytes) {
+            // The snapshot is only a repairable cache over immutable metadata
+            // records. A concurrent writer winning the optimistic SIFS update
+            // must not make the immutable record append look unsuccessful.
+            Err(AgentChannelStoreError::Io { detail, .. }) if detail.contains("conflict") => Ok(()),
+            result => result,
+        }
     }
 
     /// Resolve channel metadata from immutable state records. `snapshot.json`
@@ -1626,6 +1634,21 @@ fn merge_channel_snapshot(
             .or_insert_with(|| user.clone());
     }
     merged.users = users.into_values().collect();
+
+    // Workspace order is user intent, so retain the newer snapshot's order
+    // and append concurrently added entries from the older snapshot. Identity
+    // is the stable WorkspaceRef id; metadata from the newer snapshot wins.
+    let mut workspaces = newer.workspaces.clone();
+    let mut workspace_ids = workspaces
+        .iter()
+        .map(|workspace| workspace.id.clone())
+        .collect::<BTreeSet<_>>();
+    for workspace in &older.workspaces {
+        if workspace_ids.insert(workspace.id.clone()) {
+            workspaces.push(workspace.clone());
+        }
+    }
+    merged.workspaces = workspaces;
 
     let mut participants = newer
         .participants
@@ -2561,6 +2584,10 @@ impl AgentChat {
         self.tool_runtime.clone()
     }
 
+    pub fn workspaces(&self) -> Vec<sinomo_agent::WorkspaceRef> {
+        self.channel.workspaces.clone()
+    }
+
     pub fn set_tool_runtime_node(
         &mut self,
         sandbox_node_id: Option<String>,
@@ -2597,6 +2624,12 @@ impl AgentChat {
 
         let session_id = self.runtime.session().session_id.clone();
         let sandbox_node_id = parse_chat_tool_runtime_selection(&selection)?;
+        let conversation_workspace =
+            channel_primary_workspace_root(&self.data_dir, &self.channel, &session_id)?;
+        let requested_workspace_root = selection
+            .workspace_root
+            .as_deref()
+            .or(conversation_workspace.as_deref());
         let selected_root = self
             .runtime
             .handler_mut()
@@ -2604,9 +2637,17 @@ impl AgentChat {
                 &self.data_dir,
                 &session_id,
                 sandbox_node_id,
-                selection.workspace_root.as_deref(),
+                requested_workspace_root,
                 self.daemon_connected,
             )?;
+        if let Some(root) = selected_root.as_ref() {
+            let workspace = workspace_ref_for_selected_root(&self.data_dir, root)?
+                .binding()
+                .clone();
+            let workspace_id = workspace.id.clone();
+            self.channel.add_workspace(workspace);
+            self.channel.move_workspace(&workspace_id, 0);
+        }
         selection.workspace_root = selected_root;
         self.tool_runtime = selection;
         self.tool_runtime_explicit_override = true;
@@ -2633,6 +2674,11 @@ impl AgentChat {
         session_id: &SessionId,
     ) -> Result<(), CliError> {
         let sandbox_node_id = parse_chat_tool_runtime_selection(&self.tool_runtime)?;
+        let conversation_workspace =
+            channel_primary_workspace_root(&self.data_dir, &self.channel, session_id)?;
+        let requested_workspace_root = conversation_workspace
+            .as_deref()
+            .or(self.tool_runtime.workspace_root.as_deref());
         let selected_root = self
             .runtime
             .handler_mut()
@@ -2640,9 +2686,18 @@ impl AgentChat {
                 &self.data_dir,
                 session_id,
                 sandbox_node_id,
-                self.tool_runtime.workspace_root.as_deref(),
+                requested_workspace_root,
                 self.daemon_connected,
             )?;
+        if self.channel.workspaces.is_empty()
+            && let Some(root) = selected_root.as_ref()
+        {
+            self.channel.add_workspace(
+                workspace_ref_for_selected_root(&self.data_dir, root)?
+                    .binding()
+                    .clone(),
+            );
+        }
         self.tool_runtime.workspace_root = selected_root;
         Ok(())
     }
@@ -3444,10 +3499,18 @@ impl AgentChannelTurnExecutor for AppAgentChannelExecutor<'_> {
             chat_tool_runtime_from_agent_runtime_definition(&participant.tool_runtime)
         };
         if tool_runtime.workspace_root.is_none() {
-            tool_runtime.workspace_root = session
-                .workspace_binding
-                .as_ref()
-                .and_then(|binding| binding.local_root.clone());
+            tool_runtime.workspace_root = channel_primary_workspace_root(
+                self.data_dir,
+                channel,
+                &participant.agent_session_id,
+            )
+            .map_err(channel_executor_cli_error)?
+            .or_else(|| {
+                session
+                    .workspace_binding
+                    .as_ref()
+                    .and_then(|binding| binding.local_root.clone())
+            });
         }
         let sandbox_node_id =
             parse_chat_tool_runtime_selection(&tool_runtime).map_err(channel_executor_cli_error)?;
@@ -3526,6 +3589,20 @@ impl AgentChannelTurnExecutor for AppAgentChannelExecutor<'_> {
 
 fn channel_executor_cli_error(error: CliError) -> AgentChannelExecutorError {
     AgentChannelExecutorError::new(error.to_string())
+}
+
+fn channel_primary_workspace_root(
+    data_dir: &SinomoDataDir,
+    channel: &AgentChannel,
+    session_id: &SessionId,
+) -> Result<Option<PathBuf>, CliError> {
+    channel
+        .primary_workspace()
+        .map(|workspace| {
+            workspace_binding_root_for_data_dir(data_dir, session_id, workspace)
+                .map(|resolved| resolved.root().to_path_buf())
+        })
+        .transpose()
 }
 
 fn channel_agent_turn_system_context(
@@ -8262,7 +8339,7 @@ mod tests {
     }
 
     #[test]
-    fn app_chat_workspace_selection_is_persisted_in_the_agent_session() {
+    fn app_chat_persists_conversation_workspace_and_default_sandbox_attachment() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-workspace-binding");
         let data_dir = SinomoDataDir::new(root.join("data"));
         let workspace = root.join("selected-directory");
@@ -8295,11 +8372,35 @@ mod tests {
                 .and_then(|binding| binding.local_root.as_deref()),
             Some(canonical_workspace.as_path())
         );
+        assert_eq!(chat.workspaces().len(), 1);
+        assert_eq!(
+            chat.workspaces()[0].local_root.as_deref(),
+            Some(canonical_workspace.as_path()),
+            "the chat owns the authoritative ordered workspace grant"
+        );
+        let expected_sandbox_id =
+            sinomo_agent::local_workspace::agent_sandbox_id_for_session(&session.session_id);
+        assert_eq!(
+            session
+                .sandbox_attachment
+                .as_ref()
+                .map(|attachment| attachment.sandbox_id.as_str()),
+            Some(expected_sandbox_id.as_str())
+        );
+        assert!(
+            sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(
+                data_dir.root().join("sandbox/runtime")
+            )
+            .load(&expected_sandbox_id)
+            .is_ok(),
+            "normal chat setup provisions the persistent sandbox before tools run"
+        );
         let persisted = FileAgentSessionStore::for_data_dir(&data_dir)
             .load_session(&session.session_id)
             .expect("load session")
             .expect("persisted session");
         assert_eq!(persisted.workspace_binding, session.workspace_binding);
+        assert_eq!(persisted.sandbox_attachment, session.sandbox_attachment);
     }
 
     #[test]
@@ -8540,6 +8641,7 @@ mod tests {
             source: AgentChannelSource::app(),
         });
         left.ensure_participant("left-agent", "Left agent");
+        left.add_workspace(sinomo_agent::WorkspaceRef::local_path("/work/left"));
         left.updated_at = base + time::Duration::seconds(2);
 
         let mut right = AgentChannel::new_channel(channel_id, "Shared channel");
@@ -8549,6 +8651,7 @@ mod tests {
             source: AgentChannelSource::app(),
         });
         right.ensure_participant("right-agent", "Right agent");
+        right.add_workspace(sinomo_agent::WorkspaceRef::sifs("right", "/work/right"));
         right.updated_at = base + time::Duration::seconds(1);
 
         let merged = merge_channel_snapshot(left, right).expect("merge channel snapshots");
@@ -8566,6 +8669,9 @@ mod tests {
                 .iter()
                 .any(|participant| participant.agent_key == "right-agent")
         );
+        assert_eq!(merged.workspaces.len(), 2);
+        assert_eq!(merged.workspaces[0].id, "/work/left");
+        assert_eq!(merged.workspaces[1].id, "right");
     }
 
     #[test]

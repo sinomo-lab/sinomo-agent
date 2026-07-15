@@ -4185,7 +4185,7 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
     } else {
         None
     };
-    let (agent_session, resumed) = load_or_create_agent_run_session(
+    let (mut agent_session, resumed) = load_or_create_agent_run_session(
         &session_store,
         session_id.clone(),
         definition.role.clone(),
@@ -4199,6 +4199,25 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         }
         Err(error) => return Err(error),
     };
+    if agent_session.sandbox_attachment.is_none() {
+        agent_session
+            .attach_sandbox(sinomo_agent::AgentSessionSandboxAttachment {
+                sandbox_id: sinomo_agent::local_workspace::agent_sandbox_id_for_session(
+                    &session_id,
+                )
+                .to_string(),
+                server_id: node_id.to_string(),
+                attachment_kind: sinomo_agent::AgentSessionSandboxAttachmentKind::Automatic,
+            })
+            .map_err(|source| CliError::Parse {
+                detail: format!("attach default sandbox to agent session: {source}"),
+            })?;
+        session_store
+            .save_session(&agent_session)
+            .map_err(|source| CliError::Parse {
+                detail: format!("persist agent session sandbox attachment: {source}"),
+            })?;
+    }
     let session = InteractionSession::new(
         session_id.clone(),
         node_id,
@@ -4840,32 +4859,22 @@ pub(crate) fn configure_agent_tool_registry_for_workspace(
 ) -> Result<(), CliError> {
     let store = main_agent_config_store()?;
     let mut config = LocalWorkspaceAgentConfig::new(workspace_root);
+    let requested_sandbox_node_id = sandbox_node_id.clone();
     let coding_authority = agent_definition_has_coding_authority(definition);
-    let live_sifs_mount_result = if coding_authority {
-        ensure_simple_sandbox_sifs_mount(data_dir)
-    } else {
-        live_sifs_mount_for_selected_root(data_dir, workspace_root)
-    };
-    let live_sifs_mount = if coding_authority {
-        match live_sifs_mount_result {
-            Ok(mount) => mount,
-            Err(error)
-                if !workspace_root_uses_simple_sandbox_sifs_mount(data_dir, workspace_root)? =>
-            {
-                // SIFS is an optional integration for an ordinary local
-                // workspace. Keep the coding tools and generic host shell
-                // available, with the sandbox inheriting the local host HOME.
-                eprintln!(
-                    "warning: live SIFS integration for simple sandbox is unavailable; using the local workspace and preserving the host HOME: {error}"
-                );
-                None
-            }
-            Err(error) => return Err(error),
+    let live_sifs_mount = match ensure_simple_sandbox_sifs_mount(data_dir) {
+        Ok(mount) => mount,
+        Err(error) if !workspace_root_uses_simple_sandbox_sifs_mount(data_dir, workspace_root)? => {
+            // The workspace can remain usable without a live SIFS projection,
+            // but this runtime cannot claim that the agent's canonical home is
+            // available in that case.
+            eprintln!(
+                "warning: live SIFS integration for the agent runtime is unavailable; using the local workspace without the agent home: {error}"
+            );
+            None
         }
-    } else {
-        live_sifs_mount_result?
+        Err(error) => return Err(error),
     };
-    if allow_coding_mutation && agent_definition_has_coding_authority(definition) {
+    if allow_coding_mutation && coding_authority {
         validate_mutating_workspace_root_with_live_mount(
             data_dir,
             workspace_root,
@@ -4877,40 +4886,105 @@ pub(crate) fn configure_agent_tool_registry_for_workspace(
             .allowing_shell_commands(true)
             .allowing_file_writes(true);
     }
+    let mut provision_default_sandbox = session_id.is_some();
     if let Some(session_id) = session_id {
         config = config.with_data_dir_evidence(data_dir, session_id);
+        if let Some(attachment) = FileAgentSessionStore::for_data_dir(data_dir)
+            .load_session(session_id)
+            .map_err(|source| CliError::Parse {
+                detail: format!("load agent session sandbox attachment: {source}"),
+            })?
+            .and_then(|session| session.sandbox_attachment)
+        {
+            let sandbox_id = sinomo_runtime::sandbox::SandboxId::new(
+                attachment.sandbox_id.clone(),
+            )
+            .or_else(|_| {
+                sinomo_runtime::sandbox::SandboxId::from_legacy_named(
+                    attachment.sandbox_id.clone(),
+                )
+            })
+            .map_err(|source| CliError::Parse {
+                detail: format!(
+                    "agent session `{session_id}` has invalid sandbox attachment `{}`: {source}",
+                    attachment.sandbox_id
+                ),
+            })?;
+            config = config.with_sandbox_instance_id(sandbox_id);
+            provision_default_sandbox = attachment.attachment_kind
+                == sinomo_agent::AgentSessionSandboxAttachmentKind::Automatic;
+        }
     }
-    if coding_authority {
-        match live_sifs_mount.as_ref() {
-            Some(mount) => {
-                config = config.with_sandbox_sifs_mount_root(mount.mount_root());
-                if let Some(session_id) = session_id {
-                    match prepare_simple_sandbox_agent_home(data_dir, session_id) {
-                        Ok(home_sifs_path) => {
-                            config = config.with_agent_home_sifs_path(home_sifs_path);
-                        }
-                        Err(detail) => {
-                            // The private DFS home is optional. A permissions,
-                            // ownership, or cluster availability problem must
-                            // not veto an otherwise valid generic host command.
-                            eprintln!(
-                                "warning: live SIFS agent home is unavailable; preserving the host HOME for this session: {detail}"
-                            );
-                            config = config.without_agent_home_sifs_path();
-                        }
-                    }
+    match live_sifs_mount.as_ref() {
+        Some(mount) => {
+            config = config.with_sandbox_sifs_mount_root(mount.mount_root());
+            match prepare_simple_sandbox_agent_home(data_dir, definition.key()) {
+                Ok(home_sifs_path) => {
+                    config = config.with_agent_home_sifs_path(home_sifs_path);
+                }
+                Err(detail) => {
+                    // A permissions, ownership, or cluster availability problem
+                    // must not silently substitute a session- or host-scoped
+                    // directory for the canonical agent home.
+                    eprintln!(
+                        "warning: live SIFS home for agent `{}` is unavailable: {detail}",
+                        definition.key()
+                    );
+                    config = config.without_agent_home_sifs_path();
                 }
             }
-            None => {
-                // A SIFS path label without a live filesystem would falsely
-                // imply synchronization. Keep the generic shell usable when
-                // this platform has no host mount implementation.
-                config = config.without_agent_home_sifs_path();
-            }
+        }
+        None => {
+            // A SIFS path label without a live filesystem would falsely imply
+            // synchronization.
+            config = config.without_agent_home_sifs_path();
         }
     }
     if let Some(sandbox_node_id) = sandbox_node_id {
         config = config.with_sandbox_runtime_node_id(sandbox_node_id);
+    }
+    if provision_default_sandbox {
+        if let Some(requested_node_id) = requested_sandbox_node_id.as_ref()
+            && let Ok(cluster) = read_cluster_state(&ClusterPaths::new(data_dir))
+            && requested_node_id != &cluster.local_node_id
+        {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "automatic agent sandbox provisioning on remote node `{requested_node_id}` must be routed through the sandbox service; local node is `{}`",
+                    cluster.local_node_id
+                ),
+            });
+        }
+        let mut mounts = Vec::new();
+        let workspace = workspace_ref_for_selected_root(data_dir, workspace_root)?;
+        if let Some(sifs_root) = workspace.binding().sifs_root.as_ref() {
+            mounts.push(sinomo_runtime::sandbox::SandboxMount {
+                source_sifs_path: sifs_root.clone(),
+                mount_path: sinomo_runtime::sandbox::SandboxPath::new("/work").map_err(
+                    |source| CliError::Parse {
+                        detail: format!("invalid default sandbox workspace mount: {source}"),
+                    },
+                )?,
+                mode: if allow_coding_mutation && coding_authority {
+                    sinomo_runtime::sandbox::SandboxMountMode::ReadWrite
+                } else {
+                    sinomo_runtime::sandbox::SandboxMountMode::ReadOnly
+                },
+            });
+        }
+        if let Some(home_sifs_path) = config.agent_home_sifs_path.as_ref() {
+            mounts.push(sinomo_runtime::sandbox::SandboxMount {
+                source_sifs_path: home_sifs_path.clone(),
+                mount_path: sinomo_runtime::sandbox::SandboxPath::new("/home/agent").map_err(
+                    |source| CliError::Parse {
+                        detail: format!("invalid default sandbox home mount: {source}"),
+                    },
+                )?,
+                mode: sinomo_runtime::sandbox::SandboxMountMode::ReadWrite,
+            });
+        }
+        sinomo_agent::local_workspace::provision_default_agent_session_sandbox(&config, mounts)
+            .map_err(|detail| CliError::Parse { detail })?;
     }
     registry.clear();
     if let Some(mount) = live_sifs_mount.as_ref() {
@@ -4932,9 +5006,9 @@ pub(crate) fn configure_agent_tool_registry_for_workspace(
 #[cfg(unix)]
 fn prepare_simple_sandbox_agent_home(
     data_dir: &SinomoDataDir,
-    session_id: &SessionId,
+    agent_id: &str,
 ) -> Result<String, String> {
-    let path = format!("/sinomo/agents/{session_id}/home");
+    let path = sinomo_agent::local_workspace::agent_home_sifs_path_for_id(agent_id);
     // These libc accessors have no preconditions and only read the effective
     // credentials of the current process.
     let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
@@ -4946,7 +5020,7 @@ fn prepare_simple_sandbox_agent_home(
 #[cfg(not(unix))]
 fn prepare_simple_sandbox_agent_home(
     _data_dir: &SinomoDataDir,
-    _session_id: &SessionId,
+    _agent_id: &str,
 ) -> Result<String, String> {
     Err("POSIX SIFS agent homes are unavailable on this platform".to_string())
 }

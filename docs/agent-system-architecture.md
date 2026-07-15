@@ -157,6 +157,12 @@ An agent is the runtime entity that owns its model runtime and session state;
 chats and channels route visible messages to agents rather than treating the
 model runtime as a chat object.
 
+Agent identity also owns the agent home. The canonical home is
+`/sinomo/agents/<agent-id>/home`, is shared by every session of that agent, and
+is made available to the agent runtime by default. It is neither a session
+directory nor a coding-agent feature. Session-scoped traces, evidence, queues,
+and checkpoints remain keyed by session id.
+
 - `Agent::run` remains the compatibility helper for one-shot calls.
 - `Agent::start_turn`, `continue_turn`, `steer`, `follow_up`, `compact`, and
   `abort` operate on `AgentSession`.
@@ -231,6 +237,12 @@ storage and optional SIFS-backed evidence use the same ownership contract, and
 the agent subsystem registers its entire durable subtree through the shared
 storage registry.
 
+Agent homes are outside the session evidence subtree and are keyed by agent id.
+They use SIFS so a newly placed or explicitly migrated session sees the same
+home instead of receiving a new node-local directory. A runtime that cannot
+project the live SIFS filesystem must report the home as unavailable; it must
+not silently substitute a session-scoped or host-scoped directory.
+
 ## Tool Surface and Progressive Disclosure
 
 The primary availability surface is `AgentToolSurface`. It projects the tools
@@ -254,6 +266,25 @@ remains a host-runtime operation rather than a prompt-side authority.
 
 ## Workspace Tools
 
+Workspaces are conversation grants. A chat or channel owns an ordered list of
+`WorkspaceRef`s, and all agents participating in that conversation receive the
+same grants subject to their individual policy. The first workspace is the
+default cwd in the sandbox; later workspaces are additional accessible roots.
+An `AgentSession` may retain a legacy workspace binding only as a compatibility
+snapshot, never as the authority for what the user attached to a conversation.
+
+Workspace projection depends on the sandbox runtime:
+
+- an isolated-filesystem runtime receives explicit mounts into its persistent
+  filesystem;
+- a host-filesystem runtime receives bounded host access through its permission
+  mechanism;
+- a runtime that supports neither reports the workspace unavailable.
+
+The grant does not imply portability. SIFS-backed workspaces can be resolved on
+another server. Host-local files stay on their owning server and are not copied
+as part of session migration.
+
 The workspace surface covers bounded file discovery and reads, targeted and
 whole-file editing, structured patching, version-control inspection, command
 execution, and user input. Its architecture is defined by behavior rather than
@@ -271,6 +302,42 @@ individual tool names:
   environment blockers.
 
 ## Runtime Services and Live Control
+
+An active agent session has one authoritative session server. New sessions use
+the agent's optional home-server preference; without one, the daemon processing
+the creation request becomes the session server. Message ingress from another
+device is routed to the active server and never moves the session implicitly.
+Consequently, agents in one channel may have sessions hosted on different
+servers.
+
+Session migration is an explicit control operation. It moves session ownership
+and resumable session state, not arbitrary local resources. Host-local files
+that are not in SIFS become unavailable after migration, and Sinomo does not
+attempt local-resource transfer. The placement generation changes atomically so
+routers can reject stale ownership information.
+
+The sandbox is a persistent VM-like resource with its own filesystem, process
+runtime, placement, lifecycle, and portability. It is architecturally
+independent of the agent system and is created, configured, inspected,
+checkpointed, rebooted, migrated where supported, and destroyed only through
+the node-local or cluster-wide sandbox management interface.
+
+An agent session holds one sandbox attachment, not sandbox ownership. Different
+sessions may attach the same sandbox. Normal chat and channel orchestration
+automatically creates and attaches one sandbox for each new agent session, and
+that attachment persists with the session. An explicit resource-attachment flow
+may instead attach an existing sandbox, including one shared with other agents.
+
+Tool calls require the existing attachment and execute inside that sandbox.
+They never create, replace, reboot, migrate, or destroy a sandbox. Conversation
+workspaces are mounted into the attached sandbox before tools are exposed, and
+the first mount becomes cwd.
+
+Migrating a session does not implicitly migrate, recreate, or destroy its
+sandbox. A session may invoke a sandbox hosted on another server; in that
+arrangement every tool operation executes on the sandbox server. A non-portable
+sandbox remains bound to its server until explicitly replaced or reattached
+through sandbox-specific control.
 
 The control plane exposes read-only inspection separately from live steering,
 follow-up, interrupt, and resume operations. A daemon may always expose durable

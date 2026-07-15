@@ -1,6 +1,6 @@
 use crate::{
     AgentDefinition, AgentItem, AgentRole, AgentSession, AgentStoragePaths,
-    AgentToolRuntimeDefinition, InteractionModel, TaskId,
+    AgentToolRuntimeDefinition, InteractionModel, TaskId, WorkspaceRef,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,10 @@ pub struct AgentChannel {
     pub users: Vec<AgentChannelUser>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub participants: Vec<AgentChannelParticipant>,
+    /// Ordered resources granted to every agent participating in this
+    /// conversation. The first workspace is the default sandbox cwd.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<WorkspaceRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transcript: Vec<AgentChannelMessage>,
     #[serde(default = "default_next_channel_sequence")]
@@ -53,6 +57,7 @@ impl AgentChannel {
             deleted_at: None,
             users: vec![AgentChannelUser::app_local()],
             participants: Vec::new(),
+            workspaces: Vec::new(),
             transcript: Vec::new(),
             next_sequence: 1,
         }
@@ -182,6 +187,56 @@ impl AgentChannel {
         self.participants
             .iter_mut()
             .find(|participant| &participant.participant_id == participant_id)
+    }
+
+    pub fn primary_workspace(&self) -> Option<&WorkspaceRef> {
+        self.workspaces.first()
+    }
+
+    pub fn add_workspace(&mut self, workspace: WorkspaceRef) -> bool {
+        if let Some(existing) = self
+            .workspaces
+            .iter_mut()
+            .find(|existing| existing.id == workspace.id)
+        {
+            if existing == &workspace {
+                return false;
+            }
+            *existing = workspace;
+        } else {
+            self.workspaces.push(workspace);
+        }
+        self.touch();
+        true
+    }
+
+    pub fn remove_workspace(&mut self, workspace_id: &str) -> bool {
+        let previous_len = self.workspaces.len();
+        self.workspaces
+            .retain(|workspace| workspace.id != workspace_id);
+        if self.workspaces.len() == previous_len {
+            return false;
+        }
+        self.touch();
+        true
+    }
+
+    pub fn move_workspace(&mut self, workspace_id: &str, target_index: usize) -> bool {
+        let Some(current_index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == workspace_id)
+        else {
+            return false;
+        };
+        let workspace = self.workspaces.remove(current_index);
+        let target_index = target_index.min(self.workspaces.len());
+        self.workspaces.insert(target_index, workspace);
+        if current_index == target_index {
+            return false;
+        }
+        self.touch();
+        true
     }
 
     pub fn append_user_message(
@@ -1804,6 +1859,21 @@ mod tests {
     use sinomo_lm::{LanguageModelResponse, LanguageModelUsage};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn channel_workspaces_are_ordered_and_first_is_default_cwd() {
+        let mut channel = AgentChannel::with_default_title(SessionId::generate());
+        let first = WorkspaceRef::local_path("/work/first");
+        let second = WorkspaceRef::sifs("shared", "/teams/shared");
+
+        assert!(channel.add_workspace(first.clone()));
+        assert!(channel.add_workspace(second.clone()));
+        assert_eq!(channel.primary_workspace(), Some(&first));
+        assert!(channel.move_workspace(&second.id, 0));
+        assert_eq!(channel.primary_workspace(), Some(&second));
+        assert!(channel.remove_workspace(&second.id));
+        assert_eq!(channel.primary_workspace(), Some(&first));
+    }
 
     #[derive(Clone, Default)]
     struct MemoryChannelStore {

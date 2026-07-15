@@ -23,17 +23,19 @@ use crate::{
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::node::NodeId;
-use sinomo_runtime::sandbox::{
-    LocalSandboxInstanceLayout, LocalSandboxInstanceStore, LocalSandboxToolchainStore,
-    SandboxCancellationToken, SandboxCommandExecutionError, SandboxId,
-    SandboxInstanceLifecycleStatus, SandboxInstanceManifest, SandboxInstancePortability,
-    SandboxLocalExecutionLease, SandboxPath, SandboxPolicy, SandboxRuntimeBinding,
-    SandboxStoreError, SandboxToolchainId, SandboxTrackedProcess, SandboxTrackedProcessStatus,
-    SandboxWasiError, recover_sandbox_local_execution_journal_with_lease,
-    sandbox_execution_placement_for_node, try_acquire_sandbox_local_execution_lease,
-};
 #[cfg(test)]
-use sinomo_runtime::sandbox::{SandboxMount, SandboxMountMode};
+use sinomo_runtime::sandbox::SandboxMountMode;
+use sinomo_runtime::sandbox::{
+    LocalSandboxBackend, LocalSandboxInstanceLayout, LocalSandboxInstanceStore,
+    LocalSandboxToolchainStore, SandboxBackend, SandboxCancellationToken,
+    SandboxCommandExecutionError, SandboxCreateInstanceRequest, SandboxId,
+    SandboxInstanceLifecycleStatus, SandboxInstanceManifest, SandboxInstancePortability,
+    SandboxLocalExecutionLease, SandboxMount, SandboxPath, SandboxPolicy, SandboxRuntimeBinding,
+    SandboxStoreError, SandboxTempPolicy, SandboxToolchainId, SandboxTrackedProcess,
+    SandboxTrackedProcessStatus, SandboxWasiError,
+    recover_sandbox_local_execution_journal_with_lease, sandbox_execution_placement_for_node,
+    try_acquire_sandbox_local_execution_lease,
+};
 use sinomo_runtime::sandbox_simple::{SandboxSimpleNativeCommandRunner, SandboxSimpleNativeConfig};
 use std::collections::BTreeMap;
 use std::env;
@@ -274,17 +276,17 @@ impl LocalWorkspaceAgentConfig {
 
     pub fn with_agent_storage(mut self, paths: &AgentStoragePaths, session_id: &SessionId) -> Self {
         self.evidence_dir = Some(paths.evidence_dir_for_session(session_id));
-        self.sandbox_instance_id = Some(agent_sandbox_id_for_session(&self.root, session_id));
+        self.sandbox_instance_id = Some(agent_sandbox_id_for_session(session_id));
         self
     }
 
-    /// Enable the live SIFS-backed home for one agent session.
+    /// Enable the live SIFS-backed home for one agent identity.
     ///
     /// This is intentionally separate from [`Self::with_agent_storage`]: local
     /// evidence and stable sandbox identity remain usable on hosts where no
     /// live SIFS/FUSE mount is available.
-    pub fn with_session_agent_home_sifs_path(mut self, session_id: &SessionId) -> Self {
-        self.agent_home_sifs_path = Some(default_agent_home_sifs_path_for_session(session_id));
+    pub fn with_agent_home_for_agent_id(mut self, agent_id: &str) -> Self {
+        self.agent_home_sifs_path = Some(agent_home_sifs_path_for_id(agent_id));
         self
     }
 
@@ -294,9 +296,48 @@ impl LocalWorkspaceAgentConfig {
         session_id: &SessionId,
     ) -> Self {
         self = self.with_agent_storage(&AgentStoragePaths::from_data_dir(data_dir), session_id);
-        self.sandbox_runtime_root = data_dir.root().join("sandbox").join("agent-tools");
+        self.sandbox_runtime_root = data_dir.root().join("sandbox").join("runtime");
         self
     }
+}
+
+/// Provision the default sandbox for a newly created ordinary agent session.
+///
+/// This is an orchestration hook and must be called before tools are exposed.
+/// Tool execution only loads the attached sandbox and never calls this path.
+pub fn provision_default_agent_session_sandbox(
+    config: &LocalWorkspaceAgentConfig,
+    mounts: Vec<SandboxMount>,
+) -> Result<SandboxId, String> {
+    let sandbox_id = config
+        .sandbox_instance_id
+        .clone()
+        .ok_or_else(|| "agent session has no sandbox attachment id".to_string())?;
+    let toolchain_id = SandboxToolchainId::from_legacy_named(AGENT_SANDBOX_TOOLCHAIN_ID)
+        .map_err(|source| format!("invalid agent sandbox toolchain id: {source}"))?;
+    let store = LocalSandboxInstanceStore::new(&config.sandbox_runtime_root);
+    match store.load(&sandbox_id) {
+        Ok(_) => return Ok(sandbox_id),
+        Err(SandboxStoreError::NotFound { .. }) => {}
+        Err(source) => return Err(format!("load attached sandbox `{sandbox_id}`: {source}")),
+    }
+    let mut backend = LocalSandboxBackend::with_store(store);
+    backend
+        .create(SandboxCreateInstanceRequest {
+            sandbox_id: Some(sandbox_id.clone()),
+            toolchain_id,
+            temp_policy: SandboxTempPolicy::RetainAcrossSessions,
+            memory_mb: None,
+            wall_time_ms: None,
+            max_input_bytes: None,
+            max_output_bytes: Some(config.max_command_output_bytes as u64),
+            max_workspace_bytes: None,
+            max_written_bytes_per_command: None,
+            max_file_count: None,
+            mounts,
+        })
+        .map_err(|source| format!("provision sandbox `{sandbox_id}`: {source}"))?;
+    Ok(sandbox_id)
 }
 
 pub fn register_tools(registry: &AgentToolRegistry, config: LocalWorkspaceAgentConfig) {
@@ -751,6 +792,21 @@ fn execute_simple_sandbox_command(
             )
         })?;
     let store = LocalSandboxInstanceStore::new(&config.sandbox_runtime_root);
+    match store.load(&sandbox_id) {
+        Ok(_) => {}
+        Err(SandboxStoreError::NotFound { .. }) => {
+            return Err(AgentToolResult::blocked(
+                format!("agent session has no provisioned sandbox `{sandbox_id}`"),
+                serde_json::json!({
+                    "error": "sandbox_not_attached",
+                    "sandbox_id": sandbox_id,
+                }),
+            ));
+        }
+        Err(source) => {
+            return Err(sandbox_store_failure("load attached sandbox")(source));
+        }
+    }
     let local_execution_lease = try_acquire_sandbox_local_execution_lease(&store, &sandbox_id)
         .map_err(sandbox_store_failure(
             "acquire simple sandbox execution lease",
@@ -1229,19 +1285,15 @@ fn prepare_agent_sandbox_manifest(
     let now = time::OffsetDateTime::now_utc();
     let (mut manifest, _layout) = match store.load(sandbox_id) {
         Ok(loaded) => loaded,
-        Err(SandboxStoreError::NotFound { .. }) => match local_execution_lease {
-            Some(lease) => store
-                .create_under_local_execution_lease(
-                    lease,
-                    sandbox_id.clone(),
-                    toolchain_id.clone(),
-                    now,
-                )
-                .map_err(sandbox_store_failure("create simple sandbox instance"))?,
-            None => store
-                .create(sandbox_id.clone(), toolchain_id.clone(), now)
-                .map_err(sandbox_store_failure("create simple sandbox instance"))?,
-        },
+        Err(SandboxStoreError::NotFound { .. }) => {
+            return Err(AgentToolResult::blocked(
+                format!("agent session has no provisioned sandbox `{sandbox_id}`"),
+                serde_json::json!({
+                    "error": "sandbox_not_attached",
+                    "sandbox_id": sandbox_id,
+                }),
+            ));
+        }
         Err(source) => {
             return Err(sandbox_store_failure("load simple sandbox instance")(
                 source,
@@ -1287,11 +1339,9 @@ fn prepare_agent_sandbox_manifest(
         path_prefixes,
         agent_home_host_path.as_deref(),
     );
-    // HOME already names the live FUSE path and simple-native executes against
-    // the host namespace. Declaring a second projection is redundant and would
-    // make optional DFS HOME depend on bubblewrap merely to bind the same path
-    // elsewhere in the sandbox instance layout.
-    manifest.mounts.clear();
+    // Mounts belong to the persistent sandbox and are configured by the
+    // orchestration layer before tool execution. Never clear or rewrite them
+    // from a tool call.
     // Bound the native process itself, not only the later tool-result preview.
     // This prevents an unbounded producer from buffering until process exit.
     manifest.limits.max_output_bytes = config.max_command_output_bytes as u64;
@@ -1678,10 +1728,8 @@ fn agent_sandbox_id_for_workspace(root: &Path) -> SandboxId {
     )
 }
 
-fn agent_sandbox_id_for_session(root: &Path, session_id: &SessionId) -> SandboxId {
-    let mut seed = root.to_string_lossy().into_owned().into_bytes();
-    seed.push(0);
-    seed.extend(session_id.to_string().as_bytes());
+pub fn agent_sandbox_id_for_session(session_id: &SessionId) -> SandboxId {
+    let seed = session_id.to_string().into_bytes();
     SandboxId::derived("sinomo-agent-session-sandbox", &seed)
 }
 
@@ -1708,11 +1756,7 @@ fn agent_home_live_host_path(config: &LocalWorkspaceAgentConfig) -> Option<PathB
     Some(mount_root.join(home_sifs_path.trim_start_matches('/')))
 }
 
-fn default_agent_home_sifs_path_for_session(session_id: &SessionId) -> String {
-    agent_home_sifs_path_for_id(&session_id.to_string())
-}
-
-fn agent_home_sifs_path_for_id(agent_id: &str) -> String {
+pub fn agent_home_sifs_path_for_id(agent_id: &str) -> String {
     let agent_id = sanitize_agent_home_id(agent_id);
     format!("{AGENT_HOME_SIFS_ROOT}/{agent_id}/home")
 }
@@ -2373,6 +2417,19 @@ mod tests {
         )
     }
 
+    fn provision_test_agent_sandbox(
+        mut config: LocalWorkspaceAgentConfig,
+        session: &InteractionSession,
+    ) -> LocalWorkspaceAgentConfig {
+        if config.sandbox_instance_id.is_none() {
+            config =
+                config.with_sandbox_instance_id(agent_sandbox_id_for_session(&session.session_id));
+        }
+        provision_default_agent_session_sandbox(&config, Vec::new())
+            .expect("provision test agent sandbox before tool execution");
+        config
+    }
+
     #[test]
     fn local_workspace_commands_default_to_simple_sandbox_without_fake_sifs_mount() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-sandbox-default");
@@ -2385,6 +2442,41 @@ mod tests {
         assert!(config.agent_home_sifs_path.is_none());
         assert!(config.sandbox_sifs_mount_root.is_none());
         assert_eq!(config.git_tool_mode, LocalWorkspaceGitToolMode::Auto);
+    }
+
+    #[test]
+    fn tool_call_never_creates_a_missing_sandbox() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-tool-no-sandbox-create");
+        let workspace = root.join("workspace");
+        let runtime_root = root.join("sandbox-runtime");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let session = test_session("missing-sandbox");
+        let sandbox_id = agent_sandbox_id_for_session(&session.session_id);
+        let config = LocalWorkspaceAgentConfig::new(&workspace)
+            .with_sandbox_runtime_root(&runtime_root)
+            .with_sandbox_instance_id(sandbox_id.clone())
+            .allowing_shell_commands(true);
+        let registry = AgentToolRegistry::local_workspace_with_config(config);
+
+        let outcome = registry.execute(
+            &session,
+            0,
+            0,
+            &AgentToolCall {
+                call_id: None,
+                tool: "run_command".to_string(),
+                input: serde_json::json!({ "command": "true" }),
+                r#async: false,
+                summary: "missing sandbox must block".to_string(),
+            },
+        );
+
+        assert_eq!(outcome.status, AgentToolStatus::Blocked);
+        assert_eq!(outcome.output["error"], "sandbox_not_attached");
+        assert!(matches!(
+            LocalSandboxInstanceStore::new(runtime_root).load(&sandbox_id),
+            Err(SandboxStoreError::NotFound { .. })
+        ));
     }
 
     #[test]
@@ -2454,6 +2546,13 @@ mod tests {
         let toolchain_id =
             SandboxToolchainId::from_legacy_named(AGENT_SANDBOX_TOOLCHAIN_ID).expect("toolchain");
         let store = LocalSandboxInstanceStore::new(&runtime_root);
+        store
+            .create(
+                sandbox_id.clone(),
+                toolchain_id.clone(),
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("provision sandbox before tool configuration");
         let sandbox_cwd =
             sandbox_path_for_host_path(&canonical_workspace).expect("sandbox cwd path");
 
@@ -2532,31 +2631,45 @@ mod tests {
     }
 
     #[test]
-    fn agent_home_uses_configured_live_sifs_mount_root() {
+    fn agent_home_is_keyed_by_agent_identity_across_sessions() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-sandbox-home-data-dir");
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).expect("workspace");
         let data_dir = SinomoDataDir::new(root.join("data"));
         let sifs_mount_root = root.join("sifs");
-        let session_id = SessionId::from_legacy_named("sess-agent-home").expect("session");
-        let config = LocalWorkspaceAgentConfig::new(&workspace)
-            .with_data_dir_evidence(&data_dir, &session_id)
+        let session_a = SessionId::from_legacy_named("sess-agent-home-a").expect("session a");
+        let session_b = SessionId::from_legacy_named("sess-agent-home-b").expect("session b");
+        let agent_id = "coding-agent";
+        let config_a = LocalWorkspaceAgentConfig::new(&workspace)
+            .with_data_dir_evidence(&data_dir, &session_a)
             .with_sandbox_sifs_mount_root(&sifs_mount_root)
-            .with_session_agent_home_sifs_path(&session_id);
-        let agent_id = session_id.to_string();
+            .with_agent_home_for_agent_id(agent_id);
+        let config_b = LocalWorkspaceAgentConfig::new(&workspace)
+            .with_data_dir_evidence(&data_dir, &session_b)
+            .with_sandbox_sifs_mount_root(&sifs_mount_root)
+            .with_agent_home_for_agent_id(agent_id);
 
         assert_eq!(
-            config.agent_home_sifs_path.as_deref(),
+            config_a.agent_home_sifs_path.as_deref(),
             Some(agent_home_sifs_path_for_id(&agent_id).as_str())
         );
         assert_eq!(
-            agent_home_live_host_path(&config),
+            agent_home_live_host_path(&config_a),
             Some(
                 sifs_mount_root
                     .join("sinomo/agents")
                     .join(agent_id)
                     .join("home")
             )
+        );
+        assert_eq!(
+            agent_home_live_host_path(&config_a),
+            agent_home_live_host_path(&config_b),
+            "sessions of the same agent must share its home"
+        );
+        assert_ne!(
+            agent_home_sifs_path_for_id(agent_id),
+            agent_home_sifs_path_for_id("main-agent")
         );
     }
 
@@ -2596,6 +2709,7 @@ mod tests {
 
         assert!(config.agent_home_sifs_path.is_none());
         assert!(config.sandbox_sifs_mount_root.is_none());
+        let config = provision_test_agent_sandbox(config, &session);
         let registry = AgentToolRegistry::local_workspace_with_config(config);
         let outcome = registry.execute(
             &session,
@@ -2637,6 +2751,7 @@ mod tests {
             .with_sandbox_sifs_mount_root(&mount_root)
             .with_agent_home_sifs_path("/sinomo/agents/test/home")
             .allowing_shell_commands(true);
+        let config = provision_test_agent_sandbox(config, &session);
         let registry = AgentToolRegistry::local_workspace_with_config(config);
 
         let outcome = registry.execute(
@@ -2732,6 +2847,13 @@ mod tests {
         let toolchain_id =
             SandboxToolchainId::from_legacy_named(AGENT_SANDBOX_TOOLCHAIN_ID).expect("toolchain");
         let store = LocalSandboxInstanceStore::new(&runtime_root);
+        store
+            .create(
+                sandbox_id.clone(),
+                toolchain_id.clone(),
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("provision sandbox before attachment configuration");
         let sandbox_cwd =
             sandbox_path_for_host_path(&canonical_workspace).expect("sandbox cwd path");
 
@@ -2785,6 +2907,13 @@ mod tests {
         let toolchain_id =
             SandboxToolchainId::from_legacy_named(AGENT_SANDBOX_TOOLCHAIN_ID).expect("toolchain");
         let store = LocalSandboxInstanceStore::new(&runtime_root);
+        store
+            .create(
+                sandbox_id.clone(),
+                toolchain_id.clone(),
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("provision sandbox before process tracking");
         let sandbox_cwd =
             sandbox_path_for_host_path(&canonical_workspace).expect("sandbox cwd path");
         prepare_agent_sandbox_manifest(
@@ -2852,10 +2981,12 @@ mod tests {
             host_target.display(),
         );
 
+        let session = test_session("generic-host-shell");
+        let config = provision_test_agent_sandbox(config, &session);
         let registry = AgentToolRegistry::local_workspace_with_config(config);
         assert!(registry.contains("run_command"));
         let outcome = registry.execute(
-            &test_session("generic-host-shell"),
+            &session,
             0,
             0,
             &AgentToolCall {
@@ -2915,9 +3046,11 @@ mod tests {
         let runtime_root = root.join("sandbox-runtime");
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).expect("workspace");
+        let session = test_session("sandbox-command");
         let config = LocalWorkspaceAgentConfig::new(&workspace)
             .with_sandbox_runtime_root(&runtime_root)
             .allowing_shell_commands(true);
+        let config = provision_test_agent_sandbox(config, &session);
         let args = vec![
             "/C".to_string(),
             "echo %SINOMO_AGENT_TOOL_RUNTIME% && echo %USERPROFILE% && echo roaming>%USERPROFILE%\\roaming.txt && type %USERPROFILE%\\roaming.txt".to_string(),
@@ -2925,7 +3058,7 @@ mod tests {
 
         let execution = execute_local_command(
             &config,
-            &test_session("sandbox-command"),
+            &session,
             "cmd.exe",
             &args,
             None,

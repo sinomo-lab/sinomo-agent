@@ -7691,6 +7691,30 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
             session.workspace_binding = requested_binding.cloned();
         }
 
+        if session.sandbox_attachment.is_none() {
+            let sandbox_server_id = sandbox_node_id
+                .as_ref()
+                .map(ToString::to_string)
+                .or_else(|| {
+                    read_cluster_state(&ClusterPaths::new(data_dir))
+                        .ok()
+                        .map(|state| state.local_node_id.to_string())
+                })
+                .unwrap_or_else(|| "local-daemon".to_string());
+            session
+                .attach_sandbox(sinomo_agent::AgentSessionSandboxAttachment {
+                    sandbox_id: sinomo_agent::local_workspace::agent_sandbox_id_for_session(
+                        session_id,
+                    )
+                    .to_string(),
+                    server_id: sandbox_server_id,
+                    attachment_kind: sinomo_agent::AgentSessionSandboxAttachmentKind::Automatic,
+                })
+                .map_err(|source| CliError::Parse {
+                    detail: format!("attach default sandbox to agent session: {source}"),
+                })?;
+        }
+
         let selected_workspace = session
             .workspace_binding
             .as_ref()
