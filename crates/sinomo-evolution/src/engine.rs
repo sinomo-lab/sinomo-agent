@@ -35,9 +35,9 @@ use sinomo_lm::{
     CODEX_PROVIDER_ID, ClaudeCodeConfig, ClaudeCodeProvider, CodexCliConfig, CodexCliProvider,
     GeminiConfig, GeminiProvider, GitHubCopilotCliConfig, GitHubCopilotCliProvider,
     GitHubCopilotConfig, GitHubCopilotProvider, LanguageModelError, LanguageModelInvocation,
-    LanguageModelMessage, LanguageModelProvider, LanguageModelRequest, LanguageModelResponse,
-    LanguageModelResponseFormat, LanguageModelRole, NvidiaConfig, NvidiaProvider, OpenAiConfig,
-    OpenAiProvider, PROVIDER_DEFAULT_MODEL, codex_provider_for_model,
+    LanguageModelMessage, LanguageModelProvider, LanguageModelProviderInfo, LanguageModelRequest,
+    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole, NvidiaConfig,
+    NvidiaProvider, OpenAiConfig, OpenAiProvider, PROVIDER_DEFAULT_MODEL, codex_provider_for_model,
     complete_configured_model_request, model_or_default, normalize_model_id_for_provider,
     normalize_model_provider,
 };
@@ -48,7 +48,7 @@ use sinomo_runtime::core::{
 use sinomo_runtime::eval::{CommandRunResult, CommandRunner, ExecutingEvalHarness};
 use sinomo_runtime::events::{EventId, SessionId};
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::node::NodeId;
+use sinomo_runtime::node::{LocalNodePermission, LocalNodePermissionStore, NodeId};
 use sinomo_runtime::registry::{
     ArtifactEvidenceManifest, ArtifactEvidenceRecord, ArtifactRegistry,
     RELEASE_MATERIAL_RELATIVE_PATH, VerifiedReleaseMaterialRecord, read_release_material_from_path,
@@ -4122,6 +4122,7 @@ pub struct LanguageModelMutationBridge<P> {
     provider: P,
     model: String,
     tool_registry: EvolutionToolRegistry,
+    local_permission_data_dir: Option<SinomoDataDir>,
     max_tool_rounds: usize,
 }
 
@@ -4131,6 +4132,7 @@ impl<P> LanguageModelMutationBridge<P> {
             provider,
             model: model.into(),
             tool_registry: EvolutionToolRegistry::bootstrap(),
+            local_permission_data_dir: None,
             max_tool_rounds: 4,
         }
     }
@@ -4140,9 +4142,69 @@ impl<P> LanguageModelMutationBridge<P> {
         self
     }
 
+    /// Constructs the bridge with node-local consent available to effectful
+    /// tools. The ordinary constructor remains fail-closed for callers that do
+    /// not have an authoritative local data directory.
+    pub fn new_for_data_dir(
+        provider: P,
+        model: impl Into<String>,
+        data_dir: &SinomoDataDir,
+    ) -> Self {
+        let mut bridge = Self::new(provider, model);
+        bridge.tool_registry = EvolutionToolRegistry::bootstrap_for_data_dir(data_dir.clone());
+        bridge.local_permission_data_dir = Some(data_dir.clone());
+        bridge
+    }
+
     pub fn with_max_tool_rounds(mut self, max_tool_rounds: usize) -> Self {
         self.max_tool_rounds = max_tool_rounds;
         self
+    }
+
+    fn authorize_provider_host_access(
+        &self,
+        info: &LanguageModelProviderInfo,
+    ) -> Result<(), MutationModelError> {
+        if !info.host_access.requires_remote_management_permission() {
+            return Ok(());
+        }
+
+        let Some(data_dir) = self.local_permission_data_dir.as_ref() else {
+            return Err(self.provider_permission_denied(
+                info,
+                "no authoritative node-local permission context is configured",
+            ));
+        };
+        let store = LocalNodePermissionStore::new(data_dir.root());
+        let granted = store
+            .try_permission_granted(LocalNodePermission::RemoteManagement)
+            .map_err(|error| {
+                self.provider_permission_denied(
+                    info,
+                    format!("could not verify node-local permission: {error}"),
+                )
+            })?;
+        if !granted {
+            return Err(self.provider_permission_denied(
+                info,
+                "grant `remote-management` locally on this node",
+            ));
+        }
+        Ok(())
+    }
+
+    fn provider_permission_denied(
+        &self,
+        info: &LanguageModelProviderInfo,
+        detail: impl std::fmt::Display,
+    ) -> MutationModelError {
+        MutationModelError::LanguageModel(LanguageModelError::ProviderInvocationFailed {
+            provider: info.provider.clone(),
+            model: self.model.clone(),
+            detail: format!(
+                "provider requires node-local permission `remote-management` for unrestricted host access; {detail}"
+            ),
+        })
     }
 }
 
@@ -4204,6 +4266,10 @@ impl<P: LanguageModelProvider> MutationModel for LanguageModelMutationBridge<P> 
                     "max_tool_rounds": self.max_tool_rounds,
                 }),
             };
+            // This check belongs immediately at the provider effect boundary,
+            // not bridge construction: a local operator can revoke consent
+            // between model/tool rounds and the next host process must stop.
+            self.authorize_provider_host_access(&info)?;
             let response = self.provider.complete(&request)?;
             let structured_output = parse_structured_mutation_output(&response.content);
             let tool_calls = if direct_edit {
@@ -4337,16 +4403,24 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     ),
                     token_store_path: Some(credentials_path),
                 });
-                LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace, None)
+                LanguageModelMutationBridge::new_for_data_dir(
+                    provider,
+                    self.model.clone(),
+                    &self.data_dir,
+                )
+                .mutate(packet, workspace, None)
             }
             GitHubCopilotCliProvider::PROVIDER_ID => {
                 let provider = GitHubCopilotCliProvider::new(GitHubCopilotCliConfig {
                     model: model_or_default(&self.model, GitHubCopilotCliConfig::default().model),
                     ..GitHubCopilotCliConfig::default()
                 });
-                LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace, None)
+                LanguageModelMutationBridge::new_for_data_dir(
+                    provider,
+                    self.model.clone(),
+                    &self.data_dir,
+                )
+                .mutate(packet, workspace, None)
             }
             CodexCliProvider::PROVIDER_ID => {
                 let provider = CodexCliProvider::new(CodexCliConfig {
@@ -4354,13 +4428,21 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     working_dir: Some(workspace.path.clone()),
                     ..CodexCliConfig::default()
                 });
-                LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace, None)
+                LanguageModelMutationBridge::new_for_data_dir(
+                    provider,
+                    self.model.clone(),
+                    &self.data_dir,
+                )
+                .mutate(packet, workspace, None)
             }
             CODEX_PROVIDER_ID => {
                 let provider = codex_provider_for_model(&self.model);
-                LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace, None)
+                LanguageModelMutationBridge::new_for_data_dir(
+                    provider,
+                    self.model.clone(),
+                    &self.data_dir,
+                )
+                .mutate(packet, workspace, None)
             }
             ClaudeCodeProvider::PROVIDER_ID | "anthropic-claude-code" => {
                 let provider = ClaudeCodeProvider::new(ClaudeCodeConfig {
@@ -4368,8 +4450,12 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     working_dir: Some(workspace.path.clone()),
                     ..ClaudeCodeConfig::default()
                 });
-                LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace, None)
+                LanguageModelMutationBridge::new_for_data_dir(
+                    provider,
+                    self.model.clone(),
+                    &self.data_dir,
+                )
+                .mutate(packet, workspace, None)
             }
             AnthropicProvider::PROVIDER_ID | "claude" => {
                 let credentials_path = self
@@ -4383,8 +4469,12 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     credentials_path: Some(credentials_path),
                     ..AnthropicConfig::default()
                 });
-                LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace, None)
+                LanguageModelMutationBridge::new_for_data_dir(
+                    provider,
+                    self.model.clone(),
+                    &self.data_dir,
+                )
+                .mutate(packet, workspace, None)
             }
             OpenAiProvider::PROVIDER_ID | "openai-api" => {
                 let credentials_path = self
@@ -4398,8 +4488,12 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     credentials_path: Some(credentials_path),
                     ..OpenAiConfig::default()
                 });
-                LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace, None)
+                LanguageModelMutationBridge::new_for_data_dir(
+                    provider,
+                    self.model.clone(),
+                    &self.data_dir,
+                )
+                .mutate(packet, workspace, None)
             }
             GeminiProvider::PROVIDER_ID | "google-gemini" => {
                 let credentials_path = self
@@ -4413,8 +4507,12 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     credentials_path: Some(credentials_path),
                     ..GeminiConfig::default()
                 });
-                LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace, None)
+                LanguageModelMutationBridge::new_for_data_dir(
+                    provider,
+                    self.model.clone(),
+                    &self.data_dir,
+                )
+                .mutate(packet, workspace, None)
             }
             NvidiaProvider::PROVIDER_ID => {
                 let credentials_path = self
@@ -4429,8 +4527,12 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     api_key: None,
                     credentials_path: Some(credentials_path),
                 });
-                LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace, None)
+                LanguageModelMutationBridge::new_for_data_dir(
+                    provider,
+                    self.model.clone(),
+                    &self.data_dir,
+                )
+                .mutate(packet, workspace, None)
             }
             _ => Err(MutationModelError::LanguageModel(
                 LanguageModelError::ProviderInvocationFailed {
@@ -4465,6 +4567,7 @@ impl MutationModel for EvolutionAgentMutationModel {
             working_dir: workspace.path.clone(),
         };
         AgentMutationWorker::new(model, self.provider.clone(), self.model.clone())
+            .with_local_permission_data_dir(self.data_dir.clone())
             .with_max_steps(self.max_steps)
             .mutate(packet, workspace, bundle)
     }
@@ -4475,6 +4578,7 @@ pub struct AgentMutationWorker<M> {
     interaction_model: M,
     provider: String,
     model: String,
+    local_permission_data_dir: Option<SinomoDataDir>,
     max_steps: Option<usize>,
 }
 
@@ -4488,8 +4592,14 @@ impl<M> AgentMutationWorker<M> {
             interaction_model,
             provider: provider.into(),
             model: model.into(),
+            local_permission_data_dir: None,
             max_steps: None,
         }
+    }
+
+    pub fn with_local_permission_data_dir(mut self, data_dir: SinomoDataDir) -> Self {
+        self.local_permission_data_dir = Some(data_dir);
+        self
     }
 
     pub fn with_max_steps(mut self, max_steps: Option<usize>) -> Self {
@@ -4521,6 +4631,13 @@ where
         workspace_config.max_read_bytes = 256 * 1024;
         workspace_config.max_command_output_bytes = 128 * 1024;
         workspace_config.max_search_matches = 300;
+        sinomo_agent::local_workspace::provision_default_agent_session_sandbox(
+            &workspace_config,
+            Vec::new(),
+        )
+        .map_err(|detail| MutationModelError::Agent {
+            detail: format!("provision evolution-agent command sandbox: {detail}"),
+        })?;
 
         let mut config = AgentConfig::new(self.provider.clone(), self.model.clone())
             .with_agent_definition(sinomo_agent::AgentDefinition::evolution())
@@ -4542,6 +4659,11 @@ where
             config = config.with_max_steps(max_steps);
         }
 
+        let tool_registry = AgentToolRegistry::local_workspace_with_config(workspace_config);
+        if let Some(data_dir) = &self.local_permission_data_dir {
+            tool_registry.set_local_permission_data_dir(data_dir.root());
+        }
+
         let agent = Agent::new(
             self.interaction_model.clone(),
             self.provider.clone(),
@@ -4549,9 +4671,7 @@ where
         )
         .with_config(config)
         .with_tool_surface(AgentToolSurface::default_for_role(AgentRole::Evolution))
-        .with_tool_registry(AgentToolRegistry::local_workspace_with_config(
-            workspace_config,
-        ))
+        .with_tool_registry(tool_registry)
         .with_trace_store(FileAgentTraceStore::new(
             storage_paths.trace_path_for_session(&session.session_id),
         ));

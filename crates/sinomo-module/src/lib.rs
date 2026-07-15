@@ -1611,6 +1611,8 @@ pub struct ModuleObjectRpcRoute {
     pub category: String,
     pub operation: String,
     pub auth: ModuleRouteAuth,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_local_permissions: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1620,6 +1622,7 @@ pub struct ModuleObjectRpcRouteDescriptor {
     pub operation: CapabilityName,
     pub auth_scope: String,
     pub required_capabilities: Vec<CapabilityName>,
+    pub required_local_permissions: Vec<String>,
 }
 
 impl ModuleObjectRpcRoute {
@@ -1634,12 +1637,32 @@ impl ModuleObjectRpcRoute {
             category: category.into(),
             operation: operation.into(),
             auth,
+            required_local_permissions: Vec::new(),
         }
+    }
+
+    pub fn require_local_permission(mut self, permission: impl Into<String>) -> Self {
+        self.required_local_permissions.push(permission.into());
+        self
+    }
+
+    pub fn require_local_permissions<I, S>(mut self, permissions: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.required_local_permissions
+            .extend(permissions.into_iter().map(Into::into));
+        self
     }
 
     pub fn validate(&self) -> Result<(), ModuleSurfaceError> {
         validate_module_object_rpc_route_path(&self.route)?;
-        validate_module_surface_token(&self.category, "module object RPC route category")?;
+        validate_module_surface_token(
+            &self.route,
+            &self.category,
+            "module object RPC route category",
+        )?;
         CapabilityName::new(self.operation.clone()).map_err(|source| {
             ModuleSurfaceError::InvalidObjectRpcRouteOperation {
                 route: self.route.clone(),
@@ -1647,6 +1670,22 @@ impl ModuleObjectRpcRoute {
                 detail: source.to_string(),
             }
         })?;
+        let mut local_permissions = BTreeSet::new();
+        for permission in &self.required_local_permissions {
+            validate_module_surface_token(
+                &self.route,
+                permission,
+                "module object RPC route local permission",
+            )?;
+            if !local_permissions.insert(permission) {
+                return Err(ModuleSurfaceError::InvalidObjectRpcRoute {
+                    route: self.route.clone(),
+                    detail: format!(
+                        "required local permission `{permission}` is listed more than once"
+                    ),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -1673,6 +1712,7 @@ impl ModuleObjectRpcRoute {
             operation: operation.clone(),
             auth_scope: self.auth_scope().to_string(),
             required_capabilities: vec![operation],
+            required_local_permissions: self.required_local_permissions.clone(),
         })
     }
 }
@@ -2057,16 +2097,20 @@ fn validate_module_object_rpc_route_path(route: &str) -> Result<(), ModuleSurfac
     Ok(())
 }
 
-fn validate_module_surface_token(value: &str, context: &str) -> Result<(), ModuleSurfaceError> {
+fn validate_module_surface_token(
+    route: &str,
+    value: &str,
+    context: &str,
+) -> Result<(), ModuleSurfaceError> {
     if value.trim().is_empty() {
         return Err(ModuleSurfaceError::InvalidObjectRpcRoute {
-            route: value.to_string(),
+            route: route.to_string(),
             detail: format!("{context} must be non-empty"),
         });
     }
     if value != value.trim() {
         return Err(ModuleSurfaceError::InvalidObjectRpcRoute {
-            route: value.to_string(),
+            route: route.to_string(),
             detail: format!("{context} must not have leading or trailing whitespace"),
         });
     }
@@ -2075,7 +2119,7 @@ fn validate_module_surface_token(value: &str, context: &str) -> Result<(), Modul
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ':'))
     {
         return Err(ModuleSurfaceError::InvalidObjectRpcRoute {
-            route: value.to_string(),
+            route: route.to_string(),
             detail: format!(
                 "{context} must contain only ASCII letters, digits, '.', '-', '_', or ':'"
             ),
@@ -3246,7 +3290,8 @@ fn native_descriptor_route_to_module_route(
         route.category.clone(),
         route.operation.clone(),
         native_descriptor_route_auth(&route.auth, &route.route)?,
-    ))
+    )
+    .require_local_permissions(route.required_local_permissions.clone()))
 }
 
 fn native_descriptor_route_auth(
@@ -5605,12 +5650,15 @@ mod tests {
         )
         .with_surfaces(
             ModuleSurfaces::default()
-                .with_object_rpc_route(ModuleObjectRpcRoute::new(
-                    "/dfs/status",
-                    "dfs",
-                    "dfs.status.read",
-                    ModuleRouteAuth::LocalOrClusterMember,
-                ))
+                .with_object_rpc_route(
+                    ModuleObjectRpcRoute::new(
+                        "/dfs/status",
+                        "dfs",
+                        "dfs.status.read",
+                        ModuleRouteAuth::LocalOrClusterMember,
+                    )
+                    .require_local_permissions(["remote-management", "device:storage"]),
+                )
                 .with_event_kind_name("dfs.metadata.updated")
                 .with_storage_owner("sinomo-dfs")
                 .with_skill_resource("skill.dfs.operator", "skills/dfs/SKILL.md")
@@ -5633,6 +5681,10 @@ mod tests {
         assert_eq!(
             decoded.surfaces.object_rpc_routes[0].auth_scope(),
             "local-or-cluster-member"
+        );
+        assert_eq!(
+            decoded.surfaces.object_rpc_routes[0].required_local_permissions,
+            vec!["remote-management", "device:storage"]
         );
         assert_eq!(
             decoded.surfaces.object_rpc_routes[0]
@@ -5676,6 +5728,10 @@ mod tests {
         assert_eq!(
             descriptors[0].required_capabilities[0].as_str(),
             "dfs.status.read"
+        );
+        assert_eq!(
+            descriptors[0].required_local_permissions,
+            vec!["remote-management", "device:storage"]
         );
         let descriptor = decoded
             .surfaces
@@ -5729,6 +5785,7 @@ mod tests {
                     category: "dynamic.native".to_string(),
                     operation: "dynamic.native.inspect".to_string(),
                     auth: "admin".to_string(),
+                    required_local_permissions: vec!["remote-management".to_string()],
                 }],
                 declarative_resources: vec![NativeModuleDeclarativeResource {
                     id: "skill.dynamic-native".to_string(),
@@ -5767,6 +5824,10 @@ mod tests {
         assert_eq!(
             registration.surfaces.object_rpc_routes[0].auth,
             ModuleRouteAuth::Admin
+        );
+        assert_eq!(
+            registration.surfaces.object_rpc_routes[0].required_local_permissions,
+            vec!["remote-management"]
         );
         assert_eq!(registration.surfaces.declarative_resources.len(), 1);
         assert_eq!(
@@ -6017,6 +6078,49 @@ mod tests {
         assert!(matches!(
             duplicate,
             ModuleSurfaceError::DuplicateObjectRpcRoute { route } if route == "/dfs/status"
+        ));
+    }
+
+    #[test]
+    fn module_object_rpc_route_local_permissions_are_backward_compatible_and_validated() {
+        let legacy: ModuleObjectRpcRoute = serde_json::from_value(serde_json::json!({
+            "route": "/legacy/status",
+            "category": "legacy",
+            "operation": "legacy.status.read",
+            "auth": "admin"
+        }))
+        .expect("decode legacy route");
+        assert!(legacy.required_local_permissions.is_empty());
+
+        let invalid = ModuleObjectRpcRoute::new(
+            "/remote/status",
+            "remote",
+            "remote.status.read",
+            ModuleRouteAuth::Admin,
+        )
+        .require_local_permission(" remote-management")
+        .validate()
+        .expect_err("permission with whitespace must be rejected");
+        assert!(matches!(
+            invalid,
+            ModuleSurfaceError::InvalidObjectRpcRoute { route, detail }
+                if route == "/remote/status"
+                    && detail.contains("must not have leading or trailing whitespace")
+        ));
+
+        let duplicate = ModuleObjectRpcRoute::new(
+            "/remote/status",
+            "remote",
+            "remote.status.read",
+            ModuleRouteAuth::Admin,
+        )
+        .require_local_permissions(["remote-management", "remote-management"])
+        .validate()
+        .expect_err("duplicate permission must be rejected");
+        assert!(matches!(
+            duplicate,
+            ModuleSurfaceError::InvalidObjectRpcRoute { route, detail }
+                if route == "/remote/status" && detail.contains("listed more than once")
         ));
     }
 

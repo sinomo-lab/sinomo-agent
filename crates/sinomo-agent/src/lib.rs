@@ -2505,6 +2505,7 @@ mod tests {
                 provider: "probe".to_string(),
                 default_model: "probe".to_string(),
                 invocation: sinomo_lm::LanguageModelInvocation::InProcess,
+                host_access: sinomo_lm::LanguageModelHostAccess::Bounded,
                 supports_json_object: false,
                 supports_tool_permissions: false,
             }

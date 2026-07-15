@@ -112,6 +112,7 @@ impl LanguageModelProvider for GeminiProvider {
             provider: Self::PROVIDER_ID.to_string(),
             default_model: self.config.default_model.clone(),
             invocation: LanguageModelInvocation::Http,
+            host_access: crate::LanguageModelHostAccess::NetworkOnly,
             supports_json_object: true,
             supports_tool_permissions: false,
         }

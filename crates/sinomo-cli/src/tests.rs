@@ -14290,6 +14290,60 @@ fn minicpm_main_agent_prompt_uses_official_chat_template_shape() {
 }
 
 #[test]
+fn configured_managed_pytorch_denies_sync_and_streaming_before_custom_python_spawn() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-managed-pytorch-permission-denied");
+    let data_dir = SinomoDataDir::new(&root);
+    let model = super::ConfiguredInteractionModel {
+        data_dir: data_dir.clone(),
+        provider: sinomo_pytorch::MINICPM_PROVIDER_ID.to_string(),
+        model: sinomo_pytorch::MINICPM_DEFAULT_MODEL.to_string(),
+        account: None,
+        runtime_config: sinomo_lm::ModelRuntimeConfig {
+            pytorch_bridge: sinomo_lm::PytorchBridgeRuntimeConfig {
+                python: Some(
+                    root.join("custom-python-must-not-run")
+                        .display()
+                        .to_string(),
+                ),
+                mock: Some(true),
+                ..sinomo_lm::PytorchBridgeRuntimeConfig::default()
+            },
+            ..sinomo_lm::ModelRuntimeConfig::default()
+        },
+        managed_pytorch: Mutex::new(None),
+    };
+    let request = LanguageModelRequest {
+        provider: sinomo_pytorch::MINICPM_PROVIDER_ID.to_string(),
+        model: sinomo_pytorch::MINICPM_DEFAULT_MODEL.to_string(),
+        messages: vec![sinomo_lm::LanguageModelMessage {
+            role: sinomo_lm::LanguageModelRole::User,
+            content: "must not reach Python".to_string(),
+        }],
+        items: Vec::new(),
+        tools: Vec::new(),
+        tool_choice: None,
+        parallel_tool_calls: None,
+        temperature: None,
+        max_output_tokens: Some(8),
+        response_format: sinomo_lm::LanguageModelResponseFormat::Text,
+        metadata: serde_json::Value::Null,
+    };
+
+    let sync_error = model
+        .complete(&request)
+        .expect_err("managed process must require local consent");
+    assert!(sync_error.to_string().contains("remote-management"));
+
+    let mut deltas = Vec::new();
+    let streaming_error = model
+        .complete_streaming(&request, &mut |delta| deltas.push(delta.to_string()))
+        .expect_err("managed streaming process must require local consent");
+    assert!(streaming_error.to_string().contains("remote-management"));
+    assert!(deltas.is_empty());
+    assert!(!root.join("logs").join("pytorch").exists());
+}
+
+#[test]
 fn minicpm_response_trimming_removes_thinking_and_prompt_continuations() {
     assert_eq!(
         super::trim_generated_chat_turn("<think>\nprivate\n</think>\n\nHello.\nUser: next"),
@@ -14929,6 +14983,12 @@ fn workspace_tool_registry_grants_mutation_only_to_builtin_coding_agent() {
     assert_eq!(main_write.status, sinomo_agent::AgentToolStatus::Blocked);
     assert_eq!(main_command.status, sinomo_agent::AgentToolStatus::Blocked);
     assert!(!root.join("main.txt").exists());
+
+    let mut local_permissions = sinomo_runtime::node::LocalNodePermissions::new();
+    local_permissions.set_remote_management_enabled(true);
+    sinomo_runtime::node::LocalNodePermissionStore::new(data_dir.root())
+        .save(&local_permissions)
+        .expect("grant local host-command permission for the coding-agent fixture");
 
     let coding_registry = super::agent_tool_registry_for_workspace(
         &data_dir,

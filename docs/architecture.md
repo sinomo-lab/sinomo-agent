@@ -111,6 +111,17 @@ and signed identity establish trust. A node without cluster state is in a
 bootstrap or recovery condition and may perform only local setup, credentials,
 help, and cluster lifecycle operations.
 
+Host and device exposure is separate node-local consent. Each node keeps its
+own fail-closed permission document outside cluster KV and the remotely writable
+configuration service. Module installation, activation, and route discovery do
+not edit that document. Remote management, unsandboxed agent commands, and
+unbounded computer control must be granted manually on the receiving node and
+re-checked at the final host-effect boundary; device-facing work additionally
+requires an exposure grant for the specific resource and operation. There is no
+remote permission-management RPC. After remote management is granted, its shell
+is intentionally equivalent to local administrator access, including the
+ability to change ordinary node configuration.
+
 One installation contributes one normal cluster member. The main daemon owns
 cluster participation. The shadow daemon is a supervision and recovery endpoint
 and does not vote, own DFS data, or accept normal workload placement.
@@ -352,6 +363,8 @@ Changes to the runtime must preserve these properties:
 10. Lower trust rings never depend on higher-ring services.
 11. External backends remain replaceable and cannot become undeclared sources
     of authority.
+12. Rollout, cluster membership, and service discovery never imply node-local
+    consent to remote host or device access.
 
 Detailed contracts belong in the subsystem documents linked from the
 [documentation index](README.md). Delivery sequencing and unfinished work

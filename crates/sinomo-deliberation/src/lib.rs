@@ -481,6 +481,7 @@ mod tests {
                 provider: "fixture".to_string(),
                 default_model: "deliberator".to_string(),
                 invocation: sinomo_lm::LanguageModelInvocation::InProcess,
+                host_access: sinomo_lm::LanguageModelHostAccess::Bounded,
                 supports_json_object: true,
                 supports_tool_permissions: false,
             }

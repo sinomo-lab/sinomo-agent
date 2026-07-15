@@ -1382,6 +1382,7 @@ pub(crate) enum CliCommand {
 }
 
 pub fn default_cli_command_registry() -> CliCommandRegistry {
+    let local_data_dir = SinomoDataDir::from_env_or_home().ok();
     let module_config = sinomo_runtime::module::ModuleCliCommandConfig::new()
         .with_toggleable_native_rust_module_name(
             sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID,
@@ -1393,8 +1394,8 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
             interface_version:
                 sinomo_runtime::sandbox_wasix_api::SINOMO_SANDBOX_WASIX_INTERFACE_VERSION,
         });
-    let module_config = SinomoDataDir::from_env_or_home()
-        .ok()
+    let module_config = local_data_dir
+        .as_ref()
         .and_then(|data_dir| {
             module_config
                 .clone()
@@ -1402,7 +1403,7 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
                 .ok()
         })
         .unwrap_or(module_config);
-    CliCommandRegistry::new()
+    let mut registry = CliCommandRegistry::new()
         .register(sinomo_runtime::module::module_cli_command_handler(
             module_config,
         ))
@@ -1412,9 +1413,53 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
                 observe_cli_cluster_targets,
             ),
         )
+        .register(
+            sinomo_runtime::remote_management::remote_cli_command_handler(
+                remote_management_cli_rpc,
+            ),
+        )
         .register(sinomo_runtime::sandbox::sandbox_cli_command_handler(
             Arc::new(SinomoCliSandboxHost),
-        ))
+        ));
+    if let Some(data_dir) = local_data_dir {
+        registry = registry.register(
+            sinomo_runtime::remote_management::node_permissions_cli_command_handler(data_dir),
+        );
+    }
+    registry
+}
+
+fn remote_management_cli_rpc(
+    target_node_id: Option<&str>,
+    request: network::ObjectRpcRequest,
+) -> Result<network::ObjectRpcResponse, String> {
+    // The shared shell contract permits five-minute commands. Leave a small
+    // transport margin so the terminal response can arrive after process exit.
+    const REMOTE_MANAGEMENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+    const REMOTE_MANAGEMENT_RPC_TIMEOUT: Duration = Duration::from_secs(310);
+    let status = daemon_default_main_daemon_status(REMOTE_MANAGEMENT_CONNECT_TIMEOUT)
+        .map_err(|source| source.to_string())?
+        .ok_or_else(|| "remote management requires the local daemon to be running".to_string())?;
+    observe_cli_rpc_via_daemon(
+        &status,
+        target_node_id,
+        &request,
+        |address, request| {
+            daemon_send_daemon_rpc(address, request, REMOTE_MANAGEMENT_RPC_TIMEOUT)
+                .map_err(|source| source.to_string())
+        },
+        |address, target_node_id, request| {
+            DaemonApiClient::at_address(address.to_string())
+                .object_rpc_to_target_with_deadline(
+                    target_node_id,
+                    request,
+                    REMOTE_MANAGEMENT_CONNECT_TIMEOUT,
+                    Some(REMOTE_MANAGEMENT_RPC_TIMEOUT),
+                    true,
+                )
+                .map_err(|source| source.to_string())
+        },
+    )
 }
 
 fn cli_command_registry() -> &'static CliCommandRegistry {
@@ -2819,30 +2864,33 @@ impl ConfiguredInteractionModel {
     }
 
     fn managed_pytorch_server(&self, model: &str) -> ManagedPytorchServer {
-        ManagedPytorchServer::new(ManagedPytorchServerConfig {
-            python: self
-                .runtime_config
-                .pytorch_bridge
-                .python
-                .as_deref()
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| default_managed_pytorch_python(&self.data_dir)),
-            model: model.to_string(),
-            device: match self.runtime_config.pytorch_bridge.device.as_deref() {
-                Some("cpu") => PytorchDevice::Cpu,
-                Some("cuda") => PytorchDevice::Cuda,
-                _ => PytorchDevice::Auto,
+        ManagedPytorchServer::new_for_data_dir(
+            ManagedPytorchServerConfig {
+                python: self
+                    .runtime_config
+                    .pytorch_bridge
+                    .python
+                    .as_deref()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| default_managed_pytorch_python(&self.data_dir)),
+                model: model.to_string(),
+                device: match self.runtime_config.pytorch_bridge.device.as_deref() {
+                    Some("cpu") => PytorchDevice::Cpu,
+                    Some("cuda") => PytorchDevice::Cuda,
+                    _ => PytorchDevice::Auto,
+                },
+                mode: PytorchMode::Vision,
+                timeout_seconds: self
+                    .runtime_config
+                    .pytorch_bridge
+                    .timeout_seconds
+                    .unwrap_or(300),
+                log_dir: self.data_dir.root().join("logs").join("pytorch"),
+                mock: self.runtime_config.pytorch_bridge.mock.unwrap_or(false),
+                ..ManagedPytorchServerConfig::default()
             },
-            mode: PytorchMode::Vision,
-            timeout_seconds: self
-                .runtime_config
-                .pytorch_bridge
-                .timeout_seconds
-                .unwrap_or(300),
-            log_dir: self.data_dir.root().join("logs").join("pytorch"),
-            mock: self.runtime_config.pytorch_bridge.mock.unwrap_or(false),
-            ..ManagedPytorchServerConfig::default()
-        })
+            self.data_dir.root(),
+        )
     }
 }
 
@@ -5006,6 +5054,10 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
             .map_err(|detail| CliError::Parse { detail })?;
     }
     registry.clear();
+    // Effect-boundary permissions are host-local state. Configure the
+    // authoritative store after rebuilding the registry so unrestricted tools
+    // fail closed while ordinary sandboxed tools remain unaffected.
+    registry.set_local_permission_data_dir(data_dir.root());
     if let Some(mount) = live_sifs_mount.as_ref() {
         mount.retain_for_registry(registry);
     }
@@ -5024,6 +5076,22 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
         registry,
         sinomo_agent::SkillAgentToolConfig::new(data_dir.clone()),
     );
+    let remote_transport: Arc<dyn sinomo_agent::AgentRemoteObjectRpcTransport> = Arc::new(
+        sinomo_agent::TargetAwareAgentRemoteObjectRpcTransport::new(
+            |target_node_id: Option<&str>,
+             route_key: Option<&str>,
+             request: network::ObjectRpcRequest| {
+                if route_key.is_some() {
+                    return Err(
+                        "this runtime does not resolve remote-management route_key values; use target_node_id"
+                            .to_string(),
+                    );
+                }
+                remote_management_cli_rpc(target_node_id, request)
+            },
+        ),
+    );
+    sinomo_agent::register_remote_management_agent_tools(registry, remote_transport);
     registry.register(CliClusterStatusAgentTool::new(data_dir.clone()));
     Ok(())
 }

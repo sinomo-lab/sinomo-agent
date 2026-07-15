@@ -34,6 +34,7 @@ sinomo-module-api = { path = "../sinomo-module-api" }
 sinomo-observe = { path = "../sinomo-observe" }
 sinomo-policy = { path = "../sinomo-policy" }
 sinomo-registry = { path = "../sinomo-registry" }
+sinomo-remote-management = { path = "../sinomo-remote-management" }
 sinomo-rollout = { path = "../sinomo-rollout" }
 sinomo-sandbox = { path = "../sinomo-sandbox" }
 sinomo-sandbox-simple = { path = "../sinomo-sandbox-simple" }

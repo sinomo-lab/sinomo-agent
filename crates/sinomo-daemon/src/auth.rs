@@ -157,20 +157,34 @@ pub fn authenticate_daemon_control_request(
     paths: &DaemonPaths,
     request: &sinomo_core::network::DaemonControlRequest,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
-    authenticate_daemon_control_request_inner(paths, request, true)
+    authenticate_daemon_control_request_inner(paths, request, true, true)
+}
+
+/// Authenticates the signed request and its signer without applying the legacy
+/// static route allowlist.
+///
+/// Dynamic routes must use this only when their live catalog descriptor is
+/// authorized separately. Keeping this entry point crate-private prevents a
+/// caller from accidentally treating signature verification as route authority.
+pub(crate) fn authenticate_daemon_control_request_without_route_authorization(
+    paths: &DaemonPaths,
+    request: &sinomo_core::network::DaemonControlRequest,
+) -> Result<AuthenticatedDaemonCommand, DaemonError> {
+    authenticate_daemon_control_request_inner(paths, request, true, false)
 }
 
 pub(crate) fn authenticate_daemon_control_request_without_nonce(
     paths: &DaemonPaths,
     request: &sinomo_core::network::DaemonControlRequest,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
-    authenticate_daemon_control_request_inner(paths, request, false)
+    authenticate_daemon_control_request_inner(paths, request, false, true)
 }
 
 fn authenticate_daemon_control_request_inner(
     paths: &DaemonPaths,
     request: &sinomo_core::network::DaemonControlRequest,
     remember_nonce: bool,
+    authorize_route: bool,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
     let auth = request.auth.as_deref().ok_or(DaemonError::AuthDenied)?;
     let envelope: SignedDaemonCommand =
@@ -188,8 +202,29 @@ fn authenticate_daemon_control_request_inner(
         signer_node_id: envelope.node_id,
         signer_public_key,
     };
-    authorize_authenticated_daemon_command(&authenticated)?;
+    if authorize_route {
+        authorize_authenticated_daemon_command_at_node(paths, &authenticated)?;
+    }
     Ok(authenticated)
+}
+
+fn authorize_authenticated_daemon_command_at_node(
+    paths: &DaemonPaths,
+    authenticated: &AuthenticatedDaemonCommand,
+) -> Result<(), DaemonError> {
+    if is_config_rpc_route(&authenticated.route)
+        && !authenticated.signer.can_run_local_command()
+        && authenticated.signer.can_run_admin_command()
+    {
+        let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
+            path: paths.root.display().to_string(),
+            detail: "daemon paths have no data directory parent".to_string(),
+        })?;
+        if sinomo_core::node::LocalNodePermissionStore::new(data_dir).remote_management_enabled() {
+            return Ok(());
+        }
+    }
+    authorize_authenticated_daemon_command(authenticated)
 }
 
 fn verify_daemon_rpc_body_binding(
@@ -1137,6 +1172,42 @@ mod tests {
     }
 
     #[test]
+    fn catalog_authentication_separates_signature_from_legacy_route_authority() {
+        let data_root = unique_auth_test_root("sinomo-daemon-auth-dynamic-route");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let paths = DaemonPaths::new(&data_dir);
+        let unsigned = sinomo_core::network::ObjectRpcRequest::encode_body(
+            "/test/dynamic-module-route",
+            "test-module",
+            &(),
+        )
+        .expect("dynamic module request");
+
+        let mut legacy_request = unsigned.clone();
+        legacy_request.auth = Some(
+            sign_daemon_rpc_request_from_data_dir(&data_dir, &legacy_request)
+                .expect("sign legacy request"),
+        );
+        assert!(matches!(
+            authenticate_daemon_control_request(&paths, &legacy_request),
+            Err(DaemonError::AuthDenied)
+        ));
+
+        let mut catalog_request = unsigned;
+        catalog_request.auth = Some(
+            sign_daemon_rpc_request_from_data_dir(&data_dir, &catalog_request)
+                .expect("sign catalog request"),
+        );
+        let authenticated = authenticate_daemon_control_request_without_route_authorization(
+            &paths,
+            &catalog_request,
+        )
+        .expect("catalog will authorize the route descriptor separately");
+        assert_eq!(authenticated.route, "/test/dynamic-module-route");
+        assert_eq!(authenticated.signer, DaemonSignerAuthority::Local);
+    }
+
+    #[test]
     fn legacy_body_binding_allows_only_metadata_free_status_poll() {
         let status = sinomo_core::network::ObjectRpcRequest::encode_body(
             crate::DAEMON_STATUS_ROUTE,
@@ -1608,6 +1679,29 @@ mod tests {
                 assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
             }
         }
+    }
+
+    #[test]
+    fn remote_admin_config_requires_receiving_node_remote_management_grant() {
+        let root = unique_auth_test_root("sinomo-daemon-auth-remote-config-permission");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let voter =
+            authenticated_command(CONFIG_GET_ROUTE.to_string(), DaemonSignerAuthority::Voter);
+
+        assert!(authorize_authenticated_daemon_command_at_node(&paths, &voter).is_err());
+
+        let mut permissions = sinomo_core::node::LocalNodePermissions::new();
+        permissions.set_remote_management_enabled(true);
+        sinomo_core::node::LocalNodePermissionStore::new(data_dir.root())
+            .save(&permissions)
+            .expect("enable local remote-management permission");
+
+        authorize_authenticated_daemon_command_at_node(&paths, &voter)
+            .expect("remote voter config is enabled by local consent");
+        let member =
+            authenticated_command(CONFIG_GET_ROUTE.to_string(), DaemonSignerAuthority::Member);
+        assert!(authorize_authenticated_daemon_command_at_node(&paths, &member).is_err());
     }
 
     #[test]

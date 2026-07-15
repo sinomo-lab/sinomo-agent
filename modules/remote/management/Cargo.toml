@@ -19,9 +19,13 @@ source = "rollout:modules/remote/management"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+blake3.workspace = true
 serde.workspace = true
-serde_bytes.workspace = true
+sysinfo.workspace = true
+time.workspace = true
+sinomo-core = { path = "../../../crates/sinomo-core" }
 sinomo-module-api = { path = "../../../crates/sinomo-module-api" }
+sinomo-remote-management = { path = "../../../crates/sinomo-remote-management" }
 
 [dev-dependencies]
 sinomo-testdir = { path = "../../../crates/sinomo-testdir" }

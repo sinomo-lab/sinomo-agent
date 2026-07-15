@@ -2,8 +2,9 @@ use crate::{AgentSkillDescriptor, AgentSkillSource};
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::module::{
     DeclarativeModuleLoaderState, ModuleBackendRegistration, ModuleDeclarativeResourceExport,
-    ModuleDeclarativeResourceKind, ModuleRegistration, declarative_module_payload_cache_path,
-    read_declarative_module_loader_states, read_declarative_module_registrations,
+    ModuleDeclarativeResourceKind, ModuleRegistration, active_native_dylib_module_registrations,
+    declarative_module_payload_cache_path, read_declarative_module_loader_states,
+    read_declarative_module_registrations,
 };
 use sinomo_runtime::object::{LengthMode, serde_ext};
 use sinomo_runtime::vfs::{VfsHandle, VfsWriteOptions};
@@ -1024,11 +1025,50 @@ pub fn reconcile_active_declarative_module_skills_to_catalog<S: SkillCatalogStor
     Ok(report)
 }
 
+/// Reconciles skills exported by every active module backend. Native dylib
+/// module resources are inline in their signed descriptor, so unlike
+/// declarative modules they do not have a separate payload root.
+pub fn reconcile_active_module_skills_to_catalog<S: SkillCatalogStore>(
+    store: &S,
+    data_dir: &sinomo_runtime::local::SinomoDataDir,
+) -> Result<SkillCatalogReconcileReport, SkillCatalogError> {
+    let mut report = reconcile_active_declarative_module_skills_to_catalog(store, data_dir)?;
+    let root = data_dir.root();
+    let registrations = active_native_dylib_module_registrations(&root).map_err(|source| {
+        SkillCatalogError::Store {
+            path: root
+                .join("module/loader/native-dylib")
+                .display()
+                .to_string(),
+            detail: source.to_string(),
+        }
+    })?;
+    for registration in registrations {
+        let module_report = reconcile_module_skills_to_catalog(
+            store,
+            &registration,
+            None,
+            Some(SkillActivationScope::Cluster.as_str()),
+            &format!("module:{}", registration.module_id()),
+            "active native module skill reconciliation",
+        )?;
+        report.merge(module_report);
+    }
+    Ok(report)
+}
+
 pub fn reconcile_active_declarative_module_skills_to_sifs(
     data_dir: &sinomo_runtime::local::SinomoDataDir,
 ) -> Result<SkillCatalogReconcileReport, SkillCatalogError> {
     let store = SkillCatalogSifsStore::open(Some(data_dir.root()))?;
     reconcile_active_declarative_module_skills_to_catalog(&store, data_dir)
+}
+
+pub fn reconcile_active_module_skills_to_sifs(
+    data_dir: &sinomo_runtime::local::SinomoDataDir,
+) -> Result<SkillCatalogReconcileReport, SkillCatalogError> {
+    let store = SkillCatalogSifsStore::open(Some(data_dir.root()))?;
+    reconcile_active_module_skills_to_catalog(&store, data_dir)
 }
 
 pub fn load_skill_catalog_from_sifs(
@@ -1041,7 +1081,7 @@ pub fn load_reconciled_skill_catalog_from_sifs(
     data_dir: &sinomo_runtime::local::SinomoDataDir,
 ) -> Result<SkillCatalog, SkillCatalogError> {
     let store = SkillCatalogSifsStore::open(Some(data_dir.root()))?;
-    reconcile_active_declarative_module_skills_to_catalog(&store, data_dir)?;
+    reconcile_active_module_skills_to_catalog(&store, data_dir)?;
     store.load_catalog()
 }
 

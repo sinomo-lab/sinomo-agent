@@ -130,6 +130,7 @@ impl LanguageModelProvider for ClaudeCodeProvider {
             provider: Self::PROVIDER_ID.to_string(),
             default_model: self.config.model.clone(),
             invocation: LanguageModelInvocation::Process,
+            host_access: crate::LanguageModelHostAccess::Unrestricted,
             supports_json_object: false,
             supports_tool_permissions: true,
         }

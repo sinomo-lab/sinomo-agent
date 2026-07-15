@@ -22,6 +22,10 @@ pub struct AgentToolDescriptor {
     pub toolsets: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<AgentToolCapability>,
+    /// Host-local authority grants required at the final tool execution
+    /// boundary. These opaque names are parsed strictly by the registry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_local_permissions: Vec<String>,
     pub supports_parallel: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_specs: Vec<AgentToolProviderSpec>,
@@ -39,6 +43,7 @@ impl AgentToolDescriptor {
             output_schema: serde_json::Value::Null,
             toolsets,
             capabilities: Vec::new(),
+            required_local_permissions: Vec::new(),
             supports_parallel: false,
             provider_specs: Vec::new(),
         }
@@ -64,6 +69,19 @@ impl AgentToolDescriptor {
         capabilities: impl IntoIterator<Item = AgentToolCapability>,
     ) -> Self {
         self.capabilities = capabilities.into_iter().collect();
+        self
+    }
+
+    pub fn with_required_local_permissions(
+        mut self,
+        permissions: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.required_local_permissions = permissions.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn requiring_local_permission(mut self, permission: impl Into<String>) -> Self {
+        self.required_local_permissions.push(permission.into());
         self
     }
 
@@ -839,6 +857,7 @@ impl AgentModuleToolProjection {
                     registration.manifest.owner.clone(),
                 ])
                 .with_capabilities([AgentToolCapability::CallModule])
+                .with_required_local_permissions(route.required_local_permissions.clone())
                 .with_input_schema(serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1358,4 +1377,52 @@ pub enum AgentToolProgressEvent {
         #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
         payload: serde_json::Value,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_tool_projection_preserves_route_local_permissions() {
+        let module_id = TaskId::generate();
+        let registration = sinomo_runtime::module::ModuleRegistration::native_rust(
+            module_id.clone(),
+            "0.1.0",
+            "permission-test",
+            "sinomo-permission-test",
+            "permission-test-v1",
+            sinomo_runtime::core::TrustRing::R1TrustedRuntime,
+            "permission.test",
+        )
+        .with_surfaces(
+            sinomo_runtime::module::ModuleSurfaces::default().with_object_rpc_route(
+                sinomo_runtime::module::ModuleObjectRpcRoute::new(
+                    "/permission/test/status",
+                    "permission-test",
+                    "status",
+                    sinomo_runtime::module::ModuleRouteAuth::LocalOrClusterMember,
+                )
+                .require_local_permission("remote-management"),
+            ),
+        );
+        let projection = AgentModuleToolProjection::new()
+            .with_registration(registration)
+            .with_loader_state(sinomo_runtime::core::ModuleLoaderState {
+                module_id,
+                active_artifact_id: TaskId::generate(),
+                previous_artifact_id: None,
+                shadow_artifact_id: None,
+                candidate_artifact_id: None,
+                hot_swap_state: sinomo_runtime::core::HotSwapState::Stable,
+            });
+
+        let descriptors = projection.project_descriptors();
+
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(
+            descriptors[0].required_local_permissions,
+            vec!["remote-management".to_string()]
+        );
+    }
 }

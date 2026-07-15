@@ -486,6 +486,12 @@ pub struct ObjectRouteDescriptor {
         deserialize_with = "crate::fallible_serde::deserialize_vec"
     )]
     pub required_capabilities: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::fallible_serde::deserialize_vec"
+    )]
+    pub required_local_permissions: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency_limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -517,6 +523,7 @@ impl ObjectRouteDescriptor {
             observability: BTreeMap::new(),
             auth_scope: None,
             required_capabilities: Vec::new(),
+            required_local_permissions: Vec::new(),
             concurrency_limit: None,
             timeout_ms: None,
             request_body_mode: ObjectRpcBodyMode::None,
@@ -536,6 +543,21 @@ impl ObjectRouteDescriptor {
 
     pub fn require_capability(mut self, capability: impl Into<String>) -> Self {
         self.required_capabilities.push(capability.into());
+        self
+    }
+
+    pub fn require_local_permission(mut self, permission: impl Into<String>) -> Self {
+        self.required_local_permissions.push(permission.into());
+        self
+    }
+
+    pub fn require_local_permissions<I, S>(mut self, permissions: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.required_local_permissions
+            .extend(permissions.into_iter().map(Into::into));
         self
     }
 
@@ -670,6 +692,20 @@ impl ServiceCatalog {
                         ),
                     }
                 })?;
+            }
+            let mut local_permissions = BTreeSet::new();
+            for permission in &descriptor.required_local_permissions {
+                if !local_permissions.insert(permission) {
+                    return Err(NetworkError::Serialization {
+                        detail: format!(
+                            "object rpc route {route} declares duplicate local permission {permission}"
+                        ),
+                    });
+                }
+                validate_rpc_token(
+                    permission,
+                    &format!("object rpc route {route} local permission"),
+                )?;
             }
             for (key, value) in &descriptor.observability {
                 validate_rpc_metadata(key, &format!("object rpc route {route} observability key"))?;
@@ -1801,6 +1837,70 @@ fn validate_no_control_chars(value: &str, context: &str) -> Result<(), NetworkEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_route_descriptor_local_permissions_are_backward_compatible() {
+        let legacy = serde_json::json!({
+            "route": "/legacy/status",
+            "category": "legacy",
+            "summary": "legacy status",
+            "input_type": "LegacyStatusRequest",
+            "output_type": "LegacyStatusResponse"
+        });
+        let decoded: ObjectRouteDescriptor =
+            serde_json::from_value(legacy).expect("decode legacy descriptor");
+        assert!(decoded.required_local_permissions.is_empty());
+
+        let descriptor = ObjectRouteDescriptor::new(
+            "/remote/status",
+            "remote",
+            "remote status",
+            "RemoteStatusRequest",
+            "RemoteStatusResponse",
+        )
+        .require_local_permissions(["remote-management", "device:display"]);
+        let encoded = serde_json::to_value(&descriptor).expect("encode descriptor");
+        let decoded: ObjectRouteDescriptor =
+            serde_json::from_value(encoded).expect("decode descriptor");
+        assert_eq!(decoded, descriptor);
+    }
+
+    #[test]
+    fn service_catalog_rejects_non_normalized_and_duplicate_local_permissions() {
+        let invalid = ObjectRouteDescriptor::new(
+            "/remote/status",
+            "remote",
+            "remote status",
+            "RemoteStatusRequest",
+            "RemoteStatusResponse",
+        )
+        .require_local_permission(" remote-management");
+        let mut catalog = ServiceCatalog::default();
+        catalog.register_route(invalid);
+        let error = catalog
+            .validate()
+            .expect_err("non-normalized permission must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("must not have leading or trailing whitespace")
+        );
+
+        let duplicate = ObjectRouteDescriptor::new(
+            "/remote/status",
+            "remote",
+            "remote status",
+            "RemoteStatusRequest",
+            "RemoteStatusResponse",
+        )
+        .require_local_permissions(["remote-management", "remote-management"]);
+        let mut catalog = ServiceCatalog::default();
+        catalog.register_route(duplicate);
+        let error = catalog
+            .validate()
+            .expect_err("duplicate permission must be rejected");
+        assert!(error.to_string().contains("duplicate local permission"));
+    }
 
     struct HugeByteSizeHintDeserializer;
 

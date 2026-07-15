@@ -35,6 +35,7 @@ sinomo-config = { path = "../sinomo-config" }
 sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-module = { path = "../sinomo-module" }
 sinomo-module-api = { path = "../sinomo-module-api" }
+sinomo-remote-management = { path = "../sinomo-remote-management" }
 sinomo-observe = { path = "../sinomo-observe" }
 sinomo-registry = { path = "../sinomo-registry" }
 sinomo-rollout = { path = "../sinomo-rollout" }

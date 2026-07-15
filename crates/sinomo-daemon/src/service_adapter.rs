@@ -25,7 +25,8 @@ use tokio::io::AsyncReadExt as _;
 
 use crate::registry::network_module_surfaces;
 use sinomo_config::{
-    ConfigRegistry, ConfigRegistryBuilder, register_services as register_config_services,
+    CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_SEARCH_ROUTE, CONFIG_SET_ROUTE, ConfigRegistry,
+    ConfigRegistryBuilder, register_services as register_config_services,
 };
 use sinomo_core::kv::{
     CLUSTER_KV_LOCAL_READ_WATCH_ROUTES, CLUSTER_KV_RPC_ROUTE_POLICIES, CLUSTER_KV_RPC_ROUTES,
@@ -3822,6 +3823,159 @@ fn daemon_signer_authorizes_route_scope(authority: &DaemonSignerAuthority, scope
     }
 }
 
+fn daemon_route_local_permissions_are_granted(
+    paths: &DaemonPaths,
+    descriptor: &ObjectRouteDescriptor,
+) -> bool {
+    if descriptor.required_local_permissions.is_empty() {
+        return true;
+    }
+    let data_dir = match daemon_data_dir_path(paths) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(
+                target: "sinomo.daemon.service_auth",
+                route = %descriptor.route,
+                error = %error,
+                "daemon route local permissions denied because the data directory is unavailable"
+            );
+            return false;
+        }
+    };
+    let store = sinomo_core::node::LocalNodePermissionStore::new(&data_dir);
+    for name in &descriptor.required_local_permissions {
+        let permission = match sinomo_core::node::LocalNodePermission::try_from(name.as_str()) {
+            Ok(permission) => permission,
+            Err(error) => {
+                tracing::warn!(
+                    target: "sinomo.daemon.service_auth",
+                    route = %descriptor.route,
+                    permission = %name,
+                    error = %error,
+                    "daemon route declares an unknown node-local permission"
+                );
+                return false;
+            }
+        };
+        match store.try_permission_granted(permission) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    target: "sinomo.daemon.service_auth",
+                    route = %descriptor.route,
+                    permission = %name,
+                    "daemon route denied by node-local permission"
+                );
+                return false;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "sinomo.daemon.service_auth",
+                    route = %descriptor.route,
+                    permission = %name,
+                    error = %error,
+                    "daemon route node-local permission state is unavailable"
+                );
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn daemon_nonlocal_config_permission_is_granted(
+    paths: &DaemonPaths,
+    signer_authority: &DaemonSignerAuthority,
+    route: &str,
+) -> bool {
+    if matches!(signer_authority, DaemonSignerAuthority::Local)
+        || !matches!(
+            route,
+            CONFIG_CATALOG_ROUTE | CONFIG_SEARCH_ROUTE | CONFIG_GET_ROUTE | CONFIG_SET_ROUTE
+        )
+    {
+        return true;
+    }
+    let data_dir = match daemon_data_dir_path(paths) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(
+                target: "sinomo.daemon.service_auth",
+                route,
+                error = %error,
+                "remote config route denied because the local permission store is unavailable"
+            );
+            return false;
+        }
+    };
+    let permission = sinomo_core::node::LocalNodePermission::RemoteManagement;
+    match sinomo_core::node::LocalNodePermissionStore::new(data_dir)
+        .try_permission_granted(permission)
+    {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(
+                target: "sinomo.daemon.service_auth",
+                route,
+                permission = permission.as_str(),
+                "remote config route denied by node-local permission"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "sinomo.daemon.service_auth",
+                route,
+                permission = permission.as_str(),
+                error = %error,
+                "remote config route node-local permission state is unavailable"
+            );
+            false
+        }
+    }
+}
+
+fn daemon_authenticated_command_authorizes_route_descriptor(
+    paths: &DaemonPaths,
+    authenticated: &AuthenticatedDaemonCommand,
+    descriptor: &ObjectRouteDescriptor,
+) -> bool {
+    descriptor
+        .auth_scope
+        .as_deref()
+        .is_none_or(|scope| daemon_signer_authorizes_route_scope(&authenticated.signer, scope))
+        && daemon_route_local_permissions_are_granted(paths, descriptor)
+}
+
+/// Authenticates a request against the live route catalog. Catalog policy is
+/// authoritative for dynamic routes; legacy routes without policy metadata
+/// retain the static authorization table in `auth.rs`.
+pub(crate) fn authenticate_daemon_control_request_via_registry(
+    paths: &DaemonPaths,
+    request: &DaemonControlRequest,
+    service_host: &DaemonServiceRegistryHost,
+) -> Result<AuthenticatedDaemonCommand, DaemonError> {
+    let Some(descriptor) = service_host.object_rpc_route_descriptor(&request.route) else {
+        return crate::auth::authenticate_daemon_control_request(paths, request);
+    };
+    if descriptor.auth_scope.is_none() {
+        let authenticated = crate::auth::authenticate_daemon_control_request(paths, request)?;
+        return daemon_route_local_permissions_are_granted(paths, &descriptor)
+            .then_some(authenticated)
+            .ok_or(DaemonError::AuthDenied);
+    }
+    let authenticated =
+        crate::auth::authenticate_daemon_control_request_without_route_authorization(
+            paths, request,
+        )?;
+    if daemon_authenticated_command_authorizes_route_descriptor(paths, &authenticated, &descriptor)
+    {
+        Ok(authenticated)
+    } else {
+        Err(DaemonError::AuthDenied)
+    }
+}
+
 fn daemon_auth_public_key_prefix(public_key: &str) -> &str {
     public_key
         .get(..public_key.len().min(8))
@@ -3999,6 +4153,9 @@ fn module_object_rpc_route_descriptor_to_daemon_route(
     for capability in &descriptor.required_capabilities {
         route = route.require_capability(capability.as_str());
     }
+    for permission in &descriptor.required_local_permissions {
+        route = route.require_local_permission(permission);
+    }
     route
 }
 
@@ -4060,6 +4217,9 @@ fn service_route_descriptor(route: &ServiceRoute) -> ObjectRouteDescriptor {
     for capability in &route.required_capabilities {
         descriptor = descriptor.require_capability(capability.as_str());
     }
+    for permission in &route.required_local_permissions {
+        descriptor = descriptor.require_local_permission(permission);
+    }
     descriptor = apply_service_route_execution_policy(descriptor, route);
     descriptor
 }
@@ -4110,6 +4270,16 @@ fn validate_module_service_route_contract(
             detail: format!(
                 "module route {} capabilities {:?} do not match service capabilities {:?}",
                 descriptor.route, descriptor.required_capabilities, route.required_capabilities
+            ),
+        });
+    }
+    if descriptor.required_local_permissions != route.required_local_permissions {
+        return Err(NetworkError::Serialization {
+            detail: format!(
+                "module route {} local permissions {:?} do not match service local permissions {:?}",
+                descriptor.route,
+                descriptor.required_local_permissions,
+                route.required_local_permissions
             ),
         });
     }
@@ -4237,6 +4407,54 @@ fn dispatch_native_dylib_module_cancel_request(
     )
 }
 
+fn inject_native_dylib_host_authority(
+    data_dir_root: &std::path::Path,
+    target: &DaemonNativeDylibRouteTarget,
+    request: &mut ObjectRpcRequest,
+) -> Result<(), NetworkError> {
+    if target.operation != sinomo_remote_management::REMOTE_MANAGEMENT_SYSTEM_OBSERVE_OPERATION {
+        return Ok(());
+    }
+    let mut observation: sinomo_remote_management::RemoteManagementSystemObserveRequest =
+        request.decode_body()?;
+    // Never trust a caller-provided resource-policy view. The receiving daemon
+    // owns the exact data directory whose route permission was just authorized
+    // and overwrites the field immediately before invoking native code. These
+    // declarations do not establish that a resource exists; a future resource
+    // broker must still call the store's fail-closed
+    // `resource_operation_exposed` guard at final operation dispatch.
+    observation.host_authorized_resource_exposures.clear();
+    if observation.include_resource_exposures {
+        let store = sinomo_core::node::LocalNodePermissionStore::new(data_dir_root);
+        match store.load() {
+            Ok(permissions) => {
+                observation.host_authorized_resource_exposures = permissions
+                    .resource_exposures()
+                    .iter()
+                    .take(sinomo_remote_management::MAX_OBSERVED_RESOURCE_EXPOSURES)
+                    .map(|(resource_id, exposure)| {
+                        sinomo_remote_management::RemoteManagementResourceExposurePolicy {
+                            resource_id: resource_id.clone(),
+                            allowed_operations: exposure.operations().iter().cloned().collect(),
+                        }
+                    })
+                    .collect();
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "sinomo.daemon.service_auth",
+                    route = %request.route,
+                    error = %error,
+                    "remote resource-exposure policy observations omitted because local exposure state is unavailable"
+                );
+            }
+        }
+    }
+    request.body =
+        sinomo_module_api::encode_sobj(&observation).map_err(module_error_to_network_error)?;
+    Ok(())
+}
+
 async fn dispatch_native_dylib_module_request(
     paths: DaemonPaths,
     target: DaemonNativeDylibRouteTarget,
@@ -4247,6 +4465,8 @@ async fn dispatch_native_dylib_module_request(
     let operation_id = request.operation_id().map(str::to_string);
     tokio::task::spawn_blocking(move || {
         let data_dir_root = daemon_data_dir_path(&paths).map_err(daemon_error_to_network_error)?;
+        let mut request = request;
+        inject_native_dylib_host_authority(&data_dir_root, &target, &mut request)?;
         let state =
             sinomo_module::read_native_dylib_module_loader_state(&data_dir_root, &target.module_id)
                 .map_err(module_error_to_network_error)?
@@ -4711,16 +4931,15 @@ fn daemon_service_signer_from_request_metadata(
 
 fn daemon_service_object_rpc_authorization_layer(
     signer_authority: DaemonSignerAuthority,
+    paths: DaemonPaths,
 ) -> ObjectRpcAuthorizationLayer {
     ObjectRpcAuthorizationLayer::new(move |descriptor, _context| {
         let signer_authority = signer_authority.clone();
+        let paths = paths.clone();
         async move {
-            let Some(auth_scope) = descriptor.auth_scope.as_deref() else {
-                return Ok(());
-            };
-            if daemon_signer_authorizes_route_scope(&signer_authority, auth_scope) {
-                Ok(())
-            } else {
+            if let Some(auth_scope) = descriptor.auth_scope.as_deref()
+                && !daemon_signer_authorizes_route_scope(&signer_authority, auth_scope)
+            {
                 warn_daemon_service_auth_denied(
                     &descriptor.route,
                     auth_scope,
@@ -4728,8 +4947,19 @@ fn daemon_service_object_rpc_authorization_layer(
                     None,
                     None,
                 );
-                Err(NetworkError::AuthDenied)
+                return Err(NetworkError::AuthDenied);
             }
+            if !daemon_nonlocal_config_permission_is_granted(
+                &paths,
+                &signer_authority,
+                &descriptor.route,
+            ) {
+                return Err(NetworkError::AuthDenied);
+            }
+            if !daemon_route_local_permissions_are_granted(&paths, &descriptor) {
+                return Err(NetworkError::AuthDenied);
+            }
+            Ok(())
         }
     })
 }
@@ -4932,8 +5162,11 @@ pub(crate) async fn dispatch_rpc_via_registry_to_session_response_async(
     let router = service_host
         .route_policy_layer()
         .layer(service_host.active_router());
-    let mut router =
-        daemon_service_object_rpc_authorization_layer(authenticated.signer.clone()).layer(router);
+    let mut router = daemon_service_object_rpc_authorization_layer(
+        authenticated.signer.clone(),
+        service_host.paths.clone(),
+    )
+    .layer(router);
     let mut response =
         match sinomo_core::network::call_object_rpc_session_service_async(&mut router, request)
             .await
@@ -4996,6 +5229,26 @@ mod tests {
     use super::*;
     use sinomo_core::kv::{InProcessKvStore, KvEntry, KvRevision, KvVersion};
     use std::time::Duration;
+
+    #[test]
+    fn module_route_local_permissions_propagate_to_daemon_catalog_descriptor() {
+        let descriptor = sinomo_module::ModuleObjectRpcRoute::new(
+            "/remote/status",
+            "remote.management",
+            "remote.management.status.read",
+            sinomo_module::ModuleRouteAuth::Admin,
+        )
+        .require_local_permissions(["remote-management", "device:display"])
+        .descriptor()
+        .expect("module route descriptor");
+
+        let daemon = module_object_rpc_route_descriptor_to_daemon_route(&descriptor);
+
+        assert_eq!(
+            daemon.required_local_permissions,
+            vec!["remote-management", "device:display"]
+        );
+    }
 
     #[test]
     fn conditional_write_maps_expected_posix_failures_to_typed_outcomes() {
@@ -5161,6 +5414,7 @@ mod tests {
                 ServiceRoute::new("/test/stop", "test-stop")
                     .with_auth_scope("admin")
                     .require_capability("test.stop")
+                    .require_local_permission("remote-management")
                     .with_concurrency_limit(1)
                     .with_timeout(Duration::from_millis(500)),
             ]
@@ -5174,6 +5428,60 @@ mod tests {
                     &"stopping".to_string(),
                 )?)?;
                 Ok(ServiceDisposition::Stop)
+            })
+        }
+    }
+
+    struct TestConfigRouteService;
+
+    impl Service for TestConfigRouteService {
+        fn name(&self) -> &'static str {
+            "test-config-route"
+        }
+
+        fn routes(&self) -> &'static [&'static str] {
+            &[CONFIG_GET_ROUTE]
+        }
+
+        fn route_categories(&self) -> Vec<ServiceRoute> {
+            vec![ServiceRoute::new(CONFIG_GET_ROUTE, "config")]
+        }
+
+        fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+            Box::pin(async move {
+                let _: () = request.decode_body()?;
+                ctx.respond(ObjectRpcResponse::encode_body(
+                    request.route,
+                    &"config-read".to_string(),
+                )?)?;
+                Ok(ServiceDisposition::Continue)
+            })
+        }
+    }
+
+    struct TestPermissionOnlyService;
+
+    impl Service for TestPermissionOnlyService {
+        fn name(&self) -> &'static str {
+            "test-permission-only"
+        }
+
+        fn routes(&self) -> &'static [&'static str] {
+            &["/test/permission-only"]
+        }
+
+        fn route_categories(&self) -> Vec<ServiceRoute> {
+            vec![
+                ServiceRoute::new("/test/permission-only", "test-permission-only")
+                    .require_local_permission("remote-management"),
+            ]
+        }
+
+        fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+            Box::pin(async move {
+                let _: () = request.decode_body()?;
+                ctx.respond(ObjectRpcResponse::encode_body(request.route, &())?)?;
+                Ok(ServiceDisposition::Continue)
             })
         }
     }
@@ -5291,6 +5599,10 @@ mod tests {
         assert_eq!(
             descriptor.required_capabilities,
             vec!["test.stop".to_string()]
+        );
+        assert_eq!(
+            descriptor.required_local_permissions,
+            vec!["remote-management".to_string()]
         );
         assert_eq!(
             descriptor
@@ -5778,9 +6090,11 @@ mod tests {
             .expect("runtime");
         let host = test_service_host(&root, registry);
         let router = host.route_policy_layer().layer(host.active_router());
-        let mut router =
-            daemon_service_object_rpc_authorization_layer(DaemonSignerAuthority::Member)
-                .layer(router);
+        let mut router = daemon_service_object_rpc_authorization_layer(
+            DaemonSignerAuthority::Member,
+            host.paths.clone(),
+        )
+        .layer(router);
 
         let error = runtime
             .block_on(sinomo_core::network::call_object_rpc_service_async(
@@ -5795,6 +6109,234 @@ mod tests {
             .expect_err("member must not run admin route");
 
         assert_eq!(error, NetworkError::AuthDenied);
+    }
+
+    #[test]
+    fn catalog_authentication_requires_node_local_permission_for_dynamic_route() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-dynamic-route-local-permission");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let registry = ServiceRegistry::builder().register(TestStopService).build();
+        let host = test_service_host(&root, registry);
+        let unsigned =
+            ObjectRpcRequest::encode_body("/test/stop", "test-stop", &()).expect("dynamic request");
+
+        let mut denied = unsigned.clone();
+        denied.auth = Some(
+            crate::auth::sign_daemon_rpc_request_from_data_dir(&data_dir, &denied)
+                .expect("sign denied request"),
+        );
+        assert!(matches!(
+            authenticate_daemon_control_request_via_registry(&paths, &denied, &host),
+            Err(DaemonError::AuthDenied)
+        ));
+
+        let mut permissions = sinomo_core::node::LocalNodePermissions::new();
+        permissions.set_remote_management_enabled(true);
+        sinomo_core::node::LocalNodePermissionStore::new(data_dir.root())
+            .save(&permissions)
+            .expect("enable remote management locally");
+        let mut allowed = unsigned;
+        allowed.auth = Some(
+            crate::auth::sign_daemon_rpc_request_from_data_dir(&data_dir, &allowed)
+                .expect("sign allowed request"),
+        );
+        let authenticated =
+            authenticate_daemon_control_request_via_registry(&paths, &allowed, &host)
+                .expect("catalog auth succeeds after local grant");
+        assert_eq!(authenticated.signer, DaemonSignerAuthority::Local);
+    }
+
+    #[test]
+    fn local_permission_metadata_never_replaces_route_signer_authority() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-permission-only-route-auth");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let registry = ServiceRegistry::builder()
+            .register(TestPermissionOnlyService)
+            .build();
+        let host = test_service_host(&root, registry);
+        let mut permissions = sinomo_core::node::LocalNodePermissions::new();
+        permissions.set_remote_management_enabled(true);
+        sinomo_core::node::LocalNodePermissionStore::new(data_dir.root())
+            .save(&permissions)
+            .expect("enable remote management locally");
+        let mut request =
+            ObjectRpcRequest::encode_body("/test/permission-only", "test-permission-only", &())
+                .expect("request");
+        request.auth = Some(
+            crate::auth::sign_daemon_rpc_request_from_data_dir(&data_dir, &request)
+                .expect("sign request"),
+        );
+
+        assert!(matches!(
+            authenticate_daemon_control_request_via_registry(&paths, &request, &host),
+            Err(DaemonError::AuthDenied)
+        ));
+    }
+
+    #[test]
+    fn daemon_authorization_layer_rechecks_node_local_permission_at_dispatch() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-route-permission-recheck");
+        let data_dir = SinomoDataDir::new(&root);
+        let registry = ServiceRegistry::builder().register(TestStopService).build();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let host = test_service_host(&root, registry);
+
+        let call = |host: &DaemonServiceRegistryHost| {
+            let router = host.route_policy_layer().layer(host.active_router());
+            let mut router = daemon_service_object_rpc_authorization_layer(
+                DaemonSignerAuthority::Local,
+                host.paths.clone(),
+            )
+            .layer(router);
+            runtime.block_on(sinomo_core::network::call_object_rpc_service_async(
+                &mut router,
+                {
+                    let mut request = ObjectRpcRequest::encode_body("/test/stop", "test-stop", &())
+                        .expect("request");
+                    annotate_test_request(&mut request, DaemonSignerAuthority::Local);
+                    request
+                },
+            ))
+        };
+
+        assert_eq!(
+            call(&host).expect_err("missing permission must deny dispatch"),
+            NetworkError::AuthDenied
+        );
+        let mut permissions = sinomo_core::node::LocalNodePermissions::new();
+        permissions.set_remote_management_enabled(true);
+        sinomo_core::node::LocalNodePermissionStore::new(data_dir.root())
+            .save(&permissions)
+            .expect("enable remote management locally");
+        let response = call(&host).expect("enabled permission allows dispatch");
+        assert_eq!(
+            response.decode_body::<String>().expect("decode response"),
+            "stopping"
+        );
+    }
+
+    #[test]
+    fn daemon_authorization_layer_rechecks_remote_config_permission_after_revocation() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-config-permission-recheck");
+        let data_dir = SinomoDataDir::new(&root);
+        let registry = ServiceRegistry::builder()
+            .register(TestConfigRouteService)
+            .build();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let host = test_service_host(&root, registry);
+
+        let call = |authority: DaemonSignerAuthority| {
+            let router = host.route_policy_layer().layer(host.active_router());
+            let mut router = daemon_service_object_rpc_authorization_layer(
+                authority.clone(),
+                host.paths.clone(),
+            )
+            .layer(router);
+            runtime.block_on(sinomo_core::network::call_object_rpc_service_async(
+                &mut router,
+                {
+                    let mut request =
+                        ObjectRpcRequest::encode_body(CONFIG_GET_ROUTE, "config", &())
+                            .expect("request");
+                    annotate_test_request(&mut request, authority);
+                    request
+                },
+            ))
+        };
+
+        let local = call(DaemonSignerAuthority::Local)
+            .expect("local config remains available without remote-management permission");
+        assert_eq!(
+            local.decode_body::<String>().expect("local response"),
+            "config-read"
+        );
+        assert_eq!(
+            call(DaemonSignerAuthority::Voter)
+                .expect_err("remote config must be denied before a local grant"),
+            NetworkError::AuthDenied
+        );
+
+        let store = sinomo_core::node::LocalNodePermissionStore::new(data_dir.root());
+        let mut permissions = sinomo_core::node::LocalNodePermissions::new();
+        permissions.set_remote_management_enabled(true);
+        store.save(&permissions).expect("enable remote management");
+        let remote = call(DaemonSignerAuthority::Voter)
+            .expect("remote config is available while locally granted");
+        assert_eq!(
+            remote.decode_body::<String>().expect("remote response"),
+            "config-read"
+        );
+
+        permissions.set_remote_management_enabled(false);
+        store.save(&permissions).expect("revoke remote management");
+        assert_eq!(
+            call(DaemonSignerAuthority::Voter)
+                .expect_err("final dispatch must observe local revocation"),
+            NetworkError::AuthDenied
+        );
+    }
+
+    #[test]
+    fn native_remote_observation_separates_authoritative_policy_from_device_inventory() {
+        let authoritative = sinomo_testdir::TestDir::new("sinomo-daemon-remote-resource-authority");
+        let unrelated = sinomo_testdir::TestDir::new("sinomo-daemon-remote-resource-unrelated");
+        let mut permissions = sinomo_core::node::LocalNodePermissions::new();
+        permissions
+            .expose_resource_operation("camera.front", "observe")
+            .expect("expose authoritative camera");
+        sinomo_core::node::LocalNodePermissionStore::new(&authoritative)
+            .save(&permissions)
+            .expect("save authoritative exposures");
+        let mut unrelated_permissions = sinomo_core::node::LocalNodePermissions::new();
+        unrelated_permissions
+            .expose_resource_operation("microphone.unrelated", "capture")
+            .expect("expose unrelated microphone");
+        sinomo_core::node::LocalNodePermissionStore::new(&unrelated)
+            .save(&unrelated_permissions)
+            .expect("save unrelated exposures");
+
+        let caller_policy = sinomo_remote_management::RemoteManagementResourceExposurePolicy {
+            resource_id: "caller.spoofed".to_string(),
+            allowed_operations: vec!["everything".to_string()],
+        };
+        let payload = sinomo_remote_management::RemoteManagementSystemObserveRequest::new()
+            .including_devices(true)
+            .including_resource_exposures(true)
+            .with_host_authorized_resource_exposures([caller_policy]);
+        let mut request = ObjectRpcRequest::encode_body(
+            sinomo_remote_management::REMOTE_MANAGEMENT_SYSTEM_OBSERVE_ROUTE,
+            sinomo_remote_management::REMOTE_MANAGEMENT_RPC_CATEGORY,
+            &payload,
+        )
+        .expect("observation request");
+        let target = DaemonNativeDylibRouteTarget {
+            module_id: sinomo_module::ModuleId::from_legacy_named("remote.management")
+                .expect("module id"),
+            operation: sinomo_remote_management::REMOTE_MANAGEMENT_SYSTEM_OBSERVE_OPERATION
+                .to_string(),
+        };
+
+        inject_native_dylib_host_authority(&authoritative, &target, &mut request)
+            .expect("inject host authority");
+        let injected: sinomo_remote_management::RemoteManagementSystemObserveRequest =
+            request.decode_body().expect("decode injected request");
+        assert_eq!(injected.host_authorized_resource_exposures.len(), 1);
+        assert_eq!(
+            injected.host_authorized_resource_exposures[0].resource_id,
+            "camera.front"
+        );
+        assert_eq!(
+            injected.host_authorized_resource_exposures[0].allowed_operations,
+            vec!["observe".to_string()]
+        );
     }
 
     #[test]
@@ -6043,9 +6585,11 @@ mod tests {
             .expect("runtime");
         let host = test_service_host(&root, registry);
         let router = host.route_policy_layer().layer(host.active_router());
-        let mut router =
-            daemon_service_object_rpc_authorization_layer(DaemonSignerAuthority::Member)
-                .layer(router);
+        let mut router = daemon_service_object_rpc_authorization_layer(
+            DaemonSignerAuthority::Member,
+            host.paths.clone(),
+        )
+        .layer(router);
 
         let payload = sinomo_core::cluster::cluster_control_leave_rpc_payload(
             &sinomo_core::cluster::ClusterControlLeaveRequest::default(),

@@ -158,6 +158,9 @@ pub(super) fn descriptor() -> AgentToolDescriptor {
                 }
             }
         }))
+        .requiring_local_permission(
+            sinomo_runtime::node::LocalNodePermission::RemoteManagement.as_str(),
+        )
 }
 
 fn run_git_diff_command(

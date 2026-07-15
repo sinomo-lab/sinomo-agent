@@ -224,6 +224,7 @@ pub fn benchmarks_module_descriptor() -> NativeModuleDescriptor {
                 category: SINOMO_BENCHMARKS_RPC_CATEGORY.to_string(),
                 operation: SINOMO_BENCHMARKS_CANCEL_PROBE_OPERATION.to_string(),
                 auth: "local-or-cluster-member".to_string(),
+                required_local_permissions: Vec::new(),
             }],
             capability_exports: vec![
                 SINOMO_BENCHMARKS_OPERATION.to_string(),

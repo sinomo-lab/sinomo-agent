@@ -68,6 +68,7 @@ use sinomo_runtime::config::{
 };
 use sinomo_runtime::kv::{KvEntry, KvSnapshot, KvTxn, decode_kv_value};
 use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::node::{LocalNodePermission, LocalNodePermissionStore};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -2693,6 +2694,7 @@ pub fn complete_configured_model_request_with_account(
         ..request.clone()
     };
     let provider = configured_model_provider(data_dir, provider, model, account, working_dir)?;
+    authorize_configured_provider_host_access(data_dir, provider.as_ref(), model)?;
     provider.complete(&request)
 }
 
@@ -2734,7 +2736,51 @@ pub fn complete_configured_model_request_streaming_events_with_account_and_cance
         ..request.clone()
     };
     let provider = configured_model_provider(data_dir, provider, model, account, working_dir)?;
+    authorize_configured_provider_host_access(data_dir, provider.as_ref(), model)?;
     provider.complete_streaming_events_with_cancellation(&request, cancellation, on_event)
+}
+
+fn authorize_configured_provider_host_access(
+    data_dir: &SinomoDataDir,
+    provider: &dyn LanguageModelProvider,
+    requested_model: &str,
+) -> Result<(), LanguageModelError> {
+    let info = provider.info();
+    if !info.host_access.requires_remote_management_permission() {
+        return Ok(());
+    }
+
+    let permission = LocalNodePermission::RemoteManagement;
+    let store = LocalNodePermissionStore::new(data_dir.root());
+    let granted = store.try_permission_granted(permission).map_err(|error| {
+        configured_provider_permission_error(
+            &info,
+            requested_model,
+            format!("could not verify node-local permission: {error}"),
+        )
+    })?;
+    if !granted {
+        return Err(configured_provider_permission_error(
+            &info,
+            requested_model,
+            "grant `remote-management` locally on this node",
+        ));
+    }
+    Ok(())
+}
+
+fn configured_provider_permission_error(
+    info: &LanguageModelProviderInfo,
+    requested_model: &str,
+    detail: impl std::fmt::Display,
+) -> LanguageModelError {
+    LanguageModelError::ProviderInvocationFailed {
+        provider: info.provider.clone(),
+        model: requested_model.to_string(),
+        detail: format!(
+            "provider requires node-local permission `remote-management` for unrestricted host access; {detail}"
+        ),
+    }
 }
 
 fn configured_model_provider(
@@ -3697,8 +3743,34 @@ pub struct LanguageModelProviderInfo {
     pub provider: String,
     pub default_model: String,
     pub invocation: LanguageModelInvocation,
+    /// Describes the provider's ability to affect this host outside Sinomo's
+    /// bounded tool surface. Missing serialized values default to
+    /// `unrestricted` so older or incomplete capability records fail closed.
+    #[serde(default)]
+    pub host_access: LanguageModelHostAccess,
     pub supports_json_object: bool,
     pub supports_tool_permissions: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LanguageModelHostAccess {
+    /// The provider communicates with a remote API and has no direct host
+    /// process or filesystem access through the provider transport.
+    NetworkOnly,
+    /// The local provider is constrained by an enforced sandbox or exposes a
+    /// fixed-function inference interface without general host tools.
+    Bounded,
+    /// The provider can run unsandboxed commands or otherwise exercise
+    /// unbounded control over the host.
+    #[default]
+    Unrestricted,
+}
+
+impl LanguageModelHostAccess {
+    pub const fn requires_remote_management_permission(self) -> bool {
+        matches!(self, Self::Unrestricted)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -3734,6 +3806,11 @@ impl Default for LanguageModelCancellation {
     }
 }
 
+/// Low-level provider transport contract.
+///
+/// Calling a provider directly does not authorize its declared host access.
+/// Host runtimes must use the configured request helpers (or perform the same
+/// node-local permission check) before invoking an `Unrestricted` provider.
 pub trait LanguageModelProvider {
     fn info(&self) -> LanguageModelProviderInfo;
 
@@ -3881,6 +3958,7 @@ impl LanguageModelProvider for CommandLanguageModelProvider {
             provider: self.provider.clone(),
             default_model: self.model.clone(),
             invocation: LanguageModelInvocation::Process,
+            host_access: LanguageModelHostAccess::Unrestricted,
             supports_json_object: matches!(self.prompt_mode, CommandPromptMode::JsonRequest),
             supports_tool_permissions: false,
         }
@@ -5011,8 +5089,34 @@ mod tests {
 
         assert_eq!(info.provider, CodexCliProvider::PROVIDER_ID);
         assert_eq!(info.invocation, LanguageModelInvocation::Process);
+        assert_eq!(info.host_access, LanguageModelHostAccess::Unrestricted);
         assert!(!info.supports_json_object);
         assert!(info.supports_tool_permissions);
+    }
+
+    #[test]
+    fn coding_agent_provider_host_access_is_explicit_and_fail_closed() {
+        assert_eq!(
+            ClaudeCodeProvider::default().info().host_access,
+            LanguageModelHostAccess::Unrestricted
+        );
+        assert_eq!(
+            GitHubCopilotCliProvider::default().info().host_access,
+            LanguageModelHostAccess::Unrestricted
+        );
+
+        let legacy_info: LanguageModelProviderInfo = serde_json::from_value(serde_json::json!({
+            "provider": "legacy-process-provider",
+            "default_model": "legacy-model",
+            "invocation": "process",
+            "supports_json_object": false,
+            "supports_tool_permissions": true
+        }))
+        .expect("legacy provider info");
+        assert_eq!(
+            legacy_info.host_access,
+            LanguageModelHostAccess::Unrestricted
+        );
     }
 
     #[test]
@@ -5257,6 +5361,64 @@ mod tests {
                 ..
             } if provider == "unknown-provider" && model == "test-model"
         ));
+    }
+
+    #[test]
+    fn configured_unrestricted_provider_requires_local_remote_management_permission() {
+        let root = sinomo_testdir::TestDir::new("sinomo-lm-complete-unrestricted-denied");
+        let data_dir = SinomoDataDir::new(&root);
+
+        let error = complete_configured_model_request(
+            &data_dir,
+            ClaudeCodeProvider::PROVIDER_ID,
+            CLAUDE_CODE_DEFAULT_MODEL,
+            Some(root.to_path_buf()),
+            &request(),
+        )
+        .expect_err("Claude Code must be denied before its process is spawned");
+
+        assert!(matches!(
+            &error,
+            LanguageModelError::ProviderInvocationFailed { provider, .. }
+                if provider == ClaudeCodeProvider::PROVIDER_ID
+        ));
+        assert!(error.to_string().contains("remote-management"));
+    }
+
+    #[test]
+    fn configured_streaming_unrestricted_provider_requires_local_permission() {
+        let root = sinomo_testdir::TestDir::new("sinomo-lm-stream-unrestricted-denied");
+        let data_dir = SinomoDataDir::new(&root);
+        let mut events = Vec::new();
+
+        let error = complete_configured_model_request_streaming_events_with_account(
+            &data_dir,
+            GitHubCopilotCliProvider::PROVIDER_ID,
+            PROVIDER_DEFAULT_MODEL,
+            None,
+            Some(root.to_path_buf()),
+            &request(),
+            &mut |event| events.push(event),
+        )
+        .expect_err("Copilot CLI must be denied before its process is spawned");
+
+        assert!(events.is_empty());
+        assert!(matches!(
+            &error,
+            LanguageModelError::ProviderInvocationFailed { provider, .. }
+                if provider == GitHubCopilotCliProvider::PROVIDER_ID
+        ));
+        assert!(error.to_string().contains("remote-management"));
+    }
+
+    #[test]
+    fn configured_network_only_provider_does_not_require_remote_management_permission() {
+        let root = sinomo_testdir::TestDir::new("sinomo-lm-complete-network-only-allowed");
+        let data_dir = SinomoDataDir::new(&root);
+        let provider = OpenAiProvider::new(OpenAiConfig::default());
+
+        authorize_configured_provider_host_access(&data_dir, &provider, PROVIDER_DEFAULT_MODEL)
+            .expect("network-only provider does not require remote-management");
     }
 
     #[test]

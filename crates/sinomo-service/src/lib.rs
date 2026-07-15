@@ -216,6 +216,7 @@ pub struct ServiceRoute {
     pub category: String,
     pub auth_scope: Option<String>,
     pub required_capabilities: Vec<String>,
+    pub required_local_permissions: Vec<String>,
     pub concurrency_limit: Option<usize>,
     pub timeout_ms: Option<u64>,
     pub request_body_mode: ServiceBodyMode,
@@ -229,6 +230,7 @@ impl ServiceRoute {
             category: category.into(),
             auth_scope: None,
             required_capabilities: Vec::new(),
+            required_local_permissions: Vec::new(),
             concurrency_limit: None,
             timeout_ms: None,
             request_body_mode: ServiceBodyMode::None,
@@ -271,6 +273,21 @@ impl ServiceRoute {
         self
     }
 
+    pub fn require_local_permission(mut self, permission: impl Into<String>) -> Self {
+        self.required_local_permissions.push(permission.into());
+        self
+    }
+
+    pub fn require_local_permissions<I, S>(mut self, permissions: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.required_local_permissions
+            .extend(permissions.into_iter().map(Into::into));
+        self
+    }
+
     pub fn with_concurrency_limit(mut self, limit: usize) -> Self {
         self.concurrency_limit = Some(limit);
         self
@@ -298,6 +315,7 @@ struct RouteOwner {
     category: String,
     auth_scope: Option<String>,
     required_capabilities: Vec<String>,
+    required_local_permissions: Vec<String>,
     concurrency_limit: Option<usize>,
     timeout_ms: Option<u64>,
     request_body_mode: ServiceBodyMode,
@@ -380,6 +398,7 @@ impl ServiceRegistry {
                 category: owner.category.clone(),
                 auth_scope: owner.auth_scope.clone(),
                 required_capabilities: owner.required_capabilities.clone(),
+                required_local_permissions: owner.required_local_permissions.clone(),
                 concurrency_limit: owner.concurrency_limit,
                 timeout_ms: owner.timeout_ms,
                 request_body_mode: owner.request_body_mode,
@@ -533,6 +552,7 @@ impl ServiceRegistryBuilder {
                     category: route.category,
                     auth_scope: route.auth_scope,
                     required_capabilities: route.required_capabilities,
+                    required_local_permissions: route.required_local_permissions,
                     concurrency_limit,
                     timeout_ms: route.timeout_ms,
                     request_body_mode: route.request_body_mode,
@@ -593,6 +613,35 @@ fn validate_service_route_categories(service: &impl Service) -> Vec<ServiceRoute
             service.name(),
             route.route
         );
+        let mut local_permissions = BTreeSet::new();
+        for permission in &route.required_local_permissions {
+            assert!(
+                !permission.trim().is_empty(),
+                "service `{}` route `{}` declared an empty local permission",
+                service.name(),
+                route.route
+            );
+            assert!(
+                permission == permission.trim(),
+                "service `{}` route `{}` local permission `{permission}` has leading or trailing whitespace",
+                service.name(),
+                route.route
+            );
+            assert!(
+                permission
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ':')),
+                "service `{}` route `{}` local permission `{permission}` contains invalid characters",
+                service.name(),
+                route.route
+            );
+            assert!(
+                local_permissions.insert(permission.as_str()),
+                "service `{}` route `{}` declares local permission `{permission}` more than once",
+                service.name(),
+                route.route
+            );
+        }
         assert!(
             declared_routes.remove(route.route.as_str()),
             "service `{}` route category for `{}` is not listed in routes()",
@@ -910,11 +959,14 @@ mod tests {
                 "module",
                 "admin",
                 ["module.read", "module.write"],
-            ),
+            )
+            .require_local_permissions(["remote-management", "device:display"]),
             ServiceRoute::new("/test/module", "module")
                 .with_auth_scope("admin")
                 .require_capability("module.read")
                 .require_capability("module.write")
+                .require_local_permission("remote-management")
+                .require_local_permission("device:display")
         );
     }
 
@@ -936,6 +988,7 @@ mod tests {
                     ServiceRoute::new("/test/policy", "policy")
                         .with_auth_scope("admin")
                         .require_capability("policy.write")
+                        .require_local_permission("remote-management")
                         .with_concurrency_limit(4)
                         .with_timeout(Duration::from_millis(250))
                         .with_request_body_mode(ServiceBodyMode::Required)
@@ -965,12 +1018,46 @@ mod tests {
                 ServiceRoute::new("/test/policy", "policy")
                     .with_auth_scope("admin")
                     .require_capability("policy.write")
+                    .require_local_permission("remote-management")
                     .with_concurrency_limit(4)
                     .with_timeout(Duration::from_millis(250))
                     .with_request_body_mode(ServiceBodyMode::Required)
                     .with_response_body_mode(ServiceBodyMode::Optional)
             ]
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "has leading or trailing whitespace")]
+    fn registry_rejects_non_normalized_local_permission() {
+        struct InvalidPermissionService;
+
+        impl Service for InvalidPermissionService {
+            fn name(&self) -> &'static str {
+                "invalid-permission"
+            }
+
+            fn routes(&self) -> &'static [&'static str] {
+                &["/test/invalid-permission"]
+            }
+
+            fn route_categories(&self) -> Vec<ServiceRoute> {
+                vec![
+                    ServiceRoute::new("/test/invalid-permission", "test")
+                        .require_local_permission(" remote-management"),
+                ]
+            }
+
+            fn handle(
+                &self,
+                _ctx: ServiceContext,
+                _request: ObjectRpcRequest,
+            ) -> ServiceFuture<'_> {
+                Box::pin(async { Ok(ServiceDisposition::Continue) })
+            }
+        }
+
+        let _ = ServiceRegistry::builder().register(InvalidPermissionService);
     }
 
     #[tokio::test]

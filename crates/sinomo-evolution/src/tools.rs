@@ -9,7 +9,8 @@ use sinomo_runtime::eval::{
     LocalCommandRunner, NoopCommandRunObserver, VerificationCommand,
 };
 use sinomo_runtime::events::EventId;
-use sinomo_runtime::node::NodeId;
+use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::node::{LocalNodePermission, LocalNodePermissionStore, NodeId};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -24,6 +25,21 @@ pub struct EvolutionToolDescriptor {
     pub output_schema_json: serde_json::Value,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<ToolEffect>,
+    /// Host-local grants that must still be present immediately before the
+    /// tool executes. This metadata is intentionally separate from agent or
+    /// campaign policy: rollout and model selection never imply host consent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_local_permissions: Vec<String>,
+}
+
+impl EvolutionToolDescriptor {
+    pub fn requiring_local_permission(mut self, permission: impl Into<String>) -> Self {
+        let permission = permission.into();
+        if !self.required_local_permissions.contains(&permission) {
+            self.required_local_permissions.push(permission);
+        }
+        self
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -93,6 +109,7 @@ pub trait EvolutionTool: Send + Sync {
 pub struct EvolutionToolRegistry {
     tools: BTreeMap<String, Box<dyn EvolutionTool>>,
     command_control: Arc<CommandControlRegistry>,
+    permission_data_dir: Option<SinomoDataDir>,
 }
 
 impl Default for EvolutionToolRegistry {
@@ -110,6 +127,7 @@ impl EvolutionToolRegistry {
         Self {
             tools: BTreeMap::new(),
             command_control,
+            permission_data_dir: None,
         }
     }
 
@@ -139,6 +157,17 @@ impl EvolutionToolRegistry {
         registry
     }
 
+    /// Builds the normal evolution tool surface with a node-local authority
+    /// source. Without this context, tools requiring local consent fail closed.
+    pub fn bootstrap_for_data_dir(data_dir: SinomoDataDir) -> Self {
+        Self::bootstrap().with_permission_data_dir(data_dir)
+    }
+
+    pub fn with_permission_data_dir(mut self, data_dir: SinomoDataDir) -> Self {
+        self.permission_data_dir = Some(data_dir);
+        self
+    }
+
     pub fn active_command_run_ids(&self) -> Vec<String> {
         self.command_control.active_run_ids()
     }
@@ -161,7 +190,13 @@ impl EvolutionToolRegistry {
         call: EvolutionToolCall,
     ) -> EvolutionToolResult {
         match self.tools.get(&call.tool) {
-            Some(tool) => tool.execute(workspace, call.input),
+            Some(tool) => {
+                let descriptor = tool.descriptor();
+                if let Some(detail) = self.local_permission_denial(&descriptor) {
+                    return failed_tool_result(call.tool, detail, Vec::new());
+                }
+                tool.execute(workspace, call.input)
+            }
             None => {
                 let tool_name = call.tool;
                 failed_tool_result(
@@ -171,6 +206,46 @@ impl EvolutionToolRegistry {
                 )
             }
         }
+    }
+
+    fn local_permission_denial(&self, descriptor: &EvolutionToolDescriptor) -> Option<String> {
+        if descriptor.required_local_permissions.is_empty() {
+            return None;
+        }
+        let Some(data_dir) = &self.permission_data_dir else {
+            return Some(format!(
+                "tool `{}` requires node-local permission, but no local permission context is configured",
+                descriptor.name
+            ));
+        };
+        let store = LocalNodePermissionStore::new(data_dir.root());
+        let permissions = match store.load() {
+            Ok(permissions) => permissions,
+            Err(error) => {
+                return Some(format!(
+                    "tool `{}` cannot verify node-local permission: {error}",
+                    descriptor.name
+                ));
+            }
+        };
+        for permission_name in &descriptor.required_local_permissions {
+            let permission = match LocalNodePermission::try_from(permission_name.as_str()) {
+                Ok(permission) => permission,
+                Err(error) => {
+                    return Some(format!(
+                        "tool `{}` declares an invalid node-local permission: {error}",
+                        descriptor.name
+                    ));
+                }
+            };
+            if !permissions.is_granted(permission) {
+                return Some(format!(
+                    "tool `{}` requires node-local permission `{permission_name}`; grant it locally on this node",
+                    descriptor.name
+                ));
+            }
+        }
+        None
     }
 
     pub fn execute_with_event(
@@ -454,6 +529,7 @@ impl EvolutionTool for RunCommandTool {
             ]),
             vec![ToolEffect::RunCommand],
         )
+        .requiring_local_permission(LocalNodePermission::RemoteManagement.as_str())
     }
 
     fn execute(
@@ -545,6 +621,7 @@ fn descriptor(
         input_schema_json,
         output_schema_json,
         effects,
+        required_local_permissions: Vec::new(),
     }
 }
 

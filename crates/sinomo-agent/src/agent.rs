@@ -4530,7 +4530,14 @@ fn default_agent_config_definition() -> AgentDefinition {
 
 fn default_visible_toolsets_for_role(role: &crate::AgentRole) -> Vec<String> {
     let toolsets: &[&str] = match role {
-        crate::AgentRole::Main => &["core", "interactive", "config", "delegation", "perception"],
+        crate::AgentRole::Main => &[
+            "core",
+            "interactive",
+            "config",
+            "delegation",
+            "perception",
+            "remote",
+        ],
         crate::AgentRole::Background => &[
             "core",
             "interactive",
@@ -4539,6 +4546,7 @@ fn default_visible_toolsets_for_role(role: &crate::AgentRole) -> Vec<String> {
             "perception",
             "cluster",
             "sifs",
+            "remote",
         ],
         crate::AgentRole::Deliberation | crate::AgentRole::Evolution => &[
             "core",
@@ -11299,7 +11307,7 @@ mod tests {
     use sinomo_lm::{LanguageModelError, LanguageModelResponseFormat};
     use sinomo_memory::DurableMemoryStore;
     use sinomo_runtime::events::SessionId;
-    use sinomo_runtime::node::NodeId;
+    use sinomo_runtime::node::{LocalNodePermission, NodeId};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
@@ -11785,6 +11793,12 @@ mod tests {
             context_attachments: Vec::new(),
             tool_specs: default_coding_agent_tools(),
         }
+    }
+
+    fn with_remote_management_for_test(registry: AgentToolRegistry) -> AgentToolRegistry {
+        registry.with_local_permission_checker(|permission: LocalNodePermission| {
+            Ok(permission == LocalNodePermission::RemoteManagement)
+        })
     }
 
     fn coding_evidence(evidence: &AgentToolEvidence) -> AgentCodingToolEvidence {
@@ -14629,12 +14643,14 @@ mod tests {
                         category: "dynamic.native".to_string(),
                         operation: "dynamic.native.inspect".to_string(),
                         auth: "admin".to_string(),
+                        required_local_permissions: Vec::new(),
                     },
                     sinomo_runtime::module_api::NativeModuleObjectRpcRoute {
                         route: "/dynamic-native/apply".to_string(),
                         category: "dynamic.native".to_string(),
                         operation: "dynamic.native.apply".to_string(),
                         auth: "admin".to_string(),
+                        required_local_permissions: Vec::new(),
                     },
                 ],
                 capability_exports: vec![
@@ -16829,11 +16845,12 @@ mod tests {
         run_git_for_test(&root, ["commit", "-m", "seed"]);
         fs::write(root.join("hello.txt"), "new\n").expect("modify file");
         fs::write(root.join("new.txt"), "untracked\n").expect("untracked file");
-        let registry = AgentToolRegistry::local_workspace_with_config(
-            LocalWorkspaceAgentConfig::new(&root)
-                .using_local_process_commands()
-                .with_evidence_dir(&evidence_dir),
-        );
+        let registry =
+            with_remote_management_for_test(AgentToolRegistry::local_workspace_with_config(
+                LocalWorkspaceAgentConfig::new(&root)
+                    .using_local_process_commands()
+                    .with_evidence_dir(&evidence_dir),
+            ));
         let input = agent_input("inspect git state");
 
         let changed = registry.execute(
@@ -16904,12 +16921,13 @@ mod tests {
         std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
         fs::set_permissions(&fake_git, permissions).expect("chmod fake git");
         let fake_git_program = fake_git.display().to_string();
-        let registry = AgentToolRegistry::local_workspace_with_config(
-            LocalWorkspaceAgentConfig::new(&root)
-                .using_local_process_commands()
-                .with_git_program(fake_git_program.clone())
-                .enabling_git_tools(),
-        );
+        let registry =
+            with_remote_management_for_test(AgentToolRegistry::local_workspace_with_config(
+                LocalWorkspaceAgentConfig::new(&root)
+                    .using_local_process_commands()
+                    .with_git_program(fake_git_program.clone())
+                    .enabling_git_tools(),
+            ));
         let input = agent_input("cancel git status");
         let cancellation_token = AgentCancellationToken::new();
         let token_for_sink = cancellation_token.clone();
@@ -16953,8 +16971,9 @@ mod tests {
 
     #[test]
     fn local_workspace_registry_blocks_shell_commands_by_default() {
-        let registry =
-            AgentToolRegistry::local_workspace(std::env::current_dir().expect("current dir"));
+        let registry = with_remote_management_for_test(AgentToolRegistry::local_workspace(
+            std::env::current_dir().expect("current dir"),
+        ));
         let input = agent_input("command");
         let call = AgentToolCall {
             call_id: None,
@@ -17029,11 +17048,12 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-command-timeout");
         let subdir = root.join("subdir");
         fs::create_dir_all(&subdir).expect("workspace");
-        let registry = AgentToolRegistry::local_workspace_with_config(
-            LocalWorkspaceAgentConfig::new(&root)
-                .using_local_process_commands()
-                .allowing_shell_commands(true),
-        );
+        let registry =
+            with_remote_management_for_test(AgentToolRegistry::local_workspace_with_config(
+                LocalWorkspaceAgentConfig::new(&root)
+                    .using_local_process_commands()
+                    .allowing_shell_commands(true),
+            ));
         let input = agent_input("command timeout");
 
         let outcome = registry.execute(
@@ -17078,11 +17098,12 @@ mod tests {
             return;
         }
         let root = sinomo_testdir::TestDir::new("sinomo-agent-command-pipefail");
-        let registry = AgentToolRegistry::local_workspace_with_config(
-            LocalWorkspaceAgentConfig::new(&root)
-                .using_local_process_commands()
-                .allowing_shell_commands(true),
-        );
+        let registry =
+            with_remote_management_for_test(AgentToolRegistry::local_workspace_with_config(
+                LocalWorkspaceAgentConfig::new(&root)
+                    .using_local_process_commands()
+                    .allowing_shell_commands(true),
+            ));
         let input = agent_input("command pipefail");
 
         let outcome = registry.execute(
@@ -17127,7 +17148,8 @@ mod tests {
             .allowing_shell_commands(true)
             .with_data_dir_evidence(&data_dir, &input.session.session_id);
         config.max_command_output_bytes = 4;
-        let registry = AgentToolRegistry::local_workspace_with_config(config);
+        let registry =
+            with_remote_management_for_test(AgentToolRegistry::local_workspace_with_config(config));
 
         let outcome = registry.execute(
             &input.session,
@@ -18233,8 +18255,9 @@ old
             .using_local_process_commands()
             .allowing_shell_commands(true)
             .with_evidence_dir(&evidence_dir);
-        let agent = Agent::new(model, "fake", "fake")
-            .with_tool_registry(AgentToolRegistry::local_workspace_with_config(config));
+        let agent = Agent::new(model, "fake", "fake").with_tool_registry(
+            with_remote_management_for_test(AgentToolRegistry::local_workspace_with_config(config)),
+        );
 
         let run = agent.run(&agent_input("patch and validate")).expect("run");
         let coding_state = run.coding_state.as_ref().expect("coding state");
@@ -19643,8 +19666,8 @@ old
             .allowing_shell_commands(true);
         let agent = Agent::new(model, "fake", "fake")
             .with_config(agent_config)
-            .with_tool_registry(AgentToolRegistry::local_workspace_with_config(
-                workspace_config,
+            .with_tool_registry(with_remote_management_for_test(
+                AgentToolRegistry::local_workspace_with_config(workspace_config),
             ));
         let input = agent_input("run a cancellable command");
         let session = AgentSession::new(input.session.session_id.clone(), AgentRole::Deliberation);

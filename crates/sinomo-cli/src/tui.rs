@@ -8188,6 +8188,11 @@ fn execute_tui_workspace_tool(
 fn tui_grants_workspace_mutation_only_to_the_builtin_coding_agent() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-tui-coding-authority");
     let data_dir = SinomoDataDir::new(root.join("data"));
+    let mut local_permissions = sinomo_runtime::node::LocalNodePermissions::new();
+    local_permissions.set_remote_management_enabled(true);
+    sinomo_runtime::node::LocalNodePermissionStore::new(data_dir.root())
+        .save(&local_permissions)
+        .expect("grant local host-command permission for the coding-agent fixture");
     let workspace = root.join("workspace");
     fs::create_dir_all(&workspace).expect("create workspace");
     let workspace = fs::canonicalize(workspace).expect("canonical workspace");

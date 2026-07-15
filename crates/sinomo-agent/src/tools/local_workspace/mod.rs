@@ -2502,6 +2502,14 @@ fn truncate_utf8_lossy(bytes: &[u8], max_bytes: usize) -> TruncatedText {
 mod tests {
     use super::*;
 
+    fn with_remote_management_for_test(registry: AgentToolRegistry) -> AgentToolRegistry {
+        registry.with_local_permission_checker(
+            |permission: sinomo_runtime::node::LocalNodePermission| {
+                Ok(permission == sinomo_runtime::node::LocalNodePermission::RemoteManagement)
+            },
+        )
+    }
+
     fn test_session(name: &str) -> InteractionSession {
         InteractionSession::new(
             SessionId::from_legacy_named(format!("session-{name}")).expect("session id"),
@@ -2538,6 +2546,47 @@ mod tests {
         assert!(config.agent_home_sifs_path.is_none());
         assert!(config.sandbox_sifs_mount_root.is_none());
         assert_eq!(config.git_tool_mode, LocalWorkspaceGitToolMode::Auto);
+    }
+
+    #[test]
+    fn subprocess_descriptors_require_local_permission_for_every_current_runtime() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-command-permission-descriptor");
+        let default_runtime = LocalWorkspaceAgentConfig::new(&root);
+        assert_eq!(
+            run_command::descriptor_for_config(&default_runtime).required_local_permissions,
+            vec!["remote-management"]
+        );
+
+        let local_process = LocalWorkspaceAgentConfig::new(&root).using_local_process_commands();
+        assert_eq!(
+            run_command::descriptor_for_config(&local_process).required_local_permissions,
+            vec!["remote-management"]
+        );
+
+        let unenforced = LocalWorkspaceAgentConfig::new(&root)
+            .using_simple_sandbox_commands()
+            .allowing_unenforced_simple_sandbox(true);
+        assert_eq!(
+            run_command::descriptor_for_config(&unenforced).required_local_permissions,
+            vec!["remote-management"]
+        );
+
+        let enforced_explicit = LocalWorkspaceAgentConfig::new(&root)
+            .using_simple_sandbox_commands()
+            .allowing_unenforced_simple_sandbox(false);
+        assert_eq!(
+            run_command::descriptor_for_config(&enforced_explicit).required_local_permissions,
+            vec!["remote-management"]
+        );
+
+        assert_eq!(
+            changed_files::descriptor().required_local_permissions,
+            vec!["remote-management"]
+        );
+        assert_eq!(
+            git_diff::descriptor().required_local_permissions,
+            vec!["remote-management"]
+        );
     }
 
     #[test]
@@ -2682,7 +2731,8 @@ mod tests {
         assert!(read_paths.iter().any(|path| path == &additional));
         assert!(write_paths.iter().any(|path| path == &additional));
 
-        let registry = AgentToolRegistry::local_workspace_with_config(config);
+        let registry =
+            with_remote_management_for_test(AgentToolRegistry::local_workspace_with_config(config));
         let execute = |call_index: usize, input: serde_json::Value| {
             registry.execute(
                 &session,
@@ -2751,7 +2801,8 @@ mod tests {
             .with_sandbox_runtime_root(&runtime_root)
             .with_sandbox_instance_id(sandbox_id.clone())
             .allowing_shell_commands(true);
-        let registry = AgentToolRegistry::local_workspace_with_config(config);
+        let registry =
+            with_remote_management_for_test(AgentToolRegistry::local_workspace_with_config(config));
 
         let outcome = registry.execute(
             &session,
@@ -2793,7 +2844,9 @@ mod tests {
         };
         provision_default_agent_session_sandbox(&config, Vec::new())
             .expect("create default sandbox");
-        let registry = AgentToolRegistry::local_workspace_with_config(config.clone());
+        let registry = with_remote_management_for_test(
+            AgentToolRegistry::local_workspace_with_config(config.clone()),
+        );
         let command = registry.execute(
             &session,
             0,
@@ -3067,7 +3120,8 @@ mod tests {
         assert!(config.agent_home_sifs_path.is_none());
         assert!(config.sandbox_sifs_mount_root.is_none());
         let config = provision_test_agent_sandbox(config, &session);
-        let registry = AgentToolRegistry::local_workspace_with_config(config);
+        let registry =
+            with_remote_management_for_test(AgentToolRegistry::local_workspace_with_config(config));
         let outcome = registry.execute(
             &session,
             0,
@@ -3109,7 +3163,8 @@ mod tests {
             .with_agent_home_sifs_path("/sinomo/agents/test/home")
             .allowing_shell_commands(true);
         let config = provision_test_agent_sandbox(config, &session);
-        let registry = AgentToolRegistry::local_workspace_with_config(config);
+        let registry =
+            with_remote_management_for_test(AgentToolRegistry::local_workspace_with_config(config));
 
         let outcome = registry.execute(
             &session,
@@ -3340,7 +3395,8 @@ mod tests {
 
         let session = test_session("generic-host-shell");
         let config = provision_test_agent_sandbox(config, &session);
-        let registry = AgentToolRegistry::local_workspace_with_config(config);
+        let registry =
+            with_remote_management_for_test(AgentToolRegistry::local_workspace_with_config(config));
         assert!(registry.contains("run_command"));
         let outcome = registry.execute(
             &session,

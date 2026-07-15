@@ -44,6 +44,7 @@ default-members = [
     "crates/sinomo-policy",
     "crates/sinomo-pytorch",
     "crates/sinomo-registry",
+    "crates/sinomo-remote-management",
     "crates/sinomo-rollout",
     "crates/sinomo-runtime",
     "crates/sinomo-sandbox",
@@ -103,6 +104,7 @@ pulldown-cmark = { version = "0.13.4", default-features = false }
 rfd = "0.17.2"
 serde_json = "1.0"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+sysinfo = { version = "0.37.2", default-features = false, features = ["disk", "network", "system"] }
 tar = "0.4"
 thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "parsing", "serde", "serde-well-known"] }

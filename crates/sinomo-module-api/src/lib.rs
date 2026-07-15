@@ -222,6 +222,44 @@ pub struct NativeModuleObjectRpcRoute {
     pub category: String,
     pub operation: String,
     pub auth: String,
+    /// Node-local permissions that must be granted before this route may run.
+    ///
+    /// The native-module ABI only carries these permission names. The owning
+    /// node's policy layer decides what they mean and whether they are granted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_local_permissions: Vec<String>,
+}
+
+impl NativeModuleObjectRpcRoute {
+    pub fn new(
+        route: impl Into<String>,
+        category: impl Into<String>,
+        operation: impl Into<String>,
+        auth: impl Into<String>,
+    ) -> Self {
+        Self {
+            route: route.into(),
+            category: category.into(),
+            operation: operation.into(),
+            auth: auth.into(),
+            required_local_permissions: Vec::new(),
+        }
+    }
+
+    pub fn require_local_permission(mut self, permission: impl Into<String>) -> Self {
+        self.required_local_permissions.push(permission.into());
+        self
+    }
+
+    pub fn require_local_permissions<I, S>(mut self, permissions: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.required_local_permissions
+            .extend(permissions.into_iter().map(Into::into));
+        self
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -307,4 +345,49 @@ where
     T: for<'de> Deserialize<'de>,
 {
     Ok(sinomo_object_serde::from_bytes(bytes)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Serialize)]
+    struct LegacyNativeModuleObjectRpcRoute {
+        route: String,
+        category: String,
+        operation: String,
+        auth: String,
+    }
+
+    #[test]
+    fn native_module_route_local_permissions_roundtrip_through_sobj() {
+        let route = NativeModuleObjectRpcRoute::new(
+            "/remote/shell",
+            "remote.management",
+            "remote.management.shell.run",
+            "admin",
+        )
+        .require_local_permissions(["remote-management", "device:display"]);
+
+        let encoded = encode_sobj(&route).expect("encode route");
+        let decoded: NativeModuleObjectRpcRoute = decode_sobj(&encoded).expect("decode route");
+
+        assert_eq!(decoded, route);
+    }
+
+    #[test]
+    fn native_module_route_without_local_permissions_remains_compatible() {
+        let legacy = LegacyNativeModuleObjectRpcRoute {
+            route: "/legacy/inspect".to_string(),
+            category: "legacy".to_string(),
+            operation: "legacy.inspect".to_string(),
+            auth: "admin".to_string(),
+        };
+
+        let encoded = encode_sobj(&legacy).expect("encode legacy route");
+        let decoded: NativeModuleObjectRpcRoute =
+            decode_sobj(&encoded).expect("decode legacy route");
+
+        assert!(decoded.required_local_permissions.is_empty());
+    }
 }

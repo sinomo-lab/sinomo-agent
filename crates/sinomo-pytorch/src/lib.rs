@@ -68,6 +68,7 @@ use sinomo_lm::{
     LanguageModelError, LanguageModelMessage, LanguageModelProvider, LanguageModelProviderInfo,
     LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
 };
+use sinomo_runtime::node::{LocalNodePermission, LocalNodePermissionStore};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -314,6 +315,7 @@ impl LanguageModelProvider for PythonPytorchRuntime {
             provider: MINICPM_PROVIDER_ID.to_string(),
             default_model: self.config.model.clone(),
             invocation: sinomo_lm::LanguageModelInvocation::Process,
+            host_access: sinomo_lm::LanguageModelHostAccess::Unrestricted,
             supports_json_object: false,
             supports_tool_permissions: false,
         }
@@ -458,6 +460,7 @@ pub struct ManagedPytorchServerStatus {
 #[derive(Debug)]
 pub struct ManagedPytorchServer {
     config: ManagedPytorchServerConfig,
+    local_permission_data_dir: Option<PathBuf>,
     child: Option<Child>,
     restart_count: u64,
     last_error: Option<String>,
@@ -468,11 +471,25 @@ impl ManagedPytorchServer {
     pub fn new(config: ManagedPytorchServerConfig) -> Self {
         Self {
             config,
+            local_permission_data_dir: None,
             child: None,
             restart_count: 0,
             last_error: None,
             auth_token: generate_auth_token(),
         }
+    }
+
+    /// Constructs a managed server with the authoritative node-local consent
+    /// root. The plain constructor remains available for status/configuration
+    /// assembly, but all process launch and inference methods fail closed until
+    /// this context is supplied.
+    pub fn new_for_data_dir(
+        config: ManagedPytorchServerConfig,
+        data_dir: impl AsRef<Path>,
+    ) -> Self {
+        let mut server = Self::new(config);
+        server.local_permission_data_dir = Some(data_dir.as_ref().to_path_buf());
+        server
     }
 
     pub fn endpoint(&self) -> String {
@@ -497,13 +514,16 @@ impl ManagedPytorchServer {
         &mut self,
         request: PytorchRequest,
     ) -> Result<PytorchResponse, PytorchBridgeError> {
+        self.authorize_unrestricted_host_access()?;
         self.ensure_ready()?;
+        self.authorize_unrestricted_host_access()?;
         let runtime = self.loopback_runtime();
         match runtime.complete(request.clone()) {
             Ok(response) => Ok(response),
             Err(first) => {
                 self.last_error = Some(first.to_string());
                 self.restart()?;
+                self.authorize_unrestricted_host_access()?;
                 self.loopback_runtime().complete(request)
             }
         }
@@ -514,7 +534,9 @@ impl ManagedPytorchServer {
         request: PytorchRequest,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<PytorchResponse, PytorchBridgeError> {
+        self.authorize_unrestricted_host_access()?;
         self.ensure_ready()?;
+        self.authorize_unrestricted_host_access()?;
         let runtime = self.loopback_runtime();
         match runtime.complete_streaming(request.clone(), on_delta) {
             Ok(response) => Ok(response),
@@ -524,6 +546,7 @@ impl ManagedPytorchServer {
                     "<sinomo_progress>managed PyTorch runtime failed; restarting</sinomo_progress>",
                 );
                 self.restart()?;
+                self.authorize_unrestricted_host_access()?;
                 self.loopback_runtime()
                     .complete_streaming(request, on_delta)
             }
@@ -532,6 +555,7 @@ impl ManagedPytorchServer {
 
     pub fn release_model(&mut self) -> Result<(), PytorchBridgeError> {
         if self.child_is_running() {
+            self.authorize_unrestricted_host_access()?;
             let _ = http_post_json(
                 &self.endpoint(),
                 "/release",
@@ -585,6 +609,9 @@ impl ManagedPytorchServer {
     }
 
     fn spawn(&mut self) -> Result<(), PytorchBridgeError> {
+        // Recheck at the actual process boundary as well as at each public
+        // invocation. A local revoke that races a retry/restart must win.
+        self.authorize_unrestricted_host_access()?;
         ensure_bridge_script(&self.config.server_script)?;
         fs::create_dir_all(&self.config.log_dir).map_err(|source| PytorchBridgeError::Process {
             detail: format!(
@@ -625,6 +652,31 @@ impl ManagedPytorchServer {
                 })?,
         );
         self.last_error = None;
+        Ok(())
+    }
+
+    fn authorize_unrestricted_host_access(&self) -> Result<(), PytorchBridgeError> {
+        let Some(data_dir) = self.local_permission_data_dir.as_ref() else {
+            return Err(PytorchBridgeError::PermissionDenied {
+                detail:
+                    "managed PyTorch execution has no authoritative node-local permission context"
+                        .to_string(),
+            });
+        };
+        let store = LocalNodePermissionStore::new(data_dir);
+        let granted = store
+            .try_permission_granted(LocalNodePermission::RemoteManagement)
+            .map_err(|error| PytorchBridgeError::PermissionDenied {
+                detail: format!(
+                    "could not verify node-local permission `remote-management`: {error}"
+                ),
+            })?;
+        if !granted {
+            return Err(PytorchBridgeError::PermissionDenied {
+                detail: "grant `remote-management` locally on this node before managed PyTorch execution"
+                    .to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -699,6 +751,7 @@ impl LanguageModelProvider for RemotePytorchRuntime {
             provider: MINICPM_PROVIDER_ID.to_string(),
             default_model: PYTORCH_DEFAULT_MODEL.to_string(),
             invocation: sinomo_lm::LanguageModelInvocation::Http,
+            host_access: sinomo_lm::LanguageModelHostAccess::NetworkOnly,
             supports_json_object: false,
             supports_tool_permissions: false,
         }
@@ -736,6 +789,8 @@ pub enum PytorchBridgeError {
     Process { detail: String },
     #[error("PyTorch model network error: {detail}")]
     Network { detail: String },
+    #[error("PyTorch model node-local permission denied: {detail}")]
+    PermissionDenied { detail: String },
 }
 
 pub type MiniCpmRuntimeConfig = PytorchRuntimeConfig;
@@ -1244,6 +1299,20 @@ mod tests {
     }
 
     #[test]
+    fn local_python_runtime_reports_unrestricted_host_access_for_custom_process_config() {
+        let runtime = PythonPytorchRuntime::new(PytorchRuntimeConfig {
+            python: PathBuf::from("/custom/python-with-host-access"),
+            bridge_script: PathBuf::from("/custom/bridge-with-trust-remote-code.py"),
+            ..PytorchRuntimeConfig::default()
+        });
+
+        assert_eq!(
+            runtime.info().host_access,
+            sinomo_lm::LanguageModelHostAccess::Unrestricted
+        );
+    }
+
+    #[test]
     fn remote_runtime_posts_json_to_http_endpoint() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
         let addr = listener.local_addr().expect("addr");
@@ -1417,27 +1486,18 @@ mod tests {
     fn managed_mock_server_requires_supervisor_auth_token() {
         let port = unused_loopback_port();
         let log_dir = sinomo_testdir::TestDir::new("sinomo-pytorch-test");
-        let mut server = ManagedPytorchServer::new(ManagedPytorchServerConfig {
-            port,
-            log_dir: log_dir.to_path_buf(),
-            mock: true,
-            ..ManagedPytorchServerConfig::default()
-        });
+        set_remote_management(&log_dir, true);
+        let mut server = ManagedPytorchServer::new_for_data_dir(
+            ManagedPytorchServerConfig {
+                port,
+                log_dir: log_dir.to_path_buf(),
+                mock: true,
+                ..ManagedPytorchServerConfig::default()
+            },
+            &log_dir,
+        );
         let response = server
-            .complete(PytorchRequest {
-                mode: PytorchMode::Text,
-                system_prompt: String::new(),
-                messages: vec![LanguageModelMessage {
-                    role: LanguageModelRole::User,
-                    content: "hello".to_string(),
-                }],
-                image_path: None,
-                image_base64: None,
-                image_name: None,
-                audio_path: None,
-                stream: false,
-                metadata: serde_json::Value::Null,
-            })
+            .complete(managed_text_request("hello"))
             .expect("managed mock response");
         assert!(response.content.contains("hello"));
         let unauthorized = http_get(
@@ -1448,7 +1508,90 @@ mod tests {
         )
         .expect_err("missing token is denied");
         assert!(unauthorized.to_string().contains("403"));
+
+        set_remote_management(&log_dir, false);
+        let denied = server
+            .complete(managed_text_request("must not run"))
+            .expect_err("local revocation denies reuse of the running server");
+        assert!(matches!(
+            denied,
+            PytorchBridgeError::PermissionDenied { .. }
+        ));
         server.stop();
+    }
+
+    #[test]
+    fn managed_server_denies_sync_and_streaming_before_custom_process_setup() {
+        let data_dir = sinomo_testdir::TestDir::new("sinomo-pytorch-permission-denied");
+        let log_dir = data_dir.join("logs");
+        let config = ManagedPytorchServerConfig {
+            python: data_dir.join("custom-python-must-not-run"),
+            server_script: data_dir.join("custom-server-must-not-be-read.py"),
+            log_dir: log_dir.clone(),
+            port: unused_loopback_port(),
+            ..ManagedPytorchServerConfig::default()
+        };
+        let mut server = ManagedPytorchServer::new_for_data_dir(config, &data_dir);
+
+        let sync_error = server
+            .complete(managed_text_request("denied sync"))
+            .expect_err("missing local grant must deny before process setup");
+        assert!(matches!(
+            sync_error,
+            PytorchBridgeError::PermissionDenied { .. }
+        ));
+        let mut deltas = Vec::new();
+        let streaming_error = server
+            .complete_streaming(managed_text_request("denied stream"), &mut |delta| {
+                deltas.push(delta.to_string());
+            })
+            .expect_err("missing local grant must deny streaming before process setup");
+        assert!(matches!(
+            streaming_error,
+            PytorchBridgeError::PermissionDenied { .. }
+        ));
+        assert!(deltas.is_empty());
+        assert!(server.child.is_none());
+        assert!(!log_dir.exists());
+    }
+
+    #[test]
+    fn managed_server_without_authoritative_data_dir_fails_closed() {
+        let mut server = ManagedPytorchServer::new(ManagedPytorchServerConfig {
+            port: unused_loopback_port(),
+            ..ManagedPytorchServerConfig::default()
+        });
+
+        let error = server
+            .complete(managed_text_request("denied without context"))
+            .expect_err("plain constructor has no permission authority");
+
+        assert!(matches!(error, PytorchBridgeError::PermissionDenied { .. }));
+        assert!(server.child.is_none());
+    }
+
+    fn managed_text_request(content: &str) -> PytorchRequest {
+        PytorchRequest {
+            mode: PytorchMode::Text,
+            system_prompt: String::new(),
+            messages: vec![LanguageModelMessage {
+                role: LanguageModelRole::User,
+                content: content.to_string(),
+            }],
+            image_path: None,
+            image_base64: None,
+            image_name: None,
+            audio_path: None,
+            stream: false,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    fn set_remote_management(data_dir: &Path, enabled: bool) {
+        let store = LocalNodePermissionStore::new(data_dir);
+        let mut permissions = sinomo_runtime::node::LocalNodePermissions::default();
+        permissions.set_permission(LocalNodePermission::RemoteManagement, enabled);
+        store.save(&permissions).expect("write local permission");
     }
 
     fn unused_loopback_port() -> u16 {

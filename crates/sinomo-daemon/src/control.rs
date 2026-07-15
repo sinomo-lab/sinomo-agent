@@ -10,8 +10,8 @@ use crate::dfs::{
 };
 use crate::{
     AuthenticatedDaemonCommand, DaemonClusterStatus, DaemonDataOwnerLock, DaemonError, DaemonLock,
-    DaemonPaths, authenticate_daemon_control_request, daemon_paths_are_shadow,
-    handle_daemon_clear_rollout_status, handle_daemon_finalize_shadow_rollout, read_daemon_status,
+    DaemonPaths, daemon_paths_are_shadow, handle_daemon_clear_rollout_status,
+    handle_daemon_finalize_shadow_rollout, read_daemon_status,
 };
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
@@ -1368,63 +1368,69 @@ pub(crate) async fn handle_daemon_connection_async(
 
         let route = request.route.trim().to_string();
         let auth_started = Instant::now();
-        let authenticated = match authenticate_daemon_control_request(&paths, &request) {
-            Ok(authenticated) => authenticated,
-            Err(error) => {
-                tracing::debug!(
-                    target: "sinomo.daemon.control_rpc",
-                    traceparent = %request_traceparent,
-                    route = %request.route,
-                    category = %request.category,
-                    stream_address = %stream_address,
-                    elapsed_ms = request_received_at.elapsed().as_millis(),
-                    auth_ms = auth_started.elapsed().as_millis(),
-                    error = %error,
-                    "daemon control rpc auth failed"
-                );
-                if crate::auth::is_cluster_join_register_control_request(&request) {
-                    tracing::warn!("sinomo daemon client auth failed for {route}: {error}");
-                }
-                if let Some(key) = replay_key.as_ref()
-                    && let Some(response) = wait_for_daemon_dfs_message_replay(&paths, key).await
-                {
-                    tracing::trace!(
+        let authenticated =
+            match crate::service_adapter::authenticate_daemon_control_request_via_registry(
+                &paths,
+                &request,
+                &service_host,
+            ) {
+                Ok(authenticated) => authenticated,
+                Err(error) => {
+                    tracing::debug!(
                         target: "sinomo.daemon.control_rpc",
                         traceparent = %request_traceparent,
                         route = %request.route,
                         category = %request.category,
                         stream_address = %stream_address,
                         elapsed_ms = request_received_at.elapsed().as_millis(),
-                        "daemon control rpc served from DFS replay after auth failure"
+                        auth_ms = auth_started.elapsed().as_millis(),
+                        error = %error,
+                        "daemon control rpc auth failed"
                     );
-                    let _ = write_daemon_rpc_response_frame_async_for_control_request(
-                        &mut stream,
-                        &stream_address,
-                        &paths,
-                        &request,
-                        response,
-                    )
-                    .await;
+                    if crate::auth::is_cluster_join_register_control_request(&request) {
+                        tracing::warn!("sinomo daemon client auth failed for {route}: {error}");
+                    }
+                    if let Some(key) = replay_key.as_ref()
+                        && let Some(response) =
+                            wait_for_daemon_dfs_message_replay(&paths, key).await
+                    {
+                        tracing::trace!(
+                            target: "sinomo.daemon.control_rpc",
+                            traceparent = %request_traceparent,
+                            route = %request.route,
+                            category = %request.category,
+                            stream_address = %stream_address,
+                            elapsed_ms = request_received_at.elapsed().as_millis(),
+                            "daemon control rpc served from DFS replay after auth failure"
+                        );
+                        let _ = write_daemon_rpc_response_frame_async_for_control_request(
+                            &mut stream,
+                            &stream_address,
+                            &paths,
+                            &request,
+                            response,
+                        )
+                        .await;
+                        let _ = stream.shutdown_write(&stream_address).await;
+                        return Ok(false);
+                    }
+                    if let Ok(response) = sinomo_core::network::ObjectRpcResponse::encode_error(
+                        request.route.clone(),
+                        DaemonError::AuthDenied.to_string(),
+                    ) {
+                        let _ = write_daemon_rpc_response_frame_async_for_rpc_request(
+                            &mut stream,
+                            &stream_address,
+                            &paths,
+                            &request,
+                            response,
+                        )
+                        .await;
+                    }
                     let _ = stream.shutdown_write(&stream_address).await;
                     return Ok(false);
                 }
-                if let Ok(response) = sinomo_core::network::ObjectRpcResponse::encode_error(
-                    request.route.clone(),
-                    DaemonError::AuthDenied.to_string(),
-                ) {
-                    let _ = write_daemon_rpc_response_frame_async_for_rpc_request(
-                        &mut stream,
-                        &stream_address,
-                        &paths,
-                        &request,
-                        response,
-                    )
-                    .await;
-                }
-                let _ = stream.shutdown_write(&stream_address).await;
-                return Ok(false);
-            }
-        };
+            };
         tracing::trace!(
             target: "sinomo.daemon.control_rpc",
             traceparent = %request_traceparent,
@@ -1578,13 +1584,18 @@ pub(crate) async fn handle_daemon_object_rpc_stream_async(
     let authenticated = Arc::new(Mutex::new(None::<AuthenticatedDaemonCommand>));
     let authenticated_slot = Arc::clone(&authenticated);
     let auth_paths = paths.clone();
+    let auth_service_host = service_host.clone();
     let (request, responder) = sinomo_core::network::accept_object_rpc_server_session(
         stream,
         data_dir,
         sinomo_core::network::NetworkCallPolicy::default(),
         move |request, claimed_link_node_id, claimed_link_public_key| {
-            let command = authenticate_daemon_control_request(&auth_paths, request)
-                .map_err(|_| sinomo_core::network::NetworkError::AuthDenied)?;
+            let command = crate::service_adapter::authenticate_daemon_control_request_via_registry(
+                &auth_paths,
+                request,
+                &auth_service_host,
+            )
+            .map_err(|_| sinomo_core::network::NetworkError::AuthDenied)?;
             authorize_daemon_session_link_peer(
                 &auth_paths,
                 request,
@@ -1795,7 +1806,12 @@ async fn handle_daemon_cluster_relay_session_async(
             let request = request
                 .bind_signed_inner_request(inner_request)
                 .map_err(DaemonError::from)?;
-            let authenticated = authenticate_daemon_control_request(paths, &request.request)?;
+            let authenticated =
+                crate::service_adapter::authenticate_daemon_control_request_via_registry(
+                    paths,
+                    &request.request,
+                    service_host,
+                )?;
             crate::service_adapter::dispatch_rpc_via_registry_to_session_response_async(
                 service_host,
                 &authenticated,
@@ -1887,14 +1903,15 @@ pub(crate) async fn dispatch_daemon_control_request_in_process_async(
         return Ok(response);
     }
 
+    let service_host = crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime(
+        paths.clone(),
+        service_runtime,
+    )
+    .await?;
+
     if request.route == sinomo_core::network::CLUSTER_JOIN_CHALLENGE_ROUTE
         && request.category == sinomo_core::network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
     {
-        let service_host = crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime(
-            paths.clone(),
-            service_runtime.clone(),
-        )
-        .await?;
         if let Some(response) =
             crate::service_adapter::dispatch_pre_auth_via_registry_to_response_async(
                 &request,
@@ -1906,22 +1923,27 @@ pub(crate) async fn dispatch_daemon_control_request_in_process_async(
         }
     }
 
-    let authenticated = match authenticate_daemon_control_request(&paths, &request) {
-        Ok(authenticated) => authenticated,
-        Err(error) => {
-            if let Some(key) = replay_key.as_ref()
-                && let Some(response) = wait_for_daemon_dfs_message_replay(&paths, key).await
-            {
-                return Ok(response);
+    let authenticated =
+        match crate::service_adapter::authenticate_daemon_control_request_via_registry(
+            &paths,
+            &request,
+            &service_host,
+        ) {
+            Ok(authenticated) => authenticated,
+            Err(error) => {
+                if let Some(key) = replay_key.as_ref()
+                    && let Some(response) = wait_for_daemon_dfs_message_replay(&paths, key).await
+                {
+                    return Ok(response);
+                }
+                let detail = error.to_string();
+                return sinomo_core::network::ObjectRpcResponse::encode_error(
+                    request.route.clone(),
+                    detail,
+                )
+                .map_err(DaemonError::from);
             }
-            let detail = error.to_string();
-            return sinomo_core::network::ObjectRpcResponse::encode_error(
-                request.route.clone(),
-                detail,
-            )
-            .map_err(DaemonError::from);
-        }
-    };
+        };
     if let Some(key) = replay_key.as_ref() {
         begin_daemon_dfs_message_replay(&paths, key);
     }
@@ -1939,11 +1961,6 @@ pub(crate) async fn dispatch_daemon_control_request_in_process_async(
     if rpc_request.route == sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE {
         return daemon_cluster_network_ping_response(&paths, rpc_request);
     }
-    let service_host = crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime(
-        paths.clone(),
-        service_runtime,
-    )
-    .await?;
     if service_host
         .object_rpc_route_descriptor(&rpc_request.route)
         .is_none()

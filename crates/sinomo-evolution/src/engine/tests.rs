@@ -1,7 +1,8 @@
 use super::*;
 use crate::{WorkspaceId, read_stored_job, write_stored_job};
 use sinomo_lm::{
-    LanguageModelProviderInfo, LanguageModelResponse, LanguageModelUsage, PROVIDER_DEFAULT_MODEL,
+    LanguageModelHostAccess, LanguageModelProviderInfo, LanguageModelResponse, LanguageModelUsage,
+    PROVIDER_DEFAULT_MODEL,
 };
 use sinomo_runtime::core::{
     Confidence, EvaluationOutcome, EventEnvelope, EventKind, Id, LatencyClass, PrivacyClass,
@@ -12,6 +13,7 @@ use sinomo_runtime::events::EventId;
 use sinomo_runtime::module::{
     MODULE_INVOCATION_DECISION_EVENT_KIND, MODULE_TIMEOUT_EVENT_KIND, ModuleId,
 };
+use sinomo_runtime::node::{LocalNodePermission, LocalNodePermissionStore, LocalNodePermissions};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -3204,6 +3206,7 @@ fn language_model_bridge_requests_json_and_applies_returned_patch() {
             provider: "fake-json".to_string(),
             default_model: "fake-model".to_string(),
             invocation: sinomo_lm::LanguageModelInvocation::Http,
+            host_access: LanguageModelHostAccess::NetworkOnly,
             supports_json_object: true,
             supports_tool_permissions: false,
         },
@@ -3262,6 +3265,7 @@ fn language_model_bridge_runs_tool_rounds_before_final_patch() {
             provider: "fake-tool-loop".to_string(),
             default_model: "fake-model".to_string(),
             invocation: sinomo_lm::LanguageModelInvocation::Http,
+            host_access: LanguageModelHostAccess::NetworkOnly,
             supports_json_object: true,
             supports_tool_permissions: false,
         },
@@ -3337,6 +3341,7 @@ fn language_model_bridge_treats_http_tool_providers_as_structured_patch_mode() {
             provider: "fake-http-tools".to_string(),
             default_model: "fake-model".to_string(),
             invocation: sinomo_lm::LanguageModelInvocation::Http,
+            host_access: LanguageModelHostAccess::NetworkOnly,
             supports_json_object: true,
             supports_tool_permissions: true,
         },
@@ -3388,6 +3393,57 @@ fn language_model_bridge_treats_http_tool_providers_as_structured_patch_mode() {
 }
 
 #[test]
+fn unrestricted_language_model_bridge_fails_closed_without_permission_context() {
+    let root = temp_dir("bridge-unrestricted-no-permission-context");
+    let workspace = candidate_workspace(&root);
+    let provider = FakeLanguageModelProvider::new(
+        LanguageModelProviderInfo {
+            provider: "fake-unrestricted".to_string(),
+            default_model: "fake-model".to_string(),
+            invocation: sinomo_lm::LanguageModelInvocation::Process,
+            host_access: LanguageModelHostAccess::Unrestricted,
+            supports_json_object: false,
+            supports_tool_permissions: true,
+        },
+        "unreachable".to_string(),
+    );
+    let requests = provider.requests.clone();
+    let bridge = LanguageModelMutationBridge::new(provider, PROVIDER_DEFAULT_MODEL);
+
+    let error = bridge
+        .mutate(&bridge_permission_test_packet(&workspace), &workspace, None)
+        .expect_err("unrestricted provider must require authoritative local consent");
+
+    assert!(requests.borrow().is_empty());
+    assert!(error.to_string().contains("remote-management"));
+    assert!(error.to_string().contains("no authoritative"));
+}
+
+#[test]
+fn unrestricted_language_model_bridge_rechecks_permission_between_provider_calls() {
+    let root = temp_dir("bridge-unrestricted-revocation");
+    fs::write(root.join("context.txt"), "permission boundary\n").expect("write context");
+    let workspace = candidate_workspace(&root);
+    let data_dir = SinomoDataDir::new(root.join("node-data"));
+    set_remote_management(&data_dir, true);
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let provider = RevokingLanguageModelProvider {
+        store: LocalNodePermissionStore::new(data_dir.root()),
+        requests: requests.clone(),
+    };
+    let bridge =
+        LanguageModelMutationBridge::new_for_data_dir(provider, PROVIDER_DEFAULT_MODEL, &data_dir);
+
+    let error = bridge
+        .mutate(&bridge_permission_test_packet(&workspace), &workspace, None)
+        .expect_err("revocation must stop the next provider invocation");
+
+    assert_eq!(requests.borrow().len(), 1);
+    assert!(error.to_string().contains("remote-management"));
+    assert!(!LocalNodePermissionStore::new(data_dir.root()).remote_management_enabled());
+}
+
+#[test]
 fn language_model_bridge_errors_when_final_patch_fails_to_apply() {
     let root = git_repo("bridge-bad-patch");
     fs::write(root.join("patched.txt"), "old\n").expect("write tracked");
@@ -3399,6 +3455,7 @@ fn language_model_bridge_errors_when_final_patch_fails_to_apply() {
             provider: "fake-json".to_string(),
             default_model: "fake-model".to_string(),
             invocation: sinomo_lm::LanguageModelInvocation::Http,
+            host_access: LanguageModelHostAccess::NetworkOnly,
             supports_json_object: true,
             supports_tool_permissions: false,
         },
@@ -5079,8 +5136,10 @@ fn regression_evidence_summary_preserves_telemetry_and_event_refs_as_trace_fixtu
 }
 
 #[test]
-fn agent_mutation_worker_edits_workspace_and_returns_run_artifacts() {
+fn agent_mutation_worker_binds_local_permission_store_for_host_commands() {
     let root = temp_dir("agent-mutation-worker");
+    let data_dir = SinomoDataDir::new(root.join("node-data"));
+    set_remote_management(&data_dir, true);
     fs::write(root.join("hello.txt"), "old\n").expect("fixture");
     let job = create_bootstrap_job(
         &EvolutionRequest {
@@ -5131,16 +5190,25 @@ fn agent_mutation_worker_edits_workspace_and_returns_run_artifacts() {
         command_logs: Vec::new(),
     };
     let patch = "*** Begin Patch\n*** Update File: hello.txt\n@@\n-old\n+new\n*** End Patch";
+    let command = output_command();
     let model = FakeInteractionModel::new([
         serde_json::json!({
             "response_mode": "defer",
             "text": "Applying the requested source edit.",
-            "tool_calls": [{
-                "tool": "apply_patch",
-                "input": { "patch": patch },
-                "async": false,
-                "summary": "Update hello fixture."
-            }],
+            "tool_calls": [
+                {
+                    "tool": "apply_patch",
+                    "input": { "patch": patch },
+                    "async": false,
+                    "summary": "Update hello fixture."
+                },
+                {
+                    "tool": "run_command",
+                    "input": { "command": command },
+                    "async": false,
+                    "summary": "Verify command execution with local consent."
+                }
+            ],
             "background_handoff": null,
             "next_state": "waiting"
         })
@@ -5154,7 +5222,9 @@ fn agent_mutation_worker_edits_workspace_and_returns_run_artifacts() {
         })
         .to_string(),
     ]);
-    let worker = AgentMutationWorker::new(model, "fake", "fake").with_max_steps(Some(4));
+    let worker = AgentMutationWorker::new(model, "fake", "fake")
+        .with_local_permission_data_dir(data_dir)
+        .with_max_steps(Some(4));
 
     let result = worker
         .mutate(&mutation_packet_for_job(&job), &workspace, Some(&bundle))
@@ -5170,11 +5240,19 @@ fn agent_mutation_worker_edits_workspace_and_returns_run_artifacts() {
             .agent_summary
             .as_ref()
             .map(|summary| summary.tool_results),
-        Some(1)
+        Some(2)
     );
+    let run = result.agent_run.as_ref().expect("serialized agent run");
+    let command_outcome = run["tool_results"]
+        .as_array()
+        .expect("tool results")
+        .iter()
+        .find(|outcome| outcome["call"]["tool"] == "run_command")
+        .expect("run command outcome");
     assert_eq!(
-        result.summary.as_deref(),
-        Some("Changed hello.txt from old to new. Verification not requested.")
+        command_outcome["status"],
+        serde_json::Value::String("succeeded".to_string()),
+        "unexpected run-command outcome: {command_outcome}"
     );
 }
 
@@ -5896,6 +5974,47 @@ fn bootstrap_tool_registry_exposes_minimal_phase_three_tools() {
     }
 }
 
+fn evolution_registry_with_remote_management(root: &Path) -> EvolutionToolRegistry {
+    let data_dir = SinomoDataDir::new(root.join("node-data"));
+    set_remote_management(&data_dir, true);
+    EvolutionToolRegistry::bootstrap_for_data_dir(data_dir)
+}
+
+fn set_remote_management(data_dir: &SinomoDataDir, enabled: bool) {
+    let store = LocalNodePermissionStore::new(data_dir.root());
+    let mut permissions = LocalNodePermissions::default();
+    permissions.set_permission(LocalNodePermission::RemoteManagement, enabled);
+    store
+        .save(&permissions)
+        .expect("write remote-management grant");
+}
+
+#[test]
+fn run_command_tool_fails_closed_without_local_remote_management_permission() {
+    let root = temp_dir("run-command-local-permission");
+    let workspace = candidate_workspace(&root);
+    let registry = EvolutionToolRegistry::bootstrap();
+    let descriptor = registry
+        .descriptors()
+        .into_iter()
+        .find(|descriptor| descriptor.name == "run_command")
+        .expect("run command descriptor");
+
+    assert_eq!(
+        descriptor.required_local_permissions,
+        vec![LocalNodePermission::RemoteManagement.as_str().to_string()]
+    );
+    let result = registry.execute(
+        &workspace,
+        EvolutionToolCall {
+            tool: "run_command".to_string(),
+            input: serde_json::json!({ "command": output_command() }),
+        },
+    );
+    assert_eq!(result.status, ToolCallStatus::Failed);
+    assert!(result.evidence.summary.contains("node-local permission"));
+}
+
 #[test]
 fn read_file_tool_returns_content_and_path_evidence() {
     let root = temp_dir("read-file-tool");
@@ -5951,7 +6070,7 @@ fn tool_registry_can_emit_execution_event_with_result_and_changed_files() {
 fn run_command_tool_captures_exit_code_stdout_and_stderr() {
     let root = temp_dir("run-command-tool");
     let workspace = candidate_workspace(&root);
-    let result = EvolutionToolRegistry::bootstrap().execute(
+    let result = evolution_registry_with_remote_management(&root).execute(
         &workspace,
         EvolutionToolCall {
             tool: "run_command".to_string(),
@@ -6004,7 +6123,7 @@ fn kill_command_tool_can_terminate_active_run_command() {
 
     let root = temp_dir("kill-command-tool");
     let workspace = candidate_workspace(&root);
-    let registry = std::sync::Arc::new(EvolutionToolRegistry::bootstrap());
+    let registry = std::sync::Arc::new(evolution_registry_with_remote_management(&root));
     let running_registry = registry.clone();
     let running_workspace = workspace.clone();
     let handle = thread::spawn(move || {
@@ -6050,7 +6169,7 @@ fn run_command_can_report_git_status_and_diff_from_candidate_workspace() {
     run_in(&root, "git commit -m init").expect("git commit");
     fs::write(root.join("tracked.txt"), "after\n").expect("modify tracked");
     let workspace = candidate_workspace(&root);
-    let registry = EvolutionToolRegistry::bootstrap();
+    let registry = evolution_registry_with_remote_management(&root);
 
     let status = registry.execute(
         &workspace,
@@ -6185,6 +6304,71 @@ impl LanguageModelProvider for FakeLanguageModelProvider {
                 output_tokens: Some(20),
             }),
         })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RevokingLanguageModelProvider {
+    store: LocalNodePermissionStore,
+    requests: Rc<RefCell<Vec<LanguageModelRequest>>>,
+}
+
+impl LanguageModelProvider for RevokingLanguageModelProvider {
+    fn info(&self) -> LanguageModelProviderInfo {
+        LanguageModelProviderInfo {
+            provider: "fake-revoking-unrestricted".to_string(),
+            default_model: "fake-model".to_string(),
+            invocation: sinomo_lm::LanguageModelInvocation::Process,
+            host_access: LanguageModelHostAccess::Unrestricted,
+            supports_json_object: true,
+            supports_tool_permissions: false,
+        }
+    }
+
+    fn complete(
+        &self,
+        request: &LanguageModelRequest,
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        self.requests.borrow_mut().push(request.clone());
+        self.store
+            .mutate(|permissions| {
+                Ok(permissions.set_permission(LocalNodePermission::RemoteManagement, false))
+            })
+            .expect("revoke remote-management after first provider call");
+        Ok(LanguageModelResponse {
+            provider: "fake-revoking-unrestricted".to_string(),
+            model: "fake-model".to_string(),
+            content: serde_json::json!({
+                "tool_calls": [
+                    { "tool": "read_file", "input": { "path": "context.txt" } }
+                ],
+                "changed_files": []
+            })
+            .to_string(),
+            items: Vec::new(),
+            tool_calls: Vec::new(),
+            usage: None,
+        })
+    }
+}
+
+fn bridge_permission_test_packet(workspace: &CandidateWorkspace) -> MutationPacket {
+    MutationPacket {
+        job_id: workspace.job_id.clone(),
+        objective: "exercise provider permission boundary".to_string(),
+        target_ring: TrustRing::R1TrustedRuntime,
+        edit_scope: EditScope {
+            workspace_root: workspace.path.display().to_string(),
+            intended_paths: vec!["context.txt".to_string()],
+            notes: String::new(),
+        },
+        relevant_files: Vec::new(),
+        verification: VerificationPlan {
+            commands: Vec::new(),
+            module_replay_reports: Vec::new(),
+        },
+        output_contract: MutationOutputContract::default(),
+        recovery: RecoveryPlan::default(),
     }
 }
 

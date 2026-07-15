@@ -62,4 +62,4 @@ sinomo-runtime = { path = "../sinomo-runtime" }
 
 [dev-dependencies]
 # Headless rendering harness for visual verification of the widget tree.
-sui-testing = { path = "../../../sui/crates/sui-testing" }
+sui-testing = { package = "sinomo-ui-testing", path = "../../../sui/crates/sui-testing" }

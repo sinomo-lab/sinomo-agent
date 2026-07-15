@@ -3,10 +3,12 @@
 mod daemon;
 mod identity;
 mod membership;
+mod permissions;
 
 pub use daemon::*;
 pub use identity::*;
 pub use membership::*;
+pub use permissions::*;
 
 pub type NodeId = sinomo_base::Id;
 
@@ -29,6 +31,25 @@ pub fn register_storage_paths(
                 .field("created_at", "String"),
         )?;
     }
+    layout.register_sinomo_object(
+        "sinomo-node",
+        StorageRing::R0,
+        LOCAL_NODE_PERMISSIONS_RELATIVE_PATH,
+        ObjectSchema::new(
+            "LocalNodePermissions",
+            LOCAL_NODE_PERMISSIONS_OBJECT_VERSION,
+        )
+        .field("grants", "BTreeSet<LocalNodePermission>")
+        .field(
+            "resource_exposures",
+            "BTreeMap<String, LocalResourceExposure>",
+        ),
+    )?;
+    layout.register_binary(
+        "sinomo-node",
+        StorageRing::R0,
+        LOCAL_NODE_PERMISSIONS_LOCK_RELATIVE_PATH,
+    )?;
     Ok(())
 }
 

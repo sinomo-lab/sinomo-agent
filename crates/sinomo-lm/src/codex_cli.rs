@@ -99,6 +99,14 @@ impl CodexCliProvider {
         })
     }
 
+    fn host_access(&self) -> crate::LanguageModelHostAccess {
+        // Even the default program is resolved through the inherited PATH, so
+        // its basename is not proof that the launched executable enforces the
+        // generated sandbox flags. Fail closed until the executable itself can
+        // be pinned and authenticated.
+        crate::LanguageModelHostAccess::Unrestricted
+    }
+
     pub fn command_args(
         &self,
         request: &LanguageModelRequest,
@@ -178,6 +186,7 @@ impl LanguageModelProvider for CodexCliProvider {
             provider: Self::PROVIDER_ID.to_string(),
             default_model: self.config.model.clone(),
             invocation: LanguageModelInvocation::Process,
+            host_access: self.host_access(),
             supports_json_object: false,
             supports_tool_permissions: true,
         }
@@ -352,5 +361,48 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["-c", "model_reasoning_effort=\"xhigh\""])
         );
+    }
+
+    #[test]
+    fn host_access_fails_closed_for_every_path_resolved_codex_process() {
+        assert_eq!(
+            CodexCliProvider::default().info().host_access,
+            crate::LanguageModelHostAccess::Unrestricted
+        );
+        assert_eq!(
+            CodexCliProvider::new(CodexCliConfig {
+                full_auto: false,
+                sandbox: CodexSandboxMode::ReadOnly,
+                ..CodexCliConfig::default()
+            })
+            .info()
+            .host_access,
+            crate::LanguageModelHostAccess::Unrestricted
+        );
+
+        for config in [
+            CodexCliConfig {
+                dangerously_bypass_approvals_and_sandbox: true,
+                ..CodexCliConfig::default()
+            },
+            CodexCliConfig {
+                full_auto: false,
+                sandbox: CodexSandboxMode::DangerFullAccess,
+                ..CodexCliConfig::default()
+            },
+            CodexCliConfig {
+                extra_args: vec!["--sandbox".to_string(), "danger-full-access".to_string()],
+                ..CodexCliConfig::default()
+            },
+            CodexCliConfig {
+                program: "/tmp/custom-codex-wrapper".to_string(),
+                ..CodexCliConfig::default()
+            },
+        ] {
+            assert_eq!(
+                CodexCliProvider::new(config).info().host_access,
+                crate::LanguageModelHostAccess::Unrestricted
+            );
+        }
     }
 }

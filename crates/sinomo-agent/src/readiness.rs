@@ -44,7 +44,7 @@ use sinomo_runtime::network::{
     ObjectRpcCancelRequest, ObjectRpcIncomingBody, ObjectRpcRequest, ObjectRpcResponse,
     ObjectRpcSessionResponse,
 };
-use sinomo_runtime::node::NodeId;
+use sinomo_runtime::node::{LocalNodePermission, NodeId};
 use sinomo_runtime::service::{
     ResponseSink, ServiceContext, ServiceError, ServiceRegistry, ServiceSigner,
 };
@@ -181,6 +181,15 @@ pub fn run_local_agent_readiness_gate(workspace_root: impl Into<PathBuf>) -> Age
         workspace_root: workspace_root.display().to_string(),
         checks,
     }
+}
+
+/// Readiness registries execute only commands fixed by this local diagnostic
+/// harness. Explicitly grant its probes without weakening production agent
+/// registries, which remain fail-closed until their host configures a checker.
+fn fixed_command_readiness_registry(config: LocalWorkspaceAgentConfig) -> AgentToolRegistry {
+    AgentToolRegistry::local_workspace_with_config(config).with_local_permission_checker(
+        |permission: LocalNodePermission| Ok(permission == LocalNodePermission::RemoteManagement),
+    )
 }
 
 fn passed(
@@ -1627,7 +1636,7 @@ fn check_run_context_provenance_smoke(workspace_root: &Path) -> AgentReadinessCh
     );
     let agent = Agent::new(model, "readiness", "run-context")
         .with_config(config)
-        .with_tool_registry(AgentToolRegistry::local_workspace_with_config(
+        .with_tool_registry(fixed_command_readiness_registry(
             LocalWorkspaceAgentConfig::new(workspace_root),
         ));
     let run = match agent.run(&readiness_agent_loop_input(
@@ -2344,7 +2353,7 @@ fn check_git_diff_large_output_disclosure_smoke() -> AgentReadinessCheck {
         );
     }
 
-    let registry = AgentToolRegistry::local_workspace_with_config(
+    let registry = fixed_command_readiness_registry(
         LocalWorkspaceAgentConfig::new(&root)
             .using_local_process_commands()
             .with_evidence_dir(&evidence_dir),
@@ -2608,7 +2617,7 @@ fn check_version_control_active_cancellation_smoke() -> AgentReadinessCheck {
         );
     }
     let fake_git_program = fake_git.display().to_string();
-    let registry = AgentToolRegistry::local_workspace_with_config(
+    let registry = fixed_command_readiness_registry(
         LocalWorkspaceAgentConfig::new(&workspace_root)
             .using_local_process_commands()
             .with_git_program(fake_git_program.clone())
@@ -5755,7 +5764,7 @@ fn check_coding_state_projection_bounds_smoke() -> AgentReadinessCheck {
             .allowing_shell_commands(true)
             .with_evidence_dir(&evidence_dir);
         let agent = Agent::new(model, "readiness", "coding-projection-smoke")
-            .with_tool_registry(AgentToolRegistry::local_workspace_with_config(config));
+            .with_tool_registry(fixed_command_readiness_registry(config));
         agent
             .run(&readiness_agent_loop_input("patch and repeatedly validate"))
             .map_err(|error| error.to_string())
@@ -5912,7 +5921,7 @@ fn check_coding_state_environment_validation_smoke() -> AgentReadinessCheck {
             .allowing_shell_commands(true)
             .with_evidence_dir(&evidence_dir);
         let agent = Agent::new(model, "readiness", "coding-state-smoke")
-            .with_tool_registry(AgentToolRegistry::local_workspace_with_config(config));
+            .with_tool_registry(fixed_command_readiness_registry(config));
         agent
             .run(&readiness_agent_loop_input("patch and validate"))
             .map_err(|error| error.to_string())
@@ -6049,7 +6058,7 @@ fn check_coding_state_missing_dependency_validation_smoke() -> AgentReadinessChe
             .allowing_shell_commands(true)
             .with_evidence_dir(&evidence_dir);
         let agent = Agent::new(model, "readiness", "coding-missing-dependency-smoke")
-            .with_tool_registry(AgentToolRegistry::local_workspace_with_config(config));
+            .with_tool_registry(fixed_command_readiness_registry(config));
         agent
             .run(&readiness_agent_loop_input(
                 "patch and validate with a missing dependency",
@@ -6184,7 +6193,7 @@ fn check_coding_state_terminal_blocker_smoke() -> AgentReadinessCheck {
             .allowing_shell_commands(true)
             .with_evidence_dir(&evidence_dir);
         let agent = Agent::new(model, "readiness", "coding-terminal-blocker-smoke")
-            .with_tool_registry(AgentToolRegistry::local_workspace_with_config(config));
+            .with_tool_registry(fixed_command_readiness_registry(config));
         agent
             .run(&readiness_agent_loop_input(
                 "patch and validate against a network dependency",
@@ -6277,7 +6286,7 @@ fn check_local_command_evidence_smoke(workspace_root: &Path) -> AgentReadinessCh
         .allowing_shell_commands(true)
         .with_evidence_dir(&evidence_dir);
     config.max_command_output_bytes = 4;
-    let registry = AgentToolRegistry::local_workspace_with_config(config);
+    let registry = fixed_command_readiness_registry(config);
     let session = readiness_session();
     let success_call = AgentToolCall {
         call_id: None,
@@ -6877,7 +6886,7 @@ fn check_sifs_command_evidence_smoke(workspace_root: &Path) -> AgentReadinessChe
         .allowing_shell_commands(true)
         .with_sifs_evidence_mount(&sifs_mount, "readiness/agent/evidence");
     config.max_command_output_bytes = 4;
-    let registry = AgentToolRegistry::local_workspace_with_config(config);
+    let registry = fixed_command_readiness_registry(config);
     let session = readiness_session();
     let command = if cfg!(windows) {
         "echo abcdef & echo uvwxyz 1>&2 & exit /B 3"
@@ -7055,7 +7064,7 @@ fn check_model_visible_evidence_redaction_smoke(_workspace_root: &Path) -> Agent
         .with_sifs_evidence_mount(&sifs_mount, "readiness/agent/evidence/redaction");
     config.max_command_output_bytes = 9 * 1024;
     let agent = Agent::new(model, "readiness", "evidence-redaction")
-        .with_tool_registry(AgentToolRegistry::local_workspace_with_config(config));
+        .with_tool_registry(fixed_command_readiness_registry(config));
     let run = match agent.run(&readiness_agent_loop_input(
         "Generate large command evidence and summarize it.",
     )) {
@@ -7156,7 +7165,7 @@ fn check_model_visible_evidence_redaction_smoke(_workspace_root: &Path) -> Agent
 }
 
 fn readiness_local_registry(workspace_root: &Path) -> AgentToolRegistry {
-    AgentToolRegistry::local_workspace_with_config(
+    fixed_command_readiness_registry(
         LocalWorkspaceAgentConfig::new(workspace_root)
             .using_local_process_commands()
             .allowing_file_writes(true)

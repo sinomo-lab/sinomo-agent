@@ -48,6 +48,7 @@ pub mod r1 {
     pub use sinomo_observe as observe;
     pub use sinomo_policy as policy;
     pub use sinomo_registry as registry;
+    pub use sinomo_remote_management as remote_management;
     pub use sinomo_rollout as rollout;
     // The `sandbox` facade is always the lightweight contracts crate. Runtime
     // execution is provided by `sandbox_wasix_host`, which loads an active
@@ -102,7 +103,8 @@ pub use r1::sandbox_wasix_host;
 pub use r1::{
     api, build, cli_registry, config, daemon, device, dfs, dfs_cloud_files_api, eval, events, kv,
     local, module, module_api, modules, network, network_module, node, observe, policy, registry,
-    rollout, sandbox, sandbox_simple, sandbox_wasix_api, service, storage, supervision, test, vfs,
+    remote_management, rollout, sandbox, sandbox_simple, sandbox_wasix_api, service, storage,
+    supervision, test, vfs,
 };
 
 #[cfg(test)]

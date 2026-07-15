@@ -13,7 +13,7 @@ impl RunCommandTool {
 
 impl AgentTool for RunCommandTool {
     fn descriptor(&self) -> AgentToolDescriptor {
-        descriptor()
+        descriptor_for_config(&self.config)
     }
 
     fn execute(&self, request: super::super::AgentToolRequest<'_>) -> AgentToolResult {
@@ -28,6 +28,20 @@ impl AgentTool for RunCommandTool {
 }
 
 pub(super) fn descriptor() -> AgentToolDescriptor {
+    permission_gated_descriptor()
+}
+
+pub(super) fn descriptor_for_config(_config: &LocalWorkspaceAgentConfig) -> AgentToolDescriptor {
+    permission_gated_descriptor()
+}
+
+fn permission_gated_descriptor() -> AgentToolDescriptor {
+    base_descriptor().requiring_local_permission(
+        sinomo_runtime::node::LocalNodePermission::RemoteManagement.as_str(),
+    )
+}
+
+fn base_descriptor() -> AgentToolDescriptor {
     AgentToolDescriptor::new(spec_for_kind(AgentToolKind::RunShellCommand))
         .with_capabilities([AgentToolCapability::ExecuteProcess])
         .with_input_schema(serde_json::json!({

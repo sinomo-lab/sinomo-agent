@@ -3,6 +3,8 @@ use super::{
     AgentToolProgressSink, AgentToolRequest, AgentToolResult, AgentToolStatus,
 };
 use crate::{AgentCancellationToken, AgentToolCall, InteractionSession, TaskId};
+use sinomo_runtime::node::{LocalNodePermission, LocalNodePermissionStore};
+use std::path::Path;
 use std::sync::{
     Arc, RwLock,
     atomic::{AtomicU64, Ordering},
@@ -19,7 +21,31 @@ pub struct AgentToolRegistry {
     /// this registry (for example, a live filesystem mount). Resources are not
     /// tools and therefore never appear in model-visible descriptors.
     resources: Arc<RwLock<Vec<Arc<dyn Send + Sync>>>>,
+    local_permission_checker: Arc<RwLock<Option<Arc<dyn AgentToolLocalPermissionChecker>>>>,
     generation: Arc<AtomicU64>,
+}
+
+/// Host-provided evaluator for node-local authority grants. The registry
+/// parses descriptor tokens into the closed permission enum before invoking
+/// this checker.
+pub trait AgentToolLocalPermissionChecker: Send + Sync {
+    fn permission_granted(&self, permission: LocalNodePermission) -> Result<bool, String>;
+}
+
+impl AgentToolLocalPermissionChecker for LocalNodePermissionStore {
+    fn permission_granted(&self, permission: LocalNodePermission) -> Result<bool, String> {
+        self.try_permission_granted(permission)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl<F> AgentToolLocalPermissionChecker for F
+where
+    F: Fn(LocalNodePermission) -> Result<bool, String> + Send + Sync,
+{
+    fn permission_granted(&self, permission: LocalNodePermission) -> Result<bool, String> {
+        self(permission)
+    }
 }
 
 impl AgentToolRegistry {
@@ -60,6 +86,41 @@ impl AgentToolRegistry {
     pub fn with_gateway<G: AgentToolGateway + 'static>(self, gateway: G) -> Self {
         self.register_gateway(gateway);
         self
+    }
+
+    pub fn with_local_permission_data_dir(self, data_dir: impl AsRef<Path>) -> Self {
+        self.set_local_permission_data_dir(data_dir);
+        self
+    }
+
+    pub fn set_local_permission_data_dir(&self, data_dir: impl AsRef<Path>) {
+        self.set_local_permission_checker(LocalNodePermissionStore::new(data_dir));
+    }
+
+    pub fn with_local_permission_checker<C>(self, checker: C) -> Self
+    where
+        C: AgentToolLocalPermissionChecker + 'static,
+    {
+        self.set_local_permission_checker(checker);
+        self
+    }
+
+    pub fn set_local_permission_checker<C>(&self, checker: C)
+    where
+        C: AgentToolLocalPermissionChecker + 'static,
+    {
+        *self
+            .local_permission_checker
+            .write()
+            .expect("agent tool registry local permission checker lock poisoned") =
+            Some(Arc::new(checker));
+    }
+
+    pub fn clear_local_permission_checker(&self) {
+        *self
+            .local_permission_checker
+            .write()
+            .expect("agent tool registry local permission checker lock poisoned") = None;
     }
 
     pub fn register<T: AgentTool + 'static>(&self, tool: T) -> Option<AgentToolDescriptor> {
@@ -232,11 +293,16 @@ impl AgentToolRegistry {
             .iter()
             .find(|tool| tool.descriptor().spec.name == call.tool)
             .cloned();
+        let descriptor = tool.as_ref().map(|tool| tool.descriptor());
         let _resources = resources.clone();
         drop(resources);
         drop(tools);
         let result = tool
-            .map(|tool| {
+            .zip(descriptor)
+            .map(|(tool, descriptor)| {
+                if let Err(blocked) = self.authorize_local_permissions(&descriptor) {
+                    return blocked;
+                }
                 tool.execute(AgentToolRequest {
                     call_id: &call_id,
                     session,
@@ -258,6 +324,67 @@ impl AgentToolRegistry {
             });
 
         self.outcome_from_result(call_id, step_index, call_index, call, result)
+    }
+
+    fn authorize_local_permissions(
+        &self,
+        descriptor: &AgentToolDescriptor,
+    ) -> Result<(), AgentToolResult> {
+        if descriptor.required_local_permissions.is_empty() {
+            return Ok(());
+        }
+
+        let mut permissions = Vec::with_capacity(descriptor.required_local_permissions.len());
+        for token in &descriptor.required_local_permissions {
+            match LocalNodePermission::try_from(token.as_str()) {
+                Ok(permission) => permissions.push((token.as_str(), permission)),
+                Err(error) => {
+                    return Err(local_permission_blocked_result(
+                        descriptor,
+                        "unknown_local_permission",
+                        token,
+                        Some(error.to_string()),
+                    ));
+                }
+            }
+        }
+
+        let checker = self
+            .local_permission_checker
+            .read()
+            .expect("agent tool registry local permission checker lock poisoned")
+            .clone();
+        let Some(checker) = checker else {
+            return Err(local_permission_blocked_result(
+                descriptor,
+                "local_permission_context_unconfigured",
+                permissions[0].0,
+                None,
+            ));
+        };
+
+        for (token, permission) in permissions {
+            match checker.permission_granted(permission) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(local_permission_blocked_result(
+                        descriptor,
+                        "local_permission_denied",
+                        token,
+                        None,
+                    ));
+                }
+                Err(error) => {
+                    return Err(local_permission_blocked_result(
+                        descriptor,
+                        "local_permission_check_failed",
+                        token,
+                        Some(error),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn outcome_from_result(
@@ -296,6 +423,29 @@ impl AgentToolRegistry {
     fn bump_generation(&self) {
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+fn local_permission_blocked_result(
+    descriptor: &AgentToolDescriptor,
+    error: &'static str,
+    permission: &str,
+    detail: Option<String>,
+) -> AgentToolResult {
+    let mut output = serde_json::json!({
+        "error": error,
+        "tool": descriptor.spec.name,
+        "required_local_permission": permission,
+        "required_local_permissions": descriptor.required_local_permissions,
+    });
+    if let Some(detail) = detail {
+        output["detail"] = serde_json::Value::String(detail);
+    }
+    let summary = format!(
+        "tool `{}` blocked by node-local permission `{permission}`",
+        descriptor.spec.name
+    );
+    AgentToolResult::blocked(summary.clone(), output)
+        .with_evidence(AgentToolEvidence::availability_only(false, summary))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -497,7 +647,10 @@ mod tests {
         InteractionSurfaceKind,
     };
     use sinomo_runtime::events::SessionId;
-    use sinomo_runtime::node::NodeId;
+    use sinomo_runtime::node::{
+        LocalNodePermission, LocalNodePermissionStore, LocalNodePermissions, NodeId,
+    };
+    use std::fs;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
@@ -554,6 +707,143 @@ mod tests {
             NodeId::from_legacy_named("agent_gateway_cancel_node").expect("node"),
             InteractionSurface::new("agent.gateway.test", InteractionSurfaceKind::CommandLine),
         )
+    }
+
+    struct PermissionProbeTool {
+        descriptor: AgentToolDescriptor,
+        executions: Arc<AtomicUsize>,
+    }
+
+    impl AgentTool for PermissionProbeTool {
+        fn descriptor(&self) -> AgentToolDescriptor {
+            self.descriptor.clone()
+        }
+
+        fn execute(&self, _request: AgentToolRequest<'_>) -> AgentToolResult {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            AgentToolResult::succeeded("permission probe executed", serde_json::json!({}))
+        }
+    }
+
+    fn permission_probe_descriptor(
+        required_local_permissions: impl IntoIterator<Item = impl Into<String>>,
+    ) -> AgentToolDescriptor {
+        AgentToolDescriptor::new(AgentToolSpec::new(
+            AgentToolKind::ModuleObjectRpc,
+            "permission_probe",
+            "node-local permission enforcement probe",
+            false,
+        ))
+        .with_required_local_permissions(required_local_permissions)
+    }
+
+    fn permission_probe_call() -> AgentToolCall {
+        AgentToolCall {
+            call_id: None,
+            tool: "permission_probe".to_string(),
+            input: serde_json::json!({}),
+            r#async: false,
+            summary: "check local permission".to_string(),
+        }
+    }
+
+    #[test]
+    fn descriptor_local_permissions_are_backward_compatible_and_buildable() {
+        let descriptor = permission_probe_descriptor(["remote-management"]);
+        assert_eq!(
+            descriptor.required_local_permissions,
+            vec!["remote-management"]
+        );
+        let mut encoded = serde_json::to_value(&descriptor).expect("encode descriptor");
+        encoded
+            .as_object_mut()
+            .expect("descriptor object")
+            .remove("required_local_permissions");
+        let legacy: AgentToolDescriptor =
+            serde_json::from_value(encoded).expect("decode legacy descriptor");
+        assert!(legacy.required_local_permissions.is_empty());
+    }
+
+    #[test]
+    fn final_boundary_blocks_without_context_and_on_unknown_permission() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let registry = AgentToolRegistry::new().with_tool(PermissionProbeTool {
+            descriptor: permission_probe_descriptor(["remote-management"]),
+            executions: Arc::clone(&executions),
+        });
+        let without_context = registry.execute(&test_session(), 0, 0, &permission_probe_call());
+        assert_eq!(without_context.status, AgentToolStatus::Blocked);
+        assert_eq!(
+            without_context.output["error"],
+            "local_permission_context_unconfigured"
+        );
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+
+        let unknown_registry = AgentToolRegistry::new()
+            .with_local_permission_checker(|_: LocalNodePermission| Ok(true))
+            .with_tool(PermissionProbeTool {
+                descriptor: permission_probe_descriptor(["future-unbounded-host-control"]),
+                executions: Arc::clone(&executions),
+            });
+        let unknown = unknown_registry.execute(&test_session(), 0, 0, &permission_probe_call());
+        assert_eq!(unknown.status, AgentToolStatus::Blocked);
+        assert_eq!(unknown.output["error"], "unknown_local_permission");
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn node_permission_store_missing_corrupt_and_granted_states_gate_execution() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-local-permission-gate");
+        let store = LocalNodePermissionStore::new(&root);
+        let executions = Arc::new(AtomicUsize::new(0));
+        let registry = AgentToolRegistry::new()
+            .with_local_permission_data_dir(&root)
+            .with_tool(PermissionProbeTool {
+                descriptor: permission_probe_descriptor(["remote-management"]),
+                executions: Arc::clone(&executions),
+            });
+
+        let missing = registry.execute(&test_session(), 0, 0, &permission_probe_call());
+        assert_eq!(missing.status, AgentToolStatus::Blocked);
+        assert_eq!(missing.output["error"], "local_permission_denied");
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+
+        fs::create_dir_all(store.path().parent().expect("permission parent"))
+            .expect("create permission parent");
+        fs::write(store.path(), b"corrupt permission state").expect("write corrupt state");
+        let corrupt = registry.execute(&test_session(), 0, 1, &permission_probe_call());
+        assert_eq!(corrupt.status, AgentToolStatus::Blocked);
+        assert_eq!(corrupt.output["error"], "local_permission_check_failed");
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+
+        let mut permissions = LocalNodePermissions::new();
+        permissions.set_remote_management_enabled(true);
+        store.save(&permissions).expect("enable remote management");
+        let granted = registry.execute(&test_session(), 0, 2, &permission_probe_call());
+        assert_eq!(granted.status, AgentToolStatus::Succeeded);
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+
+        registry.clear_local_permission_checker();
+        let cleared = registry.execute(&test_session(), 0, 3, &permission_probe_call());
+        assert_eq!(cleared.status, AgentToolStatus::Blocked);
+        assert_eq!(
+            cleared.output["error"],
+            "local_permission_context_unconfigured"
+        );
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn tools_without_local_permissions_execute_without_a_permission_context() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let registry = AgentToolRegistry::new().with_tool(PermissionProbeTool {
+            descriptor: permission_probe_descriptor(Vec::<String>::new()),
+            executions: Arc::clone(&executions),
+        });
+
+        let outcome = registry.execute(&test_session(), 0, 0, &permission_probe_call());
+        assert_eq!(outcome.status, AgentToolStatus::Succeeded);
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
     }
 
     #[test]

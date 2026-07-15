@@ -141,6 +141,9 @@ pub fn module_object_rpc_route_descriptor_to_network(
     for capability in &descriptor.required_capabilities {
         route = route.require_capability(capability.as_str());
     }
+    for permission in &descriptor.required_local_permissions {
+        route = route.require_local_permission(permission);
+    }
     route
 }
 
@@ -628,6 +631,26 @@ fn load_daemon_network_module_from_loader_state(
 mod tests {
     use super::*;
     use sinomo_core::{FileSystemAccess, ModuleKind, NetworkAccess, TrustRing};
+
+    #[test]
+    fn module_route_local_permissions_propagate_to_network_descriptor() {
+        let descriptor = sinomo_module::ModuleObjectRpcRoute::new(
+            "/remote/status",
+            "remote.management",
+            "remote.management.status.read",
+            sinomo_module::ModuleRouteAuth::Admin,
+        )
+        .require_local_permissions(["remote-management", "device:display"])
+        .descriptor()
+        .expect("module route descriptor");
+
+        let network = module_object_rpc_route_descriptor_to_network(&descriptor);
+
+        assert_eq!(
+            network.required_local_permissions,
+            vec!["remote-management", "device:display"]
+        );
+    }
 
     #[test]
     fn build_module_is_registered_with_daemon_storage_binding() {

@@ -19,7 +19,6 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::PathBuf;
-use std::process::Command;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -30,6 +29,9 @@ pub const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub const CLAUDE_OAUTH_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 pub const CLAUDE_OAUTH_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
 pub const CLAUDE_OAUTH_SCOPE: &str = "org:create_api_key user:profile user:inference";
+// Keep the HTTP provider process-free: probing a PATH-resolved Claude CLI here
+// would turn ordinary request/header construction into unrestricted host code
+// execution and invalidate its `NetworkOnly` host-access classification.
 const CLAUDE_CODE_VERSION_FALLBACK: &str = "2.1.74";
 const CLAUDE_OAUTH_TOKEN_URLS: &[&str] = &[
     "https://platform.claude.com/v1/oauth/token",
@@ -454,7 +456,7 @@ impl ClaudeProvider {
             self.config
                 .claude_code_version
                 .clone()
-                .unwrap_or_else(detect_claude_code_version)
+                .unwrap_or_else(|| CLAUDE_CODE_VERSION_FALLBACK.to_string())
         )
     }
 
@@ -522,6 +524,7 @@ impl LanguageModelProvider for ClaudeProvider {
             provider: Self::PROVIDER_ID.to_string(),
             default_model: self.config.default_model.clone(),
             invocation: LanguageModelInvocation::Http,
+            host_access: crate::LanguageModelHostAccess::NetworkOnly,
             supports_json_object: false,
             supports_tool_permissions: false,
         }
@@ -816,26 +819,19 @@ fn read_claude_code_credentials_file() -> Option<ClaudeOAuthTokens> {
     parse_claude_tokens_value(&value).ok().flatten()
 }
 
-fn detect_claude_code_version() -> String {
-    for program in ["claude", "claude-code"] {
-        if let Ok(output) = Command::new(program).arg("--version").output()
-            && output.status.success()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Some(version) = stdout
-                .split_whitespace()
-                .find(|part| part.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
-            {
-                return version.to_string();
-            }
-        }
-    }
-    CLAUDE_CODE_VERSION_FALLBACK.to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_user_agent_uses_a_static_version_without_spawning_a_cli() {
+        let provider = ClaudeProvider::default();
+
+        assert_eq!(
+            provider.claude_code_user_agent(),
+            format!("claude-cli/{CLAUDE_CODE_VERSION_FALLBACK} (external, cli)")
+        );
+    }
 
     #[test]
     fn pkce_authorization_url_separates_state_from_verifier() {
