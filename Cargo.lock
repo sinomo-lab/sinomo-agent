@@ -8137,8 +8137,8 @@ dependencies = [
  "sinomo-lm",
  "sinomo-runtime",
  "sinomo-ui",
+ "sinomo-ui-testing",
  "sinomo-video",
- "sui-testing",
  "syntect",
  "time",
  "tokio",
@@ -8912,14 +8912,159 @@ version = "0.1.0"
 name = "sinomo-ui"
 version = "0.1.0"
 dependencies = [
- "sui-core",
- "sui-layout",
- "sui-platform",
- "sui-render-wgpu",
- "sui-runtime",
- "sui-scene",
- "sui-text",
- "sui-widgets",
+ "sinomo-ui-core",
+ "sinomo-ui-layout",
+ "sinomo-ui-platform",
+ "sinomo-ui-render-wgpu",
+ "sinomo-ui-runtime",
+ "sinomo-ui-scene",
+ "sinomo-ui-text",
+ "sinomo-ui-widgets",
+]
+
+[[package]]
+name = "sinomo-ui-animation"
+version = "0.1.0"
+dependencies = [
+ "sinomo-ui-core",
+]
+
+[[package]]
+name = "sinomo-ui-avif"
+version = "0.1.0"
+dependencies = [
+ "avif-serialize",
+ "rav1e",
+]
+
+[[package]]
+name = "sinomo-ui-core"
+version = "0.1.0"
+
+[[package]]
+name = "sinomo-ui-layout"
+version = "0.1.0"
+dependencies = [
+ "sinomo-ui-core",
+ "sinomo-ui-scene",
+ "sinomo-ui-text",
+]
+
+[[package]]
+name = "sinomo-ui-lucide"
+version = "1.17.0"
+dependencies = [
+ "sinomo-ui-core",
+ "sinomo-ui-runtime",
+ "sinomo-ui-scene",
+]
+
+[[package]]
+name = "sinomo-ui-platform"
+version = "0.1.0"
+dependencies = [
+ "accesskit",
+ "accesskit_winit",
+ "arboard",
+ "js-sys",
+ "resvg",
+ "sinomo-ui-core",
+ "sinomo-ui-render-wgpu",
+ "sinomo-ui-runtime",
+ "unicode-segmentation",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
+ "wgpu",
+ "windows 0.62.2",
+ "winit",
+]
+
+[[package]]
+name = "sinomo-ui-render-wgpu"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "fontdb",
+ "half",
+ "lyon_path",
+ "lyon_tessellation",
+ "pollster",
+ "sinomo-ui-core",
+ "sinomo-ui-scene",
+ "sinomo-ui-text",
+ "swash",
+ "tiny-skia 0.11.4",
+ "ttf-parser",
+ "wasm-bindgen-futures",
+ "web-time",
+ "wgpu",
+ "windows 0.62.2",
+ "winit",
+]
+
+[[package]]
+name = "sinomo-ui-runtime"
+version = "0.1.0"
+dependencies = [
+ "sinomo-ui-core",
+ "sinomo-ui-layout",
+ "sinomo-ui-scene",
+ "sinomo-ui-text",
+ "web-time",
+]
+
+[[package]]
+name = "sinomo-ui-scene"
+version = "0.1.0"
+dependencies = [
+ "resvg",
+ "sinomo-ui-core",
+ "sinomo-ui-text",
+]
+
+[[package]]
+name = "sinomo-ui-testing"
+version = "0.1.0"
+dependencies = [
+ "exr",
+ "png 0.17.16",
+ "sinomo-ui",
+ "sinomo-ui-avif",
+ "sinomo-ui-core",
+ "sinomo-ui-layout",
+ "sinomo-ui-platform",
+ "sinomo-ui-render-wgpu",
+ "sinomo-ui-runtime",
+ "sinomo-ui-scene",
+ "winit",
+]
+
+[[package]]
+name = "sinomo-ui-text"
+version = "0.1.0"
+dependencies = [
+ "cosmic-text",
+ "fontdb",
+ "rustybuzz",
+ "sinomo-ui-core",
+ "ttf-parser",
+]
+
+[[package]]
+name = "sinomo-ui-widgets"
+version = "0.1.0"
+dependencies = [
+ "palette",
+ "sinomo-ui-animation",
+ "sinomo-ui-core",
+ "sinomo-ui-layout",
+ "sinomo-ui-lucide",
+ "sinomo-ui-runtime",
+ "sinomo-ui-scene",
+ "sinomo-ui-text",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -9206,159 +9351,6 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
-
-[[package]]
-name = "sui-animation"
-version = "0.1.0"
-dependencies = [
- "sui-core",
-]
-
-[[package]]
-name = "sui-avif"
-version = "0.1.0"
-dependencies = [
- "avif-serialize",
- "rav1e",
-]
-
-[[package]]
-name = "sui-core"
-version = "0.1.0"
-
-[[package]]
-name = "sui-layout"
-version = "0.1.0"
-dependencies = [
- "sui-core",
- "sui-scene",
- "sui-text",
-]
-
-[[package]]
-name = "sui-lucide"
-version = "1.17.0"
-dependencies = [
- "sui-core",
- "sui-runtime",
- "sui-scene",
-]
-
-[[package]]
-name = "sui-platform"
-version = "0.1.0"
-dependencies = [
- "accesskit",
- "accesskit_winit",
- "arboard",
- "js-sys",
- "resvg",
- "sui-core",
- "sui-platform-windows",
- "sui-render-wgpu",
- "sui-runtime",
- "unicode-segmentation",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "web-time",
- "wgpu",
- "winit",
-]
-
-[[package]]
-name = "sui-platform-windows"
-version = "0.1.0"
-dependencies = [
- "wgpu",
- "windows 0.62.2",
-]
-
-[[package]]
-name = "sui-render-wgpu"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "fontdb",
- "half",
- "lyon_path",
- "lyon_tessellation",
- "pollster",
- "sui-core",
- "sui-platform-windows",
- "sui-scene",
- "sui-text",
- "swash",
- "tiny-skia 0.11.4",
- "ttf-parser",
- "wasm-bindgen-futures",
- "web-time",
- "wgpu",
- "winit",
-]
-
-[[package]]
-name = "sui-runtime"
-version = "0.1.0"
-dependencies = [
- "sui-core",
- "sui-layout",
- "sui-scene",
- "sui-text",
- "web-time",
-]
-
-[[package]]
-name = "sui-scene"
-version = "0.1.0"
-dependencies = [
- "resvg",
- "sui-core",
- "sui-text",
-]
-
-[[package]]
-name = "sui-testing"
-version = "0.1.0"
-dependencies = [
- "exr",
- "png 0.17.16",
- "sinomo-ui",
- "sui-avif",
- "sui-core",
- "sui-layout",
- "sui-platform",
- "sui-render-wgpu",
- "sui-runtime",
- "sui-scene",
- "winit",
-]
-
-[[package]]
-name = "sui-text"
-version = "0.1.0"
-dependencies = [
- "cosmic-text",
- "fontdb",
- "rustybuzz",
- "sui-core",
- "ttf-parser",
-]
-
-[[package]]
-name = "sui-widgets"
-version = "0.1.0"
-dependencies = [
- "palette",
- "sui-animation",
- "sui-core",
- "sui-layout",
- "sui-lucide",
- "sui-runtime",
- "sui-scene",
- "sui-text",
- "unicode-segmentation",
-]
 
 [[package]]
 name = "svgtypes"
