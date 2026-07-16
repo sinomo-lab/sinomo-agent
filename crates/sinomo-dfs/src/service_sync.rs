@@ -858,12 +858,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         purpose: MetadataQuorumSyncPurpose,
         timeout: Duration,
     ) -> Result<DfsMetadataQuorumSyncCertificate, DfsError> {
+        // A routed peer may have accepted the request but still be waiting for
+        // its local DFS service lane. Session keepalives are transport progress,
+        // not application progress, so the network's idle timer deliberately
+        // cannot bound that wait. Carry this barrier's semantic deadline into
+        // every routed/direct send instead. This also breaks the cross-node
+        // hold-and-wait cycle when several maintenance passes own their local
+        // backend lane at the same time.
+        let requested_deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        let previous_deadline = self
+            .transport
+            .set_operation_deadline(Some(requested_deadline));
+        let effective_deadline = previous_deadline
+            .filter(|existing| *existing < requested_deadline)
+            .unwrap_or(requested_deadline);
+        if effective_deadline != requested_deadline {
+            self.transport
+                .set_operation_deadline(Some(effective_deadline));
+        }
         let result = self.sync_metadata_shard_to_quorum_with_required_intersection_inner(
             target,
             required_intersection,
             &purpose,
             timeout,
         );
+        self.transport.set_operation_deadline(previous_deadline);
         self.clear_pending_metadata_sync_replications(target);
         result
     }
@@ -1332,7 +1353,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // cannot livelock a durability barrier.
             self.pending_metadata_replications
                 .insert(request_id.clone(), pending);
-            let sent = self.send_dfs_message_if_routable(
+            let sent = self.send_best_effort_message_if_routable(
                 &target_node_id,
                 DfsNetworkMessage::MetadataJournalBatch(command),
             )?;
@@ -1494,7 +1515,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     created_at: Instant::now(),
                 },
             );
-            let sent = self.send_dfs_message_if_routable(
+            let sent = self.send_best_effort_message_if_routable(
                 &target_node_id,
                 DfsNetworkMessage::MetadataJournalBatch(command),
             )?;
@@ -1596,7 +1617,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     created_at: Instant::now(),
                 },
             );
-            let sent = self.send_dfs_message_if_routable(
+            let sent = self.send_best_effort_message_if_routable(
                 &target_node_id,
                 DfsNetworkMessage::MetadataSnapshotInstall(command),
             )?;
@@ -2082,10 +2103,12 @@ mod tests {
         reject_prefix_probes: bool,
         reject_snapshot_installs: bool,
         unroutable_nodes: BTreeSet<NodeId>,
+        network_error_nodes: BTreeSet<NodeId>,
         echoes_prefix_verification: bool,
         response_sequence_override: Option<u64>,
         incoming: VecDeque<DfsRoutedMessage>,
         next_frame_id: u64,
+        operation_deadline: Option<Instant>,
     }
 
     impl MetadataAckTransport {
@@ -2108,10 +2131,12 @@ mod tests {
                 reject_prefix_probes: false,
                 reject_snapshot_installs: false,
                 unroutable_nodes: BTreeSet::new(),
+                network_error_nodes: BTreeSet::new(),
                 echoes_prefix_verification: true,
                 response_sequence_override: None,
                 incoming: VecDeque::new(),
                 next_frame_id: 1,
+                operation_deadline: None,
             }
         }
     }
@@ -2131,6 +2156,12 @@ mod tests {
             if self.unroutable_nodes.contains(target_node_id) {
                 return Err(NetworkError::UnknownNode {
                     node_id: target_node_id.clone(),
+                });
+            }
+            if self.network_error_nodes.contains(target_node_id) {
+                return Err(NetworkError::Io {
+                    operation: format!("send metadata sync probe to {target_node_id}"),
+                    detail: "test peer is offline after route selection".to_string(),
                 });
             }
             match &message.message {
@@ -2314,6 +2345,14 @@ mod tests {
 
         fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
             Ok(Some(self.incoming.len()))
+        }
+
+        fn set_operation_deadline(&mut self, deadline: Option<Instant>) -> Option<Instant> {
+            std::mem::replace(&mut self.operation_deadline, deadline)
+        }
+
+        fn operation_deadline(&self) -> Option<Instant> {
+            self.operation_deadline
         }
     }
 
@@ -3287,6 +3326,11 @@ mod tests {
                 .expect("begin removal-only membership handoff")
                 .expect("retiring assignment is exact")
         });
+        fixture
+            .service
+            .transport
+            .network_error_nodes
+            .insert(removed_replica.clone());
 
         assert_eq!(
             fixture
@@ -3297,6 +3341,10 @@ mod tests {
                 )
                 .expect("joint quorum activates without removed offline replica"),
             1
+        );
+        assert_eq!(
+            fixture.service.transport.operation_deadline, None,
+            "the handoff deadline must not leak into later DFS operations"
         );
 
         let (active, pending, proof) = fixture.control_plane.with_client(|kv| {
