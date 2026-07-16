@@ -540,9 +540,21 @@ fn daemon_object_rpc_forward_error(
     }
 }
 
-fn decode_daemon_object_rpc_forward_session_response(
-    result: ObjectRpcSessionResult,
+async fn decode_daemon_object_rpc_forward_session_response(
+    mut result: ObjectRpcSessionResult,
 ) -> Result<ObjectRpcSessionResult, DaemonApiError> {
+    // The forward envelope is itself a unary control value. When the inner
+    // response has no semantic body (notably permission and service errors),
+    // the daemon's unary compatibility layer moves that envelope into the
+    // session lane. Materialize only that explicitly marked envelope; preserve
+    // an unmarked inner response stream end to end.
+    if ObjectRpcUnarySessionAdapter::response_is_encoded(&result)? {
+        result = ObjectRpcUnarySessionAdapter::decode_response(
+            result,
+            DAEMON_API_UNARY_COMPATIBILITY_MAX_BODY_BYTES,
+        )
+        .await?;
+    }
     result.response.error_detail()?;
     match result
         .response
@@ -654,7 +666,7 @@ async fn send_daemon_object_rpc_session_async(
         runtime,
     )
     .await?;
-    decode_daemon_object_rpc_forward_session_response(result)
+    decode_daemon_object_rpc_forward_session_response(result).await
 }
 
 /// DFS peer transport that deliberately terminates at the running local
@@ -1619,8 +1631,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn forward_session_response_preserves_trusted_delivery_state() {
+    #[tokio::test]
+    async fn forward_session_response_preserves_trusted_delivery_state() {
         let outer = ObjectRpcResponse::encode_body(
             DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
             &DaemonObjectRpcForwardResponse::NetworkError {
@@ -1629,9 +1641,20 @@ mod tests {
             },
         )
         .expect("outer response");
-        let error = decode_daemon_object_rpc_forward_session_response(
-            ObjectRpcSessionResult::buffered(outer),
+        let encoded = ObjectRpcUnarySessionAdapter::encode_response(
+            sinomo_core::network::ObjectRpcSessionResponse::buffered(outer),
         )
+        .expect("stream outer network-error envelope");
+        let body = encoded
+            .body
+            .collect_to_vec(DAEMON_API_UNARY_COMPATIBILITY_MAX_BODY_BYTES)
+            .await
+            .expect("collect encoded outer network-error envelope");
+        let error = decode_daemon_object_rpc_forward_session_response(ObjectRpcSessionResult::new(
+            encoded.response,
+            sinomo_core::network::ObjectRpcIncomingBody::bytes(body),
+        ))
+        .await
         .expect_err("forward session response must fail");
 
         assert!(matches!(
@@ -1641,6 +1664,41 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn forward_session_response_decodes_streamed_unary_outer_envelope() {
+        let inner = ObjectRpcResponse::encode_error(
+            "/remote-management/system/info",
+            "device authorization was denied",
+        )
+        .expect("inner error response");
+        let outer = ObjectRpcResponse::encode_body(
+            DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+            &DaemonObjectRpcForwardResponse::Success {
+                response: inner.clone(),
+            },
+        )
+        .expect("outer response");
+        let encoded = ObjectRpcUnarySessionAdapter::encode_response(
+            sinomo_core::network::ObjectRpcSessionResponse::buffered(outer),
+        )
+        .expect("stream outer unary envelope");
+        let body = encoded
+            .body
+            .collect_to_vec(DAEMON_API_UNARY_COMPATIBILITY_MAX_BODY_BYTES)
+            .await
+            .expect("collect encoded outer envelope");
+        let decoded =
+            decode_daemon_object_rpc_forward_session_response(ObjectRpcSessionResult::new(
+                encoded.response,
+                sinomo_core::network::ObjectRpcIncomingBody::bytes(body),
+            ))
+            .await
+            .expect("decode streamed outer envelope");
+
+        assert_eq!(decoded.response, inner);
+        assert!(decoded.body.is_empty());
     }
 
     #[test]

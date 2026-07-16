@@ -136,25 +136,19 @@ impl ObjectRpcUnarySessionAdapter {
         Ok(response)
     }
 
-    /// Materializes a marked unary response for a legacy caller. An unmarked
-    /// canonical semantic response stream is rejected so a unary caller cannot
-    /// silently discard it; session callers must retain the session result.
-    pub async fn decode_response(
-        mut result: ObjectRpcSessionResult,
-        max_bytes: usize,
-    ) -> Result<ObjectRpcSessionResult, NetworkError> {
+    /// Returns whether this session result carries a unary response value in
+    /// its stream lane, rejecting malformed uses of the reserved marker.
+    ///
+    /// Unmarked body streams are semantic session attachments. Callers that
+    /// only need to unwrap an optional compatibility envelope can use this
+    /// predicate without consuming or rejecting those canonical streams.
+    pub fn response_is_encoded(result: &ObjectRpcSessionResult) -> Result<bool, NetworkError> {
         let Some(version) = result
             .response
             .metadata
             .get(OBJECT_RPC_BUFFERED_RESPONSE_BODY_METADATA_KEY)
         else {
-            if !result.body.is_empty() {
-                return Err(NetworkError::Serialization {
-                    detail: "unary object RPC response contained an unmarked semantic body stream"
-                        .to_string(),
-                });
-            }
-            return Ok(result);
+            return Ok(false);
         };
         if version != OBJECT_RPC_BUFFERED_RESPONSE_BODY_METADATA_VALUE
             || !result.response.body.is_empty()
@@ -163,6 +157,25 @@ impl ObjectRpcUnarySessionAdapter {
             return Err(NetworkError::Serialization {
                 detail: "invalid unary object RPC response stream marker".to_string(),
             });
+        }
+        Ok(true)
+    }
+
+    /// Materializes a marked unary response for a legacy caller. An unmarked
+    /// canonical semantic response stream is rejected so a unary caller cannot
+    /// silently discard it; session callers must retain the session result.
+    pub async fn decode_response(
+        mut result: ObjectRpcSessionResult,
+        max_bytes: usize,
+    ) -> Result<ObjectRpcSessionResult, NetworkError> {
+        if !Self::response_is_encoded(&result)? {
+            if !result.body.is_empty() {
+                return Err(NetworkError::Serialization {
+                    detail: "unary object RPC response contained an unmarked semantic body stream"
+                        .to_string(),
+                });
+            }
+            return Ok(result);
         }
         let body = std::mem::take(&mut result.body);
         result.response.body = body.collect_to_vec(max_bytes).await?;
