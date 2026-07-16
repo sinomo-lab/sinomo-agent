@@ -206,6 +206,19 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tower_service::Service;
 
+fn read_kv_wal_object_file<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+) -> Result<T, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|source| format!("read KV object file {}: {source}", path.display()))?;
+    sinomo_object::serde_ext::from_bytes_with_options(
+        &bytes,
+        sinomo_object::DecodeOptions::default()
+            .with_expected_version_id(sinomo_kv::KV_WAL_OBJECT_VERSION_ID),
+    )
+    .map_err(|source| format!("decode KV object file {}: {source}", path.display()))
+}
+
 fn object_rpc_request_from_kv_payload(payload: sinomo_kv::ClusterKvRpcPayload) -> ObjectRpcRequest {
     ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body)
 }
@@ -9584,6 +9597,10 @@ impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
 }
 
 impl ClusterSignedObjectRpcAsyncHost for RecordingKvTxnForwardHost {
+    fn supports_object_rpc_sessions(&self) -> bool {
+        false
+    }
+
     fn sign_object_rpc_request_async<'a>(
         &'a mut self,
         _request: &'a ObjectRpcRequest,
@@ -13368,6 +13385,10 @@ fn join_introducer_reads_newer_invite_cache_only_for_non_voter_bridge() {
     }
 
     impl ClusterSignedObjectRpcAsyncHost for RecordingBridgeForwardHost {
+        fn supports_object_rpc_sessions(&self) -> bool {
+            false
+        }
+
         fn sign_object_rpc_request_async<'a>(
             &'a mut self,
             request: &'a ObjectRpcRequest,
@@ -13615,6 +13636,10 @@ impl ClusterJoinRegistrationHost for RecordingJoinRegistrationHost {
 }
 
 impl ClusterSignedObjectRpcAsyncHost for RecordingJoinRegistrationHost {
+    fn supports_object_rpc_sessions(&self) -> bool {
+        false
+    }
+
     fn sign_object_rpc_request_async<'a>(
         &'a mut self,
         _request: &'a ObjectRpcRequest,
@@ -15245,6 +15270,10 @@ fn join_challenge_forwarding_uses_membership_state_authority_policy() {
     }
 
     impl ClusterSignedObjectRpcAsyncHost for RecordingForwardHost {
+        fn supports_object_rpc_sessions(&self) -> bool {
+            false
+        }
+
         fn sign_object_rpc_request_async<'a>(
             &'a mut self,
             request: &'a ObjectRpcRequest,
@@ -25466,7 +25495,7 @@ fn cluster_kv_watch_create_allocates_unique_ids_concurrently() {
             .watches
             .join(format!("watch-{}.sobj", registration.watch_id.0));
         let stored: ClusterKvWatchRegistration =
-            read_object_file(&watch_path).expect("read watch registration");
+            read_kv_wal_object_file(&watch_path).expect("read watch registration");
         assert_eq!(stored, registration);
     }
 }
@@ -25539,7 +25568,7 @@ fn cluster_kv_watch_cancel_removes_registration_without_reusing_id() {
         "watch ids must not be reused after cancellation"
     );
     let allocator: ClusterKvWatchAllocatorState =
-        read_object_file(&paths.kv_paths().watches_next_id).expect("read watch allocator");
+        read_kv_wal_object_file(&paths.kv_paths().watches_next_id).expect("read watch allocator");
     assert!(
         allocator.next_watch_id > second.watch_id.0,
         "watch allocator should advance past the newest watch id"
@@ -25568,7 +25597,7 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
     )
     .expect("create first watch");
     let allocator: ClusterKvWatchAllocatorState =
-        read_object_file(&paths.kv_paths().watches_next_id).expect("read seeded allocator");
+        read_kv_wal_object_file(&paths.kv_paths().watches_next_id).expect("read seeded allocator");
     assert_eq!(allocator.active_watch_count, Some(1));
     assert_eq!(allocator.pruned_compacted_revision, Some(KvRevision::ZERO));
 
@@ -25588,7 +25617,7 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
         "steady-state watch creation should use the durable allocator count"
     );
     let allocator: ClusterKvWatchAllocatorState =
-        read_object_file(&paths.kv_paths().watches_next_id)
+        read_kv_wal_object_file(&paths.kv_paths().watches_next_id)
             .expect("read allocator after second watch");
     assert_eq!(allocator.active_watch_count, Some(2));
     assert_eq!(allocator.next_watch_id, second.watch_id.0.saturating_add(1));
@@ -25601,7 +25630,8 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
     )
     .expect("cancel first watch");
     let allocator: ClusterKvWatchAllocatorState =
-        read_object_file(&paths.kv_paths().watches_next_id).expect("read allocator after cancel");
+        read_kv_wal_object_file(&paths.kv_paths().watches_next_id)
+            .expect("read allocator after cancel");
     assert_eq!(allocator.active_watch_count, Some(1));
 
     reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
@@ -25624,7 +25654,7 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
         "watch ids should keep advancing after cancel"
     );
     let allocator: ClusterKvWatchAllocatorState =
-        read_object_file(&paths.kv_paths().watches_next_id)
+        read_kv_wal_object_file(&paths.kv_paths().watches_next_id)
             .expect("read allocator after replacement");
     assert_eq!(allocator.active_watch_count, Some(2));
 }
@@ -25824,7 +25854,7 @@ fn cluster_kv_watch_drain_defers_small_cursor_writes_until_lag_bound() {
         .watches
         .join(format!("watch-{}.sobj", watch.watch_id.0));
     assert_eq!(
-        read_object_file::<ClusterKvWatchRegistration>(&watch_path)
+        read_kv_wal_object_file::<ClusterKvWatchRegistration>(&watch_path)
             .expect("read durable watch")
             .next_revision,
         KvRevision(1)
@@ -25858,7 +25888,7 @@ fn cluster_kv_watch_drain_defers_small_cursor_writes_until_lag_bound() {
         "drains must advance the hot in-process cursor immediately"
     );
     assert_eq!(
-        read_object_file::<ClusterKvWatchRegistration>(&watch_path)
+        read_kv_wal_object_file::<ClusterKvWatchRegistration>(&watch_path)
             .expect("read durable watch after deferred drain")
             .next_revision,
         KvRevision(1),
@@ -25888,7 +25918,7 @@ fn cluster_kv_watch_drain_defers_small_cursor_writes_until_lag_bound() {
     assert_eq!(drained.events, events);
     assert_eq!(drained.next_revision, KvRevision(lag_bound + 1));
     assert_eq!(
-        read_object_file::<ClusterKvWatchRegistration>(&watch_path)
+        read_kv_wal_object_file::<ClusterKvWatchRegistration>(&watch_path)
             .expect("read durable watch after lag-bound drain")
             .next_revision,
         KvRevision(lag_bound + 1),
@@ -26406,7 +26436,7 @@ fn cluster_raft_snapshot_event_history_is_bounded_when_compacted() {
     }
 
     let wal_paths = cluster_raft_wal_paths(&paths, &node_id);
-    let stored: RaftSnapshot = read_object_file(&wal_paths.snapshot).expect("raft snapshot");
+    let stored: RaftSnapshot = read_kv_wal_object_file(&wal_paths.snapshot).expect("raft snapshot");
     assert!(
         stored.kv.events.len() <= MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
         "raft snapshots should not retain an unbounded event tail"
@@ -34694,6 +34724,10 @@ mod route_cache_tests {
     }
 
     impl ClusterSignedObjectRpcAsyncHost for RecordingTargetHost {
+        fn supports_object_rpc_sessions(&self) -> bool {
+            false
+        }
+
         fn sign_object_rpc_request_async<'a>(
             &'a mut self,
             request: &'a ObjectRpcRequest,
@@ -34882,7 +34916,8 @@ mod route_cache_tests {
                 &request,
                 ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_only(Duration::from_secs(
                     15,
-                ))),
+                )))
+                .with_overall_timeout(Duration::from_secs(5)),
             )
             .await
             .expect("target rpc");

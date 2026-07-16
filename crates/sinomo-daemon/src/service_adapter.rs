@@ -47,7 +47,8 @@ use sinomo_core::network::{
     ObjectRouteDescriptor, ObjectRpcAuthorizationLayer, ObjectRpcBodySource,
     ObjectRpcCancelRequest, ObjectRpcCancelResponse, ObjectRpcRequest, ObjectRpcResponse,
     ObjectRpcRouteCatalog, ObjectRpcRoutePolicyLayer, ObjectRpcRouteRegistry, ObjectRpcRouter,
-    ObjectRpcSessionCall, ObjectRpcSessionRequest, ObjectRpcSessionResponse, ServiceCatalog,
+    ObjectRpcSessionCall, ObjectRpcSessionRequest, ObjectRpcSessionResponse,
+    ObjectRpcUnarySessionAdapterLayer, ServiceCatalog,
 };
 use sinomo_core::service::{
     ClusterAccess, ResponseSink, Service, ServiceBodyMode, ServiceContext, ServiceDisposition,
@@ -79,6 +80,8 @@ use sinomo_sandbox::{
     SandboxWriteRequest, SandboxWriteResponse,
 };
 use tower_layer::Layer;
+
+pub(crate) const DAEMON_UNARY_COMPATIBILITY_MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
 use crate::auth::{AuthenticatedDaemonCommand, DaemonSignerAuthority};
 use crate::cluster::{
@@ -158,42 +161,6 @@ fn require_service_runtime<'a>(
     })
 }
 
-async fn forward_object_rpc_from_daemon_control(
-    paths: &crate::DaemonPaths,
-    payload: crate::DaemonObjectRpcForwardRequest,
-    runtime: &tokio::runtime::Handle,
-) -> Result<crate::DaemonObjectRpcForwardResponse, ServiceError> {
-    let transport_timeouts = sinomo_core::network::DaemonRpcTimeouts::default()
-        .with_connect_timeout(Some(Duration::from_millis(payload.connect_timeout_millis)));
-    let mut options = sinomo_core::network::ClusterObjectRpcOptions::new(transport_timeouts);
-    if let Some(overall_timeout_millis) = payload.overall_timeout_millis {
-        options = options.with_overall_timeout(Duration::from_millis(overall_timeout_millis));
-    }
-    match crate::client::send_daemon_rpc_to_target_async_with_daemon_paths_and_network_error(
-        paths,
-        &payload.target_node_id,
-        &payload.request,
-        options,
-        runtime,
-        payload.observe_connectivity,
-    )
-    .await
-    {
-        Ok(response) => Ok(crate::DaemonObjectRpcForwardResponse::Success { response }),
-        Err(error) => Ok(crate::DaemonObjectRpcForwardResponse::NetworkError {
-            detail: error.to_string(),
-            delivery_state: error.delivery_state().map(|state| match state {
-                sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent => {
-                    crate::DaemonObjectRpcForwardDeliveryState::DefinitelyNotSent
-                }
-                sinomo_core::network::NetworkDeliveryState::PossiblyApplied => {
-                    crate::DaemonObjectRpcForwardDeliveryState::PossiblyApplied
-                }
-            }),
-        }),
-    }
-}
-
 fn daemon_object_rpc_forward_network_error(
     error: NetworkError,
 ) -> crate::DaemonObjectRpcForwardResponse {
@@ -225,7 +192,8 @@ async fn forward_object_rpc_session_from_daemon_control(
 
     // This is a trusted proxy boundary, not a signed relay. Rebind both body
     // finish proofs to the route signed on their next hop instead of carrying
-    // the outer daemon-forward proof into the inner DFS call (or vice versa).
+    // the outer daemon-forward proof into the inner object-RPC call (or vice
+    // versa).
     let request_body = if request_body.is_empty() {
         ObjectRpcBodySource::empty()
     } else {
@@ -584,7 +552,9 @@ impl Service for DaemonControlService {
             {
                 route.auth_scope = Some("local-command".to_string());
             }
-            if route.route == DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE {
+            if route.route == DAEMON_OBJECT_RPC_FORWARD_ROUTE
+                || route.route == DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE
+            {
                 route.request_body_mode = ServiceBodyMode::Optional;
                 route.response_body_mode = ServiceBodyMode::Optional;
             }
@@ -596,10 +566,13 @@ impl Service for DaemonControlService {
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
         Box::pin(async move {
-            if request.route == DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE {
+            if request.route == DAEMON_OBJECT_RPC_FORWARD_ROUTE
+                || request.route == DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE
+            {
+                let forward_route = request.route.clone();
                 let payload: crate::DaemonObjectRpcForwardRequest = request.decode_body()?;
                 let runtime =
-                    require_service_runtime(runtime.as_ref(), "daemon DFS object RPC forward")?
+                    require_service_runtime(runtime.as_ref(), "daemon object RPC session forward")?
                         .clone();
                 let request_body = ctx.take_request_body();
                 let (response, response_body) = forward_object_rpc_session_from_daemon_control(
@@ -610,7 +583,7 @@ impl Service for DaemonControlService {
                 )
                 .await?;
                 ctx.respond_with_body(
-                    ObjectRpcResponse::encode_body(DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, &response)?,
+                    ObjectRpcResponse::encode_body(forward_route, &response)?,
                     response_body,
                 )?;
                 return Ok(ServiceDisposition::Continue);
@@ -685,18 +658,6 @@ impl Service for DaemonControlService {
                             DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
                             &crate::DaemonLocalConnectivityReloadResponse,
                         )?,
-                        ServiceDisposition::Continue,
-                    )
-                }
-                DAEMON_OBJECT_RPC_FORWARD_ROUTE => {
-                    let payload: crate::DaemonObjectRpcForwardRequest = request.decode_body()?;
-                    let runtime =
-                        require_service_runtime(runtime.as_ref(), "daemon object RPC forward")?
-                            .clone();
-                    let response =
-                        forward_object_rpc_from_daemon_control(&paths, payload, &runtime).await?;
-                    (
-                        ObjectRpcResponse::encode_body(request.route.as_str(), &response)?,
                         ServiceDisposition::Continue,
                     )
                 }
@@ -5136,7 +5097,7 @@ pub(crate) async fn dispatch_rpc_via_registry_to_response_async(
     if !response.body.is_empty() {
         response.response.body = response
             .body
-            .collect_to_vec(sinomo_core::network::OBJECT_RPC_UNARY_ADAPTER_MAX_BODY_BYTES)
+            .collect_to_vec(DAEMON_UNARY_COMPATIBILITY_MAX_BODY_BYTES)
             .await
             .map_err(DaemonError::from)?;
     }
@@ -5172,9 +5133,9 @@ pub(crate) async fn dispatch_rpc_via_registry_to_session_response_async(
         "daemon service rpc dispatch start"
     );
     annotate_daemon_service_request(&mut request.request, authenticated);
-    let router = service_host
-        .route_policy_layer()
+    let router = ObjectRpcUnarySessionAdapterLayer::new(DAEMON_UNARY_COMPATIBILITY_MAX_BODY_BYTES)
         .layer(service_host.active_router());
+    let router = service_host.route_policy_layer().layer(router);
     let mut router = daemon_service_object_rpc_authorization_layer(
         authenticated.signer.clone(),
         service_host.paths.clone(),
@@ -7183,8 +7144,14 @@ mod tests {
             object_rpc_forward.auth_scope.as_deref(),
             Some("local-command")
         );
-        assert_eq!(object_rpc_forward.request_body_mode, ServiceBodyMode::None);
-        assert_eq!(object_rpc_forward.response_body_mode, ServiceBodyMode::None);
+        assert_eq!(
+            object_rpc_forward.request_body_mode,
+            ServiceBodyMode::Optional
+        );
+        assert_eq!(
+            object_rpc_forward.response_body_mode,
+            ServiceBodyMode::Optional
+        );
         let dfs_object_rpc_forward = route_metadata
             .iter()
             .find(|route| route.route == crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE)
@@ -7439,7 +7406,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn daemon_dfs_forward_rebinds_stream_bodies_across_two_authenticated_hops() {
+    async fn daemon_generic_and_dfs_alias_forward_stream_bodies_across_two_authenticated_hops() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-dfs-session-forward-bodies");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("data directory");
@@ -7565,8 +7532,12 @@ mod tests {
         let outer_paths = paths.clone();
         let outer_data_dir = data_dir.clone();
         let outer_runtime = tokio::runtime::Handle::current();
+        let forward_routes = [
+            crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+            crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
+        ];
         let outer_server = tokio::spawn(async move {
-            for _ in 0..2 {
+            for forward_route in forward_routes {
                 let stream = outer_listener.accept().await.expect("outer accept");
                 let (incoming, responder) = sinomo_core::network::accept_object_rpc_server_session(
                     Box::new(stream.into_inner()),
@@ -7576,10 +7547,7 @@ mod tests {
                 )
                 .await
                 .expect("outer session");
-                assert_eq!(
-                    incoming.request.route,
-                    crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE
-                );
+                assert_eq!(incoming.request.route, forward_route);
                 let payload: crate::DaemonObjectRpcForwardRequest =
                     incoming.request.decode_body().expect("forward payload");
                 let (response, body) = forward_object_rpc_session_from_daemon_control(
@@ -7592,11 +7560,8 @@ mod tests {
                 .expect("forward session");
                 responder
                     .respond(ObjectRpcSessionResponse {
-                        response: ObjectRpcResponse::encode_body(
-                            crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
-                            &response,
-                        )
-                        .expect("forward response head"),
+                        response: ObjectRpcResponse::encode_body(forward_route, &response)
+                            .expect("forward response head"),
                         body,
                     })
                     .await
@@ -7611,6 +7576,7 @@ mod tests {
         for (index, (request_body, expected_response)) in
             request_bodies.into_iter().zip(response_bodies).enumerate()
         {
+            let forward_route = forward_routes[index];
             let inner_request = ObjectRpcRequest::encode_body(
                 format!("/dfs/test/session-forward/{index}"),
                 sinomo_dfs::DFS_RPC_CATEGORY,
@@ -7624,12 +7590,9 @@ mod tests {
                 overall_timeout_millis: None,
                 observe_connectivity: false,
             };
-            let outer_head = ObjectRpcRequest::encode_body(
-                crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
-                crate::DAEMON_RPC_CATEGORY,
-                &payload,
-            )
-            .expect("outer request head");
+            let outer_head =
+                ObjectRpcRequest::encode_body(forward_route, crate::DAEMON_RPC_CATEGORY, &payload)
+                    .expect("outer request head");
             let request_body = if request_body.is_empty() {
                 ObjectRpcBodySource::empty()
             } else {

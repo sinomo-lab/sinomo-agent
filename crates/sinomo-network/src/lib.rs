@@ -42,6 +42,7 @@ mod tcp_tunnel;
 // Framing and transfer state stay private beneath the canonical session API so
 // higher-level crates cannot assemble protocol frames themselves.
 mod transfer;
+mod unary;
 
 pub use connectivity::cluster_network_record_live;
 pub use connectivity::{
@@ -236,11 +237,10 @@ pub use rpc::{
     CLUSTER_MEMBERSHIP_RPC_ROUTE_METADATA, CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
     CLUSTER_NETWORK_PING_ROUTE, CLUSTER_NETWORK_RPC_CATEGORY, CLUSTER_NETWORK_RPC_ROUTE_METADATA,
     OBJECT_RPC_ERROR_DETAIL_METADATA_KEY, OBJECT_RPC_OBSERVE_SAMPLED_METADATA_KEY,
-    OBJECT_RPC_TRACEPARENT_METADATA_KEY, OBJECT_RPC_TRACESTATE_METADATA_KEY,
-    OBJECT_RPC_UNARY_ADAPTER_MAX_BODY_BYTES, ObjectRouteDescriptor, ObjectRpcAuthorizationContext,
-    ObjectRpcAuthorizationLayer, ObjectRpcBodyMode, ObjectRpcCancelRequest,
-    ObjectRpcCancelResponse, ObjectRpcCategoryDefinition, ObjectRpcRequest, ObjectRpcResponse,
-    ObjectRpcRouteCatalog, ObjectRpcRoutePolicyLayer, ObjectRpcRouteReadiness,
+    OBJECT_RPC_TRACEPARENT_METADATA_KEY, OBJECT_RPC_TRACESTATE_METADATA_KEY, ObjectRouteDescriptor,
+    ObjectRpcAuthorizationContext, ObjectRpcAuthorizationLayer, ObjectRpcBodyMode,
+    ObjectRpcCancelRequest, ObjectRpcCancelResponse, ObjectRpcCategoryDefinition, ObjectRpcRequest,
+    ObjectRpcResponse, ObjectRpcRouteCatalog, ObjectRpcRoutePolicyLayer, ObjectRpcRouteReadiness,
     ObjectRpcRouteRegistry, ObjectRpcRouteRegistryBuilder, ObjectRpcRouter, ServiceCatalog,
     ServiceCatalogSnapshot, ServiceCategory, call_object_rpc_service_async,
     call_object_rpc_session_service_async,
@@ -261,6 +261,7 @@ pub use tcp_tunnel::{
     CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION, CLUSTER_TCP_TUNNEL_RPC_CATEGORY, ClusterTcpTunnelFrame,
     ClusterTcpTunnelOpenRequest, ClusterTcpTunnelOpenResponse,
 };
+pub use unary::{ObjectRpcUnarySessionAdapter, ObjectRpcUnarySessionAdapterLayer};
 
 pub type ClusterEndpointId = sinomo_base::Id;
 

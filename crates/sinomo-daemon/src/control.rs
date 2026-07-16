@@ -58,8 +58,7 @@ const DAEMON_SANDBOX_STREAM_CHANNEL_CAPACITY: usize = 64;
 const DAEMON_SANDBOX_SESSION_BODY_BUFFER_BYTES: usize = 256 * 1024;
 const DAEMON_DFS_MESSAGE_REPLAY_RETENTION: Duration = Duration::from_secs(120);
 const DAEMON_DFS_MESSAGE_REPLAY_WAIT: Duration = Duration::from_secs(30);
-const DAEMON_DFS_MESSAGE_REPLAY_MAX_CACHED_BODY_BYTES: usize =
-    sinomo_core::network::OBJECT_RPC_UNARY_ADAPTER_MAX_BODY_BYTES;
+const DAEMON_DFS_MESSAGE_REPLAY_MAX_CACHED_BODY_BYTES: usize = 256 * 1024 * 1024;
 const DAEMON_SANDBOX_LOCK_ANCHOR_CONTENT: &[u8] = b"sinomo-sandbox-lifecycle-lock-v1\n";
 #[cfg(feature = "sandbox")]
 const DAEMON_SANDBOX_LIFECYCLE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
@@ -1571,7 +1570,7 @@ pub(crate) async fn handle_daemon_object_rpc_stream_async(
     let authenticated_slot = Arc::clone(&authenticated);
     let auth_paths = paths.clone();
     let auth_service_host = service_host.clone();
-    let (request, responder) = sinomo_core::network::accept_object_rpc_server_session(
+    let (mut request, responder) = sinomo_core::network::accept_object_rpc_server_session(
         stream,
         data_dir,
         sinomo_core::network::NetworkCallPolicy::default(),
@@ -1611,18 +1610,24 @@ pub(crate) async fn handle_daemon_object_rpc_stream_async(
     let route = request.request.route.clone();
     let dispatch = async {
         if route == sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE {
+            sinomo_core::network::ObjectRpcUnarySessionAdapter::decode_request(
+                &mut request,
+                crate::service_adapter::DAEMON_UNARY_COMPATIBILITY_MAX_BODY_BYTES,
+            )
+            .await
+            .map_err(DaemonError::from)?;
             if !request.body.is_empty() {
                 return Err(DaemonError::Parse {
                     detail: "cluster network ping does not accept an attached body".to_string(),
                 });
             }
-            Ok((
+            let response = sinomo_core::network::ObjectRpcUnarySessionAdapter::encode_response(
                 sinomo_core::network::ObjectRpcSessionResponse::buffered(
                     daemon_cluster_network_ping_response(&paths, request.request)?,
                 ),
-                false,
-                route.clone(),
-            ))
+            )
+            .map_err(DaemonError::from)?;
+            Ok((response, false, route.clone()))
         } else if route == sinomo_core::network::CLUSTER_RELAY_ROUTE {
             handle_daemon_cluster_relay_session_async(
                 &paths,
@@ -1632,6 +1637,12 @@ pub(crate) async fn handle_daemon_object_rpc_stream_async(
             )
             .await
         } else if crate::service_adapter::is_sandbox_stream_route(&request.request) {
+            sinomo_core::network::ObjectRpcUnarySessionAdapter::decode_request(
+                &mut request,
+                crate::service_adapter::DAEMON_UNARY_COMPATIBILITY_MAX_BODY_BYTES,
+            )
+            .await
+            .map_err(DaemonError::from)?;
             if !request.body.is_empty() {
                 return Err(DaemonError::Parse {
                     detail: "sandbox stream session does not accept an attached request body"
@@ -1658,13 +1669,18 @@ pub(crate) async fn handle_daemon_object_rpc_stream_async(
     .await;
     let (response, stop, effective_route) = match dispatch {
         Ok(response) => response,
-        Err(error) => (
-            sinomo_core::network::ObjectRpcSessionResponse::buffered(
-                sinomo_core::network::ObjectRpcResponse::encode_error(&route, error.to_string())?,
-            ),
-            false,
-            route.clone(),
-        ),
+        Err(error) => {
+            let response = sinomo_core::network::ObjectRpcUnarySessionAdapter::encode_response(
+                sinomo_core::network::ObjectRpcSessionResponse::buffered(
+                    sinomo_core::network::ObjectRpcResponse::encode_error(
+                        &route,
+                        error.to_string(),
+                    )?,
+                ),
+            )
+            .map_err(DaemonError::from)?;
+            (response, false, route.clone())
+        }
     };
     responder
         .respond(response)

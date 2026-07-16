@@ -22,6 +22,7 @@ use sinomo_core::kv::{
 };
 use sinomo_core::network::{
     NetworkError, ObjectRpcRequest, ObjectRpcSessionCall, ObjectRpcSessionResult,
+    ObjectRpcUnarySessionAdapter,
 };
 use sinomo_core::node::NodeId;
 use sinomo_dfs::{
@@ -37,6 +38,19 @@ use sinomo_rollout::{
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+const DAEMON_CLIENT_UNARY_COMPATIBILITY_MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
+
+async fn decode_daemon_client_unary_response(
+    result: ObjectRpcSessionResult,
+) -> Result<ObjectRpcSessionResult, DaemonError> {
+    ObjectRpcUnarySessionAdapter::decode_response(
+        result,
+        DAEMON_CLIENT_UNARY_COMPATIBILITY_MAX_BODY_BYTES,
+    )
+    .await
+    .map_err(Into::into)
+}
 
 fn object_rpc_request_from_kv_payload(
     payload: sinomo_core::kv::ClusterKvRpcPayload,
@@ -268,7 +282,7 @@ pub async fn send_daemon_rpc_stream_async(
         DaemonSignedObjectRpcAsyncHost::new(&runtime, false).with_cluster_paths(&cluster_paths);
     let mut request = request.clone();
     request.auth = None;
-    let call = sinomo_core::network::ObjectRpcSessionCall::buffered(request);
+    let call = ObjectRpcUnarySessionAdapter::encode_request(request)?;
     let options = sinomo_core::network::ClusterObjectRpcOptions::new(timeouts);
     let result = if sinomo_core::network::is_loopback_connect_address(address) {
         let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
@@ -287,6 +301,7 @@ pub async fn send_daemon_rpc_stream_async(
             .call_endpoint_session(&state, &endpoint, call, options)
             .await?
     };
+    result.response.error_detail()?;
     let mut body = result.body;
     loop {
         let rpc = sinomo_core::network::read_object_frame_async(
@@ -558,10 +573,11 @@ async fn send_daemon_rpc_to_target_async_with_connectivity_observation(
         .with_cluster_paths(&paths);
     let mut client =
         sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, runtime, &paths);
-    client
-        .call_target(&state, target_node_id, request, options)
-        .await
-        .map_err(DaemonError::from)
+    let call = ObjectRpcUnarySessionAdapter::encode_request(request.clone())?;
+    let result = client
+        .call_target_session(&state, target_node_id, call, options)
+        .await?;
+    Ok(decode_daemon_client_unary_response(result).await?.response)
 }
 
 async fn send_daemon_rpc_to_target_async_with_daemon_paths_and_connectivity_observation(
@@ -599,9 +615,16 @@ pub(crate) async fn send_daemon_rpc_to_target_async_with_daemon_paths_and_networ
         DaemonSignedObjectRpcAsyncHost::new(runtime, observe_connectivity).with_paths(daemon_paths);
     let mut client =
         sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, runtime, &paths);
-    client
-        .call_target(&state, target_node_id, request, options)
-        .await
+    let call = ObjectRpcUnarySessionAdapter::encode_request(request.clone())?;
+    let result = client
+        .call_target_session(&state, target_node_id, call, options)
+        .await?;
+    Ok(ObjectRpcUnarySessionAdapter::decode_response(
+        result,
+        DAEMON_CLIENT_UNARY_COMPATIBILITY_MAX_BODY_BYTES,
+    )
+    .await?
+    .response)
 }
 
 pub(crate) async fn send_object_rpc_session_to_target_async_with_daemon_paths_and_options(
@@ -1980,7 +2003,7 @@ pub fn send_daemon_build_submit(
                 )
                 .await?
         };
-        decode_build_submit_session_result(result)
+        decode_build_submit_session_result(result).await
     })
 }
 
@@ -2025,7 +2048,7 @@ pub fn send_daemon_build_submit_to_endpoint(
                 )
                 .await?
         };
-        decode_build_submit_session_result(result)
+        decode_build_submit_session_result(result).await
     })
 }
 
@@ -2055,7 +2078,7 @@ pub fn send_daemon_build_submit_to_target(
                 sinomo_core::network::ClusterObjectRpcOptions::default(),
             )
             .await?;
-        decode_build_submit_session_result(result)
+        decode_build_submit_session_result(result).await
     })
 }
 
@@ -2086,9 +2109,10 @@ fn build_submit_session_call(
     Ok(ObjectRpcSessionCall::new(head, body))
 }
 
-fn decode_build_submit_session_result(
+async fn decode_build_submit_session_result(
     result: ObjectRpcSessionResult,
 ) -> Result<BuildSubmitResponse, DaemonError> {
+    let result = decode_daemon_client_unary_response(result).await?;
     if !result.body.is_empty() {
         return Err(DaemonError::Parse {
             detail: "build submit response unexpectedly contained a body attachment".to_string(),
@@ -2235,10 +2259,11 @@ fn build_artifact_session_call(
 }
 
 async fn receive_build_artifact_session_result(
-    mut result: ObjectRpcSessionResult,
+    result: ObjectRpcSessionResult,
     request: &BuildArtifactRequest,
     destination_path: &Path,
 ) -> Result<BuildArtifactResponse, DaemonError> {
+    let mut result = result;
     let response: BuildArtifactResponse = result.response.decode_body()?;
     if response.artifact.artifact_id != request.artifact_id {
         return Err(DaemonError::Parse {
@@ -2562,12 +2587,13 @@ async fn send_daemon_rollout_binary_to_loopback_async(
             sinomo_core::network::ClusterObjectRpcOptions::default(),
         )
         .await?;
-    decode_rollout_binary_session_result(result)
+    decode_rollout_binary_session_result(result).await
 }
 
-fn decode_rollout_binary_session_result(
+async fn decode_rollout_binary_session_result(
     result: ObjectRpcSessionResult,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    let result = decode_daemon_client_unary_response(result).await?;
     if !result.body.is_empty() {
         return Err(DaemonError::Parse {
             detail: "rollout binary response unexpectedly contained a body attachment".to_string(),
@@ -2596,7 +2622,7 @@ async fn send_daemon_rollout_binary_to_endpoint_async(
             sinomo_core::network::ClusterObjectRpcOptions::default(),
         )
         .await?;
-    decode_rollout_binary_session_result(result)
+    decode_rollout_binary_session_result(result).await
 }
 
 async fn send_daemon_rollout_binary_to_target_async(
@@ -2619,7 +2645,7 @@ async fn send_daemon_rollout_binary_to_target_async(
             sinomo_core::network::ClusterObjectRpcOptions::default(),
         )
         .await?;
-    decode_rollout_binary_session_result(result)
+    decode_rollout_binary_session_result(result).await
 }
 
 pub fn send_daemon_rollout_native_dylib_module(
@@ -2689,7 +2715,7 @@ pub fn send_daemon_rollout_build(
                 )
                 .await?
         };
-        decode_rollout_build_session_result(result)
+        decode_rollout_build_session_result(result).await
     })
 }
 
@@ -2731,7 +2757,7 @@ pub fn send_daemon_rollout_build_to_endpoint(
                 )
                 .await?
         };
-        decode_rollout_build_session_result(result)
+        decode_rollout_build_session_result(result).await
     })
 }
 
@@ -2759,7 +2785,7 @@ pub fn send_daemon_rollout_build_to_target(
                 sinomo_core::network::ClusterObjectRpcOptions::default(),
             )
             .await?;
-        decode_rollout_build_session_result(result)
+        decode_rollout_build_session_result(result).await
     })
 }
 
@@ -2784,9 +2810,10 @@ fn rollout_build_session_call(
     ))
 }
 
-fn decode_rollout_build_session_result(
+async fn decode_rollout_build_session_result(
     result: ObjectRpcSessionResult,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    let result = decode_daemon_client_unary_response(result).await?;
     if !result.body.is_empty() {
         return Err(DaemonError::Parse {
             detail: "rollout build response unexpectedly contained a body attachment".to_string(),
