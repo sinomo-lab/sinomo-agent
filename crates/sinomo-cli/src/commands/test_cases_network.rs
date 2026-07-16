@@ -235,14 +235,14 @@ fn run_network_state_hygiene(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let targets = filter_network_test_targets(
         ctx,
         &cluster_state,
-        network_ping_targets_from_state(&cluster_paths, &cluster_state)?,
+        super::test::live_online_remote_main_test_targets(&data_dir, &cluster_state)?,
     )?;
     ctx.record("target_count", targets.len());
     ctx.record(
         "targets",
         targets.iter().map(ToString::to_string).collect::<Vec<_>>(),
     );
-    if targets.len() < expected_targets {
+    if !super::test::cluster_test_has_expected_target_count(targets.len(), expected_targets) {
         return Ok(SinomoTestOutcome::failed(format!(
             "network hygiene saw {} remote main targets, expected at least {expected_targets}",
             targets.len()
@@ -312,14 +312,14 @@ fn run_network_state_hygiene_dirty_fixture(ctx: &mut SinomoTestContext) -> Sinom
     let targets = filter_network_test_targets(
         ctx,
         &cluster_state,
-        network_ping_targets_from_state(&cluster_paths, &cluster_state)?,
+        super::test::live_online_remote_main_test_targets(&data_dir, &cluster_state)?,
     )?;
     ctx.record("target_count", targets.len());
     ctx.record(
         "targets",
         targets.iter().map(ToString::to_string).collect::<Vec<_>>(),
     );
-    if targets.len() < expected_targets {
+    if !super::test::cluster_test_has_expected_target_count(targets.len(), expected_targets) {
         return Ok(SinomoTestOutcome::failed(format!(
             "network hygiene dirty fixture saw {} remote main targets, expected at least {expected_targets}",
             targets.len()
@@ -571,7 +571,7 @@ fn run_network_ping_with_defaults(
     let targets = filter_network_test_targets(
         ctx,
         &cluster_state,
-        network_ping_targets_from_state(&cluster_paths, &cluster_state)?,
+        super::test::live_online_remote_main_test_targets(&data_dir, &cluster_state)?,
     )?;
     let target_count = targets.len();
     ctx.record("target_count", target_count);
@@ -579,7 +579,7 @@ fn run_network_ping_with_defaults(
         "targets",
         targets.iter().map(ToString::to_string).collect::<Vec<_>>(),
     );
-    if target_count < expected_targets {
+    if !super::test::cluster_test_has_expected_target_count(target_count, expected_targets) {
         return Ok(SinomoTestOutcome::failed(format!(
             "network ping saw {target_count} remote main targets, expected at least {expected_targets}"
         )));
@@ -1664,6 +1664,7 @@ fn run_network_tcp_tunnel_stale_fallback_probe(
     Ok(SinomoTestOutcome::passed(""))
 }
 
+#[cfg(test)]
 fn network_ping_targets_from_state(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -1675,6 +1676,7 @@ fn network_ping_targets_from_state(
         .collect())
 }
 
+#[cfg(test)]
 fn network_ping_target_is_available_for_probe(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -1696,6 +1698,7 @@ fn network_ping_target_is_available_for_probe(
         })
 }
 
+#[cfg(test)]
 fn network_target_has_healthy_route(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,

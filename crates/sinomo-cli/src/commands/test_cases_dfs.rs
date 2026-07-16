@@ -470,7 +470,7 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let targets = filter_dfs_routed_status_targets(
         ctx,
         &state,
-        dfs_routed_status_targets_from_state(&cluster_paths, &state),
+        super::test::live_online_remote_main_test_targets(&data_dir, &state)?,
     )?;
     let unavailable_repair_targets =
         dfs_unavailable_repair_targets_from_state(&cluster_paths, &state);
@@ -483,7 +483,7 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         "probe_concurrency",
         targets.len().min(MAX_ROUTED_STATUS_CONCURRENCY),
     );
-    if targets.len() < expected_targets {
+    if !super::test::cluster_test_has_expected_target_count(targets.len(), expected_targets) {
         return Ok(SinomoTestOutcome::failed(format!(
             "DFS routed status saw {} remote main targets, expected at least {expected_targets}",
             targets.len()
@@ -1253,6 +1253,7 @@ impl DfsRoutedStatusGate {
     }
 }
 
+#[cfg(test)]
 fn dfs_routed_status_targets_from_state(
     cluster_paths: &ClusterPaths,
     state: &sinomo_runtime::core::ClusterBootstrapState,
