@@ -73,6 +73,60 @@ impl DfsMessageTransport for ReceiveOnlyTransport {
     }
 }
 
+#[test]
+fn detached_message_worker_finishes_every_lane_local_parent_touch() {
+    let root = temp_root("detached-worker-drains-parent-touches");
+    let node = NodeId::from_legacy_named("node_detached_parent_touches").expect("node id");
+    let sender: DfsMessageSender = Arc::new(|target_node_id, command, _timeout| {
+        Err(DfsPeerTransportError::new(format!(
+            "unexpected send to {target_node_id} for {}",
+            command.request_id
+        )))
+    });
+    let transport = DfsNodeServedMessageTransport::new_with_message_sender(
+        node,
+        Vec::new(),
+        sender,
+        Duration::from_millis(1),
+    );
+    let content = LocalContentStore::new(root.join("content")).expect("content store");
+    let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+    let mut service = NetworkedDfsService::new(transport, content)
+        .with_metadata_backend(metadata)
+        .expect("attach metadata backend");
+    service
+        .bootstrap_distributed_sifs()
+        .expect("bootstrap distributed SIFS");
+    let mut parent_versions = Vec::new();
+    for index in 0..(DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT + 3) {
+        let parent = format!("/services/deferred-parent-{index}");
+        service.posix_mkdir_all(&parent).expect("create parent");
+        service
+            .posix_set_times(&parent, Some(12_345), Some(67_890))
+            .expect("set old parent times");
+        let before = service.posix_stat(&parent).expect("parent before touch");
+        let child = format!("{parent}/created.txt");
+        service.deferred_routed_create_parent_touches.insert(child);
+        parent_versions.push((parent, before.version));
+    }
+
+    let worker = service.detach_message_deferred_work();
+
+    assert!(service.deferred_routed_create_parent_touches.is_empty());
+    assert!(!worker.has_pending().expect("detached outbox state"));
+    for (parent, version_before) in parent_versions {
+        let after = service.posix_stat(&parent).expect("parent after touch");
+        assert_ne!(
+            after.version, version_before,
+            "detaching must apply the queued metadata touch for {parent}"
+        );
+        assert!(
+            after.modified_at_unix_nanos > 67_890,
+            "detaching must refresh the queued parent mtime for {parent}"
+        );
+    }
+}
+
 #[derive(Debug)]
 struct RangeSignalingControlPlaneKvClient {
     inner: InProcessKvStore,

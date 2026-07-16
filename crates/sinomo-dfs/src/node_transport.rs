@@ -792,6 +792,18 @@ impl DfsNodeDetachedSendWorker {
             .map_err(DfsError::from_network)
     }
 
+    /// Drain after obtaining exclusive ownership of the shared outbox worker.
+    ///
+    /// Long-lived daemon schedulers use this from `spawn_blocking`: returning
+    /// early when another drain owns the gate can otherwise make the scheduler
+    /// observe a temporarily empty outbox and exit just before failed work is
+    /// restored for retry.
+    pub fn drain_exclusive(&mut self) -> Result<(), DfsError> {
+        self.transport
+            .flush_detached_peer_sends_exclusive()
+            .map_err(DfsError::from_network)
+    }
+
     #[cfg(test)]
     fn drain_at(&mut self, now: Instant) -> Result<(), DfsError> {
         self.transport
@@ -848,6 +860,30 @@ impl DfsNodeDetachedSendWorker {
             _ = &mut notified => Ok(()),
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)) => Ok(()),
         }
+    }
+
+    /// Wait until any lane sharing this detached outbox changes its work set.
+    ///
+    /// Daemon schedulers stay parked here even when the outbox is empty. This
+    /// is intentional: a concurrent maintenance drainer can temporarily move
+    /// all work into an in-flight batch and later restore a failed send. The
+    /// shared generation plus the pre-registered notification closes that
+    /// restore-after-empty race without polling.
+    pub async fn wait_for_change(&self, observed_generation: u64) -> Result<(), DfsError> {
+        let notify = Arc::clone(&self.transport.detached_send_state.ready_notify);
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let (_, _, current_generation) = self
+            .transport
+            .detached_send_scheduling_snapshot_at(Instant::now())
+            .map_err(DfsError::from_network)?;
+        if current_generation != observed_generation {
+            return Ok(());
+        }
+        notified.await;
+        Ok(())
     }
 }
 
@@ -1664,7 +1700,22 @@ impl DfsNodeTransport {
         self.flush_detached_peer_sends_with_now(&Instant::now)
     }
 
+    fn flush_detached_peer_sends_exclusive(&mut self) -> Result<(), NetworkError> {
+        self.flush_detached_peer_sends_with_now_mode(&Instant::now, true)
+    }
+
     fn flush_detached_peer_sends_with_now<F>(&mut self, now: &F) -> Result<(), NetworkError>
+    where
+        F: Fn() -> Instant + ?Sized,
+    {
+        self.flush_detached_peer_sends_with_now_mode(now, false)
+    }
+
+    fn flush_detached_peer_sends_with_now_mode<F>(
+        &mut self,
+        now: &F,
+        wait_for_drain_gate: bool,
+    ) -> Result<(), NetworkError>
     where
         F: Fn() -> Instant + ?Sized,
     {
@@ -1673,14 +1724,17 @@ impl DfsNodeTransport {
         // retaining cap-two concurrency inside its drain. A competing worker
         // never blocks a Tokio blocking-pool thread behind the global gate.
         let drain_gate = Arc::clone(&self.detached_send_state.drain_gate);
-        let _drain_guard = match drain_gate.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                return Err(NetworkError::Io {
-                    operation: "serialize detached DFS message drains".to_string(),
-                    detail: "detached send drain lock is poisoned".to_string(),
-                });
+        let drain_lock_error = || NetworkError::Io {
+            operation: "serialize detached DFS message drains".to_string(),
+            detail: "detached send drain lock is poisoned".to_string(),
+        };
+        let _drain_guard = if wait_for_drain_gate {
+            drain_gate.lock().map_err(|_| drain_lock_error())?
+        } else {
+            match drain_gate.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err(drain_lock_error()),
             }
         };
         let mut first_replay_error = None;
@@ -4981,6 +5035,129 @@ mod tests {
     }
 
     #[test]
+    fn exclusive_detached_worker_waits_for_the_shared_drain_gate() {
+        let local = node_id("node_exclusive_detached_worker_local");
+        let detached_send_state = DfsNodeDetachedSendState::new();
+        let sender: DfsMessageSender = Arc::new(|_target, command, _options| {
+            Ok(DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: Vec::new(),
+            })
+        });
+        let transport = DfsNodeServedMessageTransport::new_with_message_sender_and_detached_state(
+            local,
+            Vec::new(),
+            sender,
+            Duration::from_secs(1),
+            detached_send_state.clone(),
+        );
+        let mut worker = transport.node_transport.fork_detached_send_worker();
+        let drain_gate = Arc::clone(&detached_send_state.drain_gate);
+        let drain_guard = drain_gate.lock().expect("hold shared drain gate");
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (done_tx, done_rx) = mpsc::sync_channel(0);
+        let worker_thread = std::thread::spawn(move || {
+            started_tx.send(()).expect("report worker start");
+            let result = worker.drain_exclusive();
+            done_tx.send(result).expect("report worker result");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("exclusive worker started");
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "exclusive worker must not mistake an in-progress drain for an empty outbox"
+        );
+        drop(drain_guard);
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("exclusive worker completed after gate release")
+            .expect("exclusive drain");
+        worker_thread.join().expect("exclusive worker join");
+    }
+
+    #[test]
+    fn detached_worker_wait_observes_work_restored_by_competing_drain() {
+        let local = node_id("node_detached_restore_wait_local");
+        let remote = node_id("node_detached_restore_wait_remote");
+        let (send_started_tx, send_started_rx) = mpsc::sync_channel(0);
+        let (release_send_tx, release_send_rx) = mpsc::sync_channel(0);
+        let release_send_rx = Arc::new(Mutex::new(release_send_rx));
+        let sender_release = Arc::clone(&release_send_rx);
+        let sender: DfsMessageSender = Arc::new(move |_target, _command, _options| {
+            send_started_tx.send(()).expect("report send start");
+            sender_release
+                .lock()
+                .expect("send release lock")
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release failed send");
+            Err(DfsPeerTransportError::new(
+                "injected competing promotion failure",
+            ))
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            [remote.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        transport
+            .send_detached_routed_message(&remote, test_commit_version_message(&local, &remote, 1))
+            .expect("queue promotion");
+        let mut competing_worker = transport.fork_detached_send_worker();
+        let waiting_worker = transport.fork_detached_send_worker();
+        let inspection_worker = waiting_worker.clone();
+        let drain_thread = std::thread::spawn(move || competing_worker.drain());
+        send_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("competing drain took the promotion");
+
+        let (ready, retry_not_before, observed_generation) = waiting_worker
+            .scheduling_snapshot()
+            .expect("snapshot in-flight outbox");
+        assert!(!ready);
+        assert!(retry_not_before.is_none());
+
+        let (wait_started_tx, wait_started_rx) = mpsc::sync_channel(0);
+        let (wait_done_tx, wait_done_rx) = mpsc::sync_channel(0);
+        let wait_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("wait runtime");
+            wait_started_tx.send(()).expect("report wait start");
+            let result = runtime.block_on(waiting_worker.wait_for_change(observed_generation));
+            wait_done_tx.send(result).expect("report wait result");
+        });
+        wait_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("outbox waiter started");
+        assert_eq!(
+            wait_done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "an empty in-flight outbox must keep the watcher parked"
+        );
+
+        release_send_tx.send(()).expect("release failed send");
+        wait_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("restoration woke the outbox watcher")
+            .expect("wait for restored work");
+        drain_thread
+            .join()
+            .expect("competing drain join")
+            .expect_err("competing drain must restore the failed promotion");
+        wait_thread.join().expect("outbox wait join");
+        let (ready, retry_not_before, restored_generation) = inspection_worker
+            .scheduling_snapshot()
+            .expect("snapshot restored outbox");
+        assert!(!ready, "restored promotion should still be cooling");
+        assert!(retry_not_before.is_some());
+        assert!(restored_generation > observed_generation);
+    }
+
+    #[test]
     fn detached_send_state_is_shared_without_replacing_origin_routing_capability() {
         let local = node_id("node_detached_shared_state_local");
         let remote = node_id("node_detached_shared_state_remote");
@@ -5923,6 +6100,21 @@ impl NetworkedDfsService<DfsNodeServedMessageTransport> {
 
     pub fn prepare_message_deferred_work(&mut self) -> DfsNodeDetachedSendWorker {
         self.drain_deferred_routed_create_parent_touches();
+        self.transport.node_transport.fork_detached_send_worker()
+    }
+
+    /// Move served-message follow-up work off this service instance before a
+    /// daemon releases its metadata-heavy lane.
+    ///
+    /// Parent-directory touches are lane-local and the regular preparation
+    /// path intentionally drains only a bounded batch. A detached daemon
+    /// worker cannot recover those touches after dropping the service, so
+    /// finish that finite local queue here before returning the lightweight
+    /// worker whose retry outbox is shared across service generations.
+    pub fn detach_message_deferred_work(&mut self) -> DfsNodeDetachedSendWorker {
+        while !self.deferred_routed_create_parent_touches.is_empty() {
+            self.drain_deferred_routed_create_parent_touches();
+        }
         self.transport.node_transport.fork_detached_send_worker()
     }
 
