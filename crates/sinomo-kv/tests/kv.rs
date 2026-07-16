@@ -6175,7 +6175,8 @@ mod tests {
         local_leader: bool,
         forwarded: Option<ClusterKvTxnCommitResult>,
         committed_txns: usize,
-        elected: bool,
+        election_calls: usize,
+        current_term: u64,
         reachable_voters: usize,
     }
 
@@ -6205,7 +6206,10 @@ mod tests {
             &mut self,
             _state: &ClusterBootstrapState,
         ) -> Result<bool, Self::Error> {
-            self.elected = true;
+            self.election_calls = self.election_calls.saturating_add(1);
+            self.current_term = self
+                .current_term
+                .saturating_add(CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP);
             self.local_leader = true;
             Ok(true)
         }
@@ -6235,6 +6239,77 @@ mod tests {
             Ok(ClusterKvRaftQuorumCommitResult {
                 snapshot: store.snapshot().expect("snapshot"),
                 txn_response: Some(txn_response),
+            })
+        }
+
+        fn cluster_read_only_error(&mut self, detail: String) -> Self::Error {
+            QuorumCommitTestError::ReadOnly(detail)
+        }
+    }
+
+    impl ClusterKvTxnQuorumAsyncHost for TxnQuorumDriverTestHost {
+        type Error = QuorumCommitTestError;
+
+        fn kv_error(error: KvError) -> Self::Error {
+            QuorumCommitTestError::from(error)
+        }
+
+        fn local_is_raft_leader_async<'a>(
+            &'a mut self,
+            _state: &'a ClusterBootstrapState,
+        ) -> ClusterKvRaftQuorumFuture<'a, bool, Self::Error> {
+            Box::pin(async move { Ok(self.local_leader) })
+        }
+
+        fn forward_cluster_kv_txn_to_voter_async<'a>(
+            &'a mut self,
+            _state: &'a ClusterBootstrapState,
+            _txn: &'a KvTxn,
+        ) -> ClusterKvRaftQuorumFuture<'a, Option<ClusterKvTxnCommitResult>, Self::Error> {
+            Box::pin(async move { Ok(self.forwarded.clone()) })
+        }
+
+        fn elect_cluster_raft_leader_async<'a>(
+            &'a mut self,
+            _state: &'a ClusterBootstrapState,
+        ) -> ClusterKvRaftQuorumFuture<'a, bool, Self::Error> {
+            Box::pin(async move {
+                self.election_calls = self.election_calls.saturating_add(1);
+                self.current_term = self
+                    .current_term
+                    .saturating_add(CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP);
+                self.local_leader = true;
+                Ok(true)
+            })
+        }
+
+        fn reachable_voter_count_async<'a>(
+            &'a mut self,
+            _state: &'a ClusterBootstrapState,
+        ) -> ClusterKvRaftQuorumFuture<'a, usize, Self::Error> {
+            Box::pin(async move { Ok(self.reachable_voters) })
+        }
+
+        fn semantic_txn_no_effect_response_async<'a>(
+            &'a mut self,
+            _txn: &'a KvTxn,
+        ) -> ClusterKvRaftQuorumFuture<'a, Option<ClusterKvTxnCommitResult>, Self::Error> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn commit_cluster_raft_txn_with_quorum_async<'a>(
+            &'a mut self,
+            _state: &'a mut ClusterBootstrapState,
+            txn: KvTxn,
+        ) -> ClusterKvRaftQuorumFuture<'a, ClusterKvRaftQuorumCommitResult, Self::Error> {
+            Box::pin(async move {
+                self.committed_txns = self.committed_txns.saturating_add(1);
+                let mut store = InProcessKvStore::new();
+                let txn_response = store.txn(txn)?;
+                Ok(ClusterKvRaftQuorumCommitResult {
+                    snapshot: store.snapshot().expect("snapshot"),
+                    txn_response: Some(txn_response),
+                })
             })
         }
 
@@ -6446,7 +6521,7 @@ mod tests {
         .expect("commit local leader txn");
 
         assert_eq!(host.committed_txns, 1);
-        assert!(!host.elected);
+        assert_eq!(host.election_calls, 0);
         assert_eq!(
             result
                 .snapshot
@@ -6510,26 +6585,27 @@ mod tests {
 
         assert_eq!(result, forwarded);
         assert_eq!(host.committed_txns, 0);
-        assert!(!host.elected);
+        assert_eq!(host.election_calls, 0);
     }
 
     #[test]
-    fn kv_txn_quorum_driver_forwarded_voter_can_elect_locally() {
+    fn kv_txn_quorum_driver_forwarded_voter_never_starts_election() {
         let local = NodeId::from_legacy_named("node_txn_driver_forwarded_local").expect("local");
         let remote = NodeId::from_legacy_named("node_txn_driver_forwarded_remote").expect("remote");
         let mut state = quorum_commit_test_state(&local, &remote);
         let mut host = TxnQuorumDriverTestHost {
+            current_term: 41,
             reachable_voters: 2,
             ..TxnQuorumDriverTestHost::default()
         };
 
-        let result = commit_cluster_kv_txn_with_quorum_with_host(
+        let error = commit_cluster_kv_txn_with_quorum_with_host(
             &mut state,
             KvTxn {
                 compares: Vec::new(),
                 success: vec![KvOp::Put {
-                    key: "/kv/txn-driver/forwarded-local-election".to_string(),
-                    value: b"committed".to_vec(),
+                    key: "/kv/txn-driver/forwarded-rejected".to_string(),
+                    value: b"rejected".to_vec(),
                     lease_id: None,
                 }],
                 failure: Vec::new(),
@@ -6539,14 +6615,153 @@ mod tests {
             },
             &mut host,
         )
-        .expect("forwarded voter should be able to recover local leadership");
+        .expect_err("forwarded voter must not recover leadership by campaigning");
 
-        assert!(host.elected);
+        assert!(matches!(
+            error,
+            QuorumCommitTestError::ReadOnly(ref detail)
+                if detail == "forwarded cluster KV transaction reached a non-leader voter; forwarded requests do not start elections"
+        ));
+        assert_eq!(host.election_calls, 0);
+        assert_eq!(host.current_term, 41);
+        assert_eq!(host.committed_txns, 0);
+        assert!(!host.local_leader);
+    }
+
+    #[test]
+    fn kv_txn_quorum_driver_originating_voter_retains_election_behavior() {
+        let local = NodeId::from_legacy_named("node_txn_driver_origin_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_txn_driver_origin_remote").expect("remote");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        let mut host = TxnQuorumDriverTestHost {
+            current_term: 41,
+            reachable_voters: 2,
+            ..TxnQuorumDriverTestHost::default()
+        };
+
+        let result = commit_cluster_kv_txn_with_quorum_with_host(
+            &mut state,
+            KvTxn {
+                compares: Vec::new(),
+                success: vec![KvOp::Put {
+                    key: "/kv/txn-driver/origin-local-election".to_string(),
+                    value: b"committed".to_vec(),
+                    lease_id: None,
+                }],
+                failure: Vec::new(),
+            },
+            ClusterKvTxnQuorumDriverOptions {
+                allow_forwarding: true,
+            },
+            &mut host,
+        );
+
+        let result = result.expect("originating voter should retain local election behavior");
+        assert_eq!(host.election_calls, 1);
+        assert_eq!(
+            host.current_term,
+            41 + CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP
+        );
         assert_eq!(host.committed_txns, 1);
         assert_eq!(
             result
                 .snapshot
-                .get("/kv/txn-driver/forwarded-local-election")
+                .get("/kv/txn-driver/origin-local-election")
+                .expect("committed key")
+                .value,
+            b"committed".to_vec()
+        );
+    }
+
+    #[test]
+    fn kv_txn_quorum_async_driver_forwarded_voter_never_starts_election() {
+        let local = NodeId::from_legacy_named("node_txn_async_forwarded_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_txn_async_forwarded_remote").expect("remote");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        let mut host = TxnQuorumDriverTestHost {
+            current_term: 73,
+            reachable_voters: 2,
+            ..TxnQuorumDriverTestHost::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let error = runtime
+            .block_on(commit_cluster_kv_txn_with_quorum_async_with_host(
+                &mut state,
+                KvTxn {
+                    compares: Vec::new(),
+                    success: vec![KvOp::Put {
+                        key: "/kv/txn-driver/async-forwarded-rejected".to_string(),
+                        value: b"rejected".to_vec(),
+                        lease_id: None,
+                    }],
+                    failure: Vec::new(),
+                },
+                ClusterKvTxnQuorumDriverOptions {
+                    allow_forwarding: false,
+                },
+                &mut host,
+            ))
+            .expect_err("forwarded voter must not recover leadership by campaigning");
+
+        assert!(matches!(
+            error,
+            QuorumCommitTestError::ReadOnly(ref detail)
+                if detail == "forwarded cluster KV transaction reached a non-leader voter; forwarded requests do not start elections"
+        ));
+        assert_eq!(host.election_calls, 0);
+        assert_eq!(host.current_term, 73);
+        assert_eq!(host.committed_txns, 0);
+        assert!(!host.local_leader);
+    }
+
+    #[test]
+    fn kv_txn_quorum_async_driver_originating_voter_retains_election_behavior() {
+        let local = NodeId::from_legacy_named("node_txn_async_origin_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_txn_async_origin_remote").expect("remote");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        let mut host = TxnQuorumDriverTestHost {
+            current_term: 73,
+            reachable_voters: 2,
+            ..TxnQuorumDriverTestHost::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let result = runtime
+            .block_on(commit_cluster_kv_txn_with_quorum_async_with_host(
+                &mut state,
+                KvTxn {
+                    compares: Vec::new(),
+                    success: vec![KvOp::Put {
+                        key: "/kv/txn-driver/async-origin-local-election".to_string(),
+                        value: b"committed".to_vec(),
+                        lease_id: None,
+                    }],
+                    failure: Vec::new(),
+                },
+                ClusterKvTxnQuorumDriverOptions {
+                    allow_forwarding: true,
+                },
+                &mut host,
+            ))
+            .expect("originating voter should retain local election behavior");
+
+        assert_eq!(host.election_calls, 1);
+        assert_eq!(
+            host.current_term,
+            73 + CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP
+        );
+        assert_eq!(host.committed_txns, 1);
+        assert_eq!(
+            result
+                .snapshot
+                .get("/kv/txn-driver/async-origin-local-election")
                 .expect("committed key")
                 .value,
             b"committed".to_vec()

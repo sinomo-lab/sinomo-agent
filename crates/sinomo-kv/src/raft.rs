@@ -1575,14 +1575,16 @@ where
     let mut previous_commit_failure: Option<H::Error> = None;
     for attempt in 0..CLUSTER_KV_TXN_QUORUM_COMMIT_MAX_ATTEMPTS {
         if !host.local_is_raft_leader(state)? {
-            let forwarding_failure = if options.allow_forwarding {
-                match host.forward_cluster_kv_txn_to_voter(state, &txn) {
-                    Ok(Some(response)) => return Ok(response),
-                    Ok(None) => None,
-                    Err(error) => Some(error),
-                }
-            } else {
-                None
+            if !options.allow_forwarding {
+                return Err(host.cluster_read_only_error(
+                    "forwarded cluster KV transaction reached a non-leader voter; forwarded requests do not start elections"
+                        .to_string(),
+                ));
+            }
+            let forwarding_failure = match host.forward_cluster_kv_txn_to_voter(state, &txn) {
+                Ok(Some(response)) => return Ok(response),
+                Ok(None) => None,
+                Err(error) => Some(error),
             };
             if !host.elect_cluster_raft_leader(state)? {
                 let mut detail = if let Some(forwarding_failure) = forwarding_failure {
@@ -1590,10 +1592,8 @@ where
                         "local node is not the Raft leader and could not win quorum; forwarding also failed: {}",
                         forwarding_failure.to_string()
                     )
-                } else if options.allow_forwarding {
-                    "local node is not the Raft leader and could not win quorum".to_string()
                 } else {
-                    "forwarded cluster KV transaction reached a non-leader voter and it could not win quorum".to_string()
+                    "local node is not the Raft leader and could not win quorum".to_string()
                 };
                 if let Some(error) = previous_commit_failure.as_ref() {
                     detail.push_str("; previous local commit failed: ");
@@ -1671,14 +1671,19 @@ where
     let mut previous_commit_failure: Option<H::Error> = None;
     for attempt in 0..CLUSTER_KV_TXN_QUORUM_COMMIT_MAX_ATTEMPTS {
         if !host.local_is_raft_leader_async(state).await? {
-            let forwarding_failure = if options.allow_forwarding {
-                match host.forward_cluster_kv_txn_to_voter_async(state, &txn).await {
-                    Ok(Some(response)) => return Ok(response),
-                    Ok(None) => None,
-                    Err(error) => Some(error),
-                }
-            } else {
-                None
+            if !options.allow_forwarding {
+                return Err(host.cluster_read_only_error(
+                    "forwarded cluster KV transaction reached a non-leader voter; forwarded requests do not start elections"
+                        .to_string(),
+                ));
+            }
+            let forwarding_failure = match host
+                .forward_cluster_kv_txn_to_voter_async(state, &txn)
+                .await
+            {
+                Ok(Some(response)) => return Ok(response),
+                Ok(None) => None,
+                Err(error) => Some(error),
             };
             if !host.elect_cluster_raft_leader_async(state).await? {
                 let mut detail = if let Some(forwarding_failure) = forwarding_failure {
@@ -1686,10 +1691,8 @@ where
                         "local node is not the Raft leader and could not win quorum; forwarding also failed: {}",
                         forwarding_failure.to_string()
                     )
-                } else if options.allow_forwarding {
-                    "local node is not the Raft leader and could not win quorum".to_string()
                 } else {
-                    "forwarded cluster KV transaction reached a non-leader voter and it could not win quorum".to_string()
+                    "local node is not the Raft leader and could not win quorum".to_string()
                 };
                 if let Some(error) = previous_commit_failure.as_ref() {
                     detail.push_str("; previous local commit failed: ");

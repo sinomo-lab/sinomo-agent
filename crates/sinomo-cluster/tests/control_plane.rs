@@ -10601,7 +10601,7 @@ fn cluster_kv_snapshot_refresh_local_driver_owns_local_raft_storage() {
 }
 
 #[test]
-fn forwarded_cluster_kv_txn_driver_can_elect_without_reforwarding() {
+fn forwarded_cluster_kv_txn_driver_never_starts_election() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-forwarded-kv-local-election");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -10622,7 +10622,7 @@ fn forwarded_cluster_kv_txn_driver_can_elect_without_reforwarding() {
     mark_test_member_as_voter(&mut state.members[0]);
     let mut host = RecordingKvTxnQuorumHost::default();
 
-    let result = commit_cluster_kv_txn_with_quorum_response_with_host(
+    let error = commit_cluster_kv_txn_with_quorum_response_with_host(
         &paths,
         &mut state,
         KvTxn {
@@ -10637,19 +10637,16 @@ fn forwarded_cluster_kv_txn_driver_can_elect_without_reforwarding() {
         kv_txn_quorum_test_options(false),
         &mut host,
     )
-    .expect("forwarded non-leader voter may recover local leadership");
+    .expect_err("forwarded non-leader voter must not campaign");
 
-    assert_eq!(
-        result
-            .snapshot
-            .get("/test/forwarded-local-election")
-            .expect("committed key")
-            .value,
-        b"committed".to_vec()
-    );
-    assert_eq!(host.leader_checks, 2);
-    assert_eq!(host.elect_calls, 1);
-    assert_eq!(host.commit_calls, 1);
+    assert!(matches!(
+        error,
+        NetworkError::ClusterReadOnly { detail }
+            if detail.contains("forwarded cluster KV transaction reached a non-leader voter")
+    ));
+    assert_eq!(host.leader_checks, 1);
+    assert_eq!(host.elect_calls, 0);
+    assert_eq!(host.commit_calls, 0);
 }
 
 #[test]
@@ -11460,6 +11457,97 @@ fn cluster_raft_leader_election_driver_sets_leader_after_remote_voter_grants() {
 }
 
 #[test]
+fn cluster_raft_leader_election_preserves_remote_leader_without_offline_evidence() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-live-remote-leader");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, local_node_id, peer_node_id) = cluster_raft_handler_test_state(
+        "cluster_raft_live_remote_leader",
+        "node_raft_live_remote_leader_local",
+        "node_raft_live_remote_leader_peer",
+    );
+    let peer_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.84:21353".to_string(), 10);
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == peer_node_id)
+        .expect("peer member")
+        .endpoints
+        .push(peer_endpoint.clone());
+    write_cluster_state(&paths, &state).expect("write state");
+    let heartbeat = RaftAppendEntriesRequest {
+        term: 1,
+        leader_id: peer_node_id.clone(),
+        prev_log_index: 0,
+        prev_log_term: 0,
+        entries: Vec::new(),
+        leader_commit: 0,
+    };
+    assert!(
+        apply_cluster_raft_append(&paths, &local_node_id, None, heartbeat)
+            .expect("apply remote leader heartbeat")
+            .success
+    );
+    let observed_at = OffsetDateTime::now_utc();
+    let connectivity = cluster_connectivity_record(
+        &state,
+        &peer_endpoint,
+        ClusterConnectivityState::Healthy,
+        Some(1),
+        0,
+        Some("2026-07-16T23:00:00Z".to_string()),
+        None,
+        observed_at,
+        CLUSTER_CONNECTIVITY_TTL_SECONDS,
+    );
+    write_local_cluster_connectivity_records(
+        &paths,
+        &local_node_id,
+        std::slice::from_ref(&connectivity),
+    )
+    .expect("write healthy leader connectivity");
+    assert!(!cluster_node_blocks_leader_preference(
+        &paths,
+        &state,
+        &peer_node_id
+    ));
+    let mut host = RecordingLeaderElectionHost::default();
+
+    let elected = elect_cluster_raft_leader_with_host(
+        &paths,
+        &state,
+        ClusterRaftLeaderElectionOptions {
+            kv: ClusterKvRaftLeaderElectionOptions {
+                max_attempts: sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_ATTEMPTS,
+            },
+            timeout: Duration::from_secs(5),
+            campaign_jitter_max: Duration::ZERO,
+            tcp_command_timeout: Duration::from_secs(5),
+            iroh_command_timeout: Duration::from_secs(3),
+            tcp_foreground_attempt_timeout: Duration::from_secs(1),
+            public_foreground_attempt_timeout: Duration::from_secs(4),
+            iroh_foreground_attempt_timeout: Duration::from_millis(1500),
+        },
+        &mut host,
+    )
+    .expect("preserve remote leader");
+
+    assert!(!elected);
+    assert!(host.sent_votes.is_empty());
+    assert_eq!(
+        paths
+            .kv_paths()
+            .known_raft_voter_leader_id(&state)
+            .expect("known state authority"),
+        Some(peer_node_id.clone())
+    );
+    let node = open_cluster_raft_kv_node(&paths, &local_node_id).expect("open local raft node");
+    assert_eq!(node.hard_state().current_term, 1);
+    assert_eq!(node.hard_state().leader_id.as_ref(), Some(&peer_node_id));
+}
+
+#[test]
 fn cluster_raft_leader_election_replaces_unchanged_remote_leader() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-raft-stale-remote-leader");
     let data_dir = SinomoDataDir::new(&root);
@@ -11470,17 +11558,14 @@ fn cluster_raft_leader_election_replaces_unchanged_remote_leader() {
         "node_raft_stale_remote_leader_local",
         "node_raft_stale_remote_leader_peer",
     );
+    let peer_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.84:21353".to_string(), 10);
     state
         .members
         .iter_mut()
         .find(|member| member.node_id == peer_node_id)
         .expect("peer member")
         .endpoints
-        .push(daemon_lan_endpoint(
-            &peer_node_id,
-            "10.0.0.84:21353".to_string(),
-            10,
-        ));
+        .push(peer_endpoint.clone());
     write_cluster_state(&paths, &state).expect("write state");
     let heartbeat = RaftAppendEntriesRequest {
         term: 1,
@@ -11502,6 +11587,29 @@ fn cluster_raft_leader_election_replaces_unchanged_remote_leader() {
             .expect("known stale state authority"),
         Some(peer_node_id.clone())
     );
+    let observed_at = OffsetDateTime::now_utc();
+    let connectivity = cluster_connectivity_record(
+        &state,
+        &peer_endpoint,
+        ClusterConnectivityState::Unreachable,
+        None,
+        CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD,
+        None,
+        Some("2026-07-16T23:00:00Z".to_string()),
+        observed_at,
+        CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
+    );
+    write_local_cluster_connectivity_records(
+        &paths,
+        &local_node_id,
+        std::slice::from_ref(&connectivity),
+    )
+    .expect("write unreachable leader connectivity");
+    assert!(cluster_node_blocks_leader_preference(
+        &paths,
+        &state,
+        &peer_node_id
+    ));
     let mut host = RecordingLeaderElectionHost::default();
 
     let elected = elect_cluster_raft_leader_with_host(

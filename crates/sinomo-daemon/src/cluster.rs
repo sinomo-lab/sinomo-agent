@@ -106,8 +106,6 @@ pub const DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL: Duration = Duration::from_se
 pub const DAEMON_CLUSTER_DISCOVERY_INTERVAL: Duration =
     sinomo_core::network::CLUSTER_NETWORK_DISCOVERY_INTERVAL;
 const DAEMON_CLUSTER_STARTUP_SETTLE_DURATION: Duration = Duration::from_secs(8);
-const DAEMON_SHADOW_STATUS_STARTUP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
-const DAEMON_SHADOW_STATUS_STARTUP_RETRY_ATTEMPTS: u8 = 20;
 pub const DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL: Duration =
     sinomo_core::network::CLUSTER_NETWORK_PROBE_INTERVAL;
 const DESIRED_ROLLOUT_STALE_PROGRESS_AFTER_SECONDS: i64 = 120;
@@ -1388,151 +1386,6 @@ pub(crate) fn daemon_network_module_context_now(
     }))
 }
 
-pub(crate) fn refresh_daemon_network_module_repair_routes_on_runtime(
-    paths: &DaemonPaths,
-    runtime: &tokio::runtime::Handle,
-) -> Result<bool, DaemonError> {
-    refresh_daemon_network_module_repair_routes_with_runtime(paths, Some(runtime))
-}
-
-fn refresh_daemon_network_module_repair_routes_with_runtime(
-    paths: &DaemonPaths,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<bool, DaemonError> {
-    let Some(cluster) = daemon_cluster_status_from_paths_on_runtime(paths, runtime)? else {
-        return Ok(false);
-    };
-    let endpoints = local_network_module_endpoints()?;
-    if endpoints.is_empty() {
-        tracing::debug!(
-            "sinomo {} network module repair routes unavailable: no module endpoints",
-            cluster.process
-        );
-        return Ok(false);
-    }
-    advertise_daemon_network_module_endpoints_with_runtime(paths, endpoints, runtime)
-}
-
-pub(crate) fn start_shadow_daemon_status_publisher(
-    paths: &DaemonPaths,
-    runtime: tokio::runtime::Handle,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> Result<tokio::task::JoinHandle<()>, DaemonError> {
-    let status_paths = paths.clone();
-    let task = runtime.clone().spawn(async move {
-        let mut startup_retries_remaining = DAEMON_SHADOW_STATUS_STARTUP_RETRY_ATTEMPTS;
-        let mut publish_interval = DAEMON_SHADOW_STATUS_STARTUP_RETRY_INTERVAL;
-        loop {
-            if daemon_cluster_sleep_or_shutdown(&mut shutdown_rx, publish_interval).await {
-                return;
-            }
-            let tick_paths = status_paths.clone();
-            let tick_runtime = runtime.clone();
-            let tick = tokio::task::spawn_blocking(move || {
-                let settled_solo =
-                    daemon_paths_have_settled_solo_cluster(&tick_paths).unwrap_or(false);
-                if !settled_solo {
-                    if let Err(error) = refresh_daemon_network_module_repair_routes_on_runtime(
-                        &tick_paths,
-                        &tick_runtime,
-                    ) {
-                        tracing::warn!(
-                            "sinomo shadow daemon network module repair route tick failed: {error}"
-                        );
-                    }
-                }
-                let clustered =
-                    daemon_cluster_status_from_paths_on_runtime(&tick_paths, Some(&tick_runtime))
-                        .ok()
-                        .flatten()
-                        .is_some();
-                let steady_publish_interval =
-                    daemon_cluster_publish_interval_on_runtime(&tick_paths, Some(&tick_runtime));
-                (settled_solo, clustered, steady_publish_interval)
-            })
-            .await;
-            let Ok((settled_solo, clustered, steady_publish_interval)) = tick else {
-                tracing::warn!("sinomo shadow daemon cluster status tick task failed");
-                publish_interval = DAEMON_SHADOW_STATUS_STARTUP_RETRY_INTERVAL;
-                continue;
-            };
-            let mut status_publish_outcome = None;
-            if !settled_solo {
-                match refresh_daemon_node_status_in_kv_async_with_timeouts(
-                    &status_paths,
-                    runtime.clone(),
-                    cluster_formation_control_plane_timeouts(),
-                )
-                .await
-                {
-                    Ok(outcome) => status_publish_outcome = Some(outcome),
-                    Err(error) => {
-                        tracing::warn!("sinomo shadow daemon cluster status tick failed: {error}")
-                    }
-                }
-            }
-            if startup_retries_remaining > 0 {
-                startup_retries_remaining = startup_retries_remaining.saturating_sub(1);
-                let publish_noop = status_publish_outcome.is_some_and(|outcome| {
-                    !outcome.network_info_published && !outcome.node_status_published
-                });
-                if clustered && publish_noop {
-                    startup_retries_remaining = 0;
-                }
-            }
-            publish_interval = if startup_retries_remaining > 0 {
-                DAEMON_SHADOW_STATUS_STARTUP_RETRY_INTERVAL
-            } else {
-                steady_publish_interval
-            };
-        }
-    });
-    Ok(task)
-}
-
-fn daemon_paths_have_settled_solo_cluster(paths: &DaemonPaths) -> Result<bool, DaemonError> {
-    let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
-        path: paths.root.display().to_string(),
-        detail: "daemon paths have no data directory parent".to_string(),
-    })?;
-    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
-    if !cluster_paths.state.exists() {
-        return Ok(false);
-    }
-    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
-    Ok(sinomo_core::network::cluster_is_settled_solo(&state))
-}
-
-fn advertise_daemon_network_module_endpoints_with_runtime(
-    paths: &DaemonPaths,
-    endpoints: Vec<ClusterEndpointRecord>,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<bool, DaemonError> {
-    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    let mut state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
-    if apply_network_module_endpoints_to_state(&mut state, endpoints, OffsetDateTime::now_utc())? {
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)?;
-        if let Some(runtime) = runtime {
-            if let Err(error) = sync_cluster_state_to_kv_on_runtime(&cluster_paths, &state, runtime)
-            {
-                tracing::warn!(
-                    "sinomo network module endpoint cluster state publication failed: {error}"
-                );
-            }
-            let publish_result = publish_local_members_to_quorum_if_needed_on_runtime(
-                &cluster_paths,
-                &state,
-                runtime,
-            );
-            if let Err(error) = publish_result {
-                tracing::warn!("sinomo network module endpoint member publication failed: {error}");
-            }
-        }
-        return Ok(true);
-    }
-    Ok(false)
-}
-
 pub(crate) fn handle_daemon_cluster_kv_snapshot(
     paths: &DaemonPaths,
 ) -> Result<KvSnapshot, DaemonError> {
@@ -2094,6 +1947,7 @@ fn call_node_object_rpc_on_runtime(
     .map_err(DaemonError::from)
 }
 
+#[cfg(test)]
 pub(crate) fn publish_local_members_to_quorum_if_needed_on_runtime(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -2219,6 +2073,7 @@ fn daemon_cluster_publish_interval(paths: &DaemonPaths) -> Duration {
     daemon_cluster_publish_interval_on_runtime(paths, None)
 }
 
+#[cfg(test)]
 fn daemon_cluster_publish_interval_on_runtime(
     paths: &DaemonPaths,
     runtime: Option<&tokio::runtime::Handle>,
@@ -9797,55 +9652,6 @@ mod tests {
     }
 
     #[test]
-    fn daemon_paths_have_settled_solo_cluster_tracks_remote_members() {
-        let root = unique_cluster_test_root("sinomo-daemon-solo-cluster-detect");
-        let data_root = root.join("data");
-        let data_dir = SinomoDataDir::new(&data_root);
-        data_dir.ensure_root_layout().expect("data dir");
-        let cluster_paths = ClusterPaths::new(&data_dir);
-        cluster_paths.ensure().expect("cluster paths");
-        let daemon_paths = DaemonPaths::with_root(data_root.join("daemon"));
-
-        assert!(
-            !daemon_paths_have_settled_solo_cluster(&daemon_paths).expect("absent cluster"),
-            "absent cluster state is not a settled solo cluster"
-        );
-
-        let now = OffsetDateTime::now_utc();
-        let cluster_id = ClusterId::from_legacy_named("cluster_solo_detect").expect("cluster");
-        let local = NodeId::from_legacy_named("node_solo_detect_main").expect("node");
-        let mut state = ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "solo detect",
-            local,
-            "local",
-            "pk-local",
-            now,
-        );
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
-            .expect("write solo state");
-        assert!(
-            daemon_paths_have_settled_solo_cluster(&daemon_paths).expect("solo cluster"),
-            "local-only cluster state should be recognized as settled solo"
-        );
-
-        let remote = NodeId::from_legacy_named("node_solo_detect_remote").expect("remote");
-        state.members.push(ClusterMemberRecord::local_voter(
-            cluster_id,
-            remote,
-            "remote",
-            "pk-remote",
-            now,
-        ));
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
-            .expect("write remote state");
-        assert!(
-            !daemon_paths_have_settled_solo_cluster(&daemon_paths).expect("remote cluster"),
-            "remote members should disable solo idle suppression"
-        );
-    }
-
-    #[test]
     fn cluster_network_maintenance_skips_discovery_tick_without_socket() {
         let root = unique_cluster_test_root("sinomo-daemon-discovery-none-idle");
         let data_root = root.join("data");
@@ -12000,7 +11806,7 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_cluster_kv_txn_can_recover_local_leadership() {
+    fn forwarded_cluster_kv_txn_never_starts_local_election() {
         let root = unique_cluster_test_root("sinomo-daemon-forwarded-kv-local-election");
         let data_dir = SinomoDataDir::new(root.join("data"));
         data_dir.ensure_root_layout().expect("data dir");
@@ -12033,7 +11839,7 @@ mod tests {
         );
 
         let key = "/test/forwarded-local-election".to_string();
-        let (snapshot, response) = commit_cluster_kv_txn_with_quorum_response_with_forwarding(
+        let error = commit_cluster_kv_txn_with_quorum_response_with_forwarding(
             &paths,
             &mut state,
             KvTxn {
@@ -12047,15 +11853,22 @@ mod tests {
             },
             false,
         )
-        .expect("forwarded non-leader voter should recover local leadership");
-        assert_eq!(
-            snapshot.get(&key).expect("committed key").value,
-            b"committed".to_vec()
+        .expect_err("forwarded non-leader voter must not campaign");
+        assert!(matches!(
+            error,
+            DaemonError::ClusterReadOnly { detail }
+                if detail.contains("forwarded cluster KV transaction reached a non-leader voter")
+        ));
+        assert!(
+            sinomo_core::cluster::read_cluster_kv_snapshot(&paths)
+                .expect("read cluster snapshot")
+                .get(&key)
+                .is_none(),
+            "forwarded request must not commit locally"
         );
-        assert_eq!(response.expect("txn response").revision, snapshot.revision);
         assert_eq!(
             daemon_cluster_kv_state_authority_id(&paths, &state).expect("known state authority"),
-            Some(local)
+            None
         );
     }
 
@@ -12158,69 +11971,6 @@ mod tests {
                 .all(|member| member.node_id != remote_node),
             "the without-kv helper must not merge cached kv members"
         );
-    }
-
-    #[test]
-    fn shadow_network_module_repair_route_refreshes_local_state() {
-        let root = unique_cluster_test_root("sinomo-daemon-shadow-module-repair-route");
-        let data_dir = SinomoDataDir::new(&root);
-        let cluster_paths = ClusterPaths::new(&data_dir);
-        cluster_paths.ensure().expect("cluster paths");
-        let shadow_paths = DaemonPaths::for_shadow(&data_dir);
-        shadow_paths.ensure().expect("shadow paths");
-        let now = OffsetDateTime::now_utc();
-        let mut state = ClusterBootstrapState::initialized_locally(
-            ClusterId::from_legacy_named("cluster_shadow_module_repair_route").expect("cluster"),
-            "shadow module repair route".to_string(),
-            NodeId::from_legacy_named("node_shadow_module_repair_route").expect("node"),
-            "shadow module repair route".to_string(),
-            "main-public-key".to_string(),
-            now,
-        );
-        let main_options = DaemonRunOptions {
-            host: "0.0.0.0".to_string(),
-            port: 21_353,
-        };
-        let shadow_options = DaemonRunOptions {
-            host: "0.0.0.0".to_string(),
-            port: 21_354,
-        };
-        ensure_daemon_cluster_members(&mut state, &main_options, &shadow_options, now);
-        let shadow_cluster = daemon_cluster_status(&state, crate::DaemonClusterProcess::Shadow)
-            .expect("shadow cluster status");
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
-            .expect("write local state");
-        write_daemon_status(
-            &shadow_paths,
-            &crate::DaemonStatus::new(&shadow_options, &shadow_paths, Some(shadow_cluster)),
-        )
-        .expect("write shadow status");
-        let module_endpoint = test_network_module_relay_endpoint(
-            &shadow_daemon_node_id(&state.local_node_id),
-            "module_public_key_shadow_repair_route",
-        );
-
-        assert!(
-            advertise_daemon_network_module_endpoints_with_runtime(
-                &shadow_paths,
-                vec![module_endpoint],
-                None,
-            )
-            .expect("refresh repair route"),
-            "shadow repair route should be refreshed from the local network module endpoint"
-        );
-        let updated = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
-            .expect("read state");
-        let main_member = updated
-            .members
-            .iter()
-            .find(|member| member.node_id == state.local_node_id)
-            .expect("main member");
-        assert!(main_member.endpoints.iter().any(|endpoint| {
-            endpoint.transport == ClusterTransportKind::Iroh
-                && endpoint.address
-                    == "iroh://module_public_key_shadow_repair_route?relay=https://relay.example./"
-        }));
     }
 
     #[test]

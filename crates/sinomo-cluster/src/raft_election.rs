@@ -444,18 +444,35 @@ fn cluster_raft_leader_outcome_after_campaign_wait(
     waited_for_campaign_lock: bool,
     observation_before_wait: &ClusterRaftLeaderObservation,
     observation_after_wait: &ClusterRaftLeaderObservation,
+    remote_leader_blocks_campaign: bool,
 ) -> Option<bool> {
     if observation_after_wait.leader_id.as_ref() == Some(local_node_id) {
         Some(true)
-    } else if waited_for_campaign_lock || observation_after_wait != observation_before_wait {
+    } else if waited_for_campaign_lock
+        || observation_after_wait != observation_before_wait
+        || remote_leader_blocks_campaign
+    {
         // A caller that actually queued must accept the completed campaign's
         // outcome, including a failed election. Immediately starting another
         // campaign here recreates a term storm when quorum is temporarily
-        // unavailable. A later, fresh request can make the next attempt.
+        // unavailable. A durable remote leader also remains authoritative until
+        // local liveness evidence explicitly marks it offline or unreachable;
+        // one application forwarding failure is not an election timeout.
         Some(false)
     } else {
         None
     }
+}
+
+fn observed_remote_leader_blocks_campaign(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    observation: &ClusterRaftLeaderObservation,
+) -> bool {
+    observation.leader_id.as_ref().is_some_and(|leader_id| {
+        leader_id != &state.local_node_id
+            && !sinomo_network::cluster_node_blocks_leader_preference(paths, state, leader_id)
+    })
 }
 
 pub fn elect_cluster_raft_leader_with_host(
@@ -469,16 +486,20 @@ pub fn elect_cluster_raft_leader_with_host(
     // the durable leader while holding the same outer sequence lock used by
     // append -> replicate -> commit so a queued campaign cannot immediately
     // invalidate a leader that appeared while it waited. An unchanged remote
-    // leader is not considered usable here: the caller already failed to
-    // forward to it, so suppressing this campaign would prevent failover.
+    // leader remains authoritative unless local status/connectivity evidence
+    // explicitly marks it offline or unreachable. A forwarding failure alone
+    // is not enough evidence to preempt an otherwise live leader.
     let observation_before_wait = locked_cluster_raft_leader_observation(paths, state)?;
     let (_campaign_lock, waited_for_campaign_lock) = lock_cluster_raft_campaign(paths)?;
     let observation_after_wait = locked_cluster_raft_leader_observation(paths, state)?;
+    let remote_leader_blocks_campaign =
+        observed_remote_leader_blocks_campaign(paths, state, &observation_after_wait);
     if let Some(existing_outcome) = cluster_raft_leader_outcome_after_campaign_wait(
         &state.local_node_id,
         waited_for_campaign_lock,
         &observation_before_wait,
         &observation_after_wait,
+        remote_leader_blocks_campaign,
     ) {
         return Ok(existing_outcome);
     }
@@ -534,11 +555,17 @@ pub(crate) async fn elect_cluster_raft_leader_async_with_host(
                 lock_cluster_raft_campaign(&paths_for_lock)?;
             let observation_after_wait =
                 locked_cluster_raft_leader_observation(&paths_for_lock, &state_for_lock)?;
+            let remote_leader_blocks_campaign = observed_remote_leader_blocks_campaign(
+                &paths_for_lock,
+                &state_for_lock,
+                &observation_after_wait,
+            );
             let existing_outcome = cluster_raft_leader_outcome_after_campaign_wait(
                 &state_for_lock.local_node_id,
                 waited_for_campaign_lock,
                 &observation_before_wait,
                 &observation_after_wait,
+                remote_leader_blocks_campaign,
             );
             Ok::<_, NetworkError>((campaign_lock, existing_outcome))
         })
@@ -608,7 +635,13 @@ mod tests {
         let before = observation(Some(remote_node_id.clone()), 7);
 
         assert_eq!(
-            cluster_raft_leader_outcome_after_campaign_wait(&local_node_id, true, &before, &before,),
+            cluster_raft_leader_outcome_after_campaign_wait(
+                &local_node_id,
+                true,
+                &before,
+                &before,
+                false,
+            ),
             Some(false)
         );
         assert_eq!(
@@ -617,9 +650,21 @@ mod tests {
                 false,
                 &before,
                 &before,
+                false,
             ),
             None,
-            "the first caller must still be able to replace an unchanged stale leader"
+            "an explicitly blocked stale leader must remain replaceable"
+        );
+        assert_eq!(
+            cluster_raft_leader_outcome_after_campaign_wait(
+                &local_node_id,
+                false,
+                &before,
+                &before,
+                true,
+            ),
+            Some(false),
+            "a remote leader without explicit offline evidence must suppress the campaign"
         );
         assert_eq!(
             cluster_raft_leader_outcome_after_campaign_wait(
@@ -627,6 +672,7 @@ mod tests {
                 false,
                 &before,
                 &observation(Some(remote_node_id), 8),
+                false,
             ),
             Some(false),
             "a new term observed while acquiring the lock suppresses a stale campaign"
@@ -637,6 +683,7 @@ mod tests {
                 true,
                 &before,
                 &observation(Some(local_node_id.clone()), 8),
+                false,
             ),
             Some(true)
         );
