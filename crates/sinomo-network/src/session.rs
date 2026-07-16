@@ -46,6 +46,9 @@ static BODY_READER_DIRECT_WAIT_SPILL_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BODY_READER_DIRECT_WAIT_CLOSED_TOTAL: AtomicU64 = AtomicU64::new(0);
 const OBJECT_RPC_SESSION_PROTOCOL: &str = "sinomo.object-rpc-session.v1";
 const OBJECT_RPC_SESSION_METADATA_KEY: &str = "sinomo.rpc-session";
+pub(crate) const OBJECT_RPC_BUFFERED_REQUEST_BODY_METADATA_KEY: &str =
+    "sinomo.rpc-session.buffered-request-body";
+pub(crate) const OBJECT_RPC_BUFFERED_REQUEST_BODY_METADATA_VALUE: &str = "v1";
 const OBJECT_RPC_RESPONSE_HEAD_PROOF_METADATA_KEY: &str = "sinomo.rpc-response-head-proof";
 const OBJECT_RPC_BUFFERED_RESPONSE_BODY_METADATA_KEY: &str =
     "sinomo.rpc-session.buffered-response-body";
@@ -1797,10 +1800,9 @@ where
         policy,
         keepalive_task: Some(keepalive_task),
     };
-    Ok((
-        ObjectRpcSessionRequest::new(request, incoming_body),
-        responder,
-    ))
+    let mut request = ObjectRpcSessionRequest::new(request, incoming_body);
+    request.restore_buffered_request_body().await?;
+    Ok((request, responder))
 }
 
 #[derive(Clone, Debug)]
@@ -3071,6 +3073,47 @@ impl ObjectRpcSessionRequest {
         Self::new(request, ObjectRpcIncomingBody::empty())
     }
 
+    pub(crate) fn has_transferred_buffered_request_body(&self) -> Result<bool, NetworkError> {
+        let Some(version) = self
+            .request
+            .metadata
+            .get(OBJECT_RPC_BUFFERED_REQUEST_BODY_METADATA_KEY)
+        else {
+            return Ok(false);
+        };
+        if version != OBJECT_RPC_BUFFERED_REQUEST_BODY_METADATA_VALUE
+            || !self.request.body.is_empty()
+            || self.body.is_empty()
+        {
+            return Err(NetworkError::Serialization {
+                detail: "invalid buffered object RPC request transfer marker".to_string(),
+            });
+        }
+        Ok(true)
+    }
+
+    /// Restores a unary request body that the session client moved into the
+    /// authenticated byte-stream lane so payload size never affects the
+    /// control-head framing path.
+    ///
+    /// Callers must invoke this only after authenticating the signed request
+    /// head. The incoming body verifies its signed finish proof before EOF is
+    /// returned, so successful collection preserves the original unary body
+    /// semantics without weakening origin authentication.
+    pub async fn restore_buffered_request_body(&mut self) -> Result<(), NetworkError> {
+        if !self.has_transferred_buffered_request_body()? {
+            return Ok(());
+        }
+        let body = std::mem::replace(&mut self.body, ObjectRpcIncomingBody::empty());
+        self.request.body = body
+            .collect_to_vec(crate::OBJECT_RPC_UNARY_ADAPTER_MAX_BODY_BYTES)
+            .await?;
+        self.request
+            .metadata
+            .remove(OBJECT_RPC_BUFFERED_REQUEST_BODY_METADATA_KEY);
+        Ok(())
+    }
+
     /// Rebinds a received relay body to an already-signed inner request without
     /// consuming or copying it. The signed descriptor must agree with body
     /// presence, route, operation, declared length, and digest. Length/digest
@@ -3469,6 +3512,15 @@ mod body_tests {
         Ok(())
     }
 
+    fn receiver_bridge_call(mut request: crate::ObjectRpcRequest) -> ObjectRpcSessionCall {
+        let payload = std::mem::take(&mut request.body);
+        request.metadata.insert(
+            OBJECT_RPC_BUFFERED_REQUEST_BODY_METADATA_KEY.to_string(),
+            OBJECT_RPC_BUFFERED_REQUEST_BODY_METADATA_VALUE.to_string(),
+        );
+        ObjectRpcSessionCall::new(request, ObjectRpcBodySource::bytes(payload))
+    }
+
     #[tokio::test]
     async fn empty_sources_and_bodies_are_defaults() {
         assert!(ObjectRpcBodySource::default().is_empty());
@@ -3852,6 +3904,68 @@ mod body_tests {
     }
 
     #[tokio::test]
+    async fn relayed_buffered_request_restores_the_origin_payload_after_binding() {
+        let origin_root =
+            sinomo_testdir::TestDir::new("sinomo-session-relayed-buffered-request-origin");
+        let origin_data_dir = SinomoDataDir::new(origin_root.path());
+        let payload = vec![0x43_u8; 344_208];
+        let inner = crate::ObjectRpcRequest::from_encoded_body(
+            "/test/session/relayed-buffered-request",
+            "test",
+            payload.clone(),
+        );
+        let prepared = receiver_bridge_call(inner)
+            .prepare_for_signing()
+            .expect("prepare buffered origin request");
+        let binding = request_body_finish_binding(&prepared.request, &prepared.descriptor)
+            .expect("origin body binding");
+        let digest = TransferDigest::blake3(&payload);
+        let proof = SessionFrameSigner::from_data_dir(&origin_data_dir)
+            .expect("origin proof signer")
+            .sign_body_finish(BodyFinishProofInput {
+                binding,
+                total_bytes: payload.len() as u64,
+                digest,
+            });
+        let mut signed_inner = prepared.request;
+        signed_inner.auth = Some(
+            sign_daemon_rpc_request_from_data_dir(&origin_data_dir, &signed_inner)
+                .expect("sign buffered origin request"),
+        );
+        let outer = crate::ObjectRpcRequest::from_encoded_body(
+            crate::CLUSTER_RELAY_ROUTE,
+            "test",
+            Vec::new(),
+        );
+        let (sender, body) = ObjectRpcIncomingBody::channel(Some(payload.len() as u64));
+        let mut bound = ObjectRpcSessionRequest::new(outer, body)
+            .bind_signed_inner_request(signed_inner)
+            .expect("bind buffered origin request");
+        assert!(matches!(
+            sender.try_deliver(payload.clone()),
+            IncomingDirectDelivery::Delivered
+        ));
+        sender
+            .complete(payload.len() as u64, digest, false, Some(proof))
+            .expect("complete origin-authenticated body");
+        drop(sender);
+
+        bound
+            .restore_buffered_request_body()
+            .await
+            .expect("restore relayed buffered request");
+
+        assert_eq!(bound.request.body, payload);
+        assert!(bound.body.is_empty());
+        assert!(
+            !bound
+                .request
+                .metadata
+                .contains_key(OBJECT_RPC_BUFFERED_REQUEST_BODY_METADATA_KEY)
+        );
+    }
+
+    #[tokio::test]
     async fn relay_finish_proof_rejects_same_length_body_substitution() {
         let origin_root = sinomo_testdir::TestDir::new("sinomo-session-relay-proof-origin");
         let origin_data_dir = SinomoDataDir::new(origin_root.path());
@@ -4193,6 +4307,100 @@ mod body_tests {
             .expect("server task");
         assert_eq!(request_body, expected_request);
         assert_eq!(response_body, expected_response);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn large_buffered_request_uses_transfer_body_and_restores_payload() {
+        let client_root = sinomo_testdir::TestDir::new("sinomo-session-buffered-request-client");
+        let server_root = sinomo_testdir::TestDir::new("sinomo-session-buffered-request-server");
+        let client_data_dir = SinomoDataDir::new(client_root.path());
+        let server_data_dir = SinomoDataDir::new(server_root.path());
+        let server_public_key = proof_public_key(&server_data_dir);
+        let request_bytes = vec![0x51_u8; 237_451];
+        let expected_request = request_bytes.clone();
+        let request = crate::ObjectRpcRequest::from_encoded_body(
+            "/test/session/large-buffered-request",
+            "test",
+            request_bytes,
+        );
+        let prepared = receiver_bridge_call(request)
+            .prepare_for_signing()
+            .expect("prepare session call");
+        assert!(prepared.request.body.is_empty());
+        assert_eq!(prepared.body.total_bytes(), Some(237_451));
+        let request_auth =
+            sign_daemon_rpc_request_from_data_dir(&client_data_dir, &prepared.request)
+                .expect("request auth");
+        let (client_stream, server_stream) = tokio::io::duplex(128 * 1024);
+        let server = tokio::spawn(async move {
+            let (request, responder) = accept_object_rpc_server_session(
+                Box::new(server_stream),
+                server_data_dir,
+                NetworkCallPolicy::default(),
+                authenticate_test_request,
+            )
+            .await
+            .expect("accept session");
+            assert_eq!(request.request.body, expected_request);
+            assert!(request.body.is_empty());
+            assert!(
+                !request
+                    .request
+                    .metadata
+                    .contains_key(OBJECT_RPC_BUFFERED_REQUEST_BODY_METADATA_KEY)
+            );
+            responder
+                .respond(ObjectRpcSessionResponse::buffered(
+                    crate::ObjectRpcResponse::encode_body(
+                        "/test/session/large-buffered-request",
+                        &"ok",
+                    )
+                    .expect("response"),
+                ))
+                .await
+                .expect("send response");
+        });
+        let result = start_object_rpc_client_session(
+            Box::new(client_stream),
+            prepared,
+            request_auth,
+            client_data_dir,
+            server_public_key.clone(),
+            server_public_key,
+            NetworkCallPolicy::default(),
+        )
+        .await
+        .expect("send transferred buffered request");
+
+        assert_eq!(
+            result
+                .response
+                .decode_body::<String>()
+                .expect("decode response"),
+            "ok"
+        );
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn buffered_request_marker_requires_an_attached_transfer_body() {
+        let mut request = crate::ObjectRpcRequest::from_encoded_body(
+            "/test/session/invalid-buffered-request-marker",
+            "test",
+            Vec::new(),
+        );
+        request.metadata.insert(
+            OBJECT_RPC_BUFFERED_REQUEST_BODY_METADATA_KEY.to_string(),
+            OBJECT_RPC_BUFFERED_REQUEST_BODY_METADATA_VALUE.to_string(),
+        );
+        let mut request = ObjectRpcSessionRequest::buffered(request);
+
+        let error = request
+            .restore_buffered_request_body()
+            .await
+            .expect_err("marker without transfer body must fail");
+
+        assert!(matches!(error, NetworkError::Serialization { .. }));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

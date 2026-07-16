@@ -764,13 +764,14 @@ impl ObjectRouteEntry {
         }
     }
 
-    fn call(&self, request: ObjectRpcSessionRequest) -> ObjectRpcSessionFuture {
+    fn call(&self, mut request: ObjectRpcSessionRequest) -> ObjectRpcSessionFuture {
         let route = request.request.route.clone();
         let expected_category = self.category.clone();
         let request_body_mode = self.request_body_mode;
         let response_body_mode = self.response_body_mode;
         let handler = Arc::clone(&self.handler);
         Box::pin(async move {
+            request.restore_buffered_request_body().await?;
             if request.request.category != expected_category {
                 return Err(NetworkError::Serialization {
                     detail: format!(
@@ -1660,15 +1661,19 @@ where
                 })
             });
         }
+        let request_body_is_empty = match request.has_transferred_buffered_request_body() {
+            Ok(true) => true,
+            Ok(false) => request.body.is_empty(),
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
         if let Err(error) = validate_object_rpc_body_mode(
             &route,
             "request",
             entry.request_body_mode,
-            request.body.is_empty(),
+            request_body_is_empty,
         ) {
             return Box::pin(async move { Err(error) });
         }
-
         let mut inner = self.take_poll_ready_inner_for_call();
         Box::pin(async move {
             let timeout_route = route.clone();
@@ -2071,6 +2076,53 @@ mod tests {
                 .expect("response body"),
             b"body"
         );
+    }
+
+    #[tokio::test]
+    async fn route_policy_restores_transferred_unary_payload_before_body_mode_validation() {
+        let payload = vec![0x43_u8; 344_208];
+        let expected_payload = payload.clone();
+        let descriptor = ObjectRouteDescriptor::new(
+            "/test/transferred-unary-payload",
+            "test",
+            "transferred unary payload",
+            "Request",
+            "Response",
+        );
+        let registry = ObjectRpcRouteRegistry::builder()
+            .register_session_route(descriptor, move |request| {
+                let expected_payload = expected_payload.clone();
+                async move {
+                    assert_eq!(request.request.body, expected_payload);
+                    assert!(request.body.is_empty());
+                    Ok(ObjectRpcSessionResponse::buffered(
+                        ObjectRpcResponse::from_encoded_body(request.request.route, b"ok".to_vec()),
+                    ))
+                }
+            })
+            .build();
+        let router = ObjectRpcRouter::from_route_registry(registry).expect("router");
+        let mut service = ObjectRpcRoutePolicyLayer::new(router.catalog())
+            .expect("policy")
+            .layer(router);
+        let mut request = ObjectRpcRequest::from_encoded_body(
+            "/test/transferred-unary-payload",
+            "test",
+            Vec::new(),
+        );
+        request.metadata.insert(
+            crate::session::OBJECT_RPC_BUFFERED_REQUEST_BODY_METADATA_KEY.to_string(),
+            crate::session::OBJECT_RPC_BUFFERED_REQUEST_BODY_METADATA_VALUE.to_string(),
+        );
+
+        let response = call_object_rpc_session_service_async(
+            &mut service,
+            ObjectRpcSessionRequest::new(request, crate::ObjectRpcIncomingBody::bytes(payload)),
+        )
+        .await
+        .expect("transferred unary payload passes default body policy");
+
+        assert_eq!(response.response.body, b"ok");
     }
 
     #[tokio::test]

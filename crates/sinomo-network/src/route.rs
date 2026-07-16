@@ -5895,12 +5895,16 @@ mod tests {
             let next = self.signed_routes.len() + 1;
             self.signed_routes.push(request.route.clone());
             self.signed_requests.push(request.clone());
-            let auth = format!("test-auth-{next}").into_bytes();
+            let request = request.clone();
+            let signing_data_dir = self.session_server_data_dir.clone();
             Box::pin(async move {
                 if let Some(stall) = stall {
                     tokio::time::sleep(stall).await;
                 }
-                Ok(auth)
+                if let Some(data_dir) = signing_data_dir {
+                    return crate::sign_daemon_rpc_request_from_data_dir(&data_dir, &request);
+                }
+                Ok(format!("test-auth-{next}").into_bytes())
             })
         }
 
