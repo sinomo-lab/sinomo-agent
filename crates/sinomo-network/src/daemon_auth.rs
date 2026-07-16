@@ -473,7 +473,10 @@ pub fn sign_daemon_rpc_request_digest_from_data_dir(
 pub fn daemon_rpc_body_sha256(request: &ObjectRpcRequest) -> Vec<u8> {
     let mut digest = digest::Context::new(&digest::SHA256);
     digest.update(DAEMON_RPC_REQUEST_DIGEST_DOMAIN);
-    daemon_rpc_digest_update_bytes(&mut digest, &request.body);
+    daemon_rpc_digest_update_bytes(
+        &mut digest,
+        crate::session::daemon_auth_request_head_body(request),
+    );
     daemon_rpc_digest_update_len(&mut digest, request.metadata.len());
     for (key, value) in &request.metadata {
         daemon_rpc_digest_update_bytes(&mut digest, key.as_bytes());

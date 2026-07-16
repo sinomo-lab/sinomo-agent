@@ -387,10 +387,10 @@ For network transmission, implementations should expose scatter/gather output wh
 
 Canonical SOBJ documents retain their up-front document and container lengths.
 An unknown-length or resumable network producer is therefore represented as a
-small SOBJ RPC head plus a network-managed body attachment, not as an
-indefinite-length SOBJ value. The canonical transfer layer must incrementally
-authenticate and hash that attachment and bind its final length and digest to
-the RPC before exposing a committed result.
+typed SOBJ descriptor value plus a network-managed semantic attachment, not as
+an indefinite-length SOBJ value. The canonical transfer layer must
+incrementally authenticate and hash that attachment and bind its final length
+and digest to the RPC before exposing a committed result.
 Known-length contiguous values may still use the scatter/gather document path
 above when doing so avoids a payload copy.
 

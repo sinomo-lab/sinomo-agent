@@ -3225,6 +3225,26 @@ fn session_descriptor_from_request(
     ObjectRpcSessionDescriptor::decode_metadata(encoded)
 }
 
+/// Returns the request-head bytes covered by daemon authentication.
+///
+/// Ordinary RPC values are moved out of the signed head and carried by the
+/// canonical transfer. The signed descriptor binds that transfer's length and
+/// digest, while the server restores the value into `request.body` before
+/// dispatch. Authentication therefore hashes an empty head body in both
+/// states. Attachment calls retain their typed head body unchanged.
+pub(crate) fn daemon_auth_request_head_body(request: &crate::ObjectRpcRequest) -> &[u8] {
+    let Ok(descriptor) = session_descriptor_from_request(request) else {
+        return &request.body;
+    };
+    if descriptor.request_body_role == ObjectRpcSessionBodyRole::Value
+        && descriptor.request_body.is_some()
+    {
+        &[]
+    } else {
+        &request.body
+    }
+}
+
 /// Server-side authenticated request head and received body.
 #[derive(Debug)]
 pub struct ObjectRpcSessionRequest {
@@ -3985,6 +4005,30 @@ mod body_tests {
         );
         assert!(
             authenticate_test_request(&tampered, &envelope.node_id, &envelope.public_key).is_err()
+        );
+    }
+
+    #[test]
+    fn daemon_auth_digest_is_stable_after_value_materialization() {
+        let request = crate::ObjectRpcRequest::encode_body(
+            "/test/session/materialized-auth-value",
+            "test",
+            &"ordinary value",
+        )
+        .expect("request");
+        let value = request.body.clone();
+        let prepared = ObjectRpcSessionCall::value(request)
+            .prepare_for_signing()
+            .expect("prepare value call");
+        assert!(prepared.request.body.is_empty());
+
+        let signed_head_digest = daemon_rpc_body_sha256(&prepared.request);
+        let mut materialized = prepared.request;
+        materialized.body = value;
+        assert_eq!(
+            daemon_rpc_body_sha256(&materialized),
+            signed_head_digest,
+            "daemon authentication must continue to verify after the canonical session restores the ordinary value"
         );
     }
 

@@ -118,6 +118,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(bytes)
     }
 
+    #[cfg(test)]
     pub(crate) fn open_content_hash_range_stream(
         &self,
         object_id: &DfsObjectId,
@@ -167,34 +168,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         Ok(ObjectVersionReader::from_blob_range(reader))
-    }
-
-    pub(crate) fn read_patch_blob_range(
-        &self,
-        patch_hash: &str,
-        offset: u64,
-        len: u64,
-    ) -> Result<Vec<u8>, DfsError> {
-        let len = usize::try_from(len).map_err(|_| DfsError::Distributed {
-            message: format!("DFS patch range is too large to fit in memory: {len} bytes"),
-        })?;
-        let mut reader = self
-            .content
-            .open_blob_range_stream(patch_hash, offset, len)
-            .map_err(|source| DfsError::ContentStore {
-                message: format!(
-                    "failed to open DFS patch blob {patch_hash} at {offset}+{len}: {source}"
-                ),
-            })?;
-        let mut bytes = vec![0_u8; len];
-        reader
-            .read_exact(&mut bytes)
-            .map_err(|source| DfsError::ContentStore {
-                message: format!(
-                    "failed to read DFS patch blob {patch_hash} at {offset}+{len}: {source}"
-                ),
-            })?;
-        Ok(bytes)
     }
 
     pub(crate) fn open_patch_blob_stream(

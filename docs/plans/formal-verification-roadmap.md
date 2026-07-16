@@ -353,8 +353,9 @@ snapshot mutation APIs remain author-fenced.
 3. **Chunked patch semantics.** Prove that patch commit validates base version,
    base content, offset, and final content hash.
 4. **Range-read body integrity.** Model source retry, stale-source rejection,
-   and streamed-body verification. Prove that completed reads match current
-   metadata and that mismatched responses cannot populate local state.
+   and canonical-session attachment verification. Prove that completed reads
+   match current metadata and that mismatched responses cannot populate local
+   state.
 5. **Replica placement.** Prove that duplicate candidates, owner normalization,
    and policy widening preserve the configured commit and desired replica
    counts.

@@ -756,8 +756,6 @@ where
 
 #[test]
 fn object_rpc_router_exposes_binary_routes_and_catalog_metadata() {
-    use tower_service::Service;
-
     let category = object_rpc_category!(
         "cluster.kv",
         "Cluster KV control routes",
@@ -1134,8 +1132,6 @@ fn object_rpc_router_swaps_prebuilt_route_snapshot_without_disrupting_in_flight_
 
 #[test]
 fn object_rpc_router_accepts_prebuilt_registry_snapshot() {
-    use tower_service::Service;
-
     let mut router = object_rpc_router_with_route(
         ObjectRouteDescriptor::for_types::<(), String>("/test/base", "test", "base route"),
         |request| async move { ObjectRpcResponse::encode_body(request.route, &"base".to_string()) },
@@ -1175,8 +1171,6 @@ fn object_rpc_router_accepts_prebuilt_registry_snapshot() {
 
 #[test]
 fn object_rpc_router_updates_route_registry_from_active_snapshot() {
-    use tower_service::Service;
-
     let base_descriptor =
         ObjectRouteDescriptor::for_types::<(), String>("/test/base", "test", "base route");
     let mut router = object_rpc_router_with_route(base_descriptor.clone(), |request| async move {
@@ -1228,8 +1222,6 @@ fn object_rpc_router_updates_route_registry_from_active_snapshot() {
 
 #[test]
 fn object_rpc_router_replaces_marked_route_set_atomically() {
-    use tower_service::Service;
-
     const GROUP_KEY: &str = "test.route.group";
 
     let base_descriptor =
@@ -1359,8 +1351,6 @@ fn object_rpc_service_helper_polls_ready_before_call() {
 
 #[test]
 fn object_rpc_router_constructs_from_prebuilt_registry_snapshot() {
-    use tower_service::Service;
-
     let registry = ObjectRpcRouteRegistry::builder()
         .register_route(
             ObjectRouteDescriptor::for_types::<(), String>(
@@ -1399,8 +1389,6 @@ fn object_rpc_router_constructs_from_prebuilt_registry_snapshot() {
 
 #[test]
 fn object_rpc_router_new_accepts_first_generated_registry_snapshot() {
-    use tower_service::Service;
-
     let mut router = ObjectRpcRouter::new();
     assert_eq!(router.route_registry_snapshot().version(), 0);
     let registry = ObjectRpcRouteRegistry::builder()
@@ -1436,8 +1424,6 @@ fn object_rpc_router_new_accepts_first_generated_registry_snapshot() {
 
 #[test]
 fn object_rpc_router_rejects_stale_prebuilt_registry_snapshot() {
-    use tower_service::Service;
-
     let mut router = object_rpc_router_with_route(
         ObjectRouteDescriptor::for_types::<(), String>("/test/base", "test", "base route"),
         |request| async move { ObjectRpcResponse::encode_body(request.route, &"base".to_string()) },
@@ -1510,7 +1496,6 @@ fn object_rpc_router_rejects_stale_prebuilt_registry_snapshot() {
 #[test]
 fn object_rpc_authorization_layer_enforces_descriptor_policy_before_handler() {
     use tower_layer::Layer;
-    use tower_service::Service;
 
     let handled = Arc::new(AtomicUsize::new(0));
     let descriptor =
@@ -1591,7 +1576,6 @@ fn object_rpc_authorization_layer_enforces_descriptor_policy_before_handler() {
 #[test]
 fn object_rpc_authorization_layer_preserves_route_readiness() {
     use tower_layer::Layer;
-    use tower_service::Service;
 
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
@@ -1924,8 +1908,6 @@ fn object_rpc_route_registry_builder_rejects_replacing_unknown_route() {
 
 #[test]
 fn object_rpc_router_rejects_category_mismatch() {
-    use tower_service::Service;
-
     let mut router = object_rpc_router_with_route(
         ObjectRouteDescriptor::for_types::<(), ()>(
             "/cluster/kv/category-check",
