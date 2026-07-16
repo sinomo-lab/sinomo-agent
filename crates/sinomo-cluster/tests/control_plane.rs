@@ -36,7 +36,6 @@ use sinomo_cluster::{
     commit_cluster_raft_command_with_quorum_driver, elect_cluster_raft_leader_with_host,
     ensure_main_daemon_cluster_member, expire_cluster_network_record_ops,
     expire_cluster_network_records,
-    forward_cluster_join_challenge_rpc_to_state_authority_async_with_host,
     forward_cluster_join_challenge_rpc_to_state_authority_with_host,
     forward_cluster_kv_txn_to_state_authority_with_host,
     forward_cluster_membership_rpc_to_state_authority_with_host,
@@ -136,7 +135,6 @@ use std::path::PathBuf;
 use time::OffsetDateTime;
 
 use sinomo_kv::ClusterKvRaftConfigRecord;
-use sinomo_network::ObjectRpcFuture;
 use sinomo_network::{
     ClusterAuthMaterial, ClusterAuthVerifier, IceCandidateRecord, IceCandidateType,
     LanConnectionPlanner, RoamingConnectionPlanner, RoamingPathSelection, WebRtcKvExchange,
@@ -338,14 +336,25 @@ impl NetworkModule for TestIrohNetworkModule {
         Ok(())
     }
 
-    fn dial_rpc(
+    fn open_rpc_stream(
         &self,
         _endpoint: &ClusterEndpointRecord,
-        request: &[u8],
-        _timeouts: DaemonRpcTimeouts,
-    ) -> NetworkFuture<Vec<u8>> {
-        let response = request.to_vec();
-        Box::pin(async move { Ok(response) })
+        _health: NetworkHealthPolicy,
+    ) -> NetworkFuture<Box<dyn NetworkDuplexStream>> {
+        Box::pin(async move {
+            let (client, mut server) = tokio::io::duplex(64 * 1024);
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; 8192];
+                loop {
+                    let read = tokio::io::AsyncReadExt::read(&mut server, &mut buffer).await?;
+                    if read == 0 {
+                        return Ok::<(), std::io::Error>(());
+                    }
+                    tokio::io::AsyncWriteExt::write_all(&mut server, &buffer[..read]).await?;
+                }
+            });
+            Ok(Box::new(client) as Box<dyn NetworkDuplexStream>)
+        })
     }
 
     fn local_endpoints(&self) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
@@ -683,6 +692,53 @@ fn object_rpc_router_from_registry(registry: Arc<ObjectRpcRouteRegistry>) -> Obj
     ObjectRpcRouter::from_route_registry(registry).expect("valid object rpc route registry")
 }
 
+fn value_route<F, Fut>(
+    handler: F,
+) -> impl Fn(ObjectRpcSessionRequest) -> ObjectRpcSessionFuture + Clone + Send + Sync + 'static
+where
+    F: Fn(ObjectRpcRequest) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<ObjectRpcResponse, NetworkError>> + Send + 'static,
+{
+    let handler = Arc::new(handler);
+    move |request| {
+        let handler = Arc::clone(&handler);
+        Box::pin(async move {
+            if !request.body.is_empty() {
+                return Err(NetworkError::Serialization {
+                    detail: format!(
+                        "test value route {} does not accept a request attachment",
+                        request.request.route
+                    ),
+                });
+            }
+            handler(request.request)
+                .await
+                .map(ObjectRpcSessionResponse::value)
+        })
+    }
+}
+
+async fn call_value_object_rpc_service_async<S>(
+    service: &mut S,
+    request: ObjectRpcRequest,
+) -> Result<ObjectRpcResponse, NetworkError>
+where
+    S: Service<ObjectRpcSessionRequest, Response = ObjectRpcSessionResponse, Error = NetworkError>,
+{
+    let route = request.route.clone();
+    let response =
+        call_object_rpc_session_service_async(service, ObjectRpcSessionRequest::value(request))
+            .await?;
+    if !response.body.is_empty() {
+        return Err(NetworkError::Serialization {
+            detail: format!(
+                "object rpc route {route} returned an attachment to a value-only test caller"
+            ),
+        });
+    }
+    Ok(response.response)
+}
+
 fn object_rpc_router_with_route<F, Fut>(
     descriptor: ObjectRouteDescriptor,
     handler: F,
@@ -693,7 +749,7 @@ where
 {
     object_rpc_router_from_registry(
         ObjectRpcRouteRegistry::builder()
-            .register_route(descriptor, handler)
+            .register_route(descriptor, value_route(handler))
             .build(),
     )
 }
@@ -721,10 +777,13 @@ fn object_rpc_router_exposes_binary_routes_and_catalog_metadata() {
     let mut router = object_rpc_router_from_registry(
         ObjectRpcRouteRegistry::builder()
             .register_category(category.category.clone())
-            .register_route(increment_route, |request| async move {
-                let value: u64 = request.decode_body()?;
-                ObjectRpcResponse::encode_body(request.route, &(value + 1))
-            })
+            .register_route(
+                increment_route,
+                value_route(|request| async move {
+                    let value: u64 = request.decode_body()?;
+                    ObjectRpcResponse::encode_body(request.route, &(value + 1))
+                }),
+            )
             .build(),
     );
 
@@ -760,7 +819,7 @@ fn object_rpc_router_exposes_binary_routes_and_catalog_metadata() {
 
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let response = runtime
-        .block_on(router.call(request))
+        .block_on(call_value_object_rpc_service_async(&mut router, request))
         .expect("route response");
     assert!(response.body.starts_with(sinomo_object::MAGIC));
     assert_eq!(response.decode_body::<u64>().expect("decode"), 42);
@@ -783,10 +842,10 @@ async fn object_rpc_route_policy_layer_enforces_shared_route_concurrency() {
         }
     }
 
-    impl Service<ObjectRpcRequest> for HoldingRoute {
-        type Response = ObjectRpcResponse;
+    impl Service<ObjectRpcSessionRequest> for HoldingRoute {
+        type Response = ObjectRpcSessionResponse;
         type Error = NetworkError;
-        type Future = ObjectRpcFuture;
+        type Future = ObjectRpcSessionFuture;
 
         fn poll_ready(
             &mut self,
@@ -795,14 +854,15 @@ async fn object_rpc_route_policy_layer_enforces_shared_route_concurrency() {
             std::task::Poll::Ready(Ok(()))
         }
 
-        fn call(&mut self, request: ObjectRpcRequest) -> Self::Future {
+        fn call(&mut self, request: ObjectRpcSessionRequest) -> Self::Future {
             let entered = Arc::clone(&self.entered);
             let release = Arc::clone(&self.release);
             Box::pin(async move {
-                let _: () = request.decode_body()?;
+                let _: () = request.request.decode_body()?;
                 entered.notify_one();
                 release.notified().await;
-                ObjectRpcResponse::encode_body(request.route, &"released".to_string())
+                ObjectRpcResponse::encode_body(request.request.route, &"released".to_string())
+                    .map(ObjectRpcSessionResponse::value)
             })
         }
     }
@@ -831,7 +891,7 @@ async fn object_rpc_route_policy_layer_enforces_shared_route_concurrency() {
 
     let mut in_flight_service = policy_service.clone();
     let in_flight = tokio::spawn(async move {
-        call_object_rpc_service_async(
+        call_value_object_rpc_service_async(
             &mut in_flight_service,
             ObjectRpcRequest::encode_body("/test/policy", "test.policy", &()).expect("request"),
         )
@@ -843,7 +903,7 @@ async fn object_rpc_route_policy_layer_enforces_shared_route_concurrency() {
         .object_rpc_route_readiness("/test/policy")
         .expect("saturated readiness");
     assert_eq!(saturated.available_concurrency, Some(0));
-    let second_error = call_object_rpc_service_async(
+    let second_error = call_value_object_rpc_service_async(
         &mut policy_service,
         ObjectRpcRequest::encode_body("/test/policy", "test.policy", &()).expect("request"),
     )
@@ -888,31 +948,37 @@ async fn object_rpc_route_policy_layer_does_not_head_of_line_block_other_routes(
     let layer = ObjectRpcRoutePolicyLayer::new(catalog).expect("policy layer");
     let router = object_rpc_router_from_registry(
         ObjectRpcRouteRegistry::builder()
-            .register_route(slow_descriptor, {
-                let slow_entered = Arc::clone(&slow_entered);
-                let slow_release = Arc::clone(&slow_release);
-                move |request| {
+            .register_route(
+                slow_descriptor,
+                value_route({
                     let slow_entered = Arc::clone(&slow_entered);
                     let slow_release = Arc::clone(&slow_release);
-                    async move {
-                        let _: () = request.decode_body()?;
-                        slow_entered.notify_one();
-                        slow_release.notified().await;
-                        ObjectRpcResponse::encode_body(request.route, &"slow-done".to_string())
+                    move |request| {
+                        let slow_entered = Arc::clone(&slow_entered);
+                        let slow_release = Arc::clone(&slow_release);
+                        async move {
+                            let _: () = request.decode_body()?;
+                            slow_entered.notify_one();
+                            slow_release.notified().await;
+                            ObjectRpcResponse::encode_body(request.route, &"slow-done".to_string())
+                        }
                     }
-                }
-            })
-            .register_route(fast_descriptor, |request| async move {
-                let _: () = request.decode_body()?;
-                ObjectRpcResponse::encode_body(request.route, &"fast-done".to_string())
-            })
+                }),
+            )
+            .register_route(
+                fast_descriptor,
+                value_route(|request| async move {
+                    let _: () = request.decode_body()?;
+                    ObjectRpcResponse::encode_body(request.route, &"fast-done".to_string())
+                }),
+            )
             .build(),
     );
     let mut policy_service = layer.layer(router);
 
     let mut slow_service = policy_service.clone();
     let slow = tokio::spawn(async move {
-        call_object_rpc_service_async(
+        call_value_object_rpc_service_async(
             &mut slow_service,
             ObjectRpcRequest::encode_body("/test/slow", "test", &()).expect("slow request"),
         )
@@ -929,7 +995,7 @@ async fn object_rpc_route_policy_layer_does_not_head_of_line_block_other_routes(
 
     let fast = tokio::time::timeout(
         Duration::from_millis(50),
-        call_object_rpc_service_async(
+        call_value_object_rpc_service_async(
             &mut policy_service,
             ObjectRpcRequest::encode_body("/test/fast", "test", &()).expect("fast request"),
         ),
@@ -971,7 +1037,7 @@ async fn object_rpc_route_policy_layer_enforces_route_timeout() {
 
     let request =
         ObjectRpcRequest::encode_body("/test/policy-timeout", "test", &()).expect("request");
-    let error = call_object_rpc_service_async(&mut service, request)
+    let error = call_value_object_rpc_service_async(&mut service, request)
         .await
         .expect_err("route should time out in policy layer");
     assert!(
@@ -1023,7 +1089,7 @@ fn object_rpc_router_swaps_prebuilt_route_snapshot_without_disrupting_in_flight_
             async move {
                 let request =
                     ObjectRpcRequest::encode_body("/test/snapshot", "test", &()).expect("request");
-                router.call(request).await
+                call_value_object_rpc_service_async(&mut router, request).await
             }
         });
         entered_rx.await.expect("old handler entered");
@@ -1031,9 +1097,12 @@ fn object_rpc_router_swaps_prebuilt_route_snapshot_without_disrupting_in_flight_
         let next_registry = router
             .route_registry_snapshot()
             .to_builder()
-            .replace_route(descriptor, |request| async move {
-                ObjectRpcResponse::encode_body(request.route, &"new".to_string())
-            })
+            .replace_route(
+                descriptor,
+                value_route(|request| async move {
+                    ObjectRpcResponse::encode_body(request.route, &"new".to_string())
+                }),
+            )
             .build();
         assert!(next_registry.version() > original_version);
         router
@@ -1043,7 +1112,9 @@ fn object_rpc_router_swaps_prebuilt_route_snapshot_without_disrupting_in_flight_
         let new_request =
             ObjectRpcRequest::encode_body("/test/snapshot", "test", &()).expect("new request");
         let mut new_router = router.clone();
-        let new_response = new_router.call(new_request).await.expect("new response");
+        let new_response = call_value_object_rpc_service_async(&mut new_router, new_request)
+            .await
+            .expect("new response");
         assert_eq!(
             new_response.decode_body::<String>().expect("decode new"),
             "new"
@@ -1075,9 +1146,9 @@ fn object_rpc_router_accepts_prebuilt_registry_snapshot() {
         .to_builder()
         .register_route(
             ObjectRouteDescriptor::for_types::<(), String>("/test/module", "test", "module route"),
-            |request| async move {
+            value_route(|request| async move {
                 ObjectRpcResponse::encode_body(request.route, &"module".to_string())
-            },
+            }),
         )
         .build();
     assert!(next_registry.version() > base_version);
@@ -1094,7 +1165,9 @@ fn object_rpc_router_accepts_prebuilt_registry_snapshot() {
     runtime.block_on(async {
         for (route, expected) in [("/test/base", "base"), ("/test/module", "module")] {
             let request = ObjectRpcRequest::encode_body(route, "test", &()).expect("request");
-            let response = router.call(request).await.expect("response");
+            let response = call_value_object_rpc_service_async(&mut router, request)
+                .await
+                .expect("response");
             assert_eq!(response.decode_body::<String>().expect("decode"), expected);
         }
     });
@@ -1114,18 +1187,21 @@ fn object_rpc_router_updates_route_registry_from_active_snapshot() {
     let installed = router
         .update_route_registry(|builder| {
             builder
-                .try_replace_route(base_descriptor, |request| async move {
-                    ObjectRpcResponse::encode_body(request.route, &"new".to_string())
-                })?
+                .try_replace_route(
+                    base_descriptor,
+                    value_route(|request| async move {
+                        ObjectRpcResponse::encode_body(request.route, &"new".to_string())
+                    }),
+                )?
                 .try_register_route(
                     ObjectRouteDescriptor::for_types::<(), String>(
                         "/test/module",
                         "test",
                         "module route",
                     ),
-                    |request| async move {
+                    value_route(|request| async move {
                         ObjectRpcResponse::encode_body(request.route, &"module".to_string())
-                    },
+                    }),
                 )
         })
         .expect("update route registry");
@@ -1142,7 +1218,9 @@ fn object_rpc_router_updates_route_registry_from_active_snapshot() {
     runtime.block_on(async {
         for (route, expected) in [("/test/base", "new"), ("/test/module", "module")] {
             let request = ObjectRpcRequest::encode_body(route, "test", &()).expect("request");
-            let response = router.call(request).await.expect("response");
+            let response = call_value_object_rpc_service_async(&mut router, request)
+                .await
+                .expect("response");
             assert_eq!(response.decode_body::<String>().expect("decode"), expected);
         }
     });
@@ -1161,31 +1239,36 @@ fn object_rpc_router_replaces_marked_route_set_atomically() {
             .observable(GROUP_KEY, "old");
     let router = object_rpc_router_from_registry(
         ObjectRpcRouteRegistry::builder()
-            .register_route(base_descriptor, |request| async move {
-                ObjectRpcResponse::encode_body(request.route, &"base".to_string())
-            })
-            .register_route(old_group_descriptor, |request| async move {
-                ObjectRpcResponse::encode_body(request.route, &"old".to_string())
-            })
+            .register_route(
+                base_descriptor,
+                value_route(|request| async move {
+                    ObjectRpcResponse::encode_body(request.route, &"base".to_string())
+                }),
+            )
+            .register_route(
+                old_group_descriptor,
+                value_route(|request| async move {
+                    ObjectRpcResponse::encode_body(request.route, &"old".to_string())
+                }),
+            )
             .build(),
     );
     let old_snapshot = router.route_registry_snapshot();
 
-    let installed =
-        router
-            .replace_route_set(
-                |descriptor| descriptor.observability.contains_key(GROUP_KEY),
-                [ObjectRouteDescriptor::for_types::<(), String>(
-                    "/test/group/new",
-                    "test",
-                    "new group",
-                )
-                .observable(GROUP_KEY, "new")],
-                |request| async move {
-                    ObjectRpcResponse::encode_body(request.route, &"new".to_string())
-                },
+    let installed = router
+        .replace_route_set(
+            |descriptor| descriptor.observability.contains_key(GROUP_KEY),
+            [ObjectRouteDescriptor::for_types::<(), String>(
+                "/test/group/new",
+                "test",
+                "new group",
             )
-            .expect("replace route set");
+            .observable(GROUP_KEY, "new")],
+            value_route(|request| async move {
+                ObjectRpcResponse::encode_body(request.route, &"new".to_string())
+            }),
+        )
+        .expect("replace route set");
 
     assert!(installed.version() > old_snapshot.version());
     assert!(
@@ -1208,14 +1291,15 @@ fn object_rpc_router_replaces_marked_route_set_atomically() {
         let mut active_router = router.clone();
         for (route, expected) in [("/test/base", "base"), ("/test/group/new", "new")] {
             let request = ObjectRpcRequest::encode_body(route, "test", &()).expect("request");
-            let response = active_router.call(request).await.expect("response");
+            let response = call_value_object_rpc_service_async(&mut active_router, request)
+                .await
+                .expect("response");
             assert_eq!(response.decode_body::<String>().expect("decode"), expected);
         }
         let missing =
             ObjectRpcRequest::encode_body("/test/group/old", "test", &()).expect("request");
         assert!(matches!(
-            active_router
-                .call(missing)
+            call_value_object_rpc_service_async(&mut active_router, missing)
                 .await
                 .expect_err("old group route should be removed"),
             NetworkError::UnknownRoute { .. }
@@ -1229,10 +1313,10 @@ fn object_rpc_service_helper_polls_ready_before_call() {
         ready_polled: Arc<AtomicBool>,
     }
 
-    impl Service<ObjectRpcRequest> for ReadyCheckedService {
-        type Response = ObjectRpcResponse;
+    impl Service<ObjectRpcSessionRequest> for ReadyCheckedService {
+        type Response = ObjectRpcSessionResponse;
         type Error = NetworkError;
-        type Future = ObjectRpcFuture;
+        type Future = ObjectRpcSessionFuture;
 
         fn poll_ready(
             &mut self,
@@ -1242,7 +1326,7 @@ fn object_rpc_service_helper_polls_ready_before_call() {
             std::task::Poll::Ready(Ok(()))
         }
 
-        fn call(&mut self, request: ObjectRpcRequest) -> Self::Future {
+        fn call(&mut self, request: ObjectRpcSessionRequest) -> Self::Future {
             let ready_polled = Arc::clone(&self.ready_polled);
             Box::pin(async move {
                 if !ready_polled.load(Ordering::SeqCst) {
@@ -1251,7 +1335,8 @@ fn object_rpc_service_helper_polls_ready_before_call() {
                         detail: "call ran before poll_ready".to_string(),
                     });
                 }
-                ObjectRpcResponse::encode_body(request.route, &"ready".to_string())
+                ObjectRpcResponse::encode_body(request.request.route, &"ready".to_string())
+                    .map(ObjectRpcSessionResponse::value)
             })
         }
     }
@@ -1265,7 +1350,7 @@ fn object_rpc_service_helper_polls_ready_before_call() {
             ready_polled: Arc::new(AtomicBool::new(false)),
         };
         let request = ObjectRpcRequest::encode_body("/test/ready", "test", &()).expect("request");
-        let response = call_object_rpc_service_async(&mut service, request)
+        let response = call_value_object_rpc_service_async(&mut service, request)
             .await
             .expect("response");
         assert_eq!(response.decode_body::<String>().expect("decode"), "ready");
@@ -1283,9 +1368,9 @@ fn object_rpc_router_constructs_from_prebuilt_registry_snapshot() {
                 "test",
                 "prebuilt route",
             ),
-            |request| async move {
+            value_route(|request| async move {
                 ObjectRpcResponse::encode_body(request.route, &"prebuilt".to_string())
-            },
+            }),
         )
         .build();
     let registry_version = registry.version();
@@ -1302,7 +1387,9 @@ fn object_rpc_router_constructs_from_prebuilt_registry_snapshot() {
     runtime.block_on(async {
         let request =
             ObjectRpcRequest::encode_body("/test/prebuilt", "test", &()).expect("prebuilt request");
-        let response = router.call(request).await.expect("prebuilt response");
+        let response = call_value_object_rpc_service_async(&mut router, request)
+            .await
+            .expect("prebuilt response");
         assert_eq!(
             response.decode_body::<String>().expect("decode"),
             "prebuilt"
@@ -1316,19 +1403,18 @@ fn object_rpc_router_new_accepts_first_generated_registry_snapshot() {
 
     let mut router = ObjectRpcRouter::new();
     assert_eq!(router.route_registry_snapshot().version(), 0);
-    let registry =
-        ObjectRpcRouteRegistry::builder()
-            .register_route(
-                ObjectRouteDescriptor::for_types::<(), String>(
-                    "/test/first-generated",
-                    "test",
-                    "first generated route",
-                ),
-                |request| async move {
-                    ObjectRpcResponse::encode_body(request.route, &"first".to_string())
-                },
-            )
-            .build();
+    let registry = ObjectRpcRouteRegistry::builder()
+        .register_route(
+            ObjectRouteDescriptor::for_types::<(), String>(
+                "/test/first-generated",
+                "test",
+                "first generated route",
+            ),
+            value_route(|request| async move {
+                ObjectRpcResponse::encode_body(request.route, &"first".to_string())
+            }),
+        )
+        .build();
     assert_eq!(registry.version(), 1);
     router
         .replace_route_registry(registry)
@@ -1341,7 +1427,9 @@ fn object_rpc_router_new_accepts_first_generated_registry_snapshot() {
     runtime.block_on(async {
         let request = ObjectRpcRequest::encode_body("/test/first-generated", "test", &())
             .expect("first generated request");
-        let response = router.call(request).await.expect("first response");
+        let response = call_value_object_rpc_service_async(&mut router, request)
+            .await
+            .expect("first response");
         assert_eq!(response.decode_body::<String>().expect("decode"), "first");
     });
 }
@@ -1355,38 +1443,32 @@ fn object_rpc_router_rejects_stale_prebuilt_registry_snapshot() {
         |request| async move { ObjectRpcResponse::encode_body(request.route, &"base".to_string()) },
     );
     let stale_base = router.route_registry_snapshot();
-    let newer_registry =
-        stale_base
-            .to_builder()
-            .register_route(
-                ObjectRouteDescriptor::for_types::<(), String>(
-                    "/test/newer",
-                    "test",
-                    "newer route",
-                ),
-                |request| async move {
-                    ObjectRpcResponse::encode_body(request.route, &"newer".to_string())
-                },
-            )
-            .build();
+    let newer_registry = stale_base
+        .to_builder()
+        .register_route(
+            ObjectRouteDescriptor::for_types::<(), String>("/test/newer", "test", "newer route"),
+            value_route(|request| async move {
+                ObjectRpcResponse::encode_body(request.route, &"newer".to_string())
+            }),
+        )
+        .build();
     router
         .replace_route_registry(newer_registry)
         .expect("replace with newer registry");
 
-    let stale_registry =
-        stale_base
-            .to_builder()
-            .register_route(
-                ObjectRouteDescriptor::for_types::<(), String>(
-                    "/test/stale-only",
-                    "test",
-                    "stale route",
-                ),
-                |request| async move {
-                    ObjectRpcResponse::encode_body(request.route, &"stale".to_string())
-                },
-            )
-            .build();
+    let stale_registry = stale_base
+        .to_builder()
+        .register_route(
+            ObjectRouteDescriptor::for_types::<(), String>(
+                "/test/stale-only",
+                "test",
+                "stale route",
+            ),
+            value_route(|request| async move {
+                ObjectRpcResponse::encode_body(request.route, &"stale".to_string())
+            }),
+        )
+        .build();
     let error = router
         .replace_route_registry(stale_registry)
         .expect_err("stale snapshot must not replace a newer active registry");
@@ -1403,7 +1485,9 @@ fn object_rpc_router_rejects_stale_prebuilt_registry_snapshot() {
     runtime.block_on(async {
         let newer_request =
             ObjectRpcRequest::encode_body("/test/newer", "test", &()).expect("newer request");
-        let newer_response = router.call(newer_request).await.expect("newer response");
+        let newer_response = call_value_object_rpc_service_async(&mut router, newer_request)
+            .await
+            .expect("newer response");
         assert_eq!(
             newer_response
                 .decode_body::<String>()
@@ -1412,8 +1496,7 @@ fn object_rpc_router_rejects_stale_prebuilt_registry_snapshot() {
         );
         let stale_request =
             ObjectRpcRequest::encode_body("/test/stale-only", "test", &()).expect("stale request");
-        let error = router
-            .call(stale_request)
+        let error = call_value_object_rpc_service_async(&mut router, stale_request)
             .await
             .expect_err("stale route must not be installed");
         assert!(
@@ -1478,8 +1561,7 @@ fn object_rpc_authorization_layer_enforces_descriptor_policy_before_handler() {
     runtime.block_on(async {
         let denied =
             ObjectRpcRequest::encode_body("/test/authorized", "test", &()).expect("denied");
-        let error = router
-            .call(denied)
+        let error = call_value_object_rpc_service_async(&mut router, denied)
             .await
             .expect_err("missing auth metadata should be denied");
         assert_eq!(error, NetworkError::AuthDenied);
@@ -1498,7 +1580,9 @@ fn object_rpc_authorization_layer_enforces_descriptor_policy_before_handler() {
             "auth.capabilities".to_string(),
             "cluster.kv.read,cluster.kv.write".to_string(),
         );
-        let response = router.call(allowed).await.expect("authorized response");
+        let response = call_value_object_rpc_service_async(&mut router, allowed)
+            .await
+            .expect("authorized response");
         assert_eq!(response.decode_body::<String>().expect("decode"), "allowed");
         assert_eq!(handled.load(Ordering::SeqCst), 1);
     });
@@ -1549,7 +1633,9 @@ fn object_rpc_authorization_layer_preserves_route_readiness() {
         let mut call_service = service.clone();
         let request =
             ObjectRpcRequest::encode_body("/test/auth-ready", "test", &()).expect("request");
-        let in_flight = tokio::spawn(async move { call_service.call(request).await });
+        let in_flight = tokio::spawn(async move {
+            call_value_object_rpc_service_async(&mut call_service, request).await
+        });
         entered.notified().await;
 
         let saturated = service
@@ -1602,10 +1688,10 @@ fn object_rpc_authorization_service_calls_poll_ready_inner_instance() {
         }
     }
 
-    impl Service<ObjectRpcRequest> for ReadyTokenService {
-        type Response = ObjectRpcResponse;
+    impl Service<ObjectRpcSessionRequest> for ReadyTokenService {
+        type Response = ObjectRpcSessionResponse;
         type Error = NetworkError;
-        type Future = ObjectRpcFuture;
+        type Future = ObjectRpcSessionFuture;
 
         fn poll_ready(
             &mut self,
@@ -1615,7 +1701,7 @@ fn object_rpc_authorization_service_calls_poll_ready_inner_instance() {
             std::task::Poll::Ready(Ok(()))
         }
 
-        fn call(&mut self, request: ObjectRpcRequest) -> Self::Future {
+        fn call(&mut self, request: ObjectRpcSessionRequest) -> Self::Future {
             let ready = self.ready;
             self.ready = false;
             let calls = Arc::clone(&self.calls);
@@ -1628,7 +1714,8 @@ fn object_rpc_authorization_service_calls_poll_ready_inner_instance() {
                     });
                 }
                 calls.fetch_add(1, Ordering::SeqCst);
-                ObjectRpcResponse::encode_body(request.route, &"ready".to_string())
+                ObjectRpcResponse::encode_body(request.request.route, &"ready".to_string())
+                    .map(ObjectRpcSessionResponse::value)
             })
         }
     }
@@ -1651,7 +1738,7 @@ fn object_rpc_authorization_service_calls_poll_ready_inner_instance() {
     runtime.block_on(async {
         let request =
             ObjectRpcRequest::encode_body("/test/ready-auth", "test", &()).expect("request");
-        let response = call_object_rpc_service_async(&mut service, request)
+        let response = call_value_object_rpc_service_async(&mut service, request)
             .await
             .expect("response");
         assert_eq!(response.decode_body::<String>().expect("decode"), "ready");
@@ -1665,9 +1752,12 @@ fn object_rpc_route_registry_rejects_zero_runtime_limits() {
         ObjectRouteDescriptor::for_types::<(), ()>("/test/zero-concurrency", "test", "zero")
             .with_concurrency_limit(0);
     let error = match ObjectRpcRouteRegistry::builder()
-        .register_route(zero_concurrency, |request| async move {
-            ObjectRpcResponse::encode_body(request.route, &())
-        })
+        .register_route(
+            zero_concurrency,
+            value_route(
+                |request| async move { ObjectRpcResponse::encode_body(request.route, &()) },
+            ),
+        )
         .try_build()
     {
         Ok(_) => panic!("zero concurrency limit must be rejected"),
@@ -1683,9 +1773,12 @@ fn object_rpc_route_registry_rejects_zero_runtime_limits() {
         ObjectRouteDescriptor::for_types::<(), ()>("/test/zero-timeout", "test", "zero")
             .with_timeout(Duration::ZERO);
     let error = match ObjectRpcRouteRegistry::builder()
-        .register_route(zero_timeout, |request| async move {
-            ObjectRpcResponse::encode_body(request.route, &())
-        })
+        .register_route(
+            zero_timeout,
+            value_route(
+                |request| async move { ObjectRpcResponse::encode_body(request.route, &()) },
+            ),
+        )
         .try_build()
     {
         Ok(_) => panic!("zero timeout must be rejected"),
@@ -1703,9 +1796,12 @@ fn object_rpc_route_registry_rejects_invalid_dynamic_route_descriptors() {
     let missing_path_prefix =
         ObjectRouteDescriptor::for_types::<(), ()>("test/no-prefix", "test", "bad route");
     let error = match ObjectRpcRouteRegistry::builder()
-        .register_route(missing_path_prefix, |request| async move {
-            ObjectRpcResponse::encode_body(request.route, &())
-        })
+        .register_route(
+            missing_path_prefix,
+            value_route(
+                |request| async move { ObjectRpcResponse::encode_body(request.route, &()) },
+            ),
+        )
         .try_build()
     {
         Ok(_) => panic!("non-path route must be rejected"),
@@ -1721,9 +1817,12 @@ fn object_rpc_route_registry_rejects_invalid_dynamic_route_descriptors() {
         ObjectRouteDescriptor::for_types::<(), ()>("/test/empty-auth", "test", "bad auth")
             .with_auth_scope(" ");
     let error = match ObjectRpcRouteRegistry::builder()
-        .register_route(empty_auth_scope, |request| async move {
-            ObjectRpcResponse::encode_body(request.route, &())
-        })
+        .register_route(
+            empty_auth_scope,
+            value_route(
+                |request| async move { ObjectRpcResponse::encode_body(request.route, &()) },
+            ),
+        )
         .try_build()
     {
         Ok(_) => panic!("empty auth scope must be rejected"),
@@ -1739,9 +1838,12 @@ fn object_rpc_route_registry_rejects_invalid_dynamic_route_descriptors() {
         ObjectRouteDescriptor::for_types::<(), ()>("/test/bad-capability", "test", "bad cap")
             .require_capability("read");
     let error = match ObjectRpcRouteRegistry::builder()
-        .register_route(invalid_capability, |request| async move {
-            ObjectRpcResponse::encode_body(request.route, &())
-        })
+        .register_route(
+            invalid_capability,
+            value_route(
+                |request| async move { ObjectRpcResponse::encode_body(request.route, &()) },
+            ),
+        )
         .try_build()
     {
         Ok(_) => panic!("invalid capability must be rejected"),
@@ -1758,9 +1860,12 @@ fn object_rpc_route_registry_rejects_invalid_dynamic_route_descriptors() {
             .require_capability("cluster.kv.read")
             .require_capability("cluster.kv.read");
     let error = match ObjectRpcRouteRegistry::builder()
-        .register_route(duplicate_capability, |request| async move {
-            ObjectRpcResponse::encode_body(request.route, &())
-        })
+        .register_route(
+            duplicate_capability,
+            value_route(
+                |request| async move { ObjectRpcResponse::encode_body(request.route, &()) },
+            ),
+        )
         .try_build()
     {
         Ok(_) => panic!("duplicate capability must be rejected"),
@@ -1778,12 +1883,18 @@ fn object_rpc_route_registry_builder_rejects_duplicate_routes() {
     let descriptor =
         ObjectRouteDescriptor::for_types::<(), ()>("/test/duplicate", "test", "duplicate route");
     let error = match ObjectRpcRouteRegistry::builder()
-        .register_route(descriptor.clone(), |request| async move {
-            ObjectRpcResponse::encode_body(request.route, &())
-        })
-        .try_register_route(descriptor, |request| async move {
-            ObjectRpcResponse::encode_body(request.route, &())
-        }) {
+        .register_route(
+            descriptor.clone(),
+            value_route(
+                |request| async move { ObjectRpcResponse::encode_body(request.route, &()) },
+            ),
+        )
+        .try_register_route(
+            descriptor,
+            value_route(
+                |request| async move { ObjectRpcResponse::encode_body(request.route, &()) },
+            ),
+        ) {
         Ok(_) => panic!("duplicate route registration must be rejected"),
         Err(error) => error,
     };
@@ -1798,10 +1909,10 @@ fn object_rpc_route_registry_builder_rejects_duplicate_routes() {
 fn object_rpc_route_registry_builder_rejects_replacing_unknown_route() {
     let descriptor =
         ObjectRouteDescriptor::for_types::<(), ()>("/test/missing", "test", "missing route");
-    let error = match ObjectRpcRouteRegistry::builder()
-        .try_replace_route(descriptor, |request| async move {
-            ObjectRpcResponse::encode_body(request.route, &())
-        }) {
+    let error = match ObjectRpcRouteRegistry::builder().try_replace_route(
+        descriptor,
+        value_route(|request| async move { ObjectRpcResponse::encode_body(request.route, &()) }),
+    ) {
         Ok(_) => panic!("unknown route replacement must be rejected"),
         Err(error) => error,
     };
@@ -1831,8 +1942,7 @@ fn object_rpc_router_rejects_category_mismatch() {
     runtime.block_on(async {
         let request = ObjectRpcRequest::encode_body("/cluster/kv/category-check", "rollout", &())
             .expect("request");
-        let error = router
-            .call(request)
+        let error = call_value_object_rpc_service_async(&mut router, request)
             .await
             .expect_err("category mismatch should fail");
         assert!(
@@ -1868,47 +1978,6 @@ fn object_rpc_router_reports_route_specific_readiness() {
         router.route_readiness("/test/missing").is_none(),
         "unknown routes should not report dispatch readiness"
     );
-}
-
-#[test]
-fn object_rpc_frame_transport_serves_binary_request_response() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    runtime.block_on(async {
-        let (mut client, mut server) = tokio::io::duplex(4096);
-        let mut router = object_rpc_router_with_route(
-            ObjectRouteDescriptor::for_types::<u64, u64>(
-                "/cluster/kv/increment",
-                "cluster.kv",
-                "Increment a test counter",
-            ),
-            |request| async move {
-                let value: u64 = request.decode_body()?;
-                ObjectRpcResponse::encode_body(request.route, &(value + 1))
-            },
-        );
-        let server_task = tokio::spawn(async move {
-            serve_object_rpc_frame_async(
-                &mut server,
-                &mut router,
-                4096,
-                ObjectFrameIoOptions::none(),
-            )
-            .await
-            .expect("serve frame");
-        });
-        let request = ObjectRpcRequest::encode_body("/cluster/kv/increment", "cluster.kv", &41_u64)
-            .expect("request");
-        let response =
-            call_object_rpc_frame_async(&mut client, &request, 4096, ObjectFrameIoOptions::none())
-                .await
-                .expect("response");
-
-        server_task.await.expect("server task");
-        assert_eq!(response.decode_body::<u64>().expect("decode"), 42);
-    });
 }
 
 #[test]
@@ -1977,283 +2046,11 @@ fn async_object_frame_helpers_round_trip_binary_payloads() {
             .expect("write frame");
         });
         let request: DaemonControlRequest =
-            read_object_frame_async(&mut server, 4096, ObjectFrameIoOptions::none())
+            read_object_frame_async(&mut server, ObjectFrameIoOptions::none())
                 .await
                 .expect("read frame");
         writer.await.expect("writer task");
         assert_eq!(request.route, "/test/status");
-    });
-}
-
-#[test]
-fn async_daemon_control_client_round_trips_object_frames() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    runtime.block_on(async {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let address = listener.local_addr().expect("address").to_string();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let request: DaemonControlRequest =
-                read_object_frame_async(&mut stream, 4096, ObjectFrameIoOptions::none())
-                    .await
-                    .expect("read request");
-            assert_eq!(request.route, "/test/status");
-            let rpc_response = ObjectRpcResponse::encode_body("/test/status", &"OK".to_string())
-                .expect("rpc response");
-            write_object_frame_async(&mut stream, &rpc_response, ObjectFrameIoOptions::none())
-                .await
-                .expect("write response");
-        });
-        let request =
-            ObjectRpcRequest::encode_body("/test/status", "test", &()).expect("rpc request");
-        let response = sinomo_network::send_daemon_control_rpc_request_async(
-            &address,
-            &request,
-            DaemonRpcTimeouts::connect_only(Duration::from_secs(1)),
-            DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
-        )
-        .await
-        .expect("response");
-        server.await.expect("server");
-        assert_eq!(response.decode_body::<String>().expect("decode"), "OK");
-    });
-}
-
-#[test]
-fn async_cluster_endpoint_rpc_uses_tcp_transport() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    runtime.block_on(async {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let address = listener.local_addr().expect("address").to_string();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let request: DaemonControlRequest =
-                read_object_frame_async(&mut stream, 4096, ObjectFrameIoOptions::none())
-                    .await
-                    .expect("read request");
-            assert_eq!(request.route, "/test/endpoint-async");
-            let rpc_response =
-                ObjectRpcResponse::encode_body("/test/endpoint-async", &"OK".to_string())
-                    .expect("rpc response");
-            write_object_frame_async(&mut stream, &rpc_response, ObjectFrameIoOptions::none())
-                .await
-                .expect("write response");
-        });
-        let endpoint = ClusterEndpointRecord {
-            endpoint_id: sinomo_base::Id::generate(),
-            node_id: NodeId::from_legacy_named("node_async_endpoint_rpc").expect("node"),
-            transport: ClusterTransportKind::LanTcp,
-            address,
-            source: ClusterEndpointSource::KvMembership,
-            privacy: ClusterEndpointPrivacy::Lan,
-            priority: 0,
-            last_observed_latency_ms: None,
-        };
-        let request =
-            ObjectRpcRequest::encode_body("/test/endpoint-async", "test", &()).expect("request");
-        let response = send_daemon_rpc_to_cluster_endpoint_async(
-            &endpoint,
-            None,
-            &request,
-            DaemonRpcTimeouts::connect_only(Duration::from_secs(1)),
-        )
-        .await
-        .expect("response");
-        server.await.expect("server");
-        assert_eq!(response.decode_body::<String>().expect("decode"), "OK");
-    });
-}
-
-#[test]
-fn async_daemon_control_client_timeout_is_idle_not_total_transfer() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    runtime.block_on(async {
-        use tokio::io::AsyncWriteExt;
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let address = listener.local_addr().expect("address").to_string();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let request: DaemonControlRequest =
-                read_object_frame_async(&mut stream, 4096, ObjectFrameIoOptions::none())
-                    .await
-                    .expect("read request");
-            assert_eq!(request.route, "/test/slow");
-            let rpc_response = ObjectRpcResponse::encode_body("/test/slow", &"OK".to_string())
-                .expect("rpc response");
-            let mut response_frame = Vec::new();
-            write_object_frame_blocking(&mut response_frame, &rpc_response)
-                .expect("encode response frame");
-
-            for chunk in response_frame.chunks(8) {
-                stream.write_all(chunk).await.expect("write response chunk");
-                stream.flush().await.expect("flush response chunk");
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        });
-        let request =
-            ObjectRpcRequest::encode_body("/test/slow", "test", &()).expect("rpc request");
-        let response = sinomo_network::send_daemon_control_rpc_request_async(
-            &address,
-            &request,
-            DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(25)),
-            DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
-        )
-        .await
-        .expect("response");
-        server.await.expect("server");
-        assert_eq!(response.decode_body::<String>().expect("decode"), "OK");
-    });
-}
-
-#[test]
-fn async_daemon_control_client_without_idle_timeout_allows_response_gap() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    runtime.block_on(async {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let address = listener.local_addr().expect("address").to_string();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let request: DaemonControlRequest =
-                read_object_frame_async(&mut stream, 4096, ObjectFrameIoOptions::none())
-                    .await
-                    .expect("read request");
-            assert_eq!(request.route, "/test/no-idle-timeout");
-            tokio::time::sleep(Duration::from_millis(75)).await;
-            let rpc_response =
-                ObjectRpcResponse::encode_body("/test/no-idle-timeout", &"OK".to_string())
-                    .expect("rpc response");
-            write_object_frame_async(&mut stream, &rpc_response, ObjectFrameIoOptions::none())
-                .await
-                .expect("write response");
-        });
-        let request = ObjectRpcRequest::encode_body("/test/no-idle-timeout", "test", &())
-            .expect("rpc request");
-        let response = sinomo_network::send_daemon_control_rpc_request_async(
-            &address,
-            &request,
-            DaemonRpcTimeouts::connect_only(Duration::from_millis(20)),
-            DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
-        )
-        .await
-        .expect("response");
-        server.await.expect("server");
-        assert_eq!(response.decode_body::<String>().expect("decode"), "OK");
-    });
-}
-
-#[test]
-fn async_daemon_control_client_explicit_idle_timeout_still_fails_on_stall() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    runtime.block_on(async {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let address = listener.local_addr().expect("address").to_string();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let request: DaemonControlRequest =
-                read_object_frame_async(&mut stream, 4096, ObjectFrameIoOptions::none())
-                    .await
-                    .expect("read request");
-            assert_eq!(request.route, "/test/idle-timeout");
-            tokio::time::sleep(Duration::from_millis(75)).await;
-        });
-        let request =
-            ObjectRpcRequest::encode_body("/test/idle-timeout", "test", &()).expect("rpc request");
-        let error = sinomo_network::send_daemon_control_rpc_request_async(
-            &address,
-            &request,
-            DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(20)),
-            DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
-        )
-        .await
-        .expect_err("explicit idle timeout should fail");
-        server.await.expect("server");
-        assert!(
-            error.to_string().contains("timed out"),
-            "unexpected error: {error}"
-        );
-    });
-}
-
-#[test]
-fn async_daemon_rpc_client_rejects_legacy_wrapped_response() {
-    #[derive(serde::Serialize)]
-    struct LegacyDaemonControlResponse {
-        body: String,
-        rpc: Option<ObjectRpcResponse>,
-    }
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    runtime.block_on(async {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let address = listener.local_addr().expect("address").to_string();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let request: DaemonControlRequest =
-                read_object_frame_async(&mut stream, 4096, ObjectFrameIoOptions::none())
-                    .await
-                    .expect("read request");
-            assert_eq!(request.route, "/test/status");
-            write_object_frame_async(
-                &mut stream,
-                &LegacyDaemonControlResponse {
-                    body: "OK".to_string(),
-                    rpc: None,
-                },
-                ObjectFrameIoOptions::none(),
-            )
-            .await
-            .expect("write response");
-        });
-        let request =
-            ObjectRpcRequest::encode_body("/test/status", "test", &()).expect("rpc request");
-        let error = sinomo_network::send_daemon_control_rpc_request_async(
-            &address,
-            &request,
-            DaemonRpcTimeouts::connect_only(Duration::from_secs(1)),
-            DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
-        )
-        .await
-        .expect_err("legacy wrapped response");
-        server.await.expect("server");
-        assert!(matches!(
-            error,
-            NetworkError::DeliveryFailed {
-                delivery_state: sinomo_network::NetworkDeliveryState::PossiblyApplied,
-                detail,
-                ..
-            } if detail.contains("serialization")
-        ));
     });
 }
 
@@ -9596,44 +9393,6 @@ impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
     }
 }
 
-impl ClusterSignedObjectRpcAsyncHost for RecordingKvTxnForwardHost {
-    fn supports_object_rpc_sessions(&self) -> bool {
-        false
-    }
-
-    fn sign_object_rpc_request_async<'a>(
-        &'a mut self,
-        _request: &'a ObjectRpcRequest,
-    ) -> ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
-        Box::pin(async { Ok(b"test-signature".to_vec()) })
-    }
-
-    fn send_signed_object_rpc_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        _auth: &'a [u8],
-        request: &'a ObjectRpcRequest,
-        _timeouts: DaemonRpcTimeouts,
-    ) -> ClusterSignedObjectRpcFuture<'a, ObjectRpcResponse> {
-        self.rpcs
-            .push((endpoint.node_id.clone(), request.route.clone()));
-        let response: Result<ObjectRpcResponse, NetworkError> = match request.route.as_str() {
-            CLUSTER_KV_TXN_ROUTE => {
-                sinomo_kv::cluster_kv_txn_response_rpc_payload(&self.txn_response)
-                    .map(object_rpc_response_from_kv_payload)
-                    .map_err(kv_err)
-            }
-            CLUSTER_KV_SNAPSHOT_ROUTE => {
-                sinomo_kv::cluster_kv_snapshot_response_rpc_payload(&self.snapshot)
-                    .map(object_rpc_response_from_kv_payload)
-                    .map_err(kv_err)
-            }
-            route => ObjectRpcResponse::encode_error(route, "unexpected route"),
-        };
-        Box::pin(async move { response })
-    }
-}
-
 struct RecordingKvSnapshotRefreshHost {
     known_authority: Option<NodeId>,
     snapshots: BTreeMap<NodeId, KvSnapshot>,
@@ -11994,100 +11753,6 @@ fn cluster_kv_txn_forward_driver_uses_routed_node_rpc_without_known_state_author
 }
 
 #[test]
-fn cluster_kv_txn_async_forward_driver_uses_routed_rpc_client() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-async-forward-node-rpc");
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-    let (mut state, local_node_id, peer_node_id) = cluster_raft_handler_test_state(
-        "cluster_kv_async_forward_node_rpc",
-        "node_kv_async_forward_node_rpc_local",
-        "node_kv_async_forward_node_rpc_voter",
-    );
-    state
-        .members
-        .iter_mut()
-        .find(|member| member.node_id == local_node_id)
-        .expect("local member")
-        .state = ClusterMemberState::NonVoting;
-    let peer_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.86:21353".to_string(), 10);
-    state
-        .members
-        .iter_mut()
-        .find(|member| member.node_id == peer_node_id)
-        .expect("peer member")
-        .endpoints
-        .push(peer_endpoint.clone());
-    write_cluster_state(&paths, &state).expect("write state");
-    let now = OffsetDateTime::now_utc();
-    write_local_cluster_connectivity_records(
-        &paths,
-        &local_node_id,
-        &[ClusterConnectivityRecord {
-            cluster_id: state.cluster_id.clone(),
-            source_node_id: local_node_id.clone(),
-            target_node_id: peer_node_id.clone(),
-            endpoint_id: peer_endpoint.endpoint_id.clone(),
-            transport: peer_endpoint.transport,
-            address: peer_endpoint.address.clone(),
-            state: ClusterConnectivityState::Healthy,
-            latency_ms: Some(3),
-            consecutive_failures: 0,
-            last_success_at: Some("ok".to_string()),
-            last_failure_at: None,
-            failure_reason: None,
-            observed_at: now,
-            expires_at: now + time::Duration::seconds(600),
-        }],
-    )
-    .expect("write healthy direct connectivity");
-    let snapshot = forward_test_snapshot("/forward/async-node-rpc", b"async-node-rpc");
-    let txn_response = forward_test_txn_response(snapshot.revision);
-    let mut host = RecordingKvTxnForwardHost {
-        known_authority: None,
-        snapshot: snapshot.clone(),
-        txn_response: txn_response.clone(),
-        rpcs: Vec::new(),
-    };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-
-    let result = runtime
-        .block_on(
-            sinomo_cluster::forward_cluster_kv_txn_to_state_authority_async_with_host(
-                runtime.handle(),
-                &paths,
-                &state,
-                &KvTxn {
-                    compares: Vec::new(),
-                    success: Vec::new(),
-                    failure: Vec::new(),
-                },
-                ClusterKvTxnForwardOptions {
-                    timeout: Duration::from_secs(5),
-                    tcp_command_timeout: Duration::from_secs(5),
-                    iroh_command_timeout: Duration::from_secs(3),
-                },
-                &mut host,
-            ),
-        )
-        .expect("async forward")
-        .expect("targeted voter");
-
-    assert_eq!(result.snapshot, snapshot);
-    assert_eq!(result.txn_response, Some(txn_response));
-    assert_eq!(
-        host.rpcs,
-        vec![
-            (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
-            (peer_node_id, CLUSTER_KV_SNAPSHOT_ROUTE.to_string())
-        ]
-    );
-}
-
-#[test]
 fn cluster_raft_append_replication_retries_from_rejected_match_index() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-raft-append-replication-retry");
     let data_dir = SinomoDataDir::new(&root);
@@ -13377,82 +13042,6 @@ fn join_introducer_reads_newer_invite_cache_only_for_non_voter_bridge() {
             .is_err(),
         "a voter must not authorize from a materialized snapshot ahead of applied Raft"
     );
-
-    struct RecordingBridgeForwardHost {
-        accepted_state: ClusterBootstrapState,
-        responder_node_id: NodeId,
-        saw_retry_safe_registration: bool,
-    }
-
-    impl ClusterSignedObjectRpcAsyncHost for RecordingBridgeForwardHost {
-        fn supports_object_rpc_sessions(&self) -> bool {
-            false
-        }
-
-        fn sign_object_rpc_request_async<'a>(
-            &'a mut self,
-            request: &'a ObjectRpcRequest,
-        ) -> ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
-            self.saw_retry_safe_registration |=
-                request.route == CLUSTER_JOIN_REGISTER_ROUTE && request.is_response_retry_safe();
-            Box::pin(async { Ok(b"bridge-signature".to_vec()) })
-        }
-
-        fn send_signed_object_rpc_async<'a>(
-            &'a mut self,
-            endpoint: &'a ClusterEndpointRecord,
-            _auth: &'a [u8],
-            request: &'a ObjectRpcRequest,
-            _timeouts: DaemonRpcTimeouts,
-        ) -> ClusterSignedObjectRpcFuture<'a, ObjectRpcResponse> {
-            Box::pin(async move {
-                assert_eq!(endpoint.node_id, self.responder_node_id);
-                assert_eq!(request.route, CLUSTER_JOIN_REGISTER_ROUTE);
-                assert!(request.is_response_retry_safe());
-                ObjectRpcResponse::encode_body(
-                    CLUSTER_JOIN_REGISTER_ROUTE,
-                    &ClusterJoinRegistrationResponse {
-                        accepted: true,
-                        detail: "accepted by authority".to_string(),
-                        state: self.accepted_state.clone(),
-                        kv_snapshot: None,
-                        responder_node_id: Some(self.responder_node_id.clone()),
-                    },
-                )
-            })
-        }
-    }
-
-    impl ClusterJoinRegistrationAsyncHost for RecordingBridgeForwardHost {
-        fn commit_join_registration_state_async<'a>(
-            &'a mut self,
-            _paths: &'a ClusterPaths,
-            _state: &'a ClusterBootstrapState,
-        ) -> ClusterMembershipRpcFuture<'a, KvSnapshot> {
-            Box::pin(async { panic!("a non-voter bridge must forward instead of committing") })
-        }
-    }
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    let mut host = RecordingBridgeForwardHost {
-        accepted_state: accepted.state,
-        responder_node_id: issuer_node_id,
-        saw_retry_safe_registration: false,
-    };
-    let forwarded = runtime
-        .block_on(handle_cluster_join_registration_request_async_with_host(
-            runtime.handle(),
-            &paths,
-            registration_request,
-            now,
-            &mut host,
-        ))
-        .expect("forward bridge registration");
-    assert!(forwarded.accepted);
-    assert!(host.saw_retry_safe_registration);
 }
 
 #[test]
@@ -13636,10 +13225,6 @@ impl ClusterJoinRegistrationHost for RecordingJoinRegistrationHost {
 }
 
 impl ClusterSignedObjectRpcAsyncHost for RecordingJoinRegistrationHost {
-    fn supports_object_rpc_sessions(&self) -> bool {
-        false
-    }
-
     fn sign_object_rpc_request_async<'a>(
         &'a mut self,
         _request: &'a ObjectRpcRequest,
@@ -15269,36 +14854,6 @@ fn join_challenge_forwarding_uses_membership_state_authority_policy() {
         }
     }
 
-    impl ClusterSignedObjectRpcAsyncHost for RecordingForwardHost {
-        fn supports_object_rpc_sessions(&self) -> bool {
-            false
-        }
-
-        fn sign_object_rpc_request_async<'a>(
-            &'a mut self,
-            request: &'a ObjectRpcRequest,
-        ) -> ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
-            assert_eq!(request.route, CLUSTER_JOIN_CHALLENGE_ROUTE);
-            assert_eq!(request.category, CLUSTER_MEMBERSHIP_RPC_CATEGORY);
-            Box::pin(async { Ok(b"test-signature".to_vec()) })
-        }
-
-        fn send_signed_object_rpc_async<'a>(
-            &'a mut self,
-            endpoint: &'a ClusterEndpointRecord,
-            _auth: &'a [u8],
-            request: &'a ObjectRpcRequest,
-            _timeouts: DaemonRpcTimeouts,
-        ) -> ClusterSignedObjectRpcFuture<'a, ObjectRpcResponse> {
-            assert_eq!(request.route, CLUSTER_JOIN_CHALLENGE_ROUTE);
-            assert_eq!(request.category, CLUSTER_MEMBERSHIP_RPC_CATEGORY);
-            self.node_rpcs.push(endpoint.node_id.clone());
-            Box::pin(async {
-                ObjectRpcResponse::encode_body(CLUSTER_JOIN_CHALLENGE_ROUTE, &"proof".to_string())
-            })
-        }
-    }
-
     let root = sinomo_testdir::TestDir::new("sinomo-network-join-challenge-forward");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -15364,28 +14919,7 @@ fn join_challenge_forwarding_uses_membership_state_authority_policy() {
     let proof: String = response.decode_body().expect("proof body");
 
     assert_eq!(proof, "proof");
-    assert_eq!(host.node_rpcs, vec![voter_node.clone()]);
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    let mut async_host = RecordingForwardHost {
-        node_rpcs: Vec::new(),
-    };
-    let async_response = runtime
-        .block_on(
-            forward_cluster_join_challenge_rpc_to_state_authority_async_with_host(
-                runtime.handle(),
-                &paths,
-                &request,
-                &mut async_host,
-            ),
-        )
-        .expect("async forward join challenge");
-    let async_proof: String = async_response.decode_body().expect("async proof body");
-    assert_eq!(async_proof, "proof");
-    assert_eq!(async_host.node_rpcs, vec![voter_node]);
+    assert_eq!(host.node_rpcs, vec![voter_node]);
     assert_ne!(peer_node, state.local_node_id);
 }
 
@@ -16167,63 +15701,6 @@ fn main_daemon_data_plane_targets_prefer_healthy_bridge_ip_over_degraded_hostnam
         ordered_endpoint_ids,
         vec![bridge_ip.endpoint_id, stable_hostname.endpoint_id],
         "main-daemon data-plane routing should try the proven bridge path first, then retain the hostname fallback"
-    );
-}
-
-#[test]
-fn endpoint_transfer_profile_is_owned_by_network_endpoint_policy() {
-    let node = NodeId::from_legacy_named("node_endpoint_transfer_profile").expect("node");
-    let endpoint = |transport: ClusterTransportKind| {
-        let address = format!("{transport:?}");
-        ClusterEndpointRecord {
-            endpoint_id: ClusterEndpointId::derived(
-                "sinomo.test.endpoint-transfer-profile",
-                address.clone(),
-            ),
-            node_id: node.clone(),
-            transport,
-            address,
-            source: ClusterEndpointSource::Observed,
-            privacy: ClusterEndpointPrivacy::Lan,
-            priority: 0,
-            last_observed_latency_ms: None,
-        }
-    };
-
-    let loopback = endpoint(ClusterTransportKind::Loopback);
-    let in_process = endpoint(ClusterTransportKind::InProcess);
-    let lan_tcp = endpoint(ClusterTransportKind::LanTcp);
-    let lan_quic = endpoint(ClusterTransportKind::LanQuic);
-    let iroh = endpoint(ClusterTransportKind::Iroh);
-    let relay = endpoint(ClusterTransportKind::HttpsRelay);
-
-    assert_eq!(
-        ClusterEndpointSelector::transfer_profile_for_endpoint(&loopback),
-        ClusterEndpointTransferProfile::Local
-    );
-    assert_eq!(
-        ClusterEndpointSelector::transfer_profile_for_endpoint(&in_process),
-        ClusterEndpointTransferProfile::Local
-    );
-    assert_eq!(
-        ClusterEndpointSelector::transfer_profile_for_endpoint(&lan_tcp),
-        ClusterEndpointTransferProfile::Lan
-    );
-    assert_eq!(
-        ClusterEndpointSelector::transfer_profile_for_endpoint(&lan_quic),
-        ClusterEndpointTransferProfile::Lan
-    );
-    assert_eq!(
-        ClusterEndpointSelector::transfer_profile_for_endpoint(&iroh),
-        ClusterEndpointTransferProfile::Conservative
-    );
-    assert_eq!(
-        ClusterEndpointSelector::transfer_profile_for_endpoints([&iroh, &lan_tcp]),
-        ClusterEndpointTransferProfile::Lan
-    );
-    assert_eq!(
-        ClusterEndpointSelector::transfer_profile_for_endpoints([&relay, &lan_tcp, &loopback]),
-        ClusterEndpointTransferProfile::Local
     );
 }
 
@@ -26797,10 +26274,12 @@ fn node_endpoint_maps_module_transport() {
 }
 
 #[test]
-fn lan_quic_event_frame_codec_round_trips_event_frames_and_limits_size() {
+fn lan_quic_event_frame_codec_round_trips_arbitrary_sized_event_frames() {
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_b").expect("node");
-    let event = fixture_event("evt_codec", node_a.clone());
+    let event = fixture_event("evt_codec", node_a.clone()).with_payload(serde_json::json!({
+        "content": "x".repeat(2 * 1024 * 1024),
+    }));
     let frame = EventFrame {
         frame_id: EventFrameId(7),
         source_node_id: node_a.clone(),
@@ -26815,19 +26294,14 @@ fn lan_quic_event_frame_codec_round_trips_event_frames_and_limits_size() {
             },
         },
     };
-    let codec = LanQuicEventFrameCodec {
-        max_frame_bytes: 16 * 1024,
-    };
+    let codec = LanQuicEventFrameCodec;
 
     let encoded = codec.encode(&frame).expect("encode");
     let decoded = codec.decode(&encoded).expect("decode");
 
     assert_eq!(&encoded[..4], sinomo_object::MAGIC);
+    assert!(encoded.len() > 1024 * 1024);
     assert_eq!(decoded, frame);
-    assert!(matches!(
-        LanQuicEventFrameCodec { max_frame_bytes: 1 }.encode(&frame),
-        Err(NetworkError::FrameTooLarge { .. })
-    ));
 }
 
 #[test]
@@ -28217,7 +27691,7 @@ async fn async_in_process_transport_delivers_object_rpc_requests_without_frames(
     let node_a = NodeId::from_legacy_named("node_async_object_rpc_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_async_object_rpc_b").expect("node");
     let network = AsyncInProcessNetwork::new();
-    let mut transport_a = network.add_node(node_a.clone());
+    let transport_a = network.add_node(node_a.clone());
     let mut transport_b = network.add_node(node_b.clone());
     let request =
         ObjectRpcRequest::encode_body("/test/async-object-message", "test.object", &7_u64)
@@ -32863,7 +32337,7 @@ impl LocalhostKvNode {
 fn read_localhost_kv_request(
     stream: &mut DaemonControlStream,
 ) -> Result<LocalhostKvRequest, NetworkError> {
-    read_object_frame_blocking(stream, DAEMON_CONTROL_RPC_MAX_FRAME_BYTES)
+    read_object_frame_blocking(stream)
 }
 
 fn handle_localhost_kv_request(
@@ -32907,8 +32381,7 @@ fn send_localhost_kv_request(
     write_object_frame_blocking(&mut stream, &request).map_err(|source| source.to_string())?;
 
     let response: LocalhostKvResponse =
-        read_object_frame_blocking(&mut stream, DAEMON_CONTROL_RPC_MAX_FRAME_BYTES)
-            .map_err(|source| source.to_string())?;
+        read_object_frame_blocking(&mut stream).map_err(|source| source.to_string())?;
     if let LocalhostKvResponse::Error { message } = &response {
         return Err(message.clone());
     }
@@ -34110,9 +33583,6 @@ mod route_cache_tests {
     use sinomo_local::SinomoDataDir;
     use sinomo_network::*;
     use sinomo_node::{ClusterId, NodeId, main_daemon_capabilities};
-    use std::collections::{BTreeMap, VecDeque};
-    use std::pin::Pin;
-    use std::time::Duration;
     use time::OffsetDateTime;
 
     fn nid(name: &str) -> NodeId {
@@ -34176,20 +33646,6 @@ mod route_cache_tests {
             .find(|member| member.node_id == local_node_id)
             .expect("local member");
         member.endpoints.push(endpoint);
-    }
-
-    fn request() -> ObjectRpcRequest {
-        ObjectRpcRequest {
-            route: "/test/target".to_string(),
-            category: "test".to_string(),
-            metadata: BTreeMap::new(),
-            auth: None,
-            body: vec![1, 2, 3],
-        }
-    }
-
-    fn response(value: &str) -> ObjectRpcResponse {
-        ObjectRpcResponse::encode_body("/test/ok", &value.to_string()).expect("response")
     }
 
     fn mark_local_endpoints_healthy(
@@ -34896,319 +34352,6 @@ mod route_cache_tests {
         assert_eq!(plan.endpoints[0].address, current_endpoint.address);
     }
 
-    enum SendOutcome {
-        Response(&'static str),
-        ResponseFrom(&'static str, NodeId),
-        Error(&'static str),
-    }
-
-    struct RecordingTargetHost {
-        outcomes: VecDeque<SendOutcome>,
-        signed_routes: Vec<String>,
-        sent: Vec<(
-            ClusterEndpointRecord,
-            ObjectRpcRequest,
-            Vec<u8>,
-            DaemonRpcTimeouts,
-        )>,
-    }
-
-    impl RecordingTargetHost {
-        fn new(outcomes: impl IntoIterator<Item = SendOutcome>) -> Self {
-            Self {
-                outcomes: outcomes.into_iter().collect(),
-                signed_routes: Vec::new(),
-                sent: Vec::new(),
-            }
-        }
-    }
-
-    impl ClusterSignedObjectRpcAsyncHost for RecordingTargetHost {
-        fn supports_object_rpc_sessions(&self) -> bool {
-            false
-        }
-
-        fn sign_object_rpc_request_async<'a>(
-            &'a mut self,
-            request: &'a ObjectRpcRequest,
-        ) -> ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
-            self.signed_routes.push(request.route.clone());
-            let auth = format!("auth-{}", self.signed_routes.len()).into_bytes();
-            Box::pin(async move { Ok(auth) })
-        }
-
-        fn send_signed_object_rpc_async<'a>(
-            &'a mut self,
-            endpoint: &'a ClusterEndpointRecord,
-            auth: &'a [u8],
-            request: &'a ObjectRpcRequest,
-            timeouts: DaemonRpcTimeouts,
-        ) -> ClusterSignedObjectRpcFuture<'a, ObjectRpcResponse> {
-            self.sent
-                .push((endpoint.clone(), request.clone(), auth.to_vec(), timeouts));
-            let outcome = self
-                .outcomes
-                .pop_front()
-                .unwrap_or(SendOutcome::Response("ok"));
-            Box::pin(async move {
-                match outcome {
-                    SendOutcome::Response(value) => Ok(response(value)),
-                    SendOutcome::ResponseFrom(value, responder_node_id) => {
-                        let mut response = response(value);
-                        response.mark_responder_node_id(responder_node_id.to_string());
-                        Ok(response)
-                    }
-                    SendOutcome::Error(detail) => Err(NetworkError::Io {
-                        operation: "test target send".to_string(),
-                        detail: detail.to_string(),
-                    }),
-                }
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn object_rpc_call_target_sends_direct_final_hop() {
-        let (_root, paths) = test_paths("sinomo-network-call-target-envelope");
-        let cluster_id = cid("cluster_call_target_envelope");
-        let local = nid("node_call_target_envelope_local");
-        let target = nid("node_call_target_envelope_target");
-        let mut state = test_state(cluster_id.clone(), local.clone());
-        add_member(
-            &mut state,
-            target.clone(),
-            "target",
-            vec![endpoint(&target, "10.90.3.10:21353", 0)],
-        );
-        let target_endpoint = state.members[1].endpoints[0].clone();
-        mark_local_endpoints_healthy(&paths, &state, &[target_endpoint]);
-        let request = request();
-        let runtime = tokio::runtime::Handle::current();
-        let mut host = RecordingTargetHost::new([SendOutcome::Response("target-ok")]);
-        let mut client = ClusterObjectRpcClient::routed(&mut host, &runtime, &paths);
-
-        let rpc_response = client
-            .call_target(
-                &state,
-                &target,
-                &request,
-                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_only(Duration::from_secs(
-                    5,
-                ))),
-            )
-            .await
-            .expect("target rpc");
-
-        assert_eq!(
-            rpc_response.decode_body::<String>().expect("body"),
-            "target-ok"
-        );
-        assert_eq!(host.signed_routes, vec![request.route.clone()]);
-        assert_eq!(host.sent.len(), 1);
-        assert_eq!(host.sent[0].0.node_id, target);
-        assert_eq!(host.sent[0].1.route, request.route);
-        assert_eq!(host.sent[0].1.auth, None);
-        assert_eq!(host.sent[0].2, b"auth-1".to_vec());
-    }
-
-    #[tokio::test]
-    async fn object_rpc_call_target_replans_after_failed_edge() {
-        let (_root, paths) = test_paths("sinomo-network-call-target-replans");
-        let cluster_id = cid("cluster_call_target_replans");
-        let local = nid("node_call_target_replans_local");
-        let target = nid("node_call_target_replans_target");
-        let bridge = nid("node_call_target_replans_bridge");
-        let mut state = test_state(cluster_id, local);
-        add_member(
-            &mut state,
-            target.clone(),
-            "target",
-            vec![endpoint(&target, "10.90.4.10:21353", 0)],
-        );
-        add_member(
-            &mut state,
-            bridge.clone(),
-            "bridge",
-            vec![endpoint(&bridge, "10.90.4.20:21353", 10)],
-        );
-        let target_endpoint = state.members[1].endpoints[0].clone();
-        let bridge_endpoint = state.members[2].endpoints[0].clone();
-        mark_local_endpoints_healthy(&paths, &state, &[target_endpoint, bridge_endpoint]);
-        let bridge_to_target = connectivity_record_from_source(
-            &state.cluster_id,
-            &bridge,
-            &state.members[1].endpoints[0],
-            ClusterConnectivityState::Healthy,
-            Some(1),
-        );
-        sinomo_network::write_local_cluster_connectivity_records(
-            &paths,
-            &bridge,
-            std::slice::from_ref(&bridge_to_target),
-        )
-        .expect("write bridge target connectivity");
-        let runtime = tokio::runtime::Handle::current();
-        let mut host = RecordingTargetHost::new([
-            SendOutcome::Error("direct edge failed"),
-            SendOutcome::Response("bridge-ok"),
-        ]);
-        let mut client = ClusterObjectRpcClient::routed(&mut host, &runtime, &paths);
-        let request = request().with_response_retry_safe();
-
-        let rpc_response = client
-            .call_target(
-                &state,
-                &target,
-                &request,
-                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_only(Duration::from_secs(
-                    5,
-                ))),
-            )
-            .await
-            .expect("target rpc");
-
-        assert_eq!(
-            rpc_response.decode_body::<String>().expect("body"),
-            "bridge-ok"
-        );
-        assert_eq!(host.sent.len(), 2);
-        assert_eq!(host.sent[0].0.node_id, target);
-        assert_eq!(host.sent[0].1.route, request.route);
-        assert_eq!(host.sent[1].0.node_id, bridge);
-        let retried_envelope = RelayEnvelope::from_request(&host.sent[1].1).expect("envelope");
-        assert_eq!(retried_envelope.target_node_id, target);
-    }
-
-    #[tokio::test]
-    async fn object_rpc_call_target_caps_each_endpoint_attempt() {
-        let (_root, paths) = test_paths("sinomo-network-call-target-endpoint-budget");
-        let cluster_id = cid("cluster_call_target_endpoint_budget");
-        let local = nid("node_call_target_endpoint_budget_local");
-        let target = nid("node_call_target_endpoint_budget_target");
-        let stale_endpoint = endpoint(&target, "10.90.7.10:21353", 0);
-        let stale_endpoint_2 = endpoint(&target, "10.90.7.11:21353", 1);
-        let stale_endpoint_3 = endpoint(&target, "10.90.7.12:21353", 2);
-        let good_endpoint = endpoint(&target, "10.90.7.13:21353", 3);
-        let mut state = test_state(cluster_id, local);
-        add_member(
-            &mut state,
-            target.clone(),
-            "target",
-            vec![
-                stale_endpoint.clone(),
-                stale_endpoint_2.clone(),
-                stale_endpoint_3.clone(),
-                good_endpoint.clone(),
-            ],
-        );
-        let runtime = tokio::runtime::Handle::current();
-        let mut host = RecordingTargetHost::new([
-            SendOutcome::Error("stale endpoint hung"),
-            SendOutcome::Response("target-ok"),
-        ]);
-        let mut client = ClusterObjectRpcClient::routed(&mut host, &runtime, &paths);
-        let request = request().with_response_retry_safe();
-
-        let rpc_response = client
-            .call_target(
-                &state,
-                &target,
-                &request,
-                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_only(Duration::from_secs(
-                    15,
-                )))
-                .with_overall_timeout(Duration::from_secs(5)),
-            )
-            .await
-            .expect("target rpc");
-
-        assert_eq!(
-            rpc_response.decode_body::<String>().expect("body"),
-            "target-ok"
-        );
-        assert_eq!(host.sent.len(), 2);
-        assert_eq!(host.sent[0].0.address, "10.90.7.10:21353");
-        assert_eq!(host.sent[1].0.address, "10.90.7.11:21353");
-        let first_budget = host.sent[0]
-            .3
-            .connect_timeout
-            .expect("first endpoint budget");
-        assert!(
-            first_budget <= Duration::from_millis(1_400)
-                && first_budget >= Duration::from_millis(1_100),
-            "unverified first endpoint budget should be capped tightly: {first_budget:?}"
-        );
-        let second_budget = host.sent[1]
-            .3
-            .connect_timeout
-            .expect("second endpoint budget");
-        assert!(
-            second_budget <= Duration::from_millis(2_100)
-                && second_budget >= Duration::from_millis(1_500),
-            "unverified second endpoint budget should be capped tightly: {second_budget:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn object_rpc_call_target_retries_after_responder_mismatch() {
-        let (_root, paths) = test_paths("sinomo-network-call-target-responder-mismatch");
-        let cluster_id = cid("cluster_call_target_responder_mismatch");
-        let local = nid("node_call_target_mismatch_local");
-        let target = nid("node_call_target_mismatch_target");
-        let wrong = nid("node_call_target_mismatch_wrong");
-        let stale_endpoint = endpoint(&target, "10.90.5.10:21353", 0);
-        let good_endpoint = endpoint(&target, "10.90.5.11:21353", 1);
-        let mut state = test_state(cluster_id, local);
-        add_member(
-            &mut state,
-            target.clone(),
-            "target",
-            vec![stale_endpoint.clone(), good_endpoint.clone()],
-        );
-        mark_local_endpoints_healthy(&paths, &state, &[stale_endpoint.clone(), good_endpoint]);
-        let runtime = tokio::runtime::Handle::current();
-        let mut host = RecordingTargetHost::new([
-            SendOutcome::ResponseFrom("wrong-node", wrong),
-            SendOutcome::ResponseFrom("target-ok", target.clone()),
-        ]);
-        let mut client = ClusterObjectRpcClient::routed(&mut host, &runtime, &paths);
-        let request = request().with_response_retry_safe();
-
-        let rpc_response = client
-            .call_target(
-                &state,
-                &target,
-                &request,
-                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_only(Duration::from_secs(
-                    5,
-                ))),
-            )
-            .await
-            .expect("target rpc");
-
-        assert_eq!(
-            rpc_response.decode_body::<String>().expect("body"),
-            "target-ok"
-        );
-        assert_eq!(host.sent.len(), 2);
-        assert_eq!(host.sent[0].0.address, "10.90.5.10:21353");
-        assert_eq!(host.sent[1].0.address, "10.90.5.11:21353");
-        let records = sinomo_network::read_local_cluster_connectivity_records_for_source(
-            &paths,
-            &state.local_node_id,
-        )
-        .expect("local connectivity records");
-        let stale_record = records
-            .iter()
-            .find(|record| record.endpoint_id == stale_endpoint.endpoint_id)
-            .expect("stale endpoint record");
-        assert_eq!(stale_record.state, ClusterConnectivityState::Unreachable);
-        assert_eq!(
-            stale_record.failure_reason,
-            Some(sinomo_network::ClusterConnectivityFailureReason::IdentityMismatch)
-        );
-    }
-
     #[tokio::test]
     async fn delivery_routing_table_updates_after_connectivity_change() {
         let (_root, paths) = test_paths("sinomo-network-delivery-routing-table-updates");
@@ -35621,187 +34764,6 @@ mod route_cache_tests {
             sinomo_network::local_cluster_connectivity_content_generation(&paths),
             generation_after_first
         );
-    }
-
-    #[derive(Default)]
-    struct RecordingRelayHost {
-        sent: Vec<(ClusterEndpointRecord, RelayEnvelope, DaemonRpcTimeouts)>,
-        target_sent: Vec<(ClusterEndpointRecord, ObjectRpcRequest, DaemonRpcTimeouts)>,
-    }
-
-    impl ClusterRelayAsyncHost for RecordingRelayHost {
-        fn try_deliver_local_async<'a>(
-            &'a mut self,
-            _state: &'a ClusterBootstrapState,
-            _target_node_id: &'a NodeId,
-            _inner_request: &'a ObjectRpcRequest,
-            _timeouts: DaemonRpcTimeouts,
-        ) -> Pin<
-            Box<dyn Future<Output = Result<Option<ObjectRpcResponse>, NetworkError>> + Send + 'a>,
-        > {
-            Box::pin(async { Ok(None) })
-        }
-
-        fn send_relay_request_async<'a>(
-            &'a mut self,
-            endpoint: &'a ClusterEndpointRecord,
-            request: &'a ObjectRpcRequest,
-            timeouts: DaemonRpcTimeouts,
-        ) -> Pin<Box<dyn Future<Output = Result<ObjectRpcResponse, NetworkError>> + Send + 'a>>
-        {
-            match RelayEnvelope::from_request(request) {
-                Ok(envelope) => {
-                    self.sent.push((endpoint.clone(), envelope, timeouts));
-                    Box::pin(async { Ok(response("forwarded")) })
-                }
-                Err(error) => Box::pin(async move { Err(error) }),
-            }
-        }
-
-        fn send_target_request_async<'a>(
-            &'a mut self,
-            endpoint: &'a ClusterEndpointRecord,
-            request: &'a ObjectRpcRequest,
-            timeouts: DaemonRpcTimeouts,
-        ) -> Pin<Box<dyn Future<Output = Result<ObjectRpcResponse, NetworkError>> + Send + 'a>>
-        {
-            self.target_sent
-                .push((endpoint.clone(), request.clone(), timeouts));
-            Box::pin(async { Ok(response("forwarded")) })
-        }
-    }
-
-    #[tokio::test]
-    async fn relay_forward_uses_delivery_plan() {
-        let (_root, paths) = test_paths("sinomo-network-relay-forward-plan");
-        let cluster_id = cid("cluster_relay_forward_plan");
-        let local = nid("node_relay_forward_plan_local");
-        let target = nid("node_relay_forward_plan_target");
-        let mut state = test_state(cluster_id.clone(), local.clone());
-        add_member(
-            &mut state,
-            target.clone(),
-            "target",
-            vec![endpoint(&target, "10.90.5.10:21353", 0)],
-        );
-        let target_endpoint = state.members[1].endpoints[0].clone();
-        mark_local_endpoints_healthy(&paths, &state, &[target_endpoint]);
-        let inner = request().with_auth(b"inner-auth".to_vec());
-        let envelope = RelayEnvelope::new(cluster_id, target.clone(), inner);
-        let relay_request = envelope.into_request().expect("relay request");
-        let runtime = tokio::runtime::Handle::current();
-        let mut host = RecordingRelayHost::default();
-
-        let rpc_response = handle_cluster_relay_async_with_host(
-            &runtime,
-            &paths,
-            &state,
-            &local,
-            &relay_request,
-            ClusterRelayOptions::new(DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5))),
-            &mut host,
-        )
-        .await
-        .expect("relay forward");
-
-        assert_eq!(
-            rpc_response.decode_body::<String>().expect("body"),
-            "forwarded"
-        );
-        assert_eq!(host.sent.len(), 0);
-        assert_eq!(host.target_sent.len(), 1);
-        assert_eq!(host.target_sent[0].0.node_id, target);
-        assert_eq!(host.target_sent[0].1.route, request().route);
-        assert_eq!(host.target_sent[0].1.auth, Some(b"inner-auth".to_vec()));
-    }
-
-    #[tokio::test]
-    async fn relay_forward_uses_planned_final_hop_when_local_state_lacks_target() {
-        let (_root, paths) = test_paths("sinomo-network-relay-forward-stale-target-state");
-        let cluster_id = cid("cluster_relay_forward_stale_target_state");
-        let origin = nid("node_relay_forward_stale_origin");
-        let local = nid("node_relay_forward_stale_local");
-        let target = nid("node_relay_forward_stale_target");
-        let state = test_state(cluster_id.clone(), local.clone());
-        let target_endpoint = endpoint(&target, "node5:21353", 0);
-        let inner = request().with_auth(b"inner-auth".to_vec());
-        let mut envelope = RelayEnvelope::new(cluster_id, target.clone(), inner);
-        envelope.visited.push(origin.clone());
-        envelope.planned_path = vec![origin, local.clone(), target.clone()];
-        envelope.target_endpoints = vec![target_endpoint.clone()];
-        let relay_request = envelope.into_request().expect("relay request");
-        let runtime = tokio::runtime::Handle::current();
-        let mut host = RecordingRelayHost::default();
-
-        let rpc_response = handle_cluster_relay_async_with_host(
-            &runtime,
-            &paths,
-            &state,
-            &local,
-            &relay_request,
-            ClusterRelayOptions::new(DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5))),
-            &mut host,
-        )
-        .await
-        .expect("relay forward");
-
-        assert_eq!(
-            rpc_response.decode_body::<String>().expect("body"),
-            "forwarded"
-        );
-        assert_eq!(host.sent.len(), 0);
-        assert_eq!(host.target_sent.len(), 1);
-        assert_eq!(host.target_sent[0].0.address, target_endpoint.address);
-        assert_eq!(host.target_sent[0].0.node_id, target);
-    }
-
-    #[tokio::test]
-    async fn relay_forward_replans_when_planned_next_hop_has_no_endpoint() {
-        let (_root, paths) = test_paths("sinomo-network-relay-forward-stale-planned-hop");
-        let cluster_id = cid("cluster_relay_forward_stale_planned_hop");
-        let origin = nid("node_relay_forward_stale_hop_origin");
-        let local = nid("node_relay_forward_stale_hop_local");
-        let stale_bridge = nid("node_relay_forward_stale_hop_bridge");
-        let target = nid("node_relay_forward_stale_hop_target");
-        let mut state = test_state(cluster_id.clone(), local.clone());
-        add_member(&mut state, origin.clone(), "origin", Vec::new());
-        add_member(&mut state, stale_bridge.clone(), "stale-bridge", Vec::new());
-        let target_endpoint = endpoint(&target, "10.90.5.20:21353", 0);
-        add_member(
-            &mut state,
-            target.clone(),
-            "target",
-            vec![target_endpoint.clone()],
-        );
-        mark_local_endpoints_healthy(&paths, &state, std::slice::from_ref(&target_endpoint));
-        let inner = request().with_auth(b"inner-auth".to_vec());
-        let mut envelope = RelayEnvelope::new(cluster_id, target.clone(), inner);
-        envelope.visited.push(origin.clone());
-        envelope.planned_path = vec![origin, local.clone(), stale_bridge, target.clone()];
-        let relay_request = envelope.into_request().expect("relay request");
-        let runtime = tokio::runtime::Handle::current();
-        let mut host = RecordingRelayHost::default();
-
-        let rpc_response = handle_cluster_relay_async_with_host(
-            &runtime,
-            &paths,
-            &state,
-            &local,
-            &relay_request,
-            ClusterRelayOptions::new(DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5))),
-            &mut host,
-        )
-        .await
-        .expect("relay forward");
-
-        assert_eq!(
-            rpc_response.decode_body::<String>().expect("body"),
-            "forwarded"
-        );
-        assert_eq!(host.sent.len(), 0);
-        assert_eq!(host.target_sent.len(), 1);
-        assert_eq!(host.target_sent[0].0.address, target_endpoint.address);
-        assert_eq!(host.target_sent[0].0.node_id, target);
     }
 }
 

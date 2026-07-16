@@ -612,33 +612,27 @@ ordering, packed-segment durability, and corruption before the final
 incomplete record remain concrete conformance and separate proof obligations.
 
 The `dfs_namespace_transaction_body_transport_safety.safety` invariant is the
-bounded transport-refinement gate for moving one oversized same-shard
-`DfsNamespaceTransaction` out of the canonical object-RPC control head and into
-one authenticated request body. The model transaction contains two file
-records followed by one parent record. Its legacy inline head exceeds the
-64-KiB control limit; the streamed head carries no transaction rows and remains
-bounded independently of transaction cardinality. Only a complete body with
-matching length and digest reconstructs the original transaction identity and
-file/file/parent order. Dispatch then applies that one transaction once, with
-either all three records visible or none. Corrupt, truncated, and cancelled
-bodies terminate without reconstruction or namespace mutation. The refinement
-also reproduces the r7 integration failure in which the correctly detached
-body reached a namespace route still declaring `None`: route admission rejects
-it before collection. Declaring that route body `Optional` admits the streamed
-transaction while a separate body-free namespace probe remains accepted;
-`Required` would be an incompatible strengthening.
+bounded composition gate for carrying one same-shard
+`DfsNamespaceTransaction` through the canonical authenticated object-RPC
+session. Every modeled transaction uses that same session call with one
+semantic attachment; neither encoded byte count nor a control-head limit
+selects another RPC path. Only a complete length-, digest-, and SOBJ-valid
+attachment can reconstruct the original transaction identity and exact
+file/file/parent record order. Dispatch then applies the reconstructed
+transaction at most once, with either all three records visible or none. A
+corrupt, truncated, or cancelled attachment terminates without reconstruction
+or namespace mutation, and a duplicate application attempt leaves the one
+atomic result unchanged.
 
-The Rust refinement is `split_dfs_message_request_body` plus
-`attach_dfs_message_request_body`: the sender SOBJ-encodes the complete
-`ApplyTransaction` value, leaves an empty-row identity sentinel in the signed
-head, and uses the existing canonical request-body session. The receiver
-collects and validates the body before decoding it, verifies the transaction
-and filesystem identity against the head, and only then dispatches the restored
-operation. The DFS service catalog must advertise request-body mode `Optional`
-for `/dfs/data/namespace`, matching the body splitter without forcing small
-namespace commands out of their inline representation. Concrete transfer-frame chunking, flow-window scheduling, relay
-authentication, retry behavior, and metadata-backend crash recovery remain in
-their existing network and namespace-transaction proof slices.
+The Rust refinement is the composition of a `DfsRoutedCall` attachment with the
+single `ObjectRpcSessionCall` contract. The sender carries a typed transaction
+descriptor and its encoded transaction as the semantic request attachment; the
+receiver validates the attachment before restoring and dispatching the
+`ApplyTransaction` operation. This is not a second transfer API or a payload
+size optimization. Concrete transfer-frame chunking, flow-window scheduling,
+relay authentication, retry behavior, resource exhaustion, and
+metadata-backend crash recovery remain in their existing network and
+namespace-transaction proof slices.
 
 The `dfs_operation_authority_snapshot_reuse_safety.safety` invariant is the
 core-algorithm target for removing repeated cluster-KV snapshot loads and local

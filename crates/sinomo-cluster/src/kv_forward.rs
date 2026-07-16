@@ -12,7 +12,7 @@ use sinomo_network::{
     ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterSignedObjectRpcAsyncHost,
 };
 use sinomo_network::{NetworkDeliveryState, NetworkError};
-use sinomo_network::{ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_network::{ObjectRpcRequest, ObjectRpcResponse, ObjectRpcSessionCall};
 use sinomo_node::NodeId;
 use std::time::{Duration, Instant};
 
@@ -328,10 +328,16 @@ where
         .call_target(
             state,
             target_node_id,
-            &txn_request,
+            ObjectRpcSessionCall::value(txn_request),
             ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
         )
         .await?;
+    if !txn_response.body.is_empty() {
+        return Err(NetworkError::Serialization {
+            detail: "cluster KV transaction returned an unexpected attachment".to_string(),
+        });
+    }
+    let txn_response = txn_response.response;
     txn_response.error_detail()?;
     let txn_response =
         sinomo_kv::decode_cluster_kv_txn_rpc_body(&txn_response.body).map_err(kv_err)?;
@@ -352,11 +358,18 @@ where
         .call_target(
             state,
             target_node_id,
-            &snapshot_request,
+            ObjectRpcSessionCall::value(snapshot_request),
             ClusterObjectRpcOptions::default().with_overall_timeout(snapshot_timeout),
         )
         .await
         .map_err(|error| cluster_kv_forward_post_commit_error("fetch snapshot", error))?;
+    if !snapshot_response.body.is_empty() {
+        return Err(cluster_kv_forward_post_commit_error(
+            "fetch snapshot",
+            "cluster KV snapshot returned an unexpected attachment",
+        ));
+    }
+    let snapshot_response = snapshot_response.response;
     snapshot_response
         .error_detail()
         .map_err(|error| cluster_kv_forward_post_commit_error("fetch snapshot", error))?;

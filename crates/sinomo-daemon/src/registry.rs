@@ -211,6 +211,22 @@ where
             )
         })
         .collect::<Vec<_>>();
+    let handler = move |request: sinomo_core::network::ObjectRpcSessionRequest| {
+        let handler = handler.clone();
+        async move {
+            if !request.body.is_empty() {
+                return Err(sinomo_core::network::NetworkError::Serialization {
+                    detail: format!(
+                        "module route {} does not accept a request attachment",
+                        request.request.route
+                    ),
+                });
+            }
+            handler(request.request)
+                .await
+                .map(sinomo_core::network::ObjectRpcSessionResponse::value)
+        }
+    };
     router.replace_route_set(
         |descriptor| {
             descriptor

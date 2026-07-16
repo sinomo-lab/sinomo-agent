@@ -3,11 +3,7 @@ use crate::client::{
     send_object_rpc_session_to_target_on_runtime_with_daemon_paths_and_options,
 };
 use crate::control::DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL;
-use crate::{
-    DaemonError, DaemonPaths, DaemonRunOptions,
-    send_object_rpc_to_target_async_with_daemon_paths_and_options,
-    send_object_rpc_to_target_on_runtime_with_daemon_paths_and_options,
-};
+use crate::{DaemonError, DaemonPaths, DaemonRunOptions};
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::kv::{KvEntry, KvError, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse};
@@ -99,7 +95,7 @@ fn daemon_dfs_message_kind(message: &sinomo_dfs::DfsNetworkMessage) -> &'static 
 #[derive(Debug)]
 struct DaemonDfsMessageCommandProcessResult {
     response: DfsMessageResponse,
-    body: Option<sinomo_dfs::DfsOutboundBody>,
+    attachment: Option<sinomo_dfs::DfsOutboundAttachment>,
     events: Vec<sinomo_dfs::NetworkedDfsServiceEvent>,
 }
 
@@ -769,9 +765,9 @@ impl DfsPeerTransport for DaemonDfsUnavailablePeerTransport {
     fn call_object_rpc(
         &self,
         _target_node_id: &NodeId,
-        _request: &sinomo_core::network::ObjectRpcRequest,
+        _call: ObjectRpcSessionCall,
         _options: DfsObjectRpcSendOptions,
-    ) -> Result<sinomo_core::network::ObjectRpcResponse, DfsPeerTransportError> {
+    ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
         Err(daemon_dfs_unavailable_peer_transport_error())
     }
 }
@@ -780,35 +776,16 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsUnavailablePeerTransport {
     fn call_object_rpc_async<'a>(
         &'a self,
         _target_node_id: &'a NodeId,
-        _request: &'a sinomo_core::network::ObjectRpcRequest,
+        _call: ObjectRpcSessionCall,
         _options: DfsObjectRpcSendOptions,
-    ) -> sinomo_dfs::DfsPeerTransportFuture<
-        'a,
-        Result<sinomo_core::network::ObjectRpcResponse, DfsPeerTransportError>,
-    > {
+    ) -> sinomo_dfs::DfsPeerTransportFuture<'a, Result<ObjectRpcSessionResult, DfsPeerTransportError>>
+    {
         Box::pin(async { Err(daemon_dfs_unavailable_peer_transport_error()) })
     }
 }
 
 impl DfsPeerTransport for DaemonDfsBlockingPeerTransport {
     fn call_object_rpc(
-        &self,
-        target_node_id: &NodeId,
-        request: &sinomo_core::network::ObjectRpcRequest,
-        options: DfsObjectRpcSendOptions,
-    ) -> Result<sinomo_core::network::ObjectRpcResponse, DfsPeerTransportError> {
-        send_object_rpc_to_target_on_runtime_with_daemon_paths_and_options(
-            &self.paths,
-            target_node_id,
-            request,
-            options.cluster_rpc_options(),
-            &self.runtime,
-            options.observe_connectivity,
-        )
-        .map_err(|source| DfsPeerTransportError::new(source.to_string()))
-    }
-
-    fn call_object_rpc_session(
         &self,
         target_node_id: &NodeId,
         call: ObjectRpcSessionCall,
@@ -828,31 +805,6 @@ impl DfsPeerTransport for DaemonDfsBlockingPeerTransport {
 
 impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsAsyncPeerTransport {
     fn call_object_rpc_async<'a>(
-        &'a self,
-        target_node_id: &'a NodeId,
-        request: &'a sinomo_core::network::ObjectRpcRequest,
-        options: DfsObjectRpcSendOptions,
-    ) -> sinomo_dfs::DfsPeerTransportFuture<
-        'a,
-        Result<sinomo_core::network::ObjectRpcResponse, DfsPeerTransportError>,
-    > {
-        let runtime = self.runtime.clone();
-        let paths = self.paths.clone();
-        Box::pin(async move {
-            send_object_rpc_to_target_async_with_daemon_paths_and_options(
-                &paths,
-                target_node_id,
-                request,
-                options.cluster_rpc_options(),
-                &runtime,
-                options.observe_connectivity,
-            )
-            .await
-            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
-        })
-    }
-
-    fn call_object_rpc_session_async<'a>(
         &'a self,
         target_node_id: &'a NodeId,
         call: ObjectRpcSessionCall,
@@ -1757,7 +1709,7 @@ fn process_daemon_dfs_message_command_on_runtime(
     ));
     let DfsMessageProcessResult {
         response,
-        body,
+        attachment,
         events,
     } = service_lane.service.process_message_command(command)?;
     let deferred_work = if use_read_lane {
@@ -1802,7 +1754,7 @@ fn process_daemon_dfs_message_command_on_runtime(
     }
     Ok(Some(DaemonDfsMessageCommandProcessResult {
         response,
-        body,
+        attachment,
         events,
     }))
 }
@@ -1892,7 +1844,7 @@ async fn handle_daemon_dfs_message_async(
     };
     let DaemonDfsMessageCommandProcessResult {
         response,
-        body,
+        attachment,
         events,
     } = result;
     let should_publish_metadata = sinomo_dfs::dfs_events_should_publish_metadata(&events);
@@ -1934,7 +1886,10 @@ async fn handle_daemon_dfs_message_async(
             trace_started.elapsed().as_millis()
         ),
     );
-    Ok(DfsDataPlaneResponse { response, body })
+    Ok(DfsDataPlaneResponse {
+        response,
+        attachment,
+    })
 }
 
 #[cfg(test)]
@@ -1959,7 +1914,7 @@ fn handle_daemon_dfs_message_on_runtime(
     };
     let DaemonDfsMessageCommandProcessResult {
         response: message_response,
-        body: _,
+        attachment: _,
         events,
     } = result;
     sinomo_dfs::run_cluster_dfs_metadata_publish_after_events_with_peer_transport(

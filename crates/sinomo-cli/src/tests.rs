@@ -206,14 +206,25 @@ impl network::NetworkModule for TestIrohNetworkModule {
         Ok(())
     }
 
-    fn dial_rpc(
+    fn open_rpc_stream(
         &self,
         _endpoint: &ClusterEndpointRecord,
-        request: &[u8],
-        _timeouts: network::DaemonRpcTimeouts,
-    ) -> network::NetworkFuture<Vec<u8>> {
-        let response = request.to_vec();
-        Box::pin(async move { Ok(response) })
+        _health: network::NetworkHealthPolicy,
+    ) -> network::NetworkFuture<Box<dyn network::NetworkDuplexStream>> {
+        Box::pin(async move {
+            let (client, mut server) = tokio::io::duplex(64 * 1024);
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; 8192];
+                loop {
+                    let read = tokio::io::AsyncReadExt::read(&mut server, &mut buffer).await?;
+                    if read == 0 {
+                        return Ok::<(), std::io::Error>(());
+                    }
+                    tokio::io::AsyncWriteExt::write_all(&mut server, &buffer[..read]).await?;
+                }
+            });
+            Ok(Box::new(client) as Box<dyn network::NetworkDuplexStream>)
+        })
     }
 
     fn local_endpoints(&self) -> Result<Vec<ClusterEndpointRecord>, network::NetworkError> {

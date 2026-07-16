@@ -8,8 +8,8 @@ use sinomo_core::node::NodeId;
 use crate::{
     AsyncDfsMessageTransport, DfsCancellationFlag, DfsConflictStatus, DfsControlPlaneKvClient,
     DfsError, DfsFileSystem, DfsMessageTransport, DfsMetadataBackend, DfsMetadataStore,
-    DfsNetworkMessage, DfsOperationalMetrics, DfsRoutedMessage, DfsTransportIdentity,
-    DistributedEventualCoordinator, LocalContentStore, NetworkedDfsService,
+    DfsNetworkMessage, DfsOperationalMetrics, DfsRoutedCall, DfsRoutedMessage,
+    DfsTransportIdentity, DistributedEventualCoordinator, LocalContentStore, NetworkedDfsService,
     NetworkedDfsServiceEvent, build_dfs_routed_message,
 };
 
@@ -96,7 +96,7 @@ where
         let routed_message = self.next_dfs_routed_message(target_node_id, message);
         match self
             .transport
-            .send_routed_message_async(target_node_id, routed_message)
+            .send_routed_call_async(target_node_id, DfsRoutedCall::value(routed_message))
             .await
         {
             Ok(()) => Ok(true),

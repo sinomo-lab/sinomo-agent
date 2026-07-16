@@ -328,7 +328,7 @@ pub fn decode_network_module_sobj<T: DeserializeOwned>(bytes: &[u8]) -> Result<T
     })
 }
 
-/// Structured error returned by a v1 network module's `dial_rpc` function.
+/// Structured error returned while a network module opens or drives an RPC stream.
 ///
 /// Keeping delivery certainty across the dylib boundary is load-bearing: the
 /// route layer may retry another endpoint when bytes were definitely not sent,

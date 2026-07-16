@@ -1249,8 +1249,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let detach_request = !options.wait_for_commit
             && !options.foreground_replica_repair
             && !remote_metadata_primary;
-        let inline_remote_primary_write = remote_metadata_primary
-            && (bytes.len() as u64) <= crate::DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT;
+        let materialized_remote_primary_write = remote_metadata_primary;
         let content_started = Instant::now();
         let manifest_result = if options.wait_for_commit {
             self.content.put_object_version_blob_only_durable(
@@ -1282,7 +1281,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             target_version: target_version.clone(),
             requesting_node_id: self.node_id.clone(),
         };
-        let outcome = if inline_remote_primary_write {
+        let outcome = if materialized_remote_primary_write {
             self.write_distributed_eventual_with_base_and_parent_touch_and_repair_mode(
                 request,
                 Some(object.version.clone()),
@@ -1333,13 +1332,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let distributed_elapsed = distributed_started.elapsed();
         crate::dfs_perf_trace(format_args!(
-            "posix-byte-write node={} path={} object={} version={} bytes={} inline_routed={} content_ms={} distributed_ms={} total_ms={}",
+            "posix-byte-write node={} path={} object={} version={} bytes={} materialized_routed={} content_ms={} distributed_ms={} total_ms={}",
             self.node_id,
             trace_path,
             object.object_id,
             target_version,
             trace_bytes,
-            inline_remote_primary_write,
+            materialized_remote_primary_write,
             content_elapsed.as_millis(),
             distributed_elapsed.as_millis(),
             trace_started.elapsed().as_millis()

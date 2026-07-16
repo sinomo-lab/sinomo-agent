@@ -316,7 +316,6 @@ mod tests {
 
         let response: ObjectRpcResponse = sinomo_core::network::read_object_frame_async(
             &mut reader,
-            sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
             ObjectFrameIoOptions::none(),
         )
         .await

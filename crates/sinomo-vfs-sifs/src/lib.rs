@@ -321,10 +321,9 @@ impl DaemonSifsVfsBackend {
                 .map_err(|source| {
                     daemon_detail_to_vfs(self.backend_name(), path, source.to_string())
                 })?;
-        let response =
-            send_daemon_rpc(&self.address, &request, self.timeout).map_err(|source| {
-                daemon_detail_to_vfs(self.backend_name(), path, source.to_string())
-            })?;
+        let response = sinomo_api::send_daemon_rpc(&self.address, &request, self.timeout).map_err(
+            |source| daemon_detail_to_vfs(self.backend_name(), path, source.to_string()),
+        )?;
         response
             .decode_body()
             .map_err(|source| daemon_detail_to_vfs(self.backend_name(), path, source.to_string()))
@@ -473,59 +472,6 @@ impl VfsBackend for DaemonSifsVfsBackend {
         )?;
         Ok(())
     }
-}
-
-fn send_daemon_rpc(
-    address: &str,
-    request: &ObjectRpcRequest,
-    timeout: Duration,
-) -> std::result::Result<sinomo_core::network::ObjectRpcResponse, sinomo_core::network::NetworkError>
-{
-    let signed = sinomo_core::network::sign_daemon_rpc_request_for_local_node(request)?;
-    let control_request = request.clone().with_auth(signed);
-    block_on_daemon_client(async move {
-        sinomo_core::network::send_daemon_control_rpc_request_async(
-            address,
-            &control_request,
-            sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
-            sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
-        )
-        .await
-    })
-}
-
-fn block_on_daemon_client<F, T>(
-    future: F,
-) -> std::result::Result<T, sinomo_core::network::NetworkError>
-where
-    F: std::future::Future<Output = std::result::Result<T, sinomo_core::network::NetworkError>>
-        + Send,
-    T: Send,
-{
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        return if matches!(
-            handle.runtime_flavor(),
-            tokio::runtime::RuntimeFlavor::MultiThread
-        ) {
-            tokio::task::block_in_place(|| handle.block_on(future))
-        } else {
-            Err(sinomo_core::network::NetworkError::Io {
-                operation: "daemon VFS client runtime".to_string(),
-                detail: "daemon VFS sync client cannot run inside a current-thread Tokio runtime"
-                    .to_string(),
-            })
-        };
-    }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|source| sinomo_core::network::NetworkError::Io {
-            operation: "daemon VFS client runtime".to_string(),
-            detail: source.to_string(),
-        })?;
-    let output = runtime.block_on(future);
-    runtime.shutdown_timeout(Duration::from_millis(250));
-    output
 }
 
 fn write_options_from_append(options: &VfsAppendOptions) -> VfsWriteOptions {

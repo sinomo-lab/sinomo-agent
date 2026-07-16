@@ -1,45 +1,47 @@
-/// Streamed body transport for one oversized same-shard namespace transaction.
+/// Canonical object-RPC session transport for one same-shard namespace transaction.
 ///
-/// Evidence class: core-algorithm transport refinement for moving an encoded
-/// `DfsNamespaceTransaction` out of the bounded object-RPC control head and
-/// into the canonical authenticated request body.
+/// Evidence class: core-algorithm composition refinement for carrying an
+/// encoded `DfsNamespaceTransaction` through the authenticated object-RPC
+/// session used by every request. The attachment is selected because the
+/// transaction is a semantic file-like value, never because its encoding
+/// crosses a byte threshold. There is no alternate RPC or inline fallback in
+/// this model.
 ///
 /// The bounded transaction has two file records followed by one parent record.
-/// The legacy inline representation exceeds the 64 KiB control-frame limit.
-/// The optimized representation sends one small descriptor head and one body;
-/// the receiver collects and validates the complete body before reconstructing
-/// or dispatching the transaction. A complete valid body preserves transaction
-/// identity and record order, and the metadata authority still performs one
-/// atomic application. Corruption, truncation, or cancellation before body
-/// completion cannot expose any transaction record.
+/// The receiver validates the complete attachment before reconstructing or
+/// dispatching the transaction. A valid attachment preserves transaction
+/// identity and record order, and the metadata authority performs one atomic
+/// application. Corruption, truncation, or cancellation before attachment
+/// validation cannot expose any transaction record.
 ///
 /// Concrete SOBJ field sizes, transfer-frame chunking, relay authentication,
-/// retry policy, flow-window scheduling, and metadata-backend recovery are
-/// outside this slice. Existing session and namespace-transaction models own
-/// those contracts; this model covers their composition boundary.
+/// retry policy, flow-window scheduling, resource exhaustion, and
+/// metadata-backend recovery are outside this slice. Existing session and
+/// namespace-transaction models own those contracts; this model covers their
+/// composition boundary.
 module dfs_namespace_transaction_body_transport {
   import common.* from "../../lib/common"
 
-  type NamespaceBodyPhase =
+  type NamespaceSessionPhase =
     | TransactionReady
-    | StreamHeadPrepared
-    | BodyReceiving
-    | BodyValidated
+    | CanonicalSessionPrepared
+    | AttachmentReceiving
+    | AttachmentValidated
+    | TransactionReconstructed
     | TransactionDispatched
     | TransactionApplied
-    | BodyRejected
+    | AttachmentRejected
 
-  type NamespaceBodyIntegrity =
-    | BodyAbsent
-    | BodyExact
-    | BodyCorrupt
-    | BodyTruncated
-    | BodyCancelled
-    | BodyRejectedByRoute
+  type NamespaceAttachmentIntegrity =
+    | AttachmentNotChecked
+    | AttachmentExact
+    | AttachmentCorrupt
+    | AttachmentTruncated
+    | AttachmentCancelled
 
-  type NamespaceRouteBodyMode =
-    | RouteBodyNone
-    | RouteBodyOptional
+  type NamespaceAttachmentRole =
+    | AttachmentRoleUnset
+    | NamespaceTransactionAttachment
 
   type NamespaceTransactionId =
     | TransactionNotReconstructed
@@ -51,27 +53,25 @@ module dfs_namespace_transaction_body_transport {
     | SecondFileRecord
     | ParentRecord
 
-  type NamespaceBodyTransition =
-    | BodyTransportInitialized
-    | OversizedTransactionDetached
-    | LegacyRouteRejectedBody
-    | OptionalRouteBodyContractPublished
-    | OptionalRouteAcceptedNoBodyProbe
-    | StreamHeadAccepted
-    | ExactBodyValidated
-    | CorruptBodyRejected
-    | TruncatedBodyRejected
-    | CancelledBodyRejected
+  type NamespaceSessionTransition =
+    | SessionTransportInitialized
+    | CanonicalSessionCallPrepared
+    | CanonicalAttachmentAccepted
+    | ExactAttachmentValidated
+    | ExactTransactionReconstructed
+    | CorruptAttachmentRejected
+    | TruncatedAttachmentRejected
+    | CancelledAttachmentRejected
     | ValidatedTransactionDispatched
     | AtomicTransactionApplied
-    | BodyTransportStuttered
+    | DuplicateApplicationSuppressed
+    | SessionTransportStuttered
 
-  type NamespaceBodyTransportState = {
-    phase: NamespaceBodyPhase,
-    bodyIntegrity: NamespaceBodyIntegrity,
-    bodyBytes: int,
-    rpcCount: int,
-    headRecordCount: int,
+  type NamespaceSessionTransportState = {
+    phase: NamespaceSessionPhase,
+    attachmentIntegrity: NamespaceAttachmentIntegrity,
+    sessionCount: int,
+    attachmentRole: NamespaceAttachmentRole,
     reconstructedRecordCount: int,
     reconstructedTransactionId: NamespaceTransactionId,
     reconstructedFirst: NamespaceTransactionRecord,
@@ -79,26 +79,16 @@ module dfs_namespace_transaction_body_transport {
     reconstructedThird: NamespaceTransactionRecord,
     transactionApplyCount: int,
     visibleRecordCount: int,
-    routeBodyMode: NamespaceRouteBodyMode,
-    noBodyCompatibilityAccepted: bool,
-    lastTransition: NamespaceBodyTransition,
+    lastTransition: NamespaceSessionTransition,
   }
 
-  /// The concrete failing r6 signed request head was 89,596 bytes. The
-  /// streamed descriptor head budget is deliberately conservative rather than
-  /// claiming an exact encoder size in this abstract model.
-  pure val ControlFrameLimitBytes: int = 65536
-  pure val LegacyInlineHeadBytes: int = 89596
-  pure val StreamedHeadBudgetBytes: int = 16384
-  pure val CompleteBodyBytes: int = 80000
   pure val TransactionRecordCount: int = 3
 
-  pure val initialState: NamespaceBodyTransportState = {
+  pure val initialState: NamespaceSessionTransportState = {
     phase: TransactionReady,
-    bodyIntegrity: BodyAbsent,
-    bodyBytes: 0,
-    rpcCount: 0,
-    headRecordCount: TransactionRecordCount,
+    attachmentIntegrity: AttachmentNotChecked,
+    sessionCount: 0,
+    attachmentRole: AttachmentRoleUnset,
     reconstructedRecordCount: 0,
     reconstructedTransactionId: TransactionNotReconstructed,
     reconstructedFirst: RecordNotReconstructed,
@@ -106,147 +96,125 @@ module dfs_namespace_transaction_body_transport {
     reconstructedThird: RecordNotReconstructed,
     transactionApplyCount: 0,
     visibleRecordCount: 0,
-    routeBodyMode: RouteBodyNone,
-    noBodyCompatibilityAccepted: false,
-    lastTransition: BodyTransportInitialized,
+    lastTransition: SessionTransportInitialized,
   }
 
-  var namespaceBodyTransport: NamespaceBodyTransportState
+  var namespaceSessionTransport: NamespaceSessionTransportState
 
-  action init = namespaceBodyTransport' = initialState
+  action init = namespaceSessionTransport' = initialState
 
-  /// The original atomic transaction becomes one body. The bounded head keeps
-  /// only its descriptor/sentinel and therefore carries zero transaction rows.
-  action detachOversizedTransaction = all {
-    namespaceBodyTransport.phase == TransactionReady,
-    namespaceBodyTransport' = namespaceBodyTransport
-      .with("phase", StreamHeadPrepared)
-      .with("rpcCount", 1)
-      .with("headRecordCount", 0)
-      .with("lastTransition", OversizedTransactionDetached),
+  /// Every encoded namespace transaction enters the same object-RPC session
+  /// contract with one semantic attachment. No size predicate selects this
+  /// action or another transport API.
+  action prepareCanonicalSessionCall = all {
+    namespaceSessionTransport.phase == TransactionReady,
+    namespaceSessionTransport' = namespaceSessionTransport
+      .with("phase", CanonicalSessionPrepared)
+      .with("sessionCount", 1)
+      .with("attachmentRole", NamespaceTransactionAttachment)
+      .with("lastTransition", CanonicalSessionCallPrepared),
   }
 
-  /// The r7 compatibility gap: the transaction was correctly detached, but
-  /// the namespace route still advertised the legacy no-body-only contract.
-  /// Route admission rejects it before collection or DFS dispatch.
-  action rejectDetachedBodyAtLegacyRoute = all {
-    namespaceBodyTransport.phase == StreamHeadPrepared,
-    namespaceBodyTransport.routeBodyMode == RouteBodyNone,
-    namespaceBodyTransport' = namespaceBodyTransport
-      .with("phase", BodyRejected)
-      .with("bodyIntegrity", BodyRejectedByRoute)
-      .with("lastTransition", LegacyRouteRejectedBody),
+  action acceptCanonicalAttachment = all {
+    namespaceSessionTransport.phase == CanonicalSessionPrepared,
+    namespaceSessionTransport.attachmentRole == NamespaceTransactionAttachment,
+    namespaceSessionTransport' = namespaceSessionTransport
+      .with("phase", AttachmentReceiving)
+      .with("lastTransition", CanonicalAttachmentAccepted),
   }
 
-  /// Refinement implemented by the DFS service catalog. Optional, rather than
-  /// Required, is load-bearing: ordinary small namespace requests remain
-  /// inline while oversized ApplyTransaction requests carry one body.
-  action publishOptionalRouteBodyContract = all {
-    namespaceBodyTransport.phase == StreamHeadPrepared,
-    namespaceBodyTransport.routeBodyMode == RouteBodyNone,
-    namespaceBodyTransport' = namespaceBodyTransport
-      .with("routeBodyMode", RouteBodyOptional)
-      .with("lastTransition", OptionalRouteBodyContractPublished),
+  /// Length, digest, and complete SOBJ validation form one abstract gate. No
+  /// transaction row is reconstructed while this gate is in progress.
+  action validateExactAttachment = all {
+    namespaceSessionTransport.phase == AttachmentReceiving,
+    namespaceSessionTransport' = namespaceSessionTransport
+      .with("phase", AttachmentValidated)
+      .with("attachmentIntegrity", AttachmentExact)
+      .with("lastTransition", ExactAttachmentValidated),
   }
 
-  /// A separate body-free compatibility probe remains admissible after the
-  /// route changes to Optional. It does not consume or mutate the modeled
-  /// oversized transaction.
-  action acceptNoBodyCompatibilityProbe = all {
-    namespaceBodyTransport.phase == StreamHeadPrepared,
-    namespaceBodyTransport.routeBodyMode == RouteBodyOptional,
-    not(namespaceBodyTransport.noBodyCompatibilityAccepted),
-    namespaceBodyTransport' = namespaceBodyTransport
-      .with("noBodyCompatibilityAccepted", true)
-      .with("lastTransition", OptionalRouteAcceptedNoBodyProbe),
-  }
-
-  action acceptStreamHead = all {
-    namespaceBodyTransport.phase == StreamHeadPrepared,
-    namespaceBodyTransport.routeBodyMode == RouteBodyOptional,
-    namespaceBodyTransport' = namespaceBodyTransport
-      .with("phase", BodyReceiving)
-      .with("lastTransition", StreamHeadAccepted),
-  }
-
-  /// Collection, length validation, digest validation, and SOBJ decode form
-  /// one abstract gate. Dispatch cannot observe a partial reconstruction.
-  action validateExactBody = all {
-    namespaceBodyTransport.phase == BodyReceiving,
-    namespaceBodyTransport' = namespaceBodyTransport
-      .with("phase", BodyValidated)
-      .with("bodyIntegrity", BodyExact)
-      .with("bodyBytes", CompleteBodyBytes)
+  /// Reconstruction is enabled only by the exact-attachment gate and restores
+  /// the original transaction identity and file/file/parent ordering at once.
+  action reconstructValidatedTransaction = all {
+    namespaceSessionTransport.phase == AttachmentValidated,
+    namespaceSessionTransport.attachmentIntegrity == AttachmentExact,
+    namespaceSessionTransport' = namespaceSessionTransport
+      .with("phase", TransactionReconstructed)
       .with("reconstructedRecordCount", TransactionRecordCount)
       .with("reconstructedTransactionId", OriginalTransaction)
       .with("reconstructedFirst", FirstFileRecord)
       .with("reconstructedSecond", SecondFileRecord)
       .with("reconstructedThird", ParentRecord)
-      .with("lastTransition", ExactBodyValidated),
+      .with("lastTransition", ExactTransactionReconstructed),
   }
 
-  action rejectCorruptBody = all {
-    namespaceBodyTransport.phase == BodyReceiving,
-    namespaceBodyTransport' = namespaceBodyTransport
-      .with("phase", BodyRejected)
-      .with("bodyIntegrity", BodyCorrupt)
-      .with("bodyBytes", CompleteBodyBytes)
-      .with("lastTransition", CorruptBodyRejected),
+  action rejectCorruptAttachment = all {
+    namespaceSessionTransport.phase == AttachmentReceiving,
+    namespaceSessionTransport' = namespaceSessionTransport
+      .with("phase", AttachmentRejected)
+      .with("attachmentIntegrity", AttachmentCorrupt)
+      .with("lastTransition", CorruptAttachmentRejected),
   }
 
-  action rejectTruncatedBody = all {
-    namespaceBodyTransport.phase == BodyReceiving,
-    namespaceBodyTransport' = namespaceBodyTransport
-      .with("phase", BodyRejected)
-      .with("bodyIntegrity", BodyTruncated)
-      .with("bodyBytes", CompleteBodyBytes - 1)
-      .with("lastTransition", TruncatedBodyRejected),
+  action rejectTruncatedAttachment = all {
+    namespaceSessionTransport.phase == AttachmentReceiving,
+    namespaceSessionTransport' = namespaceSessionTransport
+      .with("phase", AttachmentRejected)
+      .with("attachmentIntegrity", AttachmentTruncated)
+      .with("lastTransition", TruncatedAttachmentRejected),
   }
 
-  action rejectCancelledBody = all {
-    namespaceBodyTransport.phase == BodyReceiving,
-    namespaceBodyTransport' = namespaceBodyTransport
-      .with("phase", BodyRejected)
-      .with("bodyIntegrity", BodyCancelled)
-      .with("bodyBytes", 0)
-      .with("lastTransition", CancelledBodyRejected),
+  action rejectCancelledAttachment = all {
+    namespaceSessionTransport.phase == AttachmentReceiving,
+    namespaceSessionTransport' = namespaceSessionTransport
+      .with("phase", AttachmentRejected)
+      .with("attachmentIntegrity", AttachmentCancelled)
+      .with("lastTransition", CancelledAttachmentRejected),
   }
 
   action dispatchValidatedTransaction = all {
-    namespaceBodyTransport.phase == BodyValidated,
-    namespaceBodyTransport' = namespaceBodyTransport
+    namespaceSessionTransport.phase == TransactionReconstructed,
+    namespaceSessionTransport' = namespaceSessionTransport
       .with("phase", TransactionDispatched)
       .with("lastTransition", ValidatedTransactionDispatched),
   }
 
-  /// The existing namespace backend applies this one reconstructed transaction
-  /// atomically; no body-transport chunk becomes an independently visible row.
+  /// The metadata backend applies the reconstructed transaction atomically;
+  /// no transfer frame becomes an independently visible namespace row.
   action applyAtomicTransaction = all {
-    namespaceBodyTransport.phase == TransactionDispatched,
-    namespaceBodyTransport.transactionApplyCount == 0,
-    namespaceBodyTransport' = namespaceBodyTransport
+    namespaceSessionTransport.phase == TransactionDispatched,
+    namespaceSessionTransport.transactionApplyCount == 0,
+    namespaceSessionTransport' = namespaceSessionTransport
       .with("phase", TransactionApplied)
       .with("transactionApplyCount", 1)
       .with("visibleRecordCount", TransactionRecordCount)
       .with("lastTransition", AtomicTransactionApplied),
   }
 
+  /// A repeated delivery or local completion attempt cannot apply the same
+  /// canonical session call twice.
+  action suppressDuplicateApplication = all {
+    namespaceSessionTransport.phase == TransactionApplied,
+    namespaceSessionTransport.transactionApplyCount == 1,
+    namespaceSessionTransport' = namespaceSessionTransport
+      .with("lastTransition", DuplicateApplicationSuppressed),
+  }
+
   action stutter =
-    namespaceBodyTransport' = namespaceBodyTransport
-      .with("lastTransition", BodyTransportStuttered)
+    namespaceSessionTransport' = namespaceSessionTransport
+      .with("lastTransition", SessionTransportStuttered)
 
   action step = any {
-    detachOversizedTransaction,
-    rejectDetachedBodyAtLegacyRoute,
-    publishOptionalRouteBodyContract,
-    acceptNoBodyCompatibilityProbe,
-    acceptStreamHead,
-    validateExactBody,
-    rejectCorruptBody,
-    rejectTruncatedBody,
-    rejectCancelledBody,
+    prepareCanonicalSessionCall,
+    acceptCanonicalAttachment,
+    validateExactAttachment,
+    reconstructValidatedTransaction,
+    rejectCorruptAttachment,
+    rejectTruncatedAttachment,
+    rejectCancelledAttachment,
     dispatchValidatedTransaction,
     applyAtomicTransaction,
+    suppressDuplicateApplication,
     stutter,
   }
 }

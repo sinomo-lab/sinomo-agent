@@ -1,194 +1,180 @@
-/// Safety and bounded reachability for streamed namespace-transaction bodies.
+/// Safety and bounded reachability for canonical namespace-transaction sessions.
 module dfs_namespace_transaction_body_transport_safety {
   import common.* from "../../lib/common"
   import dfs_namespace_transaction_body_transport.* from "../../models/dfs/namespace_transaction_body_transport"
 
   def countersStayBounded: bool = all {
-    namespaceBodyTransport.bodyBytes >= 0,
-    namespaceBodyTransport.bodyBytes <= CompleteBodyBytes,
-    namespaceBodyTransport.rpcCount >= 0,
-    namespaceBodyTransport.rpcCount <= 1,
-    namespaceBodyTransport.headRecordCount >= 0,
-    namespaceBodyTransport.headRecordCount <= TransactionRecordCount,
-    namespaceBodyTransport.reconstructedRecordCount >= 0,
-    namespaceBodyTransport.reconstructedRecordCount <= TransactionRecordCount,
-    namespaceBodyTransport.transactionApplyCount >= 0,
-    namespaceBodyTransport.transactionApplyCount <= 1,
-    namespaceBodyTransport.visibleRecordCount >= 0,
-    namespaceBodyTransport.visibleRecordCount <= TransactionRecordCount,
+    namespaceSessionTransport.sessionCount >= 0,
+    namespaceSessionTransport.sessionCount <= 1,
+    namespaceSessionTransport.reconstructedRecordCount >= 0,
+    namespaceSessionTransport.reconstructedRecordCount <= TransactionRecordCount,
+    namespaceSessionTransport.transactionApplyCount >= 0,
+    namespaceSessionTransport.transactionApplyCount <= 1,
+    namespaceSessionTransport.visibleRecordCount >= 0,
+    namespaceSessionTransport.visibleRecordCount <= TransactionRecordCount,
   }
 
-  /// The failing inline encoding is over the control limit, while detachment
-  /// gives the control plane a fixed bound independent of transaction rows.
-  def oversizedTransactionUsesBoundedHead: bool = all {
-    LegacyInlineHeadBytes > ControlFrameLimitBytes,
-    StreamedHeadBudgetBytes < ControlFrameLimitBytes,
-    namespaceBodyTransport.phase != TransactionReady implies all {
-      namespaceBodyTransport.rpcCount == 1,
-      namespaceBodyTransport.headRecordCount == 0,
+  /// The modeled transaction has exactly one transport path: one canonical
+  /// object-RPC session with a semantic attachment, independent of byte count.
+  def canonicalSessionIsTheOnlyTransportPath: bool = all {
+    namespaceSessionTransport.phase == TransactionReady implies all {
+      namespaceSessionTransport.sessionCount == 0,
+      namespaceSessionTransport.attachmentRole == AttachmentRoleUnset,
+    },
+    namespaceSessionTransport.phase != TransactionReady implies all {
+      namespaceSessionTransport.sessionCount == 1,
+      namespaceSessionTransport.attachmentRole == NamespaceTransactionAttachment,
     },
   }
 
-  /// The legacy route rejects the detached body before decoding. Publishing
-  /// Optional is the minimum refinement that admits the body while retaining
-  /// compatibility with ordinary body-free namespace operations.
-  def routeBodyContractIsExplicitAndBackwardCompatible: bool = all {
-    any {
-      namespaceBodyTransport.phase == BodyReceiving,
-      namespaceBodyTransport.phase == BodyValidated,
-      namespaceBodyTransport.phase == TransactionDispatched,
-      namespaceBodyTransport.phase == TransactionApplied,
-    } implies namespaceBodyTransport.routeBodyMode == RouteBodyOptional,
-    namespaceBodyTransport.bodyIntegrity == BodyRejectedByRoute implies all {
-      namespaceBodyTransport.phase == BodyRejected,
-      namespaceBodyTransport.routeBodyMode == RouteBodyNone,
-      namespaceBodyTransport.reconstructedRecordCount == 0,
-      namespaceBodyTransport.transactionApplyCount == 0,
-      namespaceBodyTransport.visibleRecordCount == 0,
-    },
-    namespaceBodyTransport.noBodyCompatibilityAccepted implies
-      namespaceBodyTransport.routeBodyMode == RouteBodyOptional,
-  }
-
-  /// No partial or invalid body can materialize a dispatchable transaction.
-  def reconstructionRequiresCompleteValidBody: bool =
-    namespaceBodyTransport.reconstructedRecordCount > 0 implies all {
-      namespaceBodyTransport.bodyIntegrity == BodyExact,
-      namespaceBodyTransport.bodyBytes == CompleteBodyBytes,
-      namespaceBodyTransport.reconstructedRecordCount == TransactionRecordCount,
+  /// Validation does not itself make transaction rows observable or even
+  /// reconstruct them. Reconstruction is an all-at-once successor step.
+  def reconstructionRequiresExactAttachment: bool = all {
+    namespaceSessionTransport.reconstructedRecordCount > 0 implies all {
+      namespaceSessionTransport.attachmentIntegrity == AttachmentExact,
+      namespaceSessionTransport.reconstructedRecordCount == TransactionRecordCount,
       any {
-        namespaceBodyTransport.phase == BodyValidated,
-        namespaceBodyTransport.phase == TransactionDispatched,
-        namespaceBodyTransport.phase == TransactionApplied,
+        namespaceSessionTransport.phase == TransactionReconstructed,
+        namespaceSessionTransport.phase == TransactionDispatched,
+        namespaceSessionTransport.phase == TransactionApplied,
       },
-    }
+    },
+    namespaceSessionTransport.phase == AttachmentValidated implies all {
+      namespaceSessionTransport.attachmentIntegrity == AttachmentExact,
+      namespaceSessionTransport.reconstructedRecordCount == 0,
+      namespaceSessionTransport.visibleRecordCount == 0,
+    },
+  }
 
-  /// The body codec is a transport-only change: transaction identity and the
+  /// The attachment codec is transport-only: transaction identity and the
   /// exact file/file/parent order survive reconstruction.
   def reconstructionPreservesIdentityAndOrder: bool =
-    namespaceBodyTransport.reconstructedRecordCount == TransactionRecordCount implies all {
-      namespaceBodyTransport.reconstructedTransactionId == OriginalTransaction,
-      namespaceBodyTransport.reconstructedFirst == FirstFileRecord,
-      namespaceBodyTransport.reconstructedSecond == SecondFileRecord,
-      namespaceBodyTransport.reconstructedThird == ParentRecord,
+    namespaceSessionTransport.reconstructedRecordCount == TransactionRecordCount implies all {
+      namespaceSessionTransport.reconstructedTransactionId == OriginalTransaction,
+      namespaceSessionTransport.reconstructedFirst == FirstFileRecord,
+      namespaceSessionTransport.reconstructedSecond == SecondFileRecord,
+      namespaceSessionTransport.reconstructedThird == ParentRecord,
     }
 
   def dispatchRequiresValidatedExactTransaction: bool =
     any {
-      namespaceBodyTransport.phase == TransactionDispatched,
-      namespaceBodyTransport.phase == TransactionApplied,
+      namespaceSessionTransport.phase == TransactionDispatched,
+      namespaceSessionTransport.phase == TransactionApplied,
     } implies all {
-      namespaceBodyTransport.bodyIntegrity == BodyExact,
-      namespaceBodyTransport.bodyBytes == CompleteBodyBytes,
-      namespaceBodyTransport.reconstructedRecordCount == TransactionRecordCount,
-      namespaceBodyTransport.reconstructedTransactionId == OriginalTransaction,
+      namespaceSessionTransport.attachmentIntegrity == AttachmentExact,
+      namespaceSessionTransport.reconstructedRecordCount == TransactionRecordCount,
+      namespaceSessionTransport.reconstructedTransactionId == OriginalTransaction,
       reconstructionPreservesIdentityAndOrder,
     }
 
-  /// One session body still produces one metadata transaction. Visibility is
-  /// all-or-nothing and application cannot repeat within this request.
+  /// One canonical session produces at most one metadata transaction.
+  /// Visibility is all-or-nothing, including after a duplicate apply attempt.
   def applicationIsAtomicAndAtMostOnce: bool = all {
-    namespaceBodyTransport.transactionApplyCount <= 1,
+    namespaceSessionTransport.transactionApplyCount <= 1,
     any {
-      namespaceBodyTransport.visibleRecordCount == 0,
-      namespaceBodyTransport.visibleRecordCount == TransactionRecordCount,
+      namespaceSessionTransport.visibleRecordCount == 0,
+      namespaceSessionTransport.visibleRecordCount == TransactionRecordCount,
     },
-    namespaceBodyTransport.visibleRecordCount == TransactionRecordCount
-      iff namespaceBodyTransport.phase == TransactionApplied,
-    namespaceBodyTransport.phase == TransactionApplied implies all {
-      namespaceBodyTransport.rpcCount == 1,
-      namespaceBodyTransport.transactionApplyCount == 1,
-      namespaceBodyTransport.visibleRecordCount == TransactionRecordCount,
+    namespaceSessionTransport.visibleRecordCount == TransactionRecordCount
+      iff namespaceSessionTransport.phase == TransactionApplied,
+    namespaceSessionTransport.phase == TransactionApplied implies all {
+      namespaceSessionTransport.sessionCount == 1,
+      namespaceSessionTransport.transactionApplyCount == 1,
+      namespaceSessionTransport.visibleRecordCount == TransactionRecordCount,
     },
   }
 
-  def rejectionNeverMutatesNamespace: bool =
-    namespaceBodyTransport.phase == BodyRejected implies all {
-      namespaceBodyTransport.bodyIntegrity != BodyExact,
-      namespaceBodyTransport.reconstructedRecordCount == 0,
-      namespaceBodyTransport.reconstructedTransactionId == TransactionNotReconstructed,
-      namespaceBodyTransport.transactionApplyCount == 0,
-      namespaceBodyTransport.visibleRecordCount == 0,
+  /// Every attachment integrity failure terminates before reconstruction,
+  /// dispatch, or namespace mutation.
+  def rejectionNeverReconstructsOrMutatesNamespace: bool =
+    namespaceSessionTransport.phase == AttachmentRejected implies all {
+      any {
+        namespaceSessionTransport.attachmentIntegrity == AttachmentCorrupt,
+        namespaceSessionTransport.attachmentIntegrity == AttachmentTruncated,
+        namespaceSessionTransport.attachmentIntegrity == AttachmentCancelled,
+      },
+      namespaceSessionTransport.reconstructedRecordCount == 0,
+      namespaceSessionTransport.reconstructedTransactionId == TransactionNotReconstructed,
+      namespaceSessionTransport.reconstructedFirst == RecordNotReconstructed,
+      namespaceSessionTransport.reconstructedSecond == RecordNotReconstructed,
+      namespaceSessionTransport.reconstructedThird == RecordNotReconstructed,
+      namespaceSessionTransport.transactionApplyCount == 0,
+      namespaceSessionTransport.visibleRecordCount == 0,
     }
 
-  def witnessOversizedInlineHeadIsDetached: bool = all {
-    namespaceBodyTransport.lastTransition == OversizedTransactionDetached,
-    namespaceBodyTransport.phase == StreamHeadPrepared,
-    namespaceBodyTransport.rpcCount == 1,
-    namespaceBodyTransport.headRecordCount == 0,
-    LegacyInlineHeadBytes > ControlFrameLimitBytes,
-    StreamedHeadBudgetBytes < ControlFrameLimitBytes,
+  def witnessCanonicalSessionIsPrepared: bool = all {
+    namespaceSessionTransport.lastTransition == CanonicalSessionCallPrepared,
+    namespaceSessionTransport.phase == CanonicalSessionPrepared,
+    namespaceSessionTransport.sessionCount == 1,
+    namespaceSessionTransport.attachmentRole == NamespaceTransactionAttachment,
   }
 
-  def witnessLegacyRouteRejectsDetachedBody: bool = all {
-    namespaceBodyTransport.lastTransition == LegacyRouteRejectedBody,
-    namespaceBodyTransport.phase == BodyRejected,
-    namespaceBodyTransport.bodyIntegrity == BodyRejectedByRoute,
-    namespaceBodyTransport.routeBodyMode == RouteBodyNone,
-    rejectionNeverMutatesNamespace,
+  def witnessCanonicalAttachmentIsAccepted: bool = all {
+    namespaceSessionTransport.lastTransition == CanonicalAttachmentAccepted,
+    namespaceSessionTransport.phase == AttachmentReceiving,
+    namespaceSessionTransport.attachmentRole == NamespaceTransactionAttachment,
+    namespaceSessionTransport.visibleRecordCount == 0,
   }
 
-  def witnessOptionalRouteAcceptsDetachedBody: bool = all {
-    namespaceBodyTransport.lastTransition == StreamHeadAccepted,
-    namespaceBodyTransport.phase == BodyReceiving,
-    namespaceBodyTransport.routeBodyMode == RouteBodyOptional,
-    namespaceBodyTransport.visibleRecordCount == 0,
+  def witnessExactAttachmentValidatesWithoutVisibility: bool = all {
+    namespaceSessionTransport.lastTransition == ExactAttachmentValidated,
+    namespaceSessionTransport.phase == AttachmentValidated,
+    namespaceSessionTransport.attachmentIntegrity == AttachmentExact,
+    namespaceSessionTransport.reconstructedRecordCount == 0,
+    namespaceSessionTransport.visibleRecordCount == 0,
   }
 
-  def witnessOptionalRouteStillAcceptsNoBody: bool = all {
-    namespaceBodyTransport.lastTransition == OptionalRouteAcceptedNoBodyProbe,
-    namespaceBodyTransport.phase == StreamHeadPrepared,
-    namespaceBodyTransport.routeBodyMode == RouteBodyOptional,
-    namespaceBodyTransport.noBodyCompatibilityAccepted,
-    namespaceBodyTransport.visibleRecordCount == 0,
-  }
-
-  def witnessHealthyBodyValidatesExactly: bool = all {
-    namespaceBodyTransport.lastTransition == ExactBodyValidated,
-    namespaceBodyTransport.phase == BodyValidated,
-    reconstructionRequiresCompleteValidBody,
+  def witnessExactTransactionReconstructsInOrder: bool = all {
+    namespaceSessionTransport.lastTransition == ExactTransactionReconstructed,
+    namespaceSessionTransport.phase == TransactionReconstructed,
+    reconstructionRequiresExactAttachment,
     reconstructionPreservesIdentityAndOrder,
-    namespaceBodyTransport.visibleRecordCount == 0,
+    namespaceSessionTransport.visibleRecordCount == 0,
   }
 
   def witnessHealthyTransactionAppliesAtomically: bool = all {
-    namespaceBodyTransport.lastTransition == AtomicTransactionApplied,
-    namespaceBodyTransport.phase == TransactionApplied,
-    namespaceBodyTransport.transactionApplyCount == 1,
-    namespaceBodyTransport.visibleRecordCount == TransactionRecordCount,
+    namespaceSessionTransport.lastTransition == AtomicTransactionApplied,
+    namespaceSessionTransport.phase == TransactionApplied,
+    namespaceSessionTransport.transactionApplyCount == 1,
+    namespaceSessionTransport.visibleRecordCount == TransactionRecordCount,
     dispatchRequiresValidatedExactTransaction,
   }
 
-  def witnessCorruptBodyIsRejected: bool = all {
-    namespaceBodyTransport.lastTransition == CorruptBodyRejected,
-    namespaceBodyTransport.phase == BodyRejected,
-    namespaceBodyTransport.bodyIntegrity == BodyCorrupt,
-    rejectionNeverMutatesNamespace,
+  def witnessDuplicateApplicationIsSuppressed: bool = all {
+    namespaceSessionTransport.lastTransition == DuplicateApplicationSuppressed,
+    namespaceSessionTransport.phase == TransactionApplied,
+    namespaceSessionTransport.transactionApplyCount == 1,
+    namespaceSessionTransport.visibleRecordCount == TransactionRecordCount,
   }
 
-  def witnessTruncatedBodyIsRejected: bool = all {
-    namespaceBodyTransport.lastTransition == TruncatedBodyRejected,
-    namespaceBodyTransport.phase == BodyRejected,
-    namespaceBodyTransport.bodyIntegrity == BodyTruncated,
-    namespaceBodyTransport.bodyBytes == CompleteBodyBytes - 1,
-    rejectionNeverMutatesNamespace,
+  def witnessCorruptAttachmentIsRejected: bool = all {
+    namespaceSessionTransport.lastTransition == CorruptAttachmentRejected,
+    namespaceSessionTransport.phase == AttachmentRejected,
+    namespaceSessionTransport.attachmentIntegrity == AttachmentCorrupt,
+    rejectionNeverReconstructsOrMutatesNamespace,
   }
 
-  def witnessCancelledBodyIsRejected: bool = all {
-    namespaceBodyTransport.lastTransition == CancelledBodyRejected,
-    namespaceBodyTransport.phase == BodyRejected,
-    namespaceBodyTransport.bodyIntegrity == BodyCancelled,
-    rejectionNeverMutatesNamespace,
+  def witnessTruncatedAttachmentIsRejected: bool = all {
+    namespaceSessionTransport.lastTransition == TruncatedAttachmentRejected,
+    namespaceSessionTransport.phase == AttachmentRejected,
+    namespaceSessionTransport.attachmentIntegrity == AttachmentTruncated,
+    rejectionNeverReconstructsOrMutatesNamespace,
+  }
+
+  def witnessCancelledAttachmentIsRejected: bool = all {
+    namespaceSessionTransport.lastTransition == CancelledAttachmentRejected,
+    namespaceSessionTransport.phase == AttachmentRejected,
+    namespaceSessionTransport.attachmentIntegrity == AttachmentCancelled,
+    rejectionNeverReconstructsOrMutatesNamespace,
   }
 
   def safety: bool = all {
     countersStayBounded,
-    oversizedTransactionUsesBoundedHead,
-    routeBodyContractIsExplicitAndBackwardCompatible,
-    reconstructionRequiresCompleteValidBody,
+    canonicalSessionIsTheOnlyTransportPath,
+    reconstructionRequiresExactAttachment,
     reconstructionPreservesIdentityAndOrder,
     dispatchRequiresValidatedExactTransaction,
     applicationIsAtomicAndAtMostOnce,
-    rejectionNeverMutatesNamespace,
+    rejectionNeverReconstructsOrMutatesNamespace,
   }
 }

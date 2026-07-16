@@ -106,7 +106,9 @@ pub use advisory_lock::{
     DfsAdvisoryLockTransitionContext, DfsAdvisoryLockTransitionError, DfsAdvisoryLockWaiter,
     transition_advisory_lock_state,
 };
-pub use body_rpc::{DfsBodyMessageCommand, DfsBodyMessageResponse, DfsRpcBodyDescriptor};
+pub use body_rpc::{
+    DfsAttachmentMessageCommand, DfsAttachmentMessageResponse, DfsRpcAttachmentDescriptor,
+};
 pub use cluster_service::cluster_dfs_peer_node_ids;
 pub(crate) use cluster_service::{
     object_rpc_request_from_kv_payload, open_cluster_dfs_service_with_message_sender,
@@ -148,19 +150,16 @@ pub use default_cluster::{
     metadata_shard_replica_node_ids, run_default_cluster_dfs_smoke_with_peer_transport,
     stable_dfs_service_node_ids,
 };
+pub(crate) use direct_read::dfs_direct_read_request_from_read_request;
 #[cfg(test)]
 pub(crate) use direct_read::{
-    DFS_DIRECT_READ_STATUS_FOUND, DFS_DIRECT_READ_STATUS_METADATA_KEY, dfs_direct_read_rpc_response,
-};
-pub(crate) use direct_read::{
-    DFS_DIRECT_REMOTE_READ_MAX_BYTES, dfs_direct_read_request_from_read_request,
-    direct_full_read_response_allowed,
+    DFS_DIRECT_READ_STATUS_FOUND, DFS_DIRECT_READ_STATUS_METADATA_KEY,
+    dfs_direct_read_rpc_session_result,
 };
 pub use direct_read::{
-    DfsDirectReadBodyResponse, DfsDirectReadClientBodyData, DfsDirectReadClientBodyResponse,
-    DfsDirectReadClientBodyResult, dfs_direct_read_response_from_rpc_response,
-    dfs_direct_read_response_from_rpc_session_result, dfs_direct_read_rpc_request,
-    handle_dfs_direct_read_body_rpc_request,
+    DfsDirectReadAttachmentResponse, DfsDirectReadClientData, DfsDirectReadClientResponse,
+    DfsDirectReadClientResult, dfs_direct_read_response_from_rpc_session_result,
+    dfs_direct_read_rpc_request, handle_dfs_direct_read_rpc_request,
 };
 pub use discovery::{
     DfsClusterView, DfsNodeAdvertisement, content_service_key, content_services_prefix,
@@ -240,9 +239,11 @@ pub use maintenance::{
 pub(crate) use maintenance::{
     run_cluster_dfs_maintenance_tick, write_legacy_dfs_metadata_replication_cursor,
 };
+pub(crate) use message_transport::materialize_dfs_routed_call_sync;
 pub use message_transport::{
-    AsyncDfsMessageTransport, DfsMessageTransport, DfsMessageTransportFuture, DfsOutboundBody,
-    DfsRoutedBodySend, DfsRoutedBodySendOutcome, DfsTransportIdentity,
+    AsyncDfsMessageTransport, DfsMessageTransport, DfsMessageTransportFuture,
+    DfsOutboundAttachment, DfsRoutedCall, DfsRoutedSend, DfsRoutedSendOutcome,
+    DfsTransportIdentity,
 };
 pub use metadata_api::{
     DfsMetadataBackend, DfsMetadataReplicaIngestPermit, DfsMetadataShardWriteFreeze,
@@ -358,9 +359,8 @@ pub(crate) use namespace::{
 };
 #[cfg(test)]
 pub(crate) use node_transport::{
-    AsyncDfsDirectReadBodySender, AsyncDfsDirectReadSender, AsyncDfsMessageSender,
-    DfsDirectReadSender, async_dfs_direct_read_sender_from_peer_transport,
-    dfs_direct_read_sender_from_peer_transport,
+    AsyncDfsDirectReadSender, AsyncDfsMessageSender, DfsDirectReadSender,
+    async_dfs_direct_read_sender_from_peer_transport, dfs_direct_read_sender_from_peer_transport,
 };
 pub use node_transport::{
     AsyncDfsPeerTransport, DfsNodeDetachedSendState, DfsNodeDetachedSendWorker,
@@ -447,7 +447,6 @@ pub(crate) use routes::{
     build_dfs_routed_message, dfs_network_message_allows_write_repair_progress,
 };
 pub(crate) use service_content::object_content_identity;
-pub(crate) use service_outbound::read_small_blob_from_reader;
 pub(crate) use service_repair::DFS_PENDING_TRANSFER_STALE_AFTER;
 pub use service_sync::{
     DEFAULT_DFS_POSIX_SYNC_TIMEOUT, DfsMetadataQuorumSyncCertificate,
@@ -468,19 +467,19 @@ pub use service::{
     DfsDataPlaneService, DfsService, register_data_plane_services, register_services,
 };
 pub(crate) use service_state::{
-    ActiveReplicaStage, DFS_BLOB_INLINE_LIMIT_BYTES, DFS_CONFLICT_SCAN_PAGE_SIZE,
-    DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES, DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT,
-    DFS_MAX_NESTED_NAMESPACE_COORDINATION_DEPTH, DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE,
-    DFS_METADATA_OBJECT_INTENT_PAGE_SIZE, DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
-    DFS_METADATA_OBJECT_VERSION_PAGE_SIZE, DFS_REMOTE_READ_RETRY_DELAY,
-    DFS_ROUTED_NAMESPACE_IDLE_WAIT, DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT,
+    ActiveReplicaStage, DFS_CONFLICT_SCAN_PAGE_SIZE, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES,
+    DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT, DFS_MAX_NESTED_NAMESPACE_COORDINATION_DEPTH,
+    DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE, DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
+    DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE, DFS_METADATA_OBJECT_VERSION_PAGE_SIZE,
+    DFS_REMOTE_READ_RETRY_DELAY, DFS_ROUTED_NAMESPACE_IDLE_WAIT,
+    DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT,
     DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BYTE_LIMIT,
     DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_ENTRY_LIMIT, DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
-    DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT, DFS_ROUTED_WRITE_RESPONSE_JOURNAL_BATCH_LIMIT,
-    NetworkedDfsRangeReadStream, NetworkedDfsRangeReadStreamOutcome, NetworkedDfsReadStream,
-    NetworkedDfsReadStreamOutcome, PendingMetadataAuthorityProbe, PendingMetadataReplication,
-    PendingRemoteWriteResponse, PendingRoutedNamespaceOp, PendingRoutedNamespaceResult,
-    PendingRoutedWrite, StageBlobSendOutcome, retained_networked_dfs_service_events,
+    DFS_ROUTED_WRITE_RESPONSE_JOURNAL_BATCH_LIMIT, NetworkedDfsRangeReadStream,
+    NetworkedDfsRangeReadStreamOutcome, NetworkedDfsReadStream, NetworkedDfsReadStreamOutcome,
+    PendingMetadataAuthorityProbe, PendingMetadataReplication, PendingRemoteWriteResponse,
+    PendingRoutedNamespaceOp, PendingRoutedNamespaceResult, PendingRoutedWrite,
+    StageBlobSendOutcome, retained_networked_dfs_service_events,
 };
 pub use service_state::{
     DFS_ROUTED_NAMESPACE_OP_TIMEOUT, DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT, DfsCancellationFlag,

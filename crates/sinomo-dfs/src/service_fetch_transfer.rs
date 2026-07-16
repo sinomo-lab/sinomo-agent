@@ -2,7 +2,7 @@
 //!
 //! Fetch transfers move blob bytes from an already-durable replica back to a
 //! node that needs them before staging or repairing a pending write. This
-//! module owns fetch requests, inline and reader-backed responses, and the
+//! module owns fetch requests, reader-backed responses, and the
 //! retry wakeups that follow successful or failed fetches.
 
 use sinomo_core::node::NodeId;
@@ -42,33 +42,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut sent_body_response = false;
         let result = match open_result {
             Ok((total_size_bytes, reader)) => {
-                if total_size_bytes > DFS_BLOB_INLINE_LIMIT_BYTES as u64 {
-                    self.send_fetch_blob_response_body(
-                        &requester_node_id,
-                        &command,
-                        reader,
-                        total_size_bytes,
-                    )?;
-                    sent_body_response = true;
-                    DfsFetchBlobResult::Found {
-                        content_hash: command.content_hash.clone(),
-                        bytes: Vec::new(),
-                    }
-                } else {
-                    let mut reader = reader;
-                    match read_small_blob_from_reader(
-                        &command.content_hash,
-                        total_size_bytes,
-                        &mut reader,
-                    ) {
-                        Ok(bytes) => DfsFetchBlobResult::Found {
-                            content_hash: command.content_hash.clone(),
-                            bytes,
-                        },
-                        Err(error) => DfsFetchBlobResult::Rejected {
-                            reason: error.to_string(),
-                        },
-                    }
+                self.send_fetch_blob_response_attachment(
+                    &requester_node_id,
+                    &command,
+                    reader,
+                    total_size_bytes,
+                )?;
+                sent_body_response = true;
+                DfsFetchBlobResult::Found {
+                    content_hash: command.content_hash.clone(),
+                    bytes: Vec::new(),
                 }
             }
             Err(DfsError::ContentStore { .. }) => DfsFetchBlobResult::NotFound,
@@ -120,7 +103,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    fn send_fetch_blob_response_body(
+    fn send_fetch_blob_response_attachment(
         &mut self,
         requester_node_id: &NodeId,
         command: &DfsFetchBlobCommand,
@@ -140,10 +123,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         });
         let routed = self.next_dfs_routed_message(requester_node_id, message);
         self.transport
-            .send_routed_message_with_body(
+            .send_routed_call(
                 requester_node_id,
-                routed,
-                DfsOutboundBody::from_reader(reader, total_size_bytes, &command.content_hash),
+                DfsRoutedCall::with_attachment(
+                    routed,
+                    DfsOutboundAttachment::from_reader(
+                        reader,
+                        total_size_bytes,
+                        &command.content_hash,
+                    ),
+                ),
             )
             .map_err(DfsError::from_network)
     }

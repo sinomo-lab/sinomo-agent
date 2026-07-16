@@ -12,11 +12,10 @@ mod paths;
 mod status;
 
 pub use client::{
-    DAEMON_API_CLUSTER_CONTROL_TIMEOUT, DAEMON_API_PROBE_TIMEOUT, DaemonApiClient,
-    DaemonDfsPeerTransport, RemoteConfigClient, send_daemon_rpc, send_daemon_rpc_async,
-    send_daemon_rpc_on_runtime, send_daemon_rpc_raw, send_daemon_rpc_raw_with_timeouts,
-    send_daemon_rpc_stream, send_daemon_rpc_stream_async,
-    send_daemon_rpc_stream_from_data_dir_async, send_daemon_rpc_with_timeouts,
+    DAEMON_API_PROBE_TIMEOUT, DaemonApiClient, DaemonDfsPeerTransport, RemoteConfigClient,
+    send_daemon_rpc, send_daemon_rpc_async, send_daemon_rpc_on_runtime, send_daemon_rpc_stream,
+    send_daemon_rpc_stream_async, send_daemon_rpc_stream_from_data_dir_async,
+    send_daemon_rpc_with_timeouts,
 };
 pub use error::DaemonApiError;
 pub use idle_stats::IdleStatsSnapshot;

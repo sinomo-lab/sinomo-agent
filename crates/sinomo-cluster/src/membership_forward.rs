@@ -10,7 +10,9 @@ use sinomo_network::{
     ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterSignedObjectRpcAsyncHost,
 };
 use sinomo_network::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase};
-use sinomo_network::{ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_network::{
+    ObjectRpcRequest, ObjectRpcResponse, ObjectRpcSessionCall, ObjectRpcSessionResult,
+};
 use sinomo_node::NodeId;
 use std::future::Future;
 use std::time::{Duration, Instant as StdInstant};
@@ -208,11 +210,17 @@ async fn forward_cluster_membership_rpc_to_state_authority_async_with_timeout(
                 "while routing to node {} via {} ({:?})",
                 target.node_id, target.address, target.transport
             ),
-            client.call_target(state, &target.node_id, request, options),
+            client.call_target(
+                state,
+                &target.node_id,
+                ObjectRpcSessionCall::value(request.clone()),
+                options,
+            ),
         )
         .await
         {
-            MembershipForwardAttemptOutcome::Completed(Ok(response)) => {
+            MembershipForwardAttemptOutcome::Completed(Ok(result)) => {
+                let response = membership_forward_value_response(result)?;
                 membership_forward_trace(format_args!(
                     "membership forward routed node {} via {} ({:?}) ok in {:?}",
                     target.node_id,
@@ -274,11 +282,17 @@ async fn forward_cluster_membership_rpc_to_state_authority_async_with_timeout(
                     "while sending directly to node {} via {} ({:?})",
                     target.node_id, target.address, target.transport
                 ),
-                direct_client.call_endpoint(target, request, options),
+                direct_client.call_endpoint(
+                    state,
+                    target,
+                    ObjectRpcSessionCall::value(request.clone()),
+                    options,
+                ),
             )
             .await
             {
-                MembershipForwardAttemptOutcome::Completed(Ok(response)) => {
+                MembershipForwardAttemptOutcome::Completed(Ok(result)) => {
+                    let response = membership_forward_value_response(result)?;
                     membership_forward_trace(format_args!(
                         "membership forward direct node {} via {} ({:?}) ok in {:?}",
                         target.node_id,
@@ -322,6 +336,21 @@ async fn forward_cluster_membership_rpc_to_state_authority_async_with_timeout(
         }
     }
     Err(membership_forward_failure(failure_detail, &failures))
+}
+
+fn membership_forward_value_response(
+    result: ObjectRpcSessionResult,
+) -> Result<ObjectRpcResponse, NetworkError> {
+    let (response, body) = result.into_parts();
+    if !body.is_empty() {
+        return Err(NetworkError::Serialization {
+            detail: format!(
+                "cluster membership RPC route {} returned an unexpected attachment",
+                response.route
+            ),
+        });
+    }
+    Ok(response)
 }
 
 fn membership_forward_failure(failure_detail: &str, failures: &[String]) -> NetworkError {

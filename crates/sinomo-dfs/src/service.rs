@@ -20,7 +20,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::direct_read::handle_dfs_direct_read_body_rpc_request_with_initialized_content_store;
+use crate::direct_read::handle_dfs_direct_read_rpc_request_with_initialized_content_store;
 use crate::local_state::open_cluster_aware_dfs_metadata_backend_for_inspection;
 use crate::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_PLANE_SERVICE_ROUTES, DFS_DIRECT_READ_ROUTE,
@@ -29,17 +29,15 @@ use crate::{
     DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMessageCommand, DfsMessageResponse,
     DfsMetadataBackend, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
     DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
-    DfsOperatorInspector, DfsOperatorStatus, DfsOutboundBody, DfsSmokeReport, LocalContentStore,
-    decode_dfs_message_rpc_request, default_dfs_metadata_root, default_dfs_metadata_shards_root,
-    dfs_module_surfaces, dfs_route_is_message_data_plane,
+    DfsOperatorInspector, DfsOperatorStatus, DfsOutboundAttachment, DfsSmokeReport,
+    LocalContentStore, decode_dfs_message_rpc_request, default_dfs_metadata_root,
+    default_dfs_metadata_shards_root, dfs_module_surfaces, dfs_route_is_message_data_plane,
     ensure_default_cluster_aware_dfs_expose_config, inspect_cluster_aware_dfs_status,
     metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
     resolve_dfs_conflicts, sifs_file_system_id, use_dfs_conflict_version,
 };
 use sinomo_core::local::SinomoDataDir;
-use sinomo_core::network::{
-    ClusterPaths, ObjectRpcBodySource, ObjectRpcRequest, ObjectRpcResponse,
-};
+use sinomo_core::network::{ClusterPaths, ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_core::node::NodeId;
 
 use sinomo_core::service::{
@@ -177,14 +175,14 @@ pub trait DfsDataPlaneHost: Send + Sync {
 #[derive(Debug)]
 pub struct DfsDataPlaneResponse {
     pub response: DfsMessageResponse,
-    pub body: Option<DfsOutboundBody>,
+    pub attachment: Option<DfsOutboundAttachment>,
 }
 
 impl DfsDataPlaneResponse {
-    pub fn buffered(response: DfsMessageResponse) -> Self {
+    pub fn value(response: DfsMessageResponse) -> Self {
         Self {
             response,
-            body: None,
+            attachment: None,
         }
     }
 }
@@ -366,19 +364,20 @@ impl Service for DfsDataPlaneService {
                     let authenticated_source_node_id =
                         authenticated_dfs_cluster_source_node_id(&ctx, route)?;
                     let traceparent = request.traceparent().map(ToString::to_string);
-                    let request_body = ctx.take_request_body();
-                    let command = if request_body.is_empty() {
+                    let request_attachment = ctx.take_request_body();
+                    let command = if request_attachment.is_empty() {
                         decode_dfs_message_rpc_request(&request)?
                     } else {
-                        let head = crate::body_rpc::decode_dfs_body_message_rpc_request(&request)?;
+                        let head =
+                            crate::body_rpc::decode_dfs_attachment_message_rpc_request(&request)?;
                         let max_bytes =
-                            usize::try_from(head.body.total_size_bytes).map_err(|_| {
+                            usize::try_from(head.attachment.total_size_bytes).map_err(|_| {
                                 ServiceError::Service(format!(
-                                    "DFS request body for {route} is too large for this platform"
+                                    "DFS request attachment for {route} does not fit this platform address space"
                                 ))
                             })?;
-                        let bytes = request_body.collect_to_vec(max_bytes).await?;
-                        crate::body_rpc::attach_dfs_message_request_body(head, bytes)?
+                        let bytes = request_attachment.collect_to_vec(max_bytes).await?;
+                        crate::body_rpc::attach_dfs_message_request_attachment(head, bytes)?
                     };
                     if command.routed_message.source_node_id != authenticated_source_node_id {
                         return Err(ServiceError::Service(format!(
@@ -391,22 +390,13 @@ impl Service for DfsDataPlaneService {
                         .handle_message(command, traceparent)
                         .await
                         .map_err(service_error)?;
-                    if let Some(body) = message_response.body {
-                        let response = crate::body_rpc::encode_dfs_body_message_rpc_response(
+                    if let Some(attachment) = message_response.attachment {
+                        let response = crate::body_rpc::encode_dfs_attachment_message_rpc_response(
                             route,
                             message_response.response,
-                            body.descriptor,
+                            attachment.descriptor,
                         )?;
-                        ctx.respond_with_body(response, body.source)?;
-                        return Ok(ServiceDisposition::Continue);
-                    }
-                    if let Some((head, descriptor, bytes)) =
-                        crate::body_rpc::split_dfs_message_response_body(&message_response.response)
-                    {
-                        let response = crate::body_rpc::encode_dfs_body_message_rpc_response(
-                            route, head, descriptor,
-                        )?;
-                        ctx.respond_with_body(response, ObjectRpcBodySource::bytes(bytes))?;
+                        ctx.respond_with_body(response, attachment.source)?;
                         return Ok(ServiceDisposition::Continue);
                     }
                     ObjectRpcResponse::encode_body(route, &message_response.response)?
@@ -414,11 +404,11 @@ impl Service for DfsDataPlaneService {
                 DFS_DIRECT_READ_ROUTE => {
                     let content = service.content_store_for(&ctx.data_dir)?;
                     let response =
-                        handle_dfs_direct_read_body_rpc_request_with_initialized_content_store(
+                        handle_dfs_direct_read_rpc_request_with_initialized_content_store(
                             &content, request,
                         )
                         .map_err(service_error)?;
-                    ctx.respond_with_body(response.response, response.body)?;
+                    ctx.respond_with_body(response.response, response.attachment)?;
                     return Ok(ServiceDisposition::Continue);
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
@@ -747,7 +737,7 @@ mod tests {
                     .lock()
                     .expect("message traceparents")
                     .push(traceparent);
-                Ok(DfsDataPlaneResponse::buffered(DfsMessageResponse {
+                Ok(DfsDataPlaneResponse::value(DfsMessageResponse {
                     request_id: command.request_id,
                     outbound_messages: Vec::new(),
                 }))
@@ -887,86 +877,7 @@ mod tests {
         assert_eq!(
             namespace.request_body_mode,
             ServiceBodyMode::Optional,
-            "small namespace commands stay inline while oversized atomic transactions use the streamed RPC body"
-        );
-    }
-
-    #[tokio::test]
-    async fn dfs_namespace_route_accepts_streamed_atomic_transaction_body() {
-        let host = Arc::new(StubDfsDataPlaneHost::default());
-        let registry =
-            register_data_plane_services(ServiceRegistry::builder(), host.clone()).build();
-        let source = NodeId::from_legacy_named("namespace-body-service-source")
-            .expect("namespace body source");
-        let target = NodeId::from_legacy_named("namespace-body-service-target")
-            .expect("namespace body target");
-        let file_system_id = sifs_file_system_id();
-        let transaction = crate::DfsNamespaceTransaction {
-            transaction_id: "namespace-body-service-transaction".to_string(),
-            file_system_id: file_system_id.clone(),
-            objects: Vec::new(),
-            versions: Vec::new(),
-            advisory_lock_states: Vec::new(),
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
-        let command = DfsMessageCommand {
-            request_id: "namespace-body-service-request".to_string(),
-            routed_message: crate::DfsRoutedMessage {
-                source_node_id: source.clone(),
-                target_node_id: target,
-                frame_id: 41,
-                message_id: 43,
-                message: crate::DfsNetworkMessage::NamespaceRequest(crate::DfsNamespaceCommand {
-                    request_id: "namespace-body-service-apply".to_string(),
-                    file_system_id,
-                    requesting_node_id: source.clone(),
-                    include_metadata_journal_batches: false,
-                    metadata_journal_after_sequences: Vec::new(),
-                    authority_shards: Vec::new(),
-                    operation: crate::DfsNamespaceOperation::ApplyTransaction { transaction },
-                }),
-            },
-        };
-        let inline_request = crate::dfs_message_rpc_request(&command).expect("inline request");
-        let (head, descriptor, bytes) = crate::body_rpc::split_dfs_message_request_body(&command)
-            .expect("split namespace body")
-            .expect("namespace transaction body");
-        let request =
-            crate::body_rpc::encode_dfs_body_message_rpc_request(&inline_request, head, descriptor)
-                .expect("body-aware namespace request");
-        let sink = VecSink::default();
-        let frames = Arc::clone(&sink.frames);
-        let (_root, data_dir) = temp_data_dir();
-        let ctx = ServiceContext::new(
-            data_dir,
-            None,
-            ServiceSigner::LocalNode {
-                node_id: source.to_string(),
-                public_key: "pk-namespace-body-service-source".to_string(),
-            },
-            sinomo_core::network::ObjectRpcIncomingBody::bytes(bytes),
-            Box::new(sink),
-        );
-
-        let disposition = registry
-            .dispatch(ctx, request)
-            .await
-            .expect("streamed namespace request dispatch");
-        assert_eq!(disposition, ServiceDisposition::Continue);
-        let response = frames
-            .lock()
-            .expect("response frames")
-            .pop()
-            .expect("namespace response")
-            .response;
-        let decoded: DfsMessageResponse = response.decode_body().expect("namespace response body");
-        assert_eq!(decoded.request_id, command.request_id);
-        assert_eq!(
-            host.message_request_ids
-                .lock()
-                .expect("message request ids")
-                .as_slice(),
-            ["namespace-body-service-request"]
+            "namespace commands use the canonical value path; explicit DFS attachments remain optional"
         );
     }
 
@@ -976,7 +887,7 @@ mod tests {
         data_dir.ensure_root_layout().expect("root layout");
         let object_id = DfsObjectId::generate();
         let version = DfsVersion::generate();
-        let bytes = (0..(crate::DFS_BLOB_INLINE_LIMIT_BYTES + 16 * 1024))
+        let bytes = (0..(2 * 1024 * 1024 + 16 * 1024))
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
         let content =

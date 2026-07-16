@@ -12,9 +12,9 @@ use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest};
 use crate::{
     DfsError, DfsFileSystem, DfsMessageTransport, DfsMetadataStore, DfsNetworkMessage, DfsObjectId,
     DfsObjectMetadata, DfsReadData, DfsReadOutcome, DfsReadRangeData, DfsReadRequest,
-    DfsReadResponse, DfsReadResult, DfsServiceEvent, DfsWriteCommand, DfsWriteOutcome,
-    DfsWriteResponse, DfsWriteResult, ReadRouteAction, WriteRouteAction, build_dfs_routed_message,
-    content_hash,
+    DfsReadResponse, DfsReadResult, DfsRoutedCall, DfsServiceEvent, DfsWriteCommand,
+    DfsWriteOutcome, DfsWriteResponse, DfsWriteResult, ReadRouteAction, WriteRouteAction,
+    build_dfs_routed_message, content_hash,
 };
 
 #[derive(Clone, Debug)]
@@ -410,7 +410,7 @@ impl<T: DfsMessageTransport> LocalOwnedDfsService<T> {
         self.next_message_id += 1;
 
         self.transport
-            .send_routed_message(target_node_id, routed_message)
+            .send_routed_call(target_node_id, DfsRoutedCall::value(routed_message))
             .map_err(DfsError::from_network)
     }
 

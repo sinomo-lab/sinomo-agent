@@ -42,7 +42,6 @@ mod tcp_tunnel;
 // Framing and transfer state stay private beneath the canonical session API so
 // higher-level crates cannot assemble protocol frames themselves.
 mod transfer;
-mod unary;
 
 pub use connectivity::cluster_network_record_live;
 pub use connectivity::{
@@ -81,9 +80,8 @@ pub use connectivity_store::{
 pub use daemon_auth::{
     DAEMON_AUTH_PROTOCOL, SignedDaemonCommand, daemon_auth_decode_public_key,
     daemon_auth_encode_public_key, daemon_auth_signing_payload, daemon_rpc_body_sha256,
-    daemon_rpc_legacy_body_sha256, sign_daemon_rpc_request_digest_for_local_node,
-    sign_daemon_rpc_request_digest_from_data_dir, sign_daemon_rpc_request_for_local_node,
-    sign_daemon_rpc_request_from_data_dir,
+    sign_daemon_rpc_request_digest_for_local_node, sign_daemon_rpc_request_digest_from_data_dir,
+    sign_daemon_rpc_request_for_local_node, sign_daemon_rpc_request_from_data_dir,
 };
 pub use directory::{
     ClusterDirectory, ClusterDirectoryFactory, DirectoryVersion, EmptyClusterDirectory,
@@ -114,8 +112,8 @@ pub use endpoint_selector::{
     cluster_node_blocks_leader_preference, cluster_node_blocks_leader_preference_async,
 };
 pub use endpoint_selector::{
-    ClusterEndpointSelectionPurpose, ClusterEndpointSelector, ClusterEndpointTransferProfile,
-    ClusterRouteTransferProfile, cluster_endpoint_can_carry_main_daemon_rpc,
+    ClusterEndpointSelectionPurpose, ClusterEndpointSelector,
+    cluster_endpoint_can_carry_main_daemon_rpc,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use endpoint_selector::{
@@ -194,41 +192,26 @@ pub use transfer::{NetworkCallPolicy, NetworkHealthPolicy};
 // Unconditional since stage C: dylib network modules reuse the object frame
 // codec through the sinomo-core facade.
 pub use object::read_object_frame_async;
-pub(crate) use object::send_daemon_control_request_async;
 pub use object::write_object_frame_async;
 pub use object::{
-    AsyncDaemonControlListener, AsyncDaemonControlStream, DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
-    DEFAULT_NETWORK_TIMEOUT, DaemonControlRequest, DaemonControlResponse, DaemonRpcTimeouts,
-    ObjectFrameIoOptions, SinomoObjectCodec, send_daemon_control_rpc_request_async,
-    write_borrowed_object_frame_async,
+    AsyncDaemonControlListener, AsyncDaemonControlStream, DEFAULT_NETWORK_TIMEOUT,
+    DaemonControlRequest, DaemonControlResponse, DaemonRpcTimeouts, ObjectFrameIoOptions,
+    SinomoObjectCodec, write_borrowed_object_frame_async,
 };
 // Unconditional since stage C: see read_object_frame_async above.
-pub use object::{
-    OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL, decode_single_object_frame_from_slice,
-    encode_object_frame_to_vec,
-};
+pub use object::{decode_single_object_frame_from_slice, encode_object_frame_to_vec};
 pub use paths::ClusterPaths;
 pub use peer::{
     AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions, InProcessNetwork,
     InProcessTransport,
 };
-pub use roaming::{
-    open_daemon_rpc_stream_to_cluster_endpoint_async,
-    send_daemon_rpc_response_to_cluster_endpoint_async, send_daemon_rpc_to_cluster_endpoint_async,
-};
+pub use roaming::open_daemon_rpc_stream_to_cluster_endpoint_async;
 pub use route::{
     CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY, CLUSTER_ROUTING_RPC_ROUTE_METADATA,
-    ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterRelayAsyncHost, ClusterRelayOptions,
-    ClusterRelaySessionRequestAction, ClusterSignedObjectRpcAsyncHost,
-    ClusterSignedObjectRpcFuture, ClusterSignedObjectRpcObservation, RelayEnvelope,
-    cluster_object_rpc_effective_route_timeout, cluster_relay_session_request_action,
-    handle_cluster_relay_async_with_host, relay_request_inner_route,
-    relay_response_is_routing_error,
-};
-#[cfg(any(test, feature = "test-support"))]
-pub use route::{
-    SignedObjectRpcRequestHeadEncodedLengths,
-    signed_object_rpc_request_head_encoded_lengths_for_test,
+    ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterRelaySessionRequestAction,
+    ClusterSignedObjectRpcAsyncHost, ClusterSignedObjectRpcFuture,
+    ClusterSignedObjectRpcObservation, RelayEnvelope, cluster_relay_session_request_action,
+    relay_request_inner_route, relay_response_is_routing_error,
 };
 pub use rpc::{
     CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_HEALTH_RPC_ROUTE_METADATA,
@@ -241,12 +224,9 @@ pub use rpc::{
     ObjectRpcAuthorizationContext, ObjectRpcAuthorizationLayer, ObjectRpcBodyMode,
     ObjectRpcCancelRequest, ObjectRpcCancelResponse, ObjectRpcCategoryDefinition, ObjectRpcRequest,
     ObjectRpcResponse, ObjectRpcRouteCatalog, ObjectRpcRoutePolicyLayer, ObjectRpcRouteReadiness,
-    ObjectRpcRouteRegistry, ObjectRpcRouteRegistryBuilder, ObjectRpcRouter, ServiceCatalog,
-    ServiceCatalogSnapshot, ServiceCategory, call_object_rpc_service_async,
-    call_object_rpc_session_service_async,
+    ObjectRpcRouteRegistry, ObjectRpcRouteRegistryBuilder, ObjectRpcRouter, ObjectRpcSessionFuture,
+    ServiceCatalog, ServiceCatalogSnapshot, ServiceCategory, call_object_rpc_session_service_async,
 };
-#[cfg(any(test, feature = "test-support"))]
-pub use rpc::{call_object_rpc_frame_async, serve_object_rpc_frame_async};
 pub use rpc_future::ClusterMembershipRpcFuture;
 pub use session::{
     NetworkDuplexStream, ObjectRpcBodySource, ObjectRpcIncomingBody, ObjectRpcSessionCall,
@@ -261,7 +241,6 @@ pub use tcp_tunnel::{
     CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION, CLUSTER_TCP_TUNNEL_RPC_CATEGORY, ClusterTcpTunnelFrame,
     ClusterTcpTunnelOpenRequest, ClusterTcpTunnelOpenResponse,
 };
-pub use unary::{ObjectRpcUnarySessionAdapter, ObjectRpcUnarySessionAdapterLayer};
 
 pub type ClusterEndpointId = sinomo_base::Id;
 
@@ -669,5 +648,3 @@ pub use route::cluster_delivery_routing_table_cache_mark;
 pub use route::cluster_delivery_shortest_path_next_hop;
 #[cfg(any(test, feature = "test-support"))]
 pub use route_graph_read_model::cluster_route_graph_cache_mark;
-#[cfg(any(test, feature = "test-support"))]
-pub use rpc::ObjectRpcFuture;

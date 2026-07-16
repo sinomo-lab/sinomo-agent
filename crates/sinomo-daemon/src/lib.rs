@@ -163,15 +163,11 @@ pub use auth::{
     daemon_rpc_body_sha256, sign_daemon_rpc_request_digest_for_local_node,
     sign_daemon_rpc_request_for_local_node, sign_daemon_rpc_request_from_data_dir,
 };
-#[cfg(test)]
-pub(crate) use client::send_daemon_rpc_raw;
 pub(crate) use client::{
     DaemonSignedObjectRpcAsyncHost, cluster_paths_from_env,
     fetch_cluster_kv_snapshot_from_endpoint_on_runtime,
     fetch_daemon_status_from_endpoint_on_runtime, send_cluster_member_publish_async,
     send_cluster_raft_append_on_runtime, send_cluster_raft_vote_on_runtime,
-    send_object_rpc_to_target_async_with_daemon_paths_and_options,
-    send_object_rpc_to_target_on_runtime_with_daemon_paths_and_options,
 };
 pub use client::{
     RemoteConfigClient, fetch_daemon_status_from_address, fetch_daemon_status_from_endpoint,
@@ -190,12 +186,12 @@ pub use client::{
     send_daemon_rollout_diagnostics_to_endpoint, send_daemon_rollout_native_dylib_module,
     send_daemon_rollout_native_dylib_module_to_endpoint, send_daemon_rpc, send_daemon_rpc_async,
     send_daemon_rpc_stream, send_daemon_rpc_stream_async, send_daemon_rpc_to_endpoint,
-    send_daemon_rpc_to_endpoint_async,
-    send_daemon_rpc_to_endpoint_with_rollout_legacy_compatibility,
-    send_daemon_rpc_to_endpoint_with_timeouts, send_daemon_rpc_with_rollout_legacy_compatibility,
+    send_daemon_rpc_to_endpoint_async, send_daemon_rpc_to_endpoint_with_timeouts,
     send_daemon_rpc_with_timeouts, send_daemon_shutdown_request,
     send_dfs_metadata_journal_batch_to_endpoint_async,
-    send_dfs_metadata_snapshot_install_to_endpoint_async, send_object_rpc_to_target,
+    send_dfs_metadata_snapshot_install_to_endpoint_async,
+    send_object_rpc_session_to_target_async_with_options,
+    send_object_rpc_session_to_target_with_options, send_object_rpc_to_target,
     send_object_rpc_to_target_async, send_object_rpc_to_target_async_with_options,
     send_object_rpc_to_target_with_options, send_object_rpc_to_target_with_timeouts,
 };
@@ -252,10 +248,7 @@ pub use rollout::{
     stage_rollout_main_activation, wait_for_local_shadow_rollout_completion,
     wait_for_main_daemon_health,
 };
-pub(crate) use rollout::{
-    daemon_paths_are_shadow, handle_daemon_clear_rollout_status,
-    handle_daemon_finalize_shadow_rollout,
-};
+pub(crate) use rollout::{daemon_paths_are_shadow, handle_daemon_finalize_shadow_rollout};
 pub use status::{
     DaemonClusterProcess, DaemonClusterRegistration, DaemonDataOwnerLock,
     DaemonEndpointAdvertisementConfig, DaemonLock, DaemonManualEndpointConfig,

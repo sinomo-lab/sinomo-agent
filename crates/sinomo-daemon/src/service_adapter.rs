@@ -9,7 +9,7 @@
 //! The registry mixes host-agnostic services from `sinomo-service` and native modules
 //! such as `sinomo-rollout` with **daemon-foundational** services defined here
 //! ([`DaemonControlService`], [`ClusterKvService`], [`ClusterKvConsensusService`],
-//! [`ClusterHealthService`], [`ClusterRelayService`]) that own daemon state
+//! [`ClusterHealthService`]) that own daemon state
 //! (their [`DaemonPaths`], which encode whether this is the main or shadow daemon)
 //! and call the daemon's own cluster/control handlers. Consuming services receive a real
 //! [`DaemonClusterAccess`] via [`ServiceContext::cluster`] when the node is clustered.
@@ -30,25 +30,22 @@ use sinomo_config::{
 };
 use sinomo_core::kv::{
     CLUSTER_KV_LOCAL_READ_WATCH_ROUTES, CLUSTER_KV_RPC_ROUTE_POLICIES, CLUSTER_KV_RPC_ROUTES,
-    CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_SNAPSHOT_RPC_MAX_PAYLOAD_BYTES, CLUSTER_KV_TXN_ROUTE,
-    CLUSTER_KV_WATCH_EVENTS_ROUTE, CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_RPC_ROUTE_POLICIES,
-    CLUSTER_RAFT_RPC_ROUTES, ClusterKvRpcRoutePolicy, ClusterKvWatchCancelRequest,
-    ClusterKvWatchCancelResponse, ClusterKvWatchDrainRequest, ClusterKvWatchDrainResponse,
-    ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration, KvEntry, KvError, KvOp, KvSnapshot,
-    KvTxn, KvTxnResponse,
+    CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_TXN_ROUTE, CLUSTER_KV_WATCH_EVENTS_ROUTE,
+    CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_RPC_ROUTE_POLICIES, CLUSTER_RAFT_RPC_ROUTES,
+    ClusterKvRpcRoutePolicy, ClusterKvWatchCancelRequest, ClusterKvWatchCancelResponse,
+    ClusterKvWatchDrainRequest, ClusterKvWatchDrainResponse, ClusterKvWatchPrefixRequest,
+    ClusterKvWatchRegistration, KvEntry, KvError, KvOp, KvSnapshot, KvTxn, KvTxnResponse,
 };
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
-    AsyncDaemonControlStream, CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_CHALLENGE_ROUTE,
-    CLUSTER_JOIN_REGISTER_ROUTE, CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+    CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_CHALLENGE_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE,
+    CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY,
     CLUSTER_MEMBERSHIP_RPC_ROUTE_METADATA, CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
-    CLUSTER_NETWORK_PING_ROUTE, CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_ROUTE_METADATA,
-    ClusterPaths, DaemonControlRequest, NETWORK_OBJECT_RPC_ROUTES, NetworkError,
-    ObjectRouteDescriptor, ObjectRpcAuthorizationLayer, ObjectRpcBodySource,
+    CLUSTER_NETWORK_PING_ROUTE, ClusterPaths, DaemonControlRequest, NETWORK_OBJECT_RPC_ROUTES,
+    NetworkError, ObjectRouteDescriptor, ObjectRpcAuthorizationLayer, ObjectRpcBodySource,
     ObjectRpcCancelRequest, ObjectRpcCancelResponse, ObjectRpcRequest, ObjectRpcResponse,
     ObjectRpcRouteCatalog, ObjectRpcRoutePolicyLayer, ObjectRpcRouteRegistry, ObjectRpcRouter,
-    ObjectRpcSessionCall, ObjectRpcSessionRequest, ObjectRpcSessionResponse,
-    ObjectRpcUnarySessionAdapterLayer, ServiceCatalog,
+    ObjectRpcSessionCall, ObjectRpcSessionRequest, ObjectRpcSessionResponse, ServiceCatalog,
 };
 use sinomo_core::service::{
     ClusterAccess, ResponseSink, Service, ServiceBodyMode, ServiceContext, ServiceDisposition,
@@ -59,8 +56,8 @@ use sinomo_dfs::register_services as register_dfs_services;
 use sinomo_module::{MODULE_NATIVE_DYLIB_CANCEL_ROUTE, MODULE_RPC_CATEGORY};
 use sinomo_rollout::{
     ClusterRolloutBinaryResponse, ROLLOUT_BINARY_ROUTE, ROLLOUT_BUILD_ROUTE,
-    ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE, register_services as register_rollout_services,
-    rollout_module_surfaces,
+    ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_FINALIZE_SHADOW_ROUTE, ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
+    register_services as register_rollout_services, rollout_module_surfaces,
 };
 use sinomo_sandbox::{
     LocalSandboxBackend, SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE, SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
@@ -81,8 +78,6 @@ use sinomo_sandbox::{
 };
 use tower_layer::Layer;
 
-pub(crate) const DAEMON_UNARY_COMPATIBILITY_MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
-
 use crate::auth::{AuthenticatedDaemonCommand, DaemonSignerAuthority};
 use crate::cluster::{
     DaemonClusterJoinRegistrationHost, DaemonClusterMemberMutationHost, DaemonClusterStatusProbe,
@@ -94,15 +89,13 @@ use crate::cluster::{
     handle_daemon_cluster_control_rename_on_runtime, handle_daemon_cluster_control_role_on_runtime,
     handle_daemon_cluster_kv_snapshot_async, handle_daemon_cluster_kv_txn_request_async_on_runtime,
     handle_daemon_cluster_kv_txn_request_async_on_runtime_with_timeouts,
-    handle_daemon_cluster_relay_request_on_runtime,
     handle_forwarded_daemon_cluster_kv_txn_request_async_on_runtime,
 };
 use crate::control::{
-    ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE, accepted_rollout_should_stop_current_daemon,
-    daemon_data_dir_path, daemon_status_response_async,
-    handle_daemon_sandbox_checkpoint_on_runtime, handle_daemon_sandbox_create_on_runtime,
-    handle_daemon_sandbox_destroy_on_runtime, handle_daemon_sandbox_http_fetch,
-    handle_daemon_sandbox_http_fetch_to_file_on_runtime,
+    accepted_rollout_should_stop_current_daemon, daemon_data_dir_path,
+    daemon_status_response_async, handle_daemon_sandbox_checkpoint_on_runtime,
+    handle_daemon_sandbox_create_on_runtime, handle_daemon_sandbox_destroy_on_runtime,
+    handle_daemon_sandbox_http_fetch, handle_daemon_sandbox_http_fetch_to_file_on_runtime,
     handle_daemon_sandbox_import_busybox_on_runtime, handle_daemon_sandbox_list_on_runtime,
     handle_daemon_sandbox_read_on_runtime, handle_daemon_sandbox_reboot_on_runtime,
     handle_daemon_sandbox_resume_on_runtime, handle_daemon_sandbox_run_process_plan_on_runtime,
@@ -124,6 +117,7 @@ use crate::error::DaemonError;
 use crate::event_stream::{DaemonEventHub, DaemonEventService};
 use crate::paths::DaemonPaths;
 use crate::rollout::{
+    handle_daemon_clear_rollout_status, handle_daemon_finalize_shadow_rollout,
     handle_daemon_rollout_binary_request, handle_daemon_rollout_build_request,
     handle_daemon_rollout_native_dylib_module_request,
 };
@@ -194,13 +188,15 @@ async fn forward_object_rpc_session_from_daemon_control(
     // finish proofs to the route signed on their next hop instead of carrying
     // the outer daemon-forward proof into the inner object-RPC call (or vice
     // versa).
-    let request_body = if request_body.is_empty() {
-        ObjectRpcBodySource::empty()
+    let call = if request_body.is_empty() {
+        ObjectRpcSessionCall::value(payload.request)
     } else {
         let total_bytes = request_body.total_bytes();
-        ObjectRpcBodySource::async_reader(request_body, total_bytes)
+        ObjectRpcSessionCall::new(
+            payload.request,
+            ObjectRpcBodySource::async_reader(request_body, total_bytes),
+        )
     };
-    let call = ObjectRpcSessionCall::new(payload.request, request_body);
     match crate::client::send_object_rpc_session_to_target_async_with_daemon_paths_and_network_error(
         paths,
         &payload.target_node_id,
@@ -392,28 +388,10 @@ fn handle_cluster_kv_watch_events_request(
 fn encode_cluster_kv_snapshot_response(
     snapshot: &KvSnapshot,
 ) -> Result<ObjectRpcResponse, sinomo_core::network::NetworkError> {
-    encode_cluster_kv_snapshot_response_limited(snapshot, CLUSTER_KV_SNAPSHOT_RPC_MAX_PAYLOAD_BYTES)
-}
-
-fn encode_cluster_kv_snapshot_response_limited(
-    snapshot: &KvSnapshot,
-    max_payload_bytes: usize,
-) -> Result<ObjectRpcResponse, sinomo_core::network::NetworkError> {
-    let response = object_rpc_response_from_kv_payload(
+    Ok(object_rpc_response_from_kv_payload(
         sinomo_core::kv::cluster_kv_snapshot_response_rpc_payload(snapshot)
             .map_err(sinomo_core::network::NetworkError::directory)?,
-    );
-    if response.body.len() > max_payload_bytes {
-        return ObjectRpcResponse::encode_error(
-            CLUSTER_KV_SNAPSHOT_ROUTE,
-            format!(
-                "cluster kv snapshot response is {} bytes; max is {} bytes",
-                response.body.len(),
-                max_payload_bytes
-            ),
-        );
-    }
-    Ok(response)
+    ))
 }
 
 async fn run_blocking_service_task<T>(
@@ -504,11 +482,11 @@ fn network_module_service_route(route: &'static str) -> ServiceRoute {
     )
 }
 
-fn rollout_binary_service_route(route: &'static str) -> ServiceRoute {
+fn rollout_daemon_service_route(route: &'static str) -> ServiceRoute {
     let descriptor = rollout_module_surfaces()
         .object_rpc_route_descriptor(route)
         .expect("rollout module surfaces should be valid")
-        .unwrap_or_else(|| panic!("unknown rollout binary service route {route}"));
+        .unwrap_or_else(|| panic!("unknown daemon rollout service route {route}"));
     ServiceRoute::from_route_metadata(
         descriptor.route,
         descriptor.category,
@@ -892,40 +870,6 @@ pub(crate) fn mark_daemon_rpc_response_responder(
         return;
     };
     response.mark_responder_node_id(node_id.to_string());
-}
-
-/// Daemon adapter for one-hop cluster relay routing. `sinomo-network` owns the relay
-/// decision; the daemon supplies local delivery by reinjecting through its control port.
-struct ClusterRelayService {
-    paths: DaemonPaths,
-    runtime: Option<tokio::runtime::Handle>,
-}
-
-impl Service for ClusterRelayService {
-    fn name(&self) -> &'static str {
-        "cluster-relay"
-    }
-
-    fn routes(&self) -> &'static [&'static str] {
-        &[CLUSTER_RELAY_ROUTE]
-    }
-
-    fn route_categories(&self) -> Vec<ServiceRoute> {
-        service_routes_from_metadata(CLUSTER_ROUTING_RPC_ROUTE_METADATA)
-    }
-
-    fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
-        let paths = self.paths.clone();
-        let runtime = self.runtime.clone();
-        Box::pin(async move {
-            let response =
-                handle_daemon_cluster_relay_request_on_runtime(&paths, &request, runtime.as_ref())
-                    .await
-                    .map_err(daemon_error)?;
-            ctx.respond(response)?;
-            Ok(ServiceDisposition::Continue)
-        })
-    }
 }
 
 /// Daemon adapter for the KV-owned consensus routes. Request identity flows through
@@ -1596,6 +1540,58 @@ struct RolloutBinaryService {
     paths: DaemonPaths,
 }
 
+/// Daemon-owned rollout maintenance commands. These routes used to bypass the
+/// service registry through the legacy one-frame RPC path; keeping them here
+/// makes the canonical session dispatcher the sole ordinary RPC entry point.
+struct RolloutControlService {
+    paths: DaemonPaths,
+}
+
+impl Service for RolloutControlService {
+    fn name(&self) -> &'static str {
+        "rollout-control"
+    }
+
+    fn routes(&self) -> &'static [&'static str] {
+        &[ROLLOUT_FINALIZE_SHADOW_ROUTE, ROLLOUT_CLEAR_STATUS_ROUTE]
+    }
+
+    fn route_categories(&self) -> Vec<ServiceRoute> {
+        self.routes()
+            .iter()
+            .copied()
+            .map(rollout_daemon_service_route)
+            .collect()
+    }
+
+    fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+        let paths = self.paths.clone();
+        Box::pin(async move {
+            let _: () = request.decode_body()?;
+            let route = request.route;
+            let response = match route.as_str() {
+                ROLLOUT_FINALIZE_SHADOW_ROUTE => {
+                    run_blocking_service_task(route.clone(), "rollout finalization", move || {
+                        handle_daemon_finalize_shadow_rollout(&paths)
+                            .map_err(|error| ServiceError::Service(error.to_string()))
+                    })
+                    .await?
+                }
+                ROLLOUT_CLEAR_STATUS_ROUTE => {
+                    run_blocking_service_task(route.clone(), "rollout clear-status", move || {
+                        handle_daemon_clear_rollout_status(&paths)
+                            .map_err(|error| ServiceError::Service(error.to_string()))
+                    })
+                    .await?
+                }
+                other => return Err(ServiceError::UnknownRoute(other.to_string())),
+            };
+            ctx.respond(ObjectRpcResponse::encode_body(route, &response)?)?;
+            Ok(ServiceDisposition::Continue)
+        })
+    }
+}
+
 impl RolloutBinaryService {
     fn finish(
         paths: &DaemonPaths,
@@ -1665,7 +1661,7 @@ impl Service for RolloutBinaryService {
             .iter()
             .copied()
             .map(|route| {
-                let service_route = rollout_binary_service_route(route);
+                let service_route = rollout_daemon_service_route(route);
                 match route {
                     ROLLOUT_BINARY_ROUTE => {
                         service_route.with_request_body_mode(ServiceBodyMode::Required)
@@ -3398,10 +3394,6 @@ fn daemon_service_registry(
             paths: paths.clone(),
             runtime: service_runtime.cloned(),
         })
-        .register(ClusterRelayService {
-            paths: paths.clone(),
-            runtime: service_runtime.cloned(),
-        })
         .register(ClusterKvConsensusService {
             paths: paths.clone(),
             runtime: service_runtime.cloned(),
@@ -3415,6 +3407,9 @@ fn daemon_service_registry(
             runtime: service_runtime.cloned(),
         })
         .register(NetworkModulesService {
+            paths: paths.clone(),
+        })
+        .register(RolloutControlService {
             paths: paths.clone(),
         })
         .register(RolloutBinaryService {
@@ -4706,7 +4701,7 @@ fn daemon_service_object_rpc_route_registry_from_module_snapshot(
         let handler_paths = paths.clone();
         let handler_runtime = service_runtime.clone();
         let active_native_dylib_operations = Arc::clone(&active_native_dylib_operations);
-        builder = builder.try_register_session_route(descriptor, move |request| {
+        builder = builder.try_register_route(descriptor, move |request| {
             let registry = Arc::clone(&registry);
             let paths = handler_paths.clone();
             let runtime = handler_runtime.clone();
@@ -4724,7 +4719,7 @@ fn daemon_service_object_rpc_route_registry_from_module_snapshot(
                         &active_native_dylib_operations,
                         request.request,
                     )
-                    .map(ObjectRpcSessionResponse::buffered);
+                    .map(ObjectRpcSessionResponse::value);
                 }
                 if let Some(native_target) = native_target {
                     if !request.body.is_empty() {
@@ -4740,7 +4735,7 @@ fn daemon_service_object_rpc_route_registry_from_module_snapshot(
                         request.request,
                     )
                     .await
-                    .map(ObjectRpcSessionResponse::buffered);
+                    .map(ObjectRpcSessionResponse::value);
                 }
                 let route = request.request.route.clone();
                 let category = request.request.category.clone();
@@ -4945,19 +4940,24 @@ fn daemon_service_object_rpc_authorization_layer(
 
 pub(crate) async fn try_dispatch_pre_auth_via_registry_async(
     request: &DaemonControlRequest,
-    stream: &mut AsyncDaemonControlStream,
-    stream_address: &str,
+    stream: &mut tokio::net::TcpStream,
     service_host: &DaemonServiceRegistryHost,
 ) -> Result<bool, DaemonError> {
     match dispatch_pre_auth_via_registry_to_response_async(request, service_host).await {
         Ok(Some(response)) => {
-            write_async_daemon_rpc_response_frame(stream, stream_address, response).await?;
+            sinomo_core::network::write_object_frame_async(
+                stream,
+                &response,
+                sinomo_core::network::ObjectFrameIoOptions::default(),
+            )
+            .await
+            .map_err(DaemonError::from)?;
             Ok(true)
         }
         Ok(None) => Ok(false),
         Err(error) => {
             tracing::warn!("sinomo daemon pre-auth join challenge ignored: {error}");
-            let _ = stream.shutdown_write(stream_address).await;
+            let _ = tokio::io::AsyncWriteExt::shutdown(stream).await;
             Ok(true)
         }
     }
@@ -4999,84 +4999,9 @@ pub(crate) async fn dispatch_pre_auth_via_registry_to_response_async(
         &authenticated,
         request.clone(),
         None,
-        None,
     )
     .await?;
     Ok(Some(response))
-}
-
-pub(crate) async fn try_dispatch_via_registry_async(
-    authenticated: &AuthenticatedDaemonCommand,
-    rpc_request: &Option<ObjectRpcRequest>,
-    stream: &mut AsyncDaemonControlStream,
-    stream_address: &str,
-    service_host: &DaemonServiceRegistryHost,
-    paths: &DaemonPaths,
-    replay_key: Option<Vec<u8>>,
-) -> Option<Result<bool, DaemonError>> {
-    let request = rpc_request.as_ref()?;
-    if is_sandbox_stream_route(request) {
-        return None;
-    }
-    if service_host
-        .object_rpc_route_descriptor(&request.route)
-        .is_none()
-    {
-        return None;
-    }
-    tracing::trace!(
-        target: "sinomo.daemon.service_rpc",
-        traceparent = %request.traceparent().unwrap_or_default(),
-        route = %request.route,
-        category = %request.category,
-        stream_address = %stream_address,
-        signer_node_id = %authenticated.signer_node_id,
-        body_bytes = request.body.len(),
-        dfs_data_plane = sinomo_dfs::dfs_route_is_message_data_plane(&request.route),
-        "daemon service rpc dispatch accepted"
-    );
-    Some(
-        dispatch_via_registry_async(
-            service_host,
-            authenticated,
-            request.clone(),
-            stream,
-            stream_address,
-            Some(paths),
-            replay_key,
-        )
-        .await,
-    )
-}
-
-async fn dispatch_via_registry_async(
-    service_host: &DaemonServiceRegistryHost,
-    authenticated: &AuthenticatedDaemonCommand,
-    request: ObjectRpcRequest,
-    stream: &mut AsyncDaemonControlStream,
-    stream_address: &str,
-    paths: Option<&DaemonPaths>,
-    replay_key: Option<Vec<u8>>,
-) -> Result<bool, DaemonError> {
-    let route = request.route.clone();
-    let (response, stop) = dispatch_rpc_via_registry_to_response_async(
-        service_host,
-        authenticated,
-        request,
-        paths,
-        replay_key,
-    )
-    .await?;
-    write_async_daemon_rpc_response_frame(stream, stream_address, response).await?;
-    mark_cluster_identity_restart_after_response(&route, stop, paths);
-    if stop {
-        stream
-            .shutdown_write(stream_address)
-            .await
-            .map_err(DaemonError::from)?;
-        tokio::time::sleep(ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE).await;
-    }
-    Ok(stop)
 }
 
 pub(crate) async fn dispatch_rpc_via_registry_to_response_async(
@@ -5084,22 +5009,22 @@ pub(crate) async fn dispatch_rpc_via_registry_to_response_async(
     authenticated: &AuthenticatedDaemonCommand,
     request: ObjectRpcRequest,
     paths: Option<&DaemonPaths>,
-    replay_key: Option<Vec<u8>>,
 ) -> Result<(ObjectRpcResponse, bool), DaemonError> {
-    let (mut response, stop) = dispatch_rpc_via_registry_to_session_response_async(
+    let route = request.route.clone();
+    let (response, stop) = dispatch_rpc_via_registry_to_session_response_async(
         service_host,
         authenticated,
-        ObjectRpcSessionRequest::buffered(request),
+        ObjectRpcSessionRequest::value(request),
         paths,
-        replay_key,
     )
     .await?;
     if !response.body.is_empty() {
-        response.response.body = response
-            .body
-            .collect_to_vec(DAEMON_UNARY_COMPATIBILITY_MAX_BODY_BYTES)
-            .await
-            .map_err(DaemonError::from)?;
+        return Err(NetworkError::Serialization {
+            detail: format!(
+                "object rpc route {route} returned an attachment through the value-only daemon service"
+            ),
+        }
+        .into());
     }
     Ok((response.response, stop))
 }
@@ -5109,7 +5034,6 @@ pub(crate) async fn dispatch_rpc_via_registry_to_session_response_async(
     authenticated: &AuthenticatedDaemonCommand,
     mut request: ObjectRpcSessionRequest,
     paths: Option<&DaemonPaths>,
-    replay_key: Option<Vec<u8>>,
 ) -> Result<(ObjectRpcSessionResponse, bool), DaemonError> {
     let traceparent = request
         .request
@@ -5133,26 +5057,18 @@ pub(crate) async fn dispatch_rpc_via_registry_to_session_response_async(
         "daemon service rpc dispatch start"
     );
     annotate_daemon_service_request(&mut request.request, authenticated);
-    let router = ObjectRpcUnarySessionAdapterLayer::new(DAEMON_UNARY_COMPATIBILITY_MAX_BODY_BYTES)
+    let router = service_host
+        .route_policy_layer()
         .layer(service_host.active_router());
-    let router = service_host.route_policy_layer().layer(router);
     let mut router = daemon_service_object_rpc_authorization_layer(
         authenticated.signer.clone(),
         service_host.paths.clone(),
     )
     .layer(router);
     let mut response =
-        match sinomo_core::network::call_object_rpc_session_service_async(&mut router, request)
+        sinomo_core::network::call_object_rpc_session_service_async(&mut router, request)
             .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                if let (Some(paths), Some(key)) = (paths, replay_key.as_ref()) {
-                    crate::control::abandon_daemon_dfs_message_replay(paths, key);
-                }
-                return Err(error.into());
-            }
-        };
+            .map_err(DaemonError::from)?;
     if let Some(paths) = paths {
         mark_daemon_rpc_response_responder(paths, &mut response.response);
     }
@@ -5161,14 +5077,6 @@ pub(crate) async fn dispatch_rpc_via_registry_to_session_response_async(
         .metadata
         .remove(DAEMON_SERVICE_DISPOSITION_METADATA_KEY)
         .is_some_and(|value| value == "stop");
-    if let (Some(paths), Some(key)) = (paths, replay_key.as_ref()) {
-        if response.body.is_empty() {
-            crate::control::complete_daemon_dfs_message_replay(paths, key, &response.response);
-        } else {
-            // The legacy head-only cache cannot safely replay an attached body.
-            crate::control::abandon_daemon_dfs_message_replay(paths, key);
-        }
-    }
     tracing::trace!(
         target: "sinomo.daemon.service_rpc",
         traceparent = %traceparent,
@@ -5183,26 +5091,38 @@ pub(crate) async fn dispatch_rpc_via_registry_to_session_response_async(
     Ok((response, stop))
 }
 
-async fn write_async_daemon_rpc_response_frame(
-    stream: &mut AsyncDaemonControlStream,
-    stream_address: &str,
-    response: ObjectRpcResponse,
-) -> Result<(), DaemonError> {
-    stream
-        .write_response(
-            stream_address,
-            &response,
-            sinomo_core::network::ObjectFrameIoOptions::default(),
-        )
-        .await
-        .map_err(DaemonError::from)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::kv::{InProcessKvStore, KvEntry, KvRevision, KvVersion};
+    use sinomo_core::kv::InProcessKvStore;
     use std::time::Duration;
+
+    async fn call_value_object_rpc_service_async<S>(
+        service: &mut S,
+        request: sinomo_core::network::ObjectRpcRequest,
+    ) -> Result<sinomo_core::network::ObjectRpcResponse, sinomo_core::network::NetworkError>
+    where
+        S: tower_service::Service<
+                sinomo_core::network::ObjectRpcSessionRequest,
+                Response = sinomo_core::network::ObjectRpcSessionResponse,
+                Error = sinomo_core::network::NetworkError,
+            >,
+    {
+        let route = request.route.clone();
+        let response = sinomo_core::network::call_object_rpc_session_service_async(
+            service,
+            sinomo_core::network::ObjectRpcSessionRequest::value(request),
+        )
+        .await?;
+        if !response.body.is_empty() {
+            return Err(sinomo_core::network::NetworkError::Serialization {
+                detail: format!(
+                    "object rpc route {route} returned an attachment to a value-only test caller"
+                ),
+            });
+        }
+        Ok(response.response)
+    }
 
     #[test]
     fn module_route_local_permissions_propagate_to_daemon_catalog_descriptor() {
@@ -5596,15 +5516,12 @@ mod tests {
         );
 
         let response = runtime
-            .block_on(sinomo_core::network::call_object_rpc_service_async(
-                &mut router,
-                {
-                    let mut request = ObjectRpcRequest::encode_body("/test/stop", "test-stop", &())
-                        .expect("request");
-                    annotate_test_request(&mut request, DaemonSignerAuthority::Local);
-                    request
-                },
-            ))
+            .block_on(call_value_object_rpc_service_async(&mut router, {
+                let mut request =
+                    ObjectRpcRequest::encode_body("/test/stop", "test-stop", &()).expect("request");
+                annotate_test_request(&mut request, DaemonSignerAuthority::Local);
+                request
+            }))
             .expect("response");
 
         assert_eq!(
@@ -5648,16 +5565,13 @@ mod tests {
         );
 
         let response = runtime
-            .block_on(sinomo_core::network::call_object_rpc_service_async(
-                &mut router,
-                {
-                    let mut request =
-                        ObjectRpcRequest::encode_body("/test/concurrency", "test-concurrency", &())
-                            .expect("request");
-                    annotate_test_request(&mut request, DaemonSignerAuthority::Local);
-                    request
-                },
-            ))
+            .block_on(call_value_object_rpc_service_async(&mut router, {
+                let mut request =
+                    ObjectRpcRequest::encode_body("/test/concurrency", "test-concurrency", &())
+                        .expect("request");
+                annotate_test_request(&mut request, DaemonSignerAuthority::Local);
+                request
+            }))
             .expect("response");
 
         assert_eq!(response.decode_body::<String>().expect("decode"), "limited");
@@ -5696,7 +5610,7 @@ mod tests {
             {}
             let notified = dfs_notify.notified();
             tokio::pin!(notified);
-            let response = sinomo_core::network::call_object_rpc_service_async(&mut router, {
+            let response = call_value_object_rpc_service_async(&mut router, {
                 let mut request = ObjectRpcRequest::encode_body(
                     DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
                     DAEMON_RPC_CATEGORY,
@@ -5734,19 +5648,16 @@ mod tests {
         let mut router = host.route_policy_layer().layer(host.active_router());
 
         let response = runtime
-            .block_on(sinomo_core::network::call_object_rpc_service_async(
-                &mut router,
-                {
-                    let mut request = ObjectRpcRequest::encode_body(
-                        DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
-                        DAEMON_RPC_CATEGORY,
-                        &crate::DaemonLocalConnectivityReloadRequest,
-                    )
-                    .expect("request");
-                    annotate_test_request(&mut request, DaemonSignerAuthority::Local);
-                    request
-                },
-            ))
+            .block_on(call_value_object_rpc_service_async(&mut router, {
+                let mut request = ObjectRpcRequest::encode_body(
+                    DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
+                    DAEMON_RPC_CATEGORY,
+                    &crate::DaemonLocalConnectivityReloadRequest,
+                )
+                .expect("request");
+                annotate_test_request(&mut request, DaemonSignerAuthority::Local);
+                request
+            }))
             .expect("connectivity reload response");
 
         response.error_detail().expect("connectivity reload ok");
@@ -5788,7 +5699,7 @@ mod tests {
 
         let mut router = host.route_policy_layer().layer(host.active_router());
         let response = runtime
-            .block_on(sinomo_core::network::call_object_rpc_service_async(
+            .block_on(call_value_object_rpc_service_async(
                 &mut router,
                 ObjectRpcRequest::encode_body(
                     MODULE_NATIVE_DYLIB_CANCEL_ROUTE,
@@ -6025,8 +5936,7 @@ mod tests {
                 let mut request = ObjectRpcRequest::encode_body("/test/holding", "holding", &())
                     .expect("request");
                 annotate_test_request(&mut request, DaemonSignerAuthority::Local);
-                sinomo_core::network::call_object_rpc_service_async(&mut in_flight_router, request)
-                    .await
+                call_value_object_rpc_service_async(&mut in_flight_router, request).await
             });
             entered.notified().await;
 
@@ -6071,15 +5981,12 @@ mod tests {
         .layer(router);
 
         let error = runtime
-            .block_on(sinomo_core::network::call_object_rpc_service_async(
-                &mut router,
-                {
-                    let mut request = ObjectRpcRequest::encode_body("/test/stop", "test-stop", &())
-                        .expect("request");
-                    annotate_test_request(&mut request, DaemonSignerAuthority::Member);
-                    request
-                },
-            ))
+            .block_on(call_value_object_rpc_service_async(&mut router, {
+                let mut request =
+                    ObjectRpcRequest::encode_body("/test/stop", "test-stop", &()).expect("request");
+                annotate_test_request(&mut request, DaemonSignerAuthority::Member);
+                request
+            }))
             .expect_err("member must not run admin route");
 
         assert_eq!(error, NetworkError::AuthDenied);
@@ -6167,15 +6074,12 @@ mod tests {
                 host.paths.clone(),
             )
             .layer(router);
-            runtime.block_on(sinomo_core::network::call_object_rpc_service_async(
-                &mut router,
-                {
-                    let mut request = ObjectRpcRequest::encode_body("/test/stop", "test-stop", &())
-                        .expect("request");
-                    annotate_test_request(&mut request, DaemonSignerAuthority::Local);
-                    request
-                },
-            ))
+            runtime.block_on(call_value_object_rpc_service_async(&mut router, {
+                let mut request =
+                    ObjectRpcRequest::encode_body("/test/stop", "test-stop", &()).expect("request");
+                annotate_test_request(&mut request, DaemonSignerAuthority::Local);
+                request
+            }))
         };
 
         assert_eq!(
@@ -6214,16 +6118,12 @@ mod tests {
                 host.paths.clone(),
             )
             .layer(router);
-            runtime.block_on(sinomo_core::network::call_object_rpc_service_async(
-                &mut router,
-                {
-                    let mut request =
-                        ObjectRpcRequest::encode_body(CONFIG_GET_ROUTE, "config", &())
-                            .expect("request");
-                    annotate_test_request(&mut request, authority);
-                    request
-                },
-            ))
+            runtime.block_on(call_value_object_rpc_service_async(&mut router, {
+                let mut request = ObjectRpcRequest::encode_body(CONFIG_GET_ROUTE, "config", &())
+                    .expect("request");
+                annotate_test_request(&mut request, authority);
+                request
+            }))
         };
 
         let local = call(DaemonSignerAuthority::Local)
@@ -6358,19 +6258,16 @@ mod tests {
         let mut router = host.route_policy_layer().layer(host.active_router());
 
         let response = runtime
-            .block_on(sinomo_core::network::call_object_rpc_service_async(
-                &mut router,
-                {
-                    let mut request = ObjectRpcRequest::encode_body(
-                        CLUSTER_KV_SNAPSHOT_ROUTE,
-                        sinomo_core::kv::CLUSTER_KV_RPC_CATEGORY,
-                        &(),
-                    )
-                    .expect("request");
-                    annotate_test_request(&mut request, DaemonSignerAuthority::Local);
-                    request
-                },
-            ))
+            .block_on(call_value_object_rpc_service_async(&mut router, {
+                let mut request = ObjectRpcRequest::encode_body(
+                    CLUSTER_KV_SNAPSHOT_ROUTE,
+                    sinomo_core::kv::CLUSTER_KV_RPC_CATEGORY,
+                    &(),
+                )
+                .expect("request");
+                annotate_test_request(&mut request, DaemonSignerAuthority::Local);
+                request
+            }))
             .expect("response");
 
         let snapshot = response.decode_body::<KvSnapshot>().expect("snapshot");
@@ -6437,18 +6334,15 @@ mod tests {
         )
         .expect("init payload");
         let response = runtime
-            .block_on(sinomo_core::network::call_object_rpc_service_async(
-                &mut router,
-                {
-                    let mut request = ObjectRpcRequest::from_encoded_body(
-                        init_payload.route,
-                        init_payload.category,
-                        init_payload.body,
-                    );
-                    annotate_test_request(&mut request, DaemonSignerAuthority::Local);
-                    request
-                },
-            ))
+            .block_on(call_value_object_rpc_service_async(&mut router, {
+                let mut request = ObjectRpcRequest::from_encoded_body(
+                    init_payload.route,
+                    init_payload.category,
+                    init_payload.body,
+                );
+                annotate_test_request(&mut request, DaemonSignerAuthority::Local);
+                request
+            }))
             .expect("init response");
         let init =
             sinomo_core::cluster::decode_cluster_control_init_rpc_response_body(&response.body)
@@ -6479,18 +6373,15 @@ mod tests {
         )
         .expect("rename payload");
         let response = runtime
-            .block_on(sinomo_core::network::call_object_rpc_service_async(
-                &mut router,
-                {
-                    let mut request = ObjectRpcRequest::from_encoded_body(
-                        rename_payload.route,
-                        rename_payload.category,
-                        rename_payload.body,
-                    );
-                    annotate_test_request(&mut request, DaemonSignerAuthority::Local);
-                    request
-                },
-            ))
+            .block_on(call_value_object_rpc_service_async(&mut router, {
+                let mut request = ObjectRpcRequest::from_encoded_body(
+                    rename_payload.route,
+                    rename_payload.category,
+                    rename_payload.body,
+                );
+                annotate_test_request(&mut request, DaemonSignerAuthority::Local);
+                request
+            }))
             .expect("rename response");
         let rename =
             sinomo_core::cluster::decode_cluster_control_rename_rpc_response_body(&response.body)
@@ -6608,18 +6499,15 @@ mod tests {
         )
         .expect("leave payload");
         let error = runtime
-            .block_on(sinomo_core::network::call_object_rpc_service_async(
-                &mut router,
-                {
-                    let mut request = ObjectRpcRequest::from_encoded_body(
-                        payload.route,
-                        payload.category,
-                        payload.body,
-                    );
-                    annotate_test_request(&mut request, DaemonSignerAuthority::Member);
-                    request
-                },
-            ))
+            .block_on(call_value_object_rpc_service_async(&mut router, {
+                let mut request = ObjectRpcRequest::from_encoded_body(
+                    payload.route,
+                    payload.category,
+                    payload.body,
+                );
+                annotate_test_request(&mut request, DaemonSignerAuthority::Member);
+                request
+            }))
             .expect_err("member signer must not run cluster control mutations");
         assert_eq!(error, NetworkError::AuthDenied);
     }
@@ -6935,7 +6823,6 @@ mod tests {
                 &authenticated,
                 request,
                 None,
-                None,
             ))
             .expect("dfs status dispatch");
 
@@ -7003,7 +6890,7 @@ mod tests {
             .expect("runtime");
         let mut router = host.route_policy_layer().layer(host.active_router());
         let response = runtime
-            .block_on(sinomo_core::network::call_object_rpc_service_async(
+            .block_on(call_value_object_rpc_service_async(
                 &mut router,
                 ObjectRpcRequest::encode_body(&route.route, &route.category, &()).expect("request"),
             ))
@@ -7022,46 +6909,6 @@ mod tests {
             .expect("workspace root")
             .to_path_buf();
         workspace_root.join(path)
-    }
-
-    #[test]
-    fn cluster_kv_snapshot_response_rejects_oversized_body_as_rpc_error() {
-        let mut store = InProcessKvStore::new();
-        store
-            .put("/snapshot/small", b"ok".to_vec(), None)
-            .expect("small put");
-        let snapshot = store.snapshot().expect("snapshot");
-
-        let response =
-            encode_cluster_kv_snapshot_response_limited(&snapshot, usize::MAX).expect("encode ok");
-        let decoded: KvSnapshot = response.decode_body().expect("decode snapshot");
-        assert_eq!(decoded.entries.len(), 1);
-
-        let oversized = KvSnapshot {
-            revision: KvRevision(1),
-            compacted_revision: KvRevision::ZERO,
-            entries: vec![KvEntry {
-                key: "/snapshot/large".to_string(),
-                value: vec![7_u8; 64],
-                create_revision: KvRevision(1),
-                modify_revision: KvRevision(1),
-                version: KvVersion(1),
-                lease_id: None,
-            }],
-            leases: Vec::new(),
-            events: Vec::new(),
-        };
-        let response =
-            encode_cluster_kv_snapshot_response_limited(&oversized, 1).expect("encode rpc error");
-        let error = response
-            .decode_body::<KvSnapshot>()
-            .expect_err("oversized body");
-        assert!(
-            error
-                .to_string()
-                .contains("cluster kv snapshot response is"),
-            "unexpected error: {error}"
-        );
     }
 
     #[test]
@@ -7085,7 +6932,6 @@ mod tests {
                 sinomo_core::network::CLUSTER_HEALTH_ROUTE,
                 sinomo_core::network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
                 sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE,
-                CLUSTER_RELAY_ROUTE,
                 CLUSTER_JOIN_CHALLENGE_ROUTE,
                 CLUSTER_JOIN_REGISTER_ROUTE,
                 CLUSTER_INVITE_PUBLISH_ROUTE,
@@ -7113,10 +6959,6 @@ mod tests {
         assert_eq!(
             registry.category_for_route(sinomo_core::network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE),
             Some(sinomo_core::network::CLUSTER_NETWORK_RPC_CATEGORY)
-        );
-        assert_eq!(
-            registry.category_for_route(CLUSTER_RELAY_ROUTE),
-            Some(sinomo_core::network::CLUSTER_ROUTING_RPC_CATEGORY)
         );
         assert_eq!(
             registry.category_for_route(CLUSTER_JOIN_REGISTER_ROUTE),
@@ -7599,7 +7441,7 @@ mod tests {
                 ObjectRpcBodySource::bytes(request_body)
             };
             let result = client
-                .call_loopback_session(
+                .call_loopback(
                     &data_dir,
                     &outer_address,
                     ObjectRpcSessionCall::new(outer_head, request_body),
@@ -7661,6 +7503,8 @@ mod tests {
             sinomo_rollout::ROLLOUT_BINARY_ROUTE,
             sinomo_rollout::ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
             sinomo_rollout::ROLLOUT_BUILD_ROUTE,
+            sinomo_rollout::ROLLOUT_FINALIZE_SHADOW_ROUTE,
+            sinomo_rollout::ROLLOUT_CLEAR_STATUS_ROUTE,
         ] {
             assert!(
                 shadow_registry.owns(route),

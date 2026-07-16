@@ -12,12 +12,12 @@ use sinomo_dfs::{
     DfsMetadataShardHeadWatermark, DfsMetadataShardId, DfsNetworkMessage, DfsNodeAdvertisement,
     DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsObjectVersionRecord, DfsReadData,
     DfsReadResponse, DfsReadResult, DfsRepairReplicaCommand, DfsRepairReplicaResponse,
-    DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsRoutedMessage, DfsStageBlobCommand,
-    DfsStageBlobResponse, DfsVersion, DfsWriteIntentState, DfsWriteIntentStatus,
-    LocalSobjMetadataBackend, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
-    NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
-    SharedDfsControlPlaneKvClient, file_system_config_key, metadata_shard_key,
-    sifs_node_files_path,
+    DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsRoutedCall, DfsRoutedMessage,
+    DfsStageBlobCommand, DfsStageBlobResponse, DfsVersion, DfsWriteIntentState,
+    DfsWriteIntentStatus, LocalSobjMetadataBackend, NetworkedDfsReadFreshness,
+    NetworkedDfsReadOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
+    NetworkedDfsWriteOutcome, SharedDfsControlPlaneKvClient, file_system_config_key,
+    metadata_shard_key, sifs_node_files_path,
 };
 use std::fs;
 use std::io::{Read, Result as IoResult};
@@ -6701,7 +6701,7 @@ fn networked_dfs_rejects_wrong_source_remote_read_response_without_consuming_req
         other => panic!("expected remote read request, got {other:?}"),
     };
     owner_control
-        .send_routed_message(&owner, pending_request)
+        .send_routed_call(&owner, DfsRoutedCall::value(pending_request))
         .expect("restore owner read request");
     let forged_response = DfsNetworkMessage::ReadResponse(DfsReadResponse {
         request_id: request_id.clone(),
@@ -11043,15 +11043,15 @@ fn send_dfs_test_message<T: DfsMessageTransport>(
     message: DfsNetworkMessage,
 ) {
     transport
-        .send_routed_message(
+        .send_routed_call(
             target,
-            DfsRoutedMessage {
+            DfsRoutedCall::value(DfsRoutedMessage {
                 source_node_id: source.clone(),
                 target_node_id: target.clone(),
                 frame_id: 1,
                 message_id: 1,
                 message,
-            },
+            }),
         )
         .expect("send DFS test message");
 }

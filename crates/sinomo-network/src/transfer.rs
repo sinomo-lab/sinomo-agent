@@ -19,9 +19,8 @@ pub const DEFAULT_TRANSFER_FRAME_BYTES: u32 = 1024 * 1024;
 pub const MAX_TRANSFER_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 pub const DEFAULT_TRANSFER_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_TRANSFER_WINDOW_BYTES: u64 = 256 * 1024 * 1024;
-pub const MAX_TRANSFER_CONTROL_FRAME_BYTES: usize = 64 * 1024;
-const TRANSFER_WIRE_MAGIC: [u8; 4] = *b"SXFR";
-const TRANSFER_WIRE_PREFIX_BYTES: usize = 9;
+const TRANSFER_WIRE_MAGIC: [u8; 4] = *b"SXF2";
+const TRANSFER_WIRE_PREFIX_BYTES: usize = 13;
 const TRANSFER_WIRE_CONTROL_KIND: u8 = 1;
 const TRANSFER_WIRE_DATA_KIND: u8 = 2;
 
@@ -342,28 +341,29 @@ where
         });
     }
     let kind = prefix[4];
-    let header_len = u32::from_be_bytes(prefix[5..9].try_into().expect("fixed transfer prefix"));
-    let header_len = header_len as usize;
-    if header_len == 0 || header_len > MAX_TRANSFER_CONTROL_FRAME_BYTES {
-        return Err(NetworkError::FrameTooLarge {
-            actual_bytes: header_len,
-            max_bytes: MAX_TRANSFER_CONTROL_FRAME_BYTES,
+    if !matches!(kind, TRANSFER_WIRE_CONTROL_KIND | TRANSFER_WIRE_DATA_KIND) {
+        return Err(NetworkError::Serialization {
+            detail: format!("invalid transfer frame kind {kind}"),
         });
     }
+    let wire_header_len =
+        u64::from_be_bytes(prefix[5..13].try_into().expect("fixed transfer prefix"));
+    if wire_header_len == 0 {
+        return Err(NetworkError::Serialization {
+            detail: "transfer frame header length must be non-zero".to_string(),
+        });
+    }
+    let header_len = usize::try_from(wire_header_len).map_err(|_| NetworkError::Serialization {
+        detail: format!(
+            "transfer frame header length {wire_header_len} cannot be represented on this platform"
+        ),
+    })?;
     resize_transfer_buffer(header_buffer, header_len, "transfer frame header")?;
     transfer_read_exact(reader, header_buffer, health, "read transfer frame header").await?;
     match kind {
-        TRANSFER_WIRE_CONTROL_KIND => {
-            let mut encoded = Vec::new();
-            encoded
-                .try_reserve_exact(header_buffer.len())
-                .map_err(|_| NetworkError::ResourceExhausted {
-                    operation: "copy encoded transfer control frame".to_string(),
-                    requested_bytes: header_buffer.len(),
-                })?;
-            encoded.extend_from_slice(header_buffer);
-            Ok(TransferEncodedWireFrameHeader::Control(encoded))
-        }
+        TRANSFER_WIRE_CONTROL_KIND => Ok(TransferEncodedWireFrameHeader::Control(std::mem::take(
+            header_buffer,
+        ))),
         TRANSFER_WIRE_DATA_KIND => {
             let header: TransferDataHeader =
                 SinomoObjectCodec::network_frame().decode(header_buffer)?;
@@ -375,9 +375,7 @@ where
             }
             Ok(TransferEncodedWireFrameHeader::Data(header))
         }
-        _ => Err(NetworkError::Serialization {
-            detail: format!("invalid transfer frame kind {kind}"),
-        }),
+        _ => unreachable!("transfer frame kind was validated before allocation"),
     }
 }
 
@@ -428,16 +426,19 @@ where
     transfer_flush(writer, health, "flush transfer control frame").await
 }
 
-fn transfer_wire_prefix(kind: u8, header_len: usize) -> Result<[u8; 9], NetworkError> {
-    if header_len == 0 || header_len > MAX_TRANSFER_CONTROL_FRAME_BYTES {
-        return Err(NetworkError::FrameTooLarge {
-            actual_bytes: header_len,
-            max_bytes: MAX_TRANSFER_CONTROL_FRAME_BYTES,
+fn transfer_wire_prefix(
+    kind: u8,
+    header_len: usize,
+) -> Result<[u8; TRANSFER_WIRE_PREFIX_BYTES], NetworkError> {
+    if header_len == 0 {
+        return Err(NetworkError::Serialization {
+            detail: "transfer frame header length must be non-zero".to_string(),
         });
     }
-    let header_len = u32::try_from(header_len).map_err(|_| NetworkError::FrameTooLarge {
-        actual_bytes: header_len,
-        max_bytes: MAX_TRANSFER_CONTROL_FRAME_BYTES,
+    let header_len = u64::try_from(header_len).map_err(|_| NetworkError::Serialization {
+        detail: format!(
+            "transfer frame header length {header_len} cannot be represented on the wire"
+        ),
     })?;
     let mut prefix = [0_u8; TRANSFER_WIRE_PREFIX_BYTES];
     prefix[..4].copy_from_slice(&TRANSFER_WIRE_MAGIC);
@@ -1042,7 +1043,7 @@ mod tests {
     }
 
     #[test]
-    fn transfer_controls_round_trip_as_small_sobj_documents() {
+    fn transfer_controls_round_trip_as_sobj_documents() {
         let transfer_id = TransferId::generate();
         let control =
             TransferControl::Open(open(transfer_id, 42, TransferDigest::blake3(b"payload")));
@@ -1053,6 +1054,136 @@ mod tests {
             .decode(&bytes)
             .expect("decode transfer control");
         assert_eq!(decoded, control);
+    }
+
+    #[test]
+    fn transfer_wire_prefix_uses_v2_magic_and_u64_length() {
+        let header_len = 128 * 1024 + 17;
+        let prefix = transfer_wire_prefix(TRANSFER_WIRE_CONTROL_KIND, header_len)
+            .expect("encode transfer prefix");
+
+        assert_eq!(&prefix[..4], b"SXF2");
+        assert_eq!(prefix[4], TRANSFER_WIRE_CONTROL_KIND);
+        assert_eq!(
+            u64::from_be_bytes(prefix[5..13].try_into().expect("u64 header length")),
+            header_len as u64
+        );
+
+        #[cfg(target_pointer_width = "64")]
+        {
+            let above_u32 = usize::try_from(u64::from(u32::MAX) + 1)
+                .expect("64-bit usize represents lengths above u32");
+            let prefix = transfer_wire_prefix(TRANSFER_WIRE_CONTROL_KIND, above_u32)
+                .expect("control headers are not capped at u32");
+            assert_eq!(
+                u64::from_be_bytes(prefix[5..13].try_into().expect("u64 header length")),
+                u64::from(u32::MAX) + 1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn control_frame_round_trips_with_u64_length_prefix() {
+        let encoded_control = vec![0xa5; 196_613];
+        let (mut writer, mut reader) =
+            tokio::io::duplex(encoded_control.len() + TRANSFER_WIRE_PREFIX_BYTES);
+
+        write_transfer_encoded_control_frame(
+            &mut writer,
+            &encoded_control,
+            NetworkHealthPolicy::default(),
+        )
+        .await
+        .expect("write transfer control frame");
+
+        let mut header_buffer = Vec::new();
+        let frame = read_transfer_encoded_frame_header(
+            &mut reader,
+            &mut header_buffer,
+            NetworkHealthPolicy::default(),
+        )
+        .await
+        .expect("read transfer control frame");
+        let TransferEncodedWireFrameHeader::Control(decoded) = frame else {
+            panic!("expected a control frame");
+        };
+        assert_eq!(decoded, encoded_control);
+        assert!(
+            header_buffer.is_empty(),
+            "the decoded control buffer must move without a second allocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_transfer_magic_is_rejected_before_header_allocation() {
+        let mut prefix = [0_u8; TRANSFER_WIRE_PREFIX_BYTES];
+        prefix[..4].copy_from_slice(b"SXFR");
+        prefix[4] = TRANSFER_WIRE_CONTROL_KIND;
+        prefix[5..].copy_from_slice(&u64::MAX.to_be_bytes());
+        let (mut writer, mut reader) = tokio::io::duplex(TRANSFER_WIRE_PREFIX_BYTES);
+        writer
+            .write_all(&prefix)
+            .await
+            .expect("write legacy transfer prefix");
+
+        let mut header_buffer = Vec::new();
+        let Err(error) = read_transfer_encoded_frame_header(
+            &mut reader,
+            &mut header_buffer,
+            NetworkHealthPolicy::default(),
+        )
+        .await
+        else {
+            panic!("legacy transfer magic must be rejected");
+        };
+        assert!(matches!(
+            error,
+            NetworkError::Serialization { detail } if detail == "invalid transfer frame magic"
+        ));
+        assert!(header_buffer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_transfer_kind_is_rejected_before_header_allocation() {
+        let mut prefix = [0_u8; TRANSFER_WIRE_PREFIX_BYTES];
+        prefix[..4].copy_from_slice(&TRANSFER_WIRE_MAGIC);
+        prefix[4] = u8::MAX;
+        prefix[5..].copy_from_slice(&u64::MAX.to_be_bytes());
+        let (mut writer, mut reader) = tokio::io::duplex(TRANSFER_WIRE_PREFIX_BYTES);
+        writer
+            .write_all(&prefix)
+            .await
+            .expect("write invalid transfer prefix");
+
+        let mut header_buffer = Vec::new();
+        let Err(error) = read_transfer_encoded_frame_header(
+            &mut reader,
+            &mut header_buffer,
+            NetworkHealthPolicy::default(),
+        )
+        .await
+        else {
+            panic!("unknown transfer kind must be rejected");
+        };
+        assert!(matches!(
+            error,
+            NetworkError::Serialization { detail } if detail == "invalid transfer frame kind 255"
+        ));
+        assert!(header_buffer.is_empty());
+    }
+
+    #[test]
+    fn transfer_header_allocation_failure_is_reported() {
+        let mut buffer = Vec::new();
+        let error = resize_transfer_buffer(&mut buffer, usize::MAX, "test transfer header")
+            .expect_err("impossible allocation must fail fallibly");
+        assert!(matches!(
+            error,
+            NetworkError::ResourceExhausted {
+                operation,
+                requested_bytes: usize::MAX,
+            } if operation == "test transfer header"
+        ));
     }
 
     #[test]

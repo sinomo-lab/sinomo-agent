@@ -186,60 +186,17 @@ pub enum PublicIpDiscoveryResult {
     Deferred(Vec<IpAddr>),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) struct LanQuicEndpointConfig {
-    pub bind_address: String,
-    pub alpn: String,
-    pub max_frame_bytes: usize,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl Default for LanQuicEndpointConfig {
-    fn default() -> Self {
-        Self {
-            bind_address: "0.0.0.0:21355".to_string(),
-            alpn: "sinomo-cluster-v1".to_string(),
-            max_frame_bytes: 1024 * 1024,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[cfg(any(test, feature = "test-support"))]
-pub struct LanQuicEventFrameCodec {
-    pub max_frame_bytes: usize,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl Default for LanQuicEventFrameCodec {
-    fn default() -> Self {
-        Self {
-            max_frame_bytes: LanQuicEndpointConfig::default().max_frame_bytes,
-        }
-    }
-}
+pub struct LanQuicEventFrameCodec;
 
 #[cfg(any(test, feature = "test-support"))]
 impl LanQuicEventFrameCodec {
     pub fn encode(&self, frame: &EventFrame) -> Result<Vec<u8>, NetworkError> {
-        let bytes = SinomoObjectCodec::default().encode(frame)?;
-        if bytes.len() > self.max_frame_bytes {
-            return Err(NetworkError::FrameTooLarge {
-                actual_bytes: bytes.len(),
-                max_bytes: self.max_frame_bytes,
-            });
-        }
-        Ok(bytes)
+        SinomoObjectCodec::default().encode(frame)
     }
 
     pub fn decode(&self, bytes: &[u8]) -> Result<EventFrame, NetworkError> {
-        if bytes.len() > self.max_frame_bytes {
-            return Err(NetworkError::FrameTooLarge {
-                actual_bytes: bytes.len(),
-                max_bytes: self.max_frame_bytes,
-            });
-        }
         SinomoObjectCodec::default().decode(bytes)
     }
 }

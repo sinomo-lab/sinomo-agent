@@ -29,37 +29,26 @@ cannot grant membership, mutate cluster state, or apply domain policy.
 
 ## Wire and Service Model
 
-Internal request/response traffic uses one body-aware typed object-RPC model.
-The old response-only raw-stream transport has been removed. Every canonical
-Object RPC session exposes the same full-duplex request and response streams on
-every transport, independent of payload size. Each direction has a bounded SOBJ
-control head and an optional body stream. Domain callers work with
-serde-compatible heads and high-level body sources or sinks; object encoding,
-body framing, chunking, flow control, retries, and transfer state remain inside
-the network boundary.
+Internal request/response traffic uses one typed object-RPC model. Every call
+uses the same request and response interface on every transport, independent of
+payload size. The network incrementally carries each encoded value over the
+underlying duplex stream; object encoding, framing, flow control, retries, and
+transfer state remain inside the network boundary.
 
-Bounds on a control head, transfer frame, chunk, flow-control window, or
-in-memory queue are local framing and resource bounds. They are not aggregate
-message or body limits. A canonical session can carry an arbitrary-size body
-through the same interface; it does not select another protocol when the body
-crosses a byte threshold. There is no payload-size environment variable,
-feature gate, or runtime toggle that enables streaming or chooses between an
-inline and streamed transport path.
+Transfer frames, chunks, flow-control windows, and in-memory queues may have
+fixed implementation sizes. Those sizes control incremental I/O and resource
+use; they are not aggregate message limits and are not visible as protocol
+choices. The network does not select a different API or wire protocol when a
+value crosses a byte threshold, and it has no payload-size enablement toggle.
+Object-frame heads use one `SOF2` prefix with an unsigned 64-bit length for
+every frame; there is no compact form, extended-length sentinel, or legacy
+prefix negotiation.
 
-Callers that require a complete in-memory unary value may explicitly
-materialize a canonical body stream through a compatibility adapter and must
-supply that adapter's byte bound. The bound belongs to the caller and that
-materialization, not to Object RPC transport. Unary materialization is outside
-the canonical transport core and must not introduce a second wire path or make
-payload size observable as a protocol choice. A unary decoder rejects an
-unmarked semantic body stream instead of silently discarding or materializing
-canonical session data.
-
-Body streams, including files, readers, generated data, and typed encoded
-payloads, are framed incrementally in both directions and are not repeatedly
-re-encoded as object documents. Domain protocols may attach operation
-identities and expected content digests, but do not define transport chunk
-sizes or per-chunk RPC routes.
+Files, readers, generated data, and typed encoded values all use the same
+session machinery and are framed incrementally in both directions. Domain
+protocols may attach operation identities and expected content digests, but do
+not define transport chunk sizes, per-chunk RPC routes, or separate small- and
+large-message calls.
 
 Verified body frames first move through a bounded in-memory reader channel. If
 the application falls behind, the session lazily spills only the remaining
@@ -161,9 +150,9 @@ then incorporates observed health and latency. An unreachable or unauthorized
 edge is excluded rather than merely assigned a poor rank.
 
 Purpose-specific selectors may adjust ranking for Raft, rollout, status, or
-large data, but must preserve the shared safety rules: member authorization,
-target identity, endpoint scope, transport capability, local timeout, hop limit,
-and connectivity suppression.
+full-duplex stream requirements, but must preserve the shared safety rules:
+member authorization, target identity, endpoint scope, transport capability,
+local timeout, hop limit, and connectivity suppression.
 
 ## Cluster Directory
 
@@ -197,11 +186,9 @@ five-second health timeout. A progressing call may therefore run for an
 unbounded wall-clock duration. Callers that require strict end-to-end expiry
 provide an explicit operation deadline.
 
-Canonical sessions use hop-authenticated progress frames plus an end-to-end
-origin finish attestation and the canonical health policy for every non-empty
-body, regardless of aggregate size. If a caller subsequently chooses bounded
-unary materialization, that adapter bound does not change relay progress or
-create an alternate transport path.
+Canonical calls use hop-authenticated progress frames plus an end-to-end origin
+finish attestation and the canonical health policy for every non-empty value,
+regardless of aggregate size.
 
 Route discovery remains finite through its attempt count, hop limit, and
 per-attempt health limits. Relay envelopes carry a maximum per-hop timeout, not
@@ -271,30 +258,25 @@ loopback control uses the same authentication boundary for sensitive commands.
 ## Architectural Invariants
 
 1. Domain protocols use the single typed object-RPC session and do not add
-   separate chunk-RPC paths. Typed heads and optional attached bodies are the
-   two application-visible parts of that session.
-2. Bounds on control heads, frames, chunks, windows, and buffers are never
-   aggregate message limits. Canonical request and response streams have no
-   payload-size threshold or enablement toggle and retain the same interface at
-   every size.
-3. Complete unary materialization is an explicit caller-bounded compatibility
-   adapter outside canonical transport; its limit is not an Object RPC body
-   limit and it cannot select a different wire protocol.
-4. Network and KV have no production dependency on one another;
+   separate chunk-RPC paths or small- and large-message APIs.
+2. Frame, chunk, window, and buffer sizes are never aggregate message limits.
+   Canonical requests and responses have no payload-size threshold or
+   enablement toggle and retain the same interface at every size.
+3. Network and KV have no production dependency on one another;
    `sinomo-cluster` is their only R0 bridge.
-5. Directory membership and connectivity are inputs to routing, not outputs of
+4. Directory membership and connectivity are inputs to routing, not outputs of
    successful delivery.
-6. A relay cannot modify the signed inner route or substitute request/response
+5. A relay cannot modify the signed inner route or substitute request/response
    body bytes: the original head and final content digest are authenticated end
    to end, while target-node forwarding is authorized hop by hop.
-7. Origin calls have no implicit whole-call deadline; explicit operation
+6. Origin calls have no implicit whole-call deadline; explicit operation
    deadlines are distinct from per-connect and per-progress health limits.
-8. Side-effecting routes that permit retry must provide operation-level
+7. Side-effecting routes that permit retry must provide operation-level
    idempotency; networking does not promise universal response replay.
-9. Route caches are versioned by every input that affects validity.
-10. Disabled or incompatible transports cannot consume attempt budgets.
-11. Remote requests are authorized again by the target service.
-12. Higher-level crates never bypass the network layer for cluster traffic and
+8. Route caches are versioned by every input that affects validity.
+9. Disabled or incompatible transports cannot consume attempt budgets.
+10. Remote requests are authorized again by the target service.
+11. Higher-level crates never bypass the network layer for cluster traffic and
     do not implement transport chunking, transfer retry, or resume protocols.
 
 Operation-level idempotency is a protocol requirement, not a universal current

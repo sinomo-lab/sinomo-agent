@@ -351,15 +351,6 @@ impl From<ClusterEndpointSelectionPurpose> for ClusterEndpointInternalSelectionP
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ClusterRouteTransferProfile {
-    Conservative,
-    Lan,
-    Local,
-}
-
-pub type ClusterEndpointTransferProfile = ClusterRouteTransferProfile;
-
 pub struct ClusterEndpointSelector<'a> {
     paths: &'a ClusterPaths,
     state: &'a ClusterBootstrapState,
@@ -386,18 +377,6 @@ impl<'a> ClusterEndpointSelector<'a> {
         state: &ClusterBootstrapState,
     ) -> Vec<IpAddr> {
         discover_peer_route_ip_candidates_async(state).await
-    }
-
-    pub fn transfer_profile_for_endpoint(
-        endpoint: &ClusterEndpointRecord,
-    ) -> ClusterRouteTransferProfile {
-        cluster_endpoint_transfer_profile(endpoint)
-    }
-
-    pub fn transfer_profile_for_endpoints<'e>(
-        endpoints: impl IntoIterator<Item = &'e ClusterEndpointRecord>,
-    ) -> ClusterRouteTransferProfile {
-        cluster_endpoint_transfer_profile_for_targets(endpoints)
     }
 
     pub fn select(&self, purpose: ClusterEndpointSelectionPurpose) -> Vec<ClusterEndpointRecord> {
@@ -667,34 +646,6 @@ fn try_cluster_member_daemon_status_targets_impl(
         targets.append(&mut member_targets);
     }
     Ok(targets)
-}
-
-fn cluster_endpoint_transfer_profile(
-    endpoint: &ClusterEndpointRecord,
-) -> ClusterRouteTransferProfile {
-    match endpoint.transport {
-        ClusterTransportKind::InProcess | ClusterTransportKind::Loopback => {
-            ClusterRouteTransferProfile::Local
-        }
-        ClusterTransportKind::LanTcp | ClusterTransportKind::LanQuic => {
-            ClusterRouteTransferProfile::Lan
-        }
-        _ => ClusterRouteTransferProfile::Conservative,
-    }
-}
-
-fn cluster_endpoint_transfer_profile_for_targets<'e>(
-    endpoints: impl IntoIterator<Item = &'e ClusterEndpointRecord>,
-) -> ClusterRouteTransferProfile {
-    let mut profile = ClusterRouteTransferProfile::Conservative;
-    for endpoint in endpoints {
-        match cluster_endpoint_transfer_profile(endpoint) {
-            ClusterRouteTransferProfile::Local => return ClusterRouteTransferProfile::Local,
-            ClusterRouteTransferProfile::Lan => profile = ClusterRouteTransferProfile::Lan,
-            ClusterRouteTransferProfile::Conservative => {}
-        }
-    }
-    profile
 }
 
 fn try_cluster_sync_targets_with_connectivity_context(
