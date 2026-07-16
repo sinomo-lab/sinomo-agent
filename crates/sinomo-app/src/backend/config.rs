@@ -580,7 +580,7 @@ pub const CONFIGURABLE_PROVIDERS: &[&str] = &[
 ];
 
 /// A provider's editable configuration, flattened for the Settings UI.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProviderForm {
     pub provider: String,
     pub account: String,

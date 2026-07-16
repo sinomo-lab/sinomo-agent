@@ -5602,7 +5602,7 @@ use crate::file_manager::{FileManagerBackend, FileManagerEntryKind};
 use crate::sifs_file_manager::{SifsFileManagerBackend, SifsMetadataPrimaryTransferReport};
 
 /// One SIFS directory entry.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SifsEntry {
     pub name: String,
     pub path: String,

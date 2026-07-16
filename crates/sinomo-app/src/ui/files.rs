@@ -28,21 +28,23 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+#[cfg(test)]
+use sui::WindowEvent;
 use sui::{
     Alignment, ArrangeCtx, Background, Breadcrumb, BreadcrumbItem, ButtonAppearance,
     CheckboxIndicatorState, Color, Constraints, ControlSize, DefaultTheme, DetailRow, Dock,
     EmptyState, Event, EventCtx, EventPhase, FixedPaneSplit, Flex, FlexItem, FlexWrap, FontWeight,
-    IconButton, IconGlyph, Insets, KeyState, Label, LeadingLabelCellPaint, ListItem, ListView,
-    MeasureCtx, PaintCtx, PanelSection, PlacementBadge, PlacementBadgePaint, PointerEventKind,
+    IconButton, IconGlyph, Insets, KeyState, KeyedChildren, Label, LeadingLabelCellPaint, ListItem,
+    ListView, MeasureCtx, Observable, PaintCtx, PanelSection, PlacementBadge, PlacementBadgePaint,
     RebuildOnChange, Rect, RichText, ScrollState, ScrollView, SectionLabel, SegmentedControl,
     SegmentedControlItem, SemanticRegion, SemanticTone, SemanticsCtx, SemanticsRole, Separator,
     SideSheet, SideSheetPlacement, Size, SizedBox, Stack, StackHostOptions, StatusBadge, StatusBar,
     StatusBarSegment, Surface, SurfaceBorder, SurfaceRole, SwitchView, TextCellPaint, TextSurface,
     TextWrap, Tooltip, TooltipPlacement, TrailingSlotRow, VirtualTable, VirtualTableColumn,
     VirtualTableRowActivationKind, VirtualTableRowContext, VirtualTableSortDirection, Widget,
-    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
-    containers::Padding as WidgetPadding, paint_checkbox_indicator, paint_leading_label_cell,
-    paint_placement_badge_with, paint_text_cell,
+    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, containers::Padding as WidgetPadding,
+    paint_checkbox_indicator, paint_leading_label_cell, paint_placement_badge_with,
+    paint_text_cell,
 };
 
 use sinomo_cli::app_api::{
@@ -56,7 +58,7 @@ use time::format_description::well_known::Rfc3339;
 use crate::backend::Backend;
 use crate::native_picker::{NativePickerKind, NativePickerLane, NativePickerOutcome};
 use crate::state::{Shared, Tab};
-use crate::theme::Palette;
+use crate::theme::{AppTextScale, AppThemeMode, Palette};
 use crate::ui::settings::SettingsSection;
 use crate::ui::widgets;
 
@@ -603,6 +605,270 @@ pub struct FilesState {
     pending_import_request_ids: BTreeSet<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct FilesListStructure {
+    theme: (AppThemeMode, AppTextScale),
+    source: FilesSourceKind,
+    loaded: bool,
+    loading: bool,
+    error: Option<String>,
+    list_revision: u64,
+    entries: Vec<SifsEntry>,
+    entries_total_count: usize,
+    sort_mode: FileSortMode,
+    tasks: Vec<FilesTask>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct FilesHeaderStructure {
+    theme: (AppThemeMode, AppTextScale),
+    source: FilesSourceKind,
+    clustered: bool,
+    loading: bool,
+    path: String,
+    node_id: String,
+    history_back: Vec<FilesLocation>,
+    history_forward: Vec<FilesLocation>,
+    selected: Option<usize>,
+    marked_entries: BTreeSet<usize>,
+    sort_mode: FileSortMode,
+    picker_action: Option<FilesPickerAction>,
+    picker_error: Option<String>,
+    external_file_hovered: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct FilesInspectorStructure {
+    theme: (AppThemeMode, AppTextScale),
+    source: FilesSourceKind,
+    clustered: bool,
+    loaded: bool,
+    loading: bool,
+    error: Option<String>,
+    path: String,
+    entries: Vec<SifsEntry>,
+    selected: Option<usize>,
+    selected_details: Option<SifsObjectDetails>,
+    selected_local_details: Option<LocalObjectDetails>,
+    list_slow_after_secs: Option<u64>,
+    details_loading: bool,
+    details_error: Option<String>,
+    sifs_health: Option<SifsHealthSummary>,
+    sifs_health_error: Option<String>,
+    selected_preview: Option<FilesPreview>,
+    preview_loading: bool,
+    preview_error: Option<String>,
+    inspector_details_open: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FilesDialogStructure {
+    Closed {
+        theme: (AppThemeMode, AppTextScale),
+    },
+    DocumentConfirmation {
+        theme: (AppThemeMode, AppTextScale),
+        revision: u64,
+    },
+    Document {
+        theme: (AppThemeMode, AppTextScale),
+        revision: u64,
+    },
+    Action {
+        theme: (AppThemeMode, AppTextScale),
+        source: FilesSourceKind,
+        path: String,
+        kind: FileActionPromptKind,
+        target_path: Option<String>,
+        targets: Vec<FileActionTarget>,
+        error: Option<String>,
+    },
+    Compact {
+        theme: (AppThemeMode, AppTextScale),
+        overlay: CompactFilesOverlay,
+        source: FilesSourceKind,
+        path: String,
+        list_revision: u64,
+        selected: Option<usize>,
+        details_loading: bool,
+        preview_loading: bool,
+        inspector_details_open: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FilesStructureKey {
+    theme: (AppThemeMode, AppTextScale),
+    list: FilesListStructure,
+    header: FilesHeaderStructure,
+    places: Vec<FilePlace>,
+    inspector: FilesInspectorStructure,
+    tasks: Vec<FilesTask>,
+    dialog: FilesDialogStructure,
+}
+
+impl FilesStructureKey {
+    pub(crate) fn new(
+        theme_mode: AppThemeMode,
+        text_scale: AppTextScale,
+        state: Option<&FilesState>,
+    ) -> Self {
+        let theme = (theme_mode, text_scale);
+        let Some(state) = state else {
+            return Self {
+                theme,
+                list: FilesListStructure {
+                    theme,
+                    source: FilesSourceKind::Sifs,
+                    loaded: false,
+                    loading: false,
+                    error: None,
+                    list_revision: 0,
+                    entries: Vec::new(),
+                    entries_total_count: 0,
+                    sort_mode: FileSortMode::default(),
+                    tasks: Vec::new(),
+                },
+                header: FilesHeaderStructure {
+                    theme,
+                    source: FilesSourceKind::Sifs,
+                    clustered: false,
+                    loading: false,
+                    path: "/".to_string(),
+                    node_id: String::new(),
+                    history_back: Vec::new(),
+                    history_forward: Vec::new(),
+                    selected: None,
+                    marked_entries: BTreeSet::new(),
+                    sort_mode: FileSortMode::default(),
+                    picker_action: None,
+                    picker_error: None,
+                    external_file_hovered: false,
+                },
+                places: Vec::new(),
+                inspector: FilesInspectorStructure {
+                    theme,
+                    source: FilesSourceKind::Sifs,
+                    clustered: false,
+                    loaded: false,
+                    loading: false,
+                    error: None,
+                    path: "/".to_string(),
+                    entries: Vec::new(),
+                    selected: None,
+                    selected_details: None,
+                    selected_local_details: None,
+                    list_slow_after_secs: None,
+                    details_loading: false,
+                    details_error: None,
+                    sifs_health: None,
+                    sifs_health_error: None,
+                    selected_preview: None,
+                    preview_loading: false,
+                    preview_error: None,
+                    inspector_details_open: false,
+                },
+                tasks: Vec::new(),
+                dialog: FilesDialogStructure::Closed { theme },
+            };
+        };
+        let list = FilesListStructure {
+            theme,
+            source: state.source,
+            loaded: state.loaded,
+            loading: state.loading,
+            error: state.error.clone(),
+            list_revision: state.list_revision,
+            entries: state.entries.clone(),
+            entries_total_count: state.entries_total_count,
+            sort_mode: state.sort_mode,
+            tasks: state.tasks.clone(),
+        };
+        let header = FilesHeaderStructure {
+            theme,
+            source: state.source,
+            clustered: state.clustered,
+            loading: state.loading,
+            path: state.path.clone(),
+            node_id: state.node_id.clone(),
+            history_back: state.history_back.clone(),
+            history_forward: state.history_forward.clone(),
+            selected: state.selected,
+            marked_entries: state.marked_entries.clone(),
+            sort_mode: state.sort_mode,
+            picker_action: state.picker_action,
+            picker_error: state.picker_error.clone(),
+            external_file_hovered: state.external_file_hovered,
+        };
+        let inspector = FilesInspectorStructure {
+            theme,
+            source: state.source,
+            clustered: state.clustered,
+            loaded: state.loaded,
+            loading: state.loading,
+            error: state.error.clone(),
+            path: state.path.clone(),
+            entries: state.entries.clone(),
+            selected: state.selected,
+            selected_details: state.selected_details.clone(),
+            selected_local_details: state.selected_local_details.clone(),
+            list_slow_after_secs: state.list_slow_after_secs,
+            details_loading: state.details_loading,
+            details_error: state.details_error.clone(),
+            sifs_health: state.sifs_health.clone(),
+            sifs_health_error: state.sifs_health_error.clone(),
+            selected_preview: state.selected_preview.clone(),
+            preview_loading: state.preview_loading,
+            preview_error: state.preview_error.clone(),
+            inspector_details_open: state.inspector_details_open,
+        };
+        let dialog = if state.document_close_confirmation {
+            FilesDialogStructure::DocumentConfirmation {
+                theme,
+                revision: state.document_revision,
+            }
+        } else if state.document.is_some() {
+            FilesDialogStructure::Document {
+                theme,
+                revision: state.document_revision,
+            }
+        } else if let Some(prompt) = &state.action_prompt {
+            FilesDialogStructure::Action {
+                theme,
+                source: state.source,
+                path: state.path.clone(),
+                kind: prompt.kind,
+                target_path: prompt.target_path.clone(),
+                targets: prompt.targets.clone(),
+                error: prompt.error.clone(),
+            }
+        } else if let Some(overlay) = state.compact_overlay {
+            FilesDialogStructure::Compact {
+                theme,
+                overlay,
+                source: state.source,
+                path: state.path.clone(),
+                list_revision: state.list_revision,
+                selected: state.selected,
+                details_loading: state.details_loading,
+                preview_loading: state.preview_loading,
+                inspector_details_open: state.inspector_details_open,
+            }
+        } else {
+            FilesDialogStructure::Closed { theme }
+        };
+        Self {
+            theme,
+            list,
+            header,
+            places: files_places(state),
+            inspector,
+            tasks: state.tasks.clone(),
+            dialog,
+        }
+    }
+}
+
 impl FilesState {
     pub fn new(backend: &Backend) -> Self {
         let local_path = default_local_path(backend.data_dir.root());
@@ -727,18 +993,18 @@ impl FilesState {
         true
     }
 
-    fn ensure_loaded(&mut self, waker: Option<sui::UiHandle>) {
+    fn ensure_loaded(&mut self, waker: Option<sui::UiHandle>) -> bool {
         if self.loaded {
-            self.pump_load();
-            return;
+            return self.pump_load();
         }
         if let Some(waker) = waker {
             self.ensure_worker(waker);
             self.loaded = true;
             self.reload();
-            return;
+            return true;
         }
         self.load_sync();
+        true
     }
 
     fn load_sync(&mut self) {
@@ -6964,6 +7230,7 @@ fn sifs_inspector_next_step(
     sifs_placement_next_step(details, clustered)
 }
 
+#[cfg(test)]
 fn sifs_details_signature(details: Option<&SifsObjectDetails>) -> String {
     details
         .map(|details| {
@@ -7149,6 +7416,7 @@ fn unselected_inspector_rows(files: &FilesState) -> Vec<(&'static str, String)> 
     rows
 }
 
+#[cfg(test)]
 fn local_details_signature(details: Option<&LocalObjectDetails>) -> String {
     details
         .map(|details| {
@@ -7166,6 +7434,7 @@ fn local_details_signature(details: Option<&LocalObjectDetails>) -> String {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn files_preview_signature(preview: Option<&FilesPreview>) -> String {
     preview
         .map(|preview| {
@@ -8206,31 +8475,19 @@ where
     }
 }
 
-fn files_list_body_signature(shared: &Shared) -> (u64, FileSortMode, usize, usize) {
-    let files = shared.files();
-    (
-        files.list_revision,
-        files.sort_mode,
-        files.entries.len(),
-        files.entries_total_count,
-    )
-}
-
 fn files_list_body_rebuild(
     shared: &Shared,
     reader: &ThemeReader,
     scroll_state: &ScrollState,
 ) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .files_structure
+        .select_named("files list structure", |key| key.list.clone());
     let s = shared.clone();
     let r = Rc::clone(reader);
     let ss = scroll_state.clone();
-    RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || files_list_body_signature(&s)
-        },
-        move |_key| files_list_body_table(&s, &r, &ss),
-    )
+    RebuildOnChange::new_observable(source, move |_key| files_list_body_table(&s, &r, &ss))
 }
 
 fn files_list_body_table(
@@ -8456,11 +8713,10 @@ fn request_files_overlay_rebuild(ctx: &mut EventCtx) {
 }
 
 fn open_settings_section(shared: &Shared, section: SettingsSection) {
-    let mut app = shared.borrow_mut();
-    app.active_tab = Tab::Settings;
-    if let Some(ready) = app.ready.as_mut() {
-        ready.settings.open(section);
+    if shared.is_ready() {
+        shared.settings_mut().open(section);
     }
+    shared.set_active_tab(Tab::Settings);
 }
 
 fn sifs_health_has_attention(health: &SifsHealthSummary) -> bool {
@@ -8780,24 +9036,6 @@ fn files_task_status(files: &FilesState) -> String {
     } else {
         "idle".to_string()
     }
-}
-
-fn files_tasks_signature(tasks: &[FilesTask]) -> String {
-    tasks
-        .iter()
-        .map(|task| {
-            format!(
-                "{:?}:{}:{}:{:?}:{:.2}:{}",
-                task.source,
-                task.id,
-                task.title,
-                task.state,
-                task.progress.unwrap_or(-1.0),
-                task.detail
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("|")
 }
 
 fn files_tasks_have_finished(tasks: &[FilesTask]) -> bool {
@@ -9213,34 +9451,20 @@ fn files_status_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<
     SizedBox::new().height(FILES_STATUS_H).with_child(body)
 }
 
-fn files_places_signature(
-    shared: &Shared,
-) -> (FilesSourceKind, String, String, String, String, String) {
-    let files = shared.files();
-    (
-        files.source,
-        files.path.clone(),
-        files.sifs_path.clone(),
-        files.local_path.clone(),
-        files.node_id.clone(),
-        files.data_dir.root().to_string_lossy().into_owned(),
-    )
-}
-
 fn files_places_content_height(count: usize) -> f32 {
     48.0 + count as f32 * PLACE_ROW_H + 8.0
 }
 
 fn files_places_rail(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .files_structure
+        .select_named("files places structure", |key| {
+            (key.theme, key.places.clone())
+        });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || files_places_signature(&s)
-        },
-        move |_key| files_places_rail_rebuild(&s, &r),
-    )
+    RebuildOnChange::new_observable(source, move |_key| files_places_rail_rebuild(&s, &r))
 }
 
 fn files_places_rail_rebuild(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
@@ -9547,52 +9771,34 @@ fn files_task_strip(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<
 }
 
 struct InspectorTaskQueue {
-    shared: Shared,
-    reader: ThemeReader,
-    signature: String,
     child: WidgetPod,
 }
 
 impl InspectorTaskQueue {
     fn new(shared: Shared, reader: &ThemeReader) -> Self {
-        let (signature, child) = inspector_task_queue_snapshot(&shared, reader);
+        let description_shared = shared.clone();
+        let content = KeyedInspectorTaskContent::new(shared, reader);
         Self {
-            shared,
-            reader: Rc::clone(reader),
-            signature,
-            child,
+            child: WidgetPod::new(
+                SemanticRegion::new(
+                    "File task queue",
+                    Surface::panel(content)
+                        .padding(sui::Insets {
+                            left: 12.0,
+                            right: 12.0,
+                            top: 10.0,
+                            bottom: 12.0,
+                        })
+                        .fill_width()
+                        .theme_when(clone_reader(reader)),
+                )
+                .role(SemanticsRole::Text)
+                .description_when(move || {
+                    files_task_queue_summary(&description_shared.files().tasks)
+                }),
+            ),
         }
     }
-
-    fn refresh(&mut self) -> bool {
-        let signature = {
-            let files = self.shared.files();
-            files_tasks_signature(&files.tasks)
-        };
-        if signature == self.signature {
-            return false;
-        }
-
-        let (signature, child) = inspector_task_queue_snapshot(&self.shared, &self.reader);
-        self.signature = signature;
-        self.child = child;
-        true
-    }
-}
-
-fn inspector_task_queue_snapshot(shared: &Shared, reader: &ThemeReader) -> (String, WidgetPod) {
-    let tasks = shared.files().tasks.clone();
-    let signature = files_tasks_signature(&tasks);
-    let summary = files_task_queue_summary(&tasks);
-    let child = WidgetPod::new(
-        SemanticRegion::new(
-            "File task queue",
-            inspector_task_queue_content(shared, reader, &tasks),
-        )
-        .role(SemanticsRole::Text)
-        .description(summary),
-    );
-    (signature, child)
 }
 
 fn inspector_task_clear_button(shared: &Shared, reader: &ThemeReader) -> sui::Button {
@@ -9615,11 +9821,11 @@ fn inspector_task_clear_button(shared: &Shared, reader: &ThemeReader) -> sui::Bu
         })
 }
 
-fn inspector_task_queue_content(
+fn inspector_task_queue_header(
     shared: &Shared,
     reader: &ThemeReader,
     tasks: &[FilesTask],
-) -> impl Widget + use<> {
+) -> WidgetPod {
     let theme = reader();
     let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
     let summary_style = pal.text_style(&theme, 11.0, FontWeight::MEDIUM, pal.text_muted);
@@ -9638,14 +9844,14 @@ fn inspector_task_queue_content(
         .trailing_width(if has_finished { 108.0 } else { 0.0 })
         .trailing_height(22.0)
         .gap(8.0);
+    WidgetPod::new(header)
+}
 
-    let mut rows = Flex::vertical()
-        .main_gap(8.0)
-        .align_items(Alignment::Stretch)
-        .with_child(header);
-
-    if tasks.is_empty() {
-        let idle_body = Flex::vertical()
+fn inspector_task_queue_empty(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let theme = reader();
+    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
+    WidgetPod::new(
+        Flex::vertical()
             .main_gap(8.0)
             .align_items(Alignment::Stretch)
             .with_child(
@@ -9669,46 +9875,187 @@ fn inspector_task_queue_content(
                 11.0,
                 FontWeight::NORMAL,
                 pal.text_faint,
-            )));
-        rows = rows.with_child(idle_body);
-    } else {
-        for task in tasks {
-            rows = rows.with_child(
-                SizedBox::new()
-                    .height(31.0)
-                    .with_child(task_strip_row(shared, reader, task)),
-            );
+            ))),
+    )
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct FilesTaskRowsStructure {
+    theme: (AppThemeMode, AppTextScale),
+    tasks: Vec<FilesTask>,
+}
+
+struct KeyedInspectorTaskContent {
+    source: Arc<dyn Observable<FilesTaskRowsStructure>>,
+    shared: Shared,
+    reader: ThemeReader,
+    header_key: (AppThemeMode, AppTextScale, String, bool),
+    header: WidgetPod,
+    empty: WidgetPod,
+    children: KeyedChildren<u64, FilesTask>,
+    is_empty: bool,
+}
+
+impl KeyedInspectorTaskContent {
+    const GAP: f32 = 8.0;
+    const ROW_HEIGHT: f32 = 31.0;
+
+    fn new(shared: Shared, reader: &ThemeReader) -> Self {
+        let current = shared.signals().files_structure.get();
+        let tasks = current.tasks;
+        let header_key = (
+            current.theme.0,
+            current.theme.1,
+            files_task_queue_summary(&tasks),
+            files_tasks_have_finished(&tasks),
+        );
+        let source =
+            shared
+                .signals()
+                .files_structure
+                .select_named("files keyed task rows", |key| FilesTaskRowsStructure {
+                    theme: key.theme,
+                    tasks: key.tasks.clone(),
+                });
+        Self {
+            source: Arc::new(source),
+            header: inspector_task_queue_header(&shared, reader, &tasks),
+            empty: inspector_task_queue_empty(&shared, reader),
+            shared,
+            reader: Rc::clone(reader),
+            header_key,
+            children: KeyedChildren::new(),
+            is_empty: tasks.is_empty(),
         }
     }
 
-    Surface::panel(rows)
-        .padding(sui::Insets {
-            left: 12.0,
-            right: 12.0,
-            top: 10.0,
-            bottom: 12.0,
-        })
-        .fill_width()
-        .theme_when(clone_reader(reader))
+    fn sync(&mut self, structure: FilesTaskRowsStructure) {
+        let header_key = (
+            structure.theme.0,
+            structure.theme.1,
+            files_task_queue_summary(&structure.tasks),
+            files_tasks_have_finished(&structure.tasks),
+        );
+        if header_key != self.header_key {
+            self.header_key = header_key;
+            self.header = inspector_task_queue_header(&self.shared, &self.reader, &structure.tasks);
+            self.empty = inspector_task_queue_empty(&self.shared, &self.reader);
+        }
+        self.is_empty = structure.tasks.is_empty();
+        let shared = self.shared.clone();
+        let reader = Rc::clone(&self.reader);
+        self.children.reconcile(
+            structure.tasks,
+            |task| task.id,
+            move |_id, task| {
+                let row_shared = shared.clone();
+                let row_reader = Rc::clone(&reader);
+                RebuildOnChange::new_observable(task, move |task| {
+                    WidgetPod::new(
+                        SizedBox::new()
+                            .height(Self::ROW_HEIGHT)
+                            .with_child(task_strip_row(&row_shared, &row_reader, task)),
+                    )
+                })
+            },
+        );
+    }
+}
+
+impl Widget for KeyedInspectorTaskContent {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let structure = ctx.observe(self.source.as_ref());
+        self.sync(structure);
+        let width = if constraints.max.width.is_finite() {
+            constraints.max.width
+        } else {
+            constraints.min.width.max(280.0)
+        };
+        let child_constraints = Constraints::new(Size::ZERO, Size::new(width, f32::INFINITY));
+        let header = self.header.measure(ctx, child_constraints);
+        let body_height = if self.is_empty {
+            self.empty.measure(ctx, child_constraints).height
+        } else {
+            for (_, _, child) in self.children.iter_mut() {
+                child.measure(ctx, Constraints::tight(Size::new(width, Self::ROW_HEIGHT)));
+            }
+            self.children.len() as f32 * Self::ROW_HEIGHT
+                + self.children.len().saturating_sub(1) as f32 * Self::GAP
+        };
+        constraints.clamp(Size::new(width, header.height + Self::GAP + body_height))
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let header_height = self.header.measured_size().height;
+        self.header.arrange(
+            ctx,
+            Rect::new(bounds.x(), bounds.y(), bounds.width(), header_height),
+        );
+        let mut y = bounds.y() + header_height + Self::GAP;
+        if self.is_empty {
+            self.empty.arrange(
+                ctx,
+                Rect::new(
+                    bounds.x(),
+                    y,
+                    bounds.width(),
+                    self.empty.measured_size().height,
+                ),
+            );
+            return;
+        }
+        for (_, _, child) in self.children.iter_mut() {
+            child.arrange(
+                ctx,
+                Rect::new(bounds.x(), y, bounds.width(), Self::ROW_HEIGHT),
+            );
+            y += Self::ROW_HEIGHT + Self::GAP;
+        }
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.header.paint(ctx);
+        if self.is_empty {
+            self.empty.paint(ctx);
+        } else {
+            for (_, _, child) in self.children.iter() {
+                child.paint(ctx);
+            }
+        }
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.header.semantics(ctx);
+        if self.is_empty {
+            self.empty.semantics(ctx);
+        } else {
+            for (_, _, child) in self.children.iter() {
+                child.semantics(ctx);
+            }
+        }
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.header);
+        if self.is_empty {
+            visitor.visit(&self.empty);
+        } else {
+            self.children.visit_children(visitor);
+        }
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.header);
+        if self.is_empty {
+            visitor.visit(&mut self.empty);
+        } else {
+            self.children.visit_children_mut(visitor);
+        }
+    }
 }
 
 impl Widget for InspectorTaskQueue {
-    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        let pointer_up = matches!(
-            event,
-            Event::Pointer(pointer) if matches!(pointer.kind, PointerEventKind::Up)
-        );
-        let redraw = matches!(event, Event::Window(WindowEvent::RedrawRequested));
-        if (pointer_up || redraw) && self.refresh() {
-            ctx.request_measure();
-            ctx.request_arrange();
-            ctx.request_paint();
-            ctx.request_semantics();
-        }
-    }
-
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        self.refresh();
         self.child.measure(ctx, constraints)
     }
 
@@ -9816,7 +10163,7 @@ fn unselected_inspector_actions(files: &FilesState) -> Vec<RootInspectorAction> 
 }
 
 fn open_cluster_tab(shared: &Shared) {
-    shared.borrow_mut().active_tab = Tab::Cluster;
+    shared.set_active_tab(Tab::Cluster);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10069,13 +10416,15 @@ impl InspectorView {
             let s = shared.clone();
             Rc::new(move || s.theme().with_size(ControlSize::Small))
         };
-        let key_shared = shared.clone();
+        let source = shared
+            .signals()
+            .files_structure
+            .select_named("files inspector structure", |key| key.inspector.clone());
         let build_shared = shared.clone();
         let build_reader = Rc::clone(&reader);
-        let child = RebuildOnChange::new(
-            move || inspector_summary(&key_shared),
-            move |_key| composed_inspector_content(&build_shared, &build_reader),
-        );
+        let child = RebuildOnChange::new_observable(source, move |_key| {
+            composed_inspector_content(&build_shared, &build_reader)
+        });
         Self {
             child: WidgetPod::new(child),
         }
@@ -10110,6 +10459,7 @@ impl Widget for InspectorView {
     }
 }
 
+#[cfg(test)]
 fn inspector_summary(shared: &Shared) -> String {
     let files = shared.files();
     if files.loading {
@@ -10921,24 +11271,14 @@ fn inspector(
 /// The header bar wrapped so it rebuilds (breadcrumb segments and history affordances) whenever
 /// navigation state changes. A fixed-height titlebar surface over a hairline separator.
 fn header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .files_structure
+        .select_named("files header structure", |key| key.header.clone());
     let s = shared.clone();
     let r = Rc::clone(reader);
-    let rebuilt = RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || {
-                let files = s.files();
-                (
-                    files.source,
-                    files.path.clone(),
-                    files.history_back.len(),
-                    files.history_forward.len(),
-                    files.loading,
-                )
-            }
-        },
-        move |_key| WidgetPod::new(header(&s, &r)),
-    );
+    let rebuilt =
+        RebuildOnChange::new_observable(source, move |_key| WidgetPod::new(header(&s, &r)));
     Surface::window(
         WidgetPadding::horizontal(CONTENT_PAD, rebuilt)
             .fill_child_width()
@@ -10949,24 +11289,15 @@ fn header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 }
 
 fn picker_first_header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .files_structure
+        .select_named("files picker header structure", |key| key.header.clone());
     let s = shared.clone();
     let r = Rc::clone(reader);
-    let rebuilt = RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || {
-                let files = s.files();
-                (
-                    files.source,
-                    files.path.clone(),
-                    files.history_back.len(),
-                    files.history_forward.len(),
-                    files.loading,
-                )
-            }
-        },
-        move |_key| WidgetPod::new(picker_first_header(&s, &r)),
-    );
+    let rebuilt = RebuildOnChange::new_observable(source, move |_key| {
+        WidgetPod::new(picker_first_header(&s, &r))
+    });
     Surface::window(
         WidgetPadding::horizontal(CONTENT_PAD, rebuilt)
             .fill_child_width()
@@ -11042,23 +11373,14 @@ impl Widget for FilesDesktopHeader {
 }
 
 fn compact_header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .files_structure
+        .select_named("files compact header structure", |key| key.header.clone());
     let s = shared.clone();
     let r = Rc::clone(reader);
-    let rebuilt = RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || {
-                let files = s.files();
-                (
-                    files.source,
-                    files.path.clone(),
-                    files.history_back.len(),
-                    files.loading,
-                )
-            }
-        },
-        move |_key| WidgetPod::new(compact_header(&s, &r)),
-    );
+    let rebuilt =
+        RebuildOnChange::new_observable(source, move |_key| WidgetPod::new(compact_header(&s, &r)));
     Surface::window(
         WidgetPadding::new(
             Insets {
@@ -11083,19 +11405,14 @@ fn list_column(
     reader: &ThemeReader,
     scroll_state: &ScrollState,
 ) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .files_structure
+        .select_named("files column structure", |key| key.list.clone());
     let s = shared.clone();
     let r = Rc::clone(reader);
     let ss = scroll_state.clone();
-    RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || {
-                let files = s.files();
-                (files.path.clone(), files.list_revision, files.tasks.clone())
-            }
-        },
-        move |_key| listing(&s, &r, &ss),
-    )
+    RebuildOnChange::new_observable(source, move |_key| listing(&s, &r, &ss))
 }
 
 /// Wide split: header docked on top, body fills with [ list (flex) | vertical separator |
@@ -11537,6 +11854,7 @@ fn compact_files_commands(shared: &Shared, reader: &ThemeReader) -> impl Widget 
     .viewport_width_hint(true)
 }
 
+#[cfg(test)]
 fn files_action_dialog_signature(shared: &Shared) -> String {
     let files = shared.files();
     match &files.action_prompt {
@@ -12029,35 +12347,6 @@ fn files_document_close_dialog(shared: &Shared, reader: &ThemeReader) -> Option<
     ))
 }
 
-fn files_dialog_signature(shared: &Shared) -> String {
-    let files = shared.files();
-    if files.document_close_confirmation {
-        return format!("document-confirm|{}", files.document_revision);
-    }
-    if files.document.is_some() {
-        return format!("document|{}", files.document_revision);
-    }
-    drop(files);
-    let action = files_action_dialog_signature(shared);
-    if action != "closed" {
-        return format!("action|{action}");
-    }
-    let files = shared.files();
-    let Some(overlay) = files.compact_overlay else {
-        return "closed".to_string();
-    };
-    format!(
-        "compact|{overlay:?}|{:?}|{}|{}|{:?}|{}|{}|{}",
-        files.source,
-        files.path,
-        files.list_revision,
-        files.selected,
-        files.details_loading,
-        files.preview_loading,
-        files.inspector_details_open
-    )
-}
-
 fn compact_files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
     let overlay = shared.files().compact_overlay?;
     let (title, description, selected) = match overlay {
@@ -12107,7 +12396,7 @@ struct FilesDialogHost {
     reader: ThemeReader,
     body: WidgetPod,
     dialog: Option<WidgetPod>,
-    dialog_signature: String,
+    dialog_key: FilesDialogStructure,
 }
 
 impl FilesDialogHost {
@@ -12115,23 +12404,22 @@ impl FilesDialogHost {
     where
         W: Widget + 'static,
     {
-        let mut host = Self {
+        let dialog_key = shared.signals().files_structure.get().dialog;
+        let dialog = files_dialog(&shared, &reader);
+        Self {
             shared,
             reader,
             body: WidgetPod::new(body),
-            dialog: None,
-            dialog_signature: String::new(),
-        };
-        host.sync_dialog();
-        host
+            dialog,
+            dialog_key,
+        }
     }
 
-    fn sync_dialog(&mut self) {
-        let signature = files_dialog_signature(&self.shared);
-        if signature == self.dialog_signature {
+    fn sync_dialog(&mut self, key: FilesDialogStructure) {
+        if key == self.dialog_key {
             return;
         }
-        self.dialog_signature = signature;
+        self.dialog_key = key;
         self.dialog = files_dialog(&self.shared, &self.reader);
     }
 }
@@ -12150,17 +12438,16 @@ impl Widget for FilesDialogHost {
             ctx.set_handled();
             request_files_overlay_rebuild(ctx);
         }
-        let signature = files_dialog_signature(&self.shared);
-        if signature != self.dialog_signature {
-            ctx.request_measure();
-            ctx.request_paint();
-            ctx.request_semantics();
-            ctx.request_hit_test();
-        }
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        self.sync_dialog();
+        let source = self
+            .shared
+            .signals()
+            .files_structure
+            .select_named("files dialog structure", |key| key.dialog.clone());
+        let key = ctx.observe(&source);
+        self.sync_dialog(key);
         let size = constraints.clamp(Size::new(
             if constraints.max.width.is_finite() {
                 constraints.max.width
@@ -12279,24 +12566,14 @@ impl FilesView {
 }
 
 impl Widget for FilesView {
-    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        // Navigation (a directory row / breadcrumb / up button) mutates the path and the inner
-        // `RebuildOnChange` rebuilds the list + breadcrumb, but those nested rebuilds need a fresh
-        // measure+arrange for the host. A pointer release inside the tab is the only moment a
-        // navigation can happen, so request a relayout then (this is the path the headless tests
-        // exercise, since the harness never dispatches RedrawRequested). Matches `SettingsView`.
-        if let Event::Pointer(pointer) = event
-            && matches!(pointer.kind, sui::PointerEventKind::Up)
-        {
-            ctx.request_measure();
-            ctx.request_arrange();
-            ctx.request_paint();
-        }
-    }
+    fn event(&mut self, _ctx: &mut EventCtx, _event: &Event) {}
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
         let waker = { self.shared.borrow().waker.clone() };
-        self.shared.files_mut().ensure_loaded(waker);
+        let changed = self.shared.files_mut_unpublished().ensure_loaded(waker);
+        if changed {
+            self.shared.publish_files_signals();
+        }
         let use_wide = constraints.max.width >= WIDE_THRESHOLD;
         self.use_wide.set(use_wide);
         self.active_mut().measure(ctx, constraints)
@@ -16166,9 +16443,12 @@ mod tests {
             table.value,
             Some(sui::SemanticsValue::Text("2 rows".to_string()))
         );
-        assert_eq!(
-            table.description.as_deref(),
-            Some("Columns: Name, Placement, Kind / size")
+        assert!(
+            table.description.as_deref().is_some_and(
+                |description| description.starts_with("Columns: Name, Placement, Kind / size")
+            ),
+            "table semantics should preserve the column description: {:?}",
+            table.description
         );
 
         Ok(())
@@ -17108,6 +17388,72 @@ mod tests {
         let files = shared.files();
         assert_eq!(files.tasks[5].state, FilesTaskState::CancelRequested);
         assert!(operation_cancelled(&files.worker_cancellations, 105));
+
+        Ok(())
+    }
+
+    #[test]
+    fn inspector_task_reorder_preserves_keyed_row_widget_ids() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.tasks = vec![
+                FilesTask {
+                    id: 41,
+                    source: FilesSourceKind::Sifs,
+                    title: "Copy alpha".to_string(),
+                    detail: "/alpha -> /archive/alpha".to_string(),
+                    state: FilesTaskState::Running,
+                    progress: Some(0.2),
+                },
+                FilesTask {
+                    id: 73,
+                    source: FilesSourceKind::Sifs,
+                    title: "Copy beta".to_string(),
+                    detail: "/beta -> /archive/beta".to_string(),
+                    state: FilesTaskState::Running,
+                    progress: Some(0.6),
+                },
+            ];
+        }
+        let reader: ThemeReader = Rc::new(DefaultTheme::light);
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files keyed task rows")
+                    .root(
+                        SizedBox::new()
+                            .width(INSPECTOR_W)
+                            .height(240.0)
+                            .with_child(InspectorTaskQueue::new(shared.clone(), &reader)),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        let row_ids = |snapshot: &sui_testing::WindowSnapshot| {
+            snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .filter(|node| node.role == SemanticsRole::ProgressBar)
+                .filter_map(|node| node.name.clone().map(|name| (name, node.id)))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = row_ids(&window.snapshot()?);
+        assert_eq!(before.len(), 2);
+
+        shared.files_mut().tasks.swap(0, 1);
+        app.run_until_idle()?;
+        let after = row_ids(&window.snapshot()?);
+        assert_eq!(
+            after, before,
+            "same-key task rows should move without replacing their retained widget pods"
+        );
 
         Ok(())
     }

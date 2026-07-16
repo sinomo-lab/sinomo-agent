@@ -31,7 +31,7 @@ enum ClusterHealthScope {
     Full,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterSnapshot {
     pub cluster_id: Option<String>,
     pub local_node_id: Option<String>,
@@ -42,7 +42,7 @@ pub struct ClusterSnapshot {
     pub warnings: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterNodeInfo {
     pub node_id: String,
     pub display_name: String,
@@ -63,7 +63,7 @@ pub struct ClusterNodeInfo {
     pub endpoints: Vec<ClusterEndpointInfo>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterEndpointInfo {
     pub endpoint_id: String,
     pub transport: String,
@@ -76,7 +76,7 @@ pub struct ClusterEndpointInfo {
     pub reachable: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterLinkInfo {
     pub source_node_id: String,
     pub target_node_id: String,

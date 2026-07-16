@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
+#[cfg(test)]
+use sui::WindowEvent;
 use sui::{
     Alignment, ArrangeCtx, Button, Color, Constraints, ControlSize, DefaultTheme, DetailRow,
     EmptyState, Event, EventCtx, Flex, FlexItem, FontWeight, IconGlyph, Insets, KeyState, Label,
@@ -14,7 +16,7 @@ use sui::{
     ScrollDelta, ScrollView, SectionLabel, Select, SemanticTone, SemanticsAction, SemanticsCtx,
     SemanticsNode, SemanticsRole, SemanticsValue, Size, SizedBox, StatusBadge, StrokeStyle,
     Surface, SurfaceAppearance, SurfaceBorder, SurfaceRole, TextInput, Widget, WidgetId, WidgetPod,
-    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
+    WidgetPodMutVisitor, WidgetPodVisitor,
 };
 
 use crate::backend::Backend;
@@ -24,7 +26,7 @@ use crate::backend::evolution::{
     load_evolution_dashboard, spawn_evolution_decision, spawn_evolution_job,
 };
 use crate::state::Shared;
-use crate::theme::Palette;
+use crate::theme::{AppTextScale, AppThemeMode, Palette};
 use crate::ui::widgets;
 use sinomo_runtime::local::SinomoDataDir;
 
@@ -212,7 +214,198 @@ pub struct EvolutionState {
     scope_revision: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EvolutionHeaderStructure {
+    theme: (AppThemeMode, AppTextScale),
+    dashboard: EvolutionDashboard,
+    refresh_pending: bool,
+    refresh_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EvolutionQueueEmptyStructure {
+    theme: (AppThemeMode, AppTextScale),
+    empty: bool,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EvolutionStartStructure {
+    theme: (AppThemeMode, AppTextScale),
+    objective: String,
+    scope: String,
+    target_ring_index: usize,
+    advanced_open: bool,
+    status: Option<String>,
+    error: Option<String>,
+    job_count: usize,
+    starting: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EvolutionDetailStructure {
+    theme: (AppThemeMode, AppTextScale),
+    selected: Option<EvolutionJobSummary>,
+    can_start: bool,
+    starting: bool,
+    start_status: Option<String>,
+    start_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EvolutionRailStructure {
+    theme: (AppThemeMode, AppTextScale),
+    dashboard: EvolutionDashboard,
+    selected: Option<EvolutionJobSummary>,
+    decision_status: Option<String>,
+    decision_error: Option<String>,
+    deciding: bool,
+    readiness_details_open: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EvolutionNarrowActionStructure {
+    theme: (AppThemeMode, AppTextScale),
+    selected: Option<EvolutionJobSummary>,
+    decision_status: Option<String>,
+    decision_error: Option<String>,
+    deciding: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvolutionStructureKey {
+    theme: (AppThemeMode, AppTextScale),
+    header: EvolutionHeaderStructure,
+    queue_empty: EvolutionQueueEmptyStructure,
+    start: EvolutionStartStructure,
+    detail: EvolutionDetailStructure,
+    rail: EvolutionRailStructure,
+    narrow_action: EvolutionNarrowActionStructure,
+}
+
+impl EvolutionStructureKey {
+    pub(crate) fn new(
+        theme_mode: AppThemeMode,
+        text_scale: AppTextScale,
+        state: Option<&EvolutionState>,
+    ) -> Self {
+        let theme = (theme_mode, text_scale);
+        let Some(state) = state else {
+            let dashboard = EvolutionDashboard::default();
+            return Self {
+                theme,
+                header: EvolutionHeaderStructure {
+                    theme,
+                    dashboard: dashboard.clone(),
+                    refresh_pending: false,
+                    refresh_error: None,
+                },
+                queue_empty: EvolutionQueueEmptyStructure {
+                    theme,
+                    empty: true,
+                    error: None,
+                },
+                start: EvolutionStartStructure {
+                    theme,
+                    objective: String::new(),
+                    scope: String::new(),
+                    target_ring_index: 0,
+                    advanced_open: false,
+                    status: None,
+                    error: None,
+                    job_count: 0,
+                    starting: false,
+                },
+                detail: EvolutionDetailStructure {
+                    theme,
+                    selected: None,
+                    can_start: false,
+                    starting: false,
+                    start_status: None,
+                    start_error: None,
+                },
+                rail: EvolutionRailStructure {
+                    theme,
+                    dashboard,
+                    selected: None,
+                    decision_status: None,
+                    decision_error: None,
+                    deciding: false,
+                    readiness_details_open: false,
+                },
+                narrow_action: EvolutionNarrowActionStructure {
+                    theme,
+                    selected: None,
+                    decision_status: None,
+                    decision_error: None,
+                    deciding: false,
+                },
+            };
+        };
+        let dashboard = state.dashboard.clone();
+        let selected = state
+            .selected
+            .and_then(|index| dashboard.jobs.get(index))
+            .cloned();
+        let starting = state.is_starting();
+        let deciding = state.is_deciding();
+        Self {
+            theme,
+            header: EvolutionHeaderStructure {
+                theme,
+                dashboard: dashboard.clone(),
+                refresh_pending: state.dashboard_refresh_pending(),
+                refresh_error: state.dashboard_refresh_error().map(str::to_string),
+            },
+            queue_empty: EvolutionQueueEmptyStructure {
+                theme,
+                empty: dashboard.jobs.is_empty(),
+                error: dashboard.error.clone(),
+            },
+            start: EvolutionStartStructure {
+                theme,
+                objective: state.objective_draft.clone(),
+                scope: state.scope_draft.clone(),
+                target_ring_index: state.target_ring_index,
+                advanced_open: state.start_advanced_open,
+                status: state.start_status.clone(),
+                error: state.start_error.clone(),
+                job_count: dashboard.jobs.len(),
+                starting,
+            },
+            detail: EvolutionDetailStructure {
+                theme,
+                selected: selected.clone(),
+                can_start: state.can_start(),
+                starting,
+                start_status: state.start_status.clone(),
+                start_error: state.start_error.clone(),
+            },
+            rail: EvolutionRailStructure {
+                theme,
+                dashboard,
+                selected: selected.clone(),
+                decision_status: state.decision_status.clone(),
+                decision_error: state.decision_error.clone(),
+                deciding,
+                readiness_details_open: state.readiness_details_open,
+            },
+            narrow_action: EvolutionNarrowActionStructure {
+                theme,
+                selected,
+                decision_status: state.decision_status.clone(),
+                decision_error: state.decision_error.clone(),
+                deciding,
+            },
+        }
+    }
+}
+
 impl EvolutionState {
+    pub(crate) fn editor_revisions(&self) -> (u64, u64) {
+        (self.objective_revision, self.scope_revision)
+    }
+
     pub fn new(backend: &Backend) -> Self {
         let dashboard = EvolutionDashboard::load(backend);
         Self::from_dashboard(dashboard)
@@ -807,86 +1000,9 @@ fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     move || reader()
 }
 
-struct RebuildOnChange<K: PartialEq + Clone> {
-    key_fn: Box<dyn Fn() -> K>,
-    build: Box<dyn Fn(&K) -> WidgetPod>,
-    last_key: K,
-    child: WidgetPod,
-}
-
-impl<K: PartialEq + Clone> RebuildOnChange<K> {
-    fn new<KF, BF>(key_fn: KF, build: BF) -> Self
-    where
-        KF: Fn() -> K + 'static,
-        BF: Fn(&K) -> WidgetPod + 'static,
-    {
-        let last_key = key_fn();
-        let child = build(&last_key);
-        Self {
-            key_fn: Box::new(key_fn),
-            build: Box::new(build),
-            last_key,
-            child,
-        }
-    }
-
-    fn refresh(&mut self) -> bool {
-        let key = (self.key_fn)();
-        if key != self.last_key {
-            self.child = (self.build)(&key);
-            self.last_key = key;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-impl<K: PartialEq + Clone + 'static> Widget for RebuildOnChange<K> {
-    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        let pointer_up = matches!(
-            event,
-            Event::Pointer(pointer) if matches!(pointer.kind, PointerEventKind::Up)
-        );
-        if pointer_up && self.refresh() {
-            ctx.request_measure();
-            ctx.request_arrange();
-            ctx.request_paint();
-        }
-    }
-
-    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        self.refresh();
-        self.child.measure(ctx, constraints)
-    }
-
-    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        self.child.arrange(ctx, bounds);
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        self.child.paint(ctx);
-    }
-
-    fn semantics(&self, ctx: &mut SemanticsCtx) {
-        self.child.semantics(ctx);
-    }
-
-    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
-        visitor.visit(&self.child);
-    }
-
-    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
-        visitor.visit(&mut self.child);
-    }
-}
-
 fn request_window_relayout(ctx: &mut EventCtx) {
-    use sui::{InvalidationKind, InvalidationRequest, InvalidationTarget};
-
-    let window = InvalidationTarget::Window(ctx.window_id());
-    ctx.request(InvalidationRequest::new(window, InvalidationKind::Measure));
-    ctx.request(InvalidationRequest::new(window, InvalidationKind::Arrange));
+    ctx.request_measure();
+    ctx.request_arrange();
     ctx.request_paint();
     ctx.request_semantics();
 }
@@ -899,47 +1015,32 @@ fn ready_backend(shared: &Shared) -> Option<Backend> {
         .map(|ready| ready.backend.clone())
 }
 
-fn evolution_theme_signature(shared: &Shared) -> String {
-    let app = shared.borrow();
-    format!("{:?}:{:?}", app.theme_mode, app.text_scale)
-}
-
-fn evolution_header_signature(shared: &Shared) -> String {
-    let theme = evolution_theme_signature(shared);
-    let state = shared.evolution();
-    format!(
-        "{theme}|{:?}|{}|{:?}",
-        state.dashboard,
-        state.dashboard_refresh_pending(),
-        state.dashboard_refresh_error()
-    )
-}
-
-fn evolution_header_host(shared: &Shared, reader: &ThemeReader) -> sui::RebuildOnChange<String> {
+fn evolution_header_host(
+    shared: &Shared,
+    reader: &ThemeReader,
+) -> sui::RebuildOnChange<EvolutionHeaderStructure> {
+    let source = shared
+        .signals()
+        .evolution_structure
+        .select_named("evolution header structure", |key| key.header.clone());
     let s = shared.clone();
     let r = Rc::clone(reader);
-    sui::RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || evolution_header_signature(&s)
-        },
-        move |_key| {
-            let build_s = s.clone();
-            let build_r = Rc::clone(&r);
-            WidgetPod::new(sui::RebuildOnConstraints::new(
-                true,
-                move |constraints| {
-                    let width = if constraints.max.width.is_finite() {
-                        constraints.max.width
-                    } else {
-                        constraints.min.width
-                    };
-                    width >= 740.0
-                },
-                move |show_metrics| build_evolution_header(&build_s, &build_r, *show_metrics),
-            ))
-        },
-    )
+    sui::RebuildOnChange::new_observable(source, move |_key| {
+        let build_s = s.clone();
+        let build_r = Rc::clone(&r);
+        WidgetPod::new(sui::RebuildOnConstraints::new(
+            true,
+            move |constraints| {
+                let width = if constraints.max.width.is_finite() {
+                    constraints.max.width
+                } else {
+                    constraints.min.width
+                };
+                width >= 740.0
+            },
+            move |show_metrics| build_evolution_header(&build_s, &build_r, *show_metrics),
+        ))
+    })
 }
 
 fn build_evolution_header(shared: &Shared, reader: &ThemeReader, show_metrics: bool) -> WidgetPod {
@@ -1020,128 +1121,103 @@ fn build_evolution_header(shared: &Shared, reader: &ThemeReader, show_metrics: b
 fn evolution_queue_header_host(
     shared: &Shared,
     reader: &ThemeReader,
-) -> sui::RebuildOnChange<String> {
-    let s = shared.clone();
+) -> sui::RebuildOnChange<(AppThemeMode, AppTextScale)> {
+    let source = shared
+        .signals()
+        .evolution_structure
+        .select_named("evolution queue header theme", |key| key.theme);
     let build_s = shared.clone();
     let r = Rc::clone(reader);
-    sui::RebuildOnChange::new(
-        move || evolution_theme_signature(&s),
-        move |_key| {
-            let theme = r();
-            let pal = Palette::from_theme(&theme, widgets::theme_is_dark(&build_s));
-            let column = Flex::vertical()
-                .align_items(Alignment::Stretch)
-                .gap(1.0)
-                .with_child(Label::new("Candidate queue").style(pal.text_style(
-                    &theme,
-                    theme.text.sm.size,
-                    FontWeight::SEMIBOLD,
-                    pal.text,
-                )))
-                .with_child(Label::new("Observed to promoted").style(pal.text_style(
-                    &theme,
-                    theme.text.xs.size,
-                    FontWeight::NORMAL,
-                    pal.text_faint,
-                )));
-            WidgetPod::new(
-                Surface::new(SurfaceRole::Sidebar, column)
-                    .border(SurfaceBorder::Bottom)
-                    .padding(Insets {
-                        left: PAD,
-                        top: 6.0,
-                        right: PAD,
-                        bottom: 6.0,
-                    })
-                    .fill()
-                    .theme_when(clone_reader(&r)),
-            )
-        },
-    )
-}
-
-fn evolution_queue_empty_signature(shared: &Shared) -> String {
-    let theme = evolution_theme_signature(shared);
-    let state = shared.evolution();
-    format!(
-        "{theme}|{}|{:?}",
-        state.dashboard.jobs.is_empty(),
-        state.dashboard.error
-    )
+    sui::RebuildOnChange::new_observable(source, move |_key| {
+        let theme = r();
+        let pal = Palette::from_theme(&theme, widgets::theme_is_dark(&build_s));
+        let column = Flex::vertical()
+            .align_items(Alignment::Stretch)
+            .gap(1.0)
+            .with_child(Label::new("Candidate queue").style(pal.text_style(
+                &theme,
+                theme.text.sm.size,
+                FontWeight::SEMIBOLD,
+                pal.text,
+            )))
+            .with_child(Label::new("Observed to promoted").style(pal.text_style(
+                &theme,
+                theme.text.xs.size,
+                FontWeight::NORMAL,
+                pal.text_faint,
+            )));
+        WidgetPod::new(
+            Surface::new(SurfaceRole::Sidebar, column)
+                .border(SurfaceBorder::Bottom)
+                .padding(Insets {
+                    left: PAD,
+                    top: 6.0,
+                    right: PAD,
+                    bottom: 6.0,
+                })
+                .fill()
+                .theme_when(clone_reader(&r)),
+        )
+    })
 }
 
 fn evolution_queue_empty_host(
     shared: &Shared,
     reader: &ThemeReader,
-) -> sui::RebuildOnChange<String> {
-    let s = shared.clone();
+) -> sui::RebuildOnChange<EvolutionQueueEmptyStructure> {
+    let source = shared
+        .signals()
+        .evolution_structure
+        .select_named("evolution queue empty structure", |key| {
+            key.queue_empty.clone()
+        });
     let build_s = shared.clone();
     let r = Rc::clone(reader);
-    sui::RebuildOnChange::new(
-        move || evolution_queue_empty_signature(&s),
-        move |_key| {
-            let message = build_s
-                .evolution()
-                .dashboard
-                .error
-                .clone()
-                .unwrap_or_else(|| "Start a job to create the first candidate".to_string());
-            WidgetPod::new(
-                EmptyState::new("No candidates", compact(&message, 48))
-                    .name("Evolution candidate queue empty")
-                    .icon(IconGlyph::Sparkles)
-                    .transparent()
-                    .theme_when(clone_reader(&r)),
-            )
-        },
-    )
-}
-
-fn evolution_start_signature(shared: &Shared) -> String {
-    let theme = evolution_theme_signature(shared);
-    let state = shared.evolution();
-    format!(
-        "{theme}|{}|{}|{}|{}|{:?}|{:?}|{:?}",
-        state.objective_draft,
-        state.scope_draft,
-        state.target_ring_index,
-        state.start_advanced_open,
-        state.start_status,
-        state.start_error,
-        state.dashboard
-    )
+    sui::RebuildOnChange::new_observable(source, move |_key| {
+        let message = build_s
+            .evolution()
+            .dashboard
+            .error
+            .clone()
+            .unwrap_or_else(|| "Start a job to create the first candidate".to_string());
+        WidgetPod::new(
+            EmptyState::new("No candidates", compact(&message, 48))
+                .name("Evolution candidate queue empty")
+                .icon(IconGlyph::Sparkles)
+                .transparent()
+                .theme_when(clone_reader(&r)),
+        )
+    })
 }
 
 fn evolution_start_chrome_host(
     shared: &Shared,
     reader: &ThemeReader,
-) -> sui::RebuildOnChange<String> {
+) -> sui::RebuildOnChange<EvolutionStartStructure> {
+    let source = shared
+        .signals()
+        .evolution_structure
+        .select_named("evolution start chrome structure", |key| key.start.clone());
     let s = shared.clone();
     let r = Rc::clone(reader);
-    sui::RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || evolution_start_signature(&s)
-        },
-        move |_key| {
-            let build_s = s.clone();
-            let build_r = Rc::clone(&r);
-            WidgetPod::new(sui::RebuildOnConstraints::new(
-                (true, true),
-                move |constraints| {
-                    let width = if constraints.max.width.is_finite() {
-                        constraints.max.width
-                    } else {
-                        constraints.min.width
-                    };
-                    (width >= 640.0, (width - PAD * 2.0) >= START_BREAKPOINT)
-                },
-                move |(inline, wide_header)| {
-                    build_evolution_start_chrome(&build_s, &build_r, *inline, *wide_header)
-                },
-            ))
-        },
-    )
+    sui::RebuildOnChange::new_observable(source, move |_key| {
+        let build_s = s.clone();
+        let build_r = Rc::clone(&r);
+        WidgetPod::new(sui::RebuildOnConstraints::new(
+            (true, true),
+            move |constraints| {
+                let width = if constraints.max.width.is_finite() {
+                    constraints.max.width
+                } else {
+                    constraints.min.width
+                };
+                (width >= 640.0, (width - PAD * 2.0) >= START_BREAKPOINT)
+            },
+            move |(inline, wide_header)| {
+                build_evolution_start_chrome(&build_s, &build_r, *inline, *wide_header)
+            },
+        ))
+    })
 }
 
 fn evolution_start_status(shared: &Shared) -> (String, SemanticTone) {
@@ -1259,32 +1335,17 @@ fn build_evolution_start_chrome(
     )
 }
 
-fn evolution_detail_signature(shared: &Shared) -> String {
-    let theme = evolution_theme_signature(shared);
-    let state = shared.evolution();
-    let selected = state
-        .selected
-        .and_then(|index| state.dashboard.jobs.get(index));
-    format!(
-        "{theme}|{:?}|{}|{}|{:?}|{:?}",
-        selected,
-        state.can_start(),
-        state.is_starting(),
-        state.start_status,
-        state.start_error
-    )
-}
-
-fn evolution_detail_host(shared: &Shared, reader: &ThemeReader) -> sui::RebuildOnChange<String> {
+fn evolution_detail_host(
+    shared: &Shared,
+    reader: &ThemeReader,
+) -> sui::RebuildOnChange<EvolutionDetailStructure> {
+    let source = shared
+        .signals()
+        .evolution_structure
+        .select_named("evolution detail structure", |key| key.detail.clone());
     let s = shared.clone();
     let r = Rc::clone(reader);
-    sui::RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || evolution_detail_signature(&s)
-        },
-        move |_key| build_evolution_detail(&s, &r),
-    )
+    sui::RebuildOnChange::new_observable(source, move |_key| build_evolution_detail(&s, &r))
 }
 
 fn phase_tone(phase: EvolutionPhase) -> SemanticTone {
@@ -1439,33 +1500,17 @@ fn build_evolution_detail(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     )
 }
 
-fn evolution_rail_signature(shared: &Shared) -> String {
-    let theme = evolution_theme_signature(shared);
-    let state = shared.evolution();
-    let selected = state
-        .selected
-        .and_then(|index| state.dashboard.jobs.get(index));
-    format!(
-        "{theme}|{:?}|{:?}|{:?}|{}|{:?}|{:?}",
-        selected,
-        state.decision_status,
-        state.decision_error,
-        state.is_deciding(),
-        state.readiness_details_open,
-        state.dashboard
-    )
-}
-
-fn evolution_rail_host(shared: &Shared, reader: &ThemeReader) -> sui::RebuildOnChange<String> {
+fn evolution_rail_host(
+    shared: &Shared,
+    reader: &ThemeReader,
+) -> sui::RebuildOnChange<EvolutionRailStructure> {
+    let source = shared
+        .signals()
+        .evolution_structure
+        .select_named("evolution rail structure", |key| key.rail.clone());
     let s = shared.clone();
     let r = Rc::clone(reader);
-    sui::RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || evolution_rail_signature(&s)
-        },
-        move |_key| build_evolution_rail(&s, &r),
-    )
+    sui::RebuildOnChange::new_observable(source, move |_key| build_evolution_rail(&s, &r))
 }
 
 fn compact_property_rows_surface(
@@ -1597,34 +1642,19 @@ fn build_evolution_rail(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     )
 }
 
-fn evolution_narrow_action_signature(shared: &Shared) -> String {
-    let theme = evolution_theme_signature(shared);
-    let state = shared.evolution();
-    let selected = state
-        .selected
-        .and_then(|index| state.dashboard.jobs.get(index));
-    format!(
-        "{theme}|{:?}|{:?}|{:?}|{}",
-        selected,
-        state.decision_status,
-        state.decision_error,
-        state.is_deciding()
-    )
-}
-
 fn evolution_narrow_action_host(
     shared: &Shared,
     reader: &ThemeReader,
-) -> sui::RebuildOnChange<String> {
+) -> sui::RebuildOnChange<EvolutionNarrowActionStructure> {
+    let source = shared
+        .signals()
+        .evolution_structure
+        .select_named("evolution narrow action structure", |key| {
+            key.narrow_action.clone()
+        });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    sui::RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || evolution_narrow_action_signature(&s)
-        },
-        move |_key| build_evolution_narrow_action(&s, &r),
-    )
+    sui::RebuildOnChange::new_observable(source, move |_key| build_evolution_narrow_action(&s, &r))
 }
 
 fn build_evolution_narrow_action(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
@@ -1896,13 +1926,14 @@ impl EvolutionView {
         let waker = self.shared.borrow().waker.clone();
         let has_external_waker = waker.is_some();
         let changed = {
-            let mut evolution = self.shared.evolution_mut();
+            let mut evolution = self.shared.evolution_mut_unpublished();
             let start_changed = evolution.pump_start_events(&backend, waker.clone());
             let decision_changed = evolution.pump_decision_events(&backend, waker);
             let dashboard_changed = evolution.pump_dashboard_load();
             start_changed || decision_changed || dashboard_changed
         };
         if changed {
+            self.shared.publish_evolution_signals();
             ctx.request_measure();
             ctx.request_arrange();
             ctx.request_paint();
@@ -2079,15 +2110,17 @@ impl StartControls {
         let reader = small_theme_reader(&shared);
 
         let objective = {
+            let source = shared
+                .signals()
+                .evolution_objective_revision
+                .select_named("evolution objective editor replacement", |revision| {
+                    *revision
+                });
             let s = shared.clone();
             let r = Rc::clone(&reader);
-            RebuildOnChange::new(
-                {
-                    let s = s.clone();
-                    move || s.evolution().objective_revision
-                },
-                move |_revision| WidgetPod::new(objective_input(&s, &r)),
-            )
+            sui::RebuildOnChange::new_observable(source, move |_revision| {
+                WidgetPod::new(objective_input(&s, &r))
+            })
         };
 
         let options = {
@@ -2106,26 +2139,24 @@ impl StartControls {
         };
 
         let scope = {
+            let source = shared
+                .signals()
+                .evolution_scope_revision
+                .select_named("evolution scope editor replacement", |revision| *revision);
             let s = shared.clone();
             let r = Rc::clone(&reader);
-            RebuildOnChange::new(
-                {
-                    let s = s.clone();
-                    move || s.evolution().scope_revision
-                },
-                move |_revision| {
-                    let s_for_change = s.clone();
-                    WidgetPod::new(
-                        TextInput::new("evolution-scope")
-                            .value(s.evolution().scope_draft.clone())
-                            .placeholder(SCOPE_PLACEHOLDER)
-                            .theme_when(clone_reader(&r))
-                            .on_change(move |value| {
-                                s_for_change.evolution_mut().set_scope_draft(value);
-                            }),
-                    )
-                },
-            )
+            sui::RebuildOnChange::new_observable(source, move |_revision| {
+                let s_for_change = s.clone();
+                WidgetPod::new(
+                    TextInput::new("evolution-scope")
+                        .value(s.evolution().scope_draft.clone())
+                        .placeholder(SCOPE_PLACEHOLDER)
+                        .theme_when(clone_reader(&r))
+                        .on_change(move |value| {
+                            s_for_change.evolution_mut().set_scope_draft(value);
+                        }),
+                )
+            })
         };
 
         let target = {
@@ -2671,9 +2702,6 @@ impl Widget for EvolutionView {
                     _ => {}
                 }
             }
-            Event::Window(WindowEvent::RedrawRequested) => {
-                ctx.request_paint();
-            }
             _ => {}
         }
     }
@@ -2683,6 +2711,8 @@ impl Widget for EvolutionView {
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let structure = self.shared.signals().evolution_structure.clone();
+        let _ = ctx.observe(&structure);
         let advanced_open = self.shared.evolution().start_advanced_open;
         let layout = layout_for(
             Rect::new(0.0, 0.0, constraints.max.width, constraints.max.height),
