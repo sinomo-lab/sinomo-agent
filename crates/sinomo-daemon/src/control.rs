@@ -4,9 +4,10 @@ use crate::cluster::{
     prune_local_cluster_raft_uncommitted_tail,
 };
 use crate::dfs::{
-    daemon_dfs_maintenance_notify, daemon_dfs_node_transport, daemon_dfs_node_transport_on_runtime,
-    daemon_dfs_pending_maintenance_work, ensure_default_distributed_dfs_async_on_runtime,
-    ensure_default_local_dfs_expose, run_daemon_dfs_maintenance_tick_in_blocking_task,
+    DaemonDfsMaintenanceTickOutcome, daemon_dfs_maintenance_notify, daemon_dfs_node_transport,
+    daemon_dfs_node_transport_on_runtime, daemon_dfs_pending_maintenance_work,
+    ensure_default_distributed_dfs_async_on_runtime, ensure_default_local_dfs_expose,
+    run_daemon_dfs_maintenance_tick_in_blocking_task,
 };
 use crate::{
     AuthenticatedDaemonCommand, DaemonClusterStatus, DaemonDataOwnerLock, DaemonError, DaemonLock,
@@ -40,6 +41,7 @@ use tokio::io::AsyncWriteExt as _;
 pub const DAEMON_DFS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
 pub const DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 pub const DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(30);
+const DAEMON_DFS_MAINTENANCE_LEASE_RETRY_DELAY: Duration = Duration::from_secs(5);
 // Full DFS passes own the process's sole backend-bearing service lane. Stagger
 // their first acquisition by stable membership rank so a rolling restart does
 // not make every node hold its local lane while asking a peer to enter theirs.
@@ -916,25 +918,25 @@ fn daemon_dfs_initial_maintenance_phase(paths: &DaemonPaths) -> Result<Duration,
 fn spawn_daemon_dfs_maintenance_task(
     paths: DaemonPaths,
     runtime: tokio::runtime::Handle,
-) -> tokio::task::JoinHandle<Result<(), DaemonError>> {
+) -> tokio::task::JoinHandle<Result<DaemonDfsMaintenanceTickOutcome, DaemonError>> {
     tokio::spawn(run_daemon_dfs_maintenance_tick_in_blocking_task(
         paths, runtime,
     ))
 }
 
 async fn join_daemon_dfs_maintenance_task(
-    task: tokio::task::JoinHandle<Result<(), DaemonError>>,
+    task: tokio::task::JoinHandle<Result<DaemonDfsMaintenanceTickOutcome, DaemonError>>,
     label: &str,
-) -> bool {
+) -> Option<DaemonDfsMaintenanceTickOutcome> {
     match task.await {
-        Ok(Ok(())) => true,
+        Ok(Ok(outcome)) => Some(outcome),
         Ok(Err(error)) => {
             tracing::warn!("sinomo {label} DFS maintenance tick failed: {error}");
-            false
+            None
         }
         Err(error) => {
             tracing::warn!("sinomo {label} DFS maintenance task failed: {error}");
-            false
+            None
         }
     }
 }
@@ -1000,7 +1002,9 @@ async fn run_daemon_background_maintenance_loop(
         None
     };
     let mut dfs_triggered_maintenance_requested = false;
-    let mut dfs_maintenance_task: Option<tokio::task::JoinHandle<Result<(), DaemonError>>> = None;
+    let mut dfs_maintenance_task: Option<
+        tokio::task::JoinHandle<Result<DaemonDfsMaintenanceTickOutcome, DaemonError>>,
+    > = None;
 
     loop {
         if daemon_shutdown_requested(&shutdown_rx) {
@@ -1084,10 +1088,13 @@ async fn run_daemon_background_maintenance_loop(
             let completed_task = dfs_maintenance_task
                 .take()
                 .expect("finished DFS maintenance task exists");
-            let completed_ok =
+            let completed_outcome =
                 join_daemon_dfs_maintenance_task(completed_task, label.as_str()).await;
-            dfs_triggered_maintenance_requested = false;
-            if completed_ok {
+            dfs_triggered_maintenance_requested = matches!(
+                completed_outcome,
+                Some(DaemonDfsMaintenanceTickOutcome::Deferred)
+            );
+            if completed_outcome == Some(DaemonDfsMaintenanceTickOutcome::Completed) {
                 let probe_paths = paths.clone();
                 match tokio::task::spawn_blocking(move || {
                     daemon_dfs_pending_maintenance_work(&probe_paths)
@@ -1106,7 +1113,18 @@ async fn run_daemon_background_maintenance_loop(
                     ),
                 }
             }
-            last_dfs_maintenance = std::time::Instant::now();
+            let completed_at = std::time::Instant::now();
+            last_dfs_maintenance =
+                if completed_outcome == Some(DaemonDfsMaintenanceTickOutcome::Deferred) {
+                    completed_at
+                        .checked_sub(
+                            DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL
+                                .saturating_sub(DAEMON_DFS_MAINTENANCE_LEASE_RETRY_DELAY),
+                        )
+                        .unwrap_or(completed_at)
+                } else {
+                    completed_at
+                };
         }
 
         if daemon_role_owns_default_dfs(&label)
@@ -6150,12 +6168,15 @@ mod tests {
             let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
             let task = tokio::spawn(async move {
                 release_rx.await.expect("release maintenance task");
-                Ok(())
+                Ok(DaemonDfsMaintenanceTickOutcome::Completed)
             });
             let joined = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let joined_after_wait = Arc::clone(&joined);
             let waiter = tokio::spawn(async move {
-                assert!(join_daemon_dfs_maintenance_task(task, "daemon-test").await);
+                assert_eq!(
+                    join_daemon_dfs_maintenance_task(task, "daemon-test").await,
+                    Some(DaemonDfsMaintenanceTickOutcome::Completed)
+                );
                 joined_after_wait.store(true, std::sync::atomic::Ordering::Release);
             });
 

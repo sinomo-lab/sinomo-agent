@@ -6,7 +6,9 @@ use crate::control::DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL;
 use crate::{DaemonError, DaemonPaths, DaemonRunOptions};
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
-use sinomo_core::kv::{KvEntry, KvError, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse};
+use sinomo_core::kv::{
+    KvCompare, KvEntry, KvError, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse,
+};
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{ClusterPaths, ObjectRpcSessionCall, ObjectRpcSessionResult};
 use sinomo_core::node::NodeId;
@@ -55,6 +57,16 @@ use time::OffsetDateTime;
 const DAEMON_DFS_MESSAGE_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const DAEMON_DFS_PROMOTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const DAEMON_DFS_REPAIR_MAX_JOBS_PER_TICK: usize = 8;
+const DAEMON_DFS_MAINTENANCE_LEASE_KEY: &str = "/dfs/runtime/maintenance-lease";
+const DAEMON_DFS_MAINTENANCE_LEASE_TTL: Duration = Duration::from_secs(60);
+const DAEMON_DFS_MAINTENANCE_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
+const DAEMON_DFS_MAINTENANCE_LEASE_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+// The shared wall-clock expiry remains valid beyond the holder's monotonic
+// authority deadline. The two margins tolerate up to 30 seconds of pairwise
+// clock skew and still leave 30 seconds for an expired holder's bounded peer
+// calls to unwind before an ahead claimant can take over.
+const DAEMON_DFS_MAINTENANCE_LEASE_MAX_CLOCK_SKEW: Duration = Duration::from_secs(30);
+const DAEMON_DFS_MAINTENANCE_LEASE_UNWIND_GRACE: Duration = Duration::from_secs(30);
 const DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
 // A replica journal apply is durable WAN work. Give daemon maintenance a larger
 // response budget than the library default while keeping foreground publication
@@ -445,6 +457,552 @@ fn daemon_dfs_now_unix_nanos() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
+}
+
+fn daemon_dfs_duration_nanos(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, Eq, PartialEq)]
+struct DaemonDfsMaintenanceLeaseRecord {
+    holder_node_id: NodeId,
+    owner_token: String,
+    #[serde(default)]
+    renewal_sequence: u64,
+    expires_unix_nanos: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DaemonDfsMaintenanceLeaseAcquire {
+    Acquired(DaemonDfsMaintenanceLeaseRecord),
+    Deferred(Option<DaemonDfsMaintenanceLeaseRecord>),
+}
+
+fn daemon_dfs_maintenance_lease_record(
+    holder_node_id: NodeId,
+    owner_token: String,
+    now_unix_nanos: u64,
+) -> DaemonDfsMaintenanceLeaseRecord {
+    DaemonDfsMaintenanceLeaseRecord {
+        holder_node_id,
+        owner_token,
+        renewal_sequence: 0,
+        expires_unix_nanos: now_unix_nanos
+            .saturating_add(daemon_dfs_duration_nanos(DAEMON_DFS_MAINTENANCE_LEASE_TTL))
+            .saturating_add(daemon_dfs_duration_nanos(
+                DAEMON_DFS_MAINTENANCE_LEASE_MAX_CLOCK_SKEW,
+            ))
+            .saturating_add(daemon_dfs_duration_nanos(
+                DAEMON_DFS_MAINTENANCE_LEASE_UNWIND_GRACE,
+            )),
+    }
+}
+
+async fn acquire_daemon_dfs_maintenance_lease(
+    kv: &mut dyn sinomo_dfs::AsyncDfsControlPlaneKvClient,
+    holder_node_id: NodeId,
+    owner_token: String,
+    now_unix_nanos: u64,
+) -> Result<DaemonDfsMaintenanceLeaseAcquire, KvError> {
+    kv.refresh_latest_async().await?;
+    let current = kv.get_async(DAEMON_DFS_MAINTENANCE_LEASE_KEY).await?;
+    let compare = match current.as_ref() {
+        None => KvCompare::Missing {
+            key: DAEMON_DFS_MAINTENANCE_LEASE_KEY.to_string(),
+        },
+        Some(entry) => {
+            let record =
+                sinomo_core::kv::decode_kv_value::<DaemonDfsMaintenanceLeaseRecord>(&entry.value)?;
+            if record.expires_unix_nanos > now_unix_nanos {
+                return Ok(DaemonDfsMaintenanceLeaseAcquire::Deferred(Some(record)));
+            }
+            KvCompare::ValueEquals {
+                key: DAEMON_DFS_MAINTENANCE_LEASE_KEY.to_string(),
+                value: entry.value.clone(),
+            }
+        }
+    };
+    let record = daemon_dfs_maintenance_lease_record(holder_node_id, owner_token, now_unix_nanos);
+    let response = kv
+        .txn_async(KvTxn {
+            compares: vec![compare],
+            success: vec![KvOp::Put {
+                key: DAEMON_DFS_MAINTENANCE_LEASE_KEY.to_string(),
+                value: sinomo_core::kv::encode_kv_value(&record)?,
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        })
+        .await?;
+    if response.succeeded {
+        Ok(DaemonDfsMaintenanceLeaseAcquire::Acquired(record))
+    } else {
+        Ok(DaemonDfsMaintenanceLeaseAcquire::Deferred(None))
+    }
+}
+
+async fn renew_daemon_dfs_maintenance_lease(
+    kv: &mut dyn sinomo_dfs::AsyncDfsControlPlaneKvClient,
+    current: &DaemonDfsMaintenanceLeaseRecord,
+    now_unix_nanos: u64,
+    minimum_expiry_advance: Duration,
+) -> Result<Option<DaemonDfsMaintenanceLeaseRecord>, KvError> {
+    if current.expires_unix_nanos <= now_unix_nanos {
+        return Ok(None);
+    }
+    let renewal_sequence =
+        current
+            .renewal_sequence
+            .checked_add(1)
+            .ok_or_else(|| KvError::Serialization {
+                detail: "DFS maintenance lease renewal sequence exhausted".to_string(),
+            })?;
+    let renewed = DaemonDfsMaintenanceLeaseRecord {
+        holder_node_id: current.holder_node_id.clone(),
+        owner_token: current.owner_token.clone(),
+        renewal_sequence,
+        expires_unix_nanos: current
+            .expires_unix_nanos
+            .saturating_add(daemon_dfs_duration_nanos(minimum_expiry_advance))
+            .max(
+                now_unix_nanos
+                    .saturating_add(daemon_dfs_duration_nanos(DAEMON_DFS_MAINTENANCE_LEASE_TTL))
+                    .saturating_add(daemon_dfs_duration_nanos(
+                        DAEMON_DFS_MAINTENANCE_LEASE_MAX_CLOCK_SKEW,
+                    ))
+                    .saturating_add(daemon_dfs_duration_nanos(
+                        DAEMON_DFS_MAINTENANCE_LEASE_UNWIND_GRACE,
+                    )),
+            ),
+    };
+    let response = kv
+        .txn_async(KvTxn {
+            compares: vec![KvCompare::ValueEquals {
+                key: DAEMON_DFS_MAINTENANCE_LEASE_KEY.to_string(),
+                value: sinomo_core::kv::encode_kv_value(current)?,
+            }],
+            success: vec![KvOp::Put {
+                key: DAEMON_DFS_MAINTENANCE_LEASE_KEY.to_string(),
+                value: sinomo_core::kv::encode_kv_value(&renewed)?,
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        })
+        .await?;
+    Ok(response.succeeded.then_some(renewed))
+}
+
+async fn release_daemon_dfs_maintenance_lease(
+    kv: &mut dyn sinomo_dfs::AsyncDfsControlPlaneKvClient,
+    current: &DaemonDfsMaintenanceLeaseRecord,
+) -> Result<bool, KvError> {
+    let response = kv
+        .txn_async(KvTxn {
+            compares: vec![KvCompare::ValueEquals {
+                key: DAEMON_DFS_MAINTENANCE_LEASE_KEY.to_string(),
+                value: sinomo_core::kv::encode_kv_value(current)?,
+            }],
+            success: vec![KvOp::Delete {
+                key: DAEMON_DFS_MAINTENANCE_LEASE_KEY.to_string(),
+            }],
+            failure: Vec::new(),
+        })
+        .await?;
+    Ok(response.succeeded)
+}
+
+fn daemon_dfs_maintenance_lease_error(detail: impl Into<String>) -> DaemonError {
+    DaemonError::Network {
+        address: "DFS maintenance lease".to_string(),
+        detail: detail.into(),
+    }
+}
+
+#[derive(Debug)]
+struct DaemonDfsMaintenanceLeaseRenewalState {
+    client: DaemonDfsControlPlaneKvClient,
+    record: DaemonDfsMaintenanceLeaseRecord,
+    loss_detail: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct DaemonDfsMaintenanceLeaseAuthority {
+    deadline: Instant,
+    loss_detail: Option<String>,
+}
+
+#[derive(Debug)]
+struct DaemonDfsMaintenanceLease {
+    stop_tx: tokio::sync::oneshot::Sender<()>,
+    authority_rx: tokio::sync::watch::Receiver<DaemonDfsMaintenanceLeaseAuthority>,
+    renewal_task: tokio::task::JoinHandle<DaemonDfsMaintenanceLeaseRenewalState>,
+}
+
+impl DaemonDfsMaintenanceLease {
+    fn authority_receiver(
+        &self,
+    ) -> tokio::sync::watch::Receiver<DaemonDfsMaintenanceLeaseAuthority> {
+        self.authority_rx.clone()
+    }
+
+    fn ownership_loss_detail(&self) -> Option<String> {
+        let authority = self.authority_rx.borrow();
+        if let Some(detail) = authority.loss_detail.clone() {
+            return Some(detail);
+        }
+        (Instant::now() >= authority.deadline).then(|| {
+            "local authority deadline elapsed before DFS maintenance admission".to_string()
+        })
+    }
+
+    async fn release(self) -> Result<(), DaemonError> {
+        let _ = self.stop_tx.send(());
+        let mut state = self.renewal_task.await.map_err(|source| {
+            daemon_dfs_maintenance_lease_error(format!(
+                "renewal task stopped before release: {source}"
+            ))
+        })?;
+        let released = tokio::time::timeout(
+            DAEMON_DFS_MAINTENANCE_LEASE_RELEASE_TIMEOUT,
+            release_daemon_dfs_maintenance_lease(&mut state.client, &state.record),
+        )
+        .await
+        .map_err(|_| {
+            daemon_dfs_maintenance_lease_error(format!(
+                "timed out releasing owner {} held by {}",
+                state.record.owner_token, state.record.holder_node_id
+            ))
+        })?
+        .map_err(|source| {
+            daemon_dfs_maintenance_lease_error(format!(
+                "failed to release owner {} held by {}: {source}",
+                state.record.owner_token, state.record.holder_node_id
+            ))
+        })?;
+        if let Some(detail) = state.loss_detail {
+            return Err(daemon_dfs_maintenance_lease_error(detail));
+        }
+        if !released {
+            return Err(daemon_dfs_maintenance_lease_error(format!(
+                "owner {} held by {} lost ownership before release",
+                state.record.owner_token, state.record.holder_node_id
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct DaemonDfsMaintenanceAdmission {
+    lease: DaemonDfsMaintenanceLease,
+    _lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
+    _message_execution_guard: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[derive(Debug)]
+struct DaemonDfsMaintenanceLocalAdmission {
+    lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
+    message_execution_guard: tokio::sync::OwnedSemaphorePermit,
+}
+
+async fn wait_for_daemon_dfs_maintenance_lease_loss(
+    authority_rx: &mut tokio::sync::watch::Receiver<DaemonDfsMaintenanceLeaseAuthority>,
+) -> String {
+    loop {
+        let authority = authority_rx.borrow().clone();
+        if let Some(detail) = authority.loss_detail {
+            return detail;
+        }
+        if Instant::now() >= authority.deadline {
+            return "local authority deadline elapsed while waiting for DFS maintenance lease"
+                .to_string();
+        }
+        let authority_timeout =
+            tokio::time::sleep_until(tokio::time::Instant::from_std(authority.deadline));
+        tokio::pin!(authority_timeout);
+        tokio::select! {
+            biased;
+            _ = &mut authority_timeout => {
+                return "local authority deadline elapsed while waiting for DFS maintenance lease"
+                    .to_string();
+            }
+            changed = authority_rx.changed() => {
+                if changed.is_err() {
+                    return "renewal task stopped without preserving lease ownership".to_string();
+                }
+            }
+        }
+    }
+}
+
+fn daemon_dfs_maintenance_admission_loss(
+    authority_rx: &tokio::sync::watch::Receiver<DaemonDfsMaintenanceLeaseAuthority>,
+) -> Option<String> {
+    let authority = authority_rx.borrow();
+    authority.loss_detail.clone().or_else(|| {
+        (Instant::now() >= authority.deadline).then(|| {
+            "local authority deadline elapsed during DFS maintenance admission".to_string()
+        })
+    })
+}
+
+async fn run_daemon_dfs_maintenance_lease_renewal(
+    mut client: DaemonDfsControlPlaneKvClient,
+    mut record: DaemonDfsMaintenanceLeaseRecord,
+    mut authority_started: Instant,
+    mut authority_deadline: Instant,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+    authority_tx: tokio::sync::watch::Sender<DaemonDfsMaintenanceLeaseAuthority>,
+) -> DaemonDfsMaintenanceLeaseRenewalState {
+    let loss_detail = loop {
+        let renew_at = Instant::now()
+            .checked_add(DAEMON_DFS_MAINTENANCE_LEASE_RENEW_INTERVAL)
+            .unwrap_or(authority_deadline)
+            .min(authority_deadline);
+        let renew_sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(renew_at));
+        tokio::pin!(renew_sleep);
+        tokio::select! {
+            biased;
+            _ = &mut stop_rx => break None,
+            _ = &mut renew_sleep => {}
+        }
+        if Instant::now() >= authority_deadline {
+            let detail = format!(
+                "owner {} held by {} reached its local authority deadline",
+                record.owner_token, record.holder_node_id
+            );
+            authority_tx.send_replace(DaemonDfsMaintenanceLeaseAuthority {
+                deadline: authority_deadline,
+                loss_detail: Some(detail.clone()),
+            });
+            break Some(detail);
+        }
+        let renewal_started = Instant::now();
+        let minimum_expiry_advance = renewal_started.saturating_duration_since(authority_started);
+        let renewal_result = {
+            let renewal = renew_daemon_dfs_maintenance_lease(
+                &mut client,
+                &record,
+                daemon_dfs_now_unix_nanos(),
+                minimum_expiry_advance,
+            );
+            tokio::pin!(renewal);
+            let authority_timeout =
+                tokio::time::sleep_until(tokio::time::Instant::from_std(authority_deadline));
+            tokio::pin!(authority_timeout);
+            tokio::select! {
+                biased;
+                _ = &mut stop_rx => break None,
+                _ = &mut authority_timeout => {
+                    let detail = format!(
+                        "owner {} held by {} reached its local authority deadline while renewing",
+                        record.owner_token, record.holder_node_id
+                    );
+                    authority_tx.send_replace(DaemonDfsMaintenanceLeaseAuthority {
+                        deadline: authority_deadline,
+                        loss_detail: Some(detail.clone()),
+                    });
+                    break Some(detail);
+                }
+                result = &mut renewal => result,
+            }
+        };
+        match renewal_result {
+            Ok(Some(renewed)) => {
+                record = renewed;
+                authority_started = renewal_started;
+                authority_deadline = renewal_started
+                    .checked_add(DAEMON_DFS_MAINTENANCE_LEASE_TTL)
+                    .unwrap_or(renewal_started);
+                authority_tx.send_replace(DaemonDfsMaintenanceLeaseAuthority {
+                    deadline: authority_deadline,
+                    loss_detail: None,
+                });
+            }
+            Ok(None) => {
+                let detail = format!(
+                    "owner {} held by {} expired or lost its compare-and-swap",
+                    record.owner_token, record.holder_node_id
+                );
+                authority_tx.send_replace(DaemonDfsMaintenanceLeaseAuthority {
+                    deadline: authority_deadline,
+                    loss_detail: Some(detail.clone()),
+                });
+                break Some(detail);
+            }
+            Err(source) => {
+                let detail = format!(
+                    "owner {} held by {} could not renew: {source}",
+                    record.owner_token, record.holder_node_id
+                );
+                authority_tx.send_replace(DaemonDfsMaintenanceLeaseAuthority {
+                    deadline: authority_deadline,
+                    loss_detail: Some(detail.clone()),
+                });
+                break Some(detail);
+            }
+        }
+    };
+    DaemonDfsMaintenanceLeaseRenewalState {
+        client,
+        record,
+        loss_detail,
+    }
+}
+
+fn start_daemon_dfs_maintenance_lease(
+    client: DaemonDfsControlPlaneKvClient,
+    record: DaemonDfsMaintenanceLeaseRecord,
+    authority_started: Instant,
+) -> DaemonDfsMaintenanceLease {
+    let authority_deadline = authority_started
+        .checked_add(DAEMON_DFS_MAINTENANCE_LEASE_TTL)
+        .unwrap_or(authority_started);
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let (authority_tx, authority_rx) =
+        tokio::sync::watch::channel(DaemonDfsMaintenanceLeaseAuthority {
+            deadline: authority_deadline,
+            loss_detail: None,
+        });
+    let renewal_task = tokio::spawn(run_daemon_dfs_maintenance_lease_renewal(
+        client,
+        record,
+        authority_started,
+        authority_deadline,
+        stop_rx,
+        authority_tx,
+    ));
+    DaemonDfsMaintenanceLease {
+        stop_tx,
+        authority_rx,
+        renewal_task,
+    }
+}
+
+async fn acquire_daemon_dfs_maintenance_admission_in_order<Acquire, AcquireFuture, StartLease>(
+    data_dir: &SinomoDataDir,
+    acquire_cluster_lease: Acquire,
+    start_lease: StartLease,
+) -> Result<Option<DaemonDfsMaintenanceLocalAdmission>, DaemonError>
+where
+    Acquire: FnOnce() -> AcquireFuture,
+    AcquireFuture:
+        std::future::Future<Output = Result<DaemonDfsMaintenanceLeaseAcquire, DaemonError>>,
+    StartLease: FnOnce(
+        DaemonDfsMaintenanceLeaseRecord,
+    ) -> tokio::sync::watch::Receiver<DaemonDfsMaintenanceLeaseAuthority>,
+{
+    let record = match acquire_cluster_lease().await? {
+        DaemonDfsMaintenanceLeaseAcquire::Acquired(record) => record,
+        DaemonDfsMaintenanceLeaseAcquire::Deferred(holder) => {
+            if let Some(holder) = holder {
+                tracing::debug!(
+                    target: "sinomo.dfs.maintenance",
+                    holder_node_id = %holder.holder_node_id,
+                    owner_token = %holder.owner_token,
+                    expires_unix_nanos = holder.expires_unix_nanos,
+                    "deferred DFS maintenance to the cluster lease holder"
+                );
+            } else {
+                tracing::debug!(
+                    target: "sinomo.dfs.maintenance",
+                    "deferred DFS maintenance after losing cluster lease acquisition CAS"
+                );
+            }
+            return Ok(None);
+        }
+    };
+
+    // Start renewal immediately after cluster admission, before either local
+    // gate can wait behind an already-running foreground generation.
+    let mut admission_authority_rx = start_lease(record);
+    if let Some(detail) = daemon_dfs_maintenance_admission_loss(&admission_authority_rx) {
+        return Err(daemon_dfs_maintenance_lease_error(detail));
+    }
+    let lifecycle_gate = daemon_default_dfs_lifecycle_gate(&data_dir.root())?;
+    let message_execution_gate = daemon_dfs_message_execution_gate(data_dir)?;
+    let lifecycle_guard = tokio::select! {
+        biased;
+        detail = wait_for_daemon_dfs_maintenance_lease_loss(&mut admission_authority_rx) => {
+            return Err(daemon_dfs_maintenance_lease_error(detail));
+        }
+        guard = lifecycle_gate.lock_owned() => guard,
+    };
+    let message_execution_guard = tokio::select! {
+        biased;
+        detail = wait_for_daemon_dfs_maintenance_lease_loss(&mut admission_authority_rx) => {
+            drop(lifecycle_guard);
+            return Err(daemon_dfs_maintenance_lease_error(detail));
+        }
+        result = message_execution_gate.acquire_owned() => result.map_err(|_| DaemonError::Network {
+            address: "DFS message execution".to_string(),
+            detail: "DFS message execution gate closed".to_string(),
+        })?,
+    };
+    if let Some(detail) = daemon_dfs_maintenance_admission_loss(&admission_authority_rx) {
+        drop(message_execution_guard);
+        drop(lifecycle_guard);
+        return Err(daemon_dfs_maintenance_lease_error(detail));
+    }
+    Ok(Some(DaemonDfsMaintenanceLocalAdmission {
+        lifecycle_guard,
+        message_execution_guard,
+    }))
+}
+
+async fn acquire_daemon_dfs_maintenance_admission(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    runtime: &tokio::runtime::Handle,
+    local_node_id: NodeId,
+) -> Result<Option<DaemonDfsMaintenanceAdmission>, DaemonError> {
+    let mut client = DaemonDfsControlPlaneKvClient::new_on_runtime(cluster_paths, runtime);
+    let renewal_client = client.clone();
+    let owner_token = sinomo_core::Id::generate().to_string();
+    let acquisition_started = Instant::now();
+    let mut lease = None;
+    let local_admission = acquire_daemon_dfs_maintenance_admission_in_order(
+        data_dir,
+        || async {
+            acquire_daemon_dfs_maintenance_lease(
+                &mut client,
+                local_node_id,
+                owner_token,
+                daemon_dfs_now_unix_nanos(),
+            )
+            .await
+            .map_err(|source| {
+                daemon_dfs_maintenance_lease_error(format!(
+                    "failed to acquire cluster lease: {source}"
+                ))
+            })
+        },
+        |record| {
+            let started =
+                start_daemon_dfs_maintenance_lease(renewal_client, record, acquisition_started);
+            let authority_rx = started.authority_receiver();
+            lease = Some(started);
+            authority_rx
+        },
+    )
+    .await;
+    let local_admission = match local_admission {
+        Ok(local_admission) => local_admission,
+        Err(error) => {
+            if let Some(lease) = lease {
+                let _ = lease.release().await;
+            }
+            return Err(error);
+        }
+    };
+    let Some(local_admission) = local_admission else {
+        return Ok(None);
+    };
+    Ok(Some(DaemonDfsMaintenanceAdmission {
+        lease: lease.expect("cluster admission starts DFS maintenance lease"),
+        _lifecycle_guard: local_admission.lifecycle_guard,
+        _message_execution_guard: local_admission.message_execution_guard,
+    }))
 }
 
 #[derive(Clone, Debug)]
@@ -2009,31 +2567,77 @@ async fn ensure_default_distributed_dfs_lifecycle_inner(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DaemonDfsMaintenanceTickOutcome {
+    Completed,
+    Deferred,
+}
+
 pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
-) -> Result<(), DaemonError> {
+) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
-    let lifecycle_gate = daemon_default_dfs_lifecycle_gate(data_dir)?;
-    let _lifecycle_guard = lifecycle_gate.lock_owned().await;
     let data_dir = SinomoDataDir::new(data_dir);
-    let _message_execution_guard = Arc::clone(&daemon_dfs_message_execution_gate(&data_dir)?)
-        .acquire_owned()
-        .await
-        .map_err(|_| DaemonError::Network {
-            address: "DFS message execution".to_string(),
-            detail: "DFS message execution gate closed".to_string(),
-        })?;
-    evict_daemon_dfs_message_service_cache(&data_dir)?;
     let cluster_paths = ClusterPaths::new(&data_dir);
     if !cluster_paths.state.exists() {
-        return Ok(());
-    }
-    if let Some(stats) = crate::process_idle_stats() {
-        stats.incr_disk_reads_dfs_metadata();
+        return Ok(DaemonDfsMaintenanceTickOutcome::Completed);
     }
     let cluster_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .map_err(DaemonError::from)?;
+    let Some(admission) = acquire_daemon_dfs_maintenance_admission(
+        &data_dir,
+        &cluster_paths,
+        runtime,
+        cluster_state.local_node_id.clone(),
+    )
+    .await?
+    else {
+        return Ok(DaemonDfsMaintenanceTickOutcome::Deferred);
+    };
+    let DaemonDfsMaintenanceAdmission {
+        lease,
+        _lifecycle_guard: lifecycle_guard,
+        _message_execution_guard: message_execution_guard,
+    } = admission;
+    if let Some(detail) = lease.ownership_loss_detail() {
+        drop(message_execution_guard);
+        drop(lifecycle_guard);
+        let _ = lease.release().await;
+        return Err(daemon_dfs_maintenance_lease_error(detail));
+    }
+    let mut authority_rx = lease.authority_receiver();
+    let mut maintenance = Box::pin(run_daemon_dfs_maintenance_tick_with_admission(
+        data_dir,
+        cluster_paths,
+        cluster_state,
+        runtime,
+    ));
+    let maintenance_result = tokio::select! {
+        biased;
+        detail = wait_for_daemon_dfs_maintenance_lease_loss(&mut authority_rx) => {
+            Err(daemon_dfs_maintenance_lease_error(detail))
+        },
+        result = &mut maintenance => result,
+    };
+    drop(maintenance);
+    drop(message_execution_guard);
+    drop(lifecycle_guard);
+    lease.release().await?;
+    maintenance_result?;
+    Ok(DaemonDfsMaintenanceTickOutcome::Completed)
+}
+
+async fn run_daemon_dfs_maintenance_tick_with_admission(
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    cluster_state: sinomo_core::ClusterBootstrapState,
+    runtime: &tokio::runtime::Handle,
+) -> Result<(), DaemonError> {
+    evict_daemon_dfs_message_service_cache(&data_dir)?;
+    if let Some(stats) = crate::process_idle_stats() {
+        stats.incr_disk_reads_dfs_metadata();
+    }
     let detached_send_runtime = daemon_dfs_detached_send_runtime_for_identity(
         &data_dir,
         &cluster_state.cluster_id,
@@ -2134,7 +2738,7 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
 pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
     paths: DaemonPaths,
     runtime: tokio::runtime::Handle,
-) -> Result<(), DaemonError> {
+) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
     let tick_runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
         runtime.block_on(run_daemon_dfs_maintenance_tick_on_runtime(
@@ -2322,6 +2926,7 @@ fn daemon_data_dir(paths: &DaemonPaths) -> Result<&std::path::Path, DaemonError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_core::kv::InProcessKvStore;
     use sinomo_core::node::NodeId;
     use sinomo_core::{
         ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterTransportKind,
@@ -2385,6 +2990,302 @@ mod tests {
         );
         drop(first);
         assert!(first_gate.try_lock_owned().is_ok());
+    }
+
+    #[test]
+    fn daemon_dfs_maintenance_lease_acquires_defers_renews_and_releases_with_cas() {
+        let runtime = daemon_test_runtime("daemon-dfs-maintenance-lease-cas");
+        runtime.block_on(async {
+            let mut kv = InProcessKvStore::new();
+            let first_node = NodeId::generate();
+            let second_node = NodeId::generate();
+            let acquired = acquire_daemon_dfs_maintenance_lease(
+                &mut kv,
+                first_node.clone(),
+                "first-owner".to_string(),
+                1_000,
+            )
+            .await
+            .expect("acquire first lease");
+            let DaemonDfsMaintenanceLeaseAcquire::Acquired(first) = acquired else {
+                panic!("first lease must be acquired");
+            };
+            assert_eq!(
+                first.expires_unix_nanos.saturating_sub(1_000),
+                daemon_dfs_duration_nanos(DAEMON_DFS_MAINTENANCE_LEASE_TTL)
+                    .saturating_add(daemon_dfs_duration_nanos(
+                        DAEMON_DFS_MAINTENANCE_LEASE_MAX_CLOCK_SKEW,
+                    ))
+                    .saturating_add(daemon_dfs_duration_nanos(
+                        DAEMON_DFS_MAINTENANCE_LEASE_UNWIND_GRACE,
+                    ))
+            );
+
+            assert_eq!(
+                acquire_daemon_dfs_maintenance_lease(
+                    &mut kv,
+                    second_node.clone(),
+                    "second-owner".to_string(),
+                    2_000,
+                )
+                .await
+                .expect("defer second lease"),
+                DaemonDfsMaintenanceLeaseAcquire::Deferred(Some(first.clone()))
+            );
+
+            let renewed = renew_daemon_dfs_maintenance_lease(
+                &mut kv,
+                &first,
+                3_000,
+                Duration::from_nanos(2_000),
+            )
+            .await
+            .expect("renew first lease")
+            .expect("first lease still owned");
+            assert!(renewed.expires_unix_nanos > first.expires_unix_nanos);
+            assert_eq!(renewed.renewal_sequence, first.renewal_sequence + 1);
+            assert!(
+                release_daemon_dfs_maintenance_lease(&mut kv, &renewed)
+                    .await
+                    .expect("release first lease")
+            );
+            assert!(matches!(
+                acquire_daemon_dfs_maintenance_lease(
+                    &mut kv,
+                    second_node,
+                    "second-owner".to_string(),
+                    4_000,
+                )
+                .await
+                .expect("acquire released lease"),
+                DaemonDfsMaintenanceLeaseAcquire::Acquired(_)
+            ));
+        });
+    }
+
+    #[test]
+    fn daemon_dfs_maintenance_lease_allows_expired_takeover_without_stale_release() {
+        let runtime = daemon_test_runtime("daemon-dfs-maintenance-lease-expiry");
+        runtime.block_on(async {
+            let mut kv = InProcessKvStore::new();
+            let first = match acquire_daemon_dfs_maintenance_lease(
+                &mut kv,
+                NodeId::generate(),
+                "expired-owner".to_string(),
+                10_000,
+            )
+            .await
+            .expect("acquire expiring lease")
+            {
+                DaemonDfsMaintenanceLeaseAcquire::Acquired(record) => record,
+                other => panic!("unexpected acquisition: {other:?}"),
+            };
+            let replacement = match acquire_daemon_dfs_maintenance_lease(
+                &mut kv,
+                NodeId::generate(),
+                "replacement-owner".to_string(),
+                first.expires_unix_nanos,
+            )
+            .await
+            .expect("take over expired lease")
+            {
+                DaemonDfsMaintenanceLeaseAcquire::Acquired(record) => record,
+                other => panic!("unexpected takeover: {other:?}"),
+            };
+            assert_ne!(replacement.owner_token, first.owner_token);
+            assert!(
+                !release_daemon_dfs_maintenance_lease(&mut kv, &first)
+                    .await
+                    .expect("stale release CAS")
+            );
+            assert!(
+                release_daemon_dfs_maintenance_lease(&mut kv, &replacement)
+                    .await
+                    .expect("replacement release")
+            );
+        });
+    }
+
+    #[test]
+    fn daemon_dfs_maintenance_lease_renewal_advances_through_backward_wall_clock_step() {
+        let runtime = daemon_test_runtime("daemon-dfs-maintenance-lease-clock-regression");
+        runtime.block_on(async {
+            let mut kv = InProcessKvStore::new();
+            let current = match acquire_daemon_dfs_maintenance_lease(
+                &mut kv,
+                NodeId::generate(),
+                "clock-owner".to_string(),
+                50_000,
+            )
+            .await
+            .expect("acquire lease")
+            {
+                DaemonDfsMaintenanceLeaseAcquire::Acquired(record) => record,
+                other => panic!("unexpected acquisition: {other:?}"),
+            };
+            let monotonic_advance = Duration::from_secs(10);
+            let renewed =
+                renew_daemon_dfs_maintenance_lease(&mut kv, &current, 1_000, monotonic_advance)
+                    .await
+                    .expect("renew after backward clock step")
+                    .expect("lease remains owned");
+            assert_eq!(
+                renewed.expires_unix_nanos,
+                current
+                    .expires_unix_nanos
+                    .saturating_add(daemon_dfs_duration_nanos(monotonic_advance))
+            );
+            assert_eq!(renewed.renewal_sequence, current.renewal_sequence + 1);
+            assert!(
+                release_daemon_dfs_maintenance_lease(&mut kv, &renewed)
+                    .await
+                    .expect("release renewed lease")
+            );
+        });
+    }
+
+    #[test]
+    fn daemon_dfs_maintenance_lease_waiter_enforces_deadline_without_renewer_signal() {
+        let runtime = daemon_test_runtime("daemon-dfs-maintenance-lease-local-deadline");
+        runtime.block_on(async {
+            let (_authority_tx, mut authority_rx) =
+                tokio::sync::watch::channel(DaemonDfsMaintenanceLeaseAuthority {
+                    deadline: Instant::now()
+                        .checked_add(Duration::from_millis(10))
+                        .expect("test authority deadline"),
+                    loss_detail: None,
+                });
+            let detail = tokio::time::timeout(
+                Duration::from_secs(1),
+                wait_for_daemon_dfs_maintenance_lease_loss(&mut authority_rx),
+            )
+            .await
+            .expect("local authority deadline must wake the waiter");
+            assert!(detail.contains("local authority deadline elapsed"));
+        });
+    }
+
+    #[test]
+    fn daemon_dfs_maintenance_cluster_admission_precedes_local_message_gate() {
+        let root = temp_root("daemon-dfs-maintenance-admission-order");
+        let data_dir = SinomoDataDir::new(root.path());
+        let lifecycle_gate =
+            daemon_default_dfs_lifecycle_gate(&data_dir.root()).expect("lifecycle gate");
+        let message_gate = daemon_dfs_message_execution_gate(&data_dir).expect("message gate");
+        let runtime = daemon_test_runtime("daemon-dfs-maintenance-admission-order");
+        runtime.block_on(async {
+            let held_lifecycle_gate = lifecycle_gate.clone().lock_owned().await;
+            let held_message_gate = message_gate
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("hold local message gate");
+            let mut kv = InProcessKvStore::new();
+            let first = match acquire_daemon_dfs_maintenance_lease(
+                &mut kv,
+                NodeId::generate(),
+                "node-a-owner".to_string(),
+                100,
+            )
+            .await
+            .expect("node A lease")
+            {
+                DaemonDfsMaintenanceLeaseAcquire::Acquired(record) => record,
+                other => panic!("unexpected node A admission: {other:?}"),
+            };
+
+            let deferred_admission = tokio::time::timeout(
+                Duration::from_millis(50),
+                acquire_daemon_dfs_maintenance_admission_in_order(
+                    &data_dir,
+                    || async {
+                        acquire_daemon_dfs_maintenance_lease(
+                            &mut kv,
+                            NodeId::generate(),
+                            "node-b-deferred-owner".to_string(),
+                            200,
+                        )
+                        .await
+                        .map_err(DaemonError::from)
+                    },
+                    |_| -> tokio::sync::watch::Receiver<DaemonDfsMaintenanceLeaseAuthority> {
+                        panic!("a deferred cluster lease must not start local admission")
+                    },
+                ),
+            )
+            .await
+            .expect("cluster lease denial must not wait for the held local gate")
+            .expect("node B admission decision");
+            assert!(deferred_admission.is_none());
+
+            assert!(
+                release_daemon_dfs_maintenance_lease(&mut kv, &first)
+                    .await
+                    .expect("release node A lease")
+            );
+            drop(held_lifecycle_gate);
+            let mut second = None;
+            let mut admission_authority_tx = None;
+            let (lease_started_tx, mut lease_started_rx) = tokio::sync::oneshot::channel();
+            let mut admitted_future = Box::pin(acquire_daemon_dfs_maintenance_admission_in_order(
+                &data_dir,
+                || async {
+                    acquire_daemon_dfs_maintenance_lease(
+                        &mut kv,
+                        NodeId::generate(),
+                        "node-b-owner".to_string(),
+                        300,
+                    )
+                    .await
+                    .map_err(DaemonError::from)
+                },
+                |record| {
+                    second = Some(record);
+                    lease_started_tx
+                        .send(())
+                        .expect("signal lease renewal start");
+                    let (authority_tx, authority_rx) =
+                        tokio::sync::watch::channel(DaemonDfsMaintenanceLeaseAuthority {
+                            deadline: Instant::now()
+                                .checked_add(DAEMON_DFS_MAINTENANCE_LEASE_TTL)
+                                .expect("test authority deadline"),
+                            loss_detail: None,
+                        });
+                    admission_authority_tx = Some(authority_tx);
+                    authority_rx
+                },
+            ));
+            tokio::time::timeout(Duration::from_millis(50), async {
+                tokio::select! {
+                    result = &mut admitted_future => {
+                        panic!("admission returned before the held message gate: {result:?}")
+                    }
+                    result = &mut lease_started_rx => result.expect("lease start signal"),
+                }
+            })
+            .await
+            .expect("lease renewal must start before waiting for the local message gate");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut admitted_future)
+                    .await
+                    .is_err(),
+                "admission must remain blocked while the local message gate is held"
+            );
+            drop(held_message_gate);
+            let admitted = tokio::time::timeout(Duration::from_millis(50), admitted_future)
+                .await
+                .expect("released local gate must admit node B")
+                .expect("node B admission")
+                .expect("node B admitted");
+            drop(admitted);
+            drop(admission_authority_tx);
+            let second = second.expect("node B lease record");
+            assert!(
+                release_daemon_dfs_maintenance_lease(&mut kv, &second)
+                    .await
+                    .expect("release node B lease")
+            );
+        });
     }
 
     #[test]
@@ -2569,6 +3470,22 @@ mod tests {
 
     fn daemon_test_runtime(name: &str) -> tokio::runtime::Runtime {
         crate::build_daemon_async_runtime(name).expect("test daemon runtime")
+    }
+
+    fn run_daemon_dfs_maintenance_body_for_test(
+        paths: &DaemonPaths,
+        runtime: &tokio::runtime::Runtime,
+    ) -> Result<(), DaemonError> {
+        let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let cluster_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+            .map_err(DaemonError::from)?;
+        runtime.block_on(run_daemon_dfs_maintenance_tick_with_admission(
+            data_dir,
+            cluster_paths,
+            cluster_state,
+            runtime.handle(),
+        ))
     }
 
     fn daemon_dfs_test_execution_scope(
@@ -3359,11 +4276,7 @@ mod tests {
         assert!(pending.should_trigger_background_maintenance());
 
         let runtime = daemon_test_runtime("daemon-dfs-maintenance-namespace-jobs");
-        runtime
-            .block_on(run_daemon_dfs_maintenance_tick_on_runtime(
-                &paths,
-                runtime.handle(),
-            ))
+        run_daemon_dfs_maintenance_body_for_test(&paths, &runtime)
             .expect("maintenance tick before shard bootstrap");
 
         let status = sinomo_dfs::inspect_cluster_aware_dfs_status(&data_dir, &cluster_paths)
@@ -3409,11 +4322,7 @@ mod tests {
         )
         .expect("commit root metadata shard");
 
-        runtime
-            .block_on(run_daemon_dfs_maintenance_tick_on_runtime(
-                &paths,
-                runtime.handle(),
-            ))
+        run_daemon_dfs_maintenance_body_for_test(&paths, &runtime)
             .expect("maintenance tick after shard bootstrap");
 
         let status = sinomo_dfs::inspect_cluster_aware_dfs_status(&data_dir, &cluster_paths)
@@ -3716,12 +4625,7 @@ mod tests {
         }
 
         let runtime = daemon_test_runtime("daemon-dfs-maintenance-anti-entropy");
-        runtime
-            .block_on(run_daemon_dfs_maintenance_tick_on_runtime(
-                &paths,
-                runtime.handle(),
-            ))
-            .expect("maintenance tick");
+        run_daemon_dfs_maintenance_body_for_test(&paths, &runtime).expect("maintenance tick");
 
         let backend =
             open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths).expect("metadata backend");
