@@ -70,7 +70,6 @@ exec_node_timeout() {
     exec -T \
       -e SINOMO_DATA_DIR=/data \
       -e SINOMO_DISABLE_IROH=1 \
-      -e SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS=1 \
       -e SINOMO_DAEMON_ADVERTISE_HOST="$node" \
       "$node" timeout --foreground "${seconds}s" "$@"
 }
@@ -127,7 +126,6 @@ start_shadow_supervisor() {
     nohup env \
       SINOMO_DATA_DIR=/data \
       SINOMO_DISABLE_IROH=1 \
-      SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS=1 \
       SINOMO_SHADOW_MAIN_BINARY=/usr/local/bin/sinomo \
       SINOMO_SHADOW_MAIN_HOST=0.0.0.0 \
       SINOMO_SHADOW_MAIN_PORT=21353 \

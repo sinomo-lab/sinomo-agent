@@ -93,13 +93,13 @@ pub use control_routes::{
 };
 pub use health::{
     ClusterDoctorFinding, ClusterHealthRow, ClusterNetworkPingRequest, ClusterNetworkPingResponse,
-    ClusterStatusAsyncProbe, ClusterStatusProbe, cluster_doctor_findings,
-    cluster_health_rows_with_probe, cluster_health_rpc_request,
+    ClusterStateAuthorityHealth, ClusterStatusAsyncProbe, ClusterStatusProbe,
+    cluster_doctor_findings, cluster_health_rows_with_probe, cluster_health_rpc_request,
     cluster_health_rpc_request_without_peer_views,
     cluster_health_rpc_request_without_recursive_peer_views, cluster_local_health_rpc_request,
     cluster_network_ping_rpc_request, cluster_network_ping_rpc_request_with_response_payload,
-    decode_cluster_health_rpc_response, decode_cluster_network_ping_rpc_response,
-    handle_cluster_network_ping_rpc_request_for_node,
+    cluster_state_authority_health, decode_cluster_health_rpc_response,
+    decode_cluster_network_ping_rpc_response, handle_cluster_network_ping_rpc_request_for_node,
     handle_current_cluster_health_rpc_request_async, unknown_cluster_node_status,
 };
 pub use invite::{

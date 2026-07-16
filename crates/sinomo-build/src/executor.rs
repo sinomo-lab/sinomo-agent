@@ -1,7 +1,7 @@
 use crate::{
     BuildArtifactKind, BuildArtifactManifest, BuildArtifactSetManifest, BuildError,
     BuildOutputRequest, BuildPlan, BuildProvenance, BuildTarget, BuildTargetCapability,
-    NativeDylibArtifactMetadata, Result,
+    NativeDylibArtifactMetadata, Result, process::noninteractive_command,
 };
 use serde_json::Value;
 use sinomo_module::ModuleId;
@@ -9,7 +9,6 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 pub const CARGO_BUILD_EXECUTOR_PROTOCOL: &str = "sinomo.cargo-build.v1";
 pub const CARGO_BUILD_COMMIT_OVERRIDE_ENV: &str = "SINOMO_ROLLOUT_BUILD_COMMIT_OVERRIDE";
@@ -165,7 +164,7 @@ pub fn discover_native_dylib_outputs(
         OsString::from("--filter-platform"),
         OsString::from(rust_target),
     ];
-    let output = Command::new(cargo_program)
+    let output = noninteractive_command(cargo_program)
         .args(&args)
         .current_dir(source_repo)
         .output()
@@ -522,7 +521,7 @@ impl CargoBuildExecutor {
         })?;
         let target_dir = artifact_root.join(".cargo-target");
         let command = self.plan_command(source_repo, plan, &target_dir)?;
-        let mut process = Command::new(&command.program);
+        let mut process = noninteractive_command(&command.program);
         process
             .args(&command.args)
             .current_dir(&command.current_dir);
@@ -751,7 +750,7 @@ fn path_to_slash_string(path: &Path) -> String {
 }
 
 fn command_stdout(program: &Path, args: &[OsString]) -> Result<String> {
-    let output = Command::new(program)
+    let output = noninteractive_command(program)
         .args(args)
         .output()
         .map_err(|source| BuildError::Io {
@@ -1019,7 +1018,7 @@ version = "0.1.0"
         let artifact_path = result.artifact_root.join(&artifact.relative_path);
         assert!(artifact_path.is_file());
         crate::verify_artifact_file(artifact, &artifact_path).expect("verified artifact file");
-        let output = Command::new(&artifact_path)
+        let output = noninteractive_command(&artifact_path)
             .output()
             .expect("run built fixture");
         assert!(output.status.success());

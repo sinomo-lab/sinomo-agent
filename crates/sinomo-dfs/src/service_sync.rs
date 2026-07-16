@@ -54,6 +54,10 @@ enum MetadataQuorumSyncPurpose {
         /// request. Every other union member returns an ordinary exact-prefix
         /// acknowledgement.
         primary_handoff: Option<MetadataPrimaryHandoffProbe>,
+        /// Exact assignments whose majorities must both acknowledge the
+        /// retiring primary's fenced prefix before activation.
+        retiring_shard: DfsMetadataShardConfig,
+        desired_shard: DfsMetadataShardConfig,
     },
 }
 
@@ -63,15 +67,37 @@ struct MetadataPrimaryHandoffProbe {
     promoted_node_id: NodeId,
 }
 
-impl MetadataQuorumSyncPurpose {
-    fn is_membership_handoff(&self) -> bool {
-        matches!(self, Self::MembershipHandoff { .. })
-    }
+/// One full-snapshot repair attempt for an exact target in one sync invocation.
+///
+/// The enclosing request map intentionally retains settled and unroutable
+/// attempts until the target advances (or the invocation ends). Rebuilding an
+/// identical deep snapshot cannot make an immediate rejection or missing route
+/// succeed, and doing so on every 10 ms pump iteration amplifies memory use.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MetadataCheckpointSnapshotAttempt {
+    target_node_id: NodeId,
+    shard_id: DfsMetadataShardId,
+    journal_sequence: u64,
+    state_fingerprint: String,
+}
 
+impl MetadataCheckpointSnapshotAttempt {
+    fn for_target(target_node_id: NodeId, target: &DfsMetadataQuorumSyncTarget) -> Self {
+        Self {
+            target_node_id,
+            shard_id: target.shard_id.clone(),
+            journal_sequence: target.journal_sequence,
+            state_fingerprint: target.state_fingerprint.clone(),
+        }
+    }
+}
+
+impl MetadataQuorumSyncPurpose {
     fn primary_handoff_id_for(&self, node_id: &NodeId) -> Option<&str> {
         match self {
             Self::MembershipHandoff {
                 primary_handoff: Some(primary_handoff),
+                ..
             } if &primary_handoff.promoted_node_id == node_id => {
                 Some(primary_handoff.handoff_id.as_str())
             }
@@ -286,8 +312,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// A quorum-side pending record does not by itself fence a partitioned
     /// retiring primary. This method refreshes that primary's control plane
     /// under its local publication guard, durably acknowledges the exact head
-    /// observed after all earlier commits, repairs and freshly probes the exact
-    /// retiring-plus-desired member union, and only then activates it.
+    /// observed after all earlier commits, repairs and freshly probes a joint
+    /// quorum of the retiring and desired assignments, and only then activates
+    /// it.
     pub fn reconcile_pending_metadata_shard_membership_handoffs(
         &mut self,
         metadata_shards: &[DfsMetadataShardConfig],
@@ -457,11 +484,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let desired_node_ids = std::iter::once(handoff.desired_shard.primary_node_id.clone())
             .chain(handoff.desired_shard.replica_node_ids.iter().cloned())
             .collect::<BTreeSet<_>>();
-        let required_node_ids = retiring_node_ids
+        let handoff_node_ids = retiring_node_ids
             .union(&desired_node_ids)
             .cloned()
             .collect::<BTreeSet<_>>();
-        let replica_node_ids = required_node_ids
+        let replica_node_ids = handoff_node_ids
             .iter()
             .filter(|node_id| *node_id != &self.node_id)
             .cloned()
@@ -486,7 +513,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let certificate = self.sync_metadata_shard_to_quorum_with_required_intersection(
             &target,
             &BTreeSet::new(),
-            MetadataQuorumSyncPurpose::MembershipHandoff { primary_handoff },
+            MetadataQuorumSyncPurpose::MembershipHandoff {
+                primary_handoff,
+                retiring_shard: retiring.clone(),
+                desired_shard: handoff.desired_shard.clone(),
+            },
             timeout,
         )?;
         let acknowledged_node_ids = certificate
@@ -494,7 +525,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        if acknowledged_node_ids != required_node_ids {
+        if !crate::control_plane::metadata_shard_membership_handoff_acknowledgements_are_safe(
+            retiring,
+            &handoff.desired_shard,
+            &acknowledged_node_ids,
+        ) {
             return Ok(false);
         }
 
@@ -823,12 +858,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         purpose: MetadataQuorumSyncPurpose,
         timeout: Duration,
     ) -> Result<DfsMetadataQuorumSyncCertificate, DfsError> {
+        // A routed peer may have accepted the request but still be waiting for
+        // its local DFS service lane. Session keepalives are transport progress,
+        // not application progress, so the network's idle timer deliberately
+        // cannot bound that wait. Carry this barrier's semantic deadline into
+        // every routed/direct send instead. This also breaks the cross-node
+        // hold-and-wait cycle when several maintenance passes own their local
+        // backend lane at the same time.
+        let requested_deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        let previous_deadline = self
+            .transport
+            .set_operation_deadline(Some(requested_deadline));
+        let effective_deadline = previous_deadline
+            .filter(|existing| *existing < requested_deadline)
+            .unwrap_or(requested_deadline);
+        if effective_deadline != requested_deadline {
+            self.transport
+                .set_operation_deadline(Some(effective_deadline));
+        }
         let result = self.sync_metadata_shard_to_quorum_with_required_intersection_inner(
             target,
             required_intersection,
             &purpose,
             timeout,
         );
+        self.transport.set_operation_deadline(previous_deadline);
         self.clear_pending_metadata_sync_replications(target);
         result
     }
@@ -861,7 +917,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let full_shard_grace = DFS_POSIX_FULL_SHARD_ACK_GRACE.min(timeout);
         let mut freshly_acknowledged = BTreeSet::from([self.node_id.clone()]);
         let mut pending_prefix_probes = BTreeMap::<String, NodeId>::new();
-        let mut pending_checkpoint_snapshots = BTreeMap::<String, NodeId>::new();
+        let mut pending_checkpoint_snapshots =
+            BTreeMap::<String, MetadataCheckpointSnapshotAttempt>::new();
         // A caller can capture a target and then wait behind another DFS
         // operation before entering the barrier. Upgrade once to the current
         // exact contiguous head before the first probe. Subsequent local
@@ -914,7 +971,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 events,
                 &target,
                 &mut pending_prefix_probes,
-                &mut pending_checkpoint_snapshots,
                 &mut freshly_acknowledged,
             ));
             if !rejected_nodes.is_empty()
@@ -950,7 +1006,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 events,
                 &target,
                 &mut pending_prefix_probes,
-                &mut pending_checkpoint_snapshots,
                 &mut freshly_acknowledged,
             ));
             if !rejected_nodes.is_empty()
@@ -991,7 +1046,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 events,
                 &target,
                 &mut pending_prefix_probes,
-                &mut pending_checkpoint_snapshots,
                 &mut freshly_acknowledged,
             ));
             if !rejected_nodes.is_empty()
@@ -1112,7 +1166,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn clear_superseded_metadata_sync_requests(
         &mut self,
         pending_prefix_probes: &mut BTreeMap<String, NodeId>,
-        pending_checkpoint_snapshots: &mut BTreeMap<String, NodeId>,
+        pending_checkpoint_snapshots: &mut BTreeMap<String, MetadataCheckpointSnapshotAttempt>,
     ) {
         for request_id in pending_prefix_probes
             .keys()
@@ -1137,7 +1191,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         target: &DfsMetadataQuorumSyncTarget,
         probe_barrier_id: &str,
-        pending_checkpoint_snapshots: &mut BTreeMap<String, NodeId>,
+        pending_checkpoint_snapshots: &mut BTreeMap<String, MetadataCheckpointSnapshotAttempt>,
     ) -> Result<(), DfsError> {
         self.pending_metadata_replications
             .retain(|_, pending| pending.created_at.elapsed() < Duration::from_secs(60));
@@ -1299,7 +1353,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // cannot livelock a durability barrier.
             self.pending_metadata_replications
                 .insert(request_id.clone(), pending);
-            let sent = self.send_dfs_message_if_routable(
+            let sent = self.send_best_effort_message_if_routable(
                 &target_node_id,
                 DfsNetworkMessage::MetadataJournalBatch(command),
             )?;
@@ -1461,7 +1515,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     created_at: Instant::now(),
                 },
             );
-            let sent = self.send_dfs_message_if_routable(
+            let sent = self.send_best_effort_message_if_routable(
                 &target_node_id,
                 DfsNetworkMessage::MetadataJournalBatch(command),
             )?;
@@ -1479,9 +1533,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         target: &DfsMetadataQuorumSyncTarget,
         probe_barrier_id: &str,
         rejected_node_ids: &BTreeSet<NodeId>,
-        pending_checkpoint_snapshots: &mut BTreeMap<String, NodeId>,
+        pending_checkpoint_snapshots: &mut BTreeMap<String, MetadataCheckpointSnapshotAttempt>,
     ) -> Result<(), DfsError> {
-        if rejected_node_ids.is_empty() {
+        let attempts = rejected_node_ids
+            .iter()
+            .map(|target_node_id| {
+                MetadataCheckpointSnapshotAttempt::for_target(target_node_id.clone(), target)
+            })
+            .filter(|attempt| {
+                !pending_checkpoint_snapshots
+                    .values()
+                    .any(|pending| pending == attempt)
+            })
+            .collect::<Vec<_>>();
+        // Filter before exporting, cloning, or validating the materialized
+        // tables. A settled rejection and an unroutable attempt are terminal
+        // for this exact node/head within this invocation.
+        if attempts.is_empty() {
             return Ok(());
         }
         let checkpoint_snapshot = match target.checkpoint_snapshot.as_ref() {
@@ -1518,13 +1586,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         }
-        for target_node_id in rejected_node_ids {
-            if pending_checkpoint_snapshots
-                .values()
-                .any(|pending_node_id| pending_node_id == target_node_id)
-            {
-                continue;
-            }
+        for attempt in attempts {
+            let target_node_id = attempt.target_node_id.clone();
             let request_id = format!(
                 "dfs_sync_checkpoint_{}_{}",
                 probe_barrier_id,
@@ -1554,13 +1617,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     created_at: Instant::now(),
                 },
             );
-            let sent = self.send_dfs_message_if_routable(
-                target_node_id,
+            let sent = self.send_best_effort_message_if_routable(
+                &target_node_id,
                 DfsNetworkMessage::MetadataSnapshotInstall(command),
             )?;
-            if sent {
-                pending_checkpoint_snapshots.insert(request_id, target_node_id.clone());
-            } else {
+            // Retain the exact attempt even after a response settles and even
+            // when no route exists. Only an exact target refresh clears it.
+            pending_checkpoint_snapshots.insert(request_id.clone(), attempt);
+            if !sent {
                 self.pending_metadata_replications.remove(&request_id);
             }
         }
@@ -1584,10 +1648,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(metadata_sync_certificate(target, progress))
     }
 
-    /// Partition fallback for an exact prefix that already satisfies the
-    /// pre-existing metadata recovery quorum (and, for file sync, the content
-    /// recovery-set intersection). The control-plane record is one bounded,
-    /// exact per-shard head watermark; no file metadata is written to KV.
+    /// Partition fallback for an exact prefix that already satisfies its
+    /// purpose-specific durability certificate. Ordinary sync publishes one
+    /// bounded per-shard head watermark. Membership handoff instead requires
+    /// joint majorities plus both primaries and stores that evidence only in
+    /// the activation proof.
     fn try_finalize_metadata_quorum_sync_fallback(
         &mut self,
         target: &DfsMetadataQuorumSyncTarget,
@@ -1595,21 +1660,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         purpose: &MetadataQuorumSyncPurpose,
     ) -> Result<Option<DfsMetadataQuorumSyncCertificate>, DfsError> {
         self.revalidate_metadata_quorum_sync_authority(target)?;
-        if purpose.is_membership_handoff() {
-            return Ok(None);
+        if let MetadataQuorumSyncPurpose::MembershipHandoff {
+            retiring_shard,
+            desired_shard,
+            ..
+        } = purpose
+        {
+            let acknowledged_node_ids = progress
+                .acknowledged_node_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            return Ok(
+                crate::control_plane::metadata_shard_membership_handoff_acknowledgements_are_safe(
+                    retiring_shard,
+                    desired_shard,
+                    &acknowledged_node_ids,
+                )
+                .then(|| metadata_sync_certificate(target, progress)),
+            );
         }
         let Some(expected_shard) = target.expected_shard.as_ref() else {
             return Ok(None);
         };
-        // A quorum watermark is valid only for the exact active assignment it
-        // names. Membership handoff sync deliberately targets the union of the
-        // retiring and desired assignments while `expected_shard` remains the
-        // retiring generation. Treating a partial union as an ordinary quorum
-        // can therefore either publish an unconfigured desired node or return
-        // a certificate too small to activate the handoff. In either case the
-        // invocation drops its fresh ACK set and can repeat forever. Keep that
-        // wider (or narrower) target on the full-shard path; only an exact
-        // active-assignment target may take the ordinary partition fallback.
+        // An ordinary quorum watermark is valid only for the exact active
+        // assignment it names. A wider or narrower target could publish an
+        // unconfigured node, so only an exact active-assignment target may take
+        // this control-plane fallback.
         let expected_node_ids = std::iter::once(expected_shard.primary_node_id.clone())
             .chain(expected_shard.replica_node_ids.iter().cloned())
             .collect::<BTreeSet<_>>();
@@ -1830,6 +1907,12 @@ fn metadata_shard_snapshot_at(
     expected_journal_sequence: u64,
     expected_state_fingerprint: &str,
 ) -> Result<crate::DfsMetadataTableSnapshot, DfsError> {
+    #[cfg(test)]
+    DFS_METADATA_SYNC_SNAPSHOT_BUILD_CALLS.set(
+        DFS_METADATA_SYNC_SNAPSHOT_BUILD_CALLS
+            .get()
+            .saturating_add(1),
+    );
     let snapshot = backend
         .export_shard_table_snapshot(shard_id)?
         .ok_or_else(|| DfsError::Metadata {
@@ -1867,6 +1950,21 @@ fn metadata_shard_snapshot_at(
         });
     }
     Ok(snapshot)
+}
+
+#[cfg(test)]
+thread_local! {
+    static DFS_METADATA_SYNC_SNAPSHOT_BUILD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_metadata_sync_snapshot_build_calls() {
+    DFS_METADATA_SYNC_SNAPSHOT_BUILD_CALLS.set(0);
+}
+
+#[cfg(test)]
+fn metadata_sync_snapshot_build_calls() -> usize {
+    DFS_METADATA_SYNC_SNAPSHOT_BUILD_CALLS.get()
 }
 
 fn normalized_replica_node_ids(
@@ -1922,7 +2020,6 @@ fn record_metadata_sync_prefix_probe_events(
     events: Vec<NetworkedDfsServiceEvent>,
     target: &DfsMetadataQuorumSyncTarget,
     pending_prefix_probes: &mut BTreeMap<String, NodeId>,
-    pending_checkpoint_snapshots: &mut BTreeMap<String, NodeId>,
     freshly_acknowledged: &mut BTreeSet<NodeId>,
 ) -> BTreeSet<NodeId> {
     let mut rejected_node_ids = BTreeSet::new();
@@ -1947,9 +2044,7 @@ fn record_metadata_sync_prefix_probe_events(
                     freshly_acknowledged.insert(source_node_id);
                 }
             }
-            NetworkedDfsServiceEvent::MetadataSnapshotInstalled { request_id, .. } => {
-                pending_checkpoint_snapshots.remove(&request_id);
-            }
+            NetworkedDfsServiceEvent::MetadataSnapshotInstalled { .. } => {}
             NetworkedDfsServiceEvent::MetadataJournalBatchRejected {
                 request_id,
                 source_node_id,
@@ -1958,7 +2053,6 @@ fn record_metadata_sync_prefix_probe_events(
                 if pending_prefix_probes.remove(&request_id).is_some() {
                     rejected_node_ids.insert(source_node_id);
                 }
-                pending_checkpoint_snapshots.remove(&request_id);
             }
             _ => {}
         }
@@ -2006,10 +2100,15 @@ mod tests {
         routed_prefix_probe_count: usize,
         catchup_rpc_requests: Vec<(usize, ObjectRpcRequest)>,
         snapshot_install_count: usize,
+        reject_prefix_probes: bool,
+        reject_snapshot_installs: bool,
+        unroutable_nodes: BTreeSet<NodeId>,
+        network_error_nodes: BTreeSet<NodeId>,
         echoes_prefix_verification: bool,
         response_sequence_override: Option<u64>,
         incoming: VecDeque<DfsRoutedMessage>,
         next_frame_id: u64,
+        operation_deadline: Option<Instant>,
     }
 
     impl MetadataAckTransport {
@@ -2029,10 +2128,15 @@ mod tests {
                 routed_prefix_probe_count: 0,
                 catchup_rpc_requests: Vec::new(),
                 snapshot_install_count: 0,
+                reject_prefix_probes: false,
+                reject_snapshot_installs: false,
+                unroutable_nodes: BTreeSet::new(),
+                network_error_nodes: BTreeSet::new(),
                 echoes_prefix_verification: true,
                 response_sequence_override: None,
                 incoming: VecDeque::new(),
                 next_frame_id: 1,
+                operation_deadline: None,
             }
         }
     }
@@ -2049,6 +2153,17 @@ mod tests {
             target_node_id: &NodeId,
             message: DfsRoutedMessage,
         ) -> Result<(), NetworkError> {
+            if self.unroutable_nodes.contains(target_node_id) {
+                return Err(NetworkError::UnknownNode {
+                    node_id: target_node_id.clone(),
+                });
+            }
+            if self.network_error_nodes.contains(target_node_id) {
+                return Err(NetworkError::Io {
+                    operation: format!("send metadata sync probe to {target_node_id}"),
+                    detail: "test peer is offline after route selection".to_string(),
+                });
+            }
             match &message.message {
                 DfsNetworkMessage::MetadataJournalBatch(command) if command.verify_prefix_only => {
                     self.routed_prefix_probe_count =
@@ -2080,6 +2195,7 @@ mod tests {
             self.next_frame_id += 1;
             let response = match message.message {
                 DfsNetworkMessage::MetadataJournalBatch(command) => {
+                    let rejected = command.verify_prefix_only && self.reject_prefix_probes;
                     let verified_authority_probe_id = command
                         .prefix_probe
                         .as_ref()
@@ -2096,11 +2212,22 @@ mod tests {
                             next_after_sequence: self
                                 .response_sequence_override
                                 .unwrap_or(command.batch.next_after_sequence),
-                            applied_entries: command.batch.entries.len(),
-                            verified_prefix_only: command.verify_prefix_only
+                            applied_entries: if rejected {
+                                0
+                            } else {
+                                command.batch.entries.len()
+                            },
+                            verified_prefix_only: !rejected
+                                && command.verify_prefix_only
                                 && self.echoes_prefix_verification,
                             verified_authority_probe_id,
-                            result: DfsMetadataJournalBatchResult::Applied,
+                            result: if rejected {
+                                DfsMetadataJournalBatchResult::Rejected {
+                                    reason: "test prefix rejection".to_string(),
+                                }
+                            } else {
+                                DfsMetadataJournalBatchResult::Applied
+                            },
                         },
                     )
                 }
@@ -2110,8 +2237,14 @@ mod tests {
                             request_id: command.request_id,
                             shard_id: command.shard_id,
                             next_after_sequence: command.next_after_sequence,
-                            result: DfsMetadataSnapshotInstallResult::Installed {
-                                archived_existing: false,
+                            result: if self.reject_snapshot_installs {
+                                DfsMetadataSnapshotInstallResult::Rejected {
+                                    reason: "test snapshot rejection".to_string(),
+                                }
+                            } else {
+                                DfsMetadataSnapshotInstallResult::Installed {
+                                    archived_existing: false,
+                                }
                             },
                         },
                     )
@@ -2212,6 +2345,14 @@ mod tests {
 
         fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
             Ok(Some(self.incoming.len()))
+        }
+
+        fn set_operation_deadline(&mut self, deadline: Option<Instant>) -> Option<Instant> {
+            std::mem::replace(&mut self.operation_deadline, deadline)
+        }
+
+        fn operation_deadline(&self) -> Option<Instant> {
+            self.operation_deadline
         }
     }
 
@@ -3035,7 +3176,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_membership_handoff_partial_union_skips_fallback_and_retries_exact_union() {
+    fn pending_membership_handoff_retries_until_both_assignment_quorums_ack() {
         let old_replica = node("node_sync_handoff_retry_old_replica");
         let new_replica = node("node_sync_handoff_retry_new_replica");
         let mut fixture = configured_sync_fixture(
@@ -3062,10 +3203,10 @@ mod tests {
                 std::slice::from_ref(&retiring),
                 Duration::ZERO,
             )
-            .expect_err("a partial handoff union must remain pending");
+            .expect_err("a desired-only quorum must remain pending");
         assert!(
             matches!(error, DfsError::Network { ref message } if message.contains("2/3 acknowledgements")),
-            "the full-union-only attempt must time out cleanly instead of publishing an invalid retiring-epoch watermark: {error}"
+            "the joint-quorum attempt must time out cleanly instead of publishing an invalid retiring-epoch watermark: {error}"
         );
 
         let (active, pending, proof, watermark) = fixture.control_plane.with_client(|kv| {
@@ -3126,7 +3267,7 @@ mod tests {
                     std::slice::from_ref(&retiring),
                     Duration::from_secs(1),
                 )
-                .expect("retry exact membership union"),
+                .expect("retry joint membership quorum"),
             1
         );
 
@@ -3165,7 +3306,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_removal_only_handoff_skips_fallback_until_retiring_union_acks() {
+    fn removal_handoff_joint_quorum_tolerates_offline_retiring_replica() {
         let retained_replica = node("node_sync_handoff_removal_retained_replica");
         let removed_replica = node("node_sync_handoff_removal_removed_replica");
         let mut fixture = configured_sync_fixture(
@@ -3179,69 +3320,31 @@ mod tests {
             epoch: retiring.epoch + 1,
             ..retiring.clone()
         };
-        let handoff = fixture.control_plane.with_client(|kv| {
+        fixture.control_plane.with_client(|kv| {
             DfsControlPlaneStore::new(kv)
                 .begin_metadata_shard_membership_handoff(&retiring, &desired)
                 .expect("begin removal-only membership handoff")
                 .expect("retiring assignment is exact")
         });
-
-        let error = fixture
-            .service
-            .reconcile_pending_metadata_shard_membership_handoffs(
-                std::slice::from_ref(&retiring),
-                Duration::ZERO,
-            )
-            .expect_err("a partial retiring union must remain pending");
-        assert!(
-            matches!(error, DfsError::Network { ref message } if message.contains("2/3 acknowledgements")),
-            "membership purpose must suppress ordinary fallback even when the target equals the active assignment: {error}"
-        );
-
-        let (active, pending, proof, watermark) = fixture.control_plane.with_client(|kv| {
-            let store = DfsControlPlaneStore::new(kv);
-            (
-                store
-                    .get_metadata_shard(&retiring.file_system_id, &retiring.shard_id)
-                    .expect("active shard"),
-                store
-                    .get_metadata_shard_membership_handoff(
-                        &retiring.file_system_id,
-                        &retiring.shard_id,
-                    )
-                    .expect("pending handoff"),
-                store
-                    .get_metadata_shard_membership_handoff_proof(
-                        &retiring.file_system_id,
-                        &retiring.shard_id,
-                    )
-                    .expect("handoff proof"),
-                store
-                    .get_metadata_shard_head_watermark(&retiring.file_system_id, &retiring.shard_id)
-                    .expect("head watermark"),
-            )
-        });
-        assert_eq!(active, Some(retiring.clone()));
-        let pending = pending.expect("removal-only handoff remains pending");
-        assert_eq!(pending.handoff_id, handoff.handoff_id);
-        assert!(pending.retiring_primary_fence.is_some());
-        assert!(proof.is_none());
-        assert!(watermark.is_none());
-
         fixture
             .service
             .transport
-            .acknowledged_nodes
+            .network_error_nodes
             .insert(removed_replica.clone());
+
         assert_eq!(
             fixture
                 .service
                 .reconcile_pending_metadata_shard_membership_handoffs(
                     std::slice::from_ref(&retiring),
-                    Duration::from_secs(1),
+                    Duration::ZERO,
                 )
-                .expect("retry exact retiring union"),
+                .expect("joint quorum activates without removed offline replica"),
             1
+        );
+        assert_eq!(
+            fixture.service.transport.operation_deadline, None,
+            "the handoff deadline must not leak into later DFS operations"
         );
 
         let (active, pending, proof) = fixture.control_plane.with_client(|kv| {
@@ -3267,25 +3370,31 @@ mod tests {
         });
         assert_eq!(active, Some(desired));
         assert!(pending.is_none());
+        let acknowledged_node_ids = proof
+            .acknowledged_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
         assert_eq!(
-            proof
-                .acknowledged_node_ids
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
+            acknowledged_node_ids,
             std::iter::once(retiring.primary_node_id)
-                .chain([retained_replica, removed_replica])
+                .chain([retained_replica])
                 .collect()
+        );
+        assert!(
+            !acknowledged_node_ids.contains(&removed_replica),
+            "an offline retiring-only replica must not be fabricated into the proof"
         );
     }
 
     #[test]
-    fn primary_rotation_uses_exact_handoff_and_leaves_retiring_lane_fenced() {
+    fn primary_rotation_joint_quorum_leaves_retiring_lane_fenced() {
         let promoted = node("node_sync_primary_rotation_promoted");
         let retained_replica = node("node_sync_primary_rotation_retained");
         let mut fixture = configured_sync_fixture(
             "primary_rotation",
             vec![promoted.clone(), retained_replica.clone()],
-            vec![promoted.clone(), retained_replica.clone()],
+            vec![promoted.clone()],
         );
         let retiring = fixture.shard.clone();
         let desired = DfsMetadataShardConfig {
@@ -3311,7 +3420,7 @@ mod tests {
                     std::slice::from_ref(&retiring),
                     Duration::from_secs(1),
                 )
-                .expect("complete exact primary handoff"),
+                .expect("complete joint-quorum primary handoff"),
             1
         );
 
@@ -3345,7 +3454,7 @@ mod tests {
                 .into_iter()
                 .collect::<BTreeSet<_>>(),
             std::iter::once(retiring.primary_node_id.clone())
-                .chain([promoted, retained_replica])
+                .chain([promoted])
                 .collect()
         );
 
@@ -3996,6 +4105,120 @@ mod tests {
         assert!(
             matches!(error, DfsError::Network { message } if message.contains("1/2 acknowledgements"))
         );
+    }
+
+    #[test]
+    fn rejected_checkpoint_snapshot_is_built_and_sent_once_per_frozen_target() {
+        let replica = node("node_sync_rejected_checkpoint_replica");
+        let mut fixture =
+            configured_sync_fixture("rejected_checkpoint", vec![replica.clone()], vec![replica]);
+        fixture.service.transport.reject_prefix_probes = true;
+        fixture.service.transport.reject_snapshot_installs = true;
+        let target = fixture
+            .service
+            .capture_metadata_quorum_sync_target(&fixture.object)
+            .expect("capture rejected checkpoint target");
+        assert!(target.checkpoint_snapshot.is_none());
+        reset_metadata_sync_snapshot_build_calls();
+
+        let error = fixture
+            .service
+            .sync_metadata_shard_to_quorum(&target, Duration::from_millis(35))
+            .expect_err("an exact replica that rejects repair must not certify durability");
+
+        assert!(
+            matches!(error, DfsError::Network { message } if message.contains("1/2 acknowledgements")),
+            "a rejected repair must remain fail closed"
+        );
+        assert!(
+            fixture.service.transport.routed_prefix_probe_count > 3,
+            "the fixture must exercise repeated rejection across sync pump iterations"
+        );
+        assert_eq!(
+            metadata_sync_snapshot_build_calls(),
+            1,
+            "one frozen target must not repeatedly export and validate the same deep snapshot"
+        );
+        assert_eq!(
+            fixture.service.transport.snapshot_install_count, 1,
+            "one frozen target must attempt at most one snapshot install per replica"
+        );
+    }
+
+    #[test]
+    fn unroutable_checkpoint_snapshot_is_not_rebuilt_for_same_frozen_target() {
+        let replica = node("node_sync_unroutable_checkpoint_replica");
+        let mut fixture =
+            configured_sync_fixture("unroutable_checkpoint", vec![replica.clone()], Vec::new());
+        fixture
+            .service
+            .transport
+            .unroutable_nodes
+            .insert(replica.clone());
+        let mut target = fixture
+            .service
+            .capture_metadata_quorum_sync_target(&fixture.object)
+            .expect("capture unroutable checkpoint target");
+        let rejected = BTreeSet::from([replica]);
+        let mut attempts = BTreeMap::new();
+        reset_metadata_sync_snapshot_build_calls();
+
+        fixture
+            .service
+            .send_metadata_sync_checkpoint_snapshots(
+                &target,
+                "unroutable-checkpoint",
+                &rejected,
+                &mut attempts,
+            )
+            .expect("first unroutable attempt is best effort");
+        fixture
+            .service
+            .send_metadata_sync_checkpoint_snapshots(
+                &target,
+                "unroutable-checkpoint",
+                &rejected,
+                &mut attempts,
+            )
+            .expect("identical unroutable attempt remains settled");
+
+        assert_eq!(metadata_sync_snapshot_build_calls(), 1);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(fixture.service.transport.snapshot_install_count, 0);
+        assert!(fixture.service.pending_metadata_replications.is_empty());
+
+        fixture
+            .service
+            .metadata_backend
+            .as_deref_mut()
+            .expect("metadata backend")
+            .put_object(&directory_object(
+                "/unroutable-checkpoint-next-head",
+                fixture.shard.primary_node_id.clone(),
+            ))
+            .expect("advance exact metadata head");
+        assert!(
+            fixture
+                .service
+                .refresh_metadata_sync_target_to_current_head(&mut target)
+                .expect("refresh exact metadata target")
+        );
+        let mut pending_prefix_probes = BTreeMap::new();
+        fixture
+            .service
+            .clear_superseded_metadata_sync_requests(&mut pending_prefix_probes, &mut attempts);
+        fixture
+            .service
+            .send_metadata_sync_checkpoint_snapshots(
+                &target,
+                "unroutable-checkpoint-next-head",
+                &rejected,
+                &mut attempts,
+            )
+            .expect("changed exact head permits one new repair attempt");
+
+        assert_eq!(metadata_sync_snapshot_build_calls(), 2);
+        assert_eq!(attempts.len(), 1);
     }
 
     #[test]

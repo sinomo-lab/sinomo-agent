@@ -2494,14 +2494,13 @@ impl ClusterNetworkMaintenance {
             if cluster_is_solo {
                 // no-op: nothing to publish to absent peers
             } else if sinomo_core::kv::cluster_kv_raft_local_is_voter(&state) {
-                if crate::dfs::default_distributed_dfs_enabled()
-                    && let Err(error) = ensure_default_distributed_dfs_async_on_runtime(
-                        paths,
-                        options,
-                        true,
-                        runtime.clone(),
-                    )
-                    .await
+                if let Err(error) = ensure_default_distributed_dfs_async_on_runtime(
+                    paths,
+                    options,
+                    true,
+                    runtime.clone(),
+                )
+                .await
                 {
                     tracing::warn!("sinomo daemon distributed DFS control publish failed: {error}");
                     publish_failed = true;
@@ -4736,6 +4735,7 @@ fn member_status_from_peer_local_health_rows(
             .map(|process| row.status.process == process)
             .unwrap_or(true);
         if row.availability != ClusterNodeAvailability::Online
+            || !row.live_probe_observed
             || row.status.node_id != member.node_id
             || !process_matches
         {
@@ -13014,6 +13014,7 @@ mod tests {
             member: target_member.clone(),
             status: sinomo_core::cluster::unknown_cluster_node_status(&state, &target_member, now),
             availability: ClusterNodeAvailability::Online,
+            live_probe_observed: false,
         }];
 
         let findings = sinomo_core::cluster::cluster_doctor_findings(&state, &records, &health);
@@ -15885,11 +15886,13 @@ mod tests {
                         now,
                     ),
                     availability: ClusterNodeAvailability::Online,
+                    live_probe_observed: true,
                 },
                 ClusterHealthRow {
                     member: member.clone(),
                     status: fresh.clone(),
                     availability: ClusterNodeAvailability::Online,
+                    live_probe_observed: true,
                 },
             ],
         )

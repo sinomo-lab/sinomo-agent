@@ -206,6 +206,19 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tower_service::Service;
 
+fn read_kv_wal_object_file<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+) -> Result<T, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|source| format!("read KV object file {}: {source}", path.display()))?;
+    sinomo_object::serde_ext::from_bytes_with_options(
+        &bytes,
+        sinomo_object::DecodeOptions::default()
+            .with_expected_version_id(sinomo_kv::KV_WAL_OBJECT_VERSION_ID),
+    )
+    .map_err(|source| format!("decode KV object file {}: {source}", path.display()))
+}
+
 fn object_rpc_request_from_kv_payload(payload: sinomo_kv::ClusterKvRpcPayload) -> ObjectRpcRequest {
     ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body)
 }
@@ -9584,6 +9597,10 @@ impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
 }
 
 impl ClusterSignedObjectRpcAsyncHost for RecordingKvTxnForwardHost {
+    fn supports_object_rpc_sessions(&self) -> bool {
+        false
+    }
+
     fn sign_object_rpc_request_async<'a>(
         &'a mut self,
         _request: &'a ObjectRpcRequest,
@@ -13368,6 +13385,10 @@ fn join_introducer_reads_newer_invite_cache_only_for_non_voter_bridge() {
     }
 
     impl ClusterSignedObjectRpcAsyncHost for RecordingBridgeForwardHost {
+        fn supports_object_rpc_sessions(&self) -> bool {
+            false
+        }
+
         fn sign_object_rpc_request_async<'a>(
             &'a mut self,
             request: &'a ObjectRpcRequest,
@@ -13615,6 +13636,10 @@ impl ClusterJoinRegistrationHost for RecordingJoinRegistrationHost {
 }
 
 impl ClusterSignedObjectRpcAsyncHost for RecordingJoinRegistrationHost {
+    fn supports_object_rpc_sessions(&self) -> bool {
+        false
+    }
+
     fn sign_object_rpc_request_async<'a>(
         &'a mut self,
         _request: &'a ObjectRpcRequest,
@@ -15245,6 +15270,10 @@ fn join_challenge_forwarding_uses_membership_state_authority_policy() {
     }
 
     impl ClusterSignedObjectRpcAsyncHost for RecordingForwardHost {
+        fn supports_object_rpc_sessions(&self) -> bool {
+            false
+        }
+
         fn sign_object_rpc_request_async<'a>(
             &'a mut self,
             request: &'a ObjectRpcRequest,
@@ -19836,6 +19865,7 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
                 now,
             ),
             availability: ClusterNodeAvailability::Online,
+            live_probe_observed: true,
         }],
     );
 
@@ -20160,7 +20190,7 @@ fn cluster_health_rows_select_member_process_status() {
 }
 
 #[test]
-fn cluster_health_keeps_stored_online_until_connectivity_proves_unreachable() {
+fn cluster_live_health_does_not_treat_stored_online_as_liveness() {
     struct EmptyStatusProbe;
 
     impl ClusterStatusProbe for EmptyStatusProbe {
@@ -20226,8 +20256,8 @@ fn cluster_health_keeps_stored_online_until_connectivity_proves_unreachable() {
             .find(|row| row.member.node_id == remote_node)
             .expect("remote row")
             .availability,
-        ClusterNodeAvailability::Online,
-        "stored online status remains online until connectivity proves the member unreachable"
+        ClusterNodeAvailability::Unknown,
+        "stored status supplies details but cannot prove current liveness"
     );
 
     let endpoint = remote.endpoints.first().expect("remote endpoint");
@@ -20338,6 +20368,7 @@ fn cluster_health_and_doctor_ignore_legacy_shadow_members() {
         member: legacy_shadow.clone(),
         status: unknown_cluster_node_status(&state, &legacy_shadow, now),
         availability: ClusterNodeAvailability::Offline,
+        live_probe_observed: false,
     };
     let findings = cluster_doctor_findings(
         &state,
@@ -20444,6 +20475,203 @@ fn doctor_connectivity_record(
     }
 }
 
+fn doctor_health_row(
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+    availability: ClusterNodeAvailability,
+    now: OffsetDateTime,
+) -> ClusterHealthRow {
+    let mut status = unknown_cluster_node_status(state, member, now);
+    status.availability = availability.clone();
+    ClusterHealthRow {
+        member: member.clone(),
+        status,
+        availability,
+        live_probe_observed: false,
+    }
+}
+
+#[test]
+fn cluster_doctor_tolerates_unavailable_member_while_authorities_retain_quorum() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_doctor_tolerated_offline").expect("cluster");
+    let first = NodeId::from_legacy_named("node_network_doctor_tolerated_first").expect("first");
+    let second = NodeId::from_legacy_named("node_network_doctor_tolerated_second").expect("second");
+    let offline =
+        NodeId::from_legacy_named("node_network_doctor_tolerated_offline").expect("offline");
+    let replica =
+        NodeId::from_legacy_named("node_network_doctor_tolerated_replica").expect("replica");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "doctor tolerated offline",
+        first.clone(),
+        "first",
+        "pk-first",
+        now,
+    );
+    let main_capability =
+        CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("main capability");
+    state.members[0].capabilities = vec![main_capability.clone()];
+    let mut second_member = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        second.clone(),
+        "second",
+        "pk-second",
+        now,
+    );
+    second_member.capabilities = vec![main_capability.clone()];
+    let mut offline_member = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        offline.clone(),
+        "offline",
+        "pk-offline",
+        now,
+    );
+    offline_member.capabilities = vec![main_capability];
+    let replica_member = ClusterMemberRecord::local_non_voting(
+        cluster_id.clone(),
+        replica,
+        "replica",
+        "pk-replica",
+        now,
+    );
+    state.members.extend([
+        second_member.clone(),
+        offline_member.clone(),
+        replica_member.clone(),
+    ]);
+
+    let health = vec![
+        doctor_health_row(
+            &state,
+            &state.members[0],
+            ClusterNodeAvailability::Online,
+            now,
+        ),
+        doctor_health_row(&state, &second_member, ClusterNodeAvailability::Online, now),
+        doctor_health_row(
+            &state,
+            &offline_member,
+            ClusterNodeAvailability::Offline,
+            now,
+        ),
+        doctor_health_row(
+            &state,
+            &replica_member,
+            ClusterNodeAvailability::Online,
+            now,
+        ),
+    ];
+    let records = vec![
+        doctor_connectivity_record(
+            &cluster_id,
+            &first,
+            &second,
+            "endpoint_network_doctor_tolerated_first_second",
+            "172.25.0.2:21353",
+            ClusterConnectivityState::Healthy,
+        ),
+        doctor_connectivity_record(
+            &cluster_id,
+            &second,
+            &first,
+            "endpoint_network_doctor_tolerated_second_first",
+            "172.25.0.1:21353",
+            ClusterConnectivityState::Healthy,
+        ),
+        doctor_connectivity_record(
+            &cluster_id,
+            &first,
+            &offline,
+            "endpoint_network_doctor_tolerated_offline",
+            "172.25.0.3:21353",
+            ClusterConnectivityState::Unreachable,
+        ),
+    ];
+
+    let authority_health = cluster_state_authority_health(&state, &health);
+    assert_eq!(authority_health.authority_count, 3);
+    assert_eq!(authority_health.online_authority_count, 2);
+    assert_eq!(authority_health.quorum_size, 2);
+    assert!(authority_health.has_quorum());
+
+    let findings = cluster_doctor_findings(&state, &records, &health);
+    let offline_finding = findings
+        .iter()
+        .find(|finding| finding.code == "node-offline")
+        .expect("offline member remains visible");
+    assert_eq!(offline_finding.severity, "info");
+    assert!(offline_finding.detail.contains("quorum remains available"));
+    assert!(findings.iter().all(|finding| !finding.is_warning()));
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding.code != "authority-route-missing")
+    );
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding.code != "endpoint-unreachable")
+    );
+}
+
+#[test]
+fn cluster_doctor_warns_when_unavailable_authority_breaks_quorum() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_doctor_quorum_lost").expect("cluster");
+    let first = NodeId::from_legacy_named("node_network_doctor_quorum_first").expect("first");
+    let offline = NodeId::from_legacy_named("node_network_doctor_quorum_offline").expect("offline");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "doctor quorum lost",
+        first,
+        "first",
+        "pk-first",
+        now,
+    );
+    let main_capability =
+        CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("main capability");
+    state.members[0].capabilities = vec![main_capability.clone()];
+    let mut offline_member =
+        ClusterMemberRecord::local_voter(cluster_id, offline, "offline", "pk-offline", now);
+    offline_member.capabilities = vec![main_capability];
+    state.members.push(offline_member.clone());
+    let health = vec![
+        doctor_health_row(
+            &state,
+            &state.members[0],
+            ClusterNodeAvailability::Online,
+            now,
+        ),
+        doctor_health_row(
+            &state,
+            &offline_member,
+            ClusterNodeAvailability::Offline,
+            now,
+        ),
+    ];
+
+    let authority_health = cluster_state_authority_health(&state, &health);
+    assert_eq!(authority_health.authority_count, 2);
+    assert_eq!(authority_health.online_authority_count, 1);
+    assert_eq!(authority_health.quorum_size, 2);
+    assert!(!authority_health.has_quorum());
+
+    let findings = cluster_doctor_findings(&state, &[], &health);
+    assert!(
+        findings
+            .iter()
+            .any(|finding| { finding.code == "node-offline" && finding.severity == "warning" })
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.code == "authority-route-missing")
+    );
+}
+
 #[test]
 fn cluster_doctor_suppresses_unreachable_endpoint_when_target_has_healthy_route() {
     let now = OffsetDateTime::now_utc();
@@ -20537,6 +20765,7 @@ fn cluster_doctor_suppresses_unreachable_endpoint_when_target_is_online() {
         member: target_member.clone(),
         status: unknown_cluster_node_status(&state, &target_member, now),
         availability: ClusterNodeAvailability::Online,
+        live_probe_observed: false,
     }];
 
     let findings = cluster_doctor_findings(&state, &records, &health);
@@ -25466,7 +25695,7 @@ fn cluster_kv_watch_create_allocates_unique_ids_concurrently() {
             .watches
             .join(format!("watch-{}.sobj", registration.watch_id.0));
         let stored: ClusterKvWatchRegistration =
-            read_object_file(&watch_path).expect("read watch registration");
+            read_kv_wal_object_file(&watch_path).expect("read watch registration");
         assert_eq!(stored, registration);
     }
 }
@@ -25539,7 +25768,7 @@ fn cluster_kv_watch_cancel_removes_registration_without_reusing_id() {
         "watch ids must not be reused after cancellation"
     );
     let allocator: ClusterKvWatchAllocatorState =
-        read_object_file(&paths.kv_paths().watches_next_id).expect("read watch allocator");
+        read_kv_wal_object_file(&paths.kv_paths().watches_next_id).expect("read watch allocator");
     assert!(
         allocator.next_watch_id > second.watch_id.0,
         "watch allocator should advance past the newest watch id"
@@ -25568,7 +25797,7 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
     )
     .expect("create first watch");
     let allocator: ClusterKvWatchAllocatorState =
-        read_object_file(&paths.kv_paths().watches_next_id).expect("read seeded allocator");
+        read_kv_wal_object_file(&paths.kv_paths().watches_next_id).expect("read seeded allocator");
     assert_eq!(allocator.active_watch_count, Some(1));
     assert_eq!(allocator.pruned_compacted_revision, Some(KvRevision::ZERO));
 
@@ -25588,7 +25817,7 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
         "steady-state watch creation should use the durable allocator count"
     );
     let allocator: ClusterKvWatchAllocatorState =
-        read_object_file(&paths.kv_paths().watches_next_id)
+        read_kv_wal_object_file(&paths.kv_paths().watches_next_id)
             .expect("read allocator after second watch");
     assert_eq!(allocator.active_watch_count, Some(2));
     assert_eq!(allocator.next_watch_id, second.watch_id.0.saturating_add(1));
@@ -25601,7 +25830,8 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
     )
     .expect("cancel first watch");
     let allocator: ClusterKvWatchAllocatorState =
-        read_object_file(&paths.kv_paths().watches_next_id).expect("read allocator after cancel");
+        read_kv_wal_object_file(&paths.kv_paths().watches_next_id)
+            .expect("read allocator after cancel");
     assert_eq!(allocator.active_watch_count, Some(1));
 
     reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
@@ -25624,7 +25854,7 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
         "watch ids should keep advancing after cancel"
     );
     let allocator: ClusterKvWatchAllocatorState =
-        read_object_file(&paths.kv_paths().watches_next_id)
+        read_kv_wal_object_file(&paths.kv_paths().watches_next_id)
             .expect("read allocator after replacement");
     assert_eq!(allocator.active_watch_count, Some(2));
 }
@@ -25824,7 +26054,7 @@ fn cluster_kv_watch_drain_defers_small_cursor_writes_until_lag_bound() {
         .watches
         .join(format!("watch-{}.sobj", watch.watch_id.0));
     assert_eq!(
-        read_object_file::<ClusterKvWatchRegistration>(&watch_path)
+        read_kv_wal_object_file::<ClusterKvWatchRegistration>(&watch_path)
             .expect("read durable watch")
             .next_revision,
         KvRevision(1)
@@ -25858,7 +26088,7 @@ fn cluster_kv_watch_drain_defers_small_cursor_writes_until_lag_bound() {
         "drains must advance the hot in-process cursor immediately"
     );
     assert_eq!(
-        read_object_file::<ClusterKvWatchRegistration>(&watch_path)
+        read_kv_wal_object_file::<ClusterKvWatchRegistration>(&watch_path)
             .expect("read durable watch after deferred drain")
             .next_revision,
         KvRevision(1),
@@ -25888,7 +26118,7 @@ fn cluster_kv_watch_drain_defers_small_cursor_writes_until_lag_bound() {
     assert_eq!(drained.events, events);
     assert_eq!(drained.next_revision, KvRevision(lag_bound + 1));
     assert_eq!(
-        read_object_file::<ClusterKvWatchRegistration>(&watch_path)
+        read_kv_wal_object_file::<ClusterKvWatchRegistration>(&watch_path)
             .expect("read durable watch after lag-bound drain")
             .next_revision,
         KvRevision(lag_bound + 1),
@@ -26406,7 +26636,7 @@ fn cluster_raft_snapshot_event_history_is_bounded_when_compacted() {
     }
 
     let wal_paths = cluster_raft_wal_paths(&paths, &node_id);
-    let stored: RaftSnapshot = read_object_file(&wal_paths.snapshot).expect("raft snapshot");
+    let stored: RaftSnapshot = read_kv_wal_object_file(&wal_paths.snapshot).expect("raft snapshot");
     assert!(
         stored.kv.events.len() <= MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
         "raft snapshots should not retain an unbounded event tail"
@@ -34694,6 +34924,10 @@ mod route_cache_tests {
     }
 
     impl ClusterSignedObjectRpcAsyncHost for RecordingTargetHost {
+        fn supports_object_rpc_sessions(&self) -> bool {
+            false
+        }
+
         fn sign_object_rpc_request_async<'a>(
             &'a mut self,
             request: &'a ObjectRpcRequest,
@@ -34882,7 +35116,8 @@ mod route_cache_tests {
                 &request,
                 ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_only(Duration::from_secs(
                     15,
-                ))),
+                )))
+                .with_overall_timeout(Duration::from_secs(5)),
             )
             .await
             .expect("target rpc");

@@ -9,6 +9,7 @@ mod artifact;
 mod executor;
 mod module;
 mod paths;
+mod process;
 mod protocol;
 mod target;
 

@@ -183,7 +183,7 @@ struct DfsMetadataShardOperationFloor {
 ///
 /// While this record exists, the retiring configuration remains stored at the
 /// normal shard key but may not authorize a new canonical publication. A data
-/// plane coordinator must catch up the union of the retiring and desired
+/// plane coordinator must catch up a joint quorum of the retiring and desired
 /// members and then provide [`DfsMetadataShardMembershipHandoffProof`].
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsMetadataShardMembershipHandoff {
@@ -725,7 +725,7 @@ impl<'a> DfsControlPlaneStore<'a> {
     }
 
     /// Activate a desired assignment or primary role only after exact retiring
-    /// state has been acknowledged by every member of both configurations.
+    /// state has been acknowledged by a joint quorum of both configurations.
     pub fn complete_metadata_shard_membership_handoff(
         &mut self,
         retiring: &DfsMetadataShardConfig,
@@ -1874,6 +1874,45 @@ fn metadata_shard_configured_node_ids(shard: &DfsMetadataShardConfig) -> BTreeSe
         .collect()
 }
 
+/// Whether exact-prefix acknowledgements form a safe membership-handoff
+/// certificate.
+///
+/// Requiring a majority of both assignments is the DFS equivalent of joint
+/// consensus: the retiring generation cannot be skipped, while the desired
+/// generation is durable before activation. Requiring both primaries closes
+/// the authority-transfer edges explicitly. In particular, a primary rotation
+/// cannot activate without the promoted node's handoff-bound marker, and an
+/// isolated retiring primary can never be inferred away by a quorum-side
+/// reconfiguration. Reconfiguration validation separately limits each handoff
+/// to either a same-primary membership change or a same-ring primary rotation;
+/// mixed primary and membership changes never reach this predicate.
+pub(crate) fn metadata_shard_membership_handoff_acknowledgements_are_safe(
+    retiring: &DfsMetadataShardConfig,
+    desired: &DfsMetadataShardConfig,
+    acknowledged_node_ids: &BTreeSet<NodeId>,
+) -> bool {
+    let retiring_node_ids = metadata_shard_configured_node_ids(retiring);
+    let desired_node_ids = metadata_shard_configured_node_ids(desired);
+    let configured_union = retiring_node_ids
+        .union(&desired_node_ids)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let retiring_quorum = retiring_node_ids.len() / 2 + 1;
+    let desired_quorum = desired_node_ids.len() / 2 + 1;
+
+    acknowledged_node_ids.is_subset(&configured_union)
+        && acknowledged_node_ids.contains(&retiring.primary_node_id)
+        && acknowledged_node_ids.contains(&desired.primary_node_id)
+        && acknowledged_node_ids
+            .intersection(&retiring_node_ids)
+            .count()
+            >= retiring_quorum
+        && acknowledged_node_ids
+            .intersection(&desired_node_ids)
+            .count()
+            >= desired_quorum
+}
+
 fn metadata_shard_membership_handoff_watermark_is_exact(
     handoff: &DfsMetadataShardMembershipHandoff,
     current_entry: Option<&KvEntry>,
@@ -1892,6 +1931,7 @@ fn metadata_shard_membership_handoff_activated_watermark(
     handoff: &DfsMetadataShardMembershipHandoff,
     proof: &DfsMetadataShardMembershipHandoffProof,
 ) -> Result<DfsMetadataShardHeadWatermark, KvError> {
+    let desired_node_ids = metadata_shard_configured_node_ids(&handoff.desired_shard);
     normalize_metadata_shard_head_watermark(
         &handoff.desired_shard,
         &DfsMetadataShardHeadWatermark {
@@ -1901,8 +1941,11 @@ fn metadata_shard_membership_handoff_activated_watermark(
             epoch: handoff.desired_shard.epoch,
             journal_sequence: proof.journal_sequence,
             state_fingerprint: proof.state_fingerprint.clone(),
-            acknowledged_node_ids: metadata_shard_configured_node_ids(&handoff.desired_shard)
-                .into_iter()
+            acknowledged_node_ids: proof
+                .acknowledged_node_ids
+                .iter()
+                .filter(|node_id| desired_node_ids.contains(*node_id))
+                .cloned()
                 .collect(),
         },
     )
@@ -2060,7 +2103,7 @@ fn normalize_metadata_shard_membership_handoff_proof(
 
     let retiring_node_ids = metadata_shard_configured_node_ids(&handoff.retiring_shard);
     let desired_node_ids = metadata_shard_configured_node_ids(&handoff.desired_shard);
-    let required_node_ids = retiring_node_ids
+    let configured_node_ids = retiring_node_ids
         .union(&desired_node_ids)
         .cloned()
         .collect::<BTreeSet<_>>();
@@ -2069,11 +2112,19 @@ fn normalize_metadata_shard_membership_handoff_proof(
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
-    if acknowledged_node_ids != required_node_ids {
+    if !metadata_shard_membership_handoff_acknowledgements_are_safe(
+        &handoff.retiring_shard,
+        &handoff.desired_shard,
+        &acknowledged_node_ids,
+    ) {
         return Err(KvError::Serialization {
             detail: format!(
-                "metadata shard {} membership handoff proof acknowledges {:?}; exact retiring and desired union is {:?}",
-                handoff.retiring_shard.shard_id, acknowledged_node_ids, required_node_ids
+                "metadata shard {} membership handoff proof acknowledges {:?}; safe activation requires both primaries and a majority of both retiring {:?} and desired {:?} assignments (configured union {:?})",
+                handoff.retiring_shard.shard_id,
+                acknowledged_node_ids,
+                retiring_node_ids,
+                desired_node_ids,
+                configured_node_ids,
             ),
         });
     }
@@ -3152,6 +3203,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn metadata_shard_primary_handoff_joint_quorum_tolerates_one_offline_replica() {
+        let owner = node("node_primary_joint_owner");
+        let promoted = node("node_primary_joint_promoted");
+        let retained = node("node_primary_joint_retained");
+        let offline = node("node_primary_joint_offline");
+        let file_system_id = file_system_id();
+        let current = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: vec![promoted.clone(), retained.clone(), offline.clone()],
+            epoch: 46,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let desired = DfsMetadataShardConfig {
+            primary_node_id: promoted.clone(),
+            replica_node_ids: vec![retained.clone(), offline.clone(), owner.clone()],
+            epoch: current.epoch + 1,
+            ..current.clone()
+        };
+        let mut kv = InProcessKvStore::new();
+        DfsControlPlaneStore::new(&mut kv)
+            .put_metadata_shard(&current)
+            .expect("put current shard");
+        let handoff = DfsControlPlaneStore::new(&mut kv)
+            .begin_metadata_shard_membership_handoff(&current, &desired)
+            .expect("begin primary handoff")
+            .expect("current shard remains exact");
+        let retiring_fence = DfsMetadataShardMembershipHandoffFence {
+            handoff_id: handoff.handoff_id.clone(),
+            primary_node_id: owner.clone(),
+            journal_sequence: 12,
+            state_fingerprint: "blake3:primary-joint-12".to_string(),
+        };
+        let handoff = DfsControlPlaneStore::new(&mut kv)
+            .acknowledge_metadata_shard_membership_handoff_fence(&handoff, &retiring_fence)
+            .expect("acknowledge retiring fence")
+            .expect("handoff remains pending");
+
+        let mut missing_promoted = membership_handoff_proof(&handoff, 12);
+        missing_promoted.acknowledged_node_ids =
+            vec![owner.clone(), retained.clone(), offline.clone()];
+        assert!(matches!(
+            DfsControlPlaneStore::new(&mut kv).complete_metadata_shard_membership_handoff(
+                &current,
+                &desired,
+                &missing_promoted,
+            ),
+            Err(KvError::Serialization { detail }) if detail.contains("both primaries")
+        ));
+
+        let mut proof = membership_handoff_proof(&handoff, 12);
+        proof.acknowledged_node_ids = vec![owner.clone(), promoted.clone(), retained.clone()];
+        assert!(
+            DfsControlPlaneStore::new(&mut kv)
+                .complete_metadata_shard_membership_handoff(&current, &desired, &proof)
+                .expect("joint quorum activates without the offline replica")
+        );
+        assert_eq!(
+            DfsControlPlaneStore::new(&mut kv)
+                .get_metadata_shard(&file_system_id, "root")
+                .expect("active shard"),
+            Some(desired)
+        );
+        assert_eq!(
+            DfsControlPlaneStore::new(&mut kv)
+                .get_metadata_shard_head_watermark(&file_system_id, "root")
+                .expect("activated watermark")
+                .expect("watermark value")
+                .acknowledged_node_ids
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([owner, promoted, retained])
+        );
+    }
+
     #[tokio::test]
     async fn async_metadata_shard_primary_role_handoff_accepts_exact_rotation() {
         let owner = node("node_primary_role_async_owner");
@@ -3374,7 +3503,7 @@ mod tests {
         assert!(matches!(
             DfsControlPlaneStore::new(&mut kv)
                 .complete_metadata_shard_membership_handoff(&current, &desired, &incomplete),
-            Err(KvError::Serialization { detail }) if detail.contains("exact retiring and desired union")
+            Err(KvError::Serialization { detail }) if detail.contains("majority of both retiring")
         ));
         let proof = membership_handoff_proof(&handoff, 6);
         assert!(

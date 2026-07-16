@@ -1986,11 +1986,7 @@ pub(crate) fn cluster_doctor() -> Result<(), CliError> {
     }
     println!(
         "cluster doctor: {}",
-        if findings.is_empty() {
-            "ok"
-        } else {
-            "warnings"
-        }
+        cluster_doctor_summary_label(&findings)
     );
     println!("cluster: {}", state.cluster_id);
     println!("local node: {}", state.local_node_id);
@@ -2003,6 +1999,14 @@ pub(crate) fn cluster_doctor() -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+fn cluster_doctor_summary_label(findings: &[ClusterDoctorFinding]) -> &'static str {
+    if findings.iter().any(ClusterDoctorFinding::is_warning) {
+        "warnings"
+    } else {
+        "ok"
+    }
 }
 
 pub(crate) fn cluster_connectivity() -> Result<(), CliError> {
@@ -2167,6 +2171,7 @@ fn apply_authoritative_local_main_availability(
     else {
         return;
     };
+    row.live_probe_observed = availability == ClusterNodeAvailability::Online;
     row.availability = availability.clone();
     row.status.availability = availability;
 }
@@ -3055,6 +3060,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cluster_doctor_summary_is_ok_for_info_only_observations() {
+        let info = ClusterDoctorFinding {
+            severity: "info".to_string(),
+            code: "node-offline".to_string(),
+            detail: "offline member is tolerated by quorum".to_string(),
+        };
+        assert_eq!(cluster_doctor_summary_label(&[info.clone()]), "ok");
+
+        let warning = ClusterDoctorFinding {
+            severity: "warning".to_string(),
+            ..info
+        };
+        assert_eq!(cluster_doctor_summary_label(&[warning]), "warnings");
+    }
+
+    #[test]
     fn local_main_probe_distinguishes_down_from_unresponsive() {
         let now = OffsetDateTime::now_utc();
         let cluster_id =
@@ -3134,6 +3155,7 @@ mod tests {
                 member,
                 status,
                 availability: ClusterNodeAvailability::Online,
+                live_probe_observed: false,
             }
         };
         let mut rows = vec![online_row(local_member), online_row(remote_member.clone())];

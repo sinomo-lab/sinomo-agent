@@ -58,7 +58,7 @@ use sinomo_runtime::dfs::{
     DfsVersion, SIFS_FILE_SYSTEM_ID,
 };
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::network::{self, ClusterPaths};
+use sinomo_runtime::network::{self, ClusterPaths, ObjectRpcRequest};
 use sinomo_runtime::node::NodeId;
 use sinomo_runtime::test::{
     SinomoTestContext, SinomoTestError, SinomoTestOutcome, SinomoTestRegistryBuilder,
@@ -68,10 +68,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_EXPECT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_ROUTED_STATUS_TIMEOUT_MS: u64 = 5_000;
+const MAX_ROUTED_STATUS_CONCURRENCY: usize = 16;
 const DEFAULT_BULK_FILE_COUNT: usize = 128;
 const DEFAULT_BULK_FILE_BYTES: usize = 4 * 1024;
 const DEFAULT_LIGHTWEIGHT_LATENCY_ITERATIONS: usize = 128;
@@ -468,7 +470,7 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let targets = filter_dfs_routed_status_targets(
         ctx,
         &state,
-        dfs_routed_status_targets_from_state(&cluster_paths, &state),
+        super::test::live_online_remote_main_test_targets(&data_dir, &state)?,
     )?;
     let unavailable_repair_targets =
         dfs_unavailable_repair_targets_from_state(&cluster_paths, &state);
@@ -477,7 +479,11 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         "targets",
         targets.iter().map(ToString::to_string).collect::<Vec<_>>(),
     );
-    if targets.len() < expected_targets {
+    ctx.record(
+        "probe_concurrency",
+        targets.len().min(MAX_ROUTED_STATUS_CONCURRENCY),
+    );
+    if !super::test::cluster_test_has_expected_target_count(targets.len(), expected_targets) {
         return Ok(SinomoTestOutcome::failed(format!(
             "DFS routed status saw {} remote main targets, expected at least {expected_targets}",
             targets.len()
@@ -496,70 +502,39 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 
     let started = Instant::now();
     let deadline = started + timeout;
+    let wall_gate = gate.for_bounded_target_count(targets.len());
     let mut attempts = 0usize;
     let mut failure_history = Vec::new();
     let mut dirty_status_history = Vec::new();
     ctx.record("timeout_ms", timeout_ms);
     ctx.record("max_attempts", gate.max_attempts);
     ctx.record("max_elapsed_ms", gate.max_elapsed.as_millis() as u64);
+    ctx.record(
+        "wall_max_elapsed_ms",
+        wall_gate.max_elapsed.as_millis() as u64,
+    );
     loop {
         attempts = attempts.saturating_add(1);
-        let mut statuses = BTreeMap::new();
-        let mut repair_details = BTreeMap::new();
-        let mut failures = Vec::new();
-        for target in &targets {
-            match daemon_client.dfs_object_rpc_to_target(
-                target,
-                &request,
-                Duration::from_millis(timeout_ms),
-                true,
-            ) {
-                Ok(response) => match dfs::decode_dfs_status_rpc_response(&response) {
-                    Ok(status) => {
-                        let repairs = if routed_status_needs_repair_views(
-                            &status,
-                            &unavailable_repair_targets,
-                        ) {
-                            match fetch_dfs_repair_views_for_status(
-                                &daemon_client,
-                                target,
-                                Duration::from_millis(timeout_ms),
-                                status.pending_repair_count,
-                            ) {
-                                Ok(repairs) => repairs,
-                                Err(error) => {
-                                    failures.push(format!(
-                                        "{target}: repair inspection failed: {error}"
-                                    ));
-                                    continue;
-                                }
-                            }
-                        } else {
-                            Vec::new()
-                        };
-                        if !repairs.is_empty() {
-                            repair_details.insert(
-                                target.to_string(),
-                                repairs
-                                    .iter()
-                                    .map(dfs_repair_probe_summary)
-                                    .collect::<Vec<_>>(),
-                            );
-                        }
-                        statuses.insert(
-                            target.to_string(),
-                            dfs_status_probe_summary(
-                                &status,
-                                &repairs,
-                                &unavailable_repair_targets,
-                            ),
-                        );
-                    }
-                    Err(error) => failures.push(format!("{target}: decode failed: {error}")),
-                },
-                Err(error) => failures.push(format!("{target}: {error}")),
-            }
-        }
+        let attempt = match probe_dfs_routed_status_targets(
+            &daemon_client,
+            &request,
+            &targets,
+            Duration::from_millis(timeout_ms),
+            &unavailable_repair_targets,
+        ) {
+            Ok(probes) => aggregate_dfs_routed_status_probes(probes),
+            Err(error) => DfsRoutedStatusAttempt {
+                failures: vec![format!("probe worker failure: {error}")],
+                ..DfsRoutedStatusAttempt::default()
+            },
+        };
+        let DfsRoutedStatusAttempt {
+            statuses,
+            repair_details,
+            target_elapsed_ms,
+            failures,
+        } = attempt;
+        ctx.record("target_elapsed_ms", &target_elapsed_ms);
         let dirty_statuses = routed_status_dirty_summaries(
             &statuses,
             max_remote_open_conflicts,
@@ -593,20 +568,20 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             }
             if failure_history.is_empty()
                 && dirty_status_history.is_empty()
-                && gate.success_exceeded(attempts, elapsed)
+                && wall_gate.success_exceeded(attempts, elapsed)
             {
                 return Ok(SinomoTestOutcome::failed(format!(
                     "DFS routed status succeeded in {}ms, exceeding the {}ms route/RPC gate",
                     elapsed.as_millis(),
-                    gate.max_elapsed.as_millis()
+                    wall_gate.max_elapsed.as_millis()
                 )));
             }
-            if !failure_history.is_empty() && gate.success_exceeded(attempts, elapsed) {
+            if !failure_history.is_empty() && wall_gate.success_exceeded(attempts, elapsed) {
                 return Ok(SinomoTestOutcome::failed(format!(
                     "DFS routed status recovered from route/RPC failures after {attempts} attempt(s) in {}ms, exceeding the gate of {} attempt(s) in {}ms",
                     elapsed.as_millis(),
-                    gate.max_attempts,
-                    gate.max_elapsed.as_millis()
+                    wall_gate.max_attempts,
+                    wall_gate.max_elapsed.as_millis()
                 )));
             }
             return Ok(SinomoTestOutcome::passed(format!(
@@ -614,7 +589,8 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 targets.len()
             )));
         }
-        if (!failures.is_empty() && gate.exhausted(attempts, elapsed)) || Instant::now() >= deadline
+        if (!failures.is_empty() && wall_gate.exhausted(attempts, elapsed))
+            || Instant::now() >= deadline
         {
             ctx.record("statuses", &statuses);
             ctx.record("attempts", attempts);
@@ -641,6 +617,198 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         }
         std::thread::sleep(EXPECT_POLL_INTERVAL);
     }
+}
+
+#[derive(Debug)]
+struct DfsRoutedStatusTargetProbe {
+    target: NodeId,
+    elapsed_ms: u64,
+    status: Option<BTreeMap<&'static str, u64>>,
+    repair_details: Vec<BTreeMap<&'static str, String>>,
+    error: Option<String>,
+}
+
+impl DfsRoutedStatusTargetProbe {
+    fn failed(target: NodeId, started: Instant, error: impl Into<String>) -> Self {
+        Self {
+            target,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            status: None,
+            repair_details: Vec::new(),
+            error: Some(error.into()),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DfsRoutedStatusAttempt {
+    statuses: BTreeMap<String, BTreeMap<&'static str, u64>>,
+    repair_details: BTreeMap<String, Vec<BTreeMap<&'static str, String>>>,
+    target_elapsed_ms: BTreeMap<String, u64>,
+    failures: Vec<String>,
+}
+
+fn probe_dfs_routed_status_targets(
+    daemon_client: &DaemonApiClient,
+    request: &ObjectRpcRequest,
+    targets: &[NodeId],
+    timeout: Duration,
+    unavailable_repair_targets: &BTreeSet<NodeId>,
+) -> Result<Vec<DfsRoutedStatusTargetProbe>, String> {
+    run_bounded_dfs_routed_status_jobs(targets, MAX_ROUTED_STATUS_CONCURRENCY, &|target| {
+        let panic_target = target.clone();
+        let daemon_client = daemon_client.clone();
+        let request = request.clone();
+        let started = Instant::now();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            probe_dfs_routed_status_target(
+                &daemon_client,
+                &request,
+                target,
+                timeout,
+                unavailable_repair_targets,
+            )
+        }))
+        .unwrap_or_else(|_| {
+            DfsRoutedStatusTargetProbe::failed(panic_target, started, "probe worker panicked")
+        })
+    })
+}
+
+fn probe_dfs_routed_status_target(
+    daemon_client: &DaemonApiClient,
+    request: &ObjectRpcRequest,
+    target: NodeId,
+    timeout: Duration,
+    unavailable_repair_targets: &BTreeSet<NodeId>,
+) -> DfsRoutedStatusTargetProbe {
+    let started = Instant::now();
+    let result = (|| -> Result<_, String> {
+        let response = daemon_client
+            .dfs_object_rpc_to_target_with_options(
+                &target,
+                request,
+                dfs::DfsObjectRpcSendOptions::new(timeout)
+                    .with_overall_timeout(timeout)
+                    .with_observe_connectivity(true),
+            )
+            .map_err(|error| error.to_string())?;
+        let status = dfs::decode_dfs_status_rpc_response(&response)
+            .map_err(|error| format!("decode failed: {error}"))?;
+        let repairs = if routed_status_needs_repair_views(&status, unavailable_repair_targets) {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err("repair inspection exceeded the target probe budget".to_string());
+            }
+            fetch_dfs_repair_views_for_status(
+                daemon_client,
+                &target,
+                remaining,
+                status.pending_repair_count,
+            )
+            .map_err(|error| format!("repair inspection failed: {error}"))?
+        } else {
+            Vec::new()
+        };
+        let summary = dfs_status_probe_summary(&status, &repairs, unavailable_repair_targets);
+        let repair_details = repairs
+            .iter()
+            .map(dfs_repair_probe_summary)
+            .collect::<Vec<_>>();
+        Ok((summary, repair_details))
+    })();
+    match result {
+        Ok((status, repair_details)) => DfsRoutedStatusTargetProbe {
+            target,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            status: Some(status),
+            repair_details,
+            error: None,
+        },
+        Err(error) => DfsRoutedStatusTargetProbe::failed(target, started, error),
+    }
+}
+
+fn aggregate_dfs_routed_status_probes(
+    probes: Vec<DfsRoutedStatusTargetProbe>,
+) -> DfsRoutedStatusAttempt {
+    let mut attempt = DfsRoutedStatusAttempt::default();
+    for probe in probes {
+        let target = probe.target.to_string();
+        attempt
+            .target_elapsed_ms
+            .insert(target.clone(), probe.elapsed_ms);
+        if let Some(error) = probe.error {
+            attempt.failures.push(format!("{target}: {error}"));
+            continue;
+        }
+        let Some(status) = probe.status else {
+            attempt
+                .failures
+                .push(format!("{target}: probe returned no status"));
+            continue;
+        };
+        attempt.statuses.insert(target.clone(), status);
+        if !probe.repair_details.is_empty() {
+            attempt.repair_details.insert(target, probe.repair_details);
+        }
+    }
+    attempt
+}
+
+fn run_bounded_dfs_routed_status_jobs<T, R, F>(
+    items: &[T],
+    max_concurrency: usize,
+    probe: &F,
+) -> Result<Vec<R>, String>
+where
+    T: Clone + Send + Sync,
+    R: Send,
+    F: Fn(T) -> R + Sync,
+{
+    if max_concurrency == 0 {
+        return Err("probe concurrency must be greater than zero".to_string());
+    }
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let next = AtomicUsize::new(0);
+    let worker_count = items.len().min(max_concurrency);
+    let mut indexed = std::thread::scope(|scope| -> Result<Vec<(usize, R)>, String> {
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let next = &next;
+            workers.push(scope.spawn(move || {
+                let mut results = Vec::new();
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(index) else {
+                        break;
+                    };
+                    results.push((index, probe(item.clone())));
+                }
+                results
+            }));
+        }
+        let mut indexed = Vec::with_capacity(items.len());
+        for worker in workers {
+            indexed.extend(
+                worker
+                    .join()
+                    .map_err(|_| "bounded probe worker panicked".to_string())?,
+            );
+        }
+        Ok(indexed)
+    })?;
+    if indexed.len() != items.len() {
+        return Err(format!(
+            "bounded probe completed {} of {} jobs",
+            indexed.len(),
+            items.len()
+        ));
+    }
+    indexed.sort_by_key(|(index, _)| *index);
+    Ok(indexed.into_iter().map(|(_, result)| result).collect())
 }
 
 fn run_remote_shard_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
@@ -1074,8 +1242,18 @@ impl DfsRoutedStatusGate {
     fn success_exceeded(&self, attempts: usize, elapsed: Duration) -> bool {
         attempts > self.max_attempts || elapsed > self.max_elapsed
     }
+
+    fn for_bounded_target_count(self, target_count: usize) -> Self {
+        let wave_count = target_count.max(1).div_ceil(MAX_ROUTED_STATUS_CONCURRENCY);
+        let wave_count = u32::try_from(wave_count).unwrap_or(u32::MAX);
+        Self {
+            max_attempts: self.max_attempts,
+            max_elapsed: self.max_elapsed.saturating_mul(wave_count),
+        }
+    }
 }
 
+#[cfg(test)]
 fn dfs_routed_status_targets_from_state(
     cluster_paths: &ClusterPaths,
     state: &sinomo_runtime::core::ClusterBootstrapState,
@@ -1228,7 +1406,13 @@ fn fetch_dfs_repair_views_for_status(
     })
     .map_err(|error| error.to_string())?;
     let response = daemon_client
-        .dfs_object_rpc_to_target(target, &request, timeout, true)
+        .dfs_object_rpc_to_target_with_options(
+            target,
+            &request,
+            dfs::DfsObjectRpcSendOptions::new(timeout)
+                .with_overall_timeout(timeout)
+                .with_observe_connectivity(true),
+        )
         .map_err(|error| error.to_string())?;
     match dfs::decode_dfs_inspection_rpc_response(&response).map_err(|error| error.to_string())? {
         DaemonDfsInspectionResponse::Repair { repairs, .. } => Ok(repairs),
@@ -1935,6 +2119,10 @@ fn run_protocol_codec_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult 
 fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let timeout = expect_timeout(ctx)?;
     let deadline = Instant::now() + timeout;
+    let data_dir = SinomoDataDir::new(ctx.data_dir());
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let cluster_state = cluster::read_cluster_state(&cluster_paths)
+        .map_err(|error| SinomoTestError::failed(error.to_string()))?;
     let backend = open_backend_with_deadline(ctx, deadline)?;
     let node = backend.node_label();
     ctx.record("node", &node);
@@ -1981,45 +2169,15 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     "cluster DFS invariants require local operator status".to_string(),
                 )
             })?;
-        let local_primary_shards = operator_status
-            .metadata_shards
-            .iter()
-            .filter(|shard| {
-                shard
-                    .primary_node_id
-                    .as_ref()
-                    .is_some_and(|primary| primary.as_str() == node.as_str())
-            })
-            .collect::<Vec<_>>();
-        let local_primary_replica_count = local_primary_shards
-            .iter()
-            .map(|shard| shard.replica_lag.len())
-            .sum::<usize>();
-        let configured_local_primary_replica_count = local_primary_shards
-            .iter()
-            .map(|shard| shard.replica_node_ids.len())
-            .sum::<usize>();
-        let lagging_local_primary_replica_count = local_primary_shards
-            .iter()
-            .flat_map(|shard| shard.replica_lag.iter())
-            .filter(|lag| lag.lag_entries != 0)
-            .count();
-        let max_local_primary_replica_lag_entries = local_primary_shards
-            .iter()
-            .flat_map(|shard| shard.replica_lag.iter())
-            .map(|lag| lag.lag_entries)
-            .max()
-            .unwrap_or(0);
-        if local_primary_replica_count != configured_local_primary_replica_count {
-            violations.push(format!(
-                "local_primary_replica_status_count={local_primary_replica_count}, configured={configured_local_primary_replica_count}"
-            ));
-        }
-        if lagging_local_primary_replica_count != 0 {
-            violations.push(format!(
-                "lagging_local_primary_replica_count={lagging_local_primary_replica_count}, max_lag_entries={max_local_primary_replica_lag_entries}"
-            ));
-        }
+        let explicitly_unreachable_replica_node_ids =
+            dfs_explicitly_unreachable_targets_from_state(&cluster_paths, &cluster_state);
+        let replica_assessment = assess_dfs_invariant_replica_health(
+            &node,
+            &operator_status.metadata_shards,
+            &explicitly_unreachable_replica_node_ids,
+        );
+        violations.extend(replica_assessment.violations());
+        record_dfs_invariant_replica_assessment(ctx, &replica_assessment);
         if violations.is_empty() {
             ctx.record("object_count", metrics.object_count);
             ctx.record("repair_job_count", metrics.repair_job_count);
@@ -2032,16 +2190,6 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             ctx.record(
                 "authoritative_write_frozen_shard_count",
                 metrics.authoritative_write_frozen_shard_count,
-            );
-            ctx.record("local_primary_shard_count", local_primary_shards.len());
-            ctx.record("local_primary_replica_count", local_primary_replica_count);
-            ctx.record(
-                "lagging_local_primary_replica_count",
-                lagging_local_primary_replica_count,
-            );
-            ctx.record(
-                "max_local_primary_replica_lag_entries",
-                max_local_primary_replica_lag_entries,
             );
             return Ok(SinomoTestOutcome::passed(format!(
                 "DFS operational invariants hold on node {node}"
@@ -2057,6 +2205,225 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         }
         std::thread::sleep(EXPECT_POLL_INTERVAL);
     }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DfsInvariantReplicaAssessment {
+    local_primary_shard_count: usize,
+    reported_replica_count: usize,
+    configured_replica_count: usize,
+    explicitly_unreachable_configured_replica_count: usize,
+    reachable_reported_replica_count: usize,
+    reachable_configured_replica_count: usize,
+    lagging_reachable_replica_count: usize,
+    max_reachable_replica_lag_entries: u64,
+    lagging_unreachable_replica_count: usize,
+    max_unreachable_replica_lag_entries: u64,
+    explicitly_unreachable_replica_node_ids: BTreeSet<NodeId>,
+    reachable_replica_status_mismatches: Vec<String>,
+    metadata_quorum_losses: Vec<String>,
+}
+
+impl DfsInvariantReplicaAssessment {
+    fn violations(&self) -> Vec<String> {
+        let mut violations = Vec::new();
+        if !self.reachable_replica_status_mismatches.is_empty() {
+            violations.push(format!(
+                "reachable_local_primary_replica_status_mismatches={}",
+                self.reachable_replica_status_mismatches.join(";")
+            ));
+        }
+        if self.lagging_reachable_replica_count != 0 {
+            violations.push(format!(
+                "lagging_reachable_local_primary_replica_count={}, max_lag_entries={}",
+                self.lagging_reachable_replica_count, self.max_reachable_replica_lag_entries
+            ));
+        }
+        if !self.metadata_quorum_losses.is_empty() {
+            violations.push(format!(
+                "local_primary_metadata_quorum_lost={}",
+                self.metadata_quorum_losses.join(";")
+            ));
+        }
+        violations
+    }
+}
+
+fn dfs_explicitly_unreachable_targets_from_state(
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+) -> BTreeSet<NodeId> {
+    state
+        .members
+        .iter()
+        .filter(|member| {
+            member.state.is_authorized()
+                && member.capabilities.iter().any(|capability| {
+                    capability.as_str() == sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY
+                })
+                && network::cluster_member_main_daemon_connectivity(cluster_paths, state, member)
+                    == network::ClusterMemberMainDaemonConnectivity::Unreachable
+                && !dfs_target_has_healthy_route(cluster_paths, state, &member.node_id)
+        })
+        .map(|member| member.node_id.clone())
+        .collect()
+}
+
+fn assess_dfs_invariant_replica_health(
+    local_node_id: &str,
+    metadata_shards: &[dfs::DfsMetadataShardStatus],
+    explicitly_unreachable_node_ids: &BTreeSet<NodeId>,
+) -> DfsInvariantReplicaAssessment {
+    let mut assessment = DfsInvariantReplicaAssessment::default();
+    for shard in metadata_shards.iter().filter(|shard| {
+        shard
+            .primary_node_id
+            .as_ref()
+            .is_some_and(|primary| primary.as_str() == local_node_id)
+    }) {
+        assessment.local_primary_shard_count += 1;
+        assessment.reported_replica_count += shard.replica_lag.len();
+        assessment.configured_replica_count += shard.replica_node_ids.len();
+
+        let configured_node_ids = shard
+            .replica_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let reported_node_ids = shard
+            .replica_lag
+            .iter()
+            .map(|lag| lag.target_node_id.clone())
+            .collect::<BTreeSet<_>>();
+        let unreachable_configured_node_ids = configured_node_ids
+            .intersection(explicitly_unreachable_node_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let reachable_configured_node_ids = configured_node_ids
+            .difference(&unreachable_configured_node_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let reachable_reported_node_ids = reported_node_ids
+            .intersection(&reachable_configured_node_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let missing_reachable_node_ids = reachable_configured_node_ids
+            .difference(&reported_node_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let unexpected_reported_node_ids = reported_node_ids
+            .difference(&configured_node_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+
+        assessment.explicitly_unreachable_configured_replica_count +=
+            unreachable_configured_node_ids.len();
+        assessment.reachable_configured_replica_count += reachable_configured_node_ids.len();
+        assessment.reachable_reported_replica_count += reachable_reported_node_ids.len();
+        assessment
+            .explicitly_unreachable_replica_node_ids
+            .extend(unreachable_configured_node_ids.iter().cloned());
+
+        if !missing_reachable_node_ids.is_empty() || !unexpected_reported_node_ids.is_empty() {
+            assessment.reachable_replica_status_mismatches.push(format!(
+                "{} missing_reachable={:?} unexpected={:?}",
+                shard.shard_id.0,
+                node_id_strings(&missing_reachable_node_ids),
+                node_id_strings(&unexpected_reported_node_ids)
+            ));
+        }
+
+        for lag in &shard.replica_lag {
+            if lag.lag_entries == 0 {
+                continue;
+            }
+            if unreachable_configured_node_ids.contains(&lag.target_node_id) {
+                assessment.lagging_unreachable_replica_count += 1;
+                assessment.max_unreachable_replica_lag_entries = assessment
+                    .max_unreachable_replica_lag_entries
+                    .max(lag.lag_entries);
+            } else if reachable_configured_node_ids.contains(&lag.target_node_id) {
+                assessment.lagging_reachable_replica_count += 1;
+                assessment.max_reachable_replica_lag_entries = assessment
+                    .max_reachable_replica_lag_entries
+                    .max(lag.lag_entries);
+            }
+        }
+
+        let quorum_size = dfs::dfs_metadata_replica_quorum_size(shard.replica_node_ids.len());
+        let available_participant_count = reachable_configured_node_ids.len().saturating_add(1);
+        if available_participant_count < quorum_size {
+            assessment.metadata_quorum_losses.push(format!(
+                "{} available={available_participant_count} quorum={quorum_size} configured={} unreachable={:?}",
+                shard.shard_id.0,
+                shard.replica_node_ids.len().saturating_add(1),
+                node_id_strings(&unreachable_configured_node_ids)
+            ));
+        }
+    }
+    assessment
+}
+
+fn node_id_strings(node_ids: &BTreeSet<NodeId>) -> Vec<String> {
+    node_ids.iter().map(ToString::to_string).collect()
+}
+
+fn record_dfs_invariant_replica_assessment(
+    ctx: &mut SinomoTestContext,
+    assessment: &DfsInvariantReplicaAssessment,
+) {
+    ctx.record(
+        "local_primary_shard_count",
+        assessment.local_primary_shard_count,
+    );
+    ctx.record(
+        "local_primary_replica_count",
+        assessment.reported_replica_count,
+    );
+    ctx.record(
+        "configured_local_primary_replica_count",
+        assessment.configured_replica_count,
+    );
+    ctx.record(
+        "explicitly_unreachable_configured_local_primary_replica_count",
+        assessment.explicitly_unreachable_configured_replica_count,
+    );
+    ctx.record(
+        "explicitly_unreachable_local_primary_replica_node_ids",
+        node_id_strings(&assessment.explicitly_unreachable_replica_node_ids),
+    );
+    ctx.record(
+        "reachable_local_primary_replica_count",
+        assessment.reachable_reported_replica_count,
+    );
+    ctx.record(
+        "configured_reachable_local_primary_replica_count",
+        assessment.reachable_configured_replica_count,
+    );
+    ctx.record(
+        "lagging_reachable_local_primary_replica_count",
+        assessment.lagging_reachable_replica_count,
+    );
+    ctx.record(
+        "max_reachable_local_primary_replica_lag_entries",
+        assessment.max_reachable_replica_lag_entries,
+    );
+    ctx.record(
+        "lagging_unreachable_local_primary_replica_count",
+        assessment.lagging_unreachable_replica_count,
+    );
+    ctx.record(
+        "max_unreachable_local_primary_replica_lag_entries",
+        assessment.max_unreachable_replica_lag_entries,
+    );
+    ctx.record(
+        "reachable_local_primary_replica_status_mismatches",
+        &assessment.reachable_replica_status_mismatches,
+    );
+    ctx.record(
+        "local_primary_metadata_quorum_losses",
+        &assessment.metadata_quorum_losses,
+    );
 }
 
 fn run_lightweight_latency(ctx: &mut SinomoTestContext) -> SinomoTestResult {
@@ -4678,6 +5045,215 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dfs_invariants_tolerate_lag_on_one_explicitly_unreachable_replica_with_quorum() {
+        let local = NodeId::from_legacy_named("node_dfs_invariant_local").expect("local");
+        let offline = NodeId::from_legacy_named("node_dfs_invariant_offline").expect("offline");
+        let reachable_a =
+            NodeId::from_legacy_named("node_dfs_invariant_reachable_a").expect("reachable a");
+        let reachable_b =
+            NodeId::from_legacy_named("node_dfs_invariant_reachable_b").expect("reachable b");
+        let shard = invariant_metadata_shard_status(
+            &local,
+            &[offline.clone(), reachable_a.clone(), reachable_b.clone()],
+            &[
+                (offline.clone(), 5),
+                (reachable_a.clone(), 0),
+                (reachable_b.clone(), 0),
+            ],
+        );
+        let explicitly_unreachable = BTreeSet::from([offline.clone()]);
+
+        let assessment =
+            assess_dfs_invariant_replica_health(local.as_str(), &[shard], &explicitly_unreachable);
+
+        assert!(assessment.violations().is_empty(), "{assessment:?}");
+        assert_eq!(assessment.configured_replica_count, 3);
+        assert_eq!(assessment.reported_replica_count, 3);
+        assert_eq!(
+            assessment.explicitly_unreachable_configured_replica_count,
+            1
+        );
+        assert_eq!(assessment.lagging_unreachable_replica_count, 1);
+        assert_eq!(assessment.max_unreachable_replica_lag_entries, 5);
+        assert_eq!(assessment.lagging_reachable_replica_count, 0);
+        assert_eq!(
+            assessment.explicitly_unreachable_replica_node_ids,
+            BTreeSet::from([offline])
+        );
+    }
+
+    #[test]
+    fn dfs_invariants_keep_reachable_replica_lag_as_a_failure() {
+        let local = NodeId::from_legacy_named("node_dfs_invariant_lag_local").expect("local");
+        let offline = NodeId::from_legacy_named("node_dfs_invariant_lag_offline").expect("offline");
+        let reachable_a =
+            NodeId::from_legacy_named("node_dfs_invariant_lag_reachable_a").expect("reachable a");
+        let reachable_b =
+            NodeId::from_legacy_named("node_dfs_invariant_lag_reachable_b").expect("reachable b");
+        let shard = invariant_metadata_shard_status(
+            &local,
+            &[offline.clone(), reachable_a.clone(), reachable_b.clone()],
+            &[(offline.clone(), 7), (reachable_a, 2), (reachable_b, 0)],
+        );
+
+        let assessment = assess_dfs_invariant_replica_health(
+            local.as_str(),
+            &[shard],
+            &BTreeSet::from([offline]),
+        );
+        let violations = assessment.violations();
+
+        assert_eq!(assessment.lagging_reachable_replica_count, 1);
+        assert_eq!(assessment.max_reachable_replica_lag_entries, 2);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("lagging_reachable")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn dfs_invariants_retain_counts_but_allow_missing_status_for_unreachable_replica() {
+        let local = NodeId::from_legacy_named("node_dfs_invariant_count_local").expect("local");
+        let offline =
+            NodeId::from_legacy_named("node_dfs_invariant_count_offline").expect("offline");
+        let reachable_a =
+            NodeId::from_legacy_named("node_dfs_invariant_count_reachable_a").expect("reachable a");
+        let reachable_b =
+            NodeId::from_legacy_named("node_dfs_invariant_count_reachable_b").expect("reachable b");
+        let shard = invariant_metadata_shard_status(
+            &local,
+            &[offline.clone(), reachable_a.clone(), reachable_b.clone()],
+            &[(reachable_a, 0), (reachable_b, 0)],
+        );
+
+        let assessment = assess_dfs_invariant_replica_health(
+            local.as_str(),
+            &[shard],
+            &BTreeSet::from([offline]),
+        );
+
+        assert!(assessment.violations().is_empty(), "{assessment:?}");
+        assert_eq!(assessment.configured_replica_count, 3);
+        assert_eq!(assessment.reported_replica_count, 2);
+        assert_eq!(assessment.reachable_configured_replica_count, 2);
+        assert_eq!(assessment.reachable_reported_replica_count, 2);
+        assert!(assessment.reachable_replica_status_mismatches.is_empty());
+    }
+
+    #[test]
+    fn dfs_invariants_keep_metadata_quorum_loss_as_a_failure() {
+        let local = NodeId::from_legacy_named("node_dfs_invariant_quorum_local").expect("local");
+        let offline_a =
+            NodeId::from_legacy_named("node_dfs_invariant_quorum_offline_a").expect("offline a");
+        let offline_b =
+            NodeId::from_legacy_named("node_dfs_invariant_quorum_offline_b").expect("offline b");
+        let reachable =
+            NodeId::from_legacy_named("node_dfs_invariant_quorum_reachable").expect("reachable");
+        let shard = invariant_metadata_shard_status(
+            &local,
+            &[offline_a.clone(), offline_b.clone(), reachable.clone()],
+            &[
+                (offline_a.clone(), 4),
+                (offline_b.clone(), 3),
+                (reachable, 0),
+            ],
+        );
+
+        let assessment = assess_dfs_invariant_replica_health(
+            local.as_str(),
+            &[shard],
+            &BTreeSet::from([offline_a, offline_b]),
+        );
+        let violations = assessment.violations();
+
+        assert_eq!(assessment.lagging_reachable_replica_count, 0);
+        assert_eq!(assessment.metadata_quorum_losses.len(), 1);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("metadata_quorum_lost")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn dfs_invariant_unreachable_targets_require_explicit_unreachable_connectivity() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-invariant-unreachable-target");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let paths = ClusterPaths::new(&data_dir);
+        let mut state = test_state();
+        let target = state.members[1].node_id.clone();
+        let endpoint = test_endpoint(
+            &target,
+            "endpoint_dfs_invariant_unreachable_target",
+            "unreachable.test:21353",
+        );
+        state.members[1].endpoints = vec![endpoint.clone()];
+        let degraded = connectivity_record(
+            &state,
+            &endpoint,
+            network::ClusterConnectivityState::Degraded,
+        );
+        network::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[degraded],
+        )
+        .expect("write degraded connectivity");
+        assert!(
+            !dfs_explicitly_unreachable_targets_from_state(&paths, &state).contains(&target),
+            "degraded connectivity must remain visible to invariant checks"
+        );
+
+        let unreachable = connectivity_record(
+            &state,
+            &endpoint,
+            network::ClusterConnectivityState::Unreachable,
+        );
+        network::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[unreachable],
+        )
+        .expect("write unreachable connectivity");
+
+        assert!(
+            dfs_explicitly_unreachable_targets_from_state(&paths, &state).contains(&target),
+            "an explicitly unreachable target without a healthy route is tolerated as offline"
+        );
+    }
+
+    fn invariant_metadata_shard_status(
+        primary_node_id: &NodeId,
+        replica_node_ids: &[NodeId],
+        replica_lag: &[(NodeId, u64)],
+    ) -> dfs::DfsMetadataShardStatus {
+        dfs::DfsMetadataShardStatus {
+            shard_id: dfs::DfsMetadataShardId::new("services"),
+            file_system_id: None,
+            primary_node_id: Some(primary_node_id.clone()),
+            replica_node_ids: replica_node_ids.to_vec(),
+            epoch: Some(1),
+            journal_next_sequence: 11,
+            journal_last_sequence: 10,
+            replica_lag: replica_lag
+                .iter()
+                .map(
+                    |(target_node_id, lag_entries)| dfs::DfsMetadataReplicaLagStatus {
+                        target_node_id: target_node_id.clone(),
+                        replicated_through_sequence: 10_u64.saturating_sub(*lag_entries),
+                        lag_entries: *lag_entries,
+                    },
+                )
+                .collect(),
+            replay_cursors: Vec::new(),
+        }
+    }
+
     fn test_state() -> ClusterBootstrapState {
         let now = time::OffsetDateTime::now_utc();
         let cluster_id =
@@ -4830,6 +5406,113 @@ mod tests {
     }
 
     #[test]
+    fn bounded_routed_status_probes_start_targets_concurrently() {
+        let item_count = 3usize;
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let runner_release = std::sync::Arc::clone(&release);
+        let runner = std::thread::spawn(move || {
+            let items = (0..item_count).collect::<Vec<_>>();
+            run_bounded_dfs_routed_status_jobs(&items, item_count, &|item| {
+                started_tx.send(item).expect("record started probe");
+                let (released, wake) = &*runner_release;
+                let mut released = released.lock().expect("release lock");
+                while !*released {
+                    released = wake.wait(released).expect("release wait");
+                }
+                item
+            })
+        });
+
+        let mut started = Vec::new();
+        for _ in 0..item_count {
+            match started_rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(item) => started.push(item),
+                Err(_) => break,
+            }
+        }
+        let (released, wake) = &*release;
+        *released.lock().expect("release lock") = true;
+        wake.notify_all();
+        let results = runner
+            .join()
+            .expect("bounded probe runner")
+            .expect("bounded probe results");
+
+        started.sort_unstable();
+        assert_eq!(started, vec![0, 1, 2]);
+        assert_eq!(results, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn bounded_routed_status_probes_never_exceed_limit() {
+        let active = std::sync::Arc::new(AtomicUsize::new(0));
+        let max_active = std::sync::Arc::new(AtomicUsize::new(0));
+        let items = (0..8usize).collect::<Vec<_>>();
+        let results = run_bounded_dfs_routed_status_jobs(&items, 2, &|item| {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(current, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(20));
+            active.fetch_sub(1, Ordering::SeqCst);
+            item * 2
+        })
+        .expect("bounded probe results");
+
+        assert_eq!(results, vec![0, 2, 4, 6, 8, 10, 12, 14]);
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn routed_status_attempt_preserves_target_errors_and_elapsed_diagnostics() {
+        let successful_target =
+            NodeId::from_legacy_named("node_routed_status_success").expect("successful target");
+        let failed_target =
+            NodeId::from_legacy_named("node_routed_status_failure").expect("failed target");
+        let status = BTreeMap::from([("objects", 7_u64)]);
+        let repair_details = vec![BTreeMap::from([("intent_id", "repair-a".to_string())])];
+        let attempt = aggregate_dfs_routed_status_probes(vec![
+            DfsRoutedStatusTargetProbe {
+                target: successful_target.clone(),
+                elapsed_ms: 41,
+                status: Some(status.clone()),
+                repair_details: repair_details.clone(),
+                error: None,
+            },
+            DfsRoutedStatusTargetProbe {
+                target: failed_target.clone(),
+                elapsed_ms: 73,
+                status: None,
+                repair_details: Vec::new(),
+                error: Some("decode failed: fixture".to_string()),
+            },
+        ]);
+
+        assert_eq!(
+            attempt.statuses.get(&successful_target.to_string()),
+            Some(&status)
+        );
+        assert_eq!(
+            attempt.repair_details.get(&successful_target.to_string()),
+            Some(&repair_details)
+        );
+        assert_eq!(
+            attempt
+                .target_elapsed_ms
+                .get(&successful_target.to_string()),
+            Some(&41)
+        );
+        assert_eq!(
+            attempt.target_elapsed_ms.get(&failed_target.to_string()),
+            Some(&73)
+        );
+        assert_eq!(
+            attempt.failures,
+            vec![format!("{failed_target}: decode failed: fixture")]
+        );
+    }
+
+    #[test]
     fn dfs_routed_status_gate_defaults_to_single_five_second_attempt() {
         let ctx = SinomoTestContext::new("unused");
 
@@ -4869,6 +5552,34 @@ mod tests {
         assert!(!gate.exhausted(2, Duration::from_millis(6_999)));
         assert!(gate.exhausted(3, Duration::from_millis(1)));
         assert!(gate.exhausted(1, Duration::from_millis(7_000)));
+    }
+
+    #[test]
+    fn dfs_routed_status_gate_scales_wall_budget_for_bounded_probe_waves() {
+        let gate = DfsRoutedStatusGate {
+            max_attempts: 1,
+            max_elapsed: Duration::from_secs(5),
+        };
+
+        assert_eq!(
+            gate.for_bounded_target_count(0).max_elapsed,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            gate.for_bounded_target_count(MAX_ROUTED_STATUS_CONCURRENCY)
+                .max_elapsed,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            gate.for_bounded_target_count(MAX_ROUTED_STATUS_CONCURRENCY + 1)
+                .max_elapsed,
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            gate.for_bounded_target_count(MAX_ROUTED_STATUS_CONCURRENCY * 2 + 1)
+                .max_elapsed,
+            Duration::from_secs(15)
+        );
     }
 
     #[test]

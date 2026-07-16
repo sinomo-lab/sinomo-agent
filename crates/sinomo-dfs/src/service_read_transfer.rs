@@ -12,6 +12,8 @@ use sinomo_core::node::NodeId;
 use crate::transfer::{dfs_byte_count_to_usize, range_transfer_size_bytes};
 use crate::*;
 
+const DFS_MISSING_CONTENT_AUTHORITY_GUARD_RESELECT_LIMIT: usize = 4;
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn handle_networked_read_request(
         &mut self,
@@ -1045,21 +1047,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         let backend_object = if let Some(backend) = self.metadata_backend.as_ref()
-            && let Some(mut object) = backend.get_object(object_id)?
+            && let Some(object) = backend.get_object(object_id)?
             && object.version == *version
             && object.content_hash == *content_hash
         {
-            if !object.current_locations.contains(source_node_id) {
-                None
-            } else {
-                object
-                    .current_locations
-                    .retain(|node_id| node_id != source_node_id);
-                Some(object)
-            }
+            Some(object)
         } else {
             None
         };
+        let backend_object_update = backend_object.as_ref().and_then(|object| {
+            if !object.current_locations.contains(source_node_id) {
+                return None;
+            }
+            let mut object = object.clone();
+            object
+                .current_locations
+                .retain(|node_id| node_id != source_node_id);
+            Some(object)
+        });
         let backend_version = if let Some(backend) = self.metadata_backend.as_ref()
             && let Some(mut version_record) = backend.get_version(object_id, version)?
             && version_record.content_hash == *content_hash
@@ -1082,7 +1087,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if should_persist && let Some(backend) = self.metadata_backend.as_mut() {
             let _ = backend.remove_receipt(object_id, version, source_node_id)?;
         }
-        if should_persist && let Some(object) = backend_object {
+        if should_persist && let Some(object) = backend_object_update {
             self.put_visible_object_in_metadata_backend(&object)?;
         } else if should_persist
             && let Some(version_record) = backend_version
@@ -1091,6 +1096,105 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             backend.put_version(&version_record)?;
         }
         Ok(())
+    }
+
+    /// Turn a stale local durability claim into ordinary committed-intent
+    /// repair work, but only when this node can durably mutate the exact
+    /// object's current metadata shard.
+    ///
+    /// A detached `CommitVersion` sender may retire its exact notification
+    /// only after this transition succeeds. Non-authority replicas leave the
+    /// receipt untouched and return a retryable rejection instead, so a
+    /// transient local read failure cannot silently discard durability.
+    pub(crate) fn transition_missing_local_commit_content_to_repair(
+        &mut self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        content_hash: &str,
+    ) -> Result<bool, DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(false);
+        };
+        let Some(object) = backend.get_object(object_id)? else {
+            return Ok(false);
+        };
+        if object.version != *version || object.content_hash.as_deref() != Some(content_hash) {
+            return Ok(false);
+        }
+        let publication_guard = {
+            let mut attempts = 0usize;
+            loop {
+                attempts = attempts.saturating_add(1);
+                let selected_shard = self.select_metadata_shard_for_object(&object)?;
+                let guard = selected_shard.as_ref().map(|shard| {
+                    crate::service_replica::metadata_shard_publication_guard(
+                        &shard.file_system_id,
+                        &shard.shard_id,
+                    )
+                });
+                let certified_shard =
+                    match self.certified_local_metadata_owner_shard_for_object(&object) {
+                        Ok(shard) => shard,
+                        Err(DfsError::StaleOwnerEpoch { .. }) => return Ok(false),
+                        Err(error) => return Err(error),
+                    };
+                let guarded_certified_key_matches = match (&selected_shard, &certified_shard) {
+                    (Some(selected), Some(certified)) => {
+                        selected.file_system_id == certified.file_system_id
+                            && selected.shard_id == certified.shard_id
+                    }
+                    (None, None) => true,
+                    _ => false,
+                };
+                if guarded_certified_key_matches {
+                    break guard;
+                }
+                drop(guard);
+                if attempts >= DFS_MISSING_CONTENT_AUTHORITY_GUARD_RESELECT_LIMIT {
+                    return Ok(false);
+                }
+            }
+        };
+        // A cached shard snapshot naming this node as primary is not enough to
+        // withdraw durable metadata. Reuse the normal metadata-authority path
+        // so the exact assignment is certified through a KV write barrier and
+        // any pending membership-handoff marker fences the transition. Hold
+        // the same process-wide publication guard used by retiring-primary
+        // fence capture through certification, durable prune, and the final
+        // re-read so a handoff that starts afterward must observe this change.
+        // A stale certification is deliberately retryable: the sender must
+        // not retire its detached promotion until a current authority performs
+        // the durable prune. Other metadata failures remain visible to the
+        // caller.
+        let local_node_id = self.node_id.clone();
+        self.mark_remote_read_location_missing(
+            object_id,
+            version,
+            &Some(content_hash.to_string()),
+            &local_node_id,
+        )?;
+
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(false);
+        };
+        let object_pruned = backend.get_object(object_id)?.is_some_and(|object| {
+            object.version == *version
+                && object.content_hash.as_deref() == Some(content_hash)
+                && !object.current_locations.contains(&local_node_id)
+        });
+        let version_pruned =
+            backend
+                .get_version(object_id, version)?
+                .is_none_or(|version_record| {
+                    version_record.content_hash.as_deref() == Some(content_hash)
+                        && !version_record.locations.contains(&local_node_id)
+                });
+        let receipt_pruned = !backend
+            .receipts_for_version(object_id, version)?
+            .iter()
+            .any(|receipt| receipt.replica_node_id == local_node_id);
+        drop(publication_guard);
+        Ok(object_pruned && version_pruned && receipt_pruned)
     }
 
     fn should_persist_remote_read_location_prune(

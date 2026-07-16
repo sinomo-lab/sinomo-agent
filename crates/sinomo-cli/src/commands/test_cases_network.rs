@@ -44,17 +44,106 @@ const DEFAULT_MAX_P50_US: u64 = 0;
 const DEFAULT_MAX_P95_US: u64 = 0;
 const DEFAULT_MIN_REQUESTS_PER_SECOND: f64 = 50.0;
 const DEFAULT_MIN_PAYLOAD_BYTES_PER_SECOND: f64 = 0.0;
+// This is the exact Raft-forward envelope size that exposed the old 64 KiB
+// unary cutoff. Keep the acceptance probe comfortably above the control-frame
+// bound in both directions while leaving throughput measurement to the normal
+// ping benchmark.
+const STREAMED_UNARY_ACCEPTANCE_PAYLOAD_BYTES: usize = 344_208;
+const STREAMED_UNARY_CONTROL_FRAME_BOUNDARY_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NetworkPingRunDefaults {
+    parameter_prefix: Option<&'static str>,
+    requests_per_target: usize,
+    warmup_requests_per_target: Option<usize>,
+    concurrency: usize,
+    timeout_ms: u64,
+    expected_targets: usize,
+    max_failures: usize,
+    max_p50_ms: u64,
+    max_p95_ms: u64,
+    max_p50_us: u64,
+    max_p95_us: u64,
+    min_requests_per_second: f64,
+    payload_bytes: usize,
+    response_payload_bytes: usize,
+    min_payload_bytes_per_second: f64,
+    require_streamed_unary_payloads: bool,
+}
+
+impl NetworkPingRunDefaults {
+    const fn benchmark() -> Self {
+        Self {
+            parameter_prefix: None,
+            requests_per_target: DEFAULT_REQUESTS_PER_TARGET,
+            warmup_requests_per_target: None,
+            concurrency: DEFAULT_CONCURRENCY,
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+            expected_targets: DEFAULT_EXPECTED_TARGETS,
+            max_failures: DEFAULT_MAX_FAILURES,
+            max_p50_ms: DEFAULT_MAX_P50_MS,
+            max_p95_ms: DEFAULT_MAX_P95_MS,
+            max_p50_us: DEFAULT_MAX_P50_US,
+            max_p95_us: DEFAULT_MAX_P95_US,
+            min_requests_per_second: DEFAULT_MIN_REQUESTS_PER_SECOND,
+            payload_bytes: 0,
+            response_payload_bytes: 0,
+            min_payload_bytes_per_second: DEFAULT_MIN_PAYLOAD_BYTES_PER_SECOND,
+            require_streamed_unary_payloads: false,
+        }
+    }
+
+    const fn streamed_unary_acceptance() -> Self {
+        Self {
+            parameter_prefix: Some("streamed-unary"),
+            requests_per_target: 1,
+            warmup_requests_per_target: Some(0),
+            concurrency: DEFAULT_CONCURRENCY,
+            timeout_ms: 10_000,
+            expected_targets: DEFAULT_EXPECTED_TARGETS,
+            max_failures: 0,
+            max_p50_ms: 0,
+            max_p95_ms: 0,
+            max_p50_us: 0,
+            max_p95_us: 0,
+            min_requests_per_second: 0.0,
+            payload_bytes: STREAMED_UNARY_ACCEPTANCE_PAYLOAD_BYTES,
+            response_payload_bytes: STREAMED_UNARY_ACCEPTANCE_PAYLOAD_BYTES,
+            min_payload_bytes_per_second: 0.0,
+            require_streamed_unary_payloads: true,
+        }
+    }
+
+    fn parameter_name(self, name: &str) -> String {
+        self.parameter_prefix
+            .map(|prefix| format!("{prefix}-{name}"))
+            .unwrap_or_else(|| name.to_string())
+    }
+}
 
 pub fn register_network_cluster_test_cases(
     builder: SinomoTestRegistryBuilder,
 ) -> SinomoTestRegistryBuilder {
     builder
         .register(network_ping_benchmark())
+        .register(network_streamed_unary_large_message())
         .register(network_state_hygiene())
         .register(network_state_hygiene_dirty_fixture())
         .register(network_endpoint_error_fallback())
         .register(network_tcp_tunnel_stale_fallback())
         .register(network_stale_direct_timeout_demotion())
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn network_streamed_unary_large_message(ctx) {
+        id: "cluster.network.streamed-unary-large-message",
+        summary: "Route a request and response larger than the session control-frame bound through daemon forwarding",
+        tags: ["cluster-network", "probe", "streaming", "cluster-network-dfs-acceptance"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_network_streamed_unary_large_message(ctx)
+        }
+    }
 }
 
 sinomo_runtime::test::sinomo_test_case! {
@@ -146,14 +235,14 @@ fn run_network_state_hygiene(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let targets = filter_network_test_targets(
         ctx,
         &cluster_state,
-        network_ping_targets_from_state(&cluster_paths, &cluster_state)?,
+        super::test::live_online_remote_main_test_targets(&data_dir, &cluster_state)?,
     )?;
     ctx.record("target_count", targets.len());
     ctx.record(
         "targets",
         targets.iter().map(ToString::to_string).collect::<Vec<_>>(),
     );
-    if targets.len() < expected_targets {
+    if !super::test::cluster_test_has_expected_target_count(targets.len(), expected_targets) {
         return Ok(SinomoTestOutcome::failed(format!(
             "network hygiene saw {} remote main targets, expected at least {expected_targets}",
             targets.len()
@@ -223,14 +312,14 @@ fn run_network_state_hygiene_dirty_fixture(ctx: &mut SinomoTestContext) -> Sinom
     let targets = filter_network_test_targets(
         ctx,
         &cluster_state,
-        network_ping_targets_from_state(&cluster_paths, &cluster_state)?,
+        super::test::live_online_remote_main_test_targets(&data_dir, &cluster_state)?,
     )?;
     ctx.record("target_count", targets.len());
     ctx.record(
         "targets",
         targets.iter().map(ToString::to_string).collect::<Vec<_>>(),
     );
-    if targets.len() < expected_targets {
+    if !super::test::cluster_test_has_expected_target_count(targets.len(), expected_targets) {
         return Ok(SinomoTestOutcome::failed(format!(
             "network hygiene dirty fixture saw {} remote main targets, expected at least {expected_targets}",
             targets.len()
@@ -398,34 +487,75 @@ fn network_hygiene_dirty_fixture_record(
 }
 
 fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    run_network_ping_with_defaults(ctx, NetworkPingRunDefaults::benchmark())
+}
+
+fn run_network_streamed_unary_large_message(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    run_network_ping_with_defaults(ctx, NetworkPingRunDefaults::streamed_unary_acceptance())
+}
+
+fn run_network_ping_with_defaults(
+    ctx: &mut SinomoTestContext,
+    defaults: NetworkPingRunDefaults,
+) -> SinomoTestResult {
+    let requests_per_target_name = defaults.parameter_name("requests-per-target");
+    let warmup_requests_per_target_name = defaults.parameter_name("warmup-requests-per-target");
+    let concurrency_name = defaults.parameter_name("concurrency");
+    let timeout_name = defaults.parameter_name("timeout-ms");
+    let max_failures_name = defaults.parameter_name("max-failures");
+    let max_p50_ms_name = defaults.parameter_name("max-p50-ms");
+    let max_p95_ms_name = defaults.parameter_name("max-p95-ms");
+    let max_p50_us_name = defaults.parameter_name("max-p50-us");
+    let max_p95_us_name = defaults.parameter_name("max-p95-us");
+    let min_requests_per_second_name = defaults.parameter_name("min-requests-per-second");
+    let payload_bytes_name = defaults.parameter_name("payload-bytes");
+    let response_payload_bytes_name = defaults.parameter_name("response-payload-bytes");
+    let min_payload_bytes_per_second_name = defaults.parameter_name("min-payload-bytes-per-second");
     let requests_per_target =
-        optional_usize_parameter(ctx, "requests-per-target", DEFAULT_REQUESTS_PER_TARGET)?;
-    let warmup_requests_per_target =
-        optional_usize_parameter(ctx, "warmup-requests-per-target", requests_per_target)?;
-    let concurrency = optional_usize_parameter(ctx, "concurrency", DEFAULT_CONCURRENCY)?;
-    let timeout_ms = optional_u64_parameter(ctx, "timeout-ms", DEFAULT_TIMEOUT_MS)?;
+        optional_usize_parameter(ctx, &requests_per_target_name, defaults.requests_per_target)?;
+    let warmup_requests_per_target = optional_usize_parameter(
+        ctx,
+        &warmup_requests_per_target_name,
+        defaults
+            .warmup_requests_per_target
+            .unwrap_or(requests_per_target),
+    )?;
+    let concurrency = optional_usize_parameter(ctx, &concurrency_name, defaults.concurrency)?;
+    let timeout_ms = optional_u64_parameter(ctx, &timeout_name, defaults.timeout_ms)?;
     let expected_targets =
-        optional_usize_parameter(ctx, "expected-targets", DEFAULT_EXPECTED_TARGETS)?;
-    let max_failures = optional_usize_parameter(ctx, "max-failures", DEFAULT_MAX_FAILURES)?;
-    let max_p50_ms = optional_u64_parameter(ctx, "max-p50-ms", DEFAULT_MAX_P50_MS)?;
-    let max_p95_ms = optional_u64_parameter(ctx, "max-p95-ms", DEFAULT_MAX_P95_MS)?;
-    let max_p50_us = optional_u64_parameter(ctx, "max-p50-us", DEFAULT_MAX_P50_US)?;
-    let max_p95_us = optional_u64_parameter(ctx, "max-p95-us", DEFAULT_MAX_P95_US)?;
+        optional_usize_parameter(ctx, "expected-targets", defaults.expected_targets)?;
+    let max_failures = optional_usize_parameter(ctx, &max_failures_name, defaults.max_failures)?;
+    let max_p50_ms = optional_u64_parameter(ctx, &max_p50_ms_name, defaults.max_p50_ms)?;
+    let max_p95_ms = optional_u64_parameter(ctx, &max_p95_ms_name, defaults.max_p95_ms)?;
+    let max_p50_us = optional_u64_parameter(ctx, &max_p50_us_name, defaults.max_p50_us)?;
+    let max_p95_us = optional_u64_parameter(ctx, &max_p95_us_name, defaults.max_p95_us)?;
     let min_requests_per_second = optional_f64_parameter(
         ctx,
-        "min-requests-per-second",
-        DEFAULT_MIN_REQUESTS_PER_SECOND,
+        &min_requests_per_second_name,
+        defaults.min_requests_per_second,
     )?;
-    let payload_bytes = optional_usize_parameter(ctx, "payload-bytes", 0)?;
-    let response_payload_bytes = optional_usize_parameter(ctx, "response-payload-bytes", 0)?;
+    let payload_bytes = optional_usize_parameter(ctx, &payload_bytes_name, defaults.payload_bytes)?;
+    let response_payload_bytes = optional_usize_parameter(
+        ctx,
+        &response_payload_bytes_name,
+        defaults.response_payload_bytes,
+    )?;
     let min_payload_bytes_per_second = optional_f64_parameter(
         ctx,
-        "min-payload-bytes-per-second",
-        DEFAULT_MIN_PAYLOAD_BYTES_PER_SECOND,
+        &min_payload_bytes_per_second_name,
+        defaults.min_payload_bytes_per_second,
     )?;
-    require_positive("requests-per-target", requests_per_target)?;
-    require_positive("concurrency", concurrency)?;
-    require_positive("timeout-ms", timeout_ms as usize)?;
+    require_positive(&requests_per_target_name, requests_per_target)?;
+    require_positive(&concurrency_name, concurrency)?;
+    require_positive(&timeout_name, timeout_ms as usize)?;
+    if defaults.require_streamed_unary_payloads {
+        require_streamed_unary_acceptance_payloads(
+            &payload_bytes_name,
+            payload_bytes,
+            &response_payload_bytes_name,
+            response_payload_bytes,
+        )?;
+    }
 
     let data_dir = SinomoDataDir::new(ctx.data_dir());
     let cluster_paths = ClusterPaths::new(&data_dir);
@@ -441,7 +571,7 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let targets = filter_network_test_targets(
         ctx,
         &cluster_state,
-        network_ping_targets_from_state(&cluster_paths, &cluster_state)?,
+        super::test::live_online_remote_main_test_targets(&data_dir, &cluster_state)?,
     )?;
     let target_count = targets.len();
     ctx.record("target_count", target_count);
@@ -449,7 +579,7 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         "targets",
         targets.iter().map(ToString::to_string).collect::<Vec<_>>(),
     );
-    if target_count < expected_targets {
+    if !super::test::cluster_test_has_expected_target_count(target_count, expected_targets) {
         return Ok(SinomoTestOutcome::failed(format!(
             "network ping saw {target_count} remote main targets, expected at least {expected_targets}"
         )));
@@ -1534,6 +1664,7 @@ fn run_network_tcp_tunnel_stale_fallback_probe(
     Ok(SinomoTestOutcome::passed(""))
 }
 
+#[cfg(test)]
 fn network_ping_targets_from_state(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -1545,6 +1676,7 @@ fn network_ping_targets_from_state(
         .collect())
 }
 
+#[cfg(test)]
 fn network_ping_target_is_available_for_probe(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -1566,6 +1698,7 @@ fn network_ping_target_is_available_for_probe(
         })
 }
 
+#[cfg(test)]
 fn network_target_has_healthy_route(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -2198,6 +2331,29 @@ fn require_positive(name: &str, value: usize) -> Result<(), SinomoTestError> {
     Ok(())
 }
 
+fn require_streamed_unary_acceptance_payloads(
+    request_parameter: &str,
+    request_payload_bytes: usize,
+    response_parameter: &str,
+    response_payload_bytes: usize,
+) -> Result<(), SinomoTestError> {
+    for (name, value) in [
+        (request_parameter, request_payload_bytes),
+        (response_parameter, response_payload_bytes),
+    ] {
+        if value <= STREAMED_UNARY_CONTROL_FRAME_BOUNDARY_BYTES {
+            return Err(SinomoTestError::InvalidParameter {
+                name: name.to_string(),
+                detail: format!(
+                    "must exceed the {}-byte session control-frame boundary for the streamed-unary acceptance probe",
+                    STREAMED_UNARY_CONTROL_FRAME_BOUNDARY_BYTES
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 async fn run_network_ping_jobs_async(
     jobs: Vec<NetworkPingJob>,
     concurrency: usize,
@@ -2309,6 +2465,61 @@ mod tests {
         ClusterTransportKind,
     };
     use sinomo_runtime::node::ClusterId;
+
+    #[test]
+    fn streamed_unary_acceptance_defaults_cross_control_boundary_both_ways() {
+        let defaults = NetworkPingRunDefaults::streamed_unary_acceptance();
+        let request_parameter = defaults.parameter_name("payload-bytes");
+        let response_parameter = defaults.parameter_name("response-payload-bytes");
+
+        require_streamed_unary_acceptance_payloads(
+            &request_parameter,
+            defaults.payload_bytes,
+            &response_parameter,
+            defaults.response_payload_bytes,
+        )
+        .expect("acceptance defaults");
+        assert_eq!(
+            defaults.payload_bytes,
+            STREAMED_UNARY_ACCEPTANCE_PAYLOAD_BYTES
+        );
+        assert_eq!(
+            defaults.response_payload_bytes,
+            STREAMED_UNARY_ACCEPTANCE_PAYLOAD_BYTES
+        );
+        assert_eq!(defaults.requests_per_target, 1);
+        assert_eq!(defaults.warmup_requests_per_target, Some(0));
+        assert_eq!(request_parameter, "streamed-unary-payload-bytes");
+        assert_eq!(response_parameter, "streamed-unary-response-payload-bytes");
+    }
+
+    #[test]
+    fn streamed_unary_acceptance_rejects_a_control_sized_request_or_response() {
+        for (request_bytes, response_bytes, parameter) in [
+            (
+                STREAMED_UNARY_CONTROL_FRAME_BOUNDARY_BYTES,
+                STREAMED_UNARY_ACCEPTANCE_PAYLOAD_BYTES,
+                "streamed-unary-payload-bytes",
+            ),
+            (
+                STREAMED_UNARY_ACCEPTANCE_PAYLOAD_BYTES,
+                STREAMED_UNARY_CONTROL_FRAME_BOUNDARY_BYTES,
+                "streamed-unary-response-payload-bytes",
+            ),
+        ] {
+            let error = require_streamed_unary_acceptance_payloads(
+                "streamed-unary-payload-bytes",
+                request_bytes,
+                "streamed-unary-response-payload-bytes",
+                response_bytes,
+            )
+            .expect_err("control-sized payload must not weaken acceptance coverage");
+            assert!(matches!(
+                error,
+                SinomoTestError::InvalidParameter { ref name, .. } if name == parameter
+            ));
+        }
+    }
 
     #[test]
     fn network_ping_decodes_typed_daemon_forward_success() {

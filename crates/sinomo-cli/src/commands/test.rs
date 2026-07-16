@@ -3,9 +3,10 @@ use serde::Serialize;
 #[allow(unused_imports)]
 use sinomo_runtime::cluster::ClusterKvPathsExt;
 use sinomo_runtime::test::{
-    SinomoTestCaseMetadata, SinomoTestContext, SinomoTestRegistry, SinomoTestReport,
-    SinomoTestStatus,
+    SinomoTestCaseMetadata, SinomoTestContext, SinomoTestError, SinomoTestRegistry,
+    SinomoTestReport, SinomoTestStatus,
 };
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum TestCliCommand {
@@ -54,6 +55,68 @@ struct SinomoTestSuiteReport {
     skipped: usize,
     duration_ms: u64,
     reports: Vec<SinomoTestReport>,
+}
+
+/// Returns the remote main daemons that the live cluster-health view reports
+/// online. Availability is resolved before a case applies `expected-targets`:
+/// an intentionally offline or currently unreachable member is not a probe
+/// target, while every online member remains in scope so route failures on an
+/// online node are still observable by the case itself.
+pub(super) fn live_online_remote_main_test_targets(
+    data_dir: &SinomoDataDir,
+    state: &ClusterBootstrapState,
+) -> Result<Vec<NodeId>, SinomoTestError> {
+    let (health_state, rows) =
+        super::cluster_health_rows_for_data_dir(data_dir).map_err(|error| {
+            SinomoTestError::failed(format!(
+                "cannot resolve live cluster health before selecting test targets: {error}"
+            ))
+        })?;
+    if health_state.cluster_id != state.cluster_id
+        || health_state.local_node_id != state.local_node_id
+    {
+        return Err(SinomoTestError::failed(format!(
+            "live cluster health identity changed while selecting test targets: expected cluster {} local {}, got cluster {} local {}",
+            state.cluster_id,
+            state.local_node_id,
+            health_state.cluster_id,
+            health_state.local_node_id,
+        )));
+    }
+
+    let online = rows
+        .into_iter()
+        .filter(|row| {
+            row.availability == ClusterNodeAvailability::Online && row.live_probe_observed
+        })
+        .map(|row| row.member.node_id)
+        .collect::<BTreeSet<_>>();
+    let mut candidates = state
+        .members
+        .iter()
+        .filter(|member| {
+            member.node_id != state.local_node_id
+                && member.state.is_authorized()
+                && cluster_member_expected_daemon_process(member) == Some(DAEMON_MAIN_CLUSTER_ROLE)
+        })
+        .map(|member| member.node_id.clone())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    Ok(retain_live_online_test_targets(candidates, &online))
+}
+
+fn retain_live_online_test_targets(
+    candidates: Vec<NodeId>,
+    online: &BTreeSet<NodeId>,
+) -> Vec<NodeId> {
+    candidates
+        .into_iter()
+        .filter(|target| online.contains(target))
+        .collect()
+}
+
+pub(super) const fn cluster_test_has_expected_target_count(actual: usize, expected: usize) -> bool {
+    actual >= expected
 }
 
 pub(crate) fn parse_test_command(args: &[String]) -> Result<TestCliCommand, CliError> {
@@ -581,6 +644,37 @@ mod tests {
     }
 
     #[test]
+    fn live_target_filter_excludes_offline_first_before_expected_count() {
+        let offline = NodeId::from_legacy_named("node_acceptance_offline_first").expect("node");
+        let carbon = NodeId::from_legacy_named("node_acceptance_carbon").expect("node");
+        let oracle = NodeId::from_legacy_named("node_acceptance_oracle").expect("node");
+        let candidates = vec![offline.clone(), carbon.clone(), oracle.clone()];
+        let online = BTreeSet::from([carbon.clone(), oracle.clone()]);
+
+        let selected = retain_live_online_test_targets(candidates, &online);
+
+        assert_eq!(selected, vec![carbon, oracle]);
+        assert!(!selected.contains(&offline));
+        assert!(cluster_test_has_expected_target_count(selected.len(), 2));
+        assert!(
+            !cluster_test_has_expected_target_count(selected.len(), 3),
+            "fewer reachable targets than requested must remain a strict failure"
+        );
+    }
+
+    #[test]
+    fn live_target_filter_keeps_every_online_target_for_route_validation() {
+        let online_with_broken_route =
+            NodeId::from_legacy_named("node_acceptance_online_broken_route").expect("node");
+        let selected = retain_live_online_test_targets(
+            vec![online_with_broken_route.clone()],
+            &BTreeSet::from([online_with_broken_route.clone()]),
+        );
+
+        assert_eq!(selected, vec![online_with_broken_route]);
+    }
+
+    #[test]
     fn skipped_test_outcomes_do_not_fail_cli_result() {
         assert!(test_report_result(&test_report(SinomoTestStatus::Skipped)).is_ok());
 
@@ -655,6 +749,7 @@ mod tests {
             .collect();
         for id in [
             "cluster.network.ping-benchmark",
+            "cluster.network.streamed-unary-large-message",
             "cluster.network.hygiene",
             "cluster.network.hygiene-dirty-fixture",
             "cluster.kv.quorum-commit-benchmark",
@@ -695,6 +790,7 @@ mod tests {
             .collect::<Vec<_>>();
         for id in [
             "cluster.network.ping-benchmark",
+            "cluster.network.streamed-unary-large-message",
             "cluster.network.hygiene",
             "cluster.dfs.routed-status",
             "cluster.dfs.read-your-write",

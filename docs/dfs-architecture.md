@@ -77,12 +77,15 @@ journal head and fingerprint captured under that guard. A pending freeze
 survives process restart and blocks every authoritative metadata-table mutation
 while still permitting replay, snapshot inspection, and handoff transfer.
 
-Activation transfers that immutable fenced prefix to the union of the retiring
-and desired metadata assignments and requires an exact acknowledgement from
-every member of the union. The completion proof must equal the retiring
-primary's fence; a watermark taken only when the quorum side created the
-pending record is insufficient. Only then does the desired assignment become
-active. For same-primary membership changes, the completing backend instance
+Activation transfers that immutable fenced prefix across the union of the
+retiring and desired metadata assignments and requires a joint-consensus
+certificate: a majority of each assignment plus explicit acknowledgements from
+both the retiring and desired primaries. The completion proof must equal the
+retiring primary's fence; a watermark taken only when the quorum side created
+the pending record is insufficient. This permits a configured replica to be
+offline without freezing a healthy shard while ensuring the successor starts
+with a durable majority and neither side of a reconfiguration can activate
+alone. For same-primary membership changes, the completing backend instance
 advances its local marker and explicitly rebinds. For a primary rotation, the
 retiring instance records completion without binding the successor epoch and
 therefore remains fenced. Before its exact-prefix acknowledgement can count,
@@ -100,22 +103,24 @@ until the retiring primary has handed off every write completed before its
 local fence. Healthy full-shard writes remain off Raft; exceptional quorum-
 authorized prepares advance only one bounded per-shard transfer floor in KV.
 
-Membership-handoff synchronization is therefore an exact-union operation, not
+Membership-handoff synchronization is therefore a joint-quorum operation, not
 an ordinary metadata quorum barrier. It must not take the ordinary POSIX
-cluster-quorum fallback when only part of the retiring-plus-desired union has
-acknowledged: a desired-only node is not valid evidence for a retiring-epoch
-watermark, and a retiring-only quorum is still not the exact handoff proof.
-Partial union progress stays pending and retry-enabled until every required
-member acknowledges or the bounded attempt times out without activation. A
-timed-out attempt returns to durable pending state, retains the retiring write
-fence, and is eligible for prompt rediscovery and retry.
+cluster-quorum fallback based only on a majority of the union: a desired-only
+quorum is not valid evidence for a retiring-epoch prefix, and a retiring-only
+quorum does not make the successor durable. Progress stays pending and
+retry-enabled until both assignment majorities and both primaries acknowledge,
+or the bounded attempt times out without activation. A timed-out attempt
+returns to durable pending state, retains the retiring write fence, and is
+eligible for prompt rediscovery and retry. Missing desired replicas catch up
+through normal replica maintenance after activation; missing retiring-only
+replicas remain fenced by the committed successor epoch when they return.
 
 Daemon maintenance discovery includes a pending handoff only on its retiring
 primary. This allows a handoff committed immediately after one maintenance pass
 to request the prompt maintenance cadence instead of idling until the long
 periodic tick. A pending handoff owned by another node does not schedule a local
-coordinator. Triggered reconciliation retains the same write-fence and exact-
-union activation rules; the trigger changes scheduling, not authority.
+coordinator. Triggered reconciliation retains the same write-fence and joint-
+quorum activation rules; the trigger changes scheduling, not authority.
 
 Every distributed SIFS bootstrap performs the completed-generation rebind
 check before its first authoritative namespace mutation. This closes the
@@ -374,13 +379,29 @@ data directory while retaining independent routing and response queues.
 
 Only a matching `Committed` `CommitVersionResponse` settles an entry;
 `Durable` proves staging only. Transport errors, durable-only, missing or
-mismatched acknowledgements, and explicit rejection retain the exact identity
-for idempotent backoff retry without replaying successful siblings. A drain
+mismatched acknowledgements, and retryable explicit rejection retain the exact
+identity for idempotent backoff retry without replaying successful siblings.
+Two authenticated rejection classes are terminal for the exact notification.
+A receiver whose durable intent excludes its local node cannot become
+authorized by replaying the identical command. A current metadata-shard primary
+that cannot open its exact local committed content first durably removes its
+stale receipt and visible location; its typed repair-pending rejection transfers
+convergence ownership to the ordinary committed-intent repair ledger. That
+acknowledgement proves the receipt/location prune is durable; it does not claim
+that content repair has completed. When no exact-version source is currently
+reachable, the repair remains pending under the existing bounded backoff. A
+non-authority cannot make the prune transition, so the same missing-content
+failure remains retryable. The sender emits a structured warning and retires
+either terminal identity without claiming a committed acknowledgement. A bounded
+terminal frontier retains one settled, undesired, or repair-pending
+intent/version/hash per target/filesystem/object key and suppresses exact
+duplicates while allowing a new intent identity for that key. Terminal
+classification must match the expected requester and intent or the exact repair
+object, version, and hash; wrapped or mismatched reasons stay retryable. A drain
 attempts every ready identity once under the cap before returning its first
-error, then rotates failed identities behind unattempted or concurrently queued
-work, preventing permanent failures from head-of-line blocking healthy
-promotions. Settled bookkeeping retains one current version/hash frontier per
-target/filesystem/object key rather than every historical version.
+retryable error, then rotates failed identities behind unattempted or
+concurrently queued work, preventing permanent failures from head-of-line
+blocking healthy promotions.
 
 Durable committed intents and receipts reconstruct outstanding exact
 promotions in a dedicated background maintenance hydration after restart, so

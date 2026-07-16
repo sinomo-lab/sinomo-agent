@@ -78,9 +78,9 @@ pub const OBJECT_RPC_FULL_RESPONSE_BUDGET_METADATA_KEY: &str = "sinomo-full-resp
 pub const OBJECT_RPC_TRACEPARENT_METADATA_KEY: &str = "traceparent";
 pub const OBJECT_RPC_TRACESTATE_METADATA_KEY: &str = "tracestate";
 pub const OBJECT_RPC_OBSERVE_SAMPLED_METADATA_KEY: &str = "sinomo-observe-sampled";
-/// Compatibility ceiling when a body-aware route is invoked through the unary API.
-/// New large-object callers use [`crate::ObjectRpcSessionCall`] and never collect here.
-pub const OBJECT_RPC_UNARY_ADAPTER_MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
+/// Legacy in-process `Service<ObjectRpcRequest>` materialization ceiling.
+/// This is not a transport or canonical-session body limit.
+pub(crate) const OBJECT_RPC_UNARY_COMPATIBILITY_MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
 pub const CLUSTER_HEALTH_RPC_CATEGORY: &str = "cluster.health";
 pub const CLUSTER_HEALTH_ROUTE: &str = "/cluster/health";
@@ -1211,7 +1211,7 @@ impl ObjectRpcRouter {
             if !result.body.is_empty() {
                 result.response.body = result
                     .body
-                    .collect_to_vec(OBJECT_RPC_UNARY_ADAPTER_MAX_BODY_BYTES)
+                    .collect_to_vec(OBJECT_RPC_UNARY_COMPATIBILITY_MAX_BODY_BYTES)
                     .await?;
             }
             Ok(result.response)
@@ -1660,15 +1660,20 @@ where
                 })
             });
         }
+        let request_body_is_empty =
+            match crate::ObjectRpcUnarySessionAdapter::request_is_encoded(&request) {
+                Ok(true) => true,
+                Ok(false) => request.body.is_empty(),
+                Err(error) => return Box::pin(async move { Err(error) }),
+            };
         if let Err(error) = validate_object_rpc_body_mode(
             &route,
             "request",
             entry.request_body_mode,
-            request.body.is_empty(),
+            request_body_is_empty,
         ) {
             return Box::pin(async move { Err(error) });
         }
-
         let mut inner = self.take_poll_ready_inner_for_call();
         Box::pin(async move {
             let timeout_route = route.clone();
@@ -2070,6 +2075,61 @@ mod tests {
                 .await
                 .expect("response body"),
             b"body"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_policy_restores_transferred_unary_payload_before_body_mode_validation() {
+        let payload = vec![0x43_u8; 344_208];
+        let expected_payload = payload.clone();
+        let descriptor = ObjectRouteDescriptor::new(
+            "/test/transferred-unary-payload",
+            "test",
+            "transferred unary payload",
+            "Request",
+            "Response",
+        );
+        let registry = ObjectRpcRouteRegistry::builder()
+            .register_session_route(descriptor, move |request| {
+                let expected_payload = expected_payload.clone();
+                async move {
+                    assert_eq!(request.request.body, expected_payload);
+                    assert!(request.body.is_empty());
+                    Ok(ObjectRpcSessionResponse::buffered(
+                        ObjectRpcResponse::from_encoded_body(request.request.route, b"ok".to_vec()),
+                    ))
+                }
+            })
+            .build();
+        let router = ObjectRpcRouter::from_route_registry(registry).expect("router");
+        let policy = ObjectRpcRoutePolicyLayer::new(router.catalog()).expect("policy");
+        let router = crate::ObjectRpcUnarySessionAdapterLayer::new(payload.len()).layer(router);
+        let mut service = policy.layer(router);
+        let mut request = ObjectRpcRequest::from_encoded_body(
+            "/test/transferred-unary-payload",
+            "test",
+            Vec::new(),
+        );
+        request.metadata.insert(
+            crate::unary::OBJECT_RPC_BUFFERED_REQUEST_BODY_METADATA_KEY.to_string(),
+            crate::unary::OBJECT_RPC_BUFFERED_REQUEST_BODY_METADATA_VALUE.to_string(),
+        );
+
+        let response = call_object_rpc_session_service_async(
+            &mut service,
+            ObjectRpcSessionRequest::new(request, crate::ObjectRpcIncomingBody::bytes(payload)),
+        )
+        .await
+        .expect("transferred unary payload passes default body policy");
+
+        assert!(response.response.body.is_empty());
+        assert_eq!(
+            response
+                .body
+                .collect_to_vec(2)
+                .await
+                .expect("adapted response body"),
+            b"ok"
         );
     }
 

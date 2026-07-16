@@ -1,10 +1,14 @@
 use crate::{
-    ContentStoreError, DfsDistributedError, DfsFileSystemId, DfsObjectId, MetadataBackendError,
+    ContentStoreError, DfsDistributedError, DfsFileSystemId, DfsObjectId, DfsVersion,
+    MetadataBackendError,
 };
 use sinomo_core::DfsObjectPolicy;
 use sinomo_core::kv::KvError;
 use sinomo_core::node::NodeId;
 use thiserror::Error;
+
+const DFS_REPLICA_NOT_DESIRED_REASON_PREFIX: &str =
+    "local node is not a desired replica for DFS write intent ";
 
 /// Error type shared by DFS metadata, content, routing, and service code.
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
@@ -35,6 +39,18 @@ pub enum DfsError {
     InvalidReplicationPolicy { message: String },
     #[error("content hash mismatch: expected {expected}, actual {actual}")]
     ContentHashMismatch { expected: String, actual: String },
+    /// The current metadata authority durably withdrew a stale replica receipt
+    /// after the receiver could no longer open the exact committed content.
+    /// The committed intent remains authoritative and maintenance must repair
+    /// this desired replica from another exact-version source.
+    #[error(
+        "DFS commit content repair pending for object {object_id} version {version} ({content_hash})"
+    )]
+    CommitContentRepairPending {
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        content_hash: String,
+    },
     #[error("unauthorized DFS replica command from {source_node_id}: {reason}")]
     UnauthorizedReplicaCommand {
         source_node_id: NodeId,
@@ -73,6 +89,38 @@ impl DfsError {
             message: error.to_string(),
         }
     }
+}
+
+pub(crate) fn dfs_replica_not_desired_reason(intent_id: &str) -> String {
+    format!("{DFS_REPLICA_NOT_DESIRED_REASON_PREFIX}{intent_id}")
+}
+
+pub(crate) fn dfs_rejection_is_replica_not_desired(
+    reason: &str,
+    expected_requester_node_id: &NodeId,
+    expected_intent_id: &str,
+) -> bool {
+    reason
+        == DfsError::UnauthorizedReplicaCommand {
+            source_node_id: expected_requester_node_id.clone(),
+            reason: dfs_replica_not_desired_reason(expected_intent_id),
+        }
+        .to_string()
+}
+
+pub(crate) fn dfs_rejection_is_commit_content_repair_pending(
+    reason: &str,
+    expected_object_id: &DfsObjectId,
+    expected_version: &DfsVersion,
+    expected_content_hash: &str,
+) -> bool {
+    reason
+        == DfsError::CommitContentRepairPending {
+            object_id: expected_object_id.clone(),
+            version: expected_version.clone(),
+            content_hash: expected_content_hash.to_string(),
+        }
+        .to_string()
 }
 
 fn dfs_error_current_primary(error: &DfsError) -> Option<NodeId> {

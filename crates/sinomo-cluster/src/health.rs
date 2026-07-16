@@ -46,6 +46,11 @@ pub struct ClusterHealthRow {
     pub member: ClusterMemberRecord,
     pub status: ClusterNodeStatusRecord,
     pub availability: ClusterNodeAvailability,
+    /// True when this row's liveness was established by a direct status probe
+    /// in the current health request, either locally or by a queried peer.
+    /// Older peers omit the field and cannot turn cached status into liveness.
+    #[serde(default)]
+    pub live_probe_observed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -339,12 +344,71 @@ pub struct ClusterDoctorFinding {
 }
 
 impl ClusterDoctorFinding {
+    fn info(code: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            severity: "info".to_string(),
+            code: code.into(),
+            detail: detail.into(),
+        }
+    }
+
     fn warning(code: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
             severity: "warning".to_string(),
             code: code.into(),
             detail: detail.into(),
         }
+    }
+
+    pub fn is_warning(&self) -> bool {
+        self.severity == "warning"
+    }
+}
+
+/// Availability of the configured Raft state authorities represented by a
+/// cluster health snapshot.
+///
+/// Individual members may be offline without degrading the control plane. The
+/// load-bearing threshold is the same configured voter quorum used by the KV
+/// implementation, not a fixed number of tolerated host failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClusterStateAuthorityHealth {
+    pub authority_count: usize,
+    pub online_authority_count: usize,
+    pub quorum_size: usize,
+}
+
+impl ClusterStateAuthorityHealth {
+    pub fn has_quorum(self) -> bool {
+        self.online_authority_count >= self.quorum_size
+    }
+}
+
+pub fn cluster_state_authority_health(
+    state: &ClusterBootstrapState,
+    health: &[ClusterHealthRow],
+) -> ClusterStateAuthorityHealth {
+    let online_nodes = health
+        .iter()
+        .filter(|row| row.availability == ClusterNodeAvailability::Online)
+        .map(|row| &row.member.node_id)
+        .collect::<BTreeSet<_>>();
+    let authority_count = state
+        .members
+        .iter()
+        .filter(|member| state.node_is_raft_voter(&member.node_id))
+        .count();
+    let online_authority_count = state
+        .members
+        .iter()
+        .filter(|member| {
+            state.node_is_raft_voter(&member.node_id) && online_nodes.contains(&member.node_id)
+        })
+        .count();
+    ClusterStateAuthorityHealth {
+        authority_count,
+        online_authority_count,
+        quorum_size: sinomo_kv::cluster_kv_raft_quorum_size_for_state(state),
     }
 }
 
@@ -447,6 +511,7 @@ fn cluster_health_rows_from_stored_statuses(
             member: member.clone(),
             status,
             availability,
+            live_probe_observed: false,
         });
     }
     rows.sort_by(|left, right| left.member.node_id.cmp(&right.member.node_id));
@@ -499,6 +564,7 @@ fn cluster_health_rows_with_probe_for_scope<P: ClusterStatusProbe + ?Sized>(
             member: member.clone(),
             status,
             availability,
+            live_probe_observed: live_online,
         });
     }
     if include_peer_views {
@@ -653,6 +719,7 @@ async fn cluster_health_rows_with_async_probe_for_scope_with_budget<
             member: member.clone(),
             status,
             availability,
+            live_probe_observed: live_online,
         });
     }
     if include_peer_views {
@@ -668,23 +735,44 @@ pub fn cluster_doctor_findings(
     health: &[ClusterHealthRow],
 ) -> Vec<ClusterDoctorFinding> {
     let mut findings = Vec::new();
+    let authority_health = cluster_state_authority_health(state, health);
+    let unavailable_nodes = health
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.availability,
+                ClusterNodeAvailability::Offline | ClusterNodeAvailability::Unknown
+            ) && !cluster_health_node_is_nonreportable_member(state, &row.member.node_id)
+        })
+        .map(|row| row.member.node_id.clone())
+        .collect::<BTreeSet<_>>();
     for row in health {
         if cluster_health_node_is_nonreportable_member(state, &row.member.node_id) {
             continue;
         }
         if row.availability == ClusterNodeAvailability::Offline {
-            findings.push(ClusterDoctorFinding::warning(
-                "node-offline",
-                format!(
-                    "{} is offline from {} using advertised endpoints",
-                    row.member.node_id, state.local_node_id
-                ),
-            ));
+            let detail = format!(
+                "{} is offline from {} using advertised endpoints",
+                row.member.node_id, state.local_node_id
+            );
+            findings.push(if authority_health.has_quorum() {
+                ClusterDoctorFinding::info(
+                    "node-offline",
+                    format!("{detail}; state authority quorum remains available"),
+                )
+            } else {
+                ClusterDoctorFinding::warning("node-offline", detail)
+            });
         } else if row.availability == ClusterNodeAvailability::Unknown {
-            findings.push(ClusterDoctorFinding::warning(
-                "node-unknown",
-                format!("{} has no recent reachable status", row.member.node_id),
-            ));
+            let detail = format!("{} has no recent reachable status", row.member.node_id);
+            findings.push(if authority_health.has_quorum() {
+                ClusterDoctorFinding::info(
+                    "node-unknown",
+                    format!("{detail}; state authority quorum remains available"),
+                )
+            } else {
+                ClusterDoctorFinding::warning("node-unknown", detail)
+            });
         }
     }
 
@@ -704,6 +792,16 @@ pub fn cluster_doctor_findings(
     for source in &authority_members {
         for target in &authority_members {
             if source.node_id == target.node_id {
+                continue;
+            }
+            // A retained member that is currently unavailable is expected to
+            // have no live route. Once the remaining state authorities still
+            // form quorum, the member observation above is sufficient and
+            // route/endpoint duplicates must not degrade the cluster.
+            if authority_health.has_quorum()
+                && (unavailable_nodes.contains(&source.node_id)
+                    || unavailable_nodes.contains(&target.node_id))
+            {
                 continue;
             }
             if cluster_route_next_hop(&connectivity_graph, &source.node_id, &target.node_id)
@@ -730,6 +828,12 @@ pub fn cluster_doctor_findings(
     for record in connectivity {
         if cluster_health_node_is_nonreportable_member(state, &record.source_node_id)
             || cluster_health_node_is_nonreportable_member(state, &record.target_node_id)
+        {
+            continue;
+        }
+        if authority_health.has_quorum()
+            && (unavailable_nodes.contains(&record.source_node_id)
+                || unavailable_nodes.contains(&record.target_node_id))
         {
             continue;
         }
@@ -889,9 +993,6 @@ fn cluster_health_member_availability(
     if cluster_health_member_unreachable_via_connectivity(state, member, connectivity) {
         return ClusterNodeAvailability::Offline;
     }
-    if stored.is_some_and(|status| status.availability == ClusterNodeAvailability::Online) {
-        return ClusterNodeAvailability::Online;
-    }
     ClusterNodeAvailability::Unknown
 }
 
@@ -994,6 +1095,7 @@ fn next_online_peer_to_query(
     rows.iter()
         .filter(|row| {
             row.availability == ClusterNodeAvailability::Online
+                && row.live_probe_observed
                 && !queried.contains(&row.member.node_id)
                 && row
                     .member
@@ -1069,13 +1171,19 @@ fn merge_online_peer_health_rows(
     let mut changed = false;
     let mut by_node = peer_rows
         .into_iter()
-        .filter(|row| row.availability == ClusterNodeAvailability::Online)
+        .filter(|row| {
+            row.availability == ClusterNodeAvailability::Online && row.live_probe_observed
+        })
         .map(|row| (row.member.node_id.clone(), row))
         .collect::<BTreeMap<_, _>>();
     for row in rows {
         let Some(peer_row) = by_node.remove(&row.member.node_id) else {
             continue;
         };
+        // Once both views already agree that the node is online, preserve the
+        // newest status details. For unavailable rows, the explicit live-probe
+        // provenance is stronger than timestamps from independently skewed
+        // host clocks.
         if row.availability == ClusterNodeAvailability::Online
             && peer_row.status.observed_at <= row.status.observed_at
         {
@@ -1084,6 +1192,7 @@ fn merge_online_peer_health_rows(
         row.status = peer_row.status;
         row.status.availability = ClusterNodeAvailability::Online;
         row.availability = ClusterNodeAvailability::Online;
+        row.live_probe_observed = true;
         changed = true;
     }
     changed
@@ -1196,7 +1305,31 @@ mod tests {
             member: member.clone(),
             status,
             availability: ClusterNodeAvailability::Online,
+            live_probe_observed: true,
         }
+    }
+
+    #[test]
+    fn cluster_health_row_defaults_missing_live_probe_provenance_to_false() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_health_legacy_row").expect("cluster");
+        let node_id = NodeId::from_legacy_named("node_health_legacy_row").expect("node");
+        let now = OffsetDateTime::now_utc();
+        let member = health_test_member(&cluster_id, &node_id, "node", now);
+        let row = health_test_row(
+            &member,
+            health_test_status(&cluster_id, &node_id, "legacy", now),
+        );
+        let mut encoded = serde_json::to_value(row).expect("encode health row");
+        encoded
+            .as_object_mut()
+            .expect("health row object")
+            .remove("live_probe_observed");
+
+        let decoded: ClusterHealthRow =
+            serde_json::from_value(encoded).expect("decode legacy health row");
+
+        assert!(!decoded.live_probe_observed);
     }
 
     #[test]
@@ -1234,6 +1367,53 @@ mod tests {
         )];
         assert!(!merge_online_peer_health_rows(&mut rows, older_peer_rows));
         assert_eq!(rows[0].status.commit.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn peer_health_merge_requires_live_probe_evidence_to_restore_online() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_health_restore_online").expect("cluster");
+        let node_id = NodeId::from_legacy_named("node_health_restore_online").expect("node");
+        let now = OffsetDateTime::now_utc();
+        let member = health_test_member(&cluster_id, &node_id, "node", now);
+
+        for availability in [
+            ClusterNodeAvailability::Offline,
+            ClusterNodeAvailability::Unknown,
+        ] {
+            let mut unavailable_status = health_test_status(&cluster_id, &node_id, "cached", now);
+            unavailable_status.availability = availability.clone();
+            let unavailable_row = ClusterHealthRow {
+                member: member.clone(),
+                status: unavailable_status,
+                availability: availability.clone(),
+                live_probe_observed: false,
+            };
+
+            let mut repeated_cached_online = health_test_row(
+                &member,
+                health_test_status(&cluster_id, &node_id, "cached", now),
+            );
+            repeated_cached_online.live_probe_observed = false;
+            let mut rows = vec![unavailable_row.clone()];
+            assert!(!merge_online_peer_health_rows(
+                &mut rows,
+                vec![repeated_cached_online]
+            ));
+            assert_eq!(rows[0].availability, availability);
+
+            for live_observed_at in [now, now - time::Duration::seconds(1)] {
+                let mut rows = vec![unavailable_row.clone()];
+                let live_online = vec![health_test_row(
+                    &member,
+                    health_test_status(&cluster_id, &node_id, "live", live_observed_at),
+                )];
+                assert!(merge_online_peer_health_rows(&mut rows, live_online));
+                assert_eq!(rows[0].availability, ClusterNodeAvailability::Online);
+                assert!(rows[0].live_probe_observed);
+                assert_eq!(rows[0].status.commit.as_deref(), Some("live"));
+            }
+        }
     }
 
     struct StaticPeerHealthProbe {
@@ -1341,6 +1521,7 @@ mod tests {
                 member: deep.clone(),
                 status: deep_unknown,
                 availability: ClusterNodeAvailability::Unknown,
+                live_probe_observed: false,
             },
         ];
         let deep_row = health_test_row(
@@ -1521,6 +1702,7 @@ mod tests {
                     status
                 },
                 availability: ClusterNodeAvailability::Unknown,
+                live_probe_observed: false,
             },
         ];
         let probe = StaticPeerHealthProbe {
@@ -1678,6 +1860,7 @@ mod tests {
                 member: member.clone(),
                 status,
                 availability: ClusterNodeAvailability::Unknown,
+                live_probe_observed: false,
             }
         };
         let mut rows = vec![

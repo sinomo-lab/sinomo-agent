@@ -154,6 +154,10 @@ ephemeral-local are reserved modes tracked in the
 to an object or subtree, so sensitive local files and shared artifacts can use
 the same namespace without using the same placement rules.
 
+Every clustered main daemon runs the default SIFS bootstrap, placement
+reconciliation, metadata replication, and repair lifecycle. These are mandatory
+runtime responsibilities, not deployment or environment-controlled features.
+
 The cluster KV stores compact filesystem configuration and shard placement. DFS
 metadata shards own paths, versions, intents, receipts, and namespace
 transactions. Content stores own immutable bytes and manifests. Normal

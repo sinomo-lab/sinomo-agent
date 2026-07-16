@@ -19,7 +19,6 @@ x-node-defaults: &node-defaults
   environment:
     SINOMO_DATA_DIR: /data
     SINOMO_DISABLE_IROH: "1"
-    SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
     SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-4}"
   volumes:
     - ../target/debug/sinomo:/usr/local/bin/sinomo:ro
@@ -33,7 +32,6 @@ services:
     environment:
       SINOMO_DATA_DIR: /data
       SINOMO_DISABLE_IROH: "1"
-      SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
       SINOMO_DAEMON_ADVERTISE_HOST: target
       SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-4}"
     volumes:
@@ -47,7 +45,6 @@ services:
     environment:
       SINOMO_DATA_DIR: /data
       SINOMO_DISABLE_IROH: "1"
-      SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
       SINOMO_DAEMON_ADVERTISE_HOST: source
       SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-4}"
     volumes:

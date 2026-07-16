@@ -349,6 +349,7 @@ fn rows_from_state(
                 member: member.clone(),
                 status,
                 availability,
+                live_probe_observed: false,
             }
         })
         .collect()
@@ -727,6 +728,7 @@ mod tests {
             },
             member,
             availability,
+            live_probe_observed: false,
         }
     }
 

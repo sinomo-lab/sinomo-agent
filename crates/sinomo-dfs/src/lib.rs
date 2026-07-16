@@ -174,8 +174,9 @@ pub use distributed::{
 };
 pub use error::DfsError;
 pub(crate) use error::{
-    distributed_write_rejection_current_primary, namespace_rejection_current_primary,
-    routed_write_rejection_error,
+    dfs_rejection_is_commit_content_repair_pending, dfs_rejection_is_replica_not_desired,
+    dfs_replica_not_desired_reason, distributed_write_rejection_current_primary,
+    namespace_rejection_current_primary, routed_write_rejection_error,
 };
 pub use identity::{
     DEFAULT_DFS_NODE_ID, SIFS_FILE_SYSTEM_ID, fallback_dfs_node_id, sifs_file_system_id,

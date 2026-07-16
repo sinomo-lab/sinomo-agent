@@ -2108,6 +2108,13 @@ impl ClusterSignedObjectRpcObservation {
 }
 
 pub trait ClusterSignedObjectRpcAsyncHost: Send {
+    /// Whether this host can open canonical object-RPC session streams.
+    /// Production transports use sessions; `false` is a temporary compatibility
+    /// seam for legacy host implementations while that old contract is retired.
+    fn supports_object_rpc_sessions(&self) -> bool {
+        true
+    }
+
     fn sign_object_rpc_request_async<'a>(
         &'a mut self,
         request: &'a ObjectRpcRequest,
@@ -2486,8 +2493,6 @@ where
             data_dir,
             expected_public_key,
         )
-        .await?
-        .restore_large_buffered_response_body()
         .await
     }
 
@@ -2534,8 +2539,6 @@ where
             data_dir.clone(),
             expected_public_key,
         )
-        .await?
-        .restore_large_buffered_response_body()
         .await
     }
 
@@ -2666,6 +2669,19 @@ where
         request: &ObjectRpcRequest,
         options: ClusterObjectRpcOptions,
     ) -> Result<ObjectRpcResponse, NetworkError> {
+        if self.host.supports_object_rpc_sessions() {
+            let call = crate::ObjectRpcUnarySessionAdapter::encode_request(request.clone())?;
+            let result = self
+                .call_target_session(state, target_node_id, call, options)
+                .await?;
+            return Ok(crate::ObjectRpcUnarySessionAdapter::decode_response(
+                result,
+                crate::rpc::OBJECT_RPC_UNARY_COMPATIBILITY_MAX_BODY_BYTES,
+            )
+            .await?
+            .response);
+        }
+
         let Some(context) = self.route_context else {
             return Err(NetworkError::Io {
                 operation: "cluster target rpc".to_string(),
@@ -2761,8 +2777,6 @@ where
             deadline,
             timeout_error,
         )
-        .await?
-        .restore_large_buffered_response_body()
         .await
     }
 
@@ -5885,6 +5899,10 @@ mod tests {
     }
 
     impl ClusterSignedObjectRpcAsyncHost for RecordingSignedHost {
+        fn supports_object_rpc_sessions(&self) -> bool {
+            self.session_server_data_dir.is_some()
+        }
+
         fn sign_object_rpc_request_async<'a>(
             &'a mut self,
             request: &'a ObjectRpcRequest,
@@ -5895,12 +5913,16 @@ mod tests {
             let next = self.signed_routes.len() + 1;
             self.signed_routes.push(request.route.clone());
             self.signed_requests.push(request.clone());
-            let auth = format!("test-auth-{next}").into_bytes();
+            let request = request.clone();
+            let signing_data_dir = self.session_server_data_dir.clone();
             Box::pin(async move {
                 if let Some(stall) = stall {
                     tokio::time::sleep(stall).await;
                 }
-                Ok(auth)
+                if let Some(data_dir) = signing_data_dir {
+                    return crate::sign_daemon_rpc_request_from_data_dir(&data_dir, &request);
+                }
+                Ok(format!("test-auth-{next}").into_bytes())
             })
         }
 
@@ -5934,6 +5956,7 @@ mod tests {
                     )
                     .await
                     .expect("accept test loopback session");
+                    let adapt_response = response_body.is_some();
                     let response = match response_body {
                         Some(body) => ObjectRpcResponse::from_encoded_body(
                             request.request.route.clone(),
@@ -5945,8 +5968,16 @@ mod tests {
                         )
                         .expect("encode test loopback response"),
                     };
+                    let response = if adapt_response {
+                        crate::ObjectRpcUnarySessionAdapter::encode_response(
+                            crate::ObjectRpcSessionResponse::buffered(response),
+                        )
+                        .expect("adapt test loopback response")
+                    } else {
+                        crate::ObjectRpcSessionResponse::buffered(response)
+                    };
                     responder
-                        .respond(crate::ObjectRpcSessionResponse::buffered(response))
+                        .respond(response)
                         .await
                         .expect("respond to test loopback session");
                 });
@@ -6273,6 +6304,9 @@ mod tests {
             .await
             .expect("large loopback response");
 
+        let result = crate::ObjectRpcUnarySessionAdapter::decode_response(result, expected.len())
+            .await
+            .expect("adapt large loopback response");
         assert_eq!(result.response.body, expected);
         assert!(result.body.is_empty());
     }

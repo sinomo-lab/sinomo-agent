@@ -83,9 +83,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         object: &DfsObjectMetadata,
     ) -> Result<u64, DfsError> {
+        Ok(self
+            .certified_local_metadata_owner_shard_for_object(object)?
+            .map_or(0, |shard| shard.epoch))
+    }
+
+    /// Return the exact shard assignment certified by the authority barrier,
+    /// not merely the epoch from an earlier object-to-shard selection.
+    pub(crate) fn certified_local_metadata_owner_shard_for_object(
+        &mut self,
+        object: &DfsObjectMetadata,
+    ) -> Result<Option<DfsMetadataShardConfig>, DfsError> {
         let Some(mut shard) = self.select_metadata_shard_for_object(object)? else {
             if self.control_plane.is_none() {
-                return Ok(0);
+                return Ok(None);
             }
             return Err(missing_metadata_shard_assignment(object));
         };
@@ -125,7 +136,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 epoch: refreshed.epoch,
             });
         }
-        Ok(shard.epoch)
+        Ok(Some(shard))
     }
 
     /// Capture the locally committed shard epoch for a new intent without a
@@ -897,9 +908,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if !intent.desired_replica_node_ids.contains(&self.node_id) {
                     return Err(DfsError::UnauthorizedReplicaCommand {
                         source_node_id: requester_node_id.clone(),
-                        reason: format!(
-                            "local node is not a desired replica for DFS write intent {intent_id}"
-                        ),
+                        reason: dfs_replica_not_desired_reason(intent_id),
                     });
                 }
                 return Ok(());

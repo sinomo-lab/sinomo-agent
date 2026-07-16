@@ -50,6 +50,16 @@ pub fn prepare_background_command(command: &mut Command) {
     }
 }
 
+/// Suppresses a transient Windows console for captured, non-interactive
+/// subprocesses.
+#[cfg(windows)]
+pub(crate) fn prepare_noninteractive_command(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
 pub(crate) fn build_daemon_async_runtime(
     label: &str,
 ) -> Result<tokio::runtime::Runtime, DaemonError> {

@@ -504,6 +504,7 @@ fn cli_probe_member_status_via_shadow_endpoint(
     rows.into_iter().find_map(|row| {
         let expected_process = cluster_member_expected_daemon_process(member);
         if row.availability == ClusterNodeAvailability::Online
+            && row.live_probe_observed
             && row.status.node_id == member.node_id
             && expected_process
                 .map(|process| row.status.process == process)
@@ -5436,7 +5437,10 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
 }
 
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
-const DAEMON_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(60);
+// Candidate startup includes mandatory DFS recovery and native-module loading.
+// Cold, resource-constrained nodes can legitimately need more than one minute;
+// keep the controller and shadow supervisor on the same generous deadline.
+const DAEMON_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(180);
 const DAEMON_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const DAEMON_CLUSTER_KV_TXN_TIMEOUT: Duration = Duration::from_secs(8);
 const IROH_DAEMON_JOIN_TIMEOUT: Duration = Duration::from_secs(5);

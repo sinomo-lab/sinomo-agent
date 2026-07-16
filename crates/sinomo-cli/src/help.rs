@@ -295,7 +295,7 @@ pub(super) fn print_rollout_help() {
         "      Build the data-directory source repo, stage main and shadow binaries, then verify main health."
     );
     println!(
-        "  sinomo rollout cluster [--repo <path> | --binary <path>] [--target <host:port>] [--remote-build] [--force-source] [--remote-repo <path>] [--skip-local] [--skip-native-modules]"
+        "  sinomo rollout cluster [--repo <path> | --binary <path>] [--target <host:port|iroh-url|node-id>] [--remote-build] [--force-source] [--remote-repo <path>] [--skip-local] [--skip-native-modules]"
     );
     println!(
         "      Resolve one cached or cluster-built binary/module set per target OS and architecture, distribute it to compatible nodes, then activate through shadow supervision or the main-only bootstrap path."
@@ -313,7 +313,7 @@ pub(super) fn print_rollout_help() {
         "      --skip-native-modules pushes only the locally built binary for supervisor ABI bootstrapping; it cannot be combined with --remote-build or --remote-repo."
     );
     println!(
-        "  sinomo rollout module native-dylib <module-id|package|source|cache-key> [--repo <path>] [--target <host:port>] [--skip-local]"
+        "  sinomo rollout module native-dylib <module-id|package|source|cache-key> [--repo <path>] [--target <host:port|iroh-url|node-id>] [--skip-local]"
     );
     println!(
         "      Resolve one cluster-built native-dylib artifact per target OS and architecture, install it on compatible targets, and refresh the daemon through shadow supervision."

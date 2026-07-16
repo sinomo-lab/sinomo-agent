@@ -1,4 +1,6 @@
 use crate::cluster::{CLUSTER_HEALTH_PROBE_TIMEOUT, start_shadow_daemon_status_publisher};
+#[cfg(windows)]
+use crate::prepare_noninteractive_command;
 #[cfg(not(unix))]
 use crate::spawn_shadow_rollout_completion_helper_process;
 use crate::{
@@ -1697,7 +1699,9 @@ fn terminate_process_for_rollout_stop(
     mode: RolloutTerminationMode,
 ) -> Result<(), DaemonError> {
     let args = windows_taskkill_args_for_rollout_stop(pid, mode);
-    let output = Command::new("taskkill")
+    let mut command = Command::new("taskkill");
+    prepare_noninteractive_command(&mut command);
+    let output = command
         .args(args.iter().map(String::as_str))
         .output()
         .map_err(|source| DaemonError::Io {
@@ -3279,6 +3283,10 @@ pub fn handle_daemon_clear_rollout_status(paths: &DaemonPaths) -> Result<String,
 /// hard failure that blocks the whole node.
 const SHADOW_RECOVERY_DEADLINE: Duration = Duration::from_secs(60);
 
+fn shadow_rollout_health_attempt_timeout(now: Instant, overall_deadline: Instant) -> Duration {
+    overall_deadline.saturating_duration_since(now)
+}
+
 /// Brings a shadow supervisor back up using `shadow_binary`, retrying with backoff
 /// until it reports healthy or `deadline` elapses. Used to guarantee a supervisor
 /// is running after a failed rollout handoff. Each attempt re-checks health first,
@@ -3304,6 +3312,11 @@ fn ensure_shadow_supervisor_running(
         ) {
             return Ok(());
         }
+        // Registration happens before the shadow publishes its control status.
+        // Let one live child use the remaining recovery budget; if it exits,
+        // `wait_for_shadow_rollout_health` returns early and the loop respawns it.
+        let attempt_timeout =
+            shadow_rollout_health_attempt_timeout(Instant::now(), overall_deadline);
         let attempt = spawn_shadow_for_cluster_rollout(
             shadow_binary,
             main_binary,
@@ -3318,7 +3331,7 @@ fn ensure_shadow_supervisor_running(
                 data_dir,
                 shadow_host,
                 shadow_port,
-                Duration::from_secs(5),
+                attempt_timeout,
                 child,
                 diagnostics,
             )
@@ -4297,6 +4310,19 @@ mod tests {
     fn pending_shadow_rollout_uses_fast_main_health_probe() {
         assert!(shadow_main_probe_interval(true) < Duration::from_secs(1));
         assert!(shadow_main_probe_interval(false) >= Duration::from_secs(10));
+    }
+
+    #[test]
+    fn shadow_rollout_health_attempt_allows_slow_cluster_registration() {
+        let now = Instant::now();
+        assert_eq!(
+            shadow_rollout_health_attempt_timeout(now, now + SHADOW_RECOVERY_DEADLINE),
+            SHADOW_RECOVERY_DEADLINE
+        );
+        assert_eq!(
+            shadow_rollout_health_attempt_timeout(now, now),
+            Duration::ZERO
+        );
     }
 
     #[test]

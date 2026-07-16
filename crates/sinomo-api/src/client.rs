@@ -1,12 +1,14 @@
 //! Typed client for the running daemon's control API.
 
+#[cfg(test)]
+use crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE;
 use crate::{
-    DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
-    DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
-    DAEMON_STATUS_ROUTE, DaemonApiError, DaemonLocalConnectivityReloadRequest,
-    DaemonLocalConnectivityReloadResponse, DaemonObjectRpcForwardDeliveryState,
-    DaemonObjectRpcForwardRequest, DaemonObjectRpcForwardResponse, DaemonPaths, DaemonProbeStatus,
-    DaemonStatus, probe_daemon_status,
+    DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE, DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
+    DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE, DaemonApiError,
+    DaemonLocalConnectivityReloadRequest, DaemonLocalConnectivityReloadResponse,
+    DaemonObjectRpcForwardDeliveryState, DaemonObjectRpcForwardRequest,
+    DaemonObjectRpcForwardResponse, DaemonPaths, DaemonProbeStatus, DaemonStatus,
+    probe_daemon_status,
 };
 use sinomo_config::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_RPC_CATEGORY, CONFIG_SET_ROUTE,
@@ -25,6 +27,7 @@ use sinomo_core::cluster::{
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
     ObjectRpcRequest, ObjectRpcResponse, ObjectRpcSessionCall, ObjectRpcSessionResult,
+    ObjectRpcUnarySessionAdapter,
 };
 use sinomo_core::node::NodeId;
 use std::time::Duration;
@@ -36,6 +39,9 @@ pub const DAEMON_API_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 /// cluster-control handler is running, so they need no wider idle exception.
 pub const DAEMON_API_CLUSTER_CONTROL_TIMEOUT: Duration =
     sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+/// Maximum value materialized by the daemon API's legacy unary compatibility
+/// surface. Canonical session bodies remain aggregate-unbounded.
+const DAEMON_API_UNARY_COMPATIBILITY_MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
 /// Typed daemon API client: daemon discovery plus signed object RPC.
 #[derive(Clone, Debug)]
@@ -192,26 +198,66 @@ impl DaemonApiClient {
         overall_timeout: Option<Duration>,
         observe_connectivity: bool,
     ) -> Result<ObjectRpcResponse, DaemonApiError> {
-        let effective_overall_timeout =
-            sinomo_core::network::cluster_object_rpc_effective_route_timeout(
-                request,
-                overall_timeout,
-            );
-        let request = object_rpc_forward_request(
-            DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+        let call = ObjectRpcUnarySessionAdapter::encode_request(request.clone())?;
+        block_on_daemon_client(async {
+            let result = self
+                .object_rpc_session_to_target_with_deadline_async(
+                    target_node_id,
+                    call,
+                    connect_timeout,
+                    overall_timeout,
+                    observe_connectivity,
+                )
+                .await?;
+            decode_unary_object_rpc_session_response(result).await
+        })
+    }
+
+    /// Sends one canonical object-RPC session through the running local daemon
+    /// without adding an operation-wide semantic deadline.
+    pub async fn object_rpc_session_to_target_async(
+        &self,
+        target_node_id: &NodeId,
+        call: ObjectRpcSessionCall,
+        connect_timeout: Duration,
+        observe_connectivity: bool,
+    ) -> Result<ObjectRpcSessionResult, DaemonApiError> {
+        self.object_rpc_session_to_target_with_deadline_async(
             target_node_id,
-            request,
+            call,
             connect_timeout,
-            effective_overall_timeout,
+            None,
             observe_connectivity,
-        )?;
-        let response = send_daemon_rpc_with_timeouts(
+        )
+        .await
+    }
+
+    /// Sends one canonical object-RPC session through the running local daemon.
+    /// The request and response bodies remain streams; callers that expose a
+    /// unary `Vec<u8>` API must opt into [`ObjectRpcUnarySessionAdapter`].
+    pub async fn object_rpc_session_to_target_with_deadline_async(
+        &self,
+        target_node_id: &NodeId,
+        call: ObjectRpcSessionCall,
+        connect_timeout: Duration,
+        overall_timeout: Option<Duration>,
+        observe_connectivity: bool,
+    ) -> Result<ObjectRpcSessionResult, DaemonApiError> {
+        let data_dir = SinomoDataDir::from_env_or_home()?;
+        let runtime = tokio::runtime::Handle::current();
+        send_daemon_object_rpc_session_async(
+            data_dir,
             &self.address,
-            &request,
-            self.object_rpc_forward_control_timeouts(effective_overall_timeout),
-        )?;
-        response.error_detail()?;
-        decode_daemon_object_rpc_forward_response(&response)
+            target_node_id,
+            call,
+            connect_timeout,
+            overall_timeout,
+            observe_connectivity,
+            self.object_rpc_forward_control_timeouts(overall_timeout),
+            None,
+            &runtime,
+        )
+        .await
     }
 
     /// Sends a DFS object-RPC from inside the running local daemon.
@@ -246,25 +292,21 @@ impl DaemonApiClient {
         let request = request.clone();
         block_on_daemon_client(async move {
             let runtime = tokio::runtime::Handle::current();
-            let result = send_daemon_dfs_object_rpc_session_async(
+            let call = ObjectRpcUnarySessionAdapter::encode_request(request)?;
+            let result = send_daemon_object_rpc_session_async(
                 data_dir,
                 &address,
                 &target_node_id,
-                ObjectRpcSessionCall::buffered(request),
-                options,
+                call,
+                options.connect_timeout,
+                options.overall_timeout,
+                options.observe_connectivity,
                 outer_timeouts,
                 None,
                 &runtime,
             )
             .await?;
-            let (mut response, body) = result.into_parts();
-            if !body.is_empty() {
-                response.body = body
-                    .collect_to_vec(sinomo_core::network::OBJECT_RPC_UNARY_ADAPTER_MAX_BODY_BYTES)
-                    .await?;
-            }
-            response.error_detail()?;
-            Ok(response)
+            decode_unary_object_rpc_session_response(result).await
         })
     }
 
@@ -454,6 +496,7 @@ fn object_rpc_forward_request(
     ObjectRpcRequest::encode_body(route, DAEMON_RPC_CATEGORY, &payload).map_err(Into::into)
 }
 
+#[cfg(test)]
 fn decode_daemon_object_rpc_forward_response(
     response: &ObjectRpcResponse,
 ) -> Result<ObjectRpcResponse, DaemonApiError> {
@@ -497,9 +540,21 @@ fn daemon_object_rpc_forward_error(
     }
 }
 
-fn decode_daemon_object_rpc_forward_session_response(
-    result: ObjectRpcSessionResult,
+async fn decode_daemon_object_rpc_forward_session_response(
+    mut result: ObjectRpcSessionResult,
 ) -> Result<ObjectRpcSessionResult, DaemonApiError> {
+    // The forward envelope is itself a unary control value. When the inner
+    // response has no semantic body (notably permission and service errors),
+    // the daemon's unary compatibility layer moves that envelope into the
+    // session lane. Materialize only that explicitly marked envelope; preserve
+    // an unmarked inner response stream end to end.
+    if ObjectRpcUnarySessionAdapter::response_is_encoded(&result)? {
+        result = ObjectRpcUnarySessionAdapter::decode_response(
+            result,
+            DAEMON_API_UNARY_COMPATIBILITY_MAX_BODY_BYTES,
+        )
+        .await?;
+    }
     result.response.error_detail()?;
     match result
         .response
@@ -513,9 +568,21 @@ fn decode_daemon_object_rpc_forward_session_response(
             delivery_state,
         }) => Err(daemon_object_rpc_forward_error(detail, delivery_state)),
         Err(source) => Err(DaemonApiError::Parse {
-            detail: format!("invalid daemon DFS session-forward response: {source}"),
+            detail: format!("invalid daemon object RPC session-forward response: {source}"),
         }),
     }
+}
+
+async fn decode_unary_object_rpc_session_response(
+    result: ObjectRpcSessionResult,
+) -> Result<ObjectRpcResponse, DaemonApiError> {
+    let result = ObjectRpcUnarySessionAdapter::decode_response(
+        result,
+        DAEMON_API_UNARY_COMPATIBILITY_MAX_BODY_BYTES,
+    )
+    .await?;
+    result.response.error_detail()?;
+    Ok(result.response)
 }
 
 async fn call_loopback_daemon_session_async(
@@ -528,7 +595,7 @@ async fn call_loopback_daemon_session_async(
     if !sinomo_core::network::is_loopback_connect_address(address) {
         return Err(DaemonApiError::Network {
             address: address.to_string(),
-            detail: "daemon-mediated DFS transport requires the local daemon loopback address"
+            detail: "daemon-mediated object RPC requires the local daemon loopback address"
                 .to_string(),
         });
     }
@@ -549,12 +616,14 @@ async fn call_loopback_daemon_session_async(
         .map_err(Into::into)
 }
 
-async fn send_daemon_dfs_object_rpc_session_async(
+async fn send_daemon_object_rpc_session_async(
     data_dir: SinomoDataDir,
     address: &str,
     target_node_id: &NodeId,
     call: ObjectRpcSessionCall,
-    options: sinomo_dfs::DfsObjectRpcSendOptions,
+    connect_timeout: Duration,
+    overall_timeout: Option<Duration>,
+    observe_connectivity: bool,
     outer_timeouts: sinomo_core::network::DaemonRpcTimeouts,
     known_local_node_id: Option<&NodeId>,
     runtime: &tokio::runtime::Handle,
@@ -562,7 +631,7 @@ async fn send_daemon_dfs_object_rpc_session_async(
     let effective_overall_timeout =
         sinomo_core::network::cluster_object_rpc_effective_route_timeout(
             &call.request,
-            options.overall_timeout,
+            overall_timeout,
         );
     let target_is_local = match known_local_node_id {
         Some(local_node_id) => target_node_id == local_node_id,
@@ -581,12 +650,12 @@ async fn send_daemon_dfs_object_rpc_session_async(
             .await;
     }
     let forward_request = object_rpc_forward_request(
-        DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
+        DAEMON_OBJECT_RPC_FORWARD_ROUTE,
         target_node_id,
         &call.request,
-        options.connect_timeout,
+        connect_timeout,
         effective_overall_timeout,
-        options.observe_connectivity,
+        observe_connectivity,
     )?;
     let outer = ObjectRpcSessionCall::new(forward_request, call.body);
     let result = call_loopback_daemon_session_async(
@@ -597,7 +666,7 @@ async fn send_daemon_dfs_object_rpc_session_async(
         runtime,
     )
     .await?;
-    decode_daemon_object_rpc_forward_session_response(result)
+    decode_daemon_object_rpc_forward_session_response(result).await
 }
 
 /// DFS peer transport that deliberately terminates at the running local
@@ -652,12 +721,14 @@ impl DaemonDfsPeerTransport {
         options: sinomo_dfs::DfsObjectRpcSendOptions,
         runtime: &tokio::runtime::Handle,
     ) -> Result<ObjectRpcSessionResult, DaemonApiError> {
-        send_daemon_dfs_object_rpc_session_async(
+        send_daemon_object_rpc_session_async(
             self.data_dir.clone(),
             &self.address,
             target_node_id,
             call,
-            options,
+            options.connect_timeout,
+            options.overall_timeout,
+            options.observe_connectivity,
             sinomo_core::network::DaemonRpcTimeouts::default(),
             Some(&self.local_node_id),
             runtime,
@@ -693,20 +764,14 @@ impl sinomo_dfs::DfsPeerTransport for DaemonDfsPeerTransport {
         request: &ObjectRpcRequest,
         options: sinomo_dfs::DfsObjectRpcSendOptions,
     ) -> Result<ObjectRpcResponse, sinomo_dfs::DfsPeerTransportError> {
-        let call = ObjectRpcSessionCall::buffered(request.clone());
+        let call = ObjectRpcUnarySessionAdapter::encode_request(request.clone())
+            .map_err(|source| sinomo_dfs::DfsPeerTransportError::new(source.to_string()))?;
         let runtime = self.runtime.handle().clone();
         block_on_daemon_client_on_owner_runtime(&runtime, async {
             let result = self
                 .call_session_inner(target_node_id, call, options, &runtime)
                 .await?;
-            let (mut response, body) = result.into_parts();
-            if !body.is_empty() {
-                response.body = body
-                    .collect_to_vec(sinomo_core::network::OBJECT_RPC_UNARY_ADAPTER_MAX_BODY_BYTES)
-                    .await?;
-            }
-            response.error_detail()?;
-            Ok(response)
+            decode_unary_object_rpc_session_response(result).await
         })
         .map_err(|source| sinomo_dfs::DfsPeerTransportError::new(source.to_string()))
     }
@@ -743,26 +808,15 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsPeerTransport {
         Box::pin(async move {
             let runtime = tokio::runtime::Handle::try_current()
                 .map_err(|source| sinomo_dfs::DfsPeerTransportError::new(source.to_string()))?;
+            let call = ObjectRpcUnarySessionAdapter::encode_request(request.clone())
+                .map_err(|source| sinomo_dfs::DfsPeerTransportError::new(source.to_string()))?;
             let result = self
-                .call_session_inner(
-                    target_node_id,
-                    ObjectRpcSessionCall::buffered(request.clone()),
-                    options,
-                    &runtime,
-                )
+                .call_session_inner(target_node_id, call, options, &runtime)
                 .await
                 .map_err(|source| sinomo_dfs::DfsPeerTransportError::new(source.to_string()))?;
-            let (mut response, body) = result.into_parts();
-            if !body.is_empty() {
-                response.body = body
-                    .collect_to_vec(sinomo_core::network::OBJECT_RPC_UNARY_ADAPTER_MAX_BODY_BYTES)
-                    .await
-                    .map_err(|source| sinomo_dfs::DfsPeerTransportError::new(source.to_string()))?;
-            }
-            response
-                .error_detail()
-                .map_err(|source| sinomo_dfs::DfsPeerTransportError::new(source.to_string()))?;
-            Ok(response)
+            decode_unary_object_rpc_session_response(result)
+                .await
+                .map_err(|source| sinomo_dfs::DfsPeerTransportError::new(source.to_string()))
         })
     }
 
@@ -908,20 +962,20 @@ async fn send_daemon_rpc_loopback_session_async(
     };
     let mut request = request.clone();
     request.auth = None;
-    let mut result = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host)
+    let call = ObjectRpcUnarySessionAdapter::encode_request(request)?;
+    let result = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host)
         .call_loopback_session(
             &data_dir,
             address,
-            sinomo_core::network::ObjectRpcSessionCall::buffered(request),
+            call,
             sinomo_core::network::ClusterObjectRpcOptions::new(timeouts),
         )
         .await?;
-    if !result.body.is_empty() {
-        result.response.body = result
-            .body
-            .collect_to_vec(sinomo_core::network::OBJECT_RPC_UNARY_ADAPTER_MAX_BODY_BYTES)
-            .await?;
-    }
+    let result = ObjectRpcUnarySessionAdapter::decode_response(
+        result,
+        DAEMON_API_UNARY_COMPATIBILITY_MAX_BODY_BYTES,
+    )
+    .await?;
     Ok(result.response)
 }
 
@@ -1082,7 +1136,7 @@ pub async fn send_daemon_rpc_stream_from_data_dir_async(
     };
     let mut request = request.clone();
     request.auth = None;
-    let call = sinomo_core::network::ObjectRpcSessionCall::buffered(request);
+    let call = ObjectRpcUnarySessionAdapter::encode_request(request)?;
     let options = sinomo_core::network::ClusterObjectRpcOptions::new(timeouts);
     let result = if sinomo_core::network::is_loopback_connect_address(address) {
         let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
@@ -1417,12 +1471,14 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(12)).await;
             let response =
                 ObjectRpcResponse::from_encoded_body("/test/long-loopback-response", server_body);
+            let response = ObjectRpcUnarySessionAdapter::encode_response(
+                sinomo_core::network::ObjectRpcSessionResponse::buffered(response),
+            )
+            .expect("adapt buffered unary response");
             responder
-                .respond(sinomo_core::network::ObjectRpcSessionResponse::buffered(
-                    response,
-                ))
+                .respond(response)
                 .await
-                .expect("respond with spilled buffered body");
+                .expect("respond with adapted buffered body");
         });
         let request = ObjectRpcRequest::encode_body("/test/long-loopback-response", "test", &())
             .expect("request");
@@ -1514,6 +1570,35 @@ mod tests {
     }
 
     #[test]
+    fn generic_forward_moves_a_large_unary_value_out_of_the_control_head() {
+        let target_node_id =
+            NodeId::from_legacy_named("node_generic_forward_large_unary").expect("node id");
+        let request = ObjectRpcRequest::from_encoded_body(
+            "/cluster/raft/append",
+            "cluster.raft",
+            vec![0x5a; 344_208],
+        );
+        let call = ObjectRpcUnarySessionAdapter::encode_request(request)
+            .expect("adapt large unary request");
+        let outer = object_rpc_forward_request(
+            DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+            &target_node_id,
+            &call.request,
+            Duration::from_secs(5),
+            None,
+            false,
+        )
+        .expect("encode generic forward head");
+
+        assert_eq!(call.body.total_bytes(), Some(344_208));
+        assert!(call.request.body.is_empty());
+        assert!(
+            outer.body.len() < sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
+            "the generic forward control head must remain bounded independently of the unary value"
+        );
+    }
+
+    #[test]
     fn forward_response_envelope_preserves_trusted_delivery_state() {
         for (wire_state, network_state) in [
             (
@@ -1546,8 +1631,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn forward_session_response_preserves_trusted_delivery_state() {
+    #[tokio::test]
+    async fn forward_session_response_preserves_trusted_delivery_state() {
         let outer = ObjectRpcResponse::encode_body(
             DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
             &DaemonObjectRpcForwardResponse::NetworkError {
@@ -1556,9 +1641,20 @@ mod tests {
             },
         )
         .expect("outer response");
-        let error = decode_daemon_object_rpc_forward_session_response(
-            ObjectRpcSessionResult::buffered(outer),
+        let encoded = ObjectRpcUnarySessionAdapter::encode_response(
+            sinomo_core::network::ObjectRpcSessionResponse::buffered(outer),
         )
+        .expect("stream outer network-error envelope");
+        let body = encoded
+            .body
+            .collect_to_vec(DAEMON_API_UNARY_COMPATIBILITY_MAX_BODY_BYTES)
+            .await
+            .expect("collect encoded outer network-error envelope");
+        let error = decode_daemon_object_rpc_forward_session_response(ObjectRpcSessionResult::new(
+            encoded.response,
+            sinomo_core::network::ObjectRpcIncomingBody::bytes(body),
+        ))
+        .await
         .expect_err("forward session response must fail");
 
         assert!(matches!(
@@ -1568,6 +1664,41 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn forward_session_response_decodes_streamed_unary_outer_envelope() {
+        let inner = ObjectRpcResponse::encode_error(
+            "/remote-management/system/info",
+            "device authorization was denied",
+        )
+        .expect("inner error response");
+        let outer = ObjectRpcResponse::encode_body(
+            DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+            &DaemonObjectRpcForwardResponse::Success {
+                response: inner.clone(),
+            },
+        )
+        .expect("outer response");
+        let encoded = ObjectRpcUnarySessionAdapter::encode_response(
+            sinomo_core::network::ObjectRpcSessionResponse::buffered(outer),
+        )
+        .expect("stream outer unary envelope");
+        let body = encoded
+            .body
+            .collect_to_vec(DAEMON_API_UNARY_COMPATIBILITY_MAX_BODY_BYTES)
+            .await
+            .expect("collect encoded outer envelope");
+        let decoded =
+            decode_daemon_object_rpc_forward_session_response(ObjectRpcSessionResult::new(
+                encoded.response,
+                sinomo_core::network::ObjectRpcIncomingBody::bytes(body),
+            ))
+            .await
+            .expect("decode streamed outer envelope");
+
+        assert_eq!(decoded.response, inner);
+        assert!(decoded.body.is_empty());
     }
 
     #[test]
