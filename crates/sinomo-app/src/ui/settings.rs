@@ -24,19 +24,22 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::Value;
-use sinomo_agent::{AgentDefinition, AgentOutputFormat, AgentPackageDefinition, AgentRole};
+use sinomo_agent::{
+    AgentDefinition, AgentOutputFormat, AgentPackageDefinition, AgentRole, AgentToolSpec,
+    agent_home_sifs_path_for_id, default_agent_tool_descriptors,
+};
 use sinomo_cli::app_api::{
     AgentSummary, ProviderSummary, SkillDetail, SkillMutationResult, SkillSummary, agent_summaries,
 };
 use sui::{
     Alignment, ArrangeCtx, Constraints, ContextMenu, ControlSize, DefaultTheme, Event, EventCtx,
-    FieldGroup, Flex, FlexItem, FlexWrap, FontWeight, FormRow, FormSection, IconButton, IconGlyph,
-    Label, ListItem, ListView, MeasureCtx, MenuItem, NumberInput, PaintCtx, PasswordInput,
-    PointerEventKind, ProgressBar, Rect, ScrollState, ScrollView, Select, SelectionScope,
-    SemanticTone, SemanticsCtx, Separator, Size, SizedBox, Spinner, Stack, StatusBadge, Switch,
-    SwitchView, TabBar, TextArea, TextCommand, TextInput, ThemeTextToken, Tooltip,
-    TooltipPlacement, TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    WindowEvent,
+    FieldGroup, FixedPaneSplit, Flex, FlexItem, FlexWrap, FontWeight, FormRow, FormSection,
+    IconButton, IconGlyph, Label, ListItem, ListView, MeasureCtx, MenuItem, NumberInput, PaintCtx,
+    PasswordInput, PointerEventKind, ProgressBar, RebuildOnConstraints, Rect, ScrollState,
+    ScrollView, Select, SelectionScope, SemanticTone, SemanticsCtx, Separator, Size, SizedBox,
+    Spinner, Stack, StatusBadge, Switch, SwitchView, TabBar, TextArea, TextCommand, TextInput,
+    ThemeTextToken, Tooltip, TooltipPlacement, TrailingSlotRow, Widget, WidgetPod,
+    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
 };
 
 use sinomo_runtime::config::{
@@ -79,6 +82,9 @@ const SIDEBAR_W: f32 = 256.0;
 const SIDEBAR_ITEM_H: f32 = 40.0;
 const MENU_ROW_H: f32 = 58.0;
 const CONTENT_PAD: f32 = 22.0;
+const AGENT_MENU_W: f32 = 292.0;
+const AGENT_LIST_ROW_H: f32 = 66.0;
+const AGENT_SPLIT_THRESHOLD: f32 = 820.0;
 
 /// A shared closure that resolves the current widget theme — threaded into every control so the
 /// Appearance toggle restyles the whole tab live, with no rebuild.
@@ -178,6 +184,7 @@ pub struct SettingsState {
     pub agent_snapshot: AgentConfigSnapshot,
     pub agent_selected_id: Option<String>,
     pub agent_form: AgentForm,
+    agent_detail_open: bool,
     pub agent_action_error: Option<String>,
     pub agent_action_status: Option<String>,
     pub agent_delete_confirming: Option<String>,
@@ -586,7 +593,9 @@ pub struct AgentForm {
     max_steps: String,
     max_tool_calls_per_step: String,
     max_model_repair_attempts: String,
+    home_server_node_id: String,
     sandbox_node_id: String,
+    tool_add_index: usize,
     output_format_index: usize,
 }
 
@@ -745,11 +754,17 @@ impl AgentForm {
                 .max_model_repair_attempts
                 .map(|value| value.to_string())
                 .unwrap_or_default(),
+            home_server_node_id: definition
+                .placement
+                .home_server_node_id
+                .clone()
+                .unwrap_or_default(),
             sandbox_node_id: definition
                 .tool_runtime
                 .sandbox_node_id
                 .clone()
                 .unwrap_or_default(),
+            tool_add_index: 0,
             output_format_index,
             definition,
         }
@@ -780,6 +795,8 @@ impl AgentForm {
             parse_optional_usize("max tool calls per step", &self.max_tool_calls_per_step)?;
         definition.runtime_limits.max_model_repair_attempts =
             parse_optional_usize("max model repair attempts", &self.max_model_repair_attempts)?;
+        definition.placement.home_server_node_id =
+            optional_trimmed_string(&self.home_server_node_id);
         definition.tool_runtime.sandbox_node_id = optional_trimmed_string(&self.sandbox_node_id);
         definition.output_format = output_format_for_index(self.output_format_index);
         definition.validate().map_err(|error| error.to_string())?;
@@ -907,6 +924,7 @@ impl SettingsState {
             agent_snapshot,
             agent_selected_id,
             agent_form,
+            agent_detail_open: false,
             agent_action_error: None,
             agent_action_status: None,
             agent_delete_confirming: None,
@@ -1008,6 +1026,7 @@ impl SettingsState {
             agent_snapshot: AgentConfigSnapshot::default(),
             agent_selected_id: None,
             agent_form: AgentForm::new_custom("custom-agent".to_string()),
+            agent_detail_open: false,
             agent_action_error: None,
             agent_action_status: None,
             agent_delete_confirming: None,
@@ -1598,13 +1617,18 @@ impl SettingsState {
                     self.agent_action_error = None;
                     self.agent_action_status = match success.effect {
                         AgentOperationEffect::Refreshed => None,
-                        AgentOperationEffect::Saved(id) => Some(format!("Saved custom agent {id}")),
+                        AgentOperationEffect::Saved(id) => {
+                            self.agent_detail_open = true;
+                            Some(format!("Saved custom agent {id}"))
+                        }
                         AgentOperationEffect::Deleted(id) => {
+                            self.agent_detail_open = false;
                             self.agent_delete_confirming = None;
                             self.agent_validation_report = None;
                             Some(format!("Deleted custom agent {id}"))
                         }
                         AgentOperationEffect::Imported(id) => {
+                            self.agent_detail_open = true;
                             self.agent_import_path.clear();
                             self.agent_validation_report = None;
                             Some(format!("Imported agent package {id}"))
@@ -1838,7 +1862,16 @@ impl SettingsState {
 
     fn prepare_agent_selection(&mut self, index: usize) -> Option<String> {
         let id = self.agent_snapshot.agents.get(index)?.id.clone();
+        if self
+            .agent_snapshot
+            .selected_agent
+            .as_ref()
+            .is_some_and(|agent| agent.key() != id)
+        {
+            self.agent_snapshot.selected_agent = None;
+        }
         self.agent_selected_id = Some(id.clone());
+        self.agent_detail_open = true;
         self.agent_action_error = None;
         self.agent_action_status = Some("Loading agent…".to_string());
         self.agent_delete_confirming = None;
@@ -1866,6 +1899,7 @@ impl SettingsState {
         let id = unique_agent_id(&self.agent_snapshot, "custom-agent");
         self.agent_form = AgentForm::new_custom(id.clone());
         self.agent_selected_id = Some(id);
+        self.agent_detail_open = true;
         self.agent_action_error = None;
         self.agent_action_status = None;
         self.agent_delete_confirming = None;
@@ -1896,6 +1930,7 @@ impl SettingsState {
         self.agent_form = AgentForm::duplicate_from(definition, id.clone());
         self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_selected_id = Some(id);
+        self.agent_detail_open = true;
         self.agent_action_error = None;
         self.agent_action_status = Some("Editing duplicated custom agent".to_string());
         self.agent_delete_confirming = None;
@@ -1985,6 +2020,13 @@ impl SettingsState {
         self.agent_action_status = None;
     }
 
+    fn set_agent_home_server_node_id(&mut self, value: String) {
+        self.agent_form.home_server_node_id = value;
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
     fn set_agent_sandbox_node_id(&mut self, value: String) {
         self.agent_form.sandbox_node_id = value;
         self.mark_draft_changed(SettingsOperationDomain::Agents);
@@ -2026,6 +2068,45 @@ impl SettingsState {
         self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_action_error = None;
         self.agent_action_status = None;
+    }
+
+    fn set_agent_tool_add_index(&mut self, index: usize) {
+        self.agent_form.tool_add_index = index;
+    }
+
+    fn add_selected_agent_tool(&mut self) {
+        let available = available_agent_tool_specs(&self.agent_form.definition.tools);
+        let Some(spec) = available.get(self.agent_form.tool_add_index).cloned() else {
+            return;
+        };
+        self.agent_form.definition.tools.push(spec);
+        self.agent_form
+            .definition
+            .tools
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        self.agent_form.tool_add_index = 0;
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn remove_agent_tool(&mut self, name: &str) {
+        let previous_len = self.agent_form.definition.tools.len();
+        self.agent_form
+            .definition
+            .tools
+            .retain(|tool| tool.name != name);
+        if self.agent_form.definition.tools.len() != previous_len {
+            self.agent_form.tool_add_index = 0;
+            self.mark_draft_changed(SettingsOperationDomain::Agents);
+            self.agent_action_error = None;
+            self.agent_action_status = None;
+        }
+    }
+
+    fn back_to_agent_list(&mut self) {
+        self.agent_detail_open = false;
+        self.agent_delete_confirming = None;
     }
 
     fn agent_form_can_save(&self) -> bool {
@@ -3709,10 +3790,7 @@ fn agent_sidebar_preview(snapshot: &AgentConfigSnapshot) -> String {
 }
 
 fn agent_summary_line(agent: &AgentConfigSummary) -> String {
-    let mut parts = vec![
-        agent.role.clone(),
-        format!("{} package {}", agent.source, agent.package_version),
-    ];
+    let mut parts = vec![agent.role.clone(), agent.default_model.clone()];
     if agent.tool_count == 1 {
         parts.push("1 tool".to_string());
     } else if agent.tool_count > 1 {
@@ -3723,11 +3801,17 @@ fn agent_summary_line(agent: &AgentConfigSummary) -> String {
     } else if agent.skill_count > 1 {
         parts.push(format!("{} skills", agent.skill_count));
     }
+    if let Some(node_id) = agent.home_server_node_id.as_ref()
+        && !node_id.trim().is_empty()
+    {
+        parts.push(format!("home {}", short(node_id, 12)));
+    }
     if let Some(node_id) = agent.sandbox_node_id.as_ref()
         && !node_id.trim().is_empty()
     {
         parts.push(format!("sandbox {}", short(node_id, 12)));
     }
+    parts.push(agent.source.clone());
     parts.join(" · ")
 }
 
@@ -3743,6 +3827,21 @@ fn agent_list_item(agent: &AgentConfigSummary) -> ListItem {
             AgentReadiness::Ready => "Ready",
             AgentReadiness::NeedsAttention => "Review",
         })
+}
+
+fn available_agent_tool_specs(selected: &[AgentToolSpec]) -> Vec<AgentToolSpec> {
+    let selected_names = selected
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<HashSet<_>>();
+    let mut tools = default_agent_tool_descriptors()
+        .into_iter()
+        .map(|descriptor| descriptor.spec)
+        .filter(|tool| !selected_names.contains(tool.name.as_str()))
+        .collect::<Vec<_>>();
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    tools.dedup_by(|left, right| left.name == right.name);
+    tools
 }
 
 fn module_sidebar_preview(snapshot: &ModuleConfigSnapshot) -> String {
@@ -6887,15 +6986,64 @@ fn agents_section_key(shared: &Shared) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "selected:{:?};delete:{:?};report:{:?};editor:{:?}\n{agents}",
+        "selected:{:?};detail:{};delete:{:?};report:{:?};editor:{:?};tools:{:?}\n{agents}",
         settings.agent_selected_id,
+        settings.agent_detail_open,
         settings.agent_delete_confirming,
         settings.agent_validation_report,
         settings.agent_form.previous_id,
+        settings.agent_form.definition.tools,
     )
 }
 
 fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnConstraints::new(
+        false,
+        |constraints| constraints.max.width >= AGENT_SPLIT_THRESHOLD,
+        move |wide| {
+            if *wide {
+                WidgetPod::new(
+                    FixedPaneSplit::horizontal(
+                        agent_menu_panel(&s, &r),
+                        Separator::vertical().theme_when(clone_reader(&r)),
+                        InsetX::new(agent_detail_panel(&s, &r), 18.0),
+                    )
+                    .fixed_first(AGENT_MENU_W)
+                    .divider_extent(1.0)
+                    .fallback_flexible_extent(560.0),
+                )
+            } else {
+                let back = {
+                    let s = s.clone();
+                    sui::Button::new("Agents")
+                        .icon(IconGlyph::ChevronLeft)
+                        .theme_when(clone_reader(&r))
+                        .appearance(sui::ButtonAppearance::Tonal)
+                        .tone(SemanticTone::Neutral)
+                        .on_press(move || s.settings_mut().back_to_agent_list())
+                };
+                let detail = Stack::vertical()
+                    .spacing(10.0)
+                    .alignment(Alignment::Stretch)
+                    .with_child(Stack::horizontal().with_child(back))
+                    .with_child(agent_detail_panel(&s, &r));
+                WidgetPod::new(
+                    SwitchView::new()
+                        .with_child(agent_menu_panel(&s, &r))
+                        .with_child(detail)
+                        .selected_when({
+                            let s = s.clone();
+                            move || usize::from(s.settings().agent_detail_open)
+                        }),
+                )
+            }
+        },
+    )
+}
+
+fn agent_menu_panel(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let snapshot = shared.settings().agent_snapshot.clone();
     let list = {
         let s = shared.clone();
@@ -6907,7 +7055,7 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
                     .map(agent_list_item)
                     .collect::<Vec<_>>(),
             )
-            .row_height(MENU_ROW_H)
+            .row_height(AGENT_LIST_ROW_H)
             .selected_when({
                 let s = s.clone();
                 move || s.settings().selected_agent_index()
@@ -6933,26 +7081,11 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
             .theme_when(clone_reader(reader))
             .on_press(move || s.settings_mut().create_agent())
     };
-    let duplicate = {
-        let s = shared.clone();
-        sui::Button::new("Duplicate")
-            .icon(sui::IconGlyph::Restore)
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Tonal)
-            .tone(SemanticTone::Neutral)
-            .enabled_when({
-                let s = s.clone();
-                move || s.settings().agent_snapshot.selected_agent.is_some()
-            })
-            .on_press(move || s.settings_mut().duplicate_selected_agent())
-    };
     let refresh = {
         let s = shared.clone();
-        sui::Button::new("Refresh")
-            .icon(sui::IconGlyph::Redo)
+        let button = IconButton::new(IconGlyph::Redo, "Refresh")
+            .description("Reload the agent catalog")
             .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Tonal)
-            .tone(SemanticTone::Neutral)
             .on_press(move || {
                 let selected_id = s.settings().agent_selected_id.clone();
                 queue_settings_operation(
@@ -6960,63 +7093,56 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
                     SettingsOperationScope::Agents,
                     SettingsOperation::RefreshAgents { selected_id },
                 );
-            })
+            });
+        Tooltip::new("Refresh agents", button)
+            .placement(TooltipPlacement::Above)
+            .theme(reader())
     };
 
-    let mut summary_body = FieldGroup::new()
+    let mut heading_style = settings_text_style(shared, shared.theme().text.sm);
+    heading_style.weight = FontWeight::SEMIBOLD;
+    let heading = Label::new("AGENTS").style(heading_style).color_when({
+        let s = shared.clone();
+        move || palette(&s).text
+    });
+    let actions = Stack::horizontal()
         .spacing(8.0)
-        .with_child(value_row(
-            shared,
-            reader,
-            "Catalog",
-            agent_sidebar_preview(&snapshot),
-        ))
-        .with_child(value_row(
-            shared,
-            reader,
-            "Custom agents",
-            format!("{}", agent_custom_count(&snapshot)),
-        ))
+        .alignment(Alignment::Center)
+        .with_child(new_agent)
+        .with_child(refresh);
+    let list_height = (snapshot.agents.len().max(5) as f32 * AGENT_LIST_ROW_H).min(530.0);
+    let mut panel = Stack::vertical()
+        .spacing(10.0)
+        .alignment(Alignment::Stretch)
         .with_child(
-            FormRow::new("Agents", SizedBox::new().height(230.0).with_child(list))
-                .stacked()
-                .theme_when(clone_reader(reader)),
+            TrailingSlotRow::new(heading, actions)
+                .trailing_width(150.0)
+                .trailing_height(28.0)
+                .gap(8.0),
         )
-        .with_child(
-            FormRow::new(
-                "Actions",
-                Flex::horizontal()
-                    .wrap(FlexWrap::Wrap)
-                    .gap(8.0)
-                    .align_items(Alignment::Start)
-                    .with_child(new_agent)
-                    .with_child(duplicate)
-                    .with_child(refresh),
-            )
-            .inline()
-            .theme_when(clone_reader(reader)),
-        );
+        .with_child(muted_label(shared, agent_sidebar_preview(&snapshot)))
+        .with_child(SizedBox::new().height(list_height).with_child(list));
     if let Some(error) = snapshot.error {
-        summary_body = summary_body.with_child(value_row(shared, reader, "Catalog error", error));
+        panel = panel.with_child(
+            settings_label(shared, error, shared.theme().text.xs).color_when({
+                let s = shared.clone();
+                move || palette(&s).danger_text
+            }),
+        );
     }
-    summary_body = summary_body.with_child(feedback_slot(
-        shared,
-        reader,
-        |settings| settings.agent_action_error.clone(),
-        |settings| settings.agent_action_status.clone(),
-    ));
+    panel
+}
 
+fn agent_detail_panel(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let mut stack = Stack::vertical()
         .spacing(14.0)
         .alignment(Alignment::Stretch)
-        .with_child(
-            FormSection::new("Agents", summary_body)
-                .description(
-                    "Create, inspect, validate, and move agent packages without leaving Settings.",
-                )
-                .theme_when(clone_reader(reader)),
-        )
-        .with_child(agent_package_management_section(shared, reader));
+        .with_child(feedback_slot(
+            shared,
+            reader,
+            |settings| settings.agent_action_error.clone(),
+            |settings| settings.agent_action_status.clone(),
+        ));
 
     let editing_unsaved = shared.settings().agent_form.previous_id.is_none();
     let selected = shared.settings().agent_snapshot.selected_agent.clone();
@@ -7026,7 +7152,20 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         stack = stack.with_child(agent_editor_section(shared, reader));
     } else if let Some(definition) = selected {
         stack = stack.with_child(agent_readonly_section(shared, reader, definition));
+    } else {
+        stack = stack.with_child(
+            FormSection::new(
+                "Select an agent",
+                muted_label(
+                    shared,
+                    "Choose an agent from the list or create a custom agent.",
+                ),
+            )
+            .description("Agent settings are loaded from the shared agent catalog.")
+            .theme_when(clone_reader(reader)),
+        );
     }
+    stack = stack.with_child(agent_package_management_section(shared, reader));
     if let Some(report) = shared.settings().agent_validation_report.clone() {
         stack = stack.with_child(agent_validation_report_section(shared, reader, report));
     }
@@ -7117,6 +7256,7 @@ fn agent_package_management_section(shared: &Shared, reader: &ThemeReader) -> im
     let test = agent_lifecycle_action_button(shared, reader, true);
 
     let body = FieldGroup::new()
+        .fill_width()
         .spacing(8.0)
         .with_child(
             FormRow::new(
@@ -7224,7 +7364,8 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             .on_change(move |index, _label| s.settings_mut().set_agent_output_format_index(index))
     };
 
-    let mut body = FieldGroup::new()
+    let profile = FieldGroup::new()
+        .fill_width()
         .spacing(8.0)
         .with_child(agent_text_row(
             shared,
@@ -7265,14 +7406,19 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             "System prompt",
             form.system_prompt.clone(),
             "Describe the agent behavior",
-            140.0,
+            220.0,
             |settings, value| settings.set_agent_system_prompt(value),
         ))
+        .with_child(agent_actions_row(shared, reader));
+
+    let model = FieldGroup::new()
+        .fill_width()
+        .spacing(8.0)
         .with_child(agent_text_row(
             shared,
             reader,
             "agent-provider",
-            "Provider",
+            "Default provider",
             form.provider.clone(),
             "Cluster default",
             |settings, value| settings.set_agent_provider(value),
@@ -7281,7 +7427,7 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             shared,
             reader,
             "agent-model",
-            "Model",
+            "Default model",
             form.model.clone(),
             "Provider default",
             |settings, value| settings.set_agent_model(value),
@@ -7292,7 +7438,7 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             "agent-temperature",
             "Temperature",
             form.temperature.clone(),
-            "0.2",
+            "Model default",
             |settings, value| settings.set_agent_temperature(value),
         ))
         .with_child(agent_text_row(
@@ -7308,7 +7454,112 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             FormRow::new("Output", output_format_select)
                 .inline()
                 .theme_when(clone_reader(reader)),
-        )
+        );
+
+    let mut tools = FieldGroup::new().fill_width().spacing(8.0);
+    if form.definition.tools.is_empty() {
+        tools = tools.with_child(value_row(
+            shared,
+            reader,
+            "Packaged tools",
+            "No packaged tools enabled",
+        ));
+    } else {
+        for tool in form.definition.tools.iter().cloned() {
+            tools = tools.with_child(agent_tool_editor_row(shared, reader, tool));
+        }
+    }
+    let available_tools = available_agent_tool_specs(&form.definition.tools);
+    if !available_tools.is_empty() {
+        let names = available_tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        let selected_names = names.clone();
+        let tool_select = {
+            let s = shared.clone();
+            Select::new("agent-add-tool-select")
+                .options(names)
+                .selected_when(move || {
+                    Some(
+                        s.settings()
+                            .agent_form
+                            .tool_add_index
+                            .min(selected_names.len().saturating_sub(1)),
+                    )
+                })
+                .theme_when(clone_reader(reader))
+                .on_change({
+                    let s = shared.clone();
+                    move |index, _| s.settings_mut().set_agent_tool_add_index(index)
+                })
+        };
+        let add_tool = {
+            let s = shared.clone();
+            sui::Button::new("Add tool")
+                .icon(IconGlyph::Add)
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
+                .on_press(move || s.settings_mut().add_selected_agent_tool())
+        };
+        tools = tools.with_child(
+            FormRow::new(
+                "Add packaged tool",
+                TrailingSlotRow::new(tool_select, add_tool)
+                    .trailing_width(108.0)
+                    .trailing_height(28.0)
+                    .gap(8.0),
+            )
+            .inline()
+            .theme_when(clone_reader(reader)),
+        );
+    }
+    tools = tools
+        .with_child(agent_area_row(
+            shared,
+            reader,
+            "agent-skills",
+            "Skills",
+            form.skills_text.clone(),
+            "skill-id per line",
+            84.0,
+            |settings, value| settings.set_agent_skills_text(value),
+        ))
+        .with_child(agent_area_row(
+            shared,
+            reader,
+            "agent-visible-toolsets",
+            "Visible toolsets",
+            form.visible_toolsets_text.clone(),
+            "toolset id per line; empty uses the package default",
+            76.0,
+            |settings, value| settings.set_agent_visible_toolsets_text(value),
+        ))
+        .with_child(agent_area_row(
+            shared,
+            reader,
+            "agent-allow-tools",
+            "Additional allowed tools",
+            form.allow_tools_text.clone(),
+            "tool id per line",
+            76.0,
+            |settings, value| settings.set_agent_allow_tools_text(value),
+        ))
+        .with_child(agent_area_row(
+            shared,
+            reader,
+            "agent-deny-tools",
+            "Denied tools",
+            form.deny_tools_text.clone(),
+            "tool id per line",
+            76.0,
+            |settings, value| settings.set_agent_deny_tools_text(value),
+        ));
+
+    let runtime = FieldGroup::new()
+        .fill_width()
+        .spacing(8.0)
         .with_child(agent_text_row(
             shared,
             reader,
@@ -7339,55 +7590,31 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         .with_child(agent_text_row(
             shared,
             reader,
+            "agent-home-server",
+            "Preferred home server",
+            form.home_server_node_id.clone(),
+            "Local session placement",
+            |settings, value| settings.set_agent_home_server_node_id(value),
+        ))
+        .with_child(agent_text_row(
+            shared,
+            reader,
             "agent-sandbox-node",
-            "Sandbox node",
+            "Sandbox execution node",
             form.sandbox_node_id.clone(),
             "Local runtime",
             |settings, value| settings.set_agent_sandbox_node_id(value),
         ))
-        .with_child(agent_area_row(
+        .with_child(agent_home_folder_row(
             shared,
             reader,
-            "agent-skills",
-            "Skills",
-            form.skills_text.clone(),
-            "skill-id per line",
-            74.0,
-            |settings, value| settings.set_agent_skills_text(value),
-        ))
-        .with_child(agent_area_row(
-            shared,
-            reader,
-            "agent-visible-toolsets",
-            "Visible toolsets",
-            form.visible_toolsets_text.clone(),
-            "toolset id per line",
-            70.0,
-            |settings, value| settings.set_agent_visible_toolsets_text(value),
-        ))
-        .with_child(agent_area_row(
-            shared,
-            reader,
-            "agent-allow-tools",
-            "Allowed tools",
-            form.allow_tools_text.clone(),
-            "tool id per line",
-            70.0,
-            |settings, value| settings.set_agent_allow_tools_text(value),
-        ))
-        .with_child(agent_area_row(
-            shared,
-            reader,
-            "agent-deny-tools",
-            "Denied tools",
-            form.deny_tools_text.clone(),
-            "tool id per line",
-            70.0,
-            |settings, value| settings.set_agent_deny_tools_text(value),
+            &form.id,
+            form.previous_id.is_some(),
         ));
 
+    let mut package = FieldGroup::new().fill_width().spacing(8.0);
     if let Some(summary) = selected_agent_config_summary(shared) {
-        body = body
+        package = package
             .with_child(agent_readiness_row(shared, reader, summary.readiness))
             .with_child(value_row(
                 shared,
@@ -7397,15 +7624,130 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             ))
             .with_child(value_row(shared, reader, "Provenance", summary.provenance));
     }
-    body = body.with_child(agent_actions_row(shared, reader));
-    let title = if form.previous_id.is_some() {
-        format!("Edit {}", short_one_line(&form.id, 48))
+    Stack::vertical()
+        .spacing(14.0)
+        .alignment(Alignment::Stretch)
+        .with_child(
+            FormSection::new(
+                if form.previous_id.is_some() {
+                    format!("Edit {}", short_one_line(&form.id, 48))
+                } else {
+                    "New custom agent".to_string()
+                },
+                profile,
+            )
+            .description("Identity and system instructions used for every session.")
+            .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormSection::new("Default model", model)
+                .description(
+                    "Leave provider or model blank to inherit the cluster and provider defaults.",
+                )
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormSection::new("Tools and skills", tools)
+                .description(
+                    "Packaged tools define the base capability set; tool-surface rules can further expose or restrict runtime tools.",
+                )
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormSection::new("Runtime", runtime)
+                .description(
+                    "Default turn limits and preferred placement for sessions and sandboxed tools.",
+                )
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormSection::new("Package", package)
+                .description(
+                    "Saved custom definitions live in SIFS and become available to chats and channels.",
+                )
+                .theme_when(clone_reader(reader)),
+        )
+}
+
+fn agent_tool_editor_row(shared: &Shared, reader: &ThemeReader, tool: AgentToolSpec) -> FormRow {
+    let description = if tool.async_default {
+        format!("{} Runs asynchronously by default.", tool.description)
     } else {
-        "New custom agent".to_string()
+        tool.description.clone()
     };
-    FormSection::new(title, body)
-        .description("Saved agents are stored under the local Sinomo data directory and become available in chat agent selection.")
-        .theme_when(clone_reader(reader))
+    let remove = {
+        let s = shared.clone();
+        let name = tool.name.clone();
+        let label = format!("Remove {}", tool.name);
+        let button = IconButton::new(IconGlyph::Trash, label.clone())
+            .description(format!("Remove {} from this agent", tool.name))
+            .theme_when(clone_reader(reader))
+            .on_press(move || s.settings_mut().remove_agent_tool(&name));
+        Tooltip::new(label, button)
+            .placement(TooltipPlacement::Above)
+            .theme(reader())
+    };
+    FormRow::new(
+        tool.name,
+        TrailingSlotRow::new(muted_label(shared, description), remove)
+            .trailing_width(28.0)
+            .trailing_height(28.0)
+            .gap(8.0),
+    )
+    .inline()
+    .theme_when(clone_reader(reader))
+}
+
+fn agent_home_folder_row(
+    shared: &Shared,
+    reader: &ThemeReader,
+    agent_id: &str,
+    persisted: bool,
+) -> FormRow {
+    let path = agent_home_sifs_path_for_id(agent_id);
+    let open = {
+        let s = shared.clone();
+        let path = path.clone();
+        sui::Button::new("Open home folder")
+            .icon(IconGlyph::Folder)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .enabled(persisted)
+            .on_press(move || open_agent_home_folder(&s, path.clone()))
+    };
+    let detail = if persisted {
+        "Shared SIFS home mounted into this agent's tool runtime."
+    } else {
+        "The home folder becomes available after this agent is saved and first used."
+    };
+    FormRow::new(
+        "Agent home",
+        Stack::vertical()
+            .spacing(6.0)
+            .alignment(Alignment::Stretch)
+            .with_child(
+                TrailingSlotRow::new(
+                    selectable_read_only_input(reader, "agent-home-path", path),
+                    open,
+                )
+                .trailing_width(160.0)
+                .trailing_height(28.0)
+                .gap(8.0),
+            )
+            .with_child(muted_label(shared, detail)),
+    )
+    .stacked()
+    .theme_when(clone_reader(reader))
+}
+
+fn open_agent_home_folder(shared: &Shared, path: String) {
+    let waker = shared.borrow().waker.clone();
+    {
+        let mut files = shared.files_mut();
+        files.open_sifs_path(path, waker);
+    }
+    open_tab(shared, Tab::Files);
 }
 
 fn agent_actions_row(shared: &Shared, reader: &ThemeReader) -> FormRow {
@@ -7532,6 +7874,7 @@ fn agent_readonly_section(
             .on_press(move || s.settings_mut().duplicate_selected_agent())
     };
     let mut body = FieldGroup::new()
+        .fill_width()
         .spacing(8.0)
         .with_child(agent_readiness_row(
             shared,
@@ -7600,6 +7943,12 @@ fn agent_readonly_section(
             "System prompt",
             definition.system_prompt.clone(),
         ))
+        .with_child(agent_home_folder_row(
+            shared,
+            reader,
+            definition.key(),
+            true,
+        ))
         .with_child(
             FormRow::new("Actions", duplicate)
                 .inline()
@@ -7607,6 +7956,14 @@ fn agent_readonly_section(
         );
     if let Some(node_id) = definition.tool_runtime.sandbox_node_id.as_ref() {
         body = body.with_child(value_row(shared, reader, "Sandbox node", node_id.clone()));
+    }
+    if let Some(node_id) = definition.placement.home_server_node_id.as_ref() {
+        body = body.with_child(value_row(
+            shared,
+            reader,
+            "Preferred home server",
+            node_id.clone(),
+        ));
     }
     FormSection::new(definition.name.clone(), body)
         .description("This agent is supplied by the runtime. Duplicate it to create an editable custom agent.")
@@ -11273,7 +11630,8 @@ mod tests {
             app.active_tab = Tab::Settings;
             let settings = &mut app.ready.as_mut().expect("ready state").settings;
             settings.open(SettingsSection::Agents);
-            settings.agent_import_path.clear();
+            settings.create_agent();
+            settings.agent_form.name.clear();
             settings.agent_action_status = Some("Previous operation completed".to_string());
         }
 
@@ -11288,7 +11646,7 @@ mod tests {
         let window = app.main_window()?;
         let field = window
             .get_by_role(sui::SemanticsRole::TextInput)
-            .with_name("agent-import-path");
+            .with_name("agent-name");
 
         window
             .get_by_text("Previous operation completed")
@@ -11304,7 +11662,7 @@ mod tests {
         field.fill("B")?;
         field.expect().to_be_focused()?;
         field.expect().to_have_value("AB")?;
-        assert_eq!(shared.settings().agent_import_path, "AB");
+        assert_eq!(shared.settings().agent_form.name, "AB");
 
         Ok(())
     }
@@ -12184,7 +12542,9 @@ mod tests {
         state.set_agent_model("gpt-5".to_string());
         state.set_agent_temperature("0.1".to_string());
         state.set_agent_max_steps("4".to_string());
+        state.set_agent_home_server_node_id("home-node".to_string());
         state.set_agent_skills_text("docs.skill\nreview.skill".to_string());
+        state.add_selected_agent_tool();
 
         let operation = state.agent_save_operation().expect("save operation");
         apply_test_operation(
@@ -12205,6 +12565,16 @@ mod tests {
                 .any(|agent| agent.id == "docs-agent" && agent.editable),
             "saved custom agent should appear in the settings catalog"
         );
+        let saved = state
+            .agent_snapshot
+            .selected_agent
+            .as_ref()
+            .expect("saved agent definition");
+        assert_eq!(
+            saved.placement.home_server_node_id.as_deref(),
+            Some("home-node")
+        );
+        assert_eq!(saved.tools.len(), 1);
         let summaries = agent_summaries(backend.data_dir.as_ref());
         assert!(
             summaries.iter().any(|agent| {
@@ -12355,6 +12725,34 @@ mod tests {
             .expect()
             .to_have_value("Rendered custom agent")?;
         window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("agent-temperature")
+            .expect()
+            .to_have_value("")?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("agent-home-server")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("agent-home-path")
+            .expect()
+            .to_have_value("/sinomo/agents/render-agent/home")?;
+        let render_summary = shared
+            .settings()
+            .agent_snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.id == "render-agent")
+            .cloned()
+            .expect("render agent summary");
+        assert_eq!(
+            agent_summary_line(&render_summary),
+            "main · Cluster default · custom",
+            "the agent menu detail should expose role, model policy, and source"
+        );
+        window
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("New agent")
             .expect()
@@ -12393,6 +12791,126 @@ mod tests {
             .with_name("Test readiness")
             .expect()
             .to_be_visible()?;
+        let snapshot = window.snapshot()?;
+        let agent_list = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::List
+                    && node.name.as_deref() == Some("agent-config-list")
+            })
+            .expect("agent list semantics");
+        let agent_editor = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::TextInput
+                    && node.name.as_deref() == Some("agent-id")
+            })
+            .expect("agent editor semantics");
+        assert!(
+            agent_list.bounds.max_x() < agent_editor.bounds.x(),
+            "wide agent settings should place the second-level agent menu left of the editor"
+        );
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Add tool")
+            .expect()
+            .to_be_visible()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open home folder")
+            .expect()
+            .to_be_visible()?;
+        open_agent_home_folder(&shared, "/sinomo/agents/render-agent/home".to_string());
+        assert_eq!(shared.borrow().active_tab, Tab::Files);
+        assert_eq!(
+            shared.files().source,
+            crate::ui::files::FilesSourceKind::Sifs
+        );
+        assert_eq!(shared.files().path, "/sinomo/agents/render-agent/home");
+
+        Ok(())
+    }
+
+    #[test]
+    fn settings_agents_section_drills_between_list_and_detail_when_compact() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let mut alpha =
+            AgentDefinition::custom("alpha-agent", AgentRole::Main, "Alpha system prompt.");
+        alpha.name = "Alpha Agent".to_string();
+        backend
+            .save_custom_agent_definition(&alpha, None)
+            .expect("seed alpha agent");
+        let mut zulu =
+            AgentDefinition::custom("zulu-agent", AgentRole::Background, "Zulu system prompt.");
+        zulu.name = "Zulu Agent".to_string();
+        backend
+            .save_custom_agent_definition(&zulu, None)
+            .expect("seed zulu agent");
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            app.ready
+                .as_mut()
+                .expect("ready state")
+                .settings
+                .open(SettingsSection::Agents);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Compact settings agents")
+                    .root(
+                        SizedBox::new()
+                            .size(Size::new(760.0, 720.0))
+                            .with_child(view(shared.clone())),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::List)
+            .with_name("agent-config-list")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("agent-id")
+            .expect()
+            .to_be_hidden()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::ListItem)
+            .with_name("Zulu Agent")
+            .click()?;
+        assert_eq!(
+            shared.settings().agent_selected_id.as_deref(),
+            Some("zulu-agent")
+        );
+        assert!(shared.settings().agent_detail_open);
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Agents")
+            .click()?;
+        window
+            .get_by_role(sui::SemanticsRole::List)
+            .with_name("agent-config-list")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("agent-id")
+            .expect()
+            .to_be_hidden()?;
 
         Ok(())
     }

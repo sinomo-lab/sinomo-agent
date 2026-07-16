@@ -1572,6 +1572,10 @@ impl FilesState {
         self.apply_location(source, normalized, waker);
     }
 
+    pub(crate) fn open_sifs_path(&mut self, path: impl Into<String>, waker: Option<sui::UiHandle>) {
+        self.open_location(FilesSourceKind::Sifs, path.into(), waker);
+    }
+
     fn navigate(&mut self, path: String) {
         self.open_location(self.source, path, None);
     }
