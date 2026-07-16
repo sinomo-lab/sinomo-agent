@@ -960,6 +960,30 @@ where
     }
 }
 
+async fn acknowledge_incoming_completion<W>(
+    writer: Arc<tokio::sync::Mutex<SessionFrameWriter<W>>>,
+    incoming_sender: Option<IncomingBodySender>,
+    receipt: crate::transfer::TransferReceipt,
+    proof: Option<SignedBodyFinishProof>,
+    has_spool: bool,
+) -> Result<(), NetworkError>
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Some(sender) = incoming_sender.as_ref() {
+        sender.validate_completion(receipt.completed_bytes, receipt.digest, proof)?;
+    }
+    send_session_payload(
+        &writer,
+        SessionWirePayload::Transfer(TransferControl::Complete(receipt.clone())),
+    )
+    .await?;
+    if let Some(sender) = incoming_sender.as_ref() {
+        sender.publish_completion(receipt.completed_bytes, has_spool)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct SessionReaderOutcome;
 
@@ -1176,17 +1200,12 @@ where
                     .map_err(session_transfer_error)?;
                 let digest = TransferDigest::new(*incoming_hasher.finalize().as_bytes());
                 let receipt = state.complete(digest).map_err(session_transfer_error)?;
-                if let Some(sender) = incoming_sender.as_ref() {
-                    sender.complete(
-                        receipt.completed_bytes,
-                        receipt.digest,
-                        staging.is_some(),
-                        Some(proof),
-                    )?;
-                }
-                send_session_payload(
-                    &writer,
-                    SessionWirePayload::Transfer(TransferControl::Complete(receipt.clone())),
+                acknowledge_incoming_completion(
+                    Arc::clone(&writer),
+                    incoming_sender.clone(),
+                    receipt,
+                    Some(proof),
+                    staging.is_some(),
                 )
                 .await?;
                 incoming_sender.take();
@@ -2942,11 +2961,15 @@ impl IncomingBodySender {
         Ok(())
     }
 
-    fn complete(
+    /// Validates and records the authenticated end-of-body state without
+    /// publishing EOF to the application reader. The wire receipt must be
+    /// written before [`Self::publish_completion`] wakes that reader: received
+    /// bodies own the session reader task, so exposing EOF first lets an eager
+    /// consumer drop the body and abort the task before it sends the receipt.
+    fn validate_completion(
         &self,
         available_bytes: u64,
         actual_digest: TransferDigest,
-        has_spool: bool,
         finish_proof: Option<SignedBodyFinishProof>,
     ) -> Result<(), NetworkError> {
         {
@@ -2971,6 +2994,16 @@ impl IncomingBodySender {
                 return Err(error);
             }
         }
+        Ok(())
+    }
+
+    /// Publishes a previously validated completion to the application body.
+    /// Callers must first write the transfer receipt to the peer.
+    fn publish_completion(
+        &self,
+        available_bytes: u64,
+        has_spool: bool,
+    ) -> Result<(), NetworkError> {
         if has_spool {
             self.advance_available(available_bytes)?;
         } else {
@@ -2998,6 +3031,18 @@ impl IncomingBodySender {
             direct.take();
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn complete(
+        &self,
+        available_bytes: u64,
+        actual_digest: TransferDigest,
+        has_spool: bool,
+        finish_proof: Option<SignedBodyFinishProof>,
+    ) -> Result<(), NetworkError> {
+        self.validate_completion(available_bytes, actual_digest, finish_proof)?;
+        self.publish_completion(available_bytes, has_spool)
     }
 
     fn fail(&self, error: impl Into<String>) {
@@ -3854,6 +3899,85 @@ mod body_tests {
     }
 
     #[tokio::test]
+    async fn incoming_body_eof_is_published_only_after_the_wire_receipt_is_written() {
+        let root = sinomo_testdir::TestDir::new("sinomo-session-completion-receipt-order");
+        let data_dir = SinomoDataDir::new(root.path());
+        let public_key = proof_public_key(&data_dir);
+        let session_id = TransferId::generate();
+        let transfer_id = TransferId::generate();
+        let bytes = b"body".to_vec();
+        let digest = TransferDigest::blake3(&bytes);
+        let receipt = TransferReceipt {
+            transfer_id,
+            completed_bytes: bytes.len() as u64,
+            digest,
+        };
+        let (sender, mut body) = ObjectRpcIncomingBody::channel(
+            Some(bytes.len() as u64),
+            ObjectRpcSessionBodyRole::Attachment,
+        );
+        assert!(matches!(
+            sender.try_deliver(bytes.clone()),
+            IncomingDirectDelivery::Delivered
+        ));
+        let mut received = vec![0_u8; bytes.len()];
+        body.read_exact(&mut received).await.expect("body payload");
+        assert_eq!(received, bytes);
+
+        // A one-byte wire buffer forces the signed Complete control frame to
+        // yield before it has been written. While that receipt is blocked, an
+        // eager consumer must not observe EOF and drop/abort the reader task.
+        let (write_stream, read_stream) = tokio::io::duplex(1);
+        let writer = Arc::new(tokio::sync::Mutex::new(
+            SessionFrameWriter::new(
+                write_stream,
+                data_dir,
+                session_id.clone(),
+                SessionFrameDirection::ResponderToInitiator,
+                NetworkCallPolicy::default(),
+            )
+            .expect("completion writer"),
+        ));
+        let mut reader = SessionFrameReader::new(
+            read_stream,
+            session_id,
+            SessionFrameDirection::ResponderToInitiator,
+            public_key,
+            NetworkCallPolicy::default(),
+        );
+        let completion = tokio::spawn(acknowledge_incoming_completion(
+            writer,
+            Some(sender.clone()),
+            receipt.clone(),
+            None,
+            false,
+        ));
+        let mut eof_probe = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                body.read(&mut eof_probe),
+            )
+            .await
+            .is_err(),
+            "body EOF became visible before the completion receipt could be written"
+        );
+
+        let frame = reader.receive().await.expect("completion receipt frame");
+        assert!(matches!(
+            frame,
+            SessionInboundFrame::Payload(SessionWirePayload::Transfer(
+                TransferControl::Complete(actual)
+            )) if actual == receipt
+        ));
+        completion
+            .await
+            .expect("completion task")
+            .expect("acknowledge completion");
+        assert_eq!(body.read(&mut eof_probe).await.expect("published EOF"), 0);
+    }
+
+    #[tokio::test]
     async fn incoming_body_known_length_rejects_oversize_before_collection() {
         let body = ObjectRpcIncomingBody::bytes(vec![7_u8; 1024]);
         let error = body
@@ -4555,6 +4679,72 @@ mod body_tests {
             "ok"
         );
         server.await.expect("server task");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn eager_value_materialization_does_not_abort_the_response_receipt() {
+        let client_root = sinomo_testdir::TestDir::new("sinomo-session-eager-value-receipt-client");
+        let server_root = sinomo_testdir::TestDir::new("sinomo-session-eager-value-receipt-server");
+        let client_data_dir = SinomoDataDir::new(client_root.path());
+        let server_data_dir = SinomoDataDir::new(server_root.path());
+        let server_public_key = proof_public_key(&server_data_dir);
+        let route = "/test/session/eager-value-receipt";
+        let request = crate::ObjectRpcRequest::from_encoded_body(route, "test", Vec::new());
+        let prepared = ObjectRpcSessionCall::value(request)
+            .prepare_for_signing()
+            .expect("prepare session call");
+        let request_auth =
+            sign_daemon_rpc_request_from_data_dir(&client_data_dir, &prepared.request)
+                .expect("request auth");
+        let policy = NetworkCallPolicy {
+            health: crate::transfer::NetworkHealthPolicy::new(
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            ),
+            overall_timeout: Some(std::time::Duration::from_secs(3)),
+        };
+
+        // The tiny duplex buffer makes the completion-control write yield,
+        // while current-thread scheduling lets the eager value consumer run
+        // immediately when EOF is published. Publishing EOF before Complete
+        // would let that consumer drop the body and abort the receipt writer.
+        let (client_stream, server_stream) = tokio::io::duplex(1);
+        let server = tokio::spawn(async move {
+            let (_request, responder) = accept_object_rpc_server_session(
+                Box::new(server_stream),
+                server_data_dir,
+                policy,
+                authenticate_test_request,
+            )
+            .await
+            .expect("accept session");
+            responder
+                .respond(ObjectRpcSessionResponse::value(
+                    crate::ObjectRpcResponse::from_encoded_body(route, vec![0x7b]),
+                ))
+                .await
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            start_object_rpc_client_session(
+                Box::new(client_stream),
+                prepared,
+                request_auth,
+                client_data_dir,
+                server_public_key.clone(),
+                server_public_key,
+                policy,
+            ),
+        )
+        .await
+        .expect("client session deadline")
+        .expect("receive eager value response");
+        assert_eq!(result.response.body, vec![0x7b]);
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("response receipt must not stall")
+            .expect("server task")
+            .expect("server received the response receipt");
     }
 
     #[test]
