@@ -32,13 +32,14 @@ use super::{
     daemon_advertised_endpoints_for_state, daemon_endpoint_advertisement_config_file,
     daemon_handle_daemon_sandbox_http_fetch, daemon_package_version,
     data_dir_storage_contract_findings, default_dfs_file_system_id, ensure_rollout_layout,
-    expire_cluster_network_records_in_kv, format_rollout_progress_line,
-    handle_daemon_cluster_join_request, handle_daemon_cluster_kv_txn_request,
-    handle_daemon_rollout_build_request, install_prepared_native_dylib_modules,
-    install_should_update_binary, install_with_layout, load_tui_model_runtime_config,
-    main_agent_config_tool_registry, main_agent_handler_for_tui_with_data_dir,
-    main_agent_tool_registry_for_workspace, managed_source_status, model_config_uses_cluster,
-    models_default_with_data_dir, normalize_model_provider, observe_cli_rpc_via_daemon,
+    expire_cluster_network_records_in_kv, explicit_rollout_targets_from_state,
+    format_rollout_progress_line, handle_daemon_cluster_join_request,
+    handle_daemon_cluster_kv_txn_request, handle_daemon_rollout_build_request,
+    install_prepared_native_dylib_modules, install_should_update_binary, install_with_layout,
+    load_tui_model_runtime_config, main_agent_config_tool_registry,
+    main_agent_handler_for_tui_with_data_dir, main_agent_tool_registry_for_workspace,
+    managed_source_status, model_config_uses_cluster, models_default_with_data_dir,
+    normalize_model_provider, observe_cli_rpc_via_daemon,
     open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
     parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
     parse_dfs_command, parse_install_options, parse_model_default_options,
@@ -12253,6 +12254,98 @@ fn rollout_cluster_targets_deduplicate_explicit_targets() {
     );
     assert!(targets[1].endpoint.is_some());
     assert_eq!(targets[1].rollout_node_id(), None);
+}
+
+#[test]
+fn rollout_explicit_node_id_routes_without_changing_direct_recovery_targets() {
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_rollout_explicit_routed").expect("cluster");
+    let local_node_id =
+        NodeId::from_legacy_named("node_rollout_explicit_routed_local").expect("local node");
+    let remote_node_id =
+        NodeId::from_legacy_named("node_rollout_explicit_routed_remote").expect("remote node");
+    let now = OffsetDateTime::now_utc();
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "explicit routed rollout",
+        local_node_id,
+        "local",
+        "local-key",
+        now,
+    );
+    let mut remote = ClusterMemberRecord::local_voter(
+        cluster_id,
+        remote_node_id.clone(),
+        "remote",
+        "remote-key",
+        now,
+    );
+    remote.capabilities = main_daemon_capabilities(&ClusterMemberRole::Voter);
+    remote.allowed_capabilities = remote.capabilities.clone();
+    let endpoint = iroh_invite_introducer_endpoint(
+        &remote_node_id,
+        "iroh://rollout_explicit_routed?relay=https://relay.example./".to_string(),
+    );
+    remote.endpoints.push(endpoint.clone());
+    state.members.push(remote);
+    let unknown_node_id =
+        NodeId::from_legacy_named("node_rollout_explicit_routed_unknown").expect("unknown node");
+    let unauthorized_node_id =
+        NodeId::from_legacy_named("node_rollout_explicit_routed_unauthorized")
+            .expect("unauthorized node");
+    let mut unauthorized = ClusterMemberRecord::local_voter(
+        state.cluster_id.clone(),
+        unauthorized_node_id.clone(),
+        "unauthorized",
+        "unauthorized-key",
+        now,
+    );
+    unauthorized.capabilities = main_daemon_capabilities(&ClusterMemberRole::Voter);
+    unauthorized.allowed_capabilities = unauthorized.capabilities.clone();
+    unauthorized.state = ClusterMemberState::Pending;
+    state.members.push(unauthorized);
+    let non_main_node_id =
+        NodeId::from_legacy_named("node_rollout_explicit_routed_non_main").expect("non-main node");
+    state.members.push(ClusterMemberRecord::local_voter(
+        state.cluster_id.clone(),
+        non_main_node_id.clone(),
+        "non-main",
+        "non-main-key",
+        now,
+    ));
+
+    let targets = explicit_rollout_targets_from_state(
+        vec![
+            remote_node_id.to_string(),
+            endpoint.address.clone(),
+            "iroh://rollout_explicit_unknown".to_string(),
+            "192.0.2.11:21353".to_string(),
+            unknown_node_id.to_string(),
+            unauthorized_node_id.to_string(),
+            non_main_node_id.to_string(),
+        ],
+        &state,
+    );
+
+    assert_eq!(targets.len(), 7);
+    assert_eq!(targets[0].address, remote_node_id.as_str());
+    assert!(targets[0].endpoint.is_none());
+    assert_eq!(targets[0].rollout_node_id(), Some(&remote_node_id));
+    assert!(targets[1].endpoint.is_some());
+    assert_eq!(targets[1].rollout_node_id(), None);
+    assert!(targets[2].endpoint.is_some());
+    assert_eq!(targets[2].rollout_node_id(), None);
+    assert!(targets[3].endpoint.is_none());
+    assert_eq!(targets[3].rollout_node_id(), None);
+    assert_eq!(targets[4].address, unknown_node_id.as_str());
+    assert!(targets[4].endpoint.is_none());
+    assert_eq!(targets[4].rollout_node_id(), None);
+    assert_eq!(targets[5].address, unauthorized_node_id.as_str());
+    assert!(targets[5].endpoint.is_none());
+    assert_eq!(targets[5].rollout_node_id(), None);
+    assert_eq!(targets[6].address, non_main_node_id.as_str());
+    assert!(targets[6].endpoint.is_none());
+    assert_eq!(targets[6].rollout_node_id(), None);
 }
 
 #[test]

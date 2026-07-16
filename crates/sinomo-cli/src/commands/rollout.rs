@@ -121,6 +121,14 @@ impl RolloutTarget {
         }
     }
 
+    pub(crate) fn routed_node(rollout_node_id: NodeId) -> Self {
+        Self {
+            address: rollout_node_id.to_string(),
+            endpoint: None,
+            rollout_node_id: Some(rollout_node_id),
+        }
+    }
+
     pub(crate) fn label(&self) -> &str {
         &self.address
     }
@@ -2974,15 +2982,17 @@ pub(crate) fn rollout_cluster_targets(
     let local_target = local_rollout_target(options)?;
     let data_dir = SinomoDataDir::from_env_or_home()?;
     let paths = ClusterPaths::new(&data_dir);
-    let state = if options.targets.is_empty() {
+    if !options.targets.is_empty() {
+        let state = require_cluster_bootstrap_state().ok();
+        return Ok(state.as_ref().map_or_else(
+            || explicit_rollout_targets(options.targets.clone()),
+            |state| explicit_rollout_targets_from_state(options.targets.clone(), state),
+        ));
+    }
+    let state = {
         let _ = refresh_cluster_kv_from_local_daemon(&paths);
         require_cluster_bootstrap_state().ok()
-    } else {
-        None
     };
-    if !options.targets.is_empty() {
-        return Ok(explicit_rollout_targets(options.targets.clone()));
-    }
     if let Some(state) = state.as_ref() {
         return Ok(rollout_cluster_targets_from_state(
             &paths,
@@ -3001,6 +3011,30 @@ fn explicit_rollout_targets(addresses: Vec<String>) -> Vec<RolloutTarget> {
     let mut targets = Vec::new();
     for address in addresses {
         push_unique_rollout_target(&mut targets, explicit_rollout_target(address));
+    }
+    targets
+}
+
+pub(crate) fn explicit_rollout_targets_from_state(
+    addresses: Vec<String>,
+    state: &ClusterBootstrapState,
+) -> Vec<RolloutTarget> {
+    let mut targets = Vec::new();
+    for address in addresses {
+        let target = state
+            .members
+            .iter()
+            .find(|member| {
+                member.node_id.as_str() == address
+                    && member.state.is_authorized()
+                    && member
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability.as_str() == "daemon.main.run")
+            })
+            .map(|member| RolloutTarget::routed_node(member.node_id.clone()))
+            .unwrap_or_else(|| explicit_rollout_target(address));
+        push_unique_rollout_target(&mut targets, target);
     }
     targets
 }
