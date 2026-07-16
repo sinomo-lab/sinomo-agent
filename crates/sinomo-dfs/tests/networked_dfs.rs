@@ -7975,6 +7975,7 @@ fn networked_dfs_remote_range_read_returns_slice_without_full_cache() {
         vec![owner.clone()]
     );
     let served = owner_dfs.process_incoming().expect("owner serves range");
+    // The serving event is the attachment head; the receiver materializes the range bytes.
     assert!(served.iter().any(|event| {
         matches!(
             event,
@@ -7988,7 +7989,7 @@ fn networked_dfs_remote_range_read_returns_slice_without_full_cache() {
                 && data.content_hash == owner_metadata.content_hash
                 && data.offset == offset
                 && data.total_size_bytes == bytes.len() as u64
-                && data.bytes == expected
+                && data.bytes.is_empty()
         )
     }));
 
