@@ -4,7 +4,6 @@ use crate::kv_local_store::kv_err;
 use crate::kv_local_store::locked_apply_cluster_raft_vote;
 use crate::prelude::*;
 #[allow(unused_imports)]
-#[allow(unused_imports)]
 use sinomo_kv::KvError;
 use sinomo_kv::{ClusterKvRaftLocalVoteMetadata, ClusterRaftVoteRequest, ClusterRaftVoteResponse};
 use sinomo_kv::{KvSnapshot, RaftRequestVoteRequest, RaftRequestVoteResponse};
@@ -403,12 +402,59 @@ pub(crate) fn locked_cluster_raft_local_vote_metadata(
         .map_err(kv_err)
 }
 
+fn lock_cluster_raft_campaign(paths: &ClusterPaths) -> Result<std::fs::File, NetworkError> {
+    sinomo_kv::lock_cluster_kv_commit_sequence(
+        &paths.kv_paths(),
+        sinomo_kv::CLUSTER_KV_COMMIT_SEQUENCE_LOCK_WAIT,
+    )
+    .map_err(kv_err)
+}
+
+fn locked_existing_cluster_raft_leader(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<Option<NodeId>, NetworkError> {
+    paths
+        .kv_paths()
+        .locked_known_raft_voter_leader_id(state)
+        .map_err(kv_err)
+}
+
+fn cluster_raft_leader_outcome_after_campaign_wait(
+    local_node_id: &NodeId,
+    leader_before_wait: Option<&NodeId>,
+    leader_after_wait: Option<&NodeId>,
+) -> Option<bool> {
+    match leader_after_wait {
+        Some(leader_id) if leader_id == local_node_id => Some(true),
+        Some(leader_id) if Some(leader_id) != leader_before_wait => Some(false),
+        _ => None,
+    }
+}
+
 pub fn elect_cluster_raft_leader_with_host(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     options: ClusterRaftLeaderElectionOptions,
     host: &mut impl ClusterRaftVoteTransportHost,
 ) -> Result<bool, NetworkError> {
+    // A transaction that observed no usable leader may wait here behind
+    // another transaction that is already campaigning or committing. Recheck
+    // the durable leader while holding the same outer sequence lock used by
+    // append -> replicate -> commit so a queued campaign cannot immediately
+    // invalidate a leader that appeared while it waited. An unchanged remote
+    // leader is not considered usable here: the caller already failed to
+    // forward to it, so suppressing this campaign would prevent failover.
+    let leader_before_wait = locked_existing_cluster_raft_leader(paths, state)?;
+    let _campaign_lock = lock_cluster_raft_campaign(paths)?;
+    let leader_after_wait = locked_existing_cluster_raft_leader(paths, state)?;
+    if let Some(existing_outcome) = cluster_raft_leader_outcome_after_campaign_wait(
+        &state.local_node_id,
+        leader_before_wait.as_ref(),
+        leader_after_wait.as_ref(),
+    ) {
+        return Ok(existing_outcome);
+    }
     let voter_ids = sinomo_kv::cluster_kv_raft_voter_ids(state).map_err(kv_err)?;
     let mut remote_vote_targets = Vec::new();
     if !(voter_ids.len() == 1 && voter_ids.first() == Some(&state.local_node_id)) {
@@ -451,6 +497,30 @@ pub(crate) async fn elect_cluster_raft_leader_async_with_host(
     options: ClusterRaftLeaderElectionOptions,
     host: &mut (impl ClusterRaftVoteTransportAsyncHost + Send),
 ) -> Result<bool, NetworkError> {
+    let paths_for_lock = paths.clone();
+    let state_for_lock = state.clone();
+    let (_campaign_lock, existing_outcome) = runtime
+        .spawn_blocking(move || {
+            let leader_before_wait =
+                locked_existing_cluster_raft_leader(&paths_for_lock, &state_for_lock)?;
+            let campaign_lock = lock_cluster_raft_campaign(&paths_for_lock)?;
+            let leader_after_wait =
+                locked_existing_cluster_raft_leader(&paths_for_lock, &state_for_lock)?;
+            let existing_outcome = cluster_raft_leader_outcome_after_campaign_wait(
+                &state_for_lock.local_node_id,
+                leader_before_wait.as_ref(),
+                leader_after_wait.as_ref(),
+            );
+            Ok::<_, NetworkError>((campaign_lock, existing_outcome))
+        })
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "cluster raft leader election".to_string(),
+            detail: format!("campaign lock task failed: {source}"),
+        })??;
+    if let Some(existing_outcome) = existing_outcome {
+        return Ok(existing_outcome);
+    }
     let voter_ids = sinomo_kv::cluster_kv_raft_voter_ids(state).map_err(kv_err)?;
     let mut remote_vote_targets = Vec::new();
     if !(voter_ids.len() == 1 && voter_ids.first() == Some(&state.local_node_id)) {

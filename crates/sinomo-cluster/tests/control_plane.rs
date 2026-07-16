@@ -9300,6 +9300,39 @@ impl ClusterRaftVoteTransportHost for RecordingLeaderElectionHost {
     }
 }
 
+struct BlockingLeaderElectionHost {
+    vote_calls: Arc<AtomicUsize>,
+    started: Option<std::sync::mpsc::Sender<()>>,
+    release: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+impl ClusterRaftVoteTransportHost for BlockingLeaderElectionHost {
+    fn send_raft_vote(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        _target_node_id: &NodeId,
+        request: &ClusterRaftVoteRequest,
+        _timeout: Duration,
+    ) -> Result<ClusterRaftVoteResponse, NetworkError> {
+        self.vote_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(started) = self.started.take() {
+            started.send(()).expect("report campaign start");
+        }
+        if let Some(release) = self.release.take() {
+            release.recv().expect("release blocked campaign");
+        }
+        Ok(ClusterRaftVoteResponse {
+            accepted: true,
+            detail: "granted".to_string(),
+            state: request.state.clone(),
+            vote: sinomo_kv::RaftRequestVoteResponse {
+                term: request.vote.term,
+                vote_granted: true,
+            },
+        })
+    }
+}
+
 #[derive(Default)]
 struct NodeSensitiveLeaderElectionHost {
     failing_nodes: BTreeSet<NodeId>,
@@ -11423,6 +11456,180 @@ fn cluster_raft_leader_election_driver_sets_leader_after_remote_voter_grants() {
     assert!(
         host.sent_votes[0].2 > Duration::from_secs(4),
         "node-targeted election should use the routed node budget, not a one-endpoint foreground slice"
+    );
+}
+
+#[test]
+fn cluster_raft_leader_election_replaces_unchanged_remote_leader() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-stale-remote-leader");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, local_node_id, peer_node_id) = cluster_raft_handler_test_state(
+        "cluster_raft_stale_remote_leader",
+        "node_raft_stale_remote_leader_local",
+        "node_raft_stale_remote_leader_peer",
+    );
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == peer_node_id)
+        .expect("peer member")
+        .endpoints
+        .push(daemon_lan_endpoint(
+            &peer_node_id,
+            "10.0.0.84:21353".to_string(),
+            10,
+        ));
+    write_cluster_state(&paths, &state).expect("write state");
+    let heartbeat = RaftAppendEntriesRequest {
+        term: 1,
+        leader_id: peer_node_id.clone(),
+        prev_log_index: 0,
+        prev_log_term: 0,
+        entries: Vec::new(),
+        leader_commit: 0,
+    };
+    assert!(
+        apply_cluster_raft_append(&paths, &local_node_id, None, heartbeat)
+            .expect("apply stale remote leader heartbeat")
+            .success
+    );
+    assert_eq!(
+        paths
+            .kv_paths()
+            .known_raft_voter_leader_id(&state)
+            .expect("known stale state authority"),
+        Some(peer_node_id.clone())
+    );
+    let mut host = RecordingLeaderElectionHost::default();
+
+    let elected = elect_cluster_raft_leader_with_host(
+        &paths,
+        &state,
+        ClusterRaftLeaderElectionOptions {
+            kv: ClusterKvRaftLeaderElectionOptions {
+                max_attempts: sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_ATTEMPTS,
+            },
+            timeout: Duration::from_secs(5),
+            campaign_jitter_max: Duration::ZERO,
+            tcp_command_timeout: Duration::from_secs(5),
+            iroh_command_timeout: Duration::from_secs(3),
+            tcp_foreground_attempt_timeout: Duration::from_secs(1),
+            public_foreground_attempt_timeout: Duration::from_secs(4),
+            iroh_foreground_attempt_timeout: Duration::from_millis(1500),
+        },
+        &mut host,
+    )
+    .expect("replace stale remote leader");
+
+    assert!(elected);
+    assert_eq!(
+        paths
+            .kv_paths()
+            .known_raft_voter_leader_id(&state)
+            .expect("known state authority"),
+        Some(local_node_id)
+    );
+    assert_eq!(host.sent_votes.len(), 1);
+    assert_eq!(host.sent_votes[0].0, peer_node_id);
+    assert!(host.sent_votes[0].1 > 1);
+}
+
+#[test]
+fn cluster_raft_leader_election_serializes_queued_local_campaigns() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-election-sequence");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, local_node_id, peer_node_id) = cluster_raft_handler_test_state(
+        "cluster_raft_leader_election_sequence",
+        "node_raft_election_sequence_local",
+        "node_raft_election_sequence_peer",
+    );
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == peer_node_id)
+        .expect("peer member")
+        .endpoints
+        .push(daemon_lan_endpoint(
+            &peer_node_id,
+            "10.0.0.83:21353".to_string(),
+            10,
+        ));
+    write_cluster_state(&paths, &state).expect("write state");
+
+    let options = ClusterRaftLeaderElectionOptions {
+        kv: ClusterKvRaftLeaderElectionOptions {
+            max_attempts: sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_ATTEMPTS,
+        },
+        timeout: Duration::from_secs(5),
+        campaign_jitter_max: Duration::ZERO,
+        tcp_command_timeout: Duration::from_secs(5),
+        iroh_command_timeout: Duration::from_secs(3),
+        tcp_foreground_attempt_timeout: Duration::from_secs(1),
+        public_foreground_attempt_timeout: Duration::from_secs(4),
+        iroh_foreground_attempt_timeout: Duration::from_millis(1500),
+    };
+    let vote_calls = Arc::new(AtomicUsize::new(0));
+    let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+    let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+    let first_paths = paths.clone();
+    let first_state = state.clone();
+    let first_vote_calls = Arc::clone(&vote_calls);
+    let first = std::thread::spawn(move || {
+        let mut host = BlockingLeaderElectionHost {
+            vote_calls: first_vote_calls,
+            started: Some(first_started_tx),
+            release: Some(release_first_rx),
+        };
+        elect_cluster_raft_leader_with_host(&first_paths, &first_state, options, &mut host)
+    });
+    first_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("first campaign reached remote vote");
+
+    let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+    let second_paths = paths.clone();
+    let second_state = state.clone();
+    let second_vote_calls = Arc::clone(&vote_calls);
+    let second = std::thread::spawn(move || {
+        let mut host = BlockingLeaderElectionHost {
+            vote_calls: second_vote_calls,
+            started: Some(second_started_tx),
+            release: None,
+        };
+        elect_cluster_raft_leader_with_host(&second_paths, &second_state, options, &mut host)
+    });
+
+    let second_overlapped = second_started_rx
+        .recv_timeout(Duration::from_millis(150))
+        .is_ok();
+    release_first_tx.send(()).expect("release first campaign");
+    assert!(
+        first
+            .join()
+            .expect("join first campaign")
+            .expect("first campaign")
+    );
+    assert!(
+        second
+            .join()
+            .expect("join second campaign")
+            .expect("second campaign")
+    );
+    assert!(
+        !second_overlapped,
+        "a queued local campaign must not overlap the active election"
+    );
+    assert_eq!(vote_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        paths
+            .kv_paths()
+            .known_raft_voter_leader_id(&state)
+            .expect("known state authority"),
+        Some(local_node_id)
     );
 }
 
