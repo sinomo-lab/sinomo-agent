@@ -63,6 +63,31 @@ struct MetadataPrimaryHandoffProbe {
     promoted_node_id: NodeId,
 }
 
+/// One full-snapshot repair attempt for an exact target in one sync invocation.
+///
+/// The enclosing request map intentionally retains settled and unroutable
+/// attempts until the target advances (or the invocation ends). Rebuilding an
+/// identical deep snapshot cannot make an immediate rejection or missing route
+/// succeed, and doing so on every 10 ms pump iteration amplifies memory use.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MetadataCheckpointSnapshotAttempt {
+    target_node_id: NodeId,
+    shard_id: DfsMetadataShardId,
+    journal_sequence: u64,
+    state_fingerprint: String,
+}
+
+impl MetadataCheckpointSnapshotAttempt {
+    fn for_target(target_node_id: NodeId, target: &DfsMetadataQuorumSyncTarget) -> Self {
+        Self {
+            target_node_id,
+            shard_id: target.shard_id.clone(),
+            journal_sequence: target.journal_sequence,
+            state_fingerprint: target.state_fingerprint.clone(),
+        }
+    }
+}
+
 impl MetadataQuorumSyncPurpose {
     fn is_membership_handoff(&self) -> bool {
         matches!(self, Self::MembershipHandoff { .. })
@@ -861,7 +886,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let full_shard_grace = DFS_POSIX_FULL_SHARD_ACK_GRACE.min(timeout);
         let mut freshly_acknowledged = BTreeSet::from([self.node_id.clone()]);
         let mut pending_prefix_probes = BTreeMap::<String, NodeId>::new();
-        let mut pending_checkpoint_snapshots = BTreeMap::<String, NodeId>::new();
+        let mut pending_checkpoint_snapshots =
+            BTreeMap::<String, MetadataCheckpointSnapshotAttempt>::new();
         // A caller can capture a target and then wait behind another DFS
         // operation before entering the barrier. Upgrade once to the current
         // exact contiguous head before the first probe. Subsequent local
@@ -914,7 +940,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 events,
                 &target,
                 &mut pending_prefix_probes,
-                &mut pending_checkpoint_snapshots,
                 &mut freshly_acknowledged,
             ));
             if !rejected_nodes.is_empty()
@@ -950,7 +975,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 events,
                 &target,
                 &mut pending_prefix_probes,
-                &mut pending_checkpoint_snapshots,
                 &mut freshly_acknowledged,
             ));
             if !rejected_nodes.is_empty()
@@ -991,7 +1015,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 events,
                 &target,
                 &mut pending_prefix_probes,
-                &mut pending_checkpoint_snapshots,
                 &mut freshly_acknowledged,
             ));
             if !rejected_nodes.is_empty()
@@ -1112,7 +1135,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn clear_superseded_metadata_sync_requests(
         &mut self,
         pending_prefix_probes: &mut BTreeMap<String, NodeId>,
-        pending_checkpoint_snapshots: &mut BTreeMap<String, NodeId>,
+        pending_checkpoint_snapshots: &mut BTreeMap<String, MetadataCheckpointSnapshotAttempt>,
     ) {
         for request_id in pending_prefix_probes
             .keys()
@@ -1137,7 +1160,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         target: &DfsMetadataQuorumSyncTarget,
         probe_barrier_id: &str,
-        pending_checkpoint_snapshots: &mut BTreeMap<String, NodeId>,
+        pending_checkpoint_snapshots: &mut BTreeMap<String, MetadataCheckpointSnapshotAttempt>,
     ) -> Result<(), DfsError> {
         self.pending_metadata_replications
             .retain(|_, pending| pending.created_at.elapsed() < Duration::from_secs(60));
@@ -1479,9 +1502,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         target: &DfsMetadataQuorumSyncTarget,
         probe_barrier_id: &str,
         rejected_node_ids: &BTreeSet<NodeId>,
-        pending_checkpoint_snapshots: &mut BTreeMap<String, NodeId>,
+        pending_checkpoint_snapshots: &mut BTreeMap<String, MetadataCheckpointSnapshotAttempt>,
     ) -> Result<(), DfsError> {
-        if rejected_node_ids.is_empty() {
+        let attempts = rejected_node_ids
+            .iter()
+            .map(|target_node_id| {
+                MetadataCheckpointSnapshotAttempt::for_target(target_node_id.clone(), target)
+            })
+            .filter(|attempt| {
+                !pending_checkpoint_snapshots
+                    .values()
+                    .any(|pending| pending == attempt)
+            })
+            .collect::<Vec<_>>();
+        // Filter before exporting, cloning, or validating the materialized
+        // tables. A settled rejection and an unroutable attempt are terminal
+        // for this exact node/head within this invocation.
+        if attempts.is_empty() {
             return Ok(());
         }
         let checkpoint_snapshot = match target.checkpoint_snapshot.as_ref() {
@@ -1518,13 +1555,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         }
-        for target_node_id in rejected_node_ids {
-            if pending_checkpoint_snapshots
-                .values()
-                .any(|pending_node_id| pending_node_id == target_node_id)
-            {
-                continue;
-            }
+        for attempt in attempts {
+            let target_node_id = attempt.target_node_id.clone();
             let request_id = format!(
                 "dfs_sync_checkpoint_{}_{}",
                 probe_barrier_id,
@@ -1555,12 +1587,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 },
             );
             let sent = self.send_dfs_message_if_routable(
-                target_node_id,
+                &target_node_id,
                 DfsNetworkMessage::MetadataSnapshotInstall(command),
             )?;
-            if sent {
-                pending_checkpoint_snapshots.insert(request_id, target_node_id.clone());
-            } else {
+            // Retain the exact attempt even after a response settles and even
+            // when no route exists. Only an exact target refresh clears it.
+            pending_checkpoint_snapshots.insert(request_id.clone(), attempt);
+            if !sent {
                 self.pending_metadata_replications.remove(&request_id);
             }
         }
@@ -1830,6 +1863,12 @@ fn metadata_shard_snapshot_at(
     expected_journal_sequence: u64,
     expected_state_fingerprint: &str,
 ) -> Result<crate::DfsMetadataTableSnapshot, DfsError> {
+    #[cfg(test)]
+    DFS_METADATA_SYNC_SNAPSHOT_BUILD_CALLS.set(
+        DFS_METADATA_SYNC_SNAPSHOT_BUILD_CALLS
+            .get()
+            .saturating_add(1),
+    );
     let snapshot = backend
         .export_shard_table_snapshot(shard_id)?
         .ok_or_else(|| DfsError::Metadata {
@@ -1867,6 +1906,21 @@ fn metadata_shard_snapshot_at(
         });
     }
     Ok(snapshot)
+}
+
+#[cfg(test)]
+thread_local! {
+    static DFS_METADATA_SYNC_SNAPSHOT_BUILD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_metadata_sync_snapshot_build_calls() {
+    DFS_METADATA_SYNC_SNAPSHOT_BUILD_CALLS.set(0);
+}
+
+#[cfg(test)]
+fn metadata_sync_snapshot_build_calls() -> usize {
+    DFS_METADATA_SYNC_SNAPSHOT_BUILD_CALLS.get()
 }
 
 fn normalized_replica_node_ids(
@@ -1922,7 +1976,6 @@ fn record_metadata_sync_prefix_probe_events(
     events: Vec<NetworkedDfsServiceEvent>,
     target: &DfsMetadataQuorumSyncTarget,
     pending_prefix_probes: &mut BTreeMap<String, NodeId>,
-    pending_checkpoint_snapshots: &mut BTreeMap<String, NodeId>,
     freshly_acknowledged: &mut BTreeSet<NodeId>,
 ) -> BTreeSet<NodeId> {
     let mut rejected_node_ids = BTreeSet::new();
@@ -1947,9 +2000,7 @@ fn record_metadata_sync_prefix_probe_events(
                     freshly_acknowledged.insert(source_node_id);
                 }
             }
-            NetworkedDfsServiceEvent::MetadataSnapshotInstalled { request_id, .. } => {
-                pending_checkpoint_snapshots.remove(&request_id);
-            }
+            NetworkedDfsServiceEvent::MetadataSnapshotInstalled { .. } => {}
             NetworkedDfsServiceEvent::MetadataJournalBatchRejected {
                 request_id,
                 source_node_id,
@@ -1958,7 +2009,6 @@ fn record_metadata_sync_prefix_probe_events(
                 if pending_prefix_probes.remove(&request_id).is_some() {
                     rejected_node_ids.insert(source_node_id);
                 }
-                pending_checkpoint_snapshots.remove(&request_id);
             }
             _ => {}
         }
@@ -2006,6 +2056,9 @@ mod tests {
         routed_prefix_probe_count: usize,
         catchup_rpc_requests: Vec<(usize, ObjectRpcRequest)>,
         snapshot_install_count: usize,
+        reject_prefix_probes: bool,
+        reject_snapshot_installs: bool,
+        unroutable_nodes: BTreeSet<NodeId>,
         echoes_prefix_verification: bool,
         response_sequence_override: Option<u64>,
         incoming: VecDeque<DfsRoutedMessage>,
@@ -2029,6 +2082,9 @@ mod tests {
                 routed_prefix_probe_count: 0,
                 catchup_rpc_requests: Vec::new(),
                 snapshot_install_count: 0,
+                reject_prefix_probes: false,
+                reject_snapshot_installs: false,
+                unroutable_nodes: BTreeSet::new(),
                 echoes_prefix_verification: true,
                 response_sequence_override: None,
                 incoming: VecDeque::new(),
@@ -2049,6 +2105,11 @@ mod tests {
             target_node_id: &NodeId,
             message: DfsRoutedMessage,
         ) -> Result<(), NetworkError> {
+            if self.unroutable_nodes.contains(target_node_id) {
+                return Err(NetworkError::UnknownNode {
+                    node_id: target_node_id.clone(),
+                });
+            }
             match &message.message {
                 DfsNetworkMessage::MetadataJournalBatch(command) if command.verify_prefix_only => {
                     self.routed_prefix_probe_count =
@@ -2080,6 +2141,7 @@ mod tests {
             self.next_frame_id += 1;
             let response = match message.message {
                 DfsNetworkMessage::MetadataJournalBatch(command) => {
+                    let rejected = command.verify_prefix_only && self.reject_prefix_probes;
                     let verified_authority_probe_id = command
                         .prefix_probe
                         .as_ref()
@@ -2096,11 +2158,22 @@ mod tests {
                             next_after_sequence: self
                                 .response_sequence_override
                                 .unwrap_or(command.batch.next_after_sequence),
-                            applied_entries: command.batch.entries.len(),
-                            verified_prefix_only: command.verify_prefix_only
+                            applied_entries: if rejected {
+                                0
+                            } else {
+                                command.batch.entries.len()
+                            },
+                            verified_prefix_only: !rejected
+                                && command.verify_prefix_only
                                 && self.echoes_prefix_verification,
                             verified_authority_probe_id,
-                            result: DfsMetadataJournalBatchResult::Applied,
+                            result: if rejected {
+                                DfsMetadataJournalBatchResult::Rejected {
+                                    reason: "test prefix rejection".to_string(),
+                                }
+                            } else {
+                                DfsMetadataJournalBatchResult::Applied
+                            },
                         },
                     )
                 }
@@ -2110,8 +2183,14 @@ mod tests {
                             request_id: command.request_id,
                             shard_id: command.shard_id,
                             next_after_sequence: command.next_after_sequence,
-                            result: DfsMetadataSnapshotInstallResult::Installed {
-                                archived_existing: false,
+                            result: if self.reject_snapshot_installs {
+                                DfsMetadataSnapshotInstallResult::Rejected {
+                                    reason: "test snapshot rejection".to_string(),
+                                }
+                            } else {
+                                DfsMetadataSnapshotInstallResult::Installed {
+                                    archived_existing: false,
+                                }
                             },
                         },
                     )
@@ -3996,6 +4075,120 @@ mod tests {
         assert!(
             matches!(error, DfsError::Network { message } if message.contains("1/2 acknowledgements"))
         );
+    }
+
+    #[test]
+    fn rejected_checkpoint_snapshot_is_built_and_sent_once_per_frozen_target() {
+        let replica = node("node_sync_rejected_checkpoint_replica");
+        let mut fixture =
+            configured_sync_fixture("rejected_checkpoint", vec![replica.clone()], vec![replica]);
+        fixture.service.transport.reject_prefix_probes = true;
+        fixture.service.transport.reject_snapshot_installs = true;
+        let target = fixture
+            .service
+            .capture_metadata_quorum_sync_target(&fixture.object)
+            .expect("capture rejected checkpoint target");
+        assert!(target.checkpoint_snapshot.is_none());
+        reset_metadata_sync_snapshot_build_calls();
+
+        let error = fixture
+            .service
+            .sync_metadata_shard_to_quorum(&target, Duration::from_millis(35))
+            .expect_err("an exact replica that rejects repair must not certify durability");
+
+        assert!(
+            matches!(error, DfsError::Network { message } if message.contains("1/2 acknowledgements")),
+            "a rejected repair must remain fail closed"
+        );
+        assert!(
+            fixture.service.transport.routed_prefix_probe_count > 3,
+            "the fixture must exercise repeated rejection across sync pump iterations"
+        );
+        assert_eq!(
+            metadata_sync_snapshot_build_calls(),
+            1,
+            "one frozen target must not repeatedly export and validate the same deep snapshot"
+        );
+        assert_eq!(
+            fixture.service.transport.snapshot_install_count, 1,
+            "one frozen target must attempt at most one snapshot install per replica"
+        );
+    }
+
+    #[test]
+    fn unroutable_checkpoint_snapshot_is_not_rebuilt_for_same_frozen_target() {
+        let replica = node("node_sync_unroutable_checkpoint_replica");
+        let mut fixture =
+            configured_sync_fixture("unroutable_checkpoint", vec![replica.clone()], Vec::new());
+        fixture
+            .service
+            .transport
+            .unroutable_nodes
+            .insert(replica.clone());
+        let mut target = fixture
+            .service
+            .capture_metadata_quorum_sync_target(&fixture.object)
+            .expect("capture unroutable checkpoint target");
+        let rejected = BTreeSet::from([replica]);
+        let mut attempts = BTreeMap::new();
+        reset_metadata_sync_snapshot_build_calls();
+
+        fixture
+            .service
+            .send_metadata_sync_checkpoint_snapshots(
+                &target,
+                "unroutable-checkpoint",
+                &rejected,
+                &mut attempts,
+            )
+            .expect("first unroutable attempt is best effort");
+        fixture
+            .service
+            .send_metadata_sync_checkpoint_snapshots(
+                &target,
+                "unroutable-checkpoint",
+                &rejected,
+                &mut attempts,
+            )
+            .expect("identical unroutable attempt remains settled");
+
+        assert_eq!(metadata_sync_snapshot_build_calls(), 1);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(fixture.service.transport.snapshot_install_count, 0);
+        assert!(fixture.service.pending_metadata_replications.is_empty());
+
+        fixture
+            .service
+            .metadata_backend
+            .as_deref_mut()
+            .expect("metadata backend")
+            .put_object(&directory_object(
+                "/unroutable-checkpoint-next-head",
+                fixture.shard.primary_node_id.clone(),
+            ))
+            .expect("advance exact metadata head");
+        assert!(
+            fixture
+                .service
+                .refresh_metadata_sync_target_to_current_head(&mut target)
+                .expect("refresh exact metadata target")
+        );
+        let mut pending_prefix_probes = BTreeMap::new();
+        fixture
+            .service
+            .clear_superseded_metadata_sync_requests(&mut pending_prefix_probes, &mut attempts);
+        fixture
+            .service
+            .send_metadata_sync_checkpoint_snapshots(
+                &target,
+                "unroutable-checkpoint-next-head",
+                &rejected,
+                &mut attempts,
+            )
+            .expect("changed exact head permits one new repair attempt");
+
+        assert_eq!(metadata_sync_snapshot_build_calls(), 2);
+        assert_eq!(attempts.len(), 1);
     }
 
     #[test]
