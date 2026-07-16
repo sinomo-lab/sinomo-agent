@@ -3826,7 +3826,7 @@ fn send_daemon_rollout_build_direct(
 }
 
 pub(crate) fn local_rollout_wait_timeout() -> Duration {
-    Duration::from_secs(60)
+    DAEMON_ROLLOUT_TIMEOUT
 }
 
 pub(crate) fn wait_for_main_daemon_health(

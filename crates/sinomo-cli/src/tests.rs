@@ -11954,12 +11954,12 @@ fn rollout_parser_scopes_native_module_skip_to_cluster_binary_push() {
 
 #[test]
 fn local_rollout_wait_timeout_covers_shadow_candidate_handoff() {
-    assert!(super::local_rollout_wait_timeout() >= Duration::from_secs(30));
+    assert!(super::local_rollout_wait_timeout() >= Duration::from_secs(180));
 }
 
 #[test]
 fn daemon_rollout_timeout_covers_windows_shadow_handoff() {
-    assert!(super::DAEMON_ROLLOUT_TIMEOUT >= Duration::from_secs(30));
+    assert!(super::DAEMON_ROLLOUT_TIMEOUT >= Duration::from_secs(180));
 }
 
 #[test]
