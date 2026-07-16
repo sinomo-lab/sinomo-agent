@@ -54,6 +54,10 @@ enum MetadataQuorumSyncPurpose {
         /// request. Every other union member returns an ordinary exact-prefix
         /// acknowledgement.
         primary_handoff: Option<MetadataPrimaryHandoffProbe>,
+        /// Exact assignments whose majorities must both acknowledge the
+        /// retiring primary's fenced prefix before activation.
+        retiring_shard: DfsMetadataShardConfig,
+        desired_shard: DfsMetadataShardConfig,
     },
 }
 
@@ -89,14 +93,11 @@ impl MetadataCheckpointSnapshotAttempt {
 }
 
 impl MetadataQuorumSyncPurpose {
-    fn is_membership_handoff(&self) -> bool {
-        matches!(self, Self::MembershipHandoff { .. })
-    }
-
     fn primary_handoff_id_for(&self, node_id: &NodeId) -> Option<&str> {
         match self {
             Self::MembershipHandoff {
                 primary_handoff: Some(primary_handoff),
+                ..
             } if &primary_handoff.promoted_node_id == node_id => {
                 Some(primary_handoff.handoff_id.as_str())
             }
@@ -311,8 +312,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// A quorum-side pending record does not by itself fence a partitioned
     /// retiring primary. This method refreshes that primary's control plane
     /// under its local publication guard, durably acknowledges the exact head
-    /// observed after all earlier commits, repairs and freshly probes the exact
-    /// retiring-plus-desired member union, and only then activates it.
+    /// observed after all earlier commits, repairs and freshly probes a joint
+    /// quorum of the retiring and desired assignments, and only then activates
+    /// it.
     pub fn reconcile_pending_metadata_shard_membership_handoffs(
         &mut self,
         metadata_shards: &[DfsMetadataShardConfig],
@@ -482,11 +484,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let desired_node_ids = std::iter::once(handoff.desired_shard.primary_node_id.clone())
             .chain(handoff.desired_shard.replica_node_ids.iter().cloned())
             .collect::<BTreeSet<_>>();
-        let required_node_ids = retiring_node_ids
+        let handoff_node_ids = retiring_node_ids
             .union(&desired_node_ids)
             .cloned()
             .collect::<BTreeSet<_>>();
-        let replica_node_ids = required_node_ids
+        let replica_node_ids = handoff_node_ids
             .iter()
             .filter(|node_id| *node_id != &self.node_id)
             .cloned()
@@ -511,7 +513,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let certificate = self.sync_metadata_shard_to_quorum_with_required_intersection(
             &target,
             &BTreeSet::new(),
-            MetadataQuorumSyncPurpose::MembershipHandoff { primary_handoff },
+            MetadataQuorumSyncPurpose::MembershipHandoff {
+                primary_handoff,
+                retiring_shard: retiring.clone(),
+                desired_shard: handoff.desired_shard.clone(),
+            },
             timeout,
         )?;
         let acknowledged_node_ids = certificate
@@ -519,7 +525,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        if acknowledged_node_ids != required_node_ids {
+        if !crate::control_plane::metadata_shard_membership_handoff_acknowledgements_are_safe(
+            retiring,
+            &handoff.desired_shard,
+            &acknowledged_node_ids,
+        ) {
             return Ok(false);
         }
 
@@ -1617,10 +1627,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(metadata_sync_certificate(target, progress))
     }
 
-    /// Partition fallback for an exact prefix that already satisfies the
-    /// pre-existing metadata recovery quorum (and, for file sync, the content
-    /// recovery-set intersection). The control-plane record is one bounded,
-    /// exact per-shard head watermark; no file metadata is written to KV.
+    /// Partition fallback for an exact prefix that already satisfies its
+    /// purpose-specific durability certificate. Ordinary sync publishes one
+    /// bounded per-shard head watermark. Membership handoff instead requires
+    /// joint majorities plus both primaries and stores that evidence only in
+    /// the activation proof.
     fn try_finalize_metadata_quorum_sync_fallback(
         &mut self,
         target: &DfsMetadataQuorumSyncTarget,
@@ -1628,21 +1639,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         purpose: &MetadataQuorumSyncPurpose,
     ) -> Result<Option<DfsMetadataQuorumSyncCertificate>, DfsError> {
         self.revalidate_metadata_quorum_sync_authority(target)?;
-        if purpose.is_membership_handoff() {
-            return Ok(None);
+        if let MetadataQuorumSyncPurpose::MembershipHandoff {
+            retiring_shard,
+            desired_shard,
+            ..
+        } = purpose
+        {
+            let acknowledged_node_ids = progress
+                .acknowledged_node_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            return Ok(
+                crate::control_plane::metadata_shard_membership_handoff_acknowledgements_are_safe(
+                    retiring_shard,
+                    desired_shard,
+                    &acknowledged_node_ids,
+                )
+                .then(|| metadata_sync_certificate(target, progress)),
+            );
         }
         let Some(expected_shard) = target.expected_shard.as_ref() else {
             return Ok(None);
         };
-        // A quorum watermark is valid only for the exact active assignment it
-        // names. Membership handoff sync deliberately targets the union of the
-        // retiring and desired assignments while `expected_shard` remains the
-        // retiring generation. Treating a partial union as an ordinary quorum
-        // can therefore either publish an unconfigured desired node or return
-        // a certificate too small to activate the handoff. In either case the
-        // invocation drops its fresh ACK set and can repeat forever. Keep that
-        // wider (or narrower) target on the full-shard path; only an exact
-        // active-assignment target may take the ordinary partition fallback.
+        // An ordinary quorum watermark is valid only for the exact active
+        // assignment it names. A wider or narrower target could publish an
+        // unconfigured node, so only an exact active-assignment target may take
+        // this control-plane fallback.
         let expected_node_ids = std::iter::once(expected_shard.primary_node_id.clone())
             .chain(expected_shard.replica_node_ids.iter().cloned())
             .collect::<BTreeSet<_>>();
@@ -3114,7 +3137,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_membership_handoff_partial_union_skips_fallback_and_retries_exact_union() {
+    fn pending_membership_handoff_retries_until_both_assignment_quorums_ack() {
         let old_replica = node("node_sync_handoff_retry_old_replica");
         let new_replica = node("node_sync_handoff_retry_new_replica");
         let mut fixture = configured_sync_fixture(
@@ -3141,10 +3164,10 @@ mod tests {
                 std::slice::from_ref(&retiring),
                 Duration::ZERO,
             )
-            .expect_err("a partial handoff union must remain pending");
+            .expect_err("a desired-only quorum must remain pending");
         assert!(
             matches!(error, DfsError::Network { ref message } if message.contains("2/3 acknowledgements")),
-            "the full-union-only attempt must time out cleanly instead of publishing an invalid retiring-epoch watermark: {error}"
+            "the joint-quorum attempt must time out cleanly instead of publishing an invalid retiring-epoch watermark: {error}"
         );
 
         let (active, pending, proof, watermark) = fixture.control_plane.with_client(|kv| {
@@ -3205,7 +3228,7 @@ mod tests {
                     std::slice::from_ref(&retiring),
                     Duration::from_secs(1),
                 )
-                .expect("retry exact membership union"),
+                .expect("retry joint membership quorum"),
             1
         );
 
@@ -3244,7 +3267,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_removal_only_handoff_skips_fallback_until_retiring_union_acks() {
+    fn removal_handoff_joint_quorum_tolerates_offline_retiring_replica() {
         let retained_replica = node("node_sync_handoff_removal_retained_replica");
         let removed_replica = node("node_sync_handoff_removal_removed_replica");
         let mut fixture = configured_sync_fixture(
@@ -3258,68 +3281,21 @@ mod tests {
             epoch: retiring.epoch + 1,
             ..retiring.clone()
         };
-        let handoff = fixture.control_plane.with_client(|kv| {
+        fixture.control_plane.with_client(|kv| {
             DfsControlPlaneStore::new(kv)
                 .begin_metadata_shard_membership_handoff(&retiring, &desired)
                 .expect("begin removal-only membership handoff")
                 .expect("retiring assignment is exact")
         });
 
-        let error = fixture
-            .service
-            .reconcile_pending_metadata_shard_membership_handoffs(
-                std::slice::from_ref(&retiring),
-                Duration::ZERO,
-            )
-            .expect_err("a partial retiring union must remain pending");
-        assert!(
-            matches!(error, DfsError::Network { ref message } if message.contains("2/3 acknowledgements")),
-            "membership purpose must suppress ordinary fallback even when the target equals the active assignment: {error}"
-        );
-
-        let (active, pending, proof, watermark) = fixture.control_plane.with_client(|kv| {
-            let store = DfsControlPlaneStore::new(kv);
-            (
-                store
-                    .get_metadata_shard(&retiring.file_system_id, &retiring.shard_id)
-                    .expect("active shard"),
-                store
-                    .get_metadata_shard_membership_handoff(
-                        &retiring.file_system_id,
-                        &retiring.shard_id,
-                    )
-                    .expect("pending handoff"),
-                store
-                    .get_metadata_shard_membership_handoff_proof(
-                        &retiring.file_system_id,
-                        &retiring.shard_id,
-                    )
-                    .expect("handoff proof"),
-                store
-                    .get_metadata_shard_head_watermark(&retiring.file_system_id, &retiring.shard_id)
-                    .expect("head watermark"),
-            )
-        });
-        assert_eq!(active, Some(retiring.clone()));
-        let pending = pending.expect("removal-only handoff remains pending");
-        assert_eq!(pending.handoff_id, handoff.handoff_id);
-        assert!(pending.retiring_primary_fence.is_some());
-        assert!(proof.is_none());
-        assert!(watermark.is_none());
-
-        fixture
-            .service
-            .transport
-            .acknowledged_nodes
-            .insert(removed_replica.clone());
         assert_eq!(
             fixture
                 .service
                 .reconcile_pending_metadata_shard_membership_handoffs(
                     std::slice::from_ref(&retiring),
-                    Duration::from_secs(1),
+                    Duration::ZERO,
                 )
-                .expect("retry exact retiring union"),
+                .expect("joint quorum activates without removed offline replica"),
             1
         );
 
@@ -3346,25 +3322,31 @@ mod tests {
         });
         assert_eq!(active, Some(desired));
         assert!(pending.is_none());
+        let acknowledged_node_ids = proof
+            .acknowledged_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
         assert_eq!(
-            proof
-                .acknowledged_node_ids
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
+            acknowledged_node_ids,
             std::iter::once(retiring.primary_node_id)
-                .chain([retained_replica, removed_replica])
+                .chain([retained_replica])
                 .collect()
+        );
+        assert!(
+            !acknowledged_node_ids.contains(&removed_replica),
+            "an offline retiring-only replica must not be fabricated into the proof"
         );
     }
 
     #[test]
-    fn primary_rotation_uses_exact_handoff_and_leaves_retiring_lane_fenced() {
+    fn primary_rotation_joint_quorum_leaves_retiring_lane_fenced() {
         let promoted = node("node_sync_primary_rotation_promoted");
         let retained_replica = node("node_sync_primary_rotation_retained");
         let mut fixture = configured_sync_fixture(
             "primary_rotation",
             vec![promoted.clone(), retained_replica.clone()],
-            vec![promoted.clone(), retained_replica.clone()],
+            vec![promoted.clone()],
         );
         let retiring = fixture.shard.clone();
         let desired = DfsMetadataShardConfig {
@@ -3390,7 +3372,7 @@ mod tests {
                     std::slice::from_ref(&retiring),
                     Duration::from_secs(1),
                 )
-                .expect("complete exact primary handoff"),
+                .expect("complete joint-quorum primary handoff"),
             1
         );
 
@@ -3424,7 +3406,7 @@ mod tests {
                 .into_iter()
                 .collect::<BTreeSet<_>>(),
             std::iter::once(retiring.primary_node_id.clone())
-                .chain([promoted, retained_replica])
+                .chain([promoted])
                 .collect()
         );
 
