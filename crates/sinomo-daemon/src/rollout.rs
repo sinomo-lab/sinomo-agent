@@ -1,4 +1,6 @@
 use crate::cluster::{CLUSTER_HEALTH_PROBE_TIMEOUT, start_shadow_daemon_status_publisher};
+#[cfg(windows)]
+use crate::prepare_noninteractive_command;
 #[cfg(not(unix))]
 use crate::spawn_shadow_rollout_completion_helper_process;
 use crate::{
@@ -1697,7 +1699,9 @@ fn terminate_process_for_rollout_stop(
     mode: RolloutTerminationMode,
 ) -> Result<(), DaemonError> {
     let args = windows_taskkill_args_for_rollout_stop(pid, mode);
-    let output = Command::new("taskkill")
+    let mut command = Command::new("taskkill");
+    prepare_noninteractive_command(&mut command);
+    let output = command
         .args(args.iter().map(String::as_str))
         .output()
         .map_err(|source| DaemonError::Io {

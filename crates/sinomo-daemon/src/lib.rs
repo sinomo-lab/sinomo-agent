@@ -234,6 +234,8 @@ pub use install::{UserPathUpdate, ensure_windows_user_path_contains};
 pub(crate) use observe::{
     OperationalSeverity, append_operational_event_best_effort, append_operational_log_best_effort,
 };
+#[cfg(windows)]
+pub(crate) use process::prepare_noninteractive_command;
 #[cfg(not(unix))]
 pub(crate) use process::spawn_shadow_rollout_completion_helper_process;
 pub(crate) use process::{
