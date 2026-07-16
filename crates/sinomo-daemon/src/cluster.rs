@@ -4735,6 +4735,7 @@ fn member_status_from_peer_local_health_rows(
             .map(|process| row.status.process == process)
             .unwrap_or(true);
         if row.availability != ClusterNodeAvailability::Online
+            || !row.live_probe_observed
             || row.status.node_id != member.node_id
             || !process_matches
         {
@@ -13013,6 +13014,7 @@ mod tests {
             member: target_member.clone(),
             status: sinomo_core::cluster::unknown_cluster_node_status(&state, &target_member, now),
             availability: ClusterNodeAvailability::Online,
+            live_probe_observed: false,
         }];
 
         let findings = sinomo_core::cluster::cluster_doctor_findings(&state, &records, &health);
@@ -15884,11 +15886,13 @@ mod tests {
                         now,
                     ),
                     availability: ClusterNodeAvailability::Online,
+                    live_probe_observed: true,
                 },
                 ClusterHealthRow {
                     member: member.clone(),
                     status: fresh.clone(),
                     availability: ClusterNodeAvailability::Online,
+                    live_probe_observed: true,
                 },
             ],
         )

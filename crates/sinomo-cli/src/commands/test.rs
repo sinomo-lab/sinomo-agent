@@ -86,7 +86,9 @@ pub(super) fn live_online_remote_main_test_targets(
 
     let online = rows
         .into_iter()
-        .filter(|row| row.availability == ClusterNodeAvailability::Online)
+        .filter(|row| {
+            row.availability == ClusterNodeAvailability::Online && row.live_probe_observed
+        })
         .map(|row| row.member.node_id)
         .collect::<BTreeSet<_>>();
     let mut candidates = state

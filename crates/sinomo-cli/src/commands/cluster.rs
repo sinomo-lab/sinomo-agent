@@ -2171,6 +2171,7 @@ fn apply_authoritative_local_main_availability(
     else {
         return;
     };
+    row.live_probe_observed = availability == ClusterNodeAvailability::Online;
     row.availability = availability.clone();
     row.status.availability = availability;
 }
@@ -3154,6 +3155,7 @@ mod tests {
                 member,
                 status,
                 availability: ClusterNodeAvailability::Online,
+                live_probe_observed: false,
             }
         };
         let mut rows = vec![online_row(local_member), online_row(remote_member.clone())];

@@ -19865,6 +19865,7 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
                 now,
             ),
             availability: ClusterNodeAvailability::Online,
+            live_probe_observed: true,
         }],
     );
 
@@ -20189,7 +20190,7 @@ fn cluster_health_rows_select_member_process_status() {
 }
 
 #[test]
-fn cluster_health_keeps_stored_online_until_connectivity_proves_unreachable() {
+fn cluster_live_health_does_not_treat_stored_online_as_liveness() {
     struct EmptyStatusProbe;
 
     impl ClusterStatusProbe for EmptyStatusProbe {
@@ -20255,8 +20256,8 @@ fn cluster_health_keeps_stored_online_until_connectivity_proves_unreachable() {
             .find(|row| row.member.node_id == remote_node)
             .expect("remote row")
             .availability,
-        ClusterNodeAvailability::Online,
-        "stored online status remains online until connectivity proves the member unreachable"
+        ClusterNodeAvailability::Unknown,
+        "stored status supplies details but cannot prove current liveness"
     );
 
     let endpoint = remote.endpoints.first().expect("remote endpoint");
@@ -20367,6 +20368,7 @@ fn cluster_health_and_doctor_ignore_legacy_shadow_members() {
         member: legacy_shadow.clone(),
         status: unknown_cluster_node_status(&state, &legacy_shadow, now),
         availability: ClusterNodeAvailability::Offline,
+        live_probe_observed: false,
     };
     let findings = cluster_doctor_findings(
         &state,
@@ -20485,6 +20487,7 @@ fn doctor_health_row(
         member: member.clone(),
         status,
         availability,
+        live_probe_observed: false,
     }
 }
 
@@ -20762,6 +20765,7 @@ fn cluster_doctor_suppresses_unreachable_endpoint_when_target_is_online() {
         member: target_member.clone(),
         status: unknown_cluster_node_status(&state, &target_member, now),
         availability: ClusterNodeAvailability::Online,
+        live_probe_observed: false,
     }];
 
     let findings = cluster_doctor_findings(&state, &records, &health);

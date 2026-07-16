@@ -504,6 +504,7 @@ fn cli_probe_member_status_via_shadow_endpoint(
     rows.into_iter().find_map(|row| {
         let expected_process = cluster_member_expected_daemon_process(member);
         if row.availability == ClusterNodeAvailability::Online
+            && row.live_probe_observed
             && row.status.node_id == member.node_id
             && expected_process
                 .map(|process| row.status.process == process)
