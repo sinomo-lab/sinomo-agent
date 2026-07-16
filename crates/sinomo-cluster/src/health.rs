@@ -339,12 +339,71 @@ pub struct ClusterDoctorFinding {
 }
 
 impl ClusterDoctorFinding {
+    fn info(code: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            severity: "info".to_string(),
+            code: code.into(),
+            detail: detail.into(),
+        }
+    }
+
     fn warning(code: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
             severity: "warning".to_string(),
             code: code.into(),
             detail: detail.into(),
         }
+    }
+
+    pub fn is_warning(&self) -> bool {
+        self.severity == "warning"
+    }
+}
+
+/// Availability of the configured Raft state authorities represented by a
+/// cluster health snapshot.
+///
+/// Individual members may be offline without degrading the control plane. The
+/// load-bearing threshold is the same configured voter quorum used by the KV
+/// implementation, not a fixed number of tolerated host failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClusterStateAuthorityHealth {
+    pub authority_count: usize,
+    pub online_authority_count: usize,
+    pub quorum_size: usize,
+}
+
+impl ClusterStateAuthorityHealth {
+    pub fn has_quorum(self) -> bool {
+        self.online_authority_count >= self.quorum_size
+    }
+}
+
+pub fn cluster_state_authority_health(
+    state: &ClusterBootstrapState,
+    health: &[ClusterHealthRow],
+) -> ClusterStateAuthorityHealth {
+    let online_nodes = health
+        .iter()
+        .filter(|row| row.availability == ClusterNodeAvailability::Online)
+        .map(|row| &row.member.node_id)
+        .collect::<BTreeSet<_>>();
+    let authority_count = state
+        .members
+        .iter()
+        .filter(|member| state.node_is_raft_voter(&member.node_id))
+        .count();
+    let online_authority_count = state
+        .members
+        .iter()
+        .filter(|member| {
+            state.node_is_raft_voter(&member.node_id) && online_nodes.contains(&member.node_id)
+        })
+        .count();
+    ClusterStateAuthorityHealth {
+        authority_count,
+        online_authority_count,
+        quorum_size: sinomo_kv::cluster_kv_raft_quorum_size_for_state(state),
     }
 }
 
@@ -668,23 +727,44 @@ pub fn cluster_doctor_findings(
     health: &[ClusterHealthRow],
 ) -> Vec<ClusterDoctorFinding> {
     let mut findings = Vec::new();
+    let authority_health = cluster_state_authority_health(state, health);
+    let unavailable_nodes = health
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.availability,
+                ClusterNodeAvailability::Offline | ClusterNodeAvailability::Unknown
+            ) && !cluster_health_node_is_nonreportable_member(state, &row.member.node_id)
+        })
+        .map(|row| row.member.node_id.clone())
+        .collect::<BTreeSet<_>>();
     for row in health {
         if cluster_health_node_is_nonreportable_member(state, &row.member.node_id) {
             continue;
         }
         if row.availability == ClusterNodeAvailability::Offline {
-            findings.push(ClusterDoctorFinding::warning(
-                "node-offline",
-                format!(
-                    "{} is offline from {} using advertised endpoints",
-                    row.member.node_id, state.local_node_id
-                ),
-            ));
+            let detail = format!(
+                "{} is offline from {} using advertised endpoints",
+                row.member.node_id, state.local_node_id
+            );
+            findings.push(if authority_health.has_quorum() {
+                ClusterDoctorFinding::info(
+                    "node-offline",
+                    format!("{detail}; state authority quorum remains available"),
+                )
+            } else {
+                ClusterDoctorFinding::warning("node-offline", detail)
+            });
         } else if row.availability == ClusterNodeAvailability::Unknown {
-            findings.push(ClusterDoctorFinding::warning(
-                "node-unknown",
-                format!("{} has no recent reachable status", row.member.node_id),
-            ));
+            let detail = format!("{} has no recent reachable status", row.member.node_id);
+            findings.push(if authority_health.has_quorum() {
+                ClusterDoctorFinding::info(
+                    "node-unknown",
+                    format!("{detail}; state authority quorum remains available"),
+                )
+            } else {
+                ClusterDoctorFinding::warning("node-unknown", detail)
+            });
         }
     }
 
@@ -704,6 +784,16 @@ pub fn cluster_doctor_findings(
     for source in &authority_members {
         for target in &authority_members {
             if source.node_id == target.node_id {
+                continue;
+            }
+            // A retained member that is currently unavailable is expected to
+            // have no live route. Once the remaining state authorities still
+            // form quorum, the member observation above is sufficient and
+            // route/endpoint duplicates must not degrade the cluster.
+            if authority_health.has_quorum()
+                && (unavailable_nodes.contains(&source.node_id)
+                    || unavailable_nodes.contains(&target.node_id))
+            {
                 continue;
             }
             if cluster_route_next_hop(&connectivity_graph, &source.node_id, &target.node_id)
@@ -730,6 +820,12 @@ pub fn cluster_doctor_findings(
     for record in connectivity {
         if cluster_health_node_is_nonreportable_member(state, &record.source_node_id)
             || cluster_health_node_is_nonreportable_member(state, &record.target_node_id)
+        {
+            continue;
+        }
+        if authority_health.has_quorum()
+            && (unavailable_nodes.contains(&record.source_node_id)
+                || unavailable_nodes.contains(&record.target_node_id))
         {
             continue;
         }

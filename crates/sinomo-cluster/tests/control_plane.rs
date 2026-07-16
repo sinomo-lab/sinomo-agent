@@ -20473,6 +20473,202 @@ fn doctor_connectivity_record(
     }
 }
 
+fn doctor_health_row(
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+    availability: ClusterNodeAvailability,
+    now: OffsetDateTime,
+) -> ClusterHealthRow {
+    let mut status = unknown_cluster_node_status(state, member, now);
+    status.availability = availability.clone();
+    ClusterHealthRow {
+        member: member.clone(),
+        status,
+        availability,
+    }
+}
+
+#[test]
+fn cluster_doctor_tolerates_unavailable_member_while_authorities_retain_quorum() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_doctor_tolerated_offline").expect("cluster");
+    let first = NodeId::from_legacy_named("node_network_doctor_tolerated_first").expect("first");
+    let second = NodeId::from_legacy_named("node_network_doctor_tolerated_second").expect("second");
+    let offline =
+        NodeId::from_legacy_named("node_network_doctor_tolerated_offline").expect("offline");
+    let replica =
+        NodeId::from_legacy_named("node_network_doctor_tolerated_replica").expect("replica");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "doctor tolerated offline",
+        first.clone(),
+        "first",
+        "pk-first",
+        now,
+    );
+    let main_capability =
+        CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("main capability");
+    state.members[0].capabilities = vec![main_capability.clone()];
+    let mut second_member = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        second.clone(),
+        "second",
+        "pk-second",
+        now,
+    );
+    second_member.capabilities = vec![main_capability.clone()];
+    let mut offline_member = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        offline.clone(),
+        "offline",
+        "pk-offline",
+        now,
+    );
+    offline_member.capabilities = vec![main_capability];
+    let replica_member = ClusterMemberRecord::local_non_voting(
+        cluster_id.clone(),
+        replica,
+        "replica",
+        "pk-replica",
+        now,
+    );
+    state.members.extend([
+        second_member.clone(),
+        offline_member.clone(),
+        replica_member.clone(),
+    ]);
+
+    let health = vec![
+        doctor_health_row(
+            &state,
+            &state.members[0],
+            ClusterNodeAvailability::Online,
+            now,
+        ),
+        doctor_health_row(&state, &second_member, ClusterNodeAvailability::Online, now),
+        doctor_health_row(
+            &state,
+            &offline_member,
+            ClusterNodeAvailability::Offline,
+            now,
+        ),
+        doctor_health_row(
+            &state,
+            &replica_member,
+            ClusterNodeAvailability::Online,
+            now,
+        ),
+    ];
+    let records = vec![
+        doctor_connectivity_record(
+            &cluster_id,
+            &first,
+            &second,
+            "endpoint_network_doctor_tolerated_first_second",
+            "172.25.0.2:21353",
+            ClusterConnectivityState::Healthy,
+        ),
+        doctor_connectivity_record(
+            &cluster_id,
+            &second,
+            &first,
+            "endpoint_network_doctor_tolerated_second_first",
+            "172.25.0.1:21353",
+            ClusterConnectivityState::Healthy,
+        ),
+        doctor_connectivity_record(
+            &cluster_id,
+            &first,
+            &offline,
+            "endpoint_network_doctor_tolerated_offline",
+            "172.25.0.3:21353",
+            ClusterConnectivityState::Unreachable,
+        ),
+    ];
+
+    let authority_health = cluster_state_authority_health(&state, &health);
+    assert_eq!(authority_health.authority_count, 3);
+    assert_eq!(authority_health.online_authority_count, 2);
+    assert_eq!(authority_health.quorum_size, 2);
+    assert!(authority_health.has_quorum());
+
+    let findings = cluster_doctor_findings(&state, &records, &health);
+    let offline_finding = findings
+        .iter()
+        .find(|finding| finding.code == "node-offline")
+        .expect("offline member remains visible");
+    assert_eq!(offline_finding.severity, "info");
+    assert!(offline_finding.detail.contains("quorum remains available"));
+    assert!(findings.iter().all(|finding| !finding.is_warning()));
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding.code != "authority-route-missing")
+    );
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding.code != "endpoint-unreachable")
+    );
+}
+
+#[test]
+fn cluster_doctor_warns_when_unavailable_authority_breaks_quorum() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_doctor_quorum_lost").expect("cluster");
+    let first = NodeId::from_legacy_named("node_network_doctor_quorum_first").expect("first");
+    let offline = NodeId::from_legacy_named("node_network_doctor_quorum_offline").expect("offline");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "doctor quorum lost",
+        first,
+        "first",
+        "pk-first",
+        now,
+    );
+    let main_capability =
+        CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("main capability");
+    state.members[0].capabilities = vec![main_capability.clone()];
+    let mut offline_member =
+        ClusterMemberRecord::local_voter(cluster_id, offline, "offline", "pk-offline", now);
+    offline_member.capabilities = vec![main_capability];
+    state.members.push(offline_member.clone());
+    let health = vec![
+        doctor_health_row(
+            &state,
+            &state.members[0],
+            ClusterNodeAvailability::Online,
+            now,
+        ),
+        doctor_health_row(
+            &state,
+            &offline_member,
+            ClusterNodeAvailability::Offline,
+            now,
+        ),
+    ];
+
+    let authority_health = cluster_state_authority_health(&state, &health);
+    assert_eq!(authority_health.authority_count, 2);
+    assert_eq!(authority_health.online_authority_count, 1);
+    assert_eq!(authority_health.quorum_size, 2);
+    assert!(!authority_health.has_quorum());
+
+    let findings = cluster_doctor_findings(&state, &[], &health);
+    assert!(
+        findings
+            .iter()
+            .any(|finding| { finding.code == "node-offline" && finding.severity == "warning" })
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.code == "authority-route-missing")
+    );
+}
+
 #[test]
 fn cluster_doctor_suppresses_unreachable_endpoint_when_target_has_healthy_route() {
     let now = OffsetDateTime::now_utc();
