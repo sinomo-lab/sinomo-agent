@@ -35,11 +35,11 @@ use sui::{
     Alignment, ArrangeCtx, Constraints, ContextMenu, ControlSize, DefaultTheme, Event, EventCtx,
     FieldGroup, FixedPaneSplit, Flex, FlexItem, FlexWrap, FontWeight, FormRow, FormSection,
     IconButton, IconGlyph, Label, ListItem, ListView, MeasureCtx, MenuItem, NumberInput, PaintCtx,
-    PasswordInput, PointerEventKind, ProgressBar, RebuildOnConstraints, Rect, ScrollState,
-    ScrollView, Select, SelectionScope, SemanticTone, SemanticsCtx, Separator, Size, SizedBox,
-    Spinner, Stack, StatusBadge, Switch, SwitchView, TabBar, TextArea, TextCommand, TextInput,
-    ThemeTextToken, Tooltip, TooltipPlacement, TrailingSlotRow, Widget, WidgetPod,
-    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
+    PasswordInput, PointerEventKind, ProgressBar, RebuildOnConstraints, Rect, RichText,
+    ScrollState, ScrollView, Select, SelectionScope, SemanticTone, SemanticsCtx, Separator, Size,
+    SizedBox, Spinner, Stack, StatusBadge, Switch, SwitchView, TabBar, TextArea, TextCommand,
+    TextDocument, TextInput, ThemeTextToken, Tooltip, TooltipPlacement, TrailingSlotRow, Widget,
+    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
 };
 
 use sinomo_runtime::config::{
@@ -4084,15 +4084,25 @@ where
         let s = shared.clone();
         Rc::new(move || status_when(&s.settings()))
     };
-    let error_label = Label::dynamic("Settings error", {
+    let error_selection = SelectionScope::new();
+    let error_style = {
+        let mut style = settings_text_style(shared, shared.theme().text.base);
+        style.color = palette(shared).danger_text;
+        style
+    };
+    let error_text = RichText::dynamic(TextDocument::from_plain_text("", error_style), {
         let error = Rc::clone(&error);
-        move || error().unwrap_or_default()
-    })
-    .style(settings_text_style(shared, shared.theme().text.base))
-    .color_when({
         let s = shared.clone();
-        move || palette(&s).danger_text
-    });
+        move || {
+            let mut style = settings_text_style(&s, s.theme().text.base);
+            style.color = palette(&s).danger_text;
+            TextDocument::from_plain_text(error().unwrap_or_default(), style)
+        }
+    })
+    .semantic_name("Settings error")
+    .selectable(error_selection.clone());
+    let error_text =
+        read_only_text_menu(reader, "settings-error", error_text, error_selection, true);
     let status_label = Label::dynamic("Settings status", {
         let status = Rc::clone(&status);
         move || status().unwrap_or_default()
@@ -4106,7 +4116,7 @@ where
     SwitchView::new()
         .with_child(SizedBox::new().height(0.0))
         .with_child(
-            FormRow::new("Error", error_label)
+            FormRow::new("Error", error_text)
                 .inline()
                 .theme_when(clone_reader(reader)),
         )
@@ -11663,6 +11673,78 @@ mod tests {
         field.expect().to_be_focused()?;
         field.expect().to_have_value("AB")?;
         assert_eq!(shared.settings().agent_form.name, "AB");
+
+        Ok(())
+    }
+
+    #[test]
+    fn settings_error_text_can_be_selected_and_copied() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let error_message =
+            "agent definition store I/O failed at /services/sinomo/agents: metadata unavailable";
+        shared.settings_mut().agent_action_error = Some(error_message.to_string());
+        let reader: ThemeReader = {
+            let s = shared.clone();
+            Rc::new(move || s.theme())
+        };
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Selectable settings error")
+                    .root(feedback_slot(
+                        &shared,
+                        &reader,
+                        |settings| settings.agent_action_error.clone(),
+                        |settings| settings.agent_action_status.clone(),
+                    )),
+            )
+            .build()?;
+        let clipboard = runtime.clipboard();
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let error = window
+            .get_by_role(sui::SemanticsRole::Text)
+            .with_name("Settings error");
+
+        error.expect().to_have_value(error_message)?;
+        error.focus()?;
+        let mut select_all = sui::KeyboardEvent::new("a", sui::KeyState::Pressed);
+        select_all.modifiers.control = true;
+        error.dispatch_event(sui::Event::Keyboard(select_all))?;
+        let mut copy = sui::KeyboardEvent::new("c", sui::KeyState::Pressed);
+        copy.modifiers.control = true;
+        error.dispatch_event(sui::Event::Keyboard(copy))?;
+        assert_eq!(clipboard.text().as_deref(), Some(error_message));
+
+        clipboard.set_text("context menu did not copy");
+        let error_node = window
+            .snapshot()?
+            .accessibility
+            .nodes
+            .into_iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::Text
+                    && node.name.as_deref() == Some("Settings error")
+            })
+            .expect("settings error semantics");
+        let center = sui::Point::new(
+            error_node.bounds.x() + error_node.bounds.width() * 0.5,
+            error_node.bounds.y() + error_node.bounds.height() * 0.5,
+        );
+        let mut secondary_down = sui::PointerEvent::new(sui::PointerEventKind::Down, center);
+        secondary_down.pointer_id = 1;
+        secondary_down.button = Some(sui::PointerButton::Secondary);
+        secondary_down.buttons = sui::PointerButtons::new(2);
+        window
+            .root()
+            .dispatch_event(sui::Event::Pointer(secondary_down))?;
+        window
+            .get_by_role(sui::SemanticsRole::MenuItem)
+            .with_name("Copy")
+            .click()?;
+        assert_eq!(clipboard.text().as_deref(), Some(error_message));
 
         Ok(())
     }
