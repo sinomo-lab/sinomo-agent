@@ -68,6 +68,25 @@ fn daemon_role_owns_default_dfs(label: &str) -> bool {
     label == "daemon"
 }
 
+/// A settled one-node cluster has no peer whose later publication can repair
+/// missing DFS placement. Complete its compact control-plane bootstrap before
+/// accepting app traffic so a fresh embedded daemon cannot expose SIFS with an
+/// empty metadata-shard topology.
+fn daemon_default_dfs_bootstrap_must_complete_before_serving(
+    paths: &DaemonPaths,
+    label: &str,
+) -> Result<bool, DaemonError> {
+    if !daemon_role_owns_default_dfs(label) {
+        return Ok(false);
+    }
+    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+    if !cluster_paths.state.exists() {
+        return Ok(false);
+    }
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+    Ok(sinomo_core::network::cluster_is_settled_solo(&state))
+}
+
 async fn daemon_optional_notify(notify: Option<Arc<tokio::sync::Notify>>) {
     if let Some(notify) = notify {
         notify.notified().await;
@@ -694,25 +713,34 @@ pub fn run_daemon_control_loop_with_services(
     ));
 
     if daemon_role_owns_default_dfs(label) {
-        let bootstrap_paths = paths.clone();
-        let bootstrap_options = options.clone();
-        let bootstrap_label = label.to_string();
-        let bootstrap_runtime = daemon_runtime_handle.clone();
-        let bootstrap_task = daemon_runtime_handle.spawn(async move {
-            if let Err(error) = ensure_default_distributed_dfs_async_on_runtime(
-                &bootstrap_paths,
-                &bootstrap_options,
-                false,
-                bootstrap_runtime,
-            )
-            .await
-            {
-                tracing::warn!(
-                    "sinomo {bootstrap_label} distributed DFS bootstrap failed: {error}"
-                );
-            }
-        });
-        runtime_tasks.push(("distributed DFS bootstrap", bootstrap_task));
+        if daemon_default_dfs_bootstrap_must_complete_before_serving(&paths, label)? {
+            daemon_runtime.block_on(ensure_default_distributed_dfs_async_on_runtime(
+                &paths,
+                &options,
+                true,
+                daemon_runtime_handle.clone(),
+            ))?;
+        } else {
+            let bootstrap_paths = paths.clone();
+            let bootstrap_options = options.clone();
+            let bootstrap_label = label.to_string();
+            let bootstrap_runtime = daemon_runtime_handle.clone();
+            let bootstrap_task = daemon_runtime_handle.spawn(async move {
+                if let Err(error) = ensure_default_distributed_dfs_async_on_runtime(
+                    &bootstrap_paths,
+                    &bootstrap_options,
+                    false,
+                    bootstrap_runtime,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "sinomo {bootstrap_label} distributed DFS bootstrap failed: {error}"
+                    );
+                }
+            });
+            runtime_tasks.push(("distributed DFS bootstrap", bootstrap_task));
+        }
     }
 
     let idle_stats = Arc::new(crate::IdleStatsAtomics::new());
@@ -4489,6 +4517,7 @@ mod tests {
     use crate::{DaemonRunOptions, sign_daemon_rpc_request_from_data_dir};
     use sinomo_core::local::SinomoDataDir;
     use sinomo_core::node::NodeId;
+    use sinomo_dfs::DfsMetadataBackend;
     use std::fs;
     use std::net::{TcpListener, TcpStream};
     use std::time::{Duration, Instant};
@@ -5762,6 +5791,91 @@ mod tests {
             entry.mutation,
             sinomo_dfs::DfsMetadataMutation::PutObject { .. }
         )));
+    }
+
+    #[test]
+    fn settled_solo_daemon_publishes_dfs_topology_before_serving() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-control-solo-dfs-ready");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_solo_dfs_ready")
+                .expect("cluster");
+        let local = NodeId::from_legacy_named("node_daemon_solo_dfs_ready").expect("local node");
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "daemon solo DFS ready",
+            local,
+            "local",
+            "pk-local",
+            now,
+        );
+        state.members[0].capabilities =
+            sinomo_core::node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("cluster KV");
+
+        let port_listener = TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let port = port_listener.local_addr().expect("local addr").port();
+        drop(port_listener);
+        let address = format!("127.0.0.1:{port}");
+        let paths = DaemonPaths::new(&data_dir);
+        let options = DaemonRunOptions {
+            host: "127.0.0.1".to_string(),
+            port,
+        };
+        let cluster = crate::daemon_cluster_status(&state, crate::DaemonClusterProcess::Main)
+            .expect("main cluster status");
+        let daemon = thread::spawn({
+            let paths = paths.clone();
+            move || run_daemon_control_loop(options, paths, "daemon", Some(cluster))
+        });
+
+        let start = Instant::now();
+        while send_test_status_request(&data_dir, &address, Duration::from_millis(200)).is_err() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "daemon did not become ready"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let file_system = sinomo_dfs::default_cluster_sifs(&state);
+        let shard_entries = sinomo_core::kv::read_cluster_kv_prefix_entries(
+            &cluster_paths.kv_paths(),
+            &format!(
+                "{}/",
+                sinomo_dfs::metadata_shards_prefix(&file_system.file_system_id)
+            ),
+        )
+        .expect("metadata shard topology");
+        let backend =
+            sinomo_dfs::open_cluster_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)
+                .expect("open sharded backend")
+                .expect("configured sharded backend");
+        let services_anchor = backend
+            .get_object_by_path(&file_system.file_system_id, sinomo_dfs::SIFS_SERVICES_PATH)
+            .expect("services anchor lookup");
+
+        send_test_shutdown_request(&data_dir, &address, Duration::from_secs(3))
+            .expect("shutdown request");
+        daemon
+            .join()
+            .expect("daemon thread")
+            .expect("daemon exits cleanly");
+
+        assert_eq!(
+            shard_entries.len(),
+            3,
+            "a ready solo daemon must expose root, users, and services shard placement"
+        );
+        assert!(
+            services_anchor.is_some(),
+            "a ready solo daemon must materialize the /services namespace anchor"
+        );
     }
 
     #[test]
