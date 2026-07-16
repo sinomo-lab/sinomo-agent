@@ -2118,6 +2118,10 @@ fn run_protocol_codec_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult 
 fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let timeout = expect_timeout(ctx)?;
     let deadline = Instant::now() + timeout;
+    let data_dir = SinomoDataDir::new(ctx.data_dir());
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let cluster_state = cluster::read_cluster_state(&cluster_paths)
+        .map_err(|error| SinomoTestError::failed(error.to_string()))?;
     let backend = open_backend_with_deadline(ctx, deadline)?;
     let node = backend.node_label();
     ctx.record("node", &node);
@@ -2164,45 +2168,15 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     "cluster DFS invariants require local operator status".to_string(),
                 )
             })?;
-        let local_primary_shards = operator_status
-            .metadata_shards
-            .iter()
-            .filter(|shard| {
-                shard
-                    .primary_node_id
-                    .as_ref()
-                    .is_some_and(|primary| primary.as_str() == node.as_str())
-            })
-            .collect::<Vec<_>>();
-        let local_primary_replica_count = local_primary_shards
-            .iter()
-            .map(|shard| shard.replica_lag.len())
-            .sum::<usize>();
-        let configured_local_primary_replica_count = local_primary_shards
-            .iter()
-            .map(|shard| shard.replica_node_ids.len())
-            .sum::<usize>();
-        let lagging_local_primary_replica_count = local_primary_shards
-            .iter()
-            .flat_map(|shard| shard.replica_lag.iter())
-            .filter(|lag| lag.lag_entries != 0)
-            .count();
-        let max_local_primary_replica_lag_entries = local_primary_shards
-            .iter()
-            .flat_map(|shard| shard.replica_lag.iter())
-            .map(|lag| lag.lag_entries)
-            .max()
-            .unwrap_or(0);
-        if local_primary_replica_count != configured_local_primary_replica_count {
-            violations.push(format!(
-                "local_primary_replica_status_count={local_primary_replica_count}, configured={configured_local_primary_replica_count}"
-            ));
-        }
-        if lagging_local_primary_replica_count != 0 {
-            violations.push(format!(
-                "lagging_local_primary_replica_count={lagging_local_primary_replica_count}, max_lag_entries={max_local_primary_replica_lag_entries}"
-            ));
-        }
+        let explicitly_unreachable_replica_node_ids =
+            dfs_explicitly_unreachable_targets_from_state(&cluster_paths, &cluster_state);
+        let replica_assessment = assess_dfs_invariant_replica_health(
+            &node,
+            &operator_status.metadata_shards,
+            &explicitly_unreachable_replica_node_ids,
+        );
+        violations.extend(replica_assessment.violations());
+        record_dfs_invariant_replica_assessment(ctx, &replica_assessment);
         if violations.is_empty() {
             ctx.record("object_count", metrics.object_count);
             ctx.record("repair_job_count", metrics.repair_job_count);
@@ -2215,16 +2189,6 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             ctx.record(
                 "authoritative_write_frozen_shard_count",
                 metrics.authoritative_write_frozen_shard_count,
-            );
-            ctx.record("local_primary_shard_count", local_primary_shards.len());
-            ctx.record("local_primary_replica_count", local_primary_replica_count);
-            ctx.record(
-                "lagging_local_primary_replica_count",
-                lagging_local_primary_replica_count,
-            );
-            ctx.record(
-                "max_local_primary_replica_lag_entries",
-                max_local_primary_replica_lag_entries,
             );
             return Ok(SinomoTestOutcome::passed(format!(
                 "DFS operational invariants hold on node {node}"
@@ -2240,6 +2204,225 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         }
         std::thread::sleep(EXPECT_POLL_INTERVAL);
     }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DfsInvariantReplicaAssessment {
+    local_primary_shard_count: usize,
+    reported_replica_count: usize,
+    configured_replica_count: usize,
+    explicitly_unreachable_configured_replica_count: usize,
+    reachable_reported_replica_count: usize,
+    reachable_configured_replica_count: usize,
+    lagging_reachable_replica_count: usize,
+    max_reachable_replica_lag_entries: u64,
+    lagging_unreachable_replica_count: usize,
+    max_unreachable_replica_lag_entries: u64,
+    explicitly_unreachable_replica_node_ids: BTreeSet<NodeId>,
+    reachable_replica_status_mismatches: Vec<String>,
+    metadata_quorum_losses: Vec<String>,
+}
+
+impl DfsInvariantReplicaAssessment {
+    fn violations(&self) -> Vec<String> {
+        let mut violations = Vec::new();
+        if !self.reachable_replica_status_mismatches.is_empty() {
+            violations.push(format!(
+                "reachable_local_primary_replica_status_mismatches={}",
+                self.reachable_replica_status_mismatches.join(";")
+            ));
+        }
+        if self.lagging_reachable_replica_count != 0 {
+            violations.push(format!(
+                "lagging_reachable_local_primary_replica_count={}, max_lag_entries={}",
+                self.lagging_reachable_replica_count, self.max_reachable_replica_lag_entries
+            ));
+        }
+        if !self.metadata_quorum_losses.is_empty() {
+            violations.push(format!(
+                "local_primary_metadata_quorum_lost={}",
+                self.metadata_quorum_losses.join(";")
+            ));
+        }
+        violations
+    }
+}
+
+fn dfs_explicitly_unreachable_targets_from_state(
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+) -> BTreeSet<NodeId> {
+    state
+        .members
+        .iter()
+        .filter(|member| {
+            member.state.is_authorized()
+                && member.capabilities.iter().any(|capability| {
+                    capability.as_str() == sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY
+                })
+                && network::cluster_member_main_daemon_connectivity(cluster_paths, state, member)
+                    == network::ClusterMemberMainDaemonConnectivity::Unreachable
+                && !dfs_target_has_healthy_route(cluster_paths, state, &member.node_id)
+        })
+        .map(|member| member.node_id.clone())
+        .collect()
+}
+
+fn assess_dfs_invariant_replica_health(
+    local_node_id: &str,
+    metadata_shards: &[dfs::DfsMetadataShardStatus],
+    explicitly_unreachable_node_ids: &BTreeSet<NodeId>,
+) -> DfsInvariantReplicaAssessment {
+    let mut assessment = DfsInvariantReplicaAssessment::default();
+    for shard in metadata_shards.iter().filter(|shard| {
+        shard
+            .primary_node_id
+            .as_ref()
+            .is_some_and(|primary| primary.as_str() == local_node_id)
+    }) {
+        assessment.local_primary_shard_count += 1;
+        assessment.reported_replica_count += shard.replica_lag.len();
+        assessment.configured_replica_count += shard.replica_node_ids.len();
+
+        let configured_node_ids = shard
+            .replica_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let reported_node_ids = shard
+            .replica_lag
+            .iter()
+            .map(|lag| lag.target_node_id.clone())
+            .collect::<BTreeSet<_>>();
+        let unreachable_configured_node_ids = configured_node_ids
+            .intersection(explicitly_unreachable_node_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let reachable_configured_node_ids = configured_node_ids
+            .difference(&unreachable_configured_node_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let reachable_reported_node_ids = reported_node_ids
+            .intersection(&reachable_configured_node_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let missing_reachable_node_ids = reachable_configured_node_ids
+            .difference(&reported_node_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let unexpected_reported_node_ids = reported_node_ids
+            .difference(&configured_node_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+
+        assessment.explicitly_unreachable_configured_replica_count +=
+            unreachable_configured_node_ids.len();
+        assessment.reachable_configured_replica_count += reachable_configured_node_ids.len();
+        assessment.reachable_reported_replica_count += reachable_reported_node_ids.len();
+        assessment
+            .explicitly_unreachable_replica_node_ids
+            .extend(unreachable_configured_node_ids.iter().cloned());
+
+        if !missing_reachable_node_ids.is_empty() || !unexpected_reported_node_ids.is_empty() {
+            assessment.reachable_replica_status_mismatches.push(format!(
+                "{} missing_reachable={:?} unexpected={:?}",
+                shard.shard_id.0,
+                node_id_strings(&missing_reachable_node_ids),
+                node_id_strings(&unexpected_reported_node_ids)
+            ));
+        }
+
+        for lag in &shard.replica_lag {
+            if lag.lag_entries == 0 {
+                continue;
+            }
+            if unreachable_configured_node_ids.contains(&lag.target_node_id) {
+                assessment.lagging_unreachable_replica_count += 1;
+                assessment.max_unreachable_replica_lag_entries = assessment
+                    .max_unreachable_replica_lag_entries
+                    .max(lag.lag_entries);
+            } else if reachable_configured_node_ids.contains(&lag.target_node_id) {
+                assessment.lagging_reachable_replica_count += 1;
+                assessment.max_reachable_replica_lag_entries = assessment
+                    .max_reachable_replica_lag_entries
+                    .max(lag.lag_entries);
+            }
+        }
+
+        let quorum_size = dfs::dfs_metadata_replica_quorum_size(shard.replica_node_ids.len());
+        let available_participant_count = reachable_configured_node_ids.len().saturating_add(1);
+        if available_participant_count < quorum_size {
+            assessment.metadata_quorum_losses.push(format!(
+                "{} available={available_participant_count} quorum={quorum_size} configured={} unreachable={:?}",
+                shard.shard_id.0,
+                shard.replica_node_ids.len().saturating_add(1),
+                node_id_strings(&unreachable_configured_node_ids)
+            ));
+        }
+    }
+    assessment
+}
+
+fn node_id_strings(node_ids: &BTreeSet<NodeId>) -> Vec<String> {
+    node_ids.iter().map(ToString::to_string).collect()
+}
+
+fn record_dfs_invariant_replica_assessment(
+    ctx: &mut SinomoTestContext,
+    assessment: &DfsInvariantReplicaAssessment,
+) {
+    ctx.record(
+        "local_primary_shard_count",
+        assessment.local_primary_shard_count,
+    );
+    ctx.record(
+        "local_primary_replica_count",
+        assessment.reported_replica_count,
+    );
+    ctx.record(
+        "configured_local_primary_replica_count",
+        assessment.configured_replica_count,
+    );
+    ctx.record(
+        "explicitly_unreachable_configured_local_primary_replica_count",
+        assessment.explicitly_unreachable_configured_replica_count,
+    );
+    ctx.record(
+        "explicitly_unreachable_local_primary_replica_node_ids",
+        node_id_strings(&assessment.explicitly_unreachable_replica_node_ids),
+    );
+    ctx.record(
+        "reachable_local_primary_replica_count",
+        assessment.reachable_reported_replica_count,
+    );
+    ctx.record(
+        "configured_reachable_local_primary_replica_count",
+        assessment.reachable_configured_replica_count,
+    );
+    ctx.record(
+        "lagging_reachable_local_primary_replica_count",
+        assessment.lagging_reachable_replica_count,
+    );
+    ctx.record(
+        "max_reachable_local_primary_replica_lag_entries",
+        assessment.max_reachable_replica_lag_entries,
+    );
+    ctx.record(
+        "lagging_unreachable_local_primary_replica_count",
+        assessment.lagging_unreachable_replica_count,
+    );
+    ctx.record(
+        "max_unreachable_local_primary_replica_lag_entries",
+        assessment.max_unreachable_replica_lag_entries,
+    );
+    ctx.record(
+        "reachable_local_primary_replica_status_mismatches",
+        &assessment.reachable_replica_status_mismatches,
+    );
+    ctx.record(
+        "local_primary_metadata_quorum_losses",
+        &assessment.metadata_quorum_losses,
+    );
 }
 
 fn run_lightweight_latency(ctx: &mut SinomoTestContext) -> SinomoTestResult {
@@ -4859,6 +5042,215 @@ mod tests {
             remote_shard_write_phase_timeout(Duration::from_secs(3)),
             Duration::from_secs(3)
         );
+    }
+
+    #[test]
+    fn dfs_invariants_tolerate_lag_on_one_explicitly_unreachable_replica_with_quorum() {
+        let local = NodeId::from_legacy_named("node_dfs_invariant_local").expect("local");
+        let offline = NodeId::from_legacy_named("node_dfs_invariant_offline").expect("offline");
+        let reachable_a =
+            NodeId::from_legacy_named("node_dfs_invariant_reachable_a").expect("reachable a");
+        let reachable_b =
+            NodeId::from_legacy_named("node_dfs_invariant_reachable_b").expect("reachable b");
+        let shard = invariant_metadata_shard_status(
+            &local,
+            &[offline.clone(), reachable_a.clone(), reachable_b.clone()],
+            &[
+                (offline.clone(), 5),
+                (reachable_a.clone(), 0),
+                (reachable_b.clone(), 0),
+            ],
+        );
+        let explicitly_unreachable = BTreeSet::from([offline.clone()]);
+
+        let assessment =
+            assess_dfs_invariant_replica_health(local.as_str(), &[shard], &explicitly_unreachable);
+
+        assert!(assessment.violations().is_empty(), "{assessment:?}");
+        assert_eq!(assessment.configured_replica_count, 3);
+        assert_eq!(assessment.reported_replica_count, 3);
+        assert_eq!(
+            assessment.explicitly_unreachable_configured_replica_count,
+            1
+        );
+        assert_eq!(assessment.lagging_unreachable_replica_count, 1);
+        assert_eq!(assessment.max_unreachable_replica_lag_entries, 5);
+        assert_eq!(assessment.lagging_reachable_replica_count, 0);
+        assert_eq!(
+            assessment.explicitly_unreachable_replica_node_ids,
+            BTreeSet::from([offline])
+        );
+    }
+
+    #[test]
+    fn dfs_invariants_keep_reachable_replica_lag_as_a_failure() {
+        let local = NodeId::from_legacy_named("node_dfs_invariant_lag_local").expect("local");
+        let offline = NodeId::from_legacy_named("node_dfs_invariant_lag_offline").expect("offline");
+        let reachable_a =
+            NodeId::from_legacy_named("node_dfs_invariant_lag_reachable_a").expect("reachable a");
+        let reachable_b =
+            NodeId::from_legacy_named("node_dfs_invariant_lag_reachable_b").expect("reachable b");
+        let shard = invariant_metadata_shard_status(
+            &local,
+            &[offline.clone(), reachable_a.clone(), reachable_b.clone()],
+            &[(offline.clone(), 7), (reachable_a, 2), (reachable_b, 0)],
+        );
+
+        let assessment = assess_dfs_invariant_replica_health(
+            local.as_str(),
+            &[shard],
+            &BTreeSet::from([offline]),
+        );
+        let violations = assessment.violations();
+
+        assert_eq!(assessment.lagging_reachable_replica_count, 1);
+        assert_eq!(assessment.max_reachable_replica_lag_entries, 2);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("lagging_reachable")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn dfs_invariants_retain_counts_but_allow_missing_status_for_unreachable_replica() {
+        let local = NodeId::from_legacy_named("node_dfs_invariant_count_local").expect("local");
+        let offline =
+            NodeId::from_legacy_named("node_dfs_invariant_count_offline").expect("offline");
+        let reachable_a =
+            NodeId::from_legacy_named("node_dfs_invariant_count_reachable_a").expect("reachable a");
+        let reachable_b =
+            NodeId::from_legacy_named("node_dfs_invariant_count_reachable_b").expect("reachable b");
+        let shard = invariant_metadata_shard_status(
+            &local,
+            &[offline.clone(), reachable_a.clone(), reachable_b.clone()],
+            &[(reachable_a, 0), (reachable_b, 0)],
+        );
+
+        let assessment = assess_dfs_invariant_replica_health(
+            local.as_str(),
+            &[shard],
+            &BTreeSet::from([offline]),
+        );
+
+        assert!(assessment.violations().is_empty(), "{assessment:?}");
+        assert_eq!(assessment.configured_replica_count, 3);
+        assert_eq!(assessment.reported_replica_count, 2);
+        assert_eq!(assessment.reachable_configured_replica_count, 2);
+        assert_eq!(assessment.reachable_reported_replica_count, 2);
+        assert!(assessment.reachable_replica_status_mismatches.is_empty());
+    }
+
+    #[test]
+    fn dfs_invariants_keep_metadata_quorum_loss_as_a_failure() {
+        let local = NodeId::from_legacy_named("node_dfs_invariant_quorum_local").expect("local");
+        let offline_a =
+            NodeId::from_legacy_named("node_dfs_invariant_quorum_offline_a").expect("offline a");
+        let offline_b =
+            NodeId::from_legacy_named("node_dfs_invariant_quorum_offline_b").expect("offline b");
+        let reachable =
+            NodeId::from_legacy_named("node_dfs_invariant_quorum_reachable").expect("reachable");
+        let shard = invariant_metadata_shard_status(
+            &local,
+            &[offline_a.clone(), offline_b.clone(), reachable.clone()],
+            &[
+                (offline_a.clone(), 4),
+                (offline_b.clone(), 3),
+                (reachable, 0),
+            ],
+        );
+
+        let assessment = assess_dfs_invariant_replica_health(
+            local.as_str(),
+            &[shard],
+            &BTreeSet::from([offline_a, offline_b]),
+        );
+        let violations = assessment.violations();
+
+        assert_eq!(assessment.lagging_reachable_replica_count, 0);
+        assert_eq!(assessment.metadata_quorum_losses.len(), 1);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("metadata_quorum_lost")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn dfs_invariant_unreachable_targets_require_explicit_unreachable_connectivity() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-invariant-unreachable-target");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let paths = ClusterPaths::new(&data_dir);
+        let mut state = test_state();
+        let target = state.members[1].node_id.clone();
+        let endpoint = test_endpoint(
+            &target,
+            "endpoint_dfs_invariant_unreachable_target",
+            "unreachable.test:21353",
+        );
+        state.members[1].endpoints = vec![endpoint.clone()];
+        let degraded = connectivity_record(
+            &state,
+            &endpoint,
+            network::ClusterConnectivityState::Degraded,
+        );
+        network::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[degraded],
+        )
+        .expect("write degraded connectivity");
+        assert!(
+            !dfs_explicitly_unreachable_targets_from_state(&paths, &state).contains(&target),
+            "degraded connectivity must remain visible to invariant checks"
+        );
+
+        let unreachable = connectivity_record(
+            &state,
+            &endpoint,
+            network::ClusterConnectivityState::Unreachable,
+        );
+        network::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[unreachable],
+        )
+        .expect("write unreachable connectivity");
+
+        assert!(
+            dfs_explicitly_unreachable_targets_from_state(&paths, &state).contains(&target),
+            "an explicitly unreachable target without a healthy route is tolerated as offline"
+        );
+    }
+
+    fn invariant_metadata_shard_status(
+        primary_node_id: &NodeId,
+        replica_node_ids: &[NodeId],
+        replica_lag: &[(NodeId, u64)],
+    ) -> dfs::DfsMetadataShardStatus {
+        dfs::DfsMetadataShardStatus {
+            shard_id: dfs::DfsMetadataShardId::new("services"),
+            file_system_id: None,
+            primary_node_id: Some(primary_node_id.clone()),
+            replica_node_ids: replica_node_ids.to_vec(),
+            epoch: Some(1),
+            journal_next_sequence: 11,
+            journal_last_sequence: 10,
+            replica_lag: replica_lag
+                .iter()
+                .map(
+                    |(target_node_id, lag_entries)| dfs::DfsMetadataReplicaLagStatus {
+                        target_node_id: target_node_id.clone(),
+                        replicated_through_sequence: 10_u64.saturating_sub(*lag_entries),
+                        lag_entries: *lag_entries,
+                    },
+                )
+                .collect(),
+            replay_cursors: Vec::new(),
+        }
     }
 
     fn test_state() -> ClusterBootstrapState {
