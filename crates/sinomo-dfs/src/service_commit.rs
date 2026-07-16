@@ -380,7 +380,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .unwrap_or_else(|| self.next_request_id());
             full_repair_targets.push((replica_node_id, request_id));
         }
-        let outcomes = self.send_repair_replica_bodies_if_routable(
+        let outcomes = self.send_repair_replica_attachments_if_routable(
             &full_repair_targets,
             intent_id,
             &intent.file_system_id,

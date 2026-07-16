@@ -14,12 +14,11 @@ use crate::{
     DfsDistributedWriteCommand, DfsDistributedWriteResult, DfsError, DfsFileSystemId,
     DfsMessageResponse, DfsMetadataBackend, DfsMetadataShardConfig, DfsMetadataShardId,
     DfsMetadataStore, DfsNamespaceCommand, DfsNamespaceResponse, DfsNamespaceResult, DfsObjectId,
-    DfsObjectMetadata, DfsOutboundBody, DfsPosixCoordinationResult, DfsReadData, DfsReadRangeData,
-    DfsReadResult, DfsRepairAttemptRecord, DfsVersion, DistributedEventualCoordinator,
-    DistributedRepairJob, LocalContentStore, ObjectVersionReader,
+    DfsObjectMetadata, DfsOutboundAttachment, DfsPosixCoordinationResult, DfsReadData,
+    DfsReadRangeData, DfsReadResult, DfsRepairAttemptRecord, DfsVersion,
+    DistributedEventualCoordinator, DistributedRepairJob, LocalContentStore, ObjectVersionReader,
 };
 
-pub(crate) const DFS_BLOB_INLINE_LIMIT_BYTES: usize = 1024 * 1024;
 pub(crate) const DFS_REMOTE_READ_RETRY_DELAY: Duration = Duration::from_secs(1);
 pub(crate) const DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE: usize = 4096;
 pub(crate) const DFS_METADATA_OBJECT_VERSION_PAGE_SIZE: usize = 1024;
@@ -65,7 +64,6 @@ pub(crate) const DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_ENTRY_LIMIT: usize = 2048
 pub(crate) const DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BYTE_LIMIT: usize =
     crate::DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT;
 pub(crate) const DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT: usize = 3;
-pub(crate) const DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT: u64 = DFS_BLOB_INLINE_LIMIT_BYTES as u64;
 pub(crate) const DFS_ROUTED_NAMESPACE_IDLE_WAIT: Duration = Duration::from_millis(10);
 pub(crate) const DFS_SERVED_NAMESPACE_REPLAY_LIMIT: usize = 32;
 
@@ -161,7 +159,7 @@ pub struct NetworkedDfsService<T> {
 #[derive(Debug)]
 pub struct DfsMessageProcessResult {
     pub response: DfsMessageResponse,
-    pub body: Option<DfsOutboundBody>,
+    pub attachment: Option<DfsOutboundAttachment>,
     pub events: Vec<NetworkedDfsServiceEvent>,
 }
 

@@ -482,19 +482,6 @@ pub fn daemon_rpc_body_sha256(request: &ObjectRpcRequest) -> Vec<u8> {
     digest.finish().as_ref().to_vec()
 }
 
-/// Computes the body-only digest used by daemon-auth implementations before
-/// request metadata became part of the authenticated request.
-///
-/// New requests must use [`daemon_rpc_body_sha256`]. This is exposed only so a
-/// rolling-upgrade client can retry a request after an older daemon explicitly
-/// rejects the metadata-bound signature, and so a new daemon can recognize the
-/// narrowly allowed legacy status probe.
-pub fn daemon_rpc_legacy_body_sha256(request: &ObjectRpcRequest) -> Vec<u8> {
-    digest::digest(&digest::SHA256, &request.body)
-        .as_ref()
-        .to_vec()
-}
-
 fn daemon_rpc_digest_update_bytes(digest: &mut digest::Context, bytes: &[u8]) {
     daemon_rpc_digest_update_len(digest, bytes.len());
     digest.update(bytes);
@@ -779,30 +766,6 @@ mod tests {
         assert_ne!(
             daemon_rpc_body_sha256(&request_a),
             daemon_rpc_body_sha256(&request_b)
-        );
-    }
-
-    #[test]
-    fn legacy_daemon_rpc_digest_is_body_only() {
-        let request = ObjectRpcRequest::from_encoded_body(
-            "/test/daemon-auth",
-            "test",
-            b"request-body".to_vec(),
-        )
-        .with_metadata("sender-controlled", "value");
-        let changed_metadata = request
-            .clone()
-            .with_metadata("sender-controlled", "changed");
-        let expected = digest::digest(&digest::SHA256, b"request-body");
-
-        assert_eq!(daemon_rpc_legacy_body_sha256(&request), expected.as_ref());
-        assert_eq!(
-            daemon_rpc_legacy_body_sha256(&request),
-            daemon_rpc_legacy_body_sha256(&changed_metadata)
-        );
-        assert_ne!(
-            daemon_rpc_body_sha256(&request),
-            daemon_rpc_legacy_body_sha256(&request)
         );
     }
 

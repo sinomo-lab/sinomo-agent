@@ -1,8 +1,7 @@
 //! DFS networked read transfer message handlers.
 //!
 //! This module owns remote read serving and response assembly: read requests,
-//! bulk read requests, inline responses, range responses, and reader-backed
-//! response bodies.
+//! bulk read requests, range responses, and reader-backed response bodies.
 
 use std::io::Read;
 use std::time::Instant;
@@ -48,61 +47,34 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         }
                         Ok(_) => match range {
                             Some((offset, max_bytes)) => {
-                                let streamed_range = max_bytes > DFS_BLOB_INLINE_LIMIT_BYTES;
-                                if streamed_range {
-                                    match self.open_local_current_object_range_stream_with_state(
-                                        &request.object_id,
-                                        offset,
-                                        max_bytes,
-                                    )? {
-                                        NetworkedDfsRangeReadStreamOutcome::Found(stream)
-                                            if stream.range_size_bytes > 0 =>
-                                        {
-                                            self.send_networked_range_read_response_body_from_reader(
-                                        &requester_node_id,
-                                        &request,
-                                        &stream.data,
-                                        stream.reader,
-                                    )?;
-                                            sent_body_response = true;
-                                            DfsReadResult::RangeFound(stream.data)
-                                        }
-                                        NetworkedDfsRangeReadStreamOutcome::Found(stream) => {
-                                            DfsReadResult::RangeFound(stream.data)
-                                        }
-                                        NetworkedDfsRangeReadStreamOutcome::Conflicted {
-                                            conflicts,
-                                        } => DfsReadResult::Rejected {
-                                            reason: read_conflicts_reason(conflicts),
-                                        },
-                                        NetworkedDfsRangeReadStreamOutcome::PendingReplication
-                                        | NetworkedDfsRangeReadStreamOutcome::NotFound => {
-                                            DfsReadResult::NotFound
-                                        }
+                                match self.open_local_current_object_range_stream_with_state(
+                                    &request.object_id,
+                                    offset,
+                                    max_bytes,
+                                )? {
+                                    NetworkedDfsRangeReadStreamOutcome::Found(stream)
+                                        if stream.range_size_bytes > 0 =>
+                                    {
+                                        self.send_networked_range_read_response_attachment_from_reader(
+                                            &requester_node_id,
+                                            &request,
+                                            &stream.data,
+                                            stream.reader,
+                                        )?;
+                                        sent_body_response = true;
+                                        DfsReadResult::RangeFound(stream.data)
                                     }
-                                } else {
-                                    match self.read_local_object_range_with_state(
-                                        &request.object_id,
-                                        offset,
-                                        max_bytes,
-                                        false,
-                                    )? {
-                                        NetworkedDfsRangeReadOutcome::Found { data, .. } => {
-                                            DfsReadResult::RangeFound(data)
-                                        }
-                                        NetworkedDfsRangeReadOutcome::Conflicted {
-                                            conflicts,
-                                            ..
-                                        } => DfsReadResult::Rejected {
-                                            reason: read_conflicts_reason(conflicts),
-                                        },
-                                        NetworkedDfsRangeReadOutcome::PendingReplication {
-                                            ..
-                                        }
-                                        | NetworkedDfsRangeReadOutcome::NotConfirmed { .. }
-                                        | NetworkedDfsRangeReadOutcome::NotFound => {
-                                            DfsReadResult::NotFound
-                                        }
+                                    NetworkedDfsRangeReadStreamOutcome::Found(stream) => {
+                                        DfsReadResult::RangeFound(stream.data)
+                                    }
+                                    NetworkedDfsRangeReadStreamOutcome::Conflicted {
+                                        conflicts,
+                                    } => DfsReadResult::Rejected {
+                                        reason: read_conflicts_reason(conflicts),
+                                    },
+                                    NetworkedDfsRangeReadStreamOutcome::PendingReplication
+                                    | NetworkedDfsRangeReadStreamOutcome::NotFound => {
+                                        DfsReadResult::NotFound
                                     }
                                 }
                             }
@@ -113,10 +85,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     )?;
                                 match stream_outcome {
                                     NetworkedDfsReadStreamOutcome::Found(stream)
-                                        if stream.total_size_bytes
-                                            > DFS_BLOB_INLINE_LIMIT_BYTES as u64 =>
+                                        if stream.total_size_bytes > 0 =>
                                     {
-                                        self.send_networked_read_response_body_from_reader(
+                                        self.send_networked_read_response_attachment_from_reader(
                                             &requester_node_id,
                                             &request,
                                             &stream.data,
@@ -125,28 +96,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                         sent_body_response = true;
                                         DfsReadResult::Found(stream.data)
                                     }
-                                    NetworkedDfsReadStreamOutcome::Found(_) => {
-                                        match self.read_local_object_with_state(
-                                            &request.object_id,
-                                            false,
-                                        )? {
-                                            NetworkedDfsReadOutcome::Found { data, .. } => {
-                                                DfsReadResult::Found(data)
-                                            }
-                                            NetworkedDfsReadOutcome::Conflicted {
-                                                conflicts,
-                                                ..
-                                            } => DfsReadResult::Rejected {
-                                                reason: read_conflicts_reason(conflicts),
-                                            },
-                                            NetworkedDfsReadOutcome::PendingReplication {
-                                                ..
-                                            }
-                                            | NetworkedDfsReadOutcome::NotConfirmed { .. }
-                                            | NetworkedDfsReadOutcome::NotFound => {
-                                                DfsReadResult::NotFound
-                                            }
-                                        }
+                                    NetworkedDfsReadStreamOutcome::Found(stream) => {
+                                        DfsReadResult::Found(stream.data)
                                     }
                                     NetworkedDfsReadStreamOutcome::Conflicted { conflicts } => {
                                         DfsReadResult::Rejected {
@@ -166,29 +117,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
         };
-        match &result {
-            DfsReadResult::Found(_) if sent_body_response => {}
-            DfsReadResult::RangeFound(_) if sent_body_response => {}
-            DfsReadResult::Found(data)
-                if data.bytes.len() > DFS_BLOB_INLINE_LIMIT_BYTES
-                    && !direct_full_read_response_allowed(&request, data.bytes.len() as u64) =>
-            {
-                self.send_networked_read_response_body_from_data(
-                    &requester_node_id,
-                    &request,
-                    data,
-                )?;
-            }
-            _ => {
-                self.send_dfs_message_if_routable(
-                    &requester_node_id,
-                    DfsNetworkMessage::ReadResponse(DfsReadResponse {
-                        request_id: request.request_id.clone(),
-                        object_id: request.object_id.clone(),
-                        result: result.clone(),
-                    }),
-                )?;
-            }
+        if !sent_body_response {
+            self.send_dfs_message_if_routable(
+                &requester_node_id,
+                DfsNetworkMessage::ReadResponse(DfsReadResponse {
+                    request_id: request.request_id.clone(),
+                    object_id: request.object_id.clone(),
+                    result: result.clone(),
+                }),
+            )?;
         }
         Ok(NetworkedDfsServiceEvent::RemoteReadServed {
             request_id: request.request_id,
@@ -221,144 +158,68 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let range_offset = offset.min(total_size_bytes);
                 let range_size_bytes =
                     range_transfer_size_bytes(total_size_bytes, offset, max_bytes);
-                let streamed_range = max_bytes > DFS_BLOB_INLINE_LIMIT_BYTES;
-                if streamed_range {
-                    let range_len =
-                        dfs_byte_count_to_usize("DFS range response", range_size_bytes)?;
-                    let reader = match self.content.open_blob_range_stream(
-                        &content_hash,
-                        range_offset,
-                        range_len,
-                    ) {
-                        Ok(reader) => ObjectVersionReader::from_blob_range(reader),
-                        Err(_) => match self.content.open_object_content_range_stream(
-                            object_id.as_str(),
-                            &content_hash,
-                            total_size_bytes,
-                            range_offset,
-                            range_len,
-                        )? {
-                            Some((_, reader)) => reader,
-                            None => return Ok(Some((DfsReadResult::NotFound, false))),
-                        },
-                    };
-                    let data = DfsReadRangeData {
-                        object_id,
-                        version,
-                        content_hash: Some(content_hash),
-                        offset: range_offset,
-                        total_size_bytes,
-                        bytes: Vec::new(),
-                    };
-                    self.send_networked_range_read_response_body_from_reader(
-                        requester_node_id,
-                        request,
-                        &data,
-                        reader,
-                    )?;
-                    return Ok(Some((DfsReadResult::RangeFound(data), true)));
+                let data = DfsReadRangeData {
+                    object_id: object_id.clone(),
+                    version,
+                    content_hash: Some(content_hash.clone()),
+                    offset: range_offset,
+                    total_size_bytes,
+                    bytes: Vec::new(),
+                };
+                if range_size_bytes == 0 {
+                    return Ok(Some((DfsReadResult::RangeFound(data), false)));
                 }
-                let bytes = match self
-                    .content
-                    .read_blob_range(&content_hash, offset, max_bytes)
-                {
-                    Ok(bytes) => bytes,
-                    Err(_) => match self.content.read_object_content_range(
+                let range_len = dfs_byte_count_to_usize("DFS range response", range_size_bytes)?;
+                let reader = match self.content.open_blob_range_stream(
+                    &content_hash,
+                    range_offset,
+                    range_len,
+                ) {
+                    Ok(reader) => ObjectVersionReader::from_blob_range(reader),
+                    Err(_) => match self.content.open_object_content_range_stream(
                         object_id.as_str(),
                         &content_hash,
                         total_size_bytes,
-                        offset,
-                        max_bytes,
+                        range_offset,
+                        range_len,
                     )? {
-                        Some((_, bytes)) => bytes,
+                        Some((_, reader)) => reader,
                         None => return Ok(Some((DfsReadResult::NotFound, false))),
                     },
                 };
-                return Ok(Some((
-                    DfsReadResult::RangeFound(DfsReadRangeData {
-                        object_id,
-                        version,
-                        content_hash: Some(content_hash),
-                        offset: range_offset,
-                        total_size_bytes,
-                        bytes,
-                    }),
-                    false,
-                )));
+                self.send_networked_range_read_response_attachment_from_reader(
+                    requester_node_id,
+                    request,
+                    &data,
+                    reader,
+                )?;
+                Ok(Some((DfsReadResult::RangeFound(data), true)))
             }
             None => {
-                let total_size_bytes = match hinted_size {
-                    Some(size) => size,
-                    None => {
-                        let Some(bytes) = self.read_blob_once_for_remote_response(&content_hash)?
-                        else {
-                            return Ok(Some((DfsReadResult::NotFound, false)));
-                        };
-                        return Ok(Some((
-                            DfsReadResult::Found(DfsReadData {
-                                object_id,
-                                version,
-                                content_hash: Some(content_hash),
-                                bytes,
-                            }),
-                            false,
-                        )));
-                    }
+                let reader = match self.content.open_blob_stream(&content_hash) {
+                    Ok(reader) => ObjectVersionReader::from_blob(reader),
+                    Err(_) => return Ok(Some((DfsReadResult::NotFound, false))),
                 };
-                if total_size_bytes > DFS_BLOB_INLINE_LIMIT_BYTES as u64 {
-                    if direct_full_read_response_allowed(request, total_size_bytes) {
-                        let Some(bytes) = self.read_blob_for_direct_remote_response(
-                            &content_hash,
-                            total_size_bytes,
-                        )?
-                        else {
-                            return Ok(Some((DfsReadResult::NotFound, false)));
-                        };
-                        return Ok(Some((
-                            DfsReadResult::Found(DfsReadData {
-                                object_id,
-                                version,
-                                content_hash: Some(content_hash),
-                                bytes,
-                            }),
-                            false,
-                        )));
-                    }
-                    let range_len = dfs_byte_count_to_usize("DFS read response", total_size_bytes)?;
-                    let reader =
-                        match self
-                            .content
-                            .open_blob_range_stream(&content_hash, 0, range_len)
-                        {
-                            Ok(reader) => ObjectVersionReader::from_blob_range(reader),
-                            Err(_) => return Ok(Some((DfsReadResult::NotFound, false))),
-                        };
-                    let data = DfsReadData {
-                        object_id,
-                        version,
-                        content_hash: Some(content_hash),
-                        bytes: Vec::new(),
-                    };
-                    self.send_networked_read_response_body_from_reader(
-                        requester_node_id,
-                        request,
-                        &data,
-                        reader,
-                    )?;
-                    return Ok(Some((DfsReadResult::Found(data), true)));
-                }
-                let Some(bytes) = self.read_blob_once_for_remote_response(&content_hash)? else {
+                let total_size_bytes = reader.size_bytes();
+                if hinted_size.is_some_and(|expected| expected != total_size_bytes) {
                     return Ok(Some((DfsReadResult::NotFound, false)));
+                }
+                let data = DfsReadData {
+                    object_id,
+                    version,
+                    content_hash: Some(content_hash),
+                    bytes: Vec::new(),
                 };
-                Ok(Some((
-                    DfsReadResult::Found(DfsReadData {
-                        object_id,
-                        version,
-                        content_hash: Some(content_hash),
-                        bytes,
-                    }),
-                    false,
-                )))
+                if total_size_bytes == 0 {
+                    return Ok(Some((DfsReadResult::Found(data), false)));
+                }
+                self.send_networked_read_response_attachment_from_reader(
+                    requester_node_id,
+                    request,
+                    &data,
+                    reader,
+                )?;
+                Ok(Some((DfsReadResult::Found(data), true)))
             }
         }
     }
@@ -378,39 +239,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map_err(|source| DfsError::ContentStore {
                 message: format!("failed to read blob {content_hash}: {source}"),
             })?;
-        Ok(Some(bytes))
-    }
-
-    fn read_blob_for_direct_remote_response(
-        &self,
-        content_hash: &str,
-        expected_size_bytes: u64,
-    ) -> Result<Option<Vec<u8>>, DfsError> {
-        if expected_size_bytes > DFS_DIRECT_REMOTE_READ_MAX_BYTES {
-            return Ok(None);
-        }
-        let mut reader = match self.content.open_blob_stream(content_hash) {
-            Ok(reader) => reader,
-            Err(_) => return Ok(None),
-        };
-        if reader.size_bytes() != expected_size_bytes {
-            return Ok(None);
-        }
-        let capacity = dfs_byte_count_to_usize("DFS direct remote read", expected_size_bytes)?;
-        let mut bytes = Vec::with_capacity(capacity);
-        reader
-            .read_to_end(&mut bytes)
-            .map_err(|source| DfsError::ContentStore {
-                message: format!("failed to read blob {content_hash}: {source}"),
-            })?;
-        if bytes.len() != capacity {
-            return Err(DfsError::ContentStore {
-                message: format!(
-                    "failed to read full blob {content_hash}: expected {capacity} bytes, actual {}",
-                    bytes.len()
-                ),
-            });
-        }
         Ok(Some(bytes))
     }
 
@@ -444,14 +272,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn bulk_read_item_result(&self, item: &DfsBulkReadItem) -> Result<DfsReadResult, DfsError> {
-        if item.content_size_bytes > DFS_BLOB_INLINE_LIMIT_BYTES as u64 {
-            return Ok(DfsReadResult::Rejected {
-                reason: format!(
-                    "bulk read item {} is {} bytes, above inline limit {}",
-                    item.object_id, item.content_size_bytes, DFS_BLOB_INLINE_LIMIT_BYTES
-                ),
-            });
-        }
         let Some(bytes) = self.read_blob_once_for_remote_response(&item.content_hash)? else {
             return Ok(DfsReadResult::NotFound);
         };
@@ -485,27 +305,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })
     }
 
-    pub(crate) fn send_networked_read_response_body_from_data(
-        &mut self,
-        requester_node_id: &NodeId,
-        request: &DfsReadRequest,
-        data: &DfsReadData,
-    ) -> Result<(), DfsError> {
-        let mut head = data.clone();
-        let bytes = std::mem::take(&mut head.bytes);
-        let digest = head
-            .content_hash
-            .clone()
-            .unwrap_or_else(|| content_hash(&bytes));
-        self.send_networked_read_response_body(
-            requester_node_id,
-            request,
-            DfsReadResult::Found(head),
-            DfsOutboundBody::from_bytes(bytes, digest),
-        )
-    }
-
-    fn send_networked_read_response_body_from_reader(
+    fn send_networked_read_response_attachment_from_reader(
         &mut self,
         requester_node_id: &NodeId,
         request: &DfsReadRequest,
@@ -513,20 +313,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         reader: ObjectVersionReader,
     ) -> Result<(), DfsError> {
         let body_size_bytes = reader.size_bytes();
-        self.send_networked_read_response_body(
+        self.send_networked_read_response_attachment(
             requester_node_id,
             request,
             DfsReadResult::Found(data.clone()),
-            DfsOutboundBody::from_reader_with_transport_integrity(reader, body_size_bytes),
+            DfsOutboundAttachment::from_reader_with_transport_integrity(reader, body_size_bytes),
         )
     }
 
-    fn send_networked_read_response_body(
+    fn send_networked_read_response_attachment(
         &mut self,
         requester_node_id: &NodeId,
         request: &DfsReadRequest,
         result: DfsReadResult,
-        body: DfsOutboundBody,
+        attachment: DfsOutboundAttachment,
     ) -> Result<(), DfsError> {
         let message = DfsNetworkMessage::ReadResponse(DfsReadResponse {
             request_id: request.request_id.clone(),
@@ -535,11 +335,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         });
         let routed = self.next_dfs_routed_message(requester_node_id, message);
         self.transport
-            .send_routed_message_with_body(requester_node_id, routed, body)
+            .send_routed_call(
+                requester_node_id,
+                DfsRoutedCall::with_attachment(routed, attachment),
+            )
             .map_err(DfsError::from_network)
     }
 
-    fn send_networked_range_read_response_body_from_reader(
+    fn send_networked_range_read_response_attachment_from_reader(
         &mut self,
         requester_node_id: &NodeId,
         request: &DfsReadRequest,
@@ -547,11 +350,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         reader: ObjectVersionReader,
     ) -> Result<(), DfsError> {
         let body_size_bytes = reader.size_bytes();
-        self.send_networked_read_response_body(
+        self.send_networked_read_response_attachment(
             requester_node_id,
             request,
             DfsReadResult::RangeFound(data.clone()),
-            DfsOutboundBody::from_reader_with_transport_integrity(reader, body_size_bytes),
+            DfsOutboundAttachment::from_reader_with_transport_integrity(reader, body_size_bytes),
         )
     }
 

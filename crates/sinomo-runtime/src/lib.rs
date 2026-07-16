@@ -491,7 +491,8 @@ mod tests {
         for descriptor in descriptors {
             builder = builder
                 .try_register_route(descriptor, |request| async move {
-                    network::ObjectRpcResponse::encode_body(request.route, &())
+                    network::ObjectRpcResponse::encode_body(request.request.route, &())
+                        .map(network::ObjectRpcSessionResponse::value)
                 })
                 .expect("register module descriptor in network registry");
         }

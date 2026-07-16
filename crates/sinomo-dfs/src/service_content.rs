@@ -203,7 +203,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         size_bytes: u64,
     ) -> Result<ObjectVersionReader, DfsError> {
         let max_bytes = usize::try_from(size_bytes).map_err(|_| DfsError::Distributed {
-            message: format!("DFS patch is too large to transfer: {size_bytes} bytes"),
+            message: format!("DFS patch cannot be addressed on this platform: {size_bytes} bytes"),
         })?;
         let reader = self
             .content

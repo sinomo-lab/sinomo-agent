@@ -16,52 +16,73 @@ use sinomo_core::node::NodeId;
 use crate::protocol::DfsRoutedMessage;
 use crate::routes::{dfs_routed_message_from_object_rpc_request, dfs_routed_message_rpc_request};
 use crate::{
-    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsRpcBodyDescriptor,
+    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsRpcAttachmentDescriptor,
     ObjectVersionReader,
 };
 
 #[derive(Debug)]
-pub struct DfsOutboundBody {
-    pub descriptor: DfsRpcBodyDescriptor,
+pub struct DfsOutboundAttachment {
+    pub descriptor: DfsRpcAttachmentDescriptor,
     pub source: ObjectRpcBodySource,
 }
 
-/// One independently routable DFS request body in a bounded replica fan-out.
+/// One DFS routed message plus its optional semantic attachment.
+#[derive(Debug)]
+pub struct DfsRoutedCall {
+    pub message: DfsRoutedMessage,
+    pub attachment: Option<DfsOutboundAttachment>,
+}
+
+impl DfsRoutedCall {
+    pub fn value(message: DfsRoutedMessage) -> Self {
+        Self {
+            message,
+            attachment: None,
+        }
+    }
+
+    pub fn with_attachment(message: DfsRoutedMessage, attachment: DfsOutboundAttachment) -> Self {
+        Self {
+            message,
+            attachment: Some(attachment),
+        }
+    }
+}
+
+/// One independently routable DFS call in a bounded replica fan-out.
 ///
 /// The target is retained alongside the routed frame so transports can return
 /// one ordered outcome per replica without conflating a failed peer with the
 /// rest of the fan-out.
 #[derive(Debug)]
-pub struct DfsRoutedBodySend {
+pub struct DfsRoutedSend {
     pub target_node_id: NodeId,
-    pub message: DfsRoutedMessage,
-    pub body: DfsOutboundBody,
+    pub call: DfsRoutedCall,
 }
 
-impl DfsRoutedBodySend {
-    pub fn new(target_node_id: NodeId, message: DfsRoutedMessage, body: DfsOutboundBody) -> Self {
+impl DfsRoutedSend {
+    pub fn new(target_node_id: NodeId, call: DfsRoutedCall) -> Self {
         Self {
             target_node_id,
-            message,
-            body,
+            call,
         }
     }
 }
 
 #[derive(Debug)]
-pub struct DfsRoutedBodySendOutcome {
+pub struct DfsRoutedSendOutcome {
     pub target_node_id: NodeId,
     pub result: Result<(), NetworkError>,
 }
 
-impl DfsOutboundBody {
+impl DfsOutboundAttachment {
     pub fn from_reader(
         reader: ObjectVersionReader,
         total_size_bytes: u64,
         content_hash: impl Into<String>,
     ) -> Self {
         Self {
-            descriptor: DfsRpcBodyDescriptor {
+            descriptor: DfsRpcAttachmentDescriptor {
                 total_size_bytes,
                 content_hash: Some(content_hash.into()),
             },
@@ -71,7 +92,7 @@ impl DfsOutboundBody {
 
     pub fn from_bytes(bytes: Vec<u8>, content_hash: impl Into<String>) -> Self {
         Self {
-            descriptor: DfsRpcBodyDescriptor {
+            descriptor: DfsRpcAttachmentDescriptor {
                 total_size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
                 content_hash: Some(content_hash.into()),
             },
@@ -84,7 +105,7 @@ impl DfsOutboundBody {
         total_size_bytes: u64,
     ) -> Self {
         Self {
-            descriptor: DfsRpcBodyDescriptor {
+            descriptor: DfsRpcAttachmentDescriptor {
                 total_size_bytes,
                 content_hash: None,
             },
@@ -110,32 +131,14 @@ impl DfsTransportIdentity for sinomo_core::network::AsyncInProcessTransport {
 }
 
 pub trait DfsMessageTransport: DfsTransportIdentity {
-    fn send_routed_message(
+    fn send_routed_call(
         &mut self,
         target_node_id: &NodeId,
-        message: DfsRoutedMessage,
+        call: DfsRoutedCall,
     ) -> Result<(), NetworkError>;
 
-    fn send_routed_message_with_body(
-        &mut self,
-        target_node_id: &NodeId,
-        message: DfsRoutedMessage,
-        body: DfsOutboundBody,
-    ) -> Result<(), NetworkError> {
-        let max_bytes = usize::try_from(body.descriptor.total_size_bytes).map_err(|_| {
-            NetworkError::FrameTooLarge {
-                actual_bytes: usize::MAX,
-                max_bytes: usize::MAX,
-            }
-        })?;
-        let bytes = collect_dfs_outbound_body_sync(body.source, max_bytes)?;
-        let message =
-            crate::body_rpc::attach_dfs_routed_message_body(message, body.descriptor, bytes)?;
-        self.send_routed_message(target_node_id, message)
-    }
-
-    /// Sends independent replica bodies with at most `max_inflight` sends
-    /// active at once. A zero limit is normalized to one. The compatibility
+    /// Sends independent replica calls with at most `max_inflight` sends
+    /// active at once. A zero limit is normalized to one. The default
     /// implementation is sequential; node transports override it when their
     /// underlying routing handles can be forked without sharing mutable
     /// response queues.
@@ -143,20 +146,16 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
     /// Outcomes remain in request order and a peer-level failure is isolated
     /// to that request. The outer error is reserved for fan-out orchestration
     /// failures where ordered per-peer outcomes cannot be produced.
-    fn send_routed_message_bodies_bounded(
+    fn send_routed_calls_bounded(
         &mut self,
-        requests: Vec<DfsRoutedBodySend>,
+        requests: Vec<DfsRoutedSend>,
         _max_inflight: usize,
-    ) -> Result<Vec<DfsRoutedBodySendOutcome>, NetworkError> {
+    ) -> Result<Vec<DfsRoutedSendOutcome>, NetworkError> {
         Ok(requests
             .into_iter()
             .map(|request| {
-                let result = self.send_routed_message_with_body(
-                    &request.target_node_id,
-                    request.message,
-                    request.body,
-                );
-                DfsRoutedBodySendOutcome {
+                let result = self.send_routed_call(&request.target_node_id, request.call);
+                DfsRoutedSendOutcome {
                     target_node_id: request.target_node_id,
                     result,
                 }
@@ -169,7 +168,7 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         target_node_id: &NodeId,
         message: DfsRoutedMessage,
     ) -> Result<(), NetworkError> {
-        self.send_routed_message(target_node_id, message)
+        self.send_routed_call(target_node_id, DfsRoutedCall::value(message))
     }
 
     /// Send a metadata journal batch over the canonical metadata object-RPC
@@ -268,51 +267,26 @@ pub type DfsMessageTransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Sen
 pub trait AsyncDfsMessageTransport: Send {
     fn local_node_id(&self) -> &NodeId;
 
-    fn send_routed_message_async<'a>(
+    fn send_routed_call_async<'a>(
         &'a mut self,
         target_node_id: &'a NodeId,
-        message: DfsRoutedMessage,
+        call: DfsRoutedCall,
     ) -> DfsMessageTransportFuture<'a, Result<(), NetworkError>>;
 
-    fn send_routed_message_with_body_async<'a>(
-        &'a mut self,
-        target_node_id: &'a NodeId,
-        message: DfsRoutedMessage,
-        body: DfsOutboundBody,
-    ) -> DfsMessageTransportFuture<'a, Result<(), NetworkError>> {
-        Box::pin(async move {
-            let max_bytes = usize::try_from(body.descriptor.total_size_bytes).map_err(|_| {
-                NetworkError::FrameTooLarge {
-                    actual_bytes: usize::MAX,
-                    max_bytes: usize::MAX,
-                }
-            })?;
-            let bytes = body.source.collect_to_vec(max_bytes).await?;
-            let message =
-                crate::body_rpc::attach_dfs_routed_message_body(message, body.descriptor, bytes)?;
-            self.send_routed_message_async(target_node_id, message)
-                .await
-        })
-    }
-
     /// Async counterpart of
-    /// [`DfsMessageTransport::send_routed_message_bodies_bounded`].
-    fn send_routed_message_bodies_bounded_async<'a>(
+    /// [`DfsMessageTransport::send_routed_calls_bounded`].
+    fn send_routed_calls_bounded_async<'a>(
         &'a mut self,
-        requests: Vec<DfsRoutedBodySend>,
+        requests: Vec<DfsRoutedSend>,
         _max_inflight: usize,
-    ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedBodySendOutcome>, NetworkError>> {
+    ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedSendOutcome>, NetworkError>> {
         Box::pin(async move {
             let mut outcomes = Vec::with_capacity(requests.len());
             for request in requests {
                 let result = self
-                    .send_routed_message_with_body_async(
-                        &request.target_node_id,
-                        request.message,
-                        request.body,
-                    )
+                    .send_routed_call_async(&request.target_node_id, request.call)
                     .await;
-                outcomes.push(DfsRoutedBodySendOutcome {
+                outcomes.push(DfsRoutedSendOutcome {
                     target_node_id: request.target_node_id,
                     result,
                 });
@@ -354,7 +328,7 @@ pub trait AsyncDfsMessageTransport: Send {
     }
 }
 
-fn collect_dfs_outbound_body_sync(
+fn collect_dfs_outbound_attachment_sync(
     source: ObjectRpcBodySource,
     max_bytes: usize,
 ) -> Result<Vec<u8>, NetworkError> {
@@ -368,8 +342,8 @@ fn collect_dfs_outbound_body_sync(
             });
         }
         return Err(NetworkError::Io {
-            operation: "collect DFS outbound body".to_string(),
-            detail: "sync DFS body fallback cannot run inside a current-thread Tokio runtime"
+            operation: "collect DFS outbound attachment".to_string(),
+            detail: "sync DFS attachment fallback cannot run inside a current-thread Tokio runtime"
                 .to_string(),
         });
     }
@@ -377,7 +351,7 @@ fn collect_dfs_outbound_body_sync(
         .enable_all()
         .build()
         .map_err(|source| NetworkError::Io {
-            operation: "create DFS body collection runtime".to_string(),
+            operation: "create DFS attachment collection runtime".to_string(),
             detail: source.to_string(),
         })?;
     let result = runtime.block_on(source.collect_to_vec(max_bytes));
@@ -385,32 +359,70 @@ fn collect_dfs_outbound_body_sync(
     result
 }
 
+fn dfs_attachment_size_for_platform(
+    attachment: &DfsOutboundAttachment,
+) -> Result<usize, NetworkError> {
+    usize::try_from(attachment.descriptor.total_size_bytes).map_err(|_| {
+        NetworkError::ResourceExhausted {
+            operation: "materialize DFS attachment".to_string(),
+            requested_bytes: usize::MAX,
+        }
+    })
+}
+
+pub(crate) fn materialize_dfs_routed_call_sync(
+    call: DfsRoutedCall,
+) -> Result<DfsRoutedMessage, NetworkError> {
+    let DfsRoutedCall {
+        message,
+        attachment,
+    } = call;
+    let Some(attachment) = attachment else {
+        return Ok(message);
+    };
+    let max_bytes = dfs_attachment_size_for_platform(&attachment)?;
+    let bytes = collect_dfs_outbound_attachment_sync(attachment.source, max_bytes)?;
+    crate::body_rpc::attach_dfs_routed_message_attachment(message, attachment.descriptor, bytes)
+}
+
+async fn materialize_dfs_routed_call(
+    call: DfsRoutedCall,
+) -> Result<DfsRoutedMessage, NetworkError> {
+    let DfsRoutedCall {
+        message,
+        attachment,
+    } = call;
+    let Some(attachment) = attachment else {
+        return Ok(message);
+    };
+    let max_bytes = dfs_attachment_size_for_platform(&attachment)?;
+    let bytes = attachment.source.collect_to_vec(max_bytes).await?;
+    crate::body_rpc::attach_dfs_routed_message_attachment(message, attachment.descriptor, bytes)
+}
+
 impl DfsMessageTransport for sinomo_core::network::InProcessTransport {
-    fn send_routed_message(
+    fn send_routed_call(
         &mut self,
         target_node_id: &NodeId,
-        message: DfsRoutedMessage,
+        call: DfsRoutedCall,
     ) -> Result<(), NetworkError> {
+        let message = materialize_dfs_routed_call_sync(call)?;
         let request = dfs_routed_message_rpc_request(&message)?;
         self.send_object_rpc_request(target_node_id, request)
     }
 
-    fn send_routed_message_bodies_bounded(
+    fn send_routed_calls_bounded(
         &mut self,
-        requests: Vec<DfsRoutedBodySend>,
+        requests: Vec<DfsRoutedSend>,
         max_inflight: usize,
-    ) -> Result<Vec<DfsRoutedBodySendOutcome>, NetworkError> {
+    ) -> Result<Vec<DfsRoutedSendOutcome>, NetworkError> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
         if requests.len() == 1 {
-            let request = requests.into_iter().next().expect("one body request");
-            let result = self.send_routed_message_with_body(
-                &request.target_node_id,
-                request.message,
-                request.body,
-            );
-            return Ok(vec![DfsRoutedBodySendOutcome {
+            let request = requests.into_iter().next().expect("one routed call");
+            let result = self.send_routed_call(&request.target_node_id, request.call);
+            return Ok(vec![DfsRoutedSendOutcome {
                 target_node_id: request.target_node_id,
                 result,
             }]);
@@ -429,22 +441,19 @@ impl DfsMessageTransport for sinomo_core::network::InProcessTransport {
                     loop {
                         let Some((index, request)) = pending
                             .lock()
-                            .expect("in-process DFS body fan-out queue")
+                            .expect("in-process DFS call fan-out queue")
                             .pop_front()
                         else {
                             break;
                         };
-                        let result = transport.send_routed_message_with_body(
-                            &request.target_node_id,
-                            request.message,
-                            request.body,
-                        );
+                        let result =
+                            transport.send_routed_call(&request.target_node_id, request.call);
                         completed
                             .lock()
-                            .expect("in-process DFS body fan-out results")
+                            .expect("in-process DFS call fan-out results")
                             .push((
                                 index,
-                                DfsRoutedBodySendOutcome {
+                                DfsRoutedSendOutcome {
                                     target_node_id: request.target_node_id,
                                     result,
                                 },
@@ -454,16 +463,16 @@ impl DfsMessageTransport for sinomo_core::network::InProcessTransport {
             }
             for worker in workers {
                 worker.join().map_err(|_| NetworkError::Io {
-                    operation: "join in-process DFS body fan-out".to_string(),
-                    detail: "in-process DFS body fan-out worker panicked".to_string(),
+                    operation: "join in-process DFS call fan-out".to_string(),
+                    detail: "in-process DFS call fan-out worker panicked".to_string(),
                 })?;
             }
             Ok(())
         })?;
 
         let mut completed = completed.into_inner().map_err(|_| NetworkError::Io {
-            operation: "collect in-process DFS body fan-out".to_string(),
-            detail: "in-process DFS body fan-out result lock is poisoned".to_string(),
+            operation: "collect in-process DFS call fan-out".to_string(),
+            detail: "in-process DFS call fan-out result lock is poisoned".to_string(),
         })?;
         completed.sort_by_key(|(index, _)| *index);
         Ok(completed.into_iter().map(|(_, outcome)| outcome).collect())
@@ -491,12 +500,13 @@ impl AsyncDfsMessageTransport for sinomo_core::network::AsyncInProcessTransport 
         self.local_node_id()
     }
 
-    fn send_routed_message_async<'a>(
+    fn send_routed_call_async<'a>(
         &'a mut self,
         target_node_id: &'a NodeId,
-        message: DfsRoutedMessage,
+        call: DfsRoutedCall,
     ) -> DfsMessageTransportFuture<'a, Result<(), NetworkError>> {
         Box::pin(async move {
+            let message = materialize_dfs_routed_call(call).await?;
             let request = dfs_routed_message_rpc_request(&message)?;
             self.send_object_rpc_request_async(
                 target_node_id,
@@ -507,25 +517,21 @@ impl AsyncDfsMessageTransport for sinomo_core::network::AsyncInProcessTransport 
         })
     }
 
-    fn send_routed_message_bodies_bounded_async<'a>(
+    fn send_routed_calls_bounded_async<'a>(
         &'a mut self,
-        requests: Vec<DfsRoutedBodySend>,
+        requests: Vec<DfsRoutedSend>,
         max_inflight: usize,
-    ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedBodySendOutcome>, NetworkError>> {
+    ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedSendOutcome>, NetworkError>> {
         Box::pin(async move {
             if requests.is_empty() {
                 return Ok(Vec::new());
             }
             if requests.len() == 1 {
-                let request = requests.into_iter().next().expect("one body request");
+                let request = requests.into_iter().next().expect("one routed call");
                 let result = self
-                    .send_routed_message_with_body_async(
-                        &request.target_node_id,
-                        request.message,
-                        request.body,
-                    )
+                    .send_routed_call_async(&request.target_node_id, request.call)
                     .await;
-                return Ok(vec![DfsRoutedBodySendOutcome {
+                return Ok(vec![DfsRoutedSendOutcome {
                     target_node_id: request.target_node_id,
                     result,
                 }]);
@@ -537,7 +543,7 @@ impl AsyncDfsMessageTransport for sinomo_core::network::AsyncInProcessTransport 
             // send futures gives the same bounded overlap without splitting receive ownership.
             let transport = &*self;
             let mut pending = VecDeque::from_iter(requests.into_iter().enumerate());
-            let mut active: Vec<DfsMessageTransportFuture<'_, (usize, DfsRoutedBodySendOutcome)>> =
+            let mut active: Vec<DfsMessageTransportFuture<'_, (usize, DfsRoutedSendOutcome)>> =
                 Vec::with_capacity(max_inflight);
             let mut completed = Vec::with_capacity(pending.len());
 
@@ -547,16 +553,15 @@ impl AsyncDfsMessageTransport for sinomo_core::network::AsyncInProcessTransport 
                         break;
                     };
                     active.push(Box::pin(async move {
-                        let result = send_async_in_process_routed_body(
+                        let result = send_async_in_process_routed_call(
                             transport,
                             &request.target_node_id,
-                            request.message,
-                            request.body,
+                            request.call,
                         )
                         .await;
                         (
                             index,
-                            DfsRoutedBodySendOutcome {
+                            DfsRoutedSendOutcome {
                                 target_node_id: request.target_node_id,
                                 result,
                             },
@@ -609,20 +614,12 @@ impl AsyncDfsMessageTransport for sinomo_core::network::AsyncInProcessTransport 
     }
 }
 
-async fn send_async_in_process_routed_body(
+async fn send_async_in_process_routed_call(
     transport: &sinomo_core::network::AsyncInProcessTransport,
     target_node_id: &NodeId,
-    message: DfsRoutedMessage,
-    body: DfsOutboundBody,
+    call: DfsRoutedCall,
 ) -> Result<(), NetworkError> {
-    let max_bytes = usize::try_from(body.descriptor.total_size_bytes).map_err(|_| {
-        NetworkError::FrameTooLarge {
-            actual_bytes: usize::MAX,
-            max_bytes: usize::MAX,
-        }
-    })?;
-    let bytes = body.source.collect_to_vec(max_bytes).await?;
-    let message = crate::body_rpc::attach_dfs_routed_message_body(message, body.descriptor, bytes)?;
+    let message = materialize_dfs_routed_call(call).await?;
     let request = dfs_routed_message_rpc_request(&message)?;
     transport
         .send_object_rpc_request_async(
@@ -669,81 +666,83 @@ mod tests {
         }
     }
 
-    fn body_send(
+    fn attachment_send(
         source_node_id: &NodeId,
         target_node_id: &NodeId,
         frame_id: u64,
-    ) -> DfsRoutedBodySend {
+    ) -> DfsRoutedSend {
         let bytes = vec![u8::try_from(frame_id).unwrap_or_default(); 16];
         let hash = content_hash(&bytes);
-        DfsRoutedBodySend::new(
+        DfsRoutedSend::new(
             target_node_id.clone(),
-            DfsRoutedMessage {
-                source_node_id: source_node_id.clone(),
-                target_node_id: target_node_id.clone(),
-                frame_id,
-                message_id: frame_id,
-                message: DfsNetworkMessage::StageBlob(DfsStageBlobCommand {
-                    request_id: format!("stage-{frame_id}"),
-                    intent_id: format!("intent-{frame_id}"),
-                    file_system_id: DfsFileSystemId::from_legacy_named("fanout-test-sifs")
-                        .expect("file system id"),
-                    object_id: DfsObjectId::from_legacy_named(format!("fanout-object-{frame_id}"))
+            DfsRoutedCall::with_attachment(
+                DfsRoutedMessage {
+                    source_node_id: source_node_id.clone(),
+                    target_node_id: target_node_id.clone(),
+                    frame_id,
+                    message_id: frame_id,
+                    message: DfsNetworkMessage::StageBlob(DfsStageBlobCommand {
+                        request_id: format!("stage-{frame_id}"),
+                        intent_id: format!("intent-{frame_id}"),
+                        file_system_id: DfsFileSystemId::from_legacy_named("fanout-test-sifs")
+                            .expect("file system id"),
+                        object_id: DfsObjectId::from_legacy_named(format!(
+                            "fanout-object-{frame_id}"
+                        ))
                         .expect("object id"),
-                    expected_base_version: None,
-                    version: DfsVersion::from_legacy_named(format!("fanout-version-{frame_id}"))
+                        expected_base_version: None,
+                        version: DfsVersion::from_legacy_named(format!(
+                            "fanout-version-{frame_id}"
+                        ))
                         .expect("version"),
-                    content_hash: hash.clone(),
-                    bytes: Vec::new(),
-                    object_metadata: None,
-                    authority_shard: None,
-                }),
-            },
-            DfsOutboundBody::from_bytes(bytes, hash),
+                        content_hash: hash.clone(),
+                        bytes: Vec::new(),
+                        object_metadata: None,
+                        authority_shard: None,
+                    }),
+                },
+                DfsOutboundAttachment::from_bytes(bytes, hash),
+            ),
         )
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn async_in_process_body_fanout_honors_cap_and_preserves_ordered_failures() {
+    async fn async_in_process_call_fanout_honors_cap_and_preserves_ordered_failures() {
         let network = AsyncInProcessNetwork::with_mailbox_capacity_and_per_target_send_limit(1, 1);
-        let local = node_id("async-body-fanout-local");
-        let blocked = node_id("async-body-fanout-blocked");
-        let releasable = node_id("async-body-fanout-releasable");
-        let next = node_id("async-body-fanout-next");
-        let missing = node_id("async-body-fanout-missing");
+        let local = node_id("async-attachment-fanout-local");
+        let blocked = node_id("async-attachment-fanout-blocked");
+        let releasable = node_id("async-attachment-fanout-releasable");
+        let next = node_id("async-attachment-fanout-next");
+        let missing = node_id("async-attachment-fanout-missing");
         let mut sender = network.add_node(local.clone());
         let mut blocked_receiver = network.add_node(blocked.clone());
         let mut releasable_receiver = network.add_node(releasable.clone());
         let mut next_receiver = network.add_node(next.clone());
 
-        AsyncDfsMessageTransport::send_routed_message_async(
+        AsyncDfsMessageTransport::send_routed_call_async(
             &mut sender,
             &blocked,
-            read_message(&local, &blocked, 1),
+            DfsRoutedCall::value(read_message(&local, &blocked, 1)),
         )
         .await
         .expect("prefill blocked mailbox");
-        AsyncDfsMessageTransport::send_routed_message_async(
+        AsyncDfsMessageTransport::send_routed_call_async(
             &mut sender,
             &releasable,
-            read_message(&local, &releasable, 2),
+            DfsRoutedCall::value(read_message(&local, &releasable, 2)),
         )
         .await
         .expect("prefill releasable mailbox");
 
         let requests = vec![
-            body_send(&local, &blocked, 10),
-            body_send(&local, &releasable, 11),
-            body_send(&local, &next, 12),
-            body_send(&local, &missing, 13),
+            attachment_send(&local, &blocked, 10),
+            attachment_send(&local, &releasable, 11),
+            attachment_send(&local, &next, 12),
+            attachment_send(&local, &missing, 13),
         ];
         let fanout = tokio::spawn(async move {
-            AsyncDfsMessageTransport::send_routed_message_bodies_bounded_async(
-                &mut sender,
-                requests,
-                2,
-            )
-            .await
+            AsyncDfsMessageTransport::send_routed_calls_bounded_async(&mut sender, requests, 2)
+                .await
         });
 
         assert!(
@@ -809,7 +808,7 @@ mod tests {
         ] {
             let messages = AsyncDfsMessageTransport::drain_incoming_messages_async(receiver)
                 .await
-                .expect("drain fan-out body message");
+                .expect("drain fan-out attachment message");
             assert_eq!(messages.len(), 1);
         }
     }

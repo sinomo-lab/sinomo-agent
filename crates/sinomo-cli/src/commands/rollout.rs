@@ -3497,7 +3497,7 @@ where
 }
 
 pub(crate) fn read_rollout_target_status(target: &RolloutTarget) -> Result<DaemonStatus, CliError> {
-    send_rollout_object_rpc_body(
+    send_rollout_object_rpc_value(
         target,
         sinomo_runtime::daemon::DAEMON_STATUS_ROUTE,
         sinomo_runtime::daemon::DAEMON_RPC_CATEGORY,
@@ -3506,7 +3506,7 @@ pub(crate) fn read_rollout_target_status(target: &RolloutTarget) -> Result<Daemo
     )
 }
 
-fn send_rollout_object_rpc_body<Req, Resp>(
+fn send_rollout_object_rpc_value<Req, Resp>(
     target: &RolloutTarget,
     route: &str,
     category: &str,
@@ -3517,7 +3517,7 @@ where
     Req: serde::Serialize + ?Sized,
     Resp: serde::de::DeserializeOwned,
 {
-    send_rollout_object_rpc_body_with_timeouts(
+    send_rollout_object_rpc_value_with_timeouts(
         target,
         route,
         category,
@@ -3526,7 +3526,7 @@ where
     )
 }
 
-fn send_rollout_object_rpc_body_with_timeouts<Req, Resp>(
+fn send_rollout_object_rpc_value_with_timeouts<Req, Resp>(
     target: &RolloutTarget,
     route: &str,
     category: &str,
@@ -3572,36 +3572,14 @@ fn send_rollout_object_rpc_with_timeouts(
             )
             .map_err(Into::into)
     } else if let Some(endpoint) = &target.endpoint {
-        if rollout_request_allows_legacy_auth_fallback(request) {
-            sinomo_runtime::daemon::send_daemon_rpc_to_endpoint_with_rollout_legacy_compatibility(
-                endpoint, request, timeouts,
-            )
-            .map_err(Into::into)
-        } else {
-            sinomo_runtime::daemon::send_daemon_rpc_to_endpoint_with_timeouts(
-                endpoint, request, timeouts,
-            )
-            .map_err(Into::into)
-        }
-    } else if rollout_request_allows_legacy_auth_fallback(request) {
-        sinomo_runtime::daemon::send_daemon_rpc_with_rollout_legacy_compatibility(
-            &target.address,
-            request,
-            timeouts,
+        sinomo_runtime::daemon::send_daemon_rpc_to_endpoint_with_timeouts(
+            endpoint, request, timeouts,
         )
         .map_err(Into::into)
     } else {
         sinomo_runtime::daemon::send_daemon_rpc_with_timeouts(&target.address, request, timeouts)
             .map_err(Into::into)
     }
-}
-
-fn rollout_request_allows_legacy_auth_fallback(request: &network::ObjectRpcRequest) -> bool {
-    let eligible_route = request.route == sinomo_runtime::daemon::DAEMON_STATUS_ROUTE
-        || (request.route != sinomo_runtime::rollout::ROLLOUT_BUILD_ROUTE
-            && sinomo_runtime::rollout::ROLLOUT_OBJECT_RPC_ROUTES
-                .contains(&request.route.as_str()));
-    eligible_route && request.metadata.is_empty()
 }
 
 #[derive(Clone, Debug)]
@@ -3754,15 +3732,17 @@ pub(crate) fn send_prepared_daemon_rollout_binary(
 fn send_daemon_rollout_binary_direct(
     target: &RolloutTarget,
     request: &ClusterRolloutBinaryRequest,
-    body_path: &Path,
+    attachment_path: &Path,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
     if let Some(node_id) = target.rollout_node_id() {
-        daemon_send_daemon_rollout_binary_to_target(node_id, request, body_path).map_err(Into::into)
+        daemon_send_daemon_rollout_binary_to_target(node_id, request, attachment_path)
+            .map_err(Into::into)
     } else if let Some(endpoint) = &target.endpoint {
-        daemon_send_daemon_rollout_binary_to_endpoint(endpoint, request, body_path)
+        daemon_send_daemon_rollout_binary_to_endpoint(endpoint, request, attachment_path)
             .map_err(Into::into)
     } else {
-        daemon_send_daemon_rollout_binary(&target.address, request, body_path).map_err(Into::into)
+        daemon_send_daemon_rollout_binary(&target.address, request, attachment_path)
+            .map_err(Into::into)
     }
 }
 
@@ -3771,7 +3751,7 @@ pub(crate) fn send_daemon_rollout_native_dylib_module(
     request: &ClusterRolloutNativeDylibModuleRequest,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
     if target.rollout_node_id().is_some() {
-        send_rollout_object_rpc_body(
+        send_rollout_object_rpc_value(
             target,
             sinomo_runtime::rollout::ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
             sinomo_runtime::rollout::ROLLOUT_RPC_CATEGORY,
@@ -3797,7 +3777,7 @@ pub(crate) fn send_daemon_rollout_native_dylib_module(
 
 pub(crate) fn send_daemon_rollout_clear_status(target: &RolloutTarget) -> Result<String, CliError> {
     if target.rollout_node_id().is_some() {
-        send_rollout_object_rpc_body(
+        send_rollout_object_rpc_value(
             target,
             sinomo_runtime::rollout::ROLLOUT_CLEAR_STATUS_ROUTE,
             sinomo_runtime::rollout::ROLLOUT_RPC_CATEGORY,
@@ -3815,7 +3795,7 @@ pub(crate) fn send_daemon_rollout_clear_status(target: &RolloutTarget) -> Result
 
 pub(crate) fn send_daemon_rollout_diagnostics(target: &RolloutTarget) -> Result<String, CliError> {
     if target.rollout_node_id().is_some() {
-        send_rollout_object_rpc_body(
+        send_rollout_object_rpc_value(
             target,
             sinomo_runtime::rollout::ROLLOUT_DIAGNOSTICS_ROUTE,
             sinomo_runtime::rollout::ROLLOUT_RPC_CATEGORY,

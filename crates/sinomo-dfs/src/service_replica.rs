@@ -1505,11 +1505,12 @@ mod authority_probe_tests {
     }
 
     impl DfsMessageTransport for AuthorityProbeTransport {
-        fn send_routed_message(
+        fn send_routed_call(
             &mut self,
             target_node_id: &NodeId,
-            message: DfsRoutedMessage,
+            call: DfsRoutedCall,
         ) -> Result<(), NetworkError> {
+            let message = crate::materialize_dfs_routed_call_sync(call)?;
             self.sent
                 .lock()
                 .expect("sent messages")

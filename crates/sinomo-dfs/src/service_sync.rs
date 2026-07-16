@@ -37,14 +37,6 @@ const DFS_POSIX_SYNC_IDLE_WAIT: Duration = Duration::from_millis(10);
 /// Raft-backed partition fallback. A caller's shorter timeout remains the
 /// upper bound.
 const DFS_POSIX_FULL_SHARD_ACK_GRACE: Duration = Duration::from_millis(250);
-#[cfg(test)]
-const DFS_POSIX_LEGACY_ROUTED_FRAME_BYTE_LIMIT: usize = 64 * 1024;
-/// Routed metadata catch-up must fit inside the oldest supported 64 KiB
-/// message envelope. The journal batch limit measures only its encoded batch,
-/// so reserve 24 KiB for the routed command, session descriptor, direct/relay
-/// authentication, frame proof, trace context, and SOBJ framing.
-/// Ordinary direct replication retains its larger streaming-oriented limit.
-const DFS_POSIX_ROUTED_METADATA_BATCH_BYTE_LIMIT: usize = 40 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum MetadataQuorumSyncPurpose {
@@ -953,11 +945,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // traffic. Processing a late repair acknowledgement can append
             // newer metadata locally; that must not make this barrier send a
             // successor batch and then ask the replica to prove an older head.
-            self.send_metadata_sync_catchup_batches(
-                &target,
-                &probe_barrier_id,
-                &mut pending_checkpoint_snapshots,
-            )?;
+            self.send_metadata_sync_catchup_batches(&target, &probe_barrier_id)?;
             let mut rejected_nodes = self.send_metadata_sync_prefix_probes(
                 &target,
                 &probe_barrier_id,
@@ -989,11 +977,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &rejected_nodes,
                 &mut pending_checkpoint_snapshots,
             )?;
-            self.send_metadata_sync_catchup_batches(
-                &target,
-                &probe_barrier_id,
-                &mut pending_checkpoint_snapshots,
-            )?;
+            self.send_metadata_sync_catchup_batches(&target, &probe_barrier_id)?;
             let mut rejected_nodes = self.send_metadata_sync_prefix_probes(
                 &target,
                 &probe_barrier_id,
@@ -1029,11 +1013,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // exact probe immediately so a zero-wait caller does not need an
             // artificial extra loop; real network transports simply leave it
             // pending for the next wait/pump round.
-            self.send_metadata_sync_catchup_batches(
-                &target,
-                &probe_barrier_id,
-                &mut pending_checkpoint_snapshots,
-            )?;
+            self.send_metadata_sync_catchup_batches(&target, &probe_barrier_id)?;
             let mut rejected_nodes = self.send_metadata_sync_prefix_probes(
                 &target,
                 &probe_barrier_id,
@@ -1191,7 +1171,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         target: &DfsMetadataQuorumSyncTarget,
         probe_barrier_id: &str,
-        pending_checkpoint_snapshots: &mut BTreeMap<String, MetadataCheckpointSnapshotAttempt>,
     ) -> Result<(), DfsError> {
         self.pending_metadata_replications
             .retain(|_, pending| pending.created_at.elapsed() < Duration::from_secs(60));
@@ -1209,13 +1188,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             })
             .collect::<Result<Vec<_>, MetadataBackendError>>()?;
 
-        let mut oversized_entry_nodes = BTreeSet::new();
-        // Replicas at the same cursor need the same bounded, frozen journal
-        // prefix. Read and size that prefix once, then clone only the prepared
-        // wire value per target instead of repeating backend scans and codec
-        // work before every fan-out wave.
+        // Replicas at the same cursor need the same frozen journal prefix.
+        // Read it once, then clone only the prepared wire value per target
+        // instead of repeating backend scans before every fan-out wave.
         let mut prepared_batches_by_cursor =
-            BTreeMap::<u64, Option<(DfsMetadataJournalBatch, usize)>>::new();
+            BTreeMap::<u64, Option<DfsMetadataJournalBatch>>::new();
         let mut prepared_catchups = Vec::new();
         for (target_node_id, after_sequence) in replica_cursors {
             if target_node_id == self.node_id || after_sequence >= target.journal_sequence {
@@ -1237,7 +1214,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             &target.shard_id,
                             after_sequence,
                             DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
-                            DFS_POSIX_ROUTED_METADATA_BATCH_BYTE_LIMIT,
+                            DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
                         )?
                         .and_then(|mut batch| {
                             // The local shard can advance after the barrier
@@ -1250,27 +1227,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             let last_sequence = batch.entries.last().map(|entry| entry.sequence)?;
                             batch.next_after_sequence = last_sequence;
                             Some(batch)
-                        })
-                        .map(|batch| {
-                            crate::metadata_journal::metadata_journal_batch_encoded_len(&batch)
-                                .map(|encoded_len| (batch, encoded_len))
-                        })
-                        .transpose()?;
+                        });
                     prepared_batches_by_cursor.insert(after_sequence, prepared.clone());
                     prepared
                 };
-            let Some((batch, encoded_len)) = prepared_batch else {
+            let Some(batch) = prepared_batch else {
                 continue;
             };
-            if encoded_len > DFS_POSIX_ROUTED_METADATA_BATCH_BYTE_LIMIT {
-                // The generic bounded-batch helper intentionally permits one
-                // oversized first entry so background replication can make
-                // progress. POSIX barriers cannot put that entry in the
-                // daemon's bounded command frame. Repair the exact frozen
-                // checkpoint through the body-streamed snapshot route instead.
-                oversized_entry_nodes.insert(target_node_id);
-                continue;
-            }
             let next_after_sequence = batch.next_after_sequence;
             let request_id = format!(
                 "dfs_sync_catchup_{}_{}",
@@ -1346,7 +1309,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if directly_completed_catchups.contains(&(target_node_id.clone(), request_id.clone())) {
                 continue;
             }
-            // The bounded direct path is an accelerator and may legally
+            // The direct path is an accelerator and may legally
             // return only the siblings that completed before its deadline.
             // Preserve the same request identity and enqueue every omitted
             // target on the canonical routed path so a slow first handshake
@@ -1361,12 +1324,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.pending_metadata_replications.remove(&request_id);
             }
         }
-        self.send_metadata_sync_checkpoint_snapshots(
-            target,
-            probe_barrier_id,
-            &oversized_entry_nodes,
-            pending_checkpoint_snapshots,
-        )
+        Ok(())
     }
 
     fn send_metadata_sync_prefix_probes(
@@ -2066,25 +2024,18 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use sinomo_core::DfsObjectPolicy;
     use sinomo_core::kv::{InProcessKvStore, KvEntry, KvError, KvRevision, KvTxn, KvTxnResponse};
-    use sinomo_core::local::SinomoDataDir;
-    use sinomo_core::network::{
-        NetworkError, ObjectRpcRequest, signed_object_rpc_request_head_encoded_lengths_for_test,
-    };
-    use sinomo_core::node::ClusterId;
-    use sinomo_core::{
-        ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterTransportKind,
-        DfsObjectPolicy, Id,
-    };
+    use sinomo_core::network::{NetworkError, ObjectRpcRequest};
 
     use super::*;
     use crate::{
         DfsControlPlaneKvClient, DfsFileSystem, DfsMetadataJournalBatchResponse,
         DfsMetadataJournalBatchResult, DfsMetadataShardAssignment,
         DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult, DfsNetworkMessage,
-        DfsRoutedMessage, DfsTransportIdentity, LocalContentStore, LocalShardedMetadataBackend,
-        LocalSobjMetadataBackend, SharedDfsControlPlaneKvClient, build_dfs_routed_message,
-        directory_object, sifs_file_system_id,
+        DfsRoutedCall, DfsRoutedMessage, DfsTransportIdentity, LocalContentStore,
+        LocalShardedMetadataBackend, LocalSobjMetadataBackend, SharedDfsControlPlaneKvClient,
+        build_dfs_routed_message, directory_object, sifs_file_system_id,
     };
 
     #[derive(Debug)]
@@ -2148,11 +2099,12 @@ mod tests {
     }
 
     impl DfsMessageTransport for MetadataAckTransport {
-        fn send_routed_message(
+        fn send_routed_call(
             &mut self,
             target_node_id: &NodeId,
-            message: DfsRoutedMessage,
+            call: DfsRoutedCall,
         ) -> Result<(), NetworkError> {
+            let message = crate::materialize_dfs_routed_call_sync(call)?;
             if self.unroutable_nodes.contains(target_node_id) {
                 return Err(NetworkError::UnknownNode {
                     node_id: target_node_id.clone(),
@@ -2523,15 +2475,9 @@ mod tests {
             .service
             .capture_metadata_quorum_sync_target(&fixture.object)
             .expect("capture direct catch-up target");
-        let mut pending_checkpoint_snapshots = BTreeMap::new();
-
         fixture
             .service
-            .send_metadata_sync_catchup_batches(
-                &target,
-                "direct-catchup-probe",
-                &mut pending_checkpoint_snapshots,
-            )
+            .send_metadata_sync_catchup_batches(&target, "direct-catchup-probe")
             .expect("send concurrent direct catch-up batch");
 
         assert_eq!(fixture.service.transport.direct_catchup_batch_count, 1);
@@ -2544,7 +2490,6 @@ mod tests {
             "the canonical direct batch must avoid the sequential routed fallback"
         );
         assert!(fixture.service.pending_metadata_replications.is_empty());
-        assert!(pending_checkpoint_snapshots.is_empty());
         let backend = fixture
             .service
             .metadata_backend
@@ -2578,15 +2523,9 @@ mod tests {
             .service
             .capture_metadata_quorum_sync_target(&fixture.object)
             .expect("capture partial direct catch-up target");
-        let mut pending_checkpoint_snapshots = BTreeMap::new();
-
         fixture
             .service
-            .send_metadata_sync_catchup_batches(
-                &target,
-                "partial-direct-catchup-probe",
-                &mut pending_checkpoint_snapshots,
-            )
+            .send_metadata_sync_catchup_batches(&target, "partial-direct-catchup-probe")
             .expect("fall back omitted direct catch-ups to routed sends");
 
         assert_eq!(fixture.service.transport.direct_catchup_batch_count, 1);
@@ -2624,7 +2563,6 @@ mod tests {
             );
         }
         assert!(fixture.service.pending_metadata_replications.is_empty());
-        assert!(pending_checkpoint_snapshots.is_empty());
     }
 
     #[test]
@@ -2639,14 +2577,9 @@ mod tests {
             .service
             .capture_metadata_quorum_sync_target(&fixture.object)
             .expect("capture partial direct prefix target");
-        let mut pending_checkpoint_snapshots = BTreeMap::new();
         fixture
             .service
-            .send_metadata_sync_catchup_batches(
-                &target,
-                "partial-direct-prefix-catchup",
-                &mut pending_checkpoint_snapshots,
-            )
+            .send_metadata_sync_catchup_batches(&target, "partial-direct-prefix-catchup")
             .expect("prime every replica cursor");
 
         fixture.service.transport.direct_prefix_nodes = BTreeSet::from([replicas[0].clone()]);
@@ -2679,16 +2612,16 @@ mod tests {
     }
 
     #[test]
-    fn posix_catchup_batch_fits_legacy_routed_frame() {
-        let replica = node("node_sync_bounded_catchup_replica");
+    fn posix_catchup_routes_large_metadata_batch_without_transport_switch() {
+        let replica = node("node_sync_large_catchup_replica");
         let mut fixture = configured_sync_fixture(
-            "bounded_catchup",
+            "large_catchup",
             vec![replica.clone()],
             vec![replica.clone()],
         );
         let owner = fixture.shard.primary_node_id.clone();
         for index in 0..32 {
-            let path = format!("/bounded-catchup-{index}-{}", "x".repeat(3_000));
+            let path = format!("/large-catchup-{index}-{}", "x".repeat(3_000));
             fixture
                 .service
                 .metadata_backend
@@ -2702,134 +2635,24 @@ mod tests {
             .capture_metadata_quorum_sync_target(&fixture.object)
             .expect("capture target");
 
-        let ordinary_batch = fixture
-            .service
-            .metadata_journal_batch_for_shard_since(&target.shard_id, 0)
-            .expect("ordinary catch-up batch")
-            .expect("ordinary catch-up entries");
-        let ordinary_message = build_dfs_routed_message(
-            &owner,
-            &replica,
-            1,
-            1,
-            DfsNetworkMessage::MetadataJournalBatch(DfsMetadataJournalBatchCommand {
-                request_id: "ordinary-unbounded-catchup".to_string(),
-                source_node_id: Some(owner.clone()),
-                file_system_id: Some(fixture.shard.file_system_id.clone()),
-                authority_epoch: Some(fixture.shard.epoch),
-                verify_prefix_only: false,
-                prefix_probe: None,
-                authority_probe: None,
-                batch: ordinary_batch,
-            }),
-        );
-        let ordinary_rpc_bytes =
-            crate::routes::dfs_message_rpc_request(&crate::DfsMessageCommand {
-                request_id: "dfs_message_1".to_string(),
-                routed_message: ordinary_message,
-            })
-            .expect("encode ordinary catch-up RPC")
-            .body
-            .len();
-        assert!(
-            ordinary_rpc_bytes > DFS_POSIX_LEGACY_ROUTED_FRAME_BYTE_LIMIT,
-            "fixture must reproduce an ordinary catch-up frame above the legacy 64 KiB limit"
-        );
-
-        let mut pending_checkpoint_snapshots = BTreeMap::new();
         fixture
             .service
-            .send_metadata_sync_catchup_batches(
-                &target,
-                "bounded-catchup-probe",
-                &mut pending_checkpoint_snapshots,
-            )
-            .expect("send bounded POSIX catch-up");
+            .send_metadata_sync_catchup_batches(&target, "large-catchup-probe")
+            .expect("send large POSIX catch-up");
         let [(batch_bytes, request)] = fixture.service.transport.catchup_rpc_requests.as_slice()
         else {
             panic!("expected one captured POSIX catch-up RPC");
         };
-        let rpc_bytes = request.body.len();
-        assert!(
-            *batch_bytes <= DFS_POSIX_ROUTED_METADATA_BATCH_BYTE_LIMIT,
-            "bounded catch-up batch exceeded its encoded-byte budget: {batch_bytes}"
-        );
-        assert!(
-            *batch_bytes >= DFS_POSIX_ROUTED_METADATA_BATCH_BYTE_LIMIT - 4 * 1024,
-            "fixture did not exercise the upper end of the catch-up budget: {batch_bytes}"
-        );
-        assert!(
-            rpc_bytes <= DFS_POSIX_LEGACY_ROUTED_FRAME_BYTE_LIMIT,
-            "bounded catch-up RPC exceeded the legacy routed frame: {rpc_bytes}"
-        );
-
-        // W3C traceparent has a fixed 55-byte current-version representation.
-        // Exercise it together with the full 512-byte valid tracestate limit so
-        // the frame margin cannot depend on an empty/default trace context.
-        let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
-        let tracestate = format!("a={},b={}", "a".repeat(254), "b".repeat(253));
-        assert_eq!(traceparent.len(), 55);
-        assert_eq!(tracestate.len(), 512);
-        let measured_request = request
-            .clone()
-            .with_traceparent(traceparent)
-            .with_tracestate(tracestate);
-        let route_path = (0..=8)
-            .map(|index| node(&format!("node_sync_frame_route_{index}")))
-            .collect::<Vec<_>>();
-        let local_node_id = route_path.first().expect("local route node").clone();
-        let target_node_id = route_path.last().expect("target route node").clone();
-        let target_endpoints = (0..8)
-            .map(|index| ClusterEndpointRecord {
-                endpoint_id: Id::generate(),
-                node_id: target_node_id.clone(),
-                transport: ClusterTransportKind::HttpsRelay,
-                address: format!(
-                    "https://relay-{index}.example.test/{}",
-                    "endpoint".repeat(24)
-                ),
-                source: ClusterEndpointSource::Rendezvous,
-                privacy: ClusterEndpointPrivacy::Relayed,
-                priority: u16::try_from(index).expect("endpoint priority"),
-                last_observed_latency_ms: Some(u32::MAX),
-            })
-            .collect::<Vec<_>>();
-        let frame_data_dir = SinomoDataDir::new(fixture.root.path().join("frame-identity"));
-        let frame_lengths = signed_object_rpc_request_head_encoded_lengths_for_test(
-            &frame_data_dir,
-            &measured_request,
-            &ClusterId::from_legacy_named("cluster_sync_frame_budget").expect("cluster id"),
-            &local_node_id,
-            &target_node_id,
-            &route_path,
-            &target_endpoints,
-        )
-        .expect("encode signed direct and relayed session request heads");
-        eprintln!(
-            "metadata catch-up signed heads: batch={batch_bytes} rpc={rpc_bytes} direct={} relayed={} direct_margin={} relay_margin={}",
-            frame_lengths.direct,
-            frame_lengths.relayed,
-            DFS_POSIX_LEGACY_ROUTED_FRAME_BYTE_LIMIT.saturating_sub(frame_lengths.direct),
-            DFS_POSIX_LEGACY_ROUTED_FRAME_BYTE_LIMIT.saturating_sub(frame_lengths.relayed),
-        );
-        assert!(
-            frame_lengths.direct <= DFS_POSIX_LEGACY_ROUTED_FRAME_BYTE_LIMIT,
-            "signed direct catch-up head exceeded the actual control-frame limit: {}",
-            frame_lengths.direct
-        );
-        assert!(
-            frame_lengths.relayed <= DFS_POSIX_LEGACY_ROUTED_FRAME_BYTE_LIMIT,
-            "signed relayed catch-up head exceeded the actual control-frame limit: {}",
-            frame_lengths.relayed
-        );
-        assert!(pending_checkpoint_snapshots.is_empty());
+        assert!(*batch_bytes > 0);
+        assert!(!request.body.is_empty());
+        assert_eq!(fixture.service.transport.snapshot_install_count, 0);
     }
 
     #[test]
-    fn posix_oversized_single_catchup_entry_uses_streamed_checkpoint() {
-        let replica = node("node_sync_oversized_catchup_replica");
+    fn posix_single_large_catchup_entry_uses_same_routed_message() {
+        let replica = node("node_sync_single_large_catchup_replica");
         let mut fixture = configured_sync_fixture(
-            "oversized_catchup",
+            "single_large_catchup",
             vec![replica.clone()],
             vec![replica.clone()],
         );
@@ -2849,8 +2672,11 @@ mod tests {
             )
             .expect("advance replica to the oversized entry");
 
-        let oversized = directory_object(
-            &format!("/oversized-single-entry-{}", "x".repeat(80 * 1024)),
+        let large = directory_object(
+            &format!(
+                "/single-large-entry-{}",
+                "x".repeat(DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT + 1024)
+            ),
             fixture.shard.primary_node_id.clone(),
         );
         fixture
@@ -2858,29 +2684,25 @@ mod tests {
             .metadata_backend
             .as_deref_mut()
             .expect("metadata backend")
-            .put_object(&oversized)
-            .expect("append oversized metadata entry");
+            .put_object(&large)
+            .expect("append large metadata entry");
         let target = fixture
             .service
-            .capture_metadata_quorum_sync_target(&oversized)
-            .expect("capture oversized target");
-        let mut pending_checkpoint_snapshots = BTreeMap::new();
+            .capture_metadata_quorum_sync_target(&large)
+            .expect("capture large target");
 
         fixture
             .service
-            .send_metadata_sync_catchup_batches(
-                &target,
-                "oversized-catchup-probe",
-                &mut pending_checkpoint_snapshots,
-            )
-            .expect("route oversized entry through checkpoint streaming");
+            .send_metadata_sync_catchup_batches(&target, "single-large-catchup-probe")
+            .expect("route the large entry");
 
-        assert!(
-            fixture.service.transport.catchup_rpc_requests.is_empty(),
-            "an oversized single journal entry must never enter the routed command frame"
-        );
-        assert_eq!(fixture.service.transport.snapshot_install_count, 1);
-        assert_eq!(pending_checkpoint_snapshots.len(), 1);
+        let [(batch_bytes, request)] = fixture.service.transport.catchup_rpc_requests.as_slice()
+        else {
+            panic!("expected one routed large-entry catch-up RPC");
+        };
+        assert!(*batch_bytes > DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT);
+        assert!(!request.body.is_empty());
+        assert_eq!(fixture.service.transport.snapshot_install_count, 0);
     }
 
     #[test]

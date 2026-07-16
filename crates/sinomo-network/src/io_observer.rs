@@ -15,9 +15,9 @@ pub trait IoObserver: Send + Sync {
     fn on_object_file_skipped_write(&self) {}
     fn on_kv_snapshot_actual_write(&self) {}
     fn on_kv_snapshot_skipped_write(&self) {}
-    /// Bytes sent over a framed RPC stream (4-byte length prefix + body).
+    /// Bytes sent over a framed RPC stream (SOF2 prefix + body).
     fn on_net_sent(&self, _bytes: u64) {}
-    /// Bytes received over a framed RPC stream (4-byte length prefix + body).
+    /// Bytes received over a framed RPC stream (SOF2 prefix + body).
     fn on_net_recv(&self, _bytes: u64) {}
 }
 

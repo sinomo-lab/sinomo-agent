@@ -2304,29 +2304,55 @@ impl sinomo_runtime::dfs::DfsPeerTransport for CliDfsPeerTransport {
     fn call_object_rpc(
         &self,
         target_node_id: &sinomo_runtime::node::NodeId,
-        request: &sinomo_runtime::network::ObjectRpcRequest,
+        call: sinomo_runtime::network::ObjectRpcSessionCall,
         options: sinomo_runtime::dfs::DfsObjectRpcSendOptions,
     ) -> Result<
-        sinomo_runtime::network::ObjectRpcResponse,
+        sinomo_runtime::network::ObjectRpcSessionResult,
         sinomo_runtime::dfs::DfsPeerTransportError,
     > {
-        daemon_dfs_object_rpc_to_target(target_node_id, request, options)
+        daemon_dfs_object_rpc_to_target(target_node_id, call, options)
             .map_err(|error| sinomo_runtime::dfs::DfsPeerTransportError::new(error.to_string()))
     }
 }
 
 fn daemon_dfs_object_rpc_to_target(
     target_node_id: &sinomo_runtime::node::NodeId,
-    request: &sinomo_runtime::network::ObjectRpcRequest,
+    call: sinomo_runtime::network::ObjectRpcSessionCall,
     options: sinomo_runtime::dfs::DfsObjectRpcSendOptions,
-) -> Result<sinomo_runtime::network::ObjectRpcResponse, CliError> {
+) -> Result<sinomo_runtime::network::ObjectRpcSessionResult, CliError> {
     let status = default_main_daemon_status()?.ok_or_else(|| CliError::Network {
         address: target_node_id.to_string(),
         detail: "DFS cluster object RPC requires the local daemon to be running".to_string(),
     })?;
-    DaemonApiClient::at_address(status.address)
-        .dfs_object_rpc_to_target_with_options(target_node_id, request, options)
-        .map_err(CliError::from)
+    let client = DaemonApiClient::at_address(status.address);
+    let send = client.object_rpc_session_to_target_with_deadline_async(
+        target_node_id,
+        call,
+        options.connect_timeout,
+        options.overall_timeout,
+        options.observe_connectivity,
+    );
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return if matches!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            tokio::task::block_in_place(|| handle.block_on(send)).map_err(CliError::from)
+        } else {
+            Err(CliError::Network {
+                address: target_node_id.to_string(),
+                detail: "DFS peer RPC cannot block a current-thread Tokio runtime".to_string(),
+            })
+        };
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| CliError::Network {
+            address: target_node_id.to_string(),
+            detail: source.to_string(),
+        })?;
+    runtime.block_on(send).map_err(CliError::from)
 }
 
 fn publish_dfs_metadata_journal_from_data_dir(
@@ -2818,7 +2844,7 @@ fn fetch_dfs_status_from_node_blocking(
     }
     let response = daemon_dfs_object_rpc_to_target(
         node_id,
-        &rpc_request,
+        sinomo_runtime::network::ObjectRpcSessionCall::value(rpc_request),
         sinomo_runtime::dfs::DfsObjectRpcSendOptions::default().with_overall_timeout(timeout),
     );
     if trace {
@@ -2829,8 +2855,14 @@ fn fetch_dfs_status_from_node_blocking(
         );
     }
     let response = response.map_err(CliError::from)?;
+    if !response.body.is_empty() {
+        return Err(CliError::Network {
+            address: node_id.to_string(),
+            detail: "DFS status value response unexpectedly contained an attachment".to_string(),
+        });
+    }
     let decoded =
-        sinomo_runtime::dfs::decode_dfs_status_rpc_response(&response).map_err(Into::into);
+        sinomo_runtime::dfs::decode_dfs_status_rpc_response(&response.response).map_err(Into::into);
     if trace {
         let outcome = if decoded.is_ok() { "ok" } else { "error" };
         eprintln!(

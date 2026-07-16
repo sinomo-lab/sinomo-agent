@@ -57,7 +57,7 @@ pub struct ClusterRolloutNativeDylibModuleUploadSpec {
     pub artifact: ClusterRolloutUploadArtifactSpec,
 }
 
-/// Small object-RPC head for a streamed cluster-binary rollout.
+/// Object-RPC head for a streamed cluster-binary rollout.
 ///
 /// Artifact bytes are never embedded in this object. Each artifact is sent as
 /// one body attachment on [`crate::ROLLOUT_BINARY_ROUTE`], so

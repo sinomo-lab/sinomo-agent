@@ -483,9 +483,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         else {
             return Ok(PosixBulkReadPlan::Fallback);
         };
-        if content_size_bytes > crate::DFS_BLOB_INLINE_LIMIT_BYTES as u64 {
-            return Ok(PosixBulkReadPlan::Fallback);
-        }
         let Some(source) = object
             .current_locations
             .iter()
@@ -1284,7 +1281,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 #[cfg(test)]
 mod opened_stat_tests {
     use super::*;
-    use crate::{DfsRoutedMessage, DfsTransportIdentity, LocalContentStore};
+    use crate::{DfsRoutedCall, DfsRoutedMessage, DfsTransportIdentity, LocalContentStore};
     use sinomo_core::DfsObjectPolicy;
     use sinomo_core::network::NetworkError;
 
@@ -1300,10 +1297,10 @@ mod opened_stat_tests {
     }
 
     impl DfsMessageTransport for NoNetworkTransport {
-        fn send_routed_message(
+        fn send_routed_call(
             &mut self,
             target_node_id: &NodeId,
-            _message: DfsRoutedMessage,
+            _call: DfsRoutedCall,
         ) -> std::result::Result<(), NetworkError> {
             Err(NetworkError::UnknownNode {
                 node_id: target_node_id.clone(),

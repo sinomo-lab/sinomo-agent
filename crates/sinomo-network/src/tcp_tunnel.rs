@@ -1,4 +1,3 @@
-use crate::{ObjectRpcRequest, ObjectRpcResponse};
 use serde::{Deserialize, Serialize};
 
 pub const CLUSTER_TCP_TUNNEL_OPEN_ROUTE: &str = "/cluster/tcp-tunnel/open";
@@ -36,14 +35,6 @@ impl ClusterTcpTunnelOpenResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum ClusterTcpTunnelFrame {
-    Request {
-        id: u64,
-        request: ObjectRpcRequest,
-    },
-    Response {
-        id: u64,
-        response: ObjectRpcResponse,
-    },
     /// Opens one canonical full-duplex object-RPC byte stream inside the
     /// persistent tunnel. Stream identifiers are allocated from disjoint
     /// odd/even spaces by the two physical tunnel endpoints.

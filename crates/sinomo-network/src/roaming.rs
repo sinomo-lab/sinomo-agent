@@ -1,11 +1,10 @@
-//! Roaming transport support and registry-aware daemon RPC dispatch.
+//! Roaming transport support and transport-neutral RPC stream dialing.
 //!
 //! Built-in loopback/LAN-TCP paths stay in this crate. Additional transports
 //! are loaded at runtime through the network-module registry and are dialed by
 //! transport kind or address scheme.
 
 use crate::error::NetworkError;
-use crate::object::DaemonRpcTimeouts;
 #[cfg(any(test, feature = "test-support"))]
 use crate::peer::{EndpointCandidateStatus, PeerEndpointCandidate};
 use crate::prelude::*;
@@ -204,19 +203,6 @@ impl WebRtcKvExchange {
     }
 }
 
-pub async fn send_daemon_rpc_to_cluster_endpoint_async(
-    endpoint: &ClusterEndpointRecord,
-    auth: Option<&[u8]>,
-    request: &crate::ObjectRpcRequest,
-    timeouts: DaemonRpcTimeouts,
-) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    let response =
-        send_daemon_rpc_response_to_cluster_endpoint_async(endpoint, auth, request, timeouts)
-            .await?;
-    response.error_detail()?;
-    Ok(response)
-}
-
 /// Opens the transport-neutral byte stream used by the canonical object-RPC
 /// session engine. Endpoint selection and retry stay in `route`; transports do
 /// not see object heads or transfer frames.
@@ -255,136 +241,6 @@ pub async fn open_daemon_rpc_stream_to_cluster_endpoint_async(
             module.open_rpc_stream(endpoint, health).await
         }
     }
-}
-
-/// Send a daemon RPC while preserving a received application error frame.
-///
-/// Routed delivery uses this form so a valid peer response terminates transport
-/// retry. Public endpoint callers retain the historical behavior of decoding
-/// application errors into `NetworkError`.
-pub async fn send_daemon_rpc_response_to_cluster_endpoint_async(
-    endpoint: &ClusterEndpointRecord,
-    auth: Option<&[u8]>,
-    request: &crate::ObjectRpcRequest,
-    timeouts: DaemonRpcTimeouts,
-) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    let control_request = daemon_rpc_control_request(auth, request);
-    send_daemon_control_request_to_cluster_endpoint_async(endpoint, &control_request, timeouts)
-        .await
-}
-
-fn daemon_rpc_control_request(
-    auth: Option<&[u8]>,
-    request: &crate::ObjectRpcRequest,
-) -> crate::DaemonControlRequest {
-    match auth {
-        Some(auth) => request.clone().with_auth(auth.to_vec()),
-        None => request.clone(),
-    }
-}
-
-async fn send_daemon_control_request_to_cluster_endpoint_async(
-    endpoint: &ClusterEndpointRecord,
-    request: &crate::DaemonControlRequest,
-    timeouts: DaemonRpcTimeouts,
-) -> Result<crate::DaemonControlResponse, NetworkError> {
-    match endpoint.transport {
-        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
-            send_daemon_control_request_to_address_async(&endpoint.address, request, timeouts).await
-        }
-        ref transport => {
-            if let Some(module) =
-                crate::network_module::registered_network_module_for_transport(transport)
-            {
-                return dial_daemon_control_request_via_network_module(
-                    module.as_ref(),
-                    endpoint,
-                    request,
-                    timeouts,
-                )
-                .await;
-            }
-            Err(NetworkError::Io {
-                operation: format!("send daemon rpc to {}", endpoint.address),
-                detail: format!("unsupported daemon rpc transport {:?}", endpoint.transport),
-            })
-        }
-    }
-}
-
-/// Dials one daemon control request through a runtime network module: the
-/// typed request is framed, the module returns the encoded response frame, and
-/// the frame is decoded back into the typed response.
-async fn dial_daemon_control_request_via_network_module(
-    module: &dyn crate::network_module::NetworkModule,
-    endpoint: &ClusterEndpointRecord,
-    request: &crate::DaemonControlRequest,
-    timeouts: DaemonRpcTimeouts,
-) -> Result<crate::DaemonControlResponse, NetworkError> {
-    let frame = crate::object::encode_object_frame_to_vec(request)?;
-    let response = module.dial_rpc(endpoint, &frame, timeouts).await?;
-    crate::object::decode_single_object_frame_from_slice(
-        &response,
-        crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
-    )
-}
-
-/// Synthesizes the endpoint record handed to a network module when dispatch
-/// starts from a bare address string (scheme sniff) instead of a cluster
-/// endpoint record.
-fn cluster_endpoint_record_for_module_address_dial(
-    address: &str,
-    transport: ClusterTransportKind,
-) -> ClusterEndpointRecord {
-    ClusterEndpointRecord {
-        endpoint_id: ClusterEndpointId::derived("sinomo.network-module.dial", address),
-        node_id: NodeId::from_legacy_named("node_network_module_dial_placeholder")
-            .expect("static node id"),
-        transport,
-        address: address.to_string(),
-        source: ClusterEndpointSource::Static,
-        privacy: ClusterEndpointPrivacy::InternetDirect,
-        priority: 0,
-        last_observed_latency_ms: None,
-    }
-}
-
-async fn send_daemon_control_request_to_address_async(
-    address: &str,
-    request: &crate::DaemonControlRequest,
-    timeouts: DaemonRpcTimeouts,
-) -> Result<crate::DaemonControlResponse, NetworkError> {
-    if let Some(scheme) = crate::network_module::endpoint_address_scheme(address) {
-        if let Some(module) =
-            crate::network_module::registered_network_module_for_address_scheme(scheme)
-        {
-            let transport = module
-                .descriptor()
-                .transports
-                .first()
-                .cloned()
-                .unwrap_or(ClusterTransportKind::HttpsRelay);
-            let endpoint = cluster_endpoint_record_for_module_address_dial(address, transport);
-            return dial_daemon_control_request_via_network_module(
-                module.as_ref(),
-                &endpoint,
-                request,
-                timeouts,
-            )
-            .await;
-        }
-        return Err(NetworkError::Io {
-            operation: format!("send daemon rpc to {address}"),
-            detail: format!("unsupported daemon rpc address scheme `{scheme}`"),
-        });
-    }
-    crate::send_daemon_control_request_async(
-        address,
-        request,
-        timeouts,
-        crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
-    )
-    .await
 }
 
 #[cfg(any(test, feature = "test-support"))]

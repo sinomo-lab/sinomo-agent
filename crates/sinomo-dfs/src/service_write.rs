@@ -12,6 +12,7 @@ use std::io::Read;
 use std::time::Instant;
 
 use sinomo_core::events::EventId;
+use sinomo_core::network::NetworkError;
 use sinomo_core::node::NodeId;
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 
@@ -1925,11 +1926,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_policy_min = policy.min_commit_replicas;
         let trace_policy_desired = policy.desired_replicas;
         let capture_started = Instant::now();
-        let (manifest, captured_bytes) = self.content.put_object_version_from_reader_capture(
+        let manifest = self.content.put_object_version_from_reader(
             request.object_id.as_str(),
             request.target_version.as_str(),
             reader,
-            usize::try_from(DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT).unwrap_or(usize::MAX),
         )?;
         let capture_elapsed = capture_started.elapsed();
         let request_id = self.next_request_id();
@@ -1939,41 +1939,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.local_metadata_journal_after_sequence_for_shard(&shard_id)?;
         let metadata_sequence_elapsed = metadata_sequence_started.elapsed();
         let primary_node_id = shard.primary_node_id.clone();
-        let (bytes, content_hash, content_size_bytes) = if manifest.size_bytes
-            <= DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT
-            && desired_replica_nodes.contains(&primary_node_id)
-        {
-            if let Some(bytes) = captured_bytes {
-                (bytes, None, None)
-            } else {
-                match self.content.read_object_version(
-                    request.object_id.as_str(),
-                    request.target_version.as_str(),
-                ) {
-                    Ok((_, bytes)) => (bytes, None, None),
-                    Err(_) => (
-                        Vec::new(),
-                        Some(manifest.content_hash.clone()),
-                        Some(manifest.size_bytes),
-                    ),
-                }
-            }
+        let (content_hash, content_size_bytes) = if manifest.size_bytes == 0 {
+            (None, None)
         } else {
             (
-                Vec::new(),
                 Some(manifest.content_hash.clone()),
                 Some(manifest.size_bytes),
             )
         };
-        let inline_bytes = bytes.len();
-        let captured_inline =
-            inline_bytes > 0 && content_hash.is_none() && content_size_bytes.is_none();
         let command = DfsDistributedWriteCommand {
             request_id: request_id.clone(),
             request,
             expected_base_version,
             metadata_journal_after_sequence,
-            bytes,
+            bytes: Vec::new(),
             content_hash,
             content_size_bytes,
             desired_replica_nodes,
@@ -1985,13 +1964,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             exclusive_create: false,
         };
         let send_started = Instant::now();
-        let sent = self.send_dfs_message_if_routable(
-            &primary_node_id,
-            DfsNetworkMessage::DistributedWriteRequest(command.clone()),
-        )?;
+        let message = DfsNetworkMessage::DistributedWriteRequest(command.clone());
+        let sent = if manifest.size_bytes == 0 {
+            self.send_dfs_message_if_routable(&primary_node_id, message)?
+        } else {
+            let (_, body_reader) = self.open_content_hash_stream(
+                &command.request.object_id,
+                &command.request.target_version,
+                &manifest.content_hash,
+                Some(manifest.size_bytes),
+            )?;
+            let routed = self.next_dfs_routed_message(&primary_node_id, message);
+            match self.transport.send_routed_call(
+                &primary_node_id,
+                DfsRoutedCall::with_attachment(
+                    routed,
+                    DfsOutboundAttachment::from_reader(
+                        body_reader,
+                        manifest.size_bytes,
+                        &manifest.content_hash,
+                    ),
+                ),
+            ) {
+                Ok(()) => true,
+                Err(NetworkError::UnknownNode { .. }) => false,
+                Err(error) => return Err(DfsError::from_network(error)),
+            }
+        };
         let send_elapsed = send_started.elapsed();
         dfs_perf_trace(format_args!(
-            "routed-write-send node={} requester={} primary={} request={} object={} version={} bytes={} inline_bytes={} captured_inline={} desired={} policy_min={} policy_desired={} capture_ms={} metadata_seq_ms={} send_ms={} total_ms={} sent={}",
+            "routed-write-send node={} requester={} primary={} request={} object={} version={} bytes={} reader_attachment={} desired={} policy_min={} policy_desired={} capture_ms={} metadata_seq_ms={} send_ms={} total_ms={} sent={}",
             self.node_id,
             trace_requester,
             primary_node_id,
@@ -1999,8 +2001,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             trace_object_id,
             trace_version,
             manifest.size_bytes,
-            inline_bytes,
-            captured_inline,
+            manifest.size_bytes > 0,
             trace_desired_count,
             trace_policy_min,
             trace_policy_desired,

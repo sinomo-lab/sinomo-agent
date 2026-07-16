@@ -278,18 +278,5 @@ mod tests {
         assert!(!vote.uses_full_response_budget());
         assert!(!general.is_response_retry_safe());
         assert!(!general.uses_full_response_budget());
-        let requested = Some(Duration::from_secs(30));
-        assert_eq!(
-            sinomo_network::cluster_object_rpc_effective_route_timeout(&append, requested),
-            Some(Duration::from_secs(30))
-        );
-        assert_eq!(
-            sinomo_network::cluster_object_rpc_effective_route_timeout(&vote, requested),
-            Some(Duration::from_secs(30))
-        );
-        assert_eq!(
-            sinomo_network::cluster_object_rpc_effective_route_timeout(&general, requested),
-            Some(Duration::from_secs(30))
-        );
     }
 }

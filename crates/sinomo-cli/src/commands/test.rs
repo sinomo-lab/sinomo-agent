@@ -749,7 +749,7 @@ mod tests {
             .collect();
         for id in [
             "cluster.network.ping-benchmark",
-            "cluster.network.streamed-unary-large-message",
+            "cluster.network.arbitrary-message",
             "cluster.network.hygiene",
             "cluster.network.hygiene-dirty-fixture",
             "cluster.kv.quorum-commit-benchmark",
@@ -790,7 +790,7 @@ mod tests {
             .collect::<Vec<_>>();
         for id in [
             "cluster.network.ping-benchmark",
-            "cluster.network.streamed-unary-large-message",
+            "cluster.network.arbitrary-message",
             "cluster.network.hygiene",
             "cluster.dfs.routed-status",
             "cluster.dfs.read-your-write",

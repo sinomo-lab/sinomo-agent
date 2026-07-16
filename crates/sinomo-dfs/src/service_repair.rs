@@ -626,7 +626,7 @@ where
                 .map(|(job, request_id)| (job.missing_replica_node_id.clone(), request_id.clone()))
                 .collect::<Vec<_>>();
             let outcomes = self
-                .send_repair_replica_bodies_if_routable_async(
+                .send_repair_replica_attachments_if_routable_async(
                     &fanout_targets,
                     &job.intent_id,
                     &job.file_system_id,
@@ -729,7 +729,7 @@ where
                     break;
                 }
                 let outcomes = self
-                    .send_stage_blob_bodies_if_routable_async(
+                    .send_stage_blob_attachments_if_routable_async(
                         &full_stage_targets,
                         &intent.intent_id,
                         &intent.file_system_id,
@@ -776,7 +776,7 @@ where
             return Ok(None);
         }
         let outcome = self
-            .send_stage_patch_body_if_routable_async(
+            .send_stage_patch_attachment_if_routable_async(
                 replica_node_id,
                 request_id,
                 &intent.intent_id,
@@ -1119,7 +1119,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .iter()
                 .map(|(job, request_id)| (job.missing_replica_node_id.clone(), request_id.clone()))
                 .collect::<Vec<_>>();
-            let outcomes = self.send_repair_replica_bodies_if_routable(
+            let outcomes = self.send_repair_replica_attachments_if_routable(
                 &fanout_targets,
                 &job.intent_id,
                 &job.file_system_id,
@@ -1289,7 +1289,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 break;
             }
-            let outcomes = self.send_stage_blob_bodies_if_routable(
+            let outcomes = self.send_stage_blob_attachments_if_routable(
                 &full_stage_targets,
                 intent_id,
                 &intent.file_system_id,
@@ -1333,7 +1333,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if base_version != &patch.base_version {
             return Ok(None);
         }
-        let outcome = self.send_stage_patch_body_if_routable(
+        let outcome = self.send_stage_patch_attachment_if_routable(
             replica_node_id,
             request_id,
             &intent.intent_id,

@@ -455,11 +455,12 @@ mod tests {
     }
 
     impl DfsMessageTransport for LockAckTransport {
-        fn send_routed_message(
+        fn send_routed_call(
             &mut self,
             target_node_id: &sinomo_core::node::NodeId,
-            message: DfsRoutedMessage,
+            call: DfsRoutedCall,
         ) -> std::result::Result<(), NetworkError> {
+            let message = crate::materialize_dfs_routed_call_sync(call)?;
             if !self.acknowledged_nodes.contains(target_node_id) {
                 return Ok(());
             }

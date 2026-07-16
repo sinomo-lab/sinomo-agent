@@ -175,9 +175,6 @@ pub trait NetworkModule: Send + Sync {
     fn open_rpc_stream(&self, endpoint: &ClusterEndpointRecord,
                        health: NetworkHealthPolicy)
         -> NetworkFuture<Box<dyn NetworkDuplexStream>>;
-    // Bounded unary compatibility is an adapter over open_rpc_stream.
-    fn dial_rpc(&self, endpoint: &ClusterEndpointRecord, request: &[u8],
-                timeouts: DaemonRpcTimeouts) -> NetworkFuture<Vec<u8>>;
     fn local_endpoints(&self) -> Result<Vec<ClusterEndpointRecord>, NetworkError>;
 }
 

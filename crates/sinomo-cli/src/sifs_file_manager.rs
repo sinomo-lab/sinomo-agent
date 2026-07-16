@@ -1501,9 +1501,8 @@ fn open_sifs_service_with_hydration_until(
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
         .map_err(|error| format!("cannot open DFS content store: {error}"))?;
     sifs_operation_remaining(operation_deadline, "opening the DFS content store")?;
-    // The daemon transport carries response heads and streamed attachments as
-    // one session. Routing it through the unary SIFS adapter would replace the
-    // encoded DFS response head with the attachment bytes.
+    // Both daemon-backed and direct routing use the same canonical call/result
+    // contract, preserving typed response values and explicit attachments.
     let (sync_peer_transport, async_peer_transport) =
         match sinomo_runtime::api::DaemonDfsPeerTransport::connect(data_dir.clone()) {
             Ok(peer_transport) => shared_sifs_peer_transports(peer_transport),
@@ -1813,9 +1812,9 @@ impl DfsPeerTransport for SifsDfsPeerTransport {
     fn call_object_rpc(
         &self,
         target_node_id: &NodeId,
-        request: &network::ObjectRpcRequest,
+        call: network::ObjectRpcSessionCall,
         options: DfsObjectRpcSendOptions,
-    ) -> Result<network::ObjectRpcResponse, DfsPeerTransportError> {
+    ) -> Result<network::ObjectRpcSessionResult, DfsPeerTransportError> {
         let operation_deadline =
             sifs_rpc_effective_operation_deadline(&options, self.operation_deadline);
         let options = sifs_rpc_options_with_operation_deadline(options, operation_deadline)?;
@@ -1823,7 +1822,7 @@ impl DfsPeerTransport for SifsDfsPeerTransport {
             &self.rpc_runtime,
             &self.data_dir,
             target_node_id,
-            request,
+            call,
             options,
             operation_deadline,
         )
@@ -1834,9 +1833,10 @@ impl AsyncDfsPeerTransport for SifsDfsPeerTransport {
     fn call_object_rpc_async<'a>(
         &'a self,
         target_node_id: &'a NodeId,
-        request: &'a network::ObjectRpcRequest,
+        call: network::ObjectRpcSessionCall,
         options: DfsObjectRpcSendOptions,
-    ) -> DfsPeerTransportFuture<'a, Result<network::ObjectRpcResponse, DfsPeerTransportError>> {
+    ) -> DfsPeerTransportFuture<'a, Result<network::ObjectRpcSessionResult, DfsPeerTransportError>>
+    {
         let operation_deadline =
             sifs_rpc_effective_operation_deadline(&options, self.operation_deadline);
         let options = match sifs_rpc_options_with_operation_deadline(options, operation_deadline) {
@@ -1845,18 +1845,18 @@ impl AsyncDfsPeerTransport for SifsDfsPeerTransport {
         };
         let handle = self.rpc_runtime.runtime.handle().clone();
         let target_node_id = target_node_id.clone();
-        let request = request.clone();
         let data_dir = self.data_dir.clone();
         Box::pin(async move {
             let daemon_target_node_id = target_node_id.clone();
-            let daemon_request = request.clone();
+            let daemon_runtime = handle.clone();
             let daemon_probe = tokio::task::spawn_blocking(move || {
                 sifs_send_dfs_object_rpc_via_daemon(
                     &data_dir,
                     &daemon_target_node_id,
-                    &daemon_request,
+                    call,
                     options,
                     operation_deadline,
+                    &daemon_runtime,
                 )
             });
             // Discovery and the forwarded RPC are each bounded internally.
@@ -1866,14 +1866,15 @@ impl AsyncDfsPeerTransport for SifsDfsPeerTransport {
             let daemon_result = daemon_probe
                 .await
                 .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
-            if let Some(result) = daemon_result {
-                return result;
-            }
+            let call = match daemon_result {
+                SifsDaemonRpcAttempt::Complete(result) => return result,
+                SifsDaemonRpcAttempt::Unavailable(call) => call,
+            };
 
             let options = sifs_rpc_options_with_operation_deadline(options, operation_deadline)?;
-            sinomo_runtime::daemon::send_object_rpc_to_target_async_with_options(
+            sinomo_runtime::daemon::send_object_rpc_session_to_target_async_with_options(
                 &target_node_id,
-                &request,
+                call,
                 options.cluster_rpc_options(),
                 &handle,
                 options.observe_connectivity,
@@ -1934,20 +1935,22 @@ fn sifs_send_dfs_object_rpc(
     rpc_runtime: &SifsRpcRuntime,
     data_dir: &SinomoDataDir,
     target_node_id: &NodeId,
-    request: &network::ObjectRpcRequest,
+    call: network::ObjectRpcSessionCall,
     options: DfsObjectRpcSendOptions,
     operation_deadline: Option<Instant>,
-) -> Result<network::ObjectRpcResponse, DfsPeerTransportError> {
+) -> Result<network::ObjectRpcSessionResult, DfsPeerTransportError> {
     let options = sifs_rpc_options_with_operation_deadline(options, operation_deadline)?;
-    if let Some(result) = sifs_send_dfs_object_rpc_via_daemon(
+    let call = match sifs_send_dfs_object_rpc_via_daemon(
         data_dir,
         target_node_id,
-        request,
+        call,
         options,
         operation_deadline,
+        rpc_runtime.runtime.handle(),
     ) {
-        return result;
-    }
+        SifsDaemonRpcAttempt::Complete(result) => return result,
+        SifsDaemonRpcAttempt::Unavailable(call) => call,
+    };
     let options = sifs_rpc_options_with_operation_deadline(options, operation_deadline)?;
 
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -1956,17 +1959,17 @@ fn sifs_send_dfs_object_rpc(
             tokio::runtime::RuntimeFlavor::MultiThread
         ) {
             return tokio::task::block_in_place(|| {
-                handle.block_on(async {
-                    sinomo_runtime::daemon::send_object_rpc_to_target_async_with_options(
-                        target_node_id,
-                        request,
-                        options.cluster_rpc_options(),
-                        &handle,
-                        options.observe_connectivity,
+                handle
+                    .block_on(
+                        sinomo_runtime::daemon::send_object_rpc_session_to_target_async_with_options(
+                            target_node_id,
+                            call,
+                            options.cluster_rpc_options(),
+                            &handle,
+                            options.observe_connectivity,
+                        ),
                     )
-                    .await
                     .map_err(|error| DfsPeerTransportError::new(error.to_string()))
-                })
             });
         }
         return Err(DfsPeerTransportError::new(
@@ -1975,16 +1978,15 @@ fn sifs_send_dfs_object_rpc(
     }
     rpc_runtime
         .runtime
-        .block_on(async {
-            sinomo_runtime::daemon::send_object_rpc_to_target_async_with_options(
+        .block_on(
+            sinomo_runtime::daemon::send_object_rpc_session_to_target_async_with_options(
                 target_node_id,
-                request,
+                call,
                 options.cluster_rpc_options(),
                 rpc_runtime.runtime.handle(),
                 options.observe_connectivity,
-            )
-            .await
-        })
+            ),
+        )
         .map_err(|error| DfsPeerTransportError::new(error.to_string()))
 }
 
@@ -1992,19 +1994,25 @@ fn sifs_send_dfs_object_rpc(
 /// running. Scoped to the backend's own data directory on purpose — probing
 /// the env/home default daemon routed backends opened on foreign directories
 /// (tests, tooling) through the developer's live daemon and its real cluster.
+enum SifsDaemonRpcAttempt {
+    Unavailable(network::ObjectRpcSessionCall),
+    Complete(Result<network::ObjectRpcSessionResult, DfsPeerTransportError>),
+}
+
 fn sifs_send_dfs_object_rpc_via_daemon(
     data_dir: &SinomoDataDir,
     target_node_id: &NodeId,
-    request: &network::ObjectRpcRequest,
+    call: network::ObjectRpcSessionCall,
     options: DfsObjectRpcSendOptions,
     operation_deadline: Option<Instant>,
-) -> Option<Result<network::ObjectRpcResponse, DfsPeerTransportError>> {
+    runtime: &tokio::runtime::Handle,
+) -> SifsDaemonRpcAttempt {
     let paths = sinomo_runtime::daemon::DaemonPaths::new(data_dir);
     let client = if let Some(deadline) = operation_deadline {
         let remaining =
             match sifs_rpc_remaining_operation_budget(deadline, "local daemon discovery") {
                 Ok(remaining) => remaining,
-                Err(error) => return Some(Err(error)),
+                Err(error) => return SifsDaemonRpcAttempt::Complete(Err(error)),
             };
         sinomo_runtime::daemon::DaemonApiClient::connect_for_paths_with_timeout(
             &paths,
@@ -2014,28 +2022,50 @@ fn sifs_send_dfs_object_rpc_via_daemon(
         sinomo_runtime::daemon::DaemonApiClient::connect_for_paths(&paths)
     };
     let Ok(client) = client else {
-        return None;
+        return SifsDaemonRpcAttempt::Unavailable(call);
     };
     let options = match sifs_rpc_options_with_operation_deadline(options, operation_deadline) {
         Ok(options) => options,
-        Err(error) => return Some(Err(error)),
+        Err(error) => return SifsDaemonRpcAttempt::Complete(Err(error)),
     };
     if let Some(deadline) = operation_deadline
         && let Err(error) = sifs_rpc_remaining_operation_budget(deadline, "daemon-forwarded RPC")
     {
-        return Some(Err(error));
+        return SifsDaemonRpcAttempt::Complete(Err(error));
     }
     // Keep the inner routed RPC clamped to the DFS operation deadline through
     // `options`, but do not clamp the loopback control stream to that same
-    // instant. `DaemonApiClient` deliberately gives buffered forwarding one
+    // instant. `DaemonApiClient` deliberately gives canonical forwarding one
     // default network phase of grace so the daemon can return the terminal
     // response (including a precise possibly-applied error) after the inner
     // route budget expires.
-    Some(
+    let send = async {
         client
-            .dfs_object_rpc_to_target_with_options(target_node_id, request, options)
-            .map_err(|error| DfsPeerTransportError::new(error.to_string())),
-    )
+            .object_rpc_session_to_target_with_deadline_async(
+                target_node_id,
+                call,
+                options.connect_timeout,
+                options.overall_timeout,
+                options.observe_connectivity,
+            )
+            .await
+            .map_err(|error| DfsPeerTransportError::new(error.to_string()))
+    };
+    let result = if let Ok(current) = tokio::runtime::Handle::try_current() {
+        if matches!(
+            current.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            tokio::task::block_in_place(|| runtime.block_on(send))
+        } else {
+            Err(DfsPeerTransportError::new(
+                "SIFS daemon RPC cannot block a current-thread Tokio runtime; use the async transport",
+            ))
+        }
+    } else {
+        runtime.block_on(send)
+    };
+    SifsDaemonRpcAttempt::Complete(result)
 }
 
 fn publish_sifs_metadata_journal_from_data_dir(
@@ -2326,56 +2356,33 @@ mod tests {
     use std::sync::Arc;
 
     #[derive(Clone, Debug)]
-    struct SessionOnlyPeerTransport {
+    struct CanonicalPeerTransport {
         response: network::ObjectRpcResponse,
         attachment: Vec<u8>,
     }
 
-    impl SessionOnlyPeerTransport {
-        fn session_result(&self) -> network::ObjectRpcSessionResult {
+    impl CanonicalPeerTransport {
+        fn rpc_result(&self) -> network::ObjectRpcSessionResult {
             network::ObjectRpcSessionResult::new(
                 self.response.clone(),
                 network::ObjectRpcIncomingBody::bytes(self.attachment.clone()),
             )
         }
-
-        fn unary_adapter_error() -> DfsPeerTransportError {
-            DfsPeerTransportError::new("session request was flattened through the unary adapter")
-        }
     }
 
-    impl DfsPeerTransport for SessionOnlyPeerTransport {
+    impl DfsPeerTransport for CanonicalPeerTransport {
         fn call_object_rpc(
-            &self,
-            _target_node_id: &NodeId,
-            _request: &network::ObjectRpcRequest,
-            _options: DfsObjectRpcSendOptions,
-        ) -> Result<network::ObjectRpcResponse, DfsPeerTransportError> {
-            Err(Self::unary_adapter_error())
-        }
-
-        fn call_object_rpc_session(
             &self,
             _target_node_id: &NodeId,
             _call: network::ObjectRpcSessionCall,
             _options: DfsObjectRpcSendOptions,
         ) -> Result<network::ObjectRpcSessionResult, DfsPeerTransportError> {
-            Ok(self.session_result())
+            Ok(self.rpc_result())
         }
     }
 
-    impl AsyncDfsPeerTransport for SessionOnlyPeerTransport {
+    impl AsyncDfsPeerTransport for CanonicalPeerTransport {
         fn call_object_rpc_async<'a>(
-            &'a self,
-            _target_node_id: &'a NodeId,
-            _request: &'a network::ObjectRpcRequest,
-            _options: DfsObjectRpcSendOptions,
-        ) -> DfsPeerTransportFuture<'a, Result<network::ObjectRpcResponse, DfsPeerTransportError>>
-        {
-            Box::pin(async { Err(Self::unary_adapter_error()) })
-        }
-
-        fn call_object_rpc_session_async<'a>(
             &'a self,
             _target_node_id: &'a NodeId,
             _call: network::ObjectRpcSessionCall,
@@ -2384,7 +2391,7 @@ mod tests {
             'a,
             Result<network::ObjectRpcSessionResult, DfsPeerTransportError>,
         > {
-            let result = self.session_result();
+            let result = self.rpc_result();
             Box::pin(async move { Ok(result) })
         }
     }
@@ -2448,11 +2455,11 @@ mod tests {
     }
 
     #[test]
-    fn shared_peer_transport_preserves_session_response_head_and_attachment() {
+    fn shared_peer_transport_preserves_response_value_and_attachment() {
         let route = "/dfs/test/session-preserving";
         let encoded_head = "encoded-response-head".to_string();
         let attachment = b"streamed-response-attachment".to_vec();
-        let transport = SessionOnlyPeerTransport {
+        let transport = CanonicalPeerTransport {
             response: network::ObjectRpcResponse::encode_body(route, &encoded_head)
                 .expect("response head"),
             attachment: attachment.clone(),
@@ -2466,12 +2473,12 @@ mod tests {
         let runtime = SifsRpcRuntime::new().expect("runtime");
 
         let sync_result = sync_transport
-            .call_object_rpc_session(
+            .call_object_rpc(
                 &target,
-                network::ObjectRpcSessionCall::buffered(request()),
+                network::ObjectRpcSessionCall::value(request()),
                 DfsObjectRpcSendOptions::default(),
             )
-            .expect("sync session result");
+            .expect("sync RPC result");
         assert_eq!(
             sync_result
                 .response
@@ -2489,12 +2496,12 @@ mod tests {
 
         let async_result = runtime
             .runtime
-            .block_on(async_transport.call_object_rpc_session_async(
+            .block_on(async_transport.call_object_rpc_async(
                 &target,
-                network::ObjectRpcSessionCall::buffered(request()),
+                network::ObjectRpcSessionCall::value(request()),
                 DfsObjectRpcSendOptions::default(),
             ))
-            .expect("async session result");
+            .expect("async RPC result");
         assert_eq!(
             async_result
                 .response

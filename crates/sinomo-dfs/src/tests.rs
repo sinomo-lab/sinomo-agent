@@ -5,8 +5,8 @@ use sinomo_core::events::EventId;
 use sinomo_core::kv::{InProcessKvStore, KvEntry, KvError, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
-    AsyncInProcessNetwork, ClusterPaths, InProcessNetwork, NetworkError, ObjectRpcRequest,
-    ObjectRpcResponse,
+    AsyncInProcessNetwork, ClusterPaths, InProcessNetwork, NetworkError, ObjectRpcIncomingBody,
+    ObjectRpcRequest, ObjectRpcResponse, ObjectRpcSessionCall, ObjectRpcSessionResult,
 };
 use sinomo_core::object::Value;
 use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest};
@@ -58,10 +58,10 @@ impl DfsTransportIdentity for ReceiveOnlyTransport {
 }
 
 impl DfsMessageTransport for ReceiveOnlyTransport {
-    fn send_routed_message(
+    fn send_routed_call(
         &mut self,
         target_node_id: &NodeId,
-        _message: DfsRoutedMessage,
+        _call: DfsRoutedCall,
     ) -> Result<(), NetworkError> {
         Err(NetworkError::UnknownNode {
             node_id: target_node_id.clone(),
@@ -407,6 +407,111 @@ fn test_dfs_message_command_from_message(
             message,
         ),
     }
+}
+
+struct CanonicalDfsMessagePeerTransport {
+    sender: DfsMessageSender,
+}
+
+impl CanonicalDfsMessagePeerTransport {
+    async fn call_object_rpc_inner(
+        &self,
+        target_node_id: &NodeId,
+        call: ObjectRpcSessionCall,
+        options: DfsObjectRpcSendOptions,
+    ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
+        let ObjectRpcSessionCall { request, body } = call;
+        if !dfs_route_is_message_data_plane(&request.route) {
+            return Err(DfsPeerTransportError::new(format!(
+                "unexpected DFS message peer route {}",
+                request.route
+            )));
+        }
+        let command = if body.is_empty() {
+            decode_dfs_message_rpc_request(&request)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?
+        } else {
+            let head = crate::body_rpc::decode_dfs_attachment_message_rpc_request(&request)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            let max_bytes = usize::try_from(head.attachment.total_size_bytes).map_err(|_| {
+                DfsPeerTransportError::new(
+                    "DFS request attachment does not fit this platform address space",
+                )
+            })?;
+            let bytes = body
+                .collect_to_vec(max_bytes)
+                .await
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            crate::body_rpc::attach_dfs_message_request_attachment(head, bytes)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?
+        };
+        let response = (self.sender)(target_node_id, &command, options)?;
+        ObjectRpcResponse::encode_body(&request.route, &response)
+            .map(ObjectRpcSessionResult::value)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+    }
+}
+
+impl DfsPeerTransport for CanonicalDfsMessagePeerTransport {
+    fn call_object_rpc(
+        &self,
+        target_node_id: &NodeId,
+        call: ObjectRpcSessionCall,
+        options: DfsObjectRpcSendOptions,
+    ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+        let result = runtime.block_on(self.call_object_rpc_inner(target_node_id, call, options));
+        runtime.shutdown_timeout(Duration::from_millis(250));
+        result
+    }
+}
+
+impl AsyncDfsPeerTransport for CanonicalDfsMessagePeerTransport {
+    fn call_object_rpc_async<'a>(
+        &'a self,
+        target_node_id: &'a NodeId,
+        call: ObjectRpcSessionCall,
+        options: DfsObjectRpcSendOptions,
+    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcSessionResult, DfsPeerTransportError>> {
+        Box::pin(self.call_object_rpc_inner(target_node_id, call, options))
+    }
+}
+
+fn node_transport_with_canonical_message_peer(
+    local_node_id: NodeId,
+    peer_node_ids: impl IntoIterator<Item = NodeId>,
+    connect_timeout: Duration,
+    sender: DfsMessageSender,
+) -> DfsNodeTransport {
+    let peer = Arc::new(CanonicalDfsMessagePeerTransport { sender });
+    let peer_transport: Arc<dyn DfsPeerTransport> = peer.clone();
+    let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer;
+    DfsNodeTransport::with_peer_transports_for_nodes(
+        local_node_id,
+        peer_node_ids,
+        connect_timeout,
+        peer_transport,
+        async_peer_transport,
+    )
+}
+
+fn served_transport_with_canonical_message_peer(
+    local_node_id: NodeId,
+    peer_node_ids: impl IntoIterator<Item = NodeId>,
+    sender: DfsMessageSender,
+    connect_timeout: Duration,
+) -> DfsNodeServedMessageTransport {
+    let peer_transport: Arc<dyn DfsPeerTransport> =
+        Arc::new(CanonicalDfsMessagePeerTransport { sender });
+    DfsNodeServedMessageTransport::new_with_peer_transport_for_nodes(
+        local_node_id,
+        peer_node_ids,
+        peer_transport,
+        connect_timeout,
+    )
 }
 
 #[test]
@@ -1014,10 +1119,10 @@ impl DfsTransportIdentity for FailingSendTransport {
 }
 
 impl DfsMessageTransport for FailingSendTransport {
-    fn send_routed_message(
+    fn send_routed_call(
         &mut self,
         _target_node_id: &NodeId,
-        _message: DfsRoutedMessage,
+        _call: DfsRoutedCall,
     ) -> Result<(), NetworkError> {
         Err(NetworkError::Io {
             operation: "test send".to_string(),
@@ -1042,10 +1147,10 @@ impl DfsTransportIdentity for CountingFailingSendTransport {
 }
 
 impl DfsMessageTransport for CountingFailingSendTransport {
-    fn send_routed_message(
+    fn send_routed_call(
         &mut self,
         _target_node_id: &NodeId,
-        _message: DfsRoutedMessage,
+        _call: DfsRoutedCall,
     ) -> Result<(), NetworkError> {
         self.send_count.fetch_add(1, Ordering::Relaxed);
         Err(NetworkError::Io {
@@ -1081,10 +1186,10 @@ impl DfsTransportIdentity for DeadlineDroppingSendTransport {
 }
 
 impl DfsMessageTransport for DeadlineDroppingSendTransport {
-    fn send_routed_message(
+    fn send_routed_call(
         &mut self,
         _target_node_id: &NodeId,
-        _message: DfsRoutedMessage,
+        _call: DfsRoutedCall,
     ) -> Result<(), NetworkError> {
         Ok(())
     }
@@ -1103,10 +1208,10 @@ impl DfsMessageTransport for DeadlineDroppingSendTransport {
 }
 
 impl DfsMessageTransport for DroppingSendTransport {
-    fn send_routed_message(
+    fn send_routed_call(
         &mut self,
         _target_node_id: &NodeId,
-        _message: DfsRoutedMessage,
+        _call: DfsRoutedCall,
     ) -> Result<(), NetworkError> {
         Ok(())
     }
@@ -1278,9 +1383,13 @@ fn async_dfs_message_transport_in_process_sends_waits_and_drains() {
         let message =
             test_dfs_lookup_routed_message(&node_a, &node_b, 7, "/async/message-transport");
 
-        AsyncDfsMessageTransport::send_routed_message_async(&mut transport_a, &node_b, message)
-            .await
-            .expect("send");
+        AsyncDfsMessageTransport::send_routed_call_async(
+            &mut transport_a,
+            &node_b,
+            DfsRoutedCall::value(message),
+        )
+        .await
+        .expect("send");
         assert!(
             AsyncDfsMessageTransport::wait_for_incoming_async(&mut transport_b, Duration::ZERO)
                 .await
@@ -1566,9 +1675,9 @@ fn served_message_transport_sends_nested_return_node_requests_synchronously() {
         .expect("begin served message");
 
     transport
-        .send_routed_message(
+        .send_routed_call(
             &requester,
-            build_dfs_routed_message(
+            DfsRoutedCall::value(build_dfs_routed_message(
                 &primary,
                 &requester,
                 2,
@@ -1584,14 +1693,14 @@ fn served_message_transport_sends_nested_return_node_requests_synchronously() {
                         path: "/services".to_string(),
                     },
                 }),
-            ),
+            )),
         )
         .expect("nested return-node request should be sent synchronously");
 
     assert_eq!(
         sent_requests.lock().expect("sent requests").as_slice(),
         ["dfs_message_2"],
-        "nested return-node requests must not be buffered as inline responses"
+        "nested return-node requests must be sent as calls, not returned as the original call response"
     );
     let incoming = transport
         .drain_incoming_messages()
@@ -1608,9 +1717,9 @@ fn served_message_transport_sends_nested_return_node_requests_synchronously() {
 }
 
 #[test]
-fn served_message_transport_returns_response_frames_inline() {
-    let primary = NodeId::from_legacy_named("node_served_inline_primary").expect("primary");
-    let requester = NodeId::from_legacy_named("node_served_inline_requester").expect("requester");
+fn served_message_transport_returns_response_frames_to_caller() {
+    let primary = NodeId::from_legacy_named("node_served_return_primary").expect("primary");
+    let requester = NodeId::from_legacy_named("node_served_return_requester").expect("requester");
     let sent_requests = Arc::new(AtomicUsize::new(0));
     let sender_count = Arc::clone(&sent_requests);
     let sender: DfsMessageSender = Arc::new(move |_target, _command, _timeout| {
@@ -1632,24 +1741,24 @@ fn served_message_transport_returns_response_frames_inline() {
         .expect("begin served message");
 
     transport
-        .send_routed_message(
+        .send_routed_call(
             &requester,
-            build_dfs_routed_message(
+            DfsRoutedCall::value(build_dfs_routed_message(
                 &primary,
                 &requester,
                 4,
                 4,
                 DfsNetworkMessage::NamespaceResponse(DfsNamespaceResponse {
-                    request_id: "dfs_net_req_inline_response".to_string(),
+                    request_id: "dfs_net_req_returned_response".to_string(),
                     result: DfsNamespaceResult::Applied,
                     synced_path_object: None,
                     synced_path_objects: Vec::new(),
                     metadata_journal_batches: Vec::new(),
                     posix_coordination_result: None,
                 }),
-            ),
+            )),
         )
-        .expect("response frame should return inline");
+        .expect("response frame should return to the caller");
 
     assert_eq!(sent_requests.load(Ordering::SeqCst), 0);
     let outbound = transport.finish_message();
@@ -1890,14 +1999,20 @@ impl DfsPeerTransport for RecordingPeerTransport {
     fn call_object_rpc(
         &self,
         target_node_id: &NodeId,
-        request: &ObjectRpcRequest,
+        call: ObjectRpcSessionCall,
         options: DfsObjectRpcSendOptions,
-    ) -> Result<ObjectRpcResponse, DfsPeerTransportError> {
+    ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
+        if !call.body.is_empty() {
+            return Err(DfsPeerTransportError::new(
+                "recording peer does not accept an attachment",
+            ));
+        }
+        let request = &call.request;
         self.options
             .lock()
             .expect("options")
             .push((request.route.clone(), options.observe_connectivity));
-        match request.route.as_str() {
+        let response = match request.route.as_str() {
             route if dfs_route_is_message_data_plane(route) => {
                 let command: DfsMessageCommand = request
                     .decode_body()
@@ -1923,7 +2038,7 @@ impl DfsPeerTransport for RecordingPeerTransport {
                     "rpc:{}:{}:{}",
                     request.route, target_node_id, command.request_id
                 ));
-                dfs_direct_read_rpc_response(DfsReadResponse {
+                return dfs_direct_read_rpc_session_result(DfsReadResponse {
                     request_id: command.request_id,
                     object_id: command.object_id.clone(),
                     result: DfsReadResult::Found(DfsReadData {
@@ -1933,7 +2048,7 @@ impl DfsPeerTransport for RecordingPeerTransport {
                         bytes: vec![1, 2, 3],
                     }),
                 })
-                .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()));
             }
             DFS_METADATA_JOURNAL_BATCH_ROUTE => {
                 let command: DfsMetadataJournalBatchCommand = request
@@ -1981,7 +2096,8 @@ impl DfsPeerTransport for RecordingPeerTransport {
             other => Err(DfsPeerTransportError::new(format!(
                 "unexpected DFS object RPC route {other}"
             ))),
-        }
+        }?;
+        Ok(ObjectRpcSessionResult::value(response))
     }
 }
 
@@ -1989,10 +2105,10 @@ impl AsyncDfsPeerTransport for RecordingPeerTransport {
     fn call_object_rpc_async<'a>(
         &'a self,
         target_node_id: &'a NodeId,
-        request: &'a ObjectRpcRequest,
+        call: ObjectRpcSessionCall,
         options: DfsObjectRpcSendOptions,
-    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResponse, DfsPeerTransportError>> {
-        Box::pin(async move { self.call_object_rpc(target_node_id, request, options) })
+    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcSessionResult, DfsPeerTransportError>> {
+        Box::pin(async move { self.call_object_rpc(target_node_id, call, options) })
     }
 }
 
@@ -2006,9 +2122,15 @@ impl DfsPeerTransport for ConcurrentMetadataPeerTransport {
     fn call_object_rpc(
         &self,
         _target_node_id: &NodeId,
-        request: &ObjectRpcRequest,
+        call: ObjectRpcSessionCall,
         _options: DfsObjectRpcSendOptions,
-    ) -> Result<ObjectRpcResponse, DfsPeerTransportError> {
+    ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
+        if !call.body.is_empty() {
+            return Err(DfsPeerTransportError::new(
+                "metadata peer does not accept an attachment",
+            ));
+        }
+        let request = &call.request;
         let active = self.active_calls.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_active_calls.fetch_max(active, Ordering::SeqCst);
         // Yield the worker long enough for the other scoped workers to enter.
@@ -2036,6 +2158,7 @@ impl DfsPeerTransport for ConcurrentMetadataPeerTransport {
                 result: DfsMetadataJournalBatchResult::Applied,
             },
         )
+        .map(ObjectRpcSessionResult::value)
         .map_err(|source| DfsPeerTransportError::new(source.to_string()))
     }
 }
@@ -2340,10 +2463,10 @@ impl DfsTransportIdentity for CountingEmptyTransport {
 }
 
 impl DfsMessageTransport for CountingEmptyTransport {
-    fn send_routed_message(
+    fn send_routed_call(
         &mut self,
         target_node_id: &NodeId,
-        _message: DfsRoutedMessage,
+        _call: DfsRoutedCall,
     ) -> Result<(), NetworkError> {
         Err(NetworkError::UnknownNode {
             node_id: target_node_id.clone(),
@@ -2617,11 +2740,6 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         namespace_request.uses_full_response_budget(),
         "DFS namespace message RPCs need the full verified final-hop response budget"
     );
-    assert_eq!(
-        sinomo_core::network::cluster_object_rpc_effective_route_timeout(&namespace_request, None,),
-        None,
-        "building a namespace request must not synthesize a whole-call deadline"
-    );
     assert!(
         !namespace_request.is_response_retry_safe(),
         "namespace mutations lack durable replay tracking and must not be redispatched"
@@ -2763,13 +2881,13 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
 }
 
 #[tokio::test]
-async fn direct_read_body_rpc_keeps_blob_out_of_initial_response() {
-    let root = temp_root("direct-read-rpc-stream-body");
+async fn direct_read_rpc_keeps_blob_in_the_session_attachment() {
+    let root = temp_root("direct-read-rpc-attachment");
     let data_dir = SinomoDataDir::new(&root);
     data_dir.ensure_root_layout().expect("root layout");
     let object_id = DfsObjectId::generate();
     let version = DfsVersion::generate();
-    let bytes = (0..(DFS_BLOB_INLINE_LIMIT_BYTES + 16384))
+    let bytes = (0..(2 * 1024 * 1024 + 16384))
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content")).expect("content");
@@ -2786,27 +2904,34 @@ async fn direct_read_body_rpc_keeps_blob_out_of_initial_response() {
     let direct_request = dfs_direct_read_rpc_request(&direct_read).expect("direct request");
     assert!(direct_request.is_response_retry_safe());
 
-    let mut body_response =
-        handle_dfs_direct_read_body_rpc_request(&data_dir, direct_request).expect("body");
-    assert_eq!(body_response.response.route, DFS_DIRECT_READ_ROUTE);
+    let attachment_response =
+        handle_dfs_direct_read_rpc_request(&data_dir, direct_request).expect("attachment");
+    assert_eq!(attachment_response.response.route, DFS_DIRECT_READ_ROUTE);
     assert_eq!(
-        body_response
+        attachment_response
             .response
             .metadata
             .get(DFS_DIRECT_READ_STATUS_METADATA_KEY)
             .map(String::as_str),
         Some(DFS_DIRECT_READ_STATUS_FOUND)
     );
-    assert!(body_response.response.body.is_empty());
-    let received = body_response
-        .body
+    assert!(attachment_response.response.body.is_empty());
+    let received = attachment_response
+        .attachment
         .collect_to_vec(bytes.len())
         .await
-        .expect("read body");
+        .expect("read attachment");
     assert_eq!(received, bytes);
-    body_response.response.body = received;
-    let decoded =
-        dfs_direct_read_response_from_rpc_response(body_response.response).expect("decode");
+    let decoded = dfs_direct_read_response_from_rpc_session_result(
+        sinomo_core::network::ObjectRpcSessionResult::new(
+            attachment_response.response,
+            sinomo_core::network::ObjectRpcIncomingBody::bytes(received),
+        ),
+    )
+    .expect("decode")
+    .collect_to_read_response()
+    .await
+    .expect("collect direct read");
     let DfsReadResult::Found(data) = decoded.result else {
         panic!("expected found response");
     };
@@ -2848,7 +2973,7 @@ fn node_transport_sends_rpc_and_queues_returned_messages() {
     let message = test_dfs_lookup_routed_message(&local, &remote, 7, "/node_route/send");
 
     transport
-        .send_routed_message(&remote, message.clone())
+        .send_routed_call(&remote, DfsRoutedCall::value(message.clone()))
         .expect("send message");
     let recorded = calls.lock().expect("calls lock");
     assert_eq!(recorded.as_slice(), &[(remote.clone(), message)]);
@@ -2895,7 +3020,7 @@ fn node_transport_read_message_uses_direct_sender_and_queues_response() {
     };
 
     transport
-        .send_routed_message(&remote, message)
+        .send_routed_call(&remote, DfsRoutedCall::value(message))
         .expect("send routed read message");
 
     let calls = direct_calls.lock().expect("direct calls");
@@ -2948,33 +3073,27 @@ fn node_transport_async_read_message_uses_direct_sender_and_queues_response() {
         let bytes = b"async direct node_route read bytes".to_vec();
         let bytes_hash = content_hash(&bytes);
         let direct_calls = Arc::new(Mutex::new(Vec::new()));
-        let async_direct_sender: AsyncDfsDirectReadSender = Arc::new(|_target_node_id, _request, _timeout| {
-            Box::pin(async move {
-                Err(DfsPeerTransportError::new(
-                    "buffered async direct sender should not be used when stream sender is available",
-                ))
-            })
-        });
-        let direct_calls_for_stream_sender = Arc::clone(&direct_calls);
-        let bytes_for_stream_sender = bytes.clone();
-        let async_direct_stream_sender: AsyncDfsDirectReadBodySender =
+        let direct_calls_for_sender = Arc::clone(&direct_calls);
+        let bytes_for_sender = bytes.clone();
+        let async_direct_sender: AsyncDfsDirectReadSender =
             Arc::new(move |_target_node_id, request, _timeout| {
-                let direct_calls_for_stream_sender = Arc::clone(&direct_calls_for_stream_sender);
+                let direct_calls_for_sender = Arc::clone(&direct_calls_for_sender);
                 let request = request.clone();
-                let bytes_for_stream_sender = bytes_for_stream_sender.clone();
+                let bytes_for_sender = bytes_for_sender.clone();
                 Box::pin(async move {
-                    direct_calls_for_stream_sender
+                    direct_calls_for_sender
                         .lock()
                         .expect("direct calls")
                         .push(request.clone());
-                    Ok(DfsDirectReadClientBodyResponse {
+                    Ok(DfsDirectReadClientResponse {
                         request_id: request.request_id.clone(),
                         object_id: request.object_id.clone(),
-                        result: DfsDirectReadClientBodyResult::Found(
-                            DfsDirectReadClientBodyData {
-                                content_size_bytes: bytes_for_stream_sender.len(),
-                                body: sinomo_core::network::ObjectRpcIncomingBody::empty(),
-                                buffered_bytes: bytes_for_stream_sender,
+                        result: DfsDirectReadClientResult::Found(
+                            DfsDirectReadClientData {
+                                content_size_bytes: bytes_for_sender.len(),
+                                attachment: sinomo_core::network::ObjectRpcIncomingBody::bytes(
+                                    bytes_for_sender,
+                                ),
                                 object_id: request.object_id.clone(),
                                 version: request.version.clone(),
                                 content_hash: request.content_hash.clone(),
@@ -3013,7 +3132,6 @@ fn node_transport_async_read_message_uses_direct_sender_and_queues_response() {
             async_sender,
             sync_direct_sender,
             async_direct_sender,
-            async_direct_stream_sender,
         );
         let message = DfsRoutedMessage {
             source_node_id: local.clone(),
@@ -3031,7 +3149,11 @@ fn node_transport_async_read_message_uses_direct_sender_and_queues_response() {
             }),
         };
 
-        AsyncDfsMessageTransport::send_routed_message_async(&mut transport, &remote, message)
+        AsyncDfsMessageTransport::send_routed_call_async(
+            &mut transport,
+            &remote,
+            DfsRoutedCall::value(message),
+        )
             .await
             .expect("send async routed read message");
 
@@ -3101,10 +3223,13 @@ fn node_transport_async_send_requires_async_sender() {
         let message =
             test_dfs_lookup_routed_message(&local, &remote, 7, "/node_route/async-missing");
 
-        let error =
-            AsyncDfsMessageTransport::send_routed_message_async(&mut transport, &remote, message)
-                .await
-                .expect_err("async send should require async sender");
+        let error = AsyncDfsMessageTransport::send_routed_call_async(
+            &mut transport,
+            &remote,
+            DfsRoutedCall::value(message),
+        )
+        .await
+        .expect_err("async send should require async sender");
         assert!(error.to_string().contains("without an async sender"));
         assert!(calls.lock().expect("calls lock").is_empty());
         assert_eq!(
@@ -3164,15 +3289,15 @@ fn node_transport_async_sender_does_not_require_sync_sender() {
 
         assert!(
             transport
-                .send_routed_message(&remote, message.clone())
+                .send_routed_call(&remote, DfsRoutedCall::value(message.clone()))
                 .expect_err("sync send should be unavailable")
                 .to_string()
                 .contains("without a sync sender")
         );
-        AsyncDfsMessageTransport::send_routed_message_async(
+        AsyncDfsMessageTransport::send_routed_call_async(
             &mut transport,
             &remote,
-            message.clone(),
+            DfsRoutedCall::value(message.clone()),
         )
         .await
         .expect("async send message");
@@ -3257,7 +3382,7 @@ fn node_transport_dual_senders_support_sync_and_async_sends() {
         let sync_message =
             test_dfs_lookup_routed_message(&local, &remote, 11, "/node_route/dual-sync");
         transport
-            .send_routed_message(&remote, sync_message)
+            .send_routed_call(&remote, DfsRoutedCall::value(sync_message))
             .expect("sync send message");
         assert_eq!(
             sync_calls.lock().expect("sync calls lock").as_slice(),
@@ -3273,9 +3398,13 @@ fn node_transport_dual_senders_support_sync_and_async_sends() {
 
         let async_message =
             test_dfs_lookup_routed_message(&local, &remote, 12, "/node_route/dual-async");
-        AsyncDfsMessageTransport::send_routed_message_async(&mut transport, &remote, async_message)
-            .await
-            .expect("async send message");
+        AsyncDfsMessageTransport::send_routed_call_async(
+            &mut transport,
+            &remote,
+            DfsRoutedCall::value(async_message),
+        )
+        .await
+        .expect("async send message");
         assert_eq!(
             async_calls.lock().expect("async calls lock").as_slice(),
             &[(remote.clone(), 12)]
@@ -3341,7 +3470,7 @@ fn node_transport_relays_remote_returned_messages_preserving_source() {
     let message = test_dfs_lookup_routed_message(&local, &primary, 9, "/node_route/relay");
 
     transport
-        .send_routed_message(&primary, message)
+        .send_routed_call(&primary, DfsRoutedCall::value(message))
         .expect("send through relay");
 
     assert_eq!(
@@ -3399,7 +3528,7 @@ fn node_transport_completes_synchronous_replica_write() {
             }],
         })
     });
-    let transport = DfsNodeTransport::with_connect_timeout(
+    let transport = node_transport_with_canonical_message_peer(
         local.clone(),
         vec![remote.clone()],
         Duration::from_millis(1),
@@ -3508,7 +3637,7 @@ fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare
             }],
         })
     });
-    let transport = DfsNodeTransport::with_connect_timeout(
+    let transport = node_transport_with_canonical_message_peer(
         local.clone(),
         vec![remote.clone()],
         Duration::from_millis(1),
@@ -3751,7 +3880,7 @@ fn posix_wait_for_commit_reports_repair_retry_failure_without_failing_write() {
             }],
         })
     });
-    let transport = DfsNodeTransport::with_connect_timeout(
+    let transport = node_transport_with_canonical_message_peer(
         local.clone(),
         vec![remote.clone()],
         Duration::from_millis(1),
@@ -3930,7 +4059,7 @@ fn served_message_drains_nested_stage_response_before_returning() {
             }],
         })
     });
-    let transport = DfsNodeServedMessageTransport::new_with_message_sender(
+    let transport = served_transport_with_canonical_message_peer(
         primary.clone(),
         vec![replica.clone()],
         sender,
@@ -4179,7 +4308,7 @@ fn served_receipt_returns_before_unrelated_completed_write_response_rpc() {
             outbound_messages: Vec::new(),
         })
     });
-    let transport = DfsNodeServedMessageTransport::new_with_message_sender(
+    let transport = served_transport_with_canonical_message_peer(
         primary.clone(),
         vec![requester.clone(), replica.clone()],
         sender,
@@ -4285,7 +4414,7 @@ fn served_receipt_returns_before_unrelated_completed_write_response_rpc() {
     });
     if completed_rx.recv_timeout(Duration::from_secs(2)).is_err() {
         let (state, changed) = completed_response_gate.as_ref();
-        let mut state = state.lock().expect("release blocked inline response");
+        let mut state = state.lock().expect("release blocked in-call response");
         state.1 = true;
         changed.notify_all();
         drop(state);
@@ -6146,8 +6275,12 @@ fn maintenance_tick_drains_inflight_repair_response_without_new_schedule() {
             },
         }),
     );
-    DfsMessageTransport::send_routed_message(&mut replica_transport, &owner, response_message)
-        .expect("queue repair response to owner");
+    DfsMessageTransport::send_routed_call(
+        &mut replica_transport,
+        &owner,
+        DfsRoutedCall::value(response_message),
+    )
+    .expect("queue repair response to owner");
 
     let mut maintenance_host = RecordingMaintenanceHost::default();
     let mut publisher_host = RecordingMetadataJournalPublisherHost::new(root.join("journal"));
@@ -13002,6 +13135,128 @@ fn posix_non_foreground_write_reports_only_durable_locations() {
     std::fs::remove_dir_all(root).ok();
 }
 
+struct StatelessPrimaryPeerTransport {
+    primary_node_id: NodeId,
+    content_root: PathBuf,
+    metadata_root: PathBuf,
+    control_plane: SharedDfsControlPlaneKvClient<InProcessKvStore>,
+    trace: Arc<Mutex<Vec<String>>>,
+}
+
+impl StatelessPrimaryPeerTransport {
+    async fn call_object_rpc_inner(
+        &self,
+        target_node_id: &NodeId,
+        call: ObjectRpcSessionCall,
+    ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
+        if target_node_id != &self.primary_node_id {
+            return Err(DfsPeerTransportError::new(format!(
+                "unexpected stateless DFS target {target_node_id}"
+            )));
+        }
+        let ObjectRpcSessionCall { request, body } = call;
+        let command = if body.is_empty() {
+            decode_dfs_message_rpc_request(&request)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?
+        } else {
+            let head = crate::body_rpc::decode_dfs_attachment_message_rpc_request(&request)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            let max_bytes = usize::try_from(head.attachment.total_size_bytes).map_err(|_| {
+                DfsPeerTransportError::new(
+                    "stateless DFS request attachment does not fit this platform address space",
+                )
+            })?;
+            let bytes = body
+                .collect_to_vec(max_bytes)
+                .await
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            crate::body_rpc::attach_dfs_message_request_attachment(head, bytes)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?
+        };
+        self.trace
+            .lock()
+            .expect("trace")
+            .push(format!("in:{:?}", command.routed_message.message));
+        let content = LocalContentStore::new(&self.content_root).expect("content");
+        let metadata =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("services"), &self.metadata_root)
+                .expect("metadata");
+        let result = process_dfs_message_command_for_test(
+            self.primary_node_id.clone(),
+            command,
+            content,
+            Box::new(metadata),
+            Some(Box::new(self.control_plane.clone())),
+        )
+        .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+        for event in &result.events {
+            self.trace
+                .lock()
+                .expect("trace")
+                .push(format!("event:{event:?}"));
+        }
+        for message in &result.response.outbound_messages {
+            self.trace
+                .lock()
+                .expect("trace")
+                .push(format!("out:{:?}", message.message));
+        }
+        if let Some(attachment) = result.attachment {
+            let max_bytes = usize::try_from(attachment.descriptor.total_size_bytes).map_err(|_| {
+                DfsPeerTransportError::new(
+                    "stateless DFS response attachment does not fit this platform address space",
+                )
+            })?;
+            let bytes = attachment
+                .source
+                .collect_to_vec(max_bytes)
+                .await
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            let response = crate::body_rpc::encode_dfs_attachment_message_rpc_response(
+                &request.route,
+                result.response,
+                attachment.descriptor,
+            )
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            return Ok(ObjectRpcSessionResult::new(
+                response,
+                ObjectRpcIncomingBody::bytes(bytes),
+            ));
+        }
+        ObjectRpcResponse::encode_body(&request.route, &result.response)
+            .map(ObjectRpcSessionResult::value)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+    }
+}
+
+impl DfsPeerTransport for StatelessPrimaryPeerTransport {
+    fn call_object_rpc(
+        &self,
+        target_node_id: &NodeId,
+        call: ObjectRpcSessionCall,
+        _options: DfsObjectRpcSendOptions,
+    ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+        let result = runtime.block_on(self.call_object_rpc_inner(target_node_id, call));
+        runtime.shutdown_timeout(Duration::from_millis(250));
+        result
+    }
+}
+
+impl AsyncDfsPeerTransport for StatelessPrimaryPeerTransport {
+    fn call_object_rpc_async<'a>(
+        &'a self,
+        target_node_id: &'a NodeId,
+        call: ObjectRpcSessionCall,
+        _options: DfsObjectRpcSendOptions,
+    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcSessionResult, DfsPeerTransportError>> {
+        Box::pin(self.call_object_rpc_inner(target_node_id, call))
+    }
+}
+
 #[test]
 fn stateless_node_route_reader_write_commits_after_primary_fetch_receipt() {
     let root = temp_root("stateless-node_route-reader-write-primary-fetch");
@@ -13054,49 +13309,21 @@ fn stateless_node_route_reader_write_commits_after_primary_fetch_receipt() {
                 .expect("primary SIFS bootstrap object");
         }
     }
-    let primary_for_sender = primary.clone();
-    let primary_content_for_sender = primary_content_root.clone();
-    let primary_metadata_for_sender = primary_metadata_root.clone();
-    let control_plane_for_sender = control_plane.clone();
-    let trace_for_sender = Arc::clone(&trace);
-    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
-        trace_for_sender
-            .lock()
-            .expect("trace")
-            .push(format!("in:{:?}", command.routed_message.message));
-        let content = LocalContentStore::new(&primary_content_for_sender).expect("content");
-        let metadata = LocalSobjMetadataBackend::new(
-            DfsMetadataShardId::new("services"),
-            &primary_metadata_for_sender,
-        )
-        .expect("metadata");
-        let result = process_dfs_message_command_for_test(
-            primary_for_sender.clone(),
-            command.clone(),
-            content,
-            Box::new(metadata),
-            Some(Box::new(control_plane_for_sender.clone())),
-        )
-        .expect("process stateless primary message");
-        for event in &result.events {
-            trace_for_sender
-                .lock()
-                .expect("trace")
-                .push(format!("event:{event:?}"));
-        }
-        for message in &result.response.outbound_messages {
-            trace_for_sender
-                .lock()
-                .expect("trace")
-                .push(format!("out:{:?}", message.message));
-        }
-        Ok(result.response)
+    let peer = Arc::new(StatelessPrimaryPeerTransport {
+        primary_node_id: primary.clone(),
+        content_root: primary_content_root,
+        metadata_root: primary_metadata_root,
+        control_plane: control_plane.clone(),
+        trace: Arc::clone(&trace),
     });
-    let transport = DfsNodeTransport::with_connect_timeout(
+    let peer_transport: Arc<dyn DfsPeerTransport> = peer.clone();
+    let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer;
+    let transport = DfsNodeTransport::with_peer_transports_for_nodes(
         writer.clone(),
         vec![primary.clone()],
         Duration::from_millis(1),
-        sender,
+        peer_transport,
+        async_peer_transport,
     );
     let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
     let mut dfs =
@@ -13277,8 +13504,8 @@ fn posix_routed_strict_write_prefers_metadata_primary_replica() {
 }
 
 #[test]
-fn posix_routed_small_write_sends_inline_bytes_request() {
-    let root = temp_root("posix-routed-small-inline-bytes");
+fn posix_routed_materialized_write_sends_value() {
+    let root = temp_root("posix-routed-value");
     let writer = NodeId::from_legacy_named("node_posix_routed_inline_writer").expect("writer");
     let primary = NodeId::from_legacy_named("node_posix_routed_inline_primary").expect("primary");
     let file_system = file_system(primary.clone());
@@ -13321,7 +13548,7 @@ fn posix_routed_small_write_sends_inline_bytes_request() {
     );
     let mut object = file_metadata(primary.clone());
     object.file_system_id = file_system.file_system_id.clone();
-    object.path = "/routed-small-inline.txt".to_string();
+    object.path = "/routed-value.txt".to_string();
     object.policy = DfsObjectPolicy::ReplicatedEventual;
     object.current_locations = vec![writer.clone()];
     let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
@@ -13337,10 +13564,10 @@ fn posix_routed_small_write_sends_inline_bytes_request() {
         .expect("attach writer metadata replica");
     dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
 
-    let bytes = b"small routed POSIX bytes".to_vec();
+    let bytes = b"materialized routed POSIX bytes".to_vec();
     let expected_hash = content_hash(&bytes);
     dfs.posix_write_file(
-        "/routed-small-inline.txt",
+        "/routed-value.txt",
         &bytes,
         DfsWriteOptions {
             policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
@@ -13364,15 +13591,15 @@ fn posix_routed_small_write_sends_inline_bytes_request() {
         dfs.content
             .read_blob(&expected_hash)
             .expect("writer retained local blob"),
-        b"small routed POSIX bytes"
+        b"materialized routed POSIX bytes"
     );
 
     std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
-fn posix_routed_large_write_sends_manifest_only_request() {
-    let root = temp_root("posix-routed-large-manifest-only");
+fn posix_routed_multimegabyte_write_uses_same_value_path() {
+    let root = temp_root("posix-routed-multimegabyte-value");
     let writer = NodeId::from_legacy_named("node_posix_routed_manifest_writer").expect("writer");
     let primary = NodeId::from_legacy_named("node_posix_routed_manifest_primary").expect("primary");
     let file_system = file_system(primary.clone());
@@ -13415,7 +13642,7 @@ fn posix_routed_large_write_sends_manifest_only_request() {
     );
     let mut object = file_metadata(primary.clone());
     object.file_system_id = file_system.file_system_id.clone();
-    object.path = "/routed-large-manifest-only.bin".to_string();
+    object.path = "/routed-multimegabyte-value.bin".to_string();
     object.policy = DfsObjectPolicy::ReplicatedEventual;
     object.current_locations = vec![writer.clone()];
     let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
@@ -13431,10 +13658,10 @@ fn posix_routed_large_write_sends_manifest_only_request() {
         .expect("attach writer metadata replica");
     dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
 
-    let bytes = vec![0x57; DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT as usize + 8192];
+    let bytes = vec![0x57; 2 * 1024 * 1024 + 8192];
     let expected_hash = content_hash(&bytes);
     dfs.posix_write_file(
-        "/routed-large-manifest-only.bin",
+        "/routed-multimegabyte-value.bin",
         &bytes,
         DfsWriteOptions {
             policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
@@ -13450,16 +13677,9 @@ fn posix_routed_large_write_sends_manifest_only_request() {
         .expect("capture")
         .clone()
         .expect("captured routed write command");
-    assert!(
-        command.bytes.is_empty(),
-        "large routed writes must not inline {} bytes into one RPC",
-        bytes.len()
-    );
-    assert_eq!(
-        command.content_hash.as_deref(),
-        Some(expected_hash.as_str())
-    );
-    assert_eq!(command.content_size_bytes, Some(bytes.len() as u64));
+    assert_eq!(command.bytes, bytes);
+    assert_eq!(command.content_hash, None);
+    assert_eq!(command.content_size_bytes, None);
     assert_eq!(command.desired_replica_nodes, vec![writer, primary]);
     assert_eq!(
         dfs.content
@@ -13472,12 +13692,12 @@ fn posix_routed_large_write_sends_manifest_only_request() {
 }
 
 #[test]
-fn posix_remote_primary_deferred_small_write_inlines_payload() {
-    let root = temp_root("posix-remote-primary-deferred-small-inline");
-    let writer =
-        NodeId::from_legacy_named("node_posix_remote_deferred_small_writer").expect("writer");
-    let primary =
-        NodeId::from_legacy_named("node_posix_remote_deferred_small_primary").expect("primary");
+fn posix_remote_primary_deferred_materialized_write_carries_payload() {
+    let root = temp_root("posix-remote-primary-deferred-materialized");
+    let writer = NodeId::from_legacy_named("node_posix_remote_deferred_materialized_writer")
+        .expect("writer");
+    let primary = NodeId::from_legacy_named("node_posix_remote_deferred_materialized_primary")
+        .expect("primary");
     let file_system = file_system(primary.clone());
     let shard = DfsMetadataShardConfig {
         file_system_id: file_system.file_system_id.clone(),
@@ -13516,7 +13736,7 @@ fn posix_remote_primary_deferred_small_write_inlines_payload() {
         Duration::from_millis(1),
         sender,
     );
-    let path = "/routed-small-deferred-inline.bin";
+    let path = "/routed-deferred-materialized.bin";
     let mut object = file_metadata(primary.clone());
     object.file_system_id = file_system.file_system_id.clone();
     object.path = path.to_string();
@@ -13531,7 +13751,7 @@ fn posix_remote_primary_deferred_small_write_inlines_payload() {
         .expect("attach metadata backend");
     dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
 
-    let bytes = b"small deferred remote primary write should be inline".to_vec();
+    let bytes = b"deferred remote primary write uses the materialized value path".to_vec();
     let expected_hash = content_hash(&bytes);
     let stat = dfs
         .posix_write_file(
@@ -13555,7 +13775,7 @@ fn posix_remote_primary_deferred_small_write_inlines_payload() {
     assert_eq!(command.bytes, bytes);
     assert_eq!(
         command.content_hash, None,
-        "small remote-primary POSIX writes should not require a follow-up blob fetch"
+        "materialized remote-primary POSIX writes should not require a follow-up blob fetch"
     );
     assert_eq!(command.content_size_bytes, None);
     assert_eq!(command.desired_replica_nodes, vec![writer, primary]);
@@ -13641,7 +13861,7 @@ fn posix_remote_primary_nonforeground_wait_write_requests_bounded_response_journ
         Duration::from_millis(1),
         sender,
     );
-    let path = "/routed-small-wait-nonforeground-inline.bin";
+    let path = "/routed-materialized-wait-nonforeground.bin";
     let mut object = file_metadata(primary.clone());
     object.file_system_id = file_system.file_system_id.clone();
     object.path = path.to_string();
@@ -13656,7 +13876,7 @@ fn posix_remote_primary_nonforeground_wait_write_requests_bounded_response_journ
         .expect("attach metadata backend");
     dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
 
-    let bytes = b"small wait remote primary write should not replay journal".to_vec();
+    let bytes = b"materialized wait remote primary write should not replay journal".to_vec();
     let expected_hash = content_hash(&bytes);
     let stat = dfs
         .posix_write_file(
@@ -13747,7 +13967,7 @@ fn posix_local_primary_detached_manifest_write_persists_visible_metadata_without
     dfs.posix_mkdir_all("/services").expect("parent");
 
     let path = "/services/local-primary-large.bin";
-    let bytes = vec![0x63; DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT as usize + 8192];
+    let bytes = vec![0x63; 2 * 1024 * 1024 + 8192];
     let expected_hash = content_hash(&bytes);
     let stat = dfs
         .posix_write_file_with_known_parent_deferred_local_replay(
@@ -15021,7 +15241,7 @@ fn background_w2_stages_only_quorum_deficit_and_defers_n3_repair() {
         .add_object_metadata(metadata)
         .expect("replica object");
 
-    let bytes = vec![0x5a; DFS_BLOB_INLINE_LIMIT_BYTES + 4096];
+    let bytes = vec![0x5a; 2 * 1024 * 1024 + 4096];
     let outcome = owner_dfs
         .write_distributed_eventual_from_reader_with_candidates_and_parent_touch(
             DfsWriteRequest {
@@ -15118,7 +15338,7 @@ fn background_quorum_stage_refills_failed_target_without_retry_tick() {
     metadata.policy = DfsObjectPolicy::ReplicatedEventual;
     owner_dfs.add_object_metadata(metadata).expect("object");
 
-    let bytes = vec![0xa5; DFS_BLOB_INLINE_LIMIT_BYTES + 4096];
+    let bytes = vec![0xa5; 2 * 1024 * 1024 + 4096];
     let outcome = owner_dfs
         .write_distributed_eventual_from_reader_with_base_and_parent_touch(
             DfsWriteRequest {
@@ -15202,7 +15422,7 @@ fn foreground_w2_does_not_repair_a_sibling_stage_already_inflight() {
         .add_object_metadata(metadata)
         .expect("replica object");
 
-    let bytes = vec![0x6b; DFS_BLOB_INLINE_LIMIT_BYTES + 4096];
+    let bytes = vec![0x6b; 2 * 1024 * 1024 + 4096];
     let outcome = owner_dfs
         .write_distributed_eventual_from_reader_with_candidates_and_parent_touch(
             DfsWriteRequest {
@@ -15337,7 +15557,7 @@ fn foreground_w1_postcommit_targets_use_repair_not_stage() {
                 target_version: version_2,
                 requesting_node_id: owner.clone(),
             },
-            std::io::Cursor::new(vec![0x3c; DFS_BLOB_INLINE_LIMIT_BYTES + 4096]),
+            std::io::Cursor::new(vec![0x3c; 2 * 1024 * 1024 + 4096]),
             vec![owner, replica_a, replica_b],
             DfsReplicationPolicy::new(1, 3).expect("policy"),
             false,
@@ -15719,7 +15939,7 @@ fn persisted_repair_attempts_prevent_duplicate_fetch_after_reopen() {
     let version_1 = DfsVersion::from_legacy_named("version_persisted_fetch_1").expect("version");
     let version_2 = DfsVersion::from_legacy_named("version_persisted_fetch_2").expect("version");
     let content_hash = content_hash(b"persisted repair fetch body");
-    let size_bytes = DFS_BLOB_INLINE_LIMIT_BYTES as u64 + 17;
+    let size_bytes = 2 * 1024 * 1024 + 17;
     let network = InProcessNetwork::new();
     let primary_transport = network.add_node(primary.clone());
     let mut source_transport = network.add_node(source.clone());
@@ -19854,30 +20074,27 @@ fn malformed_dfs_object_rpc_message_does_not_block_following_valid_message() {
             ),
         )
         .expect("send malformed object RPC message");
-    let valid_command = test_dfs_message_command(
-        "dfs_valid_after_bad_object_message",
-        build_dfs_routed_message(
-            &requester,
-            &server,
-            2,
-            2,
-            DfsNetworkMessage::ReadRequest(DfsReadRequest {
-                request_id: "dfs_net_req_after_bad_message".to_string(),
-                object_id: object_id.clone(),
-                version: None,
-                content_hash: None,
-                content_size_bytes: None,
-                range_offset: None,
-                range_max_bytes: None,
-            }),
-        ),
+    let valid_message = build_dfs_routed_message(
+        &requester,
+        &server,
+        2,
+        2,
+        DfsNetworkMessage::ReadRequest(DfsReadRequest {
+            request_id: "dfs_net_req_after_bad_message".to_string(),
+            object_id: object_id.clone(),
+            version: None,
+            content_hash: None,
+            content_size_bytes: None,
+            range_offset: None,
+            range_max_bytes: None,
+        }),
     );
-    requester_transport
-        .send_object_rpc_request(
-            &server,
-            dfs_message_rpc_request(&valid_command).expect("valid DFS message request"),
-        )
-        .expect("send valid object RPC message");
+    DfsMessageTransport::send_routed_call(
+        &mut requester_transport,
+        &server,
+        DfsRoutedCall::value(valid_message),
+    )
+    .expect("send valid DFS call after malformed object RPC message");
 
     let events = dfs
         .process_incoming()
@@ -19893,11 +20110,20 @@ fn malformed_dfs_object_rpc_message_does_not_block_following_valid_message() {
                 ..
             } if request_id == "dfs_net_req_after_bad_message"
                 && served_object_id == &object_id
-                && data.bytes == bytes
+                && data.bytes.is_empty()
         )
     }));
     let responses = drain_dfs_messages(&mut requester_transport);
-    assert_eq!(responses.len(), 1);
+    assert!(matches!(
+        responses.as_slice(),
+        [DfsNetworkMessage::ReadResponse(DfsReadResponse {
+            request_id,
+            object_id: response_object_id,
+            result: DfsReadResult::Found(data),
+        })] if request_id == "dfs_net_req_after_bad_message"
+            && response_object_id == &object_id
+            && data.bytes.as_slice() == bytes
+    ));
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -19908,7 +20134,7 @@ fn hinted_remote_read_serves_blob_without_local_metadata() {
     let server = NodeId::from_legacy_named("node_hinted_read_server").expect("node");
     let object_id = DfsObjectId::from_legacy_named("obj_hinted_read_no_metadata").expect("object");
     let version = DfsVersion::from_legacy_named("version_hinted_read").expect("version");
-    let bytes = (0..(DFS_BLOB_INLINE_LIMIT_BYTES + 8192))
+    let bytes = (0..(2 * 1024 * 1024 + 8192))
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
     let network = InProcessNetwork::new();
@@ -19939,7 +20165,7 @@ fn hinted_remote_read_serves_blob_without_local_metadata() {
         NetworkedDfsServiceEvent::RemoteReadServed {
             result: DfsReadResult::Found(DfsReadData { bytes: result_bytes, .. }),
             ..
-        } if result_bytes == bytes
+        } if result_bytes.is_empty()
     ));
     let responses = drain_dfs_messages(&mut requester_transport);
     assert!(matches!(
@@ -19953,8 +20179,8 @@ fn hinted_remote_read_serves_blob_without_local_metadata() {
 }
 
 #[test]
-fn uncached_remote_read_within_direct_budget_uses_direct_response() {
-    let root = temp_root("uncached-large-remote-read-direct-response");
+fn uncached_remote_read_arbitrary_size_uses_reader_response() {
+    let root = temp_root("uncached-remote-read-reader-response");
     let owner = NodeId::from_legacy_named("node_uncached_direct_owner").expect("node");
     let reader = NodeId::from_legacy_named("node_uncached_direct_reader").expect("node");
     let network = InProcessNetwork::new();
@@ -19980,7 +20206,7 @@ fn uncached_remote_read_within_direct_budget_uses_direct_response() {
     object.policy = DfsObjectPolicy::ReplicatedEventual;
     object.current_locations = vec![owner.clone()];
     let object_id = object.object_id.clone();
-    let bytes = (0..(DFS_BLOB_INLINE_LIMIT_BYTES + 8192))
+    let bytes = (0..(2 * 1024 * 1024 + 8192))
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
     owner_dfs
@@ -20036,7 +20262,7 @@ fn uncached_remote_read_direct_transport_completes_without_protocol_frame() {
     let reader = NodeId::from_legacy_named("node_uncached_bypass_reader").expect("node");
     let object_id = DfsObjectId::from_legacy_named("obj_uncached_bypass").expect("object");
     let version = DfsVersion::from_legacy_named("version_uncached_bypass").expect("version");
-    let bytes = (0..(DFS_BLOB_INLINE_LIMIT_BYTES + 8192))
+    let bytes = (0..(2 * 1024 * 1024 + 8192))
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
     let owner_content = LocalContentStore::new(root.join("owner")).expect("owner content");
@@ -22620,7 +22846,7 @@ fn active_repair_attempt_does_not_resurrect_cleared_resume_identity() {
         object_id.clone(),
         version.clone(),
         content_hash.clone(),
-        DFS_BLOB_INLINE_LIMIT_BYTES as u64 + 1,
+        2 * 1024 * 1024 + 1,
     );
     let retry = pending.repair_retries.entry(replica.clone()).or_default();
     retry.attempts = 1;
@@ -28039,13 +28265,12 @@ fn sifs_posix_write_at_retries_lost_patch_stage_as_patch() {
 }
 
 #[test]
-fn sifs_posix_write_at_retries_lost_large_patch_stage_as_streamed_body() {
-    let root = temp_root("sifs-posix-write-at-large-patch-body-retry");
-    let owner =
-        NodeId::from_legacy_named("node_sifs_write_at_large_patch_retry_owner").expect("owner");
+fn sifs_posix_write_at_retries_lost_patch_attachment() {
+    let root = temp_root("sifs-posix-write-at-patch-attachment-retry");
+    let owner = NodeId::from_legacy_named("node_sifs_write_at_patch_retry_owner").expect("owner");
     let replica =
-        NodeId::from_legacy_named("node_sifs_write_at_large_patch_retry_replica").expect("replica");
-    let path = "/services/retry-write-at-large-patch.bin";
+        NodeId::from_legacy_named("node_sifs_write_at_patch_retry_replica").expect("replica");
+    let path = "/services/retry-write-at-patch.bin";
     let network = InProcessNetwork::new();
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -28124,7 +28349,7 @@ fn sifs_posix_write_at_retries_lost_large_patch_stage_as_streamed_body() {
                 foreground_replica_repair: true,
             },
         )
-        .expect("large patch write");
+        .expect("patch write");
     assert!(
         bulk_reads.get() > 1,
         "replicated write_at reader should stream the patch through the content store"
@@ -28133,7 +28358,7 @@ fn sifs_posix_write_at_retries_lost_large_patch_stage_as_streamed_body() {
         .pending_writes
         .values()
         .next()
-        .expect("pending large patch write");
+        .expect("pending patch write");
     let pending_patch = pending.patch.as_ref().expect("pending patch metadata");
     assert_eq!(pending_patch.patch_hash, patch_hash);
     assert_eq!(pending_patch.patch_size_bytes, patch.len() as u64);
@@ -28150,32 +28375,32 @@ fn sifs_posix_write_at_retries_lost_large_patch_stage_as_streamed_body() {
         first_messages
             .iter()
             .any(|message| matches!(message, DfsNetworkMessage::StagePatch(_))),
-        "first large patch stage should send a streamed patch body"
+        "first patch stage should send a patch attachment"
     );
     assert!(
         first_messages
             .iter()
             .all(|message| !matches!(message, DfsNetworkMessage::StageBlob(_))),
-        "large patch stage should not send a full-object body"
+        "patch stage should not send a full-object attachment"
     );
 
     owner_dfs.repair_retry_tick = 16;
     owner_dfs
         .retry_pending_repairs()
-        .expect("retry pending large patch stage");
+        .expect("retry pending patch stage");
 
     let retry_messages = drain_dfs_messages(&mut replica_mailbox);
     assert!(
         retry_messages
             .iter()
             .any(|message| matches!(message, DfsNetworkMessage::StagePatch(_))),
-        "lost large patch stage should be retried as a streamed patch body"
+        "lost patch stage should be retried with a patch attachment"
     );
     assert!(
         retry_messages
             .iter()
             .all(|message| !matches!(message, DfsNetworkMessage::StageBlob(_))),
-        "large patch retry should not fall back to a full-object body before an explicit patch rejection"
+        "patch retry should not fall back to a full-object attachment before an explicit patch rejection"
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -29513,7 +29738,7 @@ fn sifs_cluster_primary_posix_write(cluster: &mut SifsPosixCluster, path: &str, 
 fn sifs_cluster_primary_detached_large_write_defers_blob_durability_flush() {
     let mut cluster = sifs_posix_cluster("sifs-cluster-primary-detached-large");
     let path = "/services/primary-detached-large.bin";
-    let bytes = (0..(DFS_BLOB_INLINE_LIMIT_BYTES + 8192))
+    let bytes = (0..(2 * 1024 * 1024 + 8192))
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
     let expected_hash = content_hash(&bytes);
@@ -38125,10 +38350,10 @@ fn sifs_non_replica_prefix_read_reuses_authoritative_metadata_for_remote_range()
     let path = "/users/prefix-range.txt";
     let empty_path = "/users/empty-prefix-range.txt";
     let corrupt_path = "/users/corrupt-prefix-range.txt";
-    let bytes = (0..(DFS_BLOB_INLINE_LIMIT_BYTES + 8192))
+    let bytes = (0..(2 * 1024 * 1024 + 8192))
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
-    let corrupt_source_bytes = (0..(DFS_BLOB_INLINE_LIMIT_BYTES + 4096))
+    let corrupt_source_bytes = (0..(2 * 1024 * 1024 + 4096))
         .map(|index| ((index * 7) % 251) as u8)
         .collect::<Vec<_>>();
     let mut primary = primary;

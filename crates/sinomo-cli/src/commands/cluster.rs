@@ -1639,7 +1639,9 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
         }
     }
 
-    struct CliClusterJoinReconciliationTransport;
+    struct CliClusterJoinReconciliationTransport {
+        state: ClusterBootstrapState,
+    }
 
     impl cluster::ClusterControlPlaneTransport for CliClusterJoinReconciliationTransport {
         fn send_kv_replication(
@@ -1693,9 +1695,11 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
             request: &network::ObjectRpcRequest,
             timeout: Duration,
         ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
-            send_join_rpc(endpoint, request, timeout).map_err(|source| network::NetworkError::Io {
-                operation: "cluster join membership rpc".to_string(),
-                detail: source.to_string(),
+            send_join_rpc(&self.state, endpoint, request, timeout).map_err(|source| {
+                network::NetworkError::Io {
+                    operation: "cluster join membership rpc".to_string(),
+                    detail: source.to_string(),
+                }
             })
         }
 
@@ -1730,7 +1734,9 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
         }
     }
 
-    let mut host = cluster::ClusterControlPlaneDriver::new(CliClusterJoinReconciliationTransport);
+    let mut host = cluster::ClusterControlPlaneDriver::new(CliClusterJoinReconciliationTransport {
+        state: state.clone(),
+    });
     let reconciliation = cluster::reconcile_cluster_join_with_introducers_with_host(
         state,
         invite,
@@ -1752,12 +1758,13 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
 }
 
 fn send_join_rpc(
+    state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
     request: &network::ObjectRpcRequest,
     timeout: Duration,
 ) -> Result<network::ObjectRpcResponse, CliError> {
     match endpoint.transport {
-        ClusterTransportKind::Iroh => send_join_endpoint_rpc(endpoint, request, timeout),
+        ClusterTransportKind::Iroh => send_join_endpoint_rpc(state, endpoint, request, timeout),
         _ => crate::daemon_send_daemon_rpc_with_timeouts(
             &endpoint.address,
             request,
@@ -1769,6 +1776,7 @@ fn send_join_rpc(
 }
 
 fn send_join_endpoint_rpc(
+    state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
     request: &network::ObjectRpcRequest,
     timeout: Duration,
@@ -1780,7 +1788,9 @@ fn send_join_endpoint_rpc(
         ) {
             let runtime = handle.clone();
             tokio::task::block_in_place(|| {
-                runtime.block_on(send_join_endpoint_rpc_async(endpoint, request, timeout))
+                runtime.block_on(send_join_endpoint_rpc_async(
+                    state, endpoint, request, timeout,
+                ))
             })
             .map_err(CliError::from)
         } else {
@@ -1798,13 +1808,16 @@ fn send_join_endpoint_rpc(
             detail: source.to_string(),
         })?;
     let output = runtime
-        .block_on(send_join_endpoint_rpc_async(endpoint, request, timeout))
+        .block_on(send_join_endpoint_rpc_async(
+            state, endpoint, request, timeout,
+        ))
         .map_err(CliError::from);
     runtime.shutdown_timeout(Duration::from_millis(250));
     output
 }
 
 async fn send_join_endpoint_rpc_async(
+    state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
     request: &network::ObjectRpcRequest,
     timeout: Duration,
@@ -1812,7 +1825,20 @@ async fn send_join_endpoint_rpc_async(
     let mut host = CliSignedEndpointRpcHost::new(None, "cluster join endpoint rpc signing");
     let mut client = network::ClusterObjectRpcClient::endpoint_only(&mut host);
     let options = network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout);
-    client.call_endpoint(endpoint, request, options).await
+    let result = client
+        .call_endpoint(
+            state,
+            endpoint,
+            network::ObjectRpcSessionCall::value(request.clone()),
+            options,
+        )
+        .await?;
+    if !result.body.is_empty() {
+        return Err(network::NetworkError::Serialization {
+            detail: "cluster join endpoint RPC returned an unexpected attachment".to_string(),
+        });
+    }
+    Ok(result.response)
 }
 
 pub(crate) fn parse_cluster_join_invite_argument(raw: &str) -> Result<ClusterJoinInvite, CliError> {
@@ -2806,11 +2832,18 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
             let result = runtime.block_on(client.call_target(
                 state,
                 target_node_id,
-                request,
+                network::ObjectRpcSessionCall::value(request.clone()),
                 network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
             ));
             runtime.shutdown_timeout(Duration::from_millis(250));
-            result
+            let result = result?;
+            if !result.body.is_empty() {
+                return Err(network::NetworkError::Serialization {
+                    detail: "cluster KV snapshot refresh returned an unexpected attachment"
+                        .to_string(),
+                });
+            }
+            Ok(result.response)
         }
 
         fn cache_cluster_kv_snapshot_if_newer_than_raft(

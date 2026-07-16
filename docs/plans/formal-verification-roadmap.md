@@ -120,19 +120,18 @@ claim one kernel syscall. Variable record lengths, allocation failure,
 concurrent appenders, filesystem ordering, and concrete Rust byte-conformance
 tests remain refinement obligations.
 
-Completed 2026-07-15: a bounded namespace-transaction body-transport slice
-proves that an oversized same-shard transaction may move from the 64-KiB
-object-RPC control head into one authenticated request body without becoming a
-sequence of partially visible batches. A complete length/digest-valid body
-reconstructs the exact transaction identity and file/file/parent order, then
-applies once with all records visible atomically. Corrupt, truncated, and
-cancelled bodies never reconstruct or mutate namespace state. Concrete SOBJ
-size conformance and the remote-primary cluster probe remain Rust and live-gate
-obligations; transfer flow control and backend crash recovery stay owned by
-their existing proof slices. The r7 live probe exposed and the same slice now
-covers the service-catalog boundary: a legacy `None` route rejects the body,
-whereas `Optional` admits the detached transaction and continues to accept
-ordinary body-free namespace commands.
+Revised 2026-07-16: the namespace-transaction session-transport slice proves
+that one same-shard transaction travels through the single authenticated
+object-RPC session contract with a semantic attachment, independent of its
+encoded byte count. The model contains no control-head limit, size threshold,
+inline fallback, compatibility route, or alternate RPC API. A complete valid
+attachment reconstructs the exact transaction identity and file/file/parent
+order, then applies at most once with all records visible atomically. Corrupt,
+truncated, and cancelled attachments never reconstruct or mutate namespace
+state, and a duplicate application attempt cannot repeat the mutation.
+Concrete SOBJ conformance and the remote-primary cluster probe remain Rust and
+live-gate obligations; transfer flow control and backend crash recovery stay
+owned by their existing proof slices.
 
 Completed 2026-07-14: a bounded directory-tombstone overlay refinement compares
 the reference full-table clone/replay emptiness check with sparse direct-child

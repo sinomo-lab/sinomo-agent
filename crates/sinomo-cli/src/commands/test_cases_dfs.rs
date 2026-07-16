@@ -51,11 +51,11 @@ use sinomo_runtime::api::DaemonApiClient;
 use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
 use sinomo_runtime::dfs::{
-    self, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsBodyMessageCommand,
+    self, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsAttachmentMessageCommand,
     DfsFetchBlobResponse, DfsFetchBlobResult, DfsFileSystemId, DfsMessageCommand,
     DfsNetworkMessage, DfsObjectId, DfsOperatorRepairView, DfsOperatorStatus, DfsReadData,
-    DfsReadResponse, DfsReadResult, DfsRoutedMessage, DfsRpcBodyDescriptor, DfsStageBlobCommand,
-    DfsVersion, SIFS_FILE_SYSTEM_ID,
+    DfsReadResponse, DfsReadResult, DfsRoutedMessage, DfsRpcAttachmentDescriptor,
+    DfsStageBlobCommand, DfsVersion, SIFS_FILE_SYSTEM_ID,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths, ObjectRpcRequest};
@@ -2018,10 +2018,10 @@ fn run_protocol_codec_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult 
         for sample in &encoded_samples {
             let decoded = sample
                 .request
-                .decode_body::<DfsBodyMessageCommand>()
+                .decode_body::<DfsAttachmentMessageCommand>()
                 .map_err(|error| {
                     SinomoTestError::failed(format!(
-                        "cannot decode {} DFS body-aware request head: {error}",
+                        "cannot decode {} DFS attachment request head: {error}",
                         sample.label
                     ))
                 })?;
@@ -2123,6 +2123,15 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let cluster_paths = ClusterPaths::new(&data_dir);
     let cluster_state = cluster::read_cluster_state(&cluster_paths)
         .map_err(|error| SinomoTestError::failed(error.to_string()))?;
+    let live_online_remote_node_ids =
+        super::test::live_online_remote_main_test_targets(&data_dir, &cluster_state)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+    let explicitly_unreachable_replica_node_ids = dfs_unavailable_targets_from_live_health(
+        &cluster_paths,
+        &cluster_state,
+        &live_online_remote_node_ids,
+    );
     let backend = open_backend_with_deadline(ctx, deadline)?;
     let node = backend.node_label();
     ctx.record("node", &node);
@@ -2169,8 +2178,6 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     "cluster DFS invariants require local operator status".to_string(),
                 )
             })?;
-        let explicitly_unreachable_replica_node_ids =
-            dfs_explicitly_unreachable_targets_from_state(&cluster_paths, &cluster_state);
         let replica_assessment = assess_dfs_invariant_replica_health(
             &node,
             &operator_status.metadata_shards,
@@ -2249,20 +2256,26 @@ impl DfsInvariantReplicaAssessment {
     }
 }
 
-fn dfs_explicitly_unreachable_targets_from_state(
+/// Returns remote main daemons that the current live-health sweep did not
+/// observe online and for which no healthy route remains. A stale or startup
+/// `Unknown`/`Degraded` connectivity record must not make an offline replica
+/// look available, while a healthy route keeps a transient probe miss visible
+/// to the invariant.
+fn dfs_unavailable_targets_from_live_health(
     cluster_paths: &ClusterPaths,
     state: &sinomo_runtime::core::ClusterBootstrapState,
+    live_online_remote_node_ids: &BTreeSet<NodeId>,
 ) -> BTreeSet<NodeId> {
     state
         .members
         .iter()
         .filter(|member| {
-            member.state.is_authorized()
+            member.node_id != state.local_node_id
+                && member.state.is_authorized()
                 && member.capabilities.iter().any(|capability| {
                     capability.as_str() == sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY
                 })
-                && network::cluster_member_main_daemon_connectivity(cluster_paths, state, member)
-                    == network::ClusterMemberMainDaemonConnectivity::Unreachable
+                && !live_online_remote_node_ids.contains(&member.node_id)
                 && !dfs_target_has_healthy_route(cluster_paths, state, &member.node_id)
         })
         .map(|member| member.node_id.clone())
@@ -4012,7 +4025,7 @@ where
 struct DfsProtocolCodecSample {
     label: &'static str,
     route: &'static str,
-    head: DfsBodyMessageCommand,
+    head: DfsAttachmentMessageCommand,
 }
 
 struct EncodedDfsProtocolCodecSample {
@@ -4028,14 +4041,14 @@ fn dfs_protocol_codec_samples(payload: &[u8]) -> Vec<DfsProtocolCodecSample> {
         DfsFileSystemId::from_legacy_named(SIFS_FILE_SYSTEM_ID).expect("filesystem id");
     let object_id = DfsObjectId::from_legacy_named("dfs_codec_object").expect("object id");
     let version = DfsVersion::from_legacy_named("dfs_codec_version").expect("version id");
-    let body = DfsRpcBodyDescriptor {
+    let attachment = DfsRpcAttachmentDescriptor {
         total_size_bytes: u64::try_from(payload.len()).expect("DFS codec payload fits u64"),
         content_hash: Some(format!("blake3:{}", blake3::hash(payload).to_hex())),
     };
 
     vec![
         dfs_protocol_codec_sample(
-            "stage-blob-body-head",
+            "stage-blob-attachment-head",
             dfs::DFS_DATA_STAGE_BLOB_ROUTE,
             1,
             1,
@@ -4048,15 +4061,15 @@ fn dfs_protocol_codec_samples(payload: &[u8]) -> Vec<DfsProtocolCodecSample> {
                 object_id: object_id.clone(),
                 expected_base_version: None,
                 version: version.clone(),
-                content_hash: body.content_hash.clone().expect("content hash"),
+                content_hash: attachment.content_hash.clone().expect("content hash"),
                 bytes: Vec::new(),
                 object_metadata: None,
                 authority_shard: None,
             }),
-            body.clone(),
+            attachment.clone(),
         ),
         dfs_protocol_codec_sample(
-            "read-response-body-head",
+            "read-response-attachment-head",
             dfs::DFS_DATA_READ_RESPONSE_ROUTE,
             2,
             2,
@@ -4068,14 +4081,14 @@ fn dfs_protocol_codec_samples(payload: &[u8]) -> Vec<DfsProtocolCodecSample> {
                 result: DfsReadResult::Found(DfsReadData {
                     object_id: object_id.clone(),
                     version: version.clone(),
-                    content_hash: body.content_hash.clone(),
+                    content_hash: attachment.content_hash.clone(),
                     bytes: Vec::new(),
                 }),
             }),
-            body.clone(),
+            attachment.clone(),
         ),
         dfs_protocol_codec_sample(
-            "fetch-blob-response-body-head",
+            "fetch-blob-response-attachment-head",
             dfs::DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE,
             3,
             3,
@@ -4088,11 +4101,11 @@ fn dfs_protocol_codec_samples(payload: &[u8]) -> Vec<DfsProtocolCodecSample> {
                 version,
                 source_node_id: target_node_id.clone(),
                 result: DfsFetchBlobResult::Found {
-                    content_hash: body.content_hash.clone().expect("content hash"),
+                    content_hash: attachment.content_hash.clone().expect("content hash"),
                     bytes: Vec::new(),
                 },
             }),
-            body,
+            attachment,
         ),
     ]
 }
@@ -4105,12 +4118,12 @@ fn dfs_protocol_codec_sample(
     source_node_id: &NodeId,
     target_node_id: &NodeId,
     message: DfsNetworkMessage,
-    body: DfsRpcBodyDescriptor,
+    attachment: DfsRpcAttachmentDescriptor,
 ) -> DfsProtocolCodecSample {
     DfsProtocolCodecSample {
         label,
         route,
-        head: DfsBodyMessageCommand {
+        head: DfsAttachmentMessageCommand {
             command: DfsMessageCommand {
                 request_id: format!("dfs-codec-{label}-{frame_id}"),
                 routed_message: DfsRoutedMessage {
@@ -4121,7 +4134,7 @@ fn dfs_protocol_codec_sample(
                     message,
                 },
             },
-            body,
+            attachment,
         },
     }
 }
@@ -4136,38 +4149,38 @@ fn encode_dfs_protocol_codec_head(
     )
     .map_err(|error| {
         SinomoTestError::failed(format!(
-            "cannot encode {} DFS body-aware request head: {error}",
+            "cannot encode {} DFS attachment request head: {error}",
             sample.label
         ))
     })
 }
 
 fn validate_decoded_dfs_protocol_codec_head(
-    head: &DfsBodyMessageCommand,
+    head: &DfsAttachmentMessageCommand,
     expected_attachment_bytes: usize,
     expected_attachment_hash: &str,
 ) -> Result<(), SinomoTestError> {
     let expected_attachment_bytes = u64::try_from(expected_attachment_bytes)
         .map_err(|_| SinomoTestError::failed("DFS codec attachment length does not fit u64"))?;
-    if head.body.total_size_bytes != expected_attachment_bytes {
+    if head.attachment.total_size_bytes != expected_attachment_bytes {
         return Err(SinomoTestError::failed(format!(
-            "decoded DFS body descriptor declared {} bytes, expected {expected_attachment_bytes}",
-            head.body.total_size_bytes
+            "decoded DFS attachment descriptor declared {} bytes, expected {expected_attachment_bytes}",
+            head.attachment.total_size_bytes
         )));
     }
-    if head.body.content_hash.as_deref() != Some(expected_attachment_hash) {
+    if head.attachment.content_hash.as_deref() != Some(expected_attachment_hash) {
         return Err(SinomoTestError::failed(format!(
-            "decoded DFS body descriptor hash {:?} did not match attachment hash {expected_attachment_hash}",
-            head.body.content_hash
+            "decoded DFS attachment descriptor hash {:?} did not match attachment hash {expected_attachment_hash}",
+            head.attachment.content_hash
         )));
     }
     if head.command.routed_message.source_node_id == head.command.routed_message.target_node_id {
         return Err(SinomoTestError::failed(
-            "decoded DFS body-aware head did not preserve distinct source and target nodes",
+            "decoded DFS attachment head did not preserve distinct source and target nodes",
         ));
     }
 
-    let (message_hash, inline_bytes) = match &head.command.routed_message.message {
+    let (message_hash, embedded_bytes) = match &head.command.routed_message.message {
         DfsNetworkMessage::StageBlob(command) => (
             Some(command.content_hash.as_str()),
             command.bytes.as_slice(),
@@ -4176,7 +4189,7 @@ fn validate_decoded_dfs_protocol_codec_head(
             DfsReadResult::Found(data) => (data.content_hash.as_deref(), data.bytes.as_slice()),
             other => {
                 return Err(SinomoTestError::failed(format!(
-                    "decoded DFS read response body head was not found data: {other:?}"
+                    "decoded DFS read response attachment head was not found data: {other:?}"
                 )));
             }
         },
@@ -4187,13 +4200,13 @@ fn validate_decoded_dfs_protocol_codec_head(
             } => (Some(content_hash.as_str()), bytes.as_slice()),
             other => {
                 return Err(SinomoTestError::failed(format!(
-                    "decoded DFS fetch response body head was not found data: {other:?}"
+                    "decoded DFS fetch response attachment head was not found data: {other:?}"
                 )));
             }
         },
         other => {
             return Err(SinomoTestError::failed(format!(
-                "unexpected DFS body-aware protocol message variant: {other:?}"
+                "unexpected DFS attachment protocol message variant: {other:?}"
             )));
         }
     };
@@ -4202,10 +4215,10 @@ fn validate_decoded_dfs_protocol_codec_head(
             "decoded DFS message head hash {message_hash:?} did not match attachment hash {expected_attachment_hash}"
         )));
     }
-    if !inline_bytes.is_empty() {
+    if !embedded_bytes.is_empty() {
         return Err(SinomoTestError::failed(format!(
-            "decoded DFS body-aware head embedded {} attachment bytes in SOBJ",
-            inline_bytes.len()
+            "decoded DFS attachment head embedded {} attachment bytes in SOBJ",
+            embedded_bytes.len()
         )));
     }
     Ok(())
@@ -4956,23 +4969,23 @@ mod tests {
     }
 
     #[test]
-    fn dfs_protocol_codec_uses_body_heads_without_inline_attachment_bytes() {
+    fn dfs_protocol_codec_uses_attachment_heads_without_embedded_attachment_bytes() {
         let payload = bulk_payload("dfs-protocol-codec-test", 0, 16 * 1024);
         let payload_hash = format!("blake3:{}", blake3::hash(&payload).to_hex());
         let samples = dfs_protocol_codec_samples(&payload);
 
         assert_eq!(samples.len(), 3);
         for sample in &samples {
-            let request = encode_dfs_protocol_codec_head(sample).expect("encode body head");
+            let request = encode_dfs_protocol_codec_head(sample).expect("encode attachment head");
             let decoded = request
-                .decode_body::<DfsBodyMessageCommand>()
-                .expect("decode body head");
+                .decode_body::<DfsAttachmentMessageCommand>()
+                .expect("decode attachment head");
             validate_decoded_dfs_protocol_codec_head(
                 &decoded,
                 payload.len(),
                 payload_hash.as_str(),
             )
-            .expect("validate body head");
+            .expect("validate attachment head");
         }
     }
 
@@ -5180,7 +5193,7 @@ mod tests {
     }
 
     #[test]
-    fn dfs_invariant_unreachable_targets_require_explicit_unreachable_connectivity() {
+    fn dfs_invariant_unavailable_targets_require_failed_live_probe_and_no_healthy_route() {
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-invariant-unreachable-target");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("root layout");
@@ -5193,6 +5206,11 @@ mod tests {
             "unreachable.test:21353",
         );
         state.members[1].endpoints = vec![endpoint.clone()];
+        assert!(
+            dfs_unavailable_targets_from_live_health(&paths, &state, &BTreeSet::new())
+                .contains(&target),
+            "an unknown node missed by the current live-health sweep is unavailable"
+        );
         let degraded = connectivity_record(
             &state,
             &endpoint,
@@ -5204,26 +5222,30 @@ mod tests {
             &[degraded],
         )
         .expect("write degraded connectivity");
+        let live_online = BTreeSet::from([target.clone()]);
         assert!(
-            !dfs_explicitly_unreachable_targets_from_state(&paths, &state).contains(&target),
-            "degraded connectivity must remain visible to invariant checks"
+            !dfs_unavailable_targets_from_live_health(&paths, &state, &live_online)
+                .contains(&target),
+            "a node observed online remains in the invariant even with degraded connectivity"
+        );
+        assert!(
+            dfs_unavailable_targets_from_live_health(&paths, &state, &BTreeSet::new())
+                .contains(&target),
+            "a failed current live probe without a healthy route is tolerated as unavailable"
         );
 
-        let unreachable = connectivity_record(
+        let healthy = connectivity_record(
             &state,
             &endpoint,
-            network::ClusterConnectivityState::Unreachable,
+            network::ClusterConnectivityState::Healthy,
         );
-        network::write_local_cluster_connectivity_records(
-            &paths,
-            &state.local_node_id,
-            &[unreachable],
-        )
-        .expect("write unreachable connectivity");
+        network::write_local_cluster_connectivity_records(&paths, &state.local_node_id, &[healthy])
+            .expect("write healthy connectivity");
 
         assert!(
-            dfs_explicitly_unreachable_targets_from_state(&paths, &state).contains(&target),
-            "an explicitly unreachable target without a healthy route is tolerated as offline"
+            !dfs_unavailable_targets_from_live_health(&paths, &state, &BTreeSet::new())
+                .contains(&target),
+            "a healthy route keeps a transient live-probe miss visible to invariant checks"
         );
     }
 

@@ -4,10 +4,7 @@
 //! The Docker cluster gate uses them before DFS scenarios so routing, relay,
 //! authentication, and concurrent request handling must be healthy first.
 
-use sinomo_runtime::api::{
-    DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DaemonApiClient,
-    DaemonObjectRpcForwardRequest, DaemonObjectRpcForwardResponse, send_daemon_rpc_async,
-};
+use sinomo_runtime::api::DaemonApiClient;
 use sinomo_runtime::cluster;
 use sinomo_runtime::core::{
     ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
@@ -44,12 +41,9 @@ const DEFAULT_MAX_P50_US: u64 = 0;
 const DEFAULT_MAX_P95_US: u64 = 0;
 const DEFAULT_MIN_REQUESTS_PER_SECOND: f64 = 50.0;
 const DEFAULT_MIN_PAYLOAD_BYTES_PER_SECOND: f64 = 0.0;
-// This is the exact Raft-forward envelope size that exposed the old 64 KiB
-// unary cutoff. Keep the acceptance probe comfortably above the control-frame
-// bound in both directions while leaving throughput measurement to the normal
-// ping benchmark.
-const STREAMED_UNARY_ACCEPTANCE_PAYLOAD_BYTES: usize = 344_208;
-const STREAMED_UNARY_CONTROL_FRAME_BOUNDARY_BYTES: usize = 64 * 1024;
+// Exercise the ordinary RPC interface with a substantial request and response.
+// This is a test fixture size, not a protocol boundary.
+const ARBITRARY_MESSAGE_PAYLOAD_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct NetworkPingRunDefaults {
@@ -68,7 +62,6 @@ struct NetworkPingRunDefaults {
     payload_bytes: usize,
     response_payload_bytes: usize,
     min_payload_bytes_per_second: f64,
-    require_streamed_unary_payloads: bool,
 }
 
 impl NetworkPingRunDefaults {
@@ -89,13 +82,12 @@ impl NetworkPingRunDefaults {
             payload_bytes: 0,
             response_payload_bytes: 0,
             min_payload_bytes_per_second: DEFAULT_MIN_PAYLOAD_BYTES_PER_SECOND,
-            require_streamed_unary_payloads: false,
         }
     }
 
-    const fn streamed_unary_acceptance() -> Self {
+    const fn arbitrary_message() -> Self {
         Self {
-            parameter_prefix: Some("streamed-unary"),
+            parameter_prefix: Some("arbitrary-message"),
             requests_per_target: 1,
             warmup_requests_per_target: Some(0),
             concurrency: DEFAULT_CONCURRENCY,
@@ -107,10 +99,9 @@ impl NetworkPingRunDefaults {
             max_p50_us: 0,
             max_p95_us: 0,
             min_requests_per_second: 0.0,
-            payload_bytes: STREAMED_UNARY_ACCEPTANCE_PAYLOAD_BYTES,
-            response_payload_bytes: STREAMED_UNARY_ACCEPTANCE_PAYLOAD_BYTES,
+            payload_bytes: ARBITRARY_MESSAGE_PAYLOAD_BYTES,
+            response_payload_bytes: ARBITRARY_MESSAGE_PAYLOAD_BYTES,
             min_payload_bytes_per_second: 0.0,
-            require_streamed_unary_payloads: true,
         }
     }
 
@@ -126,7 +117,7 @@ pub fn register_network_cluster_test_cases(
 ) -> SinomoTestRegistryBuilder {
     builder
         .register(network_ping_benchmark())
-        .register(network_streamed_unary_large_message())
+        .register(network_arbitrary_message())
         .register(network_state_hygiene())
         .register(network_state_hygiene_dirty_fixture())
         .register(network_endpoint_error_fallback())
@@ -135,13 +126,13 @@ pub fn register_network_cluster_test_cases(
 }
 
 sinomo_runtime::test::sinomo_test_case! {
-    pub fn network_streamed_unary_large_message(ctx) {
-        id: "cluster.network.streamed-unary-large-message",
-        summary: "Route a request and response larger than the session control-frame bound through daemon forwarding",
-        tags: ["cluster-network", "probe", "streaming", "cluster-network-dfs-acceptance"],
+    pub fn network_arbitrary_message(ctx) {
+        id: "cluster.network.arbitrary-message",
+        summary: "Route an arbitrary-sized request and response through the ordinary daemon RPC interface",
+        tags: ["cluster-network", "probe", "arbitrary-message", "cluster-network-dfs-acceptance"],
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
-            run_network_streamed_unary_large_message(ctx)
+            run_network_arbitrary_message(ctx)
         }
     }
 }
@@ -490,8 +481,8 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     run_network_ping_with_defaults(ctx, NetworkPingRunDefaults::benchmark())
 }
 
-fn run_network_streamed_unary_large_message(ctx: &mut SinomoTestContext) -> SinomoTestResult {
-    run_network_ping_with_defaults(ctx, NetworkPingRunDefaults::streamed_unary_acceptance())
+fn run_network_arbitrary_message(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    run_network_ping_with_defaults(ctx, NetworkPingRunDefaults::arbitrary_message())
 }
 
 fn run_network_ping_with_defaults(
@@ -548,15 +539,6 @@ fn run_network_ping_with_defaults(
     require_positive(&requests_per_target_name, requests_per_target)?;
     require_positive(&concurrency_name, concurrency)?;
     require_positive(&timeout_name, timeout_ms as usize)?;
-    if defaults.require_streamed_unary_payloads {
-        require_streamed_unary_acceptance_payloads(
-            &payload_bytes_name,
-            payload_bytes,
-            &response_payload_bytes_name,
-            response_payload_bytes,
-        )?;
-    }
-
     let data_dir = SinomoDataDir::new(ctx.data_dir());
     let cluster_paths = ClusterPaths::new(&data_dir);
     super::refresh_cluster_kv_from_local_daemon(&cluster_paths).map_err(|error| {
@@ -2166,28 +2148,17 @@ async fn run_network_ping_job(job: NetworkPingJob) -> NetworkPingResult {
 }
 
 async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome {
-    let forward_payload = DaemonObjectRpcForwardRequest {
-        target_node_id: job.target_node_id.clone(),
-        request: job.request.clone(),
-        connect_timeout_millis: u64::try_from(job.timeout.as_millis()).unwrap_or(u64::MAX),
-        overall_timeout_millis: Some(u64::try_from(job.timeout.as_millis()).unwrap_or(u64::MAX)),
-        observe_connectivity: true,
-    };
-    let forward_request = match network::ObjectRpcRequest::encode_body(
-        DAEMON_OBJECT_RPC_FORWARD_ROUTE,
-        DAEMON_RPC_CATEGORY,
-        &forward_payload,
-    ) {
-        Ok(request) => request,
-        Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
-    };
-    let response = match send_daemon_rpc_async(
-        &job.daemon_address,
-        &forward_request,
-        network::DaemonRpcTimeouts::connect_and_idle(job.control_timeout),
-        &tokio::runtime::Handle::current(),
-    )
-    .await
+    let client =
+        DaemonApiClient::at_address(job.daemon_address.clone()).with_timeout(job.control_timeout);
+    let response = match client
+        .object_rpc_to_target_with_deadline_async(
+            &job.target_node_id,
+            &job.request,
+            job.timeout,
+            Some(job.timeout),
+            true,
+        )
+        .await
     {
         Ok(response) => response,
         Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
@@ -2195,10 +2166,6 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
     if let Err(error) = response.error_detail() {
         return NetworkPingOutcome::Failure(error.to_string());
     }
-    let response = match decode_network_ping_forward_response(&response) {
-        Ok(response) => response,
-        Err(error) => return NetworkPingOutcome::Failure(error),
-    };
     let response = match cluster::decode_cluster_network_ping_rpc_response(&response) {
         Ok(response) => response,
         Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
@@ -2229,24 +2196,6 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
         ));
     }
     NetworkPingOutcome::Success
-}
-
-fn decode_network_ping_forward_response(
-    response: &network::ObjectRpcResponse,
-) -> Result<network::ObjectRpcResponse, String> {
-    match response.decode_body::<DaemonObjectRpcForwardResponse>() {
-        Ok(DaemonObjectRpcForwardResponse::Success { response }) => Ok(response),
-        Ok(DaemonObjectRpcForwardResponse::NetworkError { detail, .. }) => Err(detail),
-        // During a rolling upgrade, an older daemon can still return the inner
-        // ObjectRpcResponse directly instead of the typed forwarding envelope.
-        Err(envelope_error) => response
-            .decode_body::<network::ObjectRpcResponse>()
-            .map_err(|legacy_error| {
-                format!(
-                    "cannot decode daemon-forwarded ping response: {envelope_error}; legacy response decode failed: {legacy_error}"
-                )
-            }),
-    }
 }
 
 fn optional_usize_parameter(
@@ -2327,29 +2276,6 @@ fn require_positive(name: &str, value: usize) -> Result<(), SinomoTestError> {
             name: name.to_string(),
             detail: "must be greater than zero".to_string(),
         });
-    }
-    Ok(())
-}
-
-fn require_streamed_unary_acceptance_payloads(
-    request_parameter: &str,
-    request_payload_bytes: usize,
-    response_parameter: &str,
-    response_payload_bytes: usize,
-) -> Result<(), SinomoTestError> {
-    for (name, value) in [
-        (request_parameter, request_payload_bytes),
-        (response_parameter, response_payload_bytes),
-    ] {
-        if value <= STREAMED_UNARY_CONTROL_FRAME_BOUNDARY_BYTES {
-            return Err(SinomoTestError::InvalidParameter {
-                name: name.to_string(),
-                detail: format!(
-                    "must exceed the {}-byte session control-frame boundary for the streamed-unary acceptance probe",
-                    STREAMED_UNARY_CONTROL_FRAME_BOUNDARY_BYTES
-                ),
-            });
-        }
     }
     Ok(())
 }
@@ -2467,106 +2393,22 @@ mod tests {
     use sinomo_runtime::node::ClusterId;
 
     #[test]
-    fn streamed_unary_acceptance_defaults_cross_control_boundary_both_ways() {
-        let defaults = NetworkPingRunDefaults::streamed_unary_acceptance();
+    fn arbitrary_message_defaults_use_ordinary_size_neutral_parameters() {
+        let defaults = NetworkPingRunDefaults::arbitrary_message();
         let request_parameter = defaults.parameter_name("payload-bytes");
         let response_parameter = defaults.parameter_name("response-payload-bytes");
 
-        require_streamed_unary_acceptance_payloads(
-            &request_parameter,
-            defaults.payload_bytes,
-            &response_parameter,
-            defaults.response_payload_bytes,
-        )
-        .expect("acceptance defaults");
-        assert_eq!(
-            defaults.payload_bytes,
-            STREAMED_UNARY_ACCEPTANCE_PAYLOAD_BYTES
-        );
+        assert_eq!(defaults.payload_bytes, ARBITRARY_MESSAGE_PAYLOAD_BYTES);
         assert_eq!(
             defaults.response_payload_bytes,
-            STREAMED_UNARY_ACCEPTANCE_PAYLOAD_BYTES
+            ARBITRARY_MESSAGE_PAYLOAD_BYTES
         );
         assert_eq!(defaults.requests_per_target, 1);
         assert_eq!(defaults.warmup_requests_per_target, Some(0));
-        assert_eq!(request_parameter, "streamed-unary-payload-bytes");
-        assert_eq!(response_parameter, "streamed-unary-response-payload-bytes");
-    }
-
-    #[test]
-    fn streamed_unary_acceptance_rejects_a_control_sized_request_or_response() {
-        for (request_bytes, response_bytes, parameter) in [
-            (
-                STREAMED_UNARY_CONTROL_FRAME_BOUNDARY_BYTES,
-                STREAMED_UNARY_ACCEPTANCE_PAYLOAD_BYTES,
-                "streamed-unary-payload-bytes",
-            ),
-            (
-                STREAMED_UNARY_ACCEPTANCE_PAYLOAD_BYTES,
-                STREAMED_UNARY_CONTROL_FRAME_BOUNDARY_BYTES,
-                "streamed-unary-response-payload-bytes",
-            ),
-        ] {
-            let error = require_streamed_unary_acceptance_payloads(
-                "streamed-unary-payload-bytes",
-                request_bytes,
-                "streamed-unary-response-payload-bytes",
-                response_bytes,
-            )
-            .expect_err("control-sized payload must not weaken acceptance coverage");
-            assert!(matches!(
-                error,
-                SinomoTestError::InvalidParameter { ref name, .. } if name == parameter
-            ));
-        }
-    }
-
-    #[test]
-    fn network_ping_decodes_typed_daemon_forward_success() {
-        let inner = network::ObjectRpcResponse::encode_body("/cluster/network/ping", &"pong")
-            .expect("inner response");
-        let outer = network::ObjectRpcResponse::encode_body(
-            DAEMON_OBJECT_RPC_FORWARD_ROUTE,
-            &DaemonObjectRpcForwardResponse::Success {
-                response: inner.clone(),
-            },
-        )
-        .expect("forward response");
-
+        assert_eq!(request_parameter, "arbitrary-message-payload-bytes");
         assert_eq!(
-            decode_network_ping_forward_response(&outer).expect("decoded forward response"),
-            inner
-        );
-    }
-
-    #[test]
-    fn network_ping_reports_typed_daemon_forward_error() {
-        let outer = network::ObjectRpcResponse::encode_body(
-            DAEMON_OBJECT_RPC_FORWARD_ROUTE,
-            &DaemonObjectRpcForwardResponse::NetworkError {
-                detail: "forward failed".to_string(),
-                delivery_state: None,
-            },
-        )
-        .expect("forward response");
-
-        assert_eq!(
-            decode_network_ping_forward_response(&outer).expect_err("forward failure"),
-            "forward failed"
-        );
-    }
-
-    #[test]
-    fn network_ping_accepts_legacy_daemon_forward_response() {
-        let inner = network::ObjectRpcResponse::encode_body("/cluster/network/ping", &"pong")
-            .expect("inner response");
-        let outer =
-            network::ObjectRpcResponse::encode_body(DAEMON_OBJECT_RPC_FORWARD_ROUTE, &inner)
-                .expect("legacy forward response");
-
-        assert_eq!(
-            decode_network_ping_forward_response(&outer).expect("legacy response"),
-            inner
+            response_parameter,
+            "arbitrary-message-response-payload-bytes"
         );
     }
 

@@ -177,7 +177,12 @@ impl ServiceContext {
         let sink = self.response_sink.take().ok_or_else(|| {
             ServiceError::Service("service response was already sent".to_string())
         })?;
-        sink.send(ObjectRpcSessionResponse { response, body })
+        let response = if body.is_empty() {
+            ObjectRpcSessionResponse::value(response)
+        } else {
+            ObjectRpcSessionResponse::new(response, body)
+        };
+        sink.send(response)
     }
 }
 

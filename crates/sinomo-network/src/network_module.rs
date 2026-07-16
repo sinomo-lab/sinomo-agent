@@ -15,7 +15,6 @@
 //! provider in `directory.rs`).
 
 use crate::error::NetworkError;
-use crate::object::DaemonRpcTimeouts;
 use crate::session::NetworkDuplexStream;
 use crate::transfer::NetworkHealthPolicy;
 use arc_swap::ArcSwap;
@@ -27,7 +26,6 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Daemon object-RPC route listing registered network modules and their
 /// enabled state ([`NetworkModuleListResponse`]).
@@ -171,61 +169,6 @@ pub trait NetworkModule: Send + Sync {
                     "network module `{module_id}` does not support full-duplex streams for `{endpoint}`"
                 ),
             })
-        })
-    }
-
-    /// Dial a request/response daemon RPC to `endpoint`. `request` is the
-    /// encoded object frame; the resolved bytes are the encoded response
-    /// frame.
-    fn dial_rpc(
-        &self,
-        endpoint: &ClusterEndpointRecord,
-        request: &[u8],
-        timeouts: DaemonRpcTimeouts,
-    ) -> NetworkFuture<Vec<u8>> {
-        let defaults = NetworkHealthPolicy::default();
-        let health = NetworkHealthPolicy::new(
-            timeouts.connect_timeout.unwrap_or(defaults.connect_timeout),
-            timeouts
-                .idle_timeout
-                .unwrap_or(defaults.no_progress_timeout),
-        );
-        let open = self.open_rpc_stream(endpoint, health);
-        let request = request.to_vec();
-        Box::pin(async move {
-            let mut stream = open.await?;
-            stream.write_all(&request).await.map_err(|source| {
-                NetworkError::delivery_failed(
-                    "write network module RPC request",
-                    crate::NetworkDeliveryState::PossiblyApplied,
-                    source.to_string(),
-                )
-            })?;
-            stream.shutdown().await.map_err(|source| NetworkError::Io {
-                operation: "shutdown network module RPC request".to_string(),
-                detail: source.to_string(),
-            })?;
-            let mut response = Vec::new();
-            let max_response_bytes = crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES;
-            stream
-                .take(
-                    u64::try_from(max_response_bytes)
-                        .unwrap_or(u64::MAX)
-                        .saturating_add(1),
-                )
-                .read_to_end(&mut response)
-                .await
-                .map_err(|source| NetworkError::Io {
-                    operation: "read network module RPC response".to_string(),
-                    detail: source.to_string(),
-                })?;
-            if response.len() > max_response_bytes {
-                return Err(NetworkError::FrameTooLarge {
-                    actual_bytes: response.len(),
-                    max_bytes: max_response_bytes,
-                });
-            }
-            Ok(response)
         })
     }
 
@@ -607,13 +550,6 @@ pub(crate) fn registered_network_module_for_transport(
     network_module_registry()?.module_for_transport(kind)
 }
 
-/// Enabled dialer module for `scheme` from the process-wide registry, if any.
-pub(crate) fn registered_network_module_for_address_scheme(
-    scheme: &str,
-) -> Option<Arc<dyn NetworkModule>> {
-    network_module_registry()?.module_for_address_scheme(scheme)
-}
-
 /// Returns the scheme of an address like `scheme://rest`. Scheme validation is
 /// deliberately small and URL-parser-free because daemon endpoint addresses are
 /// transport strings, not necessarily full URLs.
@@ -640,7 +576,6 @@ mod tests {
         descriptor: NetworkModuleDescriptor,
         starts: AtomicUsize,
         stops: AtomicUsize,
-        dials: AtomicUsize,
         last_context: Mutex<Option<NetworkModuleContext>>,
     }
 
@@ -657,7 +592,6 @@ mod tests {
                 },
                 starts: AtomicUsize::new(0),
                 stops: AtomicUsize::new(0),
-                dials: AtomicUsize::new(0),
                 last_context: Mutex::new(None),
             }
         }
@@ -677,17 +611,6 @@ mod tests {
         fn stop(&self) -> Result<(), NetworkError> {
             self.stops.fetch_add(1, Ordering::SeqCst);
             Ok(())
-        }
-
-        fn dial_rpc(
-            &self,
-            _endpoint: &ClusterEndpointRecord,
-            request: &[u8],
-            _timeouts: DaemonRpcTimeouts,
-        ) -> NetworkFuture<Vec<u8>> {
-            self.dials.fetch_add(1, Ordering::SeqCst);
-            let response = request.to_vec();
-            Box::pin(async move { Ok(response) })
         }
 
         fn local_endpoints(&self) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {

@@ -764,8 +764,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        DfsMessageTransport, DfsReplicationPolicy, DfsRoutedMessage, DfsTransportIdentity,
-        DfsWriteOptions, LocalContentStore, NetworkedDfsService, open_root_local_metadata_backend,
+        DfsMessageTransport, DfsReplicationPolicy, DfsRoutedCall, DfsRoutedMessage,
+        DfsTransportIdentity, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
+        open_root_local_metadata_backend,
     };
 
     #[derive(Debug)]
@@ -790,10 +791,10 @@ mod tests {
     }
 
     impl DfsMessageTransport for LocalOnlyTransport {
-        fn send_routed_message(
+        fn send_routed_call(
             &mut self,
             target_node_id: &NodeId,
-            _message: DfsRoutedMessage,
+            _call: DfsRoutedCall,
         ) -> Result<(), NetworkError> {
             Err(NetworkError::UnknownNode {
                 node_id: target_node_id.clone(),
