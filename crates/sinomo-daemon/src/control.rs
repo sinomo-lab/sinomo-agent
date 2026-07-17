@@ -1268,6 +1268,14 @@ fn daemon_dfs_periodic_maintenance_is_due(
         && now.saturating_duration_since(last_maintenance) >= DAEMON_DFS_MAINTENANCE_INTERVAL
 }
 
+fn daemon_dfs_maintenance_should_launch(
+    periodic_due: bool,
+    triggered_due: bool,
+    triggered_work_revalidated: bool,
+) -> bool {
+    periodic_due || (triggered_due && triggered_work_revalidated)
+}
+
 async fn run_daemon_background_maintenance_loop(
     paths: DaemonPaths,
     options: crate::DaemonRunOptions,
@@ -1514,20 +1522,74 @@ async fn run_daemon_background_maintenance_loop(
             break;
         }
 
+        let maintenance_launch_now = Instant::now();
+        let mut dfs_periodic_maintenance_due = daemon_dfs_periodic_maintenance_is_due(
+            maintenance_launch_now,
+            initial_dfs_maintenance_not_before,
+            last_dfs_maintenance,
+        );
+        let dfs_triggered_maintenance_due = dfs_triggered_maintenance_requested
+            && maintenance_launch_now >= initial_dfs_maintenance_not_before
+            && maintenance_launch_now.saturating_duration_since(last_dfs_maintenance)
+                >= DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL;
         if daemon_role_owns_default_dfs(&label)
             && dfs_maintenance_task.is_none()
-            && (daemon_dfs_periodic_maintenance_is_due(
-                Instant::now(),
-                initial_dfs_maintenance_not_before,
-                last_dfs_maintenance,
-            ) || (dfs_triggered_maintenance_requested
-                && Instant::now() >= initial_dfs_maintenance_not_before
-                && last_dfs_maintenance.elapsed() >= DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL))
+            && (dfs_periodic_maintenance_due || dfs_triggered_maintenance_due)
         {
-            let dfs_paths = paths.clone();
-            let dfs_runtime = runtime.clone();
-            dfs_maintenance_task = Some(spawn_daemon_dfs_maintenance_task(dfs_paths, dfs_runtime));
-            dfs_triggered_maintenance_requested = false;
+            if dfs_triggered_maintenance_due && !dfs_periodic_maintenance_due {
+                // A trigger is a durable-work classification observed at an
+                // earlier point in time. Revalidate it at the launch boundary
+                // so a transient state produced around the previous pass cannot
+                // remain latched for the entire minimum interval and start an
+                // otherwise unnecessary broad metadata scan.
+                let probe_paths = paths.clone();
+                let work = match tokio::task::spawn_blocking(move || {
+                    daemon_dfs_pending_maintenance_work(&probe_paths)
+                })
+                .await
+                {
+                    Ok(Ok(work)) => Some(work),
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            "sinomo {label} DFS maintenance pre-launch probe failed: {error}"
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "sinomo {label} DFS maintenance pre-launch probe task failed: {error}"
+                        );
+                        None
+                    }
+                };
+                apply_daemon_dfs_maintenance_probe_result(
+                    work,
+                    &mut dfs_triggered_maintenance_requested,
+                    &mut next_dfs_maintenance_probe,
+                );
+                // The inspection is normally cheap, but it can cross the
+                // mandatory periodic deadline under storage pressure. Observe
+                // that boundary again before deciding whether to launch.
+                dfs_periodic_maintenance_due = daemon_dfs_periodic_maintenance_is_due(
+                    Instant::now(),
+                    initial_dfs_maintenance_not_before,
+                    last_dfs_maintenance,
+                );
+            }
+            if daemon_shutdown_requested(&shutdown_rx) {
+                break;
+            }
+            if daemon_dfs_maintenance_should_launch(
+                dfs_periodic_maintenance_due,
+                dfs_triggered_maintenance_due,
+                dfs_triggered_maintenance_requested,
+            ) {
+                let dfs_paths = paths.clone();
+                let dfs_runtime = runtime.clone();
+                dfs_maintenance_task =
+                    Some(spawn_daemon_dfs_maintenance_task(dfs_paths, dfs_runtime));
+                dfs_triggered_maintenance_requested = false;
+            }
         }
 
         if daemon_shutdown_requested(&shutdown_rx) {
@@ -6755,6 +6817,26 @@ mod tests {
             now,
             last_maintenance
         ));
+    }
+
+    #[test]
+    fn triggered_dfs_maintenance_revalidates_work_at_launch() {
+        assert!(
+            !daemon_dfs_maintenance_should_launch(false, true, false),
+            "a stale triggered latch must not launch a broad maintenance pass"
+        );
+        assert!(
+            daemon_dfs_maintenance_should_launch(false, true, true),
+            "revalidated actionable work must still launch promptly"
+        );
+        assert!(
+            daemon_dfs_maintenance_should_launch(true, false, false),
+            "periodic maintenance must not depend on triggered-work classification"
+        );
+        assert!(
+            daemon_dfs_maintenance_should_launch(true, true, false),
+            "a simultaneous periodic deadline must win even when triggered work went quiet"
+        );
     }
 
     #[test]
