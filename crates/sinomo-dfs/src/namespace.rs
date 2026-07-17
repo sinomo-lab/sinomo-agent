@@ -185,47 +185,15 @@ pub(crate) fn namespace_transaction_id_for_batch(
     objects: &[DfsObjectMetadata],
     versions: &[DfsObjectVersionRecord],
 ) -> String {
-    let mut input = format!("{file_system_id}\0{}\0{}\0", objects.len(), versions.len());
-    for object in objects {
-        input.push_str(object.object_id.as_str());
-        input.push('\0');
-        input.push_str(object.version.as_str());
-        input.push('\0');
-        input.push_str(&object.path);
-        input.push('\0');
-        input.push_str(&format!("{:?}", object.kind));
-        input.push('\0');
-        input.push_str(object.content_hash.as_deref().unwrap_or(""));
-        input.push('\0');
-        input.push_str(
-            &object
-                .content_size_bytes
-                .map(|size| size.to_string())
-                .unwrap_or_default(),
-        );
-        input.push('\0');
-    }
-    for version in versions {
-        input.push_str(version.object_id.as_str());
-        input.push('\0');
-        input.push_str(version.version.as_str());
-        input.push('\0');
-        input.push_str(version.content_hash.as_deref().unwrap_or(""));
-        input.push('\0');
-        input.push_str(
-            &version
-                .size_bytes
-                .map(|size| size.to_string())
-                .unwrap_or_default(),
-        );
-        input.push('\0');
-        input.push_str(if version.visible { "visible" } else { "hidden" });
-        input.push('\0');
-    }
-    format!(
-        "namespace_{kind}_{}",
-        blake3::hash(input.as_bytes()).to_hex()
-    )
+    // This is an idempotency identity, so it must cover the complete durable
+    // payload. In particular, placement reconciliation changes policy and
+    // replica locations without minting a new content version. The former
+    // hand-maintained fingerprint omitted those fields, causing a later
+    // policy transition to reuse an existing transaction ID with a different
+    // payload.
+    let input = serde_json::to_vec(&(file_system_id, objects, versions))
+        .expect("DFS namespace transaction payload is serializable");
+    format!("namespace_{kind}_{}", blake3::hash(&input).to_hex())
 }
 
 #[cfg(test)]
@@ -293,6 +261,44 @@ mod tests {
             objects
                 .iter()
                 .any(|object| object.path == sifs_node_files_path(&node_b))
+        );
+    }
+
+    #[test]
+    fn namespace_batch_transaction_id_covers_policy_only_metadata_changes() {
+        let node = NodeId::from_legacy_named("node_namespace_batch_payload").expect("node");
+        let mut object = distributed_sifs_bootstrap_objects(node)
+            .into_iter()
+            .find(|object| object.path == SIFS_SERVICES_PATH)
+            .expect("services object");
+        let file_system_id = object.file_system_id.clone();
+        let eventual = namespace_transaction_id_for_batch(
+            "visible-object",
+            &file_system_id,
+            std::slice::from_ref(&object),
+            &[],
+        );
+        assert_eq!(
+            eventual,
+            namespace_transaction_id_for_batch(
+                "visible-object",
+                &file_system_id,
+                std::slice::from_ref(&object),
+                &[],
+            ),
+            "an exact retry must keep the same transaction identity"
+        );
+
+        object.policy = DfsObjectPolicy::ReplicatedConfirmed;
+        let confirmed = namespace_transaction_id_for_batch(
+            "visible-object",
+            &file_system_id,
+            std::slice::from_ref(&object),
+            &[],
+        );
+        assert_ne!(
+            eventual, confirmed,
+            "a policy-only mutation is a different durable transaction payload"
         );
     }
 }

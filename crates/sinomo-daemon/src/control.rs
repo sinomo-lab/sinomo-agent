@@ -1463,6 +1463,48 @@ pub(crate) async fn handle_daemon_connection_async(
         return Ok(false);
     }
 
+    if request.route == sinomo_core::network::CLUSTER_JOIN_REGISTER_ROUTE
+        && request.category == sinomo_core::network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
+    {
+        let authenticated =
+            match crate::service_adapter::authenticate_daemon_control_request_via_registry(
+                &paths,
+                &request,
+                &service_host,
+            ) {
+                Ok(authenticated) => authenticated,
+                Err(error) => {
+                    crate::cluster_join_trace(format_args!(
+                        "raw join registration auth denied: {error}"
+                    ));
+                    if let Ok(response) = sinomo_core::network::ObjectRpcResponse::encode_error(
+                        request.route.clone(),
+                        DaemonError::AuthDenied.to_string(),
+                    ) {
+                        let _ = write_daemon_rpc_response_frame_async(&mut stream, response).await;
+                    }
+                    let _ = stream.shutdown().await;
+                    return Ok(false);
+                }
+            };
+        let route = request.route.clone();
+        let (response, stop) = crate::service_adapter::dispatch_rpc_via_registry_to_response_async(
+            &service_host,
+            &authenticated,
+            request,
+            Some(&paths),
+        )
+        .await?;
+        write_daemon_rpc_response_frame_async(&mut stream, response).await?;
+        let _ = stream.shutdown().await;
+        crate::service_adapter::mark_cluster_identity_restart_after_response(
+            &route,
+            stop,
+            Some(&paths),
+        );
+        return Ok(stop);
+    }
+
     if request.route != sinomo_core::network::CLUSTER_TCP_TUNNEL_OPEN_ROUTE {
         tracing::debug!(
             route = %request.route,
@@ -1573,14 +1615,29 @@ pub(crate) async fn handle_daemon_object_rpc_stream_async(
                 request,
                 &auth_service_host,
             )
-            .map_err(|_| sinomo_core::network::NetworkError::AuthDenied)?;
+            .map_err(|error| {
+                crate::cluster_join_trace(format_args!(
+                    "session auth denied route={} claimed_link_node={}: {error}",
+                    request.route, claimed_link_node_id
+                ));
+                sinomo_core::network::NetworkError::AuthDenied
+            })?;
             authorize_daemon_session_link_peer(
                 &auth_paths,
                 request,
                 &command,
                 claimed_link_node_id,
                 claimed_link_public_key,
-            )?;
+            )
+            .inspect_err(|error| {
+                crate::cluster_join_trace(format_args!(
+                    "session link auth denied route={} origin_node={} claimed_link_node={} authority={:?}: {error}",
+                    request.route,
+                    command.signer_node_id,
+                    claimed_link_node_id,
+                    command.signer
+                ));
+            })?;
             *authenticated_slot
                 .lock()
                 .map_err(|_| sinomo_core::network::NetworkError::Io {

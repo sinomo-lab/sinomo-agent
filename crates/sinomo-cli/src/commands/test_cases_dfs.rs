@@ -18,6 +18,9 @@
 //!   current shard primaries for external performance orchestration.
 //! - `cluster.dfs.service-advertisements` — verify DFS service discovery
 //!   records advertise node identities instead of concrete network routes.
+//! - `cluster.dfs.placement-management` — exercise Files-compatible placement
+//!   preview/update/progress APIs, constraints, inheritance, and reconciliation
+//!   of files written before the policy change.
 //! - `cluster.dfs.invariants` — operational-metric sweep: no open conflicts,
 //!   no stuck routed namespace ops, no leaked cross-shard locks.
 //! - `cluster.dfs.lightweight-latency` — warmed SIFS stat/list/read-prefix
@@ -45,17 +48,20 @@
 //!   large-object throughput probes that exercise streaming body transfer and
 //!   read-side no-write accounting.
 
+use crate::app_api::SifsBrowser;
 use crate::file_manager::FileManagerBackend;
 use crate::sifs_file_manager::SifsFileManagerBackend;
 use sinomo_runtime::api::DaemonApiClient;
 use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
+use sinomo_runtime::core::DfsObjectPolicy;
 use sinomo_runtime::dfs::{
     self, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsAttachmentMessageCommand,
     DfsFetchBlobResponse, DfsFetchBlobResult, DfsFileSystemId, DfsMessageCommand,
-    DfsNetworkMessage, DfsObjectId, DfsOperatorRepairView, DfsOperatorStatus, DfsReadData,
-    DfsReadResponse, DfsReadResult, DfsRoutedMessage, DfsRpcAttachmentDescriptor,
-    DfsStageBlobCommand, DfsVersion, SIFS_FILE_SYSTEM_ID,
+    DfsNetworkMessage, DfsObjectId, DfsOperatorRepairView, DfsOperatorStatus, DfsPlacementPolicy,
+    DfsPlacementReconciliationState, DfsPlacementScope, DfsReadData, DfsReadResponse,
+    DfsReadResult, DfsRoutedMessage, DfsRpcAttachmentDescriptor, DfsStageBlobCommand, DfsVersion,
+    SIFS_FILE_SYSTEM_ID,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths, ObjectRpcRequest};
@@ -95,6 +101,7 @@ pub fn register_dfs_cluster_test_cases(
         .register(dfs_remote_shard_write())
         .register(dfs_shard_layout())
         .register(dfs_service_advertisements())
+        .register(dfs_placement_management())
         .register(dfs_concurrent_file_race())
         .register(dfs_concurrent_dir_race())
         .register(dfs_failover_current_read())
@@ -172,6 +179,18 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_service_advertisements(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_placement_management(ctx) {
+        id: "cluster.dfs.placement-management",
+        summary: "Exercise managed DFS placement preview, updates, constraints, inheritance, and durable reconciliation through daemon APIs",
+        tags: ["cluster-dfs", "probe", "placement"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_placement_management(ctx)
         }
     }
 }
@@ -1564,6 +1583,330 @@ fn run_service_advertisements(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         metadata.len(),
         content.len()
     )))
+}
+
+fn run_placement_management(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let timeout = expect_timeout(ctx)?;
+    let requested_min_zones = optional_usize_parameter(ctx, "min-zones", 0)?;
+    let data_dir = SinomoDataDir::new(ctx.data_dir());
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    super::refresh_cluster_kv_from_local_daemon(&cluster_paths).map_err(|error| {
+        SinomoTestError::failed(format!(
+            "cannot refresh cluster snapshot before DFS placement check: {error}"
+        ))
+    })?;
+    let mut content =
+        read_dfs_service_advertisements(&cluster_paths, dfs::content_services_prefix())
+            .map_err(SinomoTestError::failed)?;
+    content.retain(|advertisement| advertisement.accepts_content);
+    content.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    content.dedup_by(|left, right| left.node_id == right.node_id);
+    if content.len() < 4 {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "placement constraints require at least four content nodes, found {}",
+            content.len()
+        )));
+    }
+    let available_zones = content
+        .iter()
+        .filter_map(|advertisement| advertisement.zone.clone())
+        .collect::<BTreeSet<_>>();
+    let min_zones = if requested_min_zones == 0 {
+        available_zones.len().min(3)
+    } else {
+        requested_min_zones
+    };
+    if available_zones.len() < min_zones {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "placement check requires {min_zones} zone(s), but advertisements expose only {}: {}",
+            available_zones.len(),
+            available_zones
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+
+    let required_node_id = content[0].node_id.clone();
+    let forbidden_node_id = content
+        .iter()
+        .rev()
+        .find(|advertisement| advertisement.node_id != required_node_id)
+        .map(|advertisement| advertisement.node_id.clone())
+        .ok_or_else(|| SinomoTestError::failed("cannot choose distinct placement constraints"))?;
+    let nonce = probe_nonce();
+    let base = format!("{DEFAULT_ROUNDTRIP_BASE}/placement-{nonce}");
+    let inherited_path = format!("{base}/inherited.txt");
+    let override_path = format!("{base}/override.txt");
+    let browser = open_local_daemon_sifs_browser(ctx)?;
+    ctx.record("node", browser.node_id());
+    ctx.record("path", &base);
+    ctx.record("content_nodes", content.len());
+    ctx.record("available_zones", &available_zones);
+    ctx.record("required_node_id", required_node_id.to_string());
+    ctx.record("forbidden_node_id", forbidden_node_id.to_string());
+    ctx.record("min_zones", min_zones);
+
+    browser
+        .create_dir_all(&base)
+        .map_err(|error| placement_test_error("create test directory", error))?;
+    browser
+        .write_file(&inherited_path, b"placement inheritance probe")
+        .map_err(|error| placement_test_error("write inherited test file", error))?;
+    browser
+        .write_file(&override_path, b"placement self override probe")
+        .map_err(|error| placement_test_error("write override test file", error))?;
+
+    let initial_inherited = browser
+        .stat(&inherited_path)
+        .map_err(|error| placement_test_error("stat existing test file", error))?;
+    ctx.record(
+        "initial_replica_count",
+        initial_inherited.current_locations.len(),
+    );
+
+    let mut eventual = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 3)
+        .map_err(|error| placement_test_error("construct eventual placement policy", error))?;
+    eventual.required_node_ids = vec![required_node_id.clone()];
+    eventual.forbidden_node_ids = vec![forbidden_node_id.clone()];
+    eventual.min_distinct_zones = min_zones;
+    eventual
+        .validate()
+        .map_err(|error| placement_test_error("validate eventual placement policy", error))?;
+
+    let preview = browser
+        .preview_placement(&base, Some(eventual.clone()), DfsPlacementScope::Subtree)
+        .map_err(|error| placement_test_error("preview subtree placement", error))?;
+    ctx.record("subtree_preview", &preview);
+    let desired = &preview.placement.plan.desired_replica_nodes;
+    if desired.len() != 3
+        || !desired.contains(&required_node_id)
+        || desired.contains(&forbidden_node_id)
+        || preview.placement.represented_zone_count < min_zones
+    {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "subtree preview violated N/required/forbidden/zone constraints: desired={desired:?}, zones={}",
+            preview.placement.represented_zone_count
+        )));
+    }
+    if preview.warnings.is_empty() {
+        return Ok(SinomoTestOutcome::failed(
+            "replicated-eventual W=1/N=3 preview did not explain asynchronous repair",
+        ));
+    }
+
+    let subtree_update = browser
+        .update_placement(&base, Some(eventual.clone()), DfsPlacementScope::Subtree)
+        .map_err(|error| placement_test_error("apply subtree placement", error))?;
+    ctx.record("subtree_job_id", &subtree_update.reconciliation.job_id);
+    // Reopen the Files-facing daemon client before observing the job. The job
+    // must be recoverable by id from cluster KV, not retained in client memory.
+    let progress_browser = open_local_daemon_sifs_browser(ctx)?;
+    let (subtree_job, subtree_states) = wait_for_placement_job(
+        &progress_browser,
+        &subtree_update.reconciliation.job_id,
+        timeout,
+    )
+    .map_err(|error| placement_test_error("reconcile subtree placement", error))?;
+    ctx.record("subtree_progress_states", &subtree_states);
+    ctx.record("subtree_final_job", &subtree_job);
+    if subtree_job.matched_object_count < 3 || subtree_job.updated_object_count < 2 {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "subtree reconciliation did not account for existing objects: matched={}, updated={}",
+            subtree_job.matched_object_count, subtree_job.updated_object_count
+        )));
+    }
+
+    let inherited_details = browser
+        .stat(&inherited_path)
+        .map_err(|error| placement_test_error("stat inherited placement", error))?;
+    let inherited_placement = inherited_details
+        .placement
+        .as_ref()
+        .ok_or_else(|| SinomoTestError::failed("inherited file stat omitted resolved placement"))?;
+    if inherited_placement.policy != eventual
+        || inherited_placement.source_path.as_deref() != Some(base.as_str())
+        || inherited_placement.source_scope != Some(DfsPlacementScope::Subtree)
+        || !inherited_placement.inherited
+        || inherited_details.current_locations.len() != 3
+    {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "existing file did not converge to inherited subtree placement: {inherited_details:?}"
+        )));
+    }
+
+    let confirmed = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 2, 2)
+        .map_err(|error| placement_test_error("construct confirmed placement policy", error))?;
+    let confirmed_preview = browser
+        .preview_placement(
+            &override_path,
+            Some(confirmed.clone()),
+            DfsPlacementScope::SelfOnly,
+        )
+        .map_err(|error| placement_test_error("preview self placement", error))?;
+    ctx.record("self_preview", &confirmed_preview);
+    if confirmed_preview.resolved.policy != confirmed
+        || confirmed_preview.resolved.source_path.as_deref() != Some(override_path.as_str())
+        || confirmed_preview.resolved.source_scope != Some(DfsPlacementScope::SelfOnly)
+        || confirmed_preview.resolved.inherited
+    {
+        return Ok(SinomoTestOutcome::failed(
+            "self preview did not override the inherited subtree rule",
+        ));
+    }
+    let confirmed_update = browser
+        .update_placement(
+            &override_path,
+            Some(confirmed.clone()),
+            DfsPlacementScope::SelfOnly,
+        )
+        .map_err(|error| placement_test_error("apply self placement", error))?;
+    let (confirmed_job, confirmed_states) = wait_for_placement_job(
+        &progress_browser,
+        &confirmed_update.reconciliation.job_id,
+        timeout,
+    )
+    .map_err(|error| placement_test_error("reconcile self placement", error))?;
+    ctx.record("self_progress_states", &confirmed_states);
+    ctx.record("self_final_job", &confirmed_job);
+
+    let override_details = browser
+        .stat(&override_path)
+        .map_err(|error| placement_test_error("stat self placement", error))?;
+    let override_placement = override_details
+        .placement
+        .as_ref()
+        .ok_or_else(|| SinomoTestError::failed("self-overridden file omitted placement"))?;
+    let sibling_details = browser
+        .stat(&inherited_path)
+        .map_err(|error| placement_test_error("stat inherited sibling", error))?;
+    if override_placement.policy != confirmed
+        || override_details.current_locations.len() != 2
+        || sibling_details
+            .placement
+            .as_ref()
+            .map(|placement| &placement.policy)
+            != Some(&eventual)
+    {
+        return Ok(SinomoTestOutcome::failed(
+            "self-only confirmed placement leaked to its inherited sibling or did not converge",
+        ));
+    }
+
+    let removal_preview = browser
+        .preview_placement(&override_path, None, DfsPlacementScope::SelfOnly)
+        .map_err(|error| placement_test_error("preview self-rule removal", error))?;
+    ctx.record("self_removal_preview", &removal_preview);
+    if removal_preview.resolved.policy != eventual
+        || removal_preview.resolved.source_path.as_deref() != Some(base.as_str())
+        || !removal_preview.resolved.inherited
+    {
+        return Ok(SinomoTestOutcome::failed(
+            "removing the self-only rule did not preview restoration of subtree inheritance",
+        ));
+    }
+    let removal_update = browser
+        .update_placement(&override_path, None, DfsPlacementScope::SelfOnly)
+        .map_err(|error| placement_test_error("remove self placement", error))?;
+    let (removal_job, removal_states) = wait_for_placement_job(
+        &progress_browser,
+        &removal_update.reconciliation.job_id,
+        timeout,
+    )
+    .map_err(|error| placement_test_error("reconcile self-rule removal", error))?;
+    ctx.record("self_removal_progress_states", &removal_states);
+    ctx.record("self_removal_final_job", &removal_job);
+    let restored_details = browser
+        .stat(&override_path)
+        .map_err(|error| placement_test_error("stat restored inheritance", error))?;
+    if restored_details
+        .placement
+        .as_ref()
+        .is_none_or(|placement| placement.policy != eventual || !placement.inherited)
+        || restored_details.current_locations.len() != 3
+    {
+        return Ok(SinomoTestOutcome::failed(
+            "self-rule removal did not durably restore the inherited N=3 placement",
+        ));
+    }
+
+    let subtree_removal = browser
+        .update_placement(&base, None, DfsPlacementScope::Subtree)
+        .map_err(|error| placement_test_error("remove subtree placement", error))?;
+    let (_, cleanup_states) = wait_for_placement_job(
+        &progress_browser,
+        &subtree_removal.reconciliation.job_id,
+        timeout,
+    )
+    .map_err(|error| placement_test_error("reconcile subtree-rule removal", error))?;
+    ctx.record("cleanup_progress_states", &cleanup_states);
+    browser
+        .delete(&inherited_path, false)
+        .map_err(|error| placement_test_error("delete inherited test file", error))?;
+    browser
+        .delete(&override_path, false)
+        .map_err(|error| placement_test_error("delete override test file", error))?;
+    browser
+        .delete(&base, true)
+        .map_err(|error| placement_test_error("delete placement test directory", error))?;
+
+    Ok(SinomoTestOutcome::passed(format!(
+        "placement preview and durable reconciliation enforced eventual W=1/N=3 across {min_zones} zone(s), required/forbidden nodes, confirmed W=N=2, and self/subtree inheritance"
+    )))
+}
+
+fn open_local_daemon_sifs_browser(ctx: &SinomoTestContext) -> Result<SifsBrowser, SinomoTestError> {
+    let data_dir = SinomoDataDir::new(ctx.data_dir());
+    let paths = sinomo_runtime::daemon::DaemonPaths::new(&data_dir);
+    let status = sinomo_runtime::daemon::read_daemon_status(&paths).map_err(|error| {
+        SinomoTestError::failed(format!("cannot read local daemon status: {error}"))
+    })?;
+    SifsBrowser::open_daemon(status.address).map_err(|error| {
+        SinomoTestError::failed(format!("cannot open daemon SIFS browser: {error}"))
+    })
+}
+
+fn wait_for_placement_job(
+    browser: &SifsBrowser,
+    job_id: &str,
+    timeout: Duration,
+) -> Result<(dfs::DfsPlacementReconciliationJob, Vec<String>), String> {
+    let deadline = Instant::now() + timeout;
+    let mut states = Vec::new();
+    loop {
+        let job = browser.placement_progress(job_id)?;
+        let state = format!("{:?}", job.state);
+        if states.last() != Some(&state) {
+            states.push(state);
+        }
+        if job.state == DfsPlacementReconciliationState::Completed {
+            return Ok((job, states));
+        }
+        if job.state == DfsPlacementReconciliationState::Failed {
+            return Err(format!(
+                "placement job {job_id} failed: {}",
+                job.last_error.as_deref().unwrap_or("no detail")
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "placement job {job_id} did not complete within {}s; state={:?}, scanned={}, repairs={}/{}, last_error={}",
+                timeout.as_secs(),
+                job.state,
+                job.scanned_object_count,
+                job.completed_repair_count,
+                job.scheduled_repair_count,
+                job.last_error.as_deref().unwrap_or("none")
+            ));
+        }
+        let _ = browser.request_maintenance_refresh();
+        std::thread::sleep(EXPECT_POLL_INTERVAL);
+    }
+}
+
+fn placement_test_error(operation: &str, error: impl std::fmt::Display) -> SinomoTestError {
+    SinomoTestError::failed(format!("cannot {operation}: {error}"))
 }
 
 fn read_dfs_service_advertisements(

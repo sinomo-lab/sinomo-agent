@@ -978,7 +978,13 @@ fn authorize_cluster_join_request_signer(
         .members
         .iter()
         .find(|member| member.node_public_key == public_key)
-        .ok_or(DaemonError::AuthDenied)?;
+        .ok_or_else(|| {
+            crate::cluster_join_trace(format_args!(
+                "join auth denied: signer key does not match any of {} requested members",
+                request.members.len()
+            ));
+            DaemonError::AuthDenied
+        })?;
     let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon paths have no data directory parent".to_string(),
@@ -987,18 +993,36 @@ fn authorize_cluster_join_request_signer(
     let state = sinomo_core::cluster::read_cluster_state(&cluster_paths)?;
 
     let persisted_invite =
-        read_active_cluster_invite(&cluster_paths, &state, &request.invite.invite_id)?;
+        read_active_cluster_invite(&cluster_paths, &state, &request.invite.invite_id).inspect_err(
+            |error| {
+                crate::cluster_join_trace(format_args!(
+                    "join auth denied: active invite lookup failed: {error}"
+                ));
+            },
+        )?;
     if !persisted_invite
         .allowed_member_roles
         .contains(&requested_member.role)
     {
+        crate::cluster_join_trace(format_args!(
+            "join auth denied: requested role {:?} is not allowed",
+            requested_member.role
+        ));
         return Err(DaemonError::AuthDenied);
     }
-    verify_cluster_join_invite_signature(&persisted_invite)?;
+    verify_cluster_join_invite_signature(&persisted_invite).inspect_err(|error| {
+        crate::cluster_join_trace(format_args!(
+            "join auth denied: persisted invite signature is invalid: {error}"
+        ));
+    })?;
     if persisted_invite.expires_at <= OffsetDateTime::now_utc() {
+        crate::cluster_join_trace(format_args!("join auth denied: persisted invite expired"));
         return Err(DaemonError::AuthExpired);
     }
     if persisted_invite.cluster_id != state.cluster_id {
+        crate::cluster_join_trace(format_args!(
+            "join auth denied: persisted invite cluster does not match local cluster"
+        ));
         return Err(DaemonError::AuthDenied);
     }
     if !state.members.iter().any(|member| {
@@ -1006,17 +1030,30 @@ fn authorize_cluster_join_request_signer(
             && member.node_public_key == persisted_invite.issuer_public_key
             && member.state.is_authorized()
     }) {
+        crate::cluster_join_trace(format_args!(
+            "join auth denied: invite issuer is not an authorized local member"
+        ));
         return Err(DaemonError::AuthDenied);
     }
 
     if request.invite.cluster_public_key != persisted_invite.cluster_public_key {
+        crate::cluster_join_trace(format_args!(
+            "join auth denied: invite cluster public key does not match persisted invite"
+        ));
         return Err(DaemonError::AuthDenied);
     }
     if request.invitation_secret.trim().is_empty()
         || request.invitation_secret != persisted_invite.invitation_secret
     {
+        crate::cluster_join_trace(format_args!(
+            "join auth denied: invitation secret is empty or does not match"
+        ));
         return Err(DaemonError::AuthDenied);
     }
+    crate::cluster_join_trace(format_args!(
+        "join auth accepted for requested node {}",
+        requested_member.node_id
+    ));
     Ok(())
 }
 

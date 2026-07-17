@@ -2268,6 +2268,7 @@ fn run_local_dfs_smoke(
             bootstrap: sinomo_runtime::dfs::DfsDefaultClusterBootstrapOptions {
                 publish_cluster_control: false,
                 materialize_local_metadata: false,
+                local_zone: None,
             },
             smoke: foreground_dfs_smoke_options(),
         },

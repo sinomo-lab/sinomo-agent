@@ -2394,6 +2394,24 @@ impl ClusterNetworkMaintenance {
                     tracing::warn!("sinomo daemon desired rollout reconcile failed: {error}");
                 }
             } else if !sinomo_core::kv::cluster_kv_raft_local_is_voter(&state) {
+                // A replica owns its node-local DFS zone advertisement even
+                // though shard/control publication remains authority-only.
+                // Retry it on the durable cluster publication cadence so a
+                // transient startup route failure cannot leave placement
+                // discovery permanently zone-less.
+                if let Err(error) = ensure_default_distributed_dfs_async_on_runtime(
+                    paths,
+                    options,
+                    false,
+                    runtime.clone(),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "sinomo daemon local DFS service advertisement publish failed: {error}"
+                    );
+                    publish_failed = true;
+                }
                 self.idle_stats.incr_kv_publish_member();
                 pending_work
                     .member_publishes
@@ -5063,6 +5081,7 @@ pub(crate) fn handle_daemon_cluster_control_join_on_runtime(
     }
 
     daemon_cluster_control_join_fresh_on_runtime(
+        daemon_paths,
         &paths,
         &invite,
         preserved_node_id,
@@ -5076,6 +5095,7 @@ pub(crate) fn handle_daemon_cluster_control_join_on_runtime(
 /// single-node migration: prepares pending state, reconciles with the
 /// invite's introducers, and persists the accepted state.
 fn daemon_cluster_control_join_fresh_on_runtime(
+    daemon_paths: &DaemonPaths,
     paths: &ClusterPaths,
     invite: &sinomo_core::ClusterJoinInvite,
     preserved_node_id: Option<NodeId>,
@@ -5120,6 +5140,8 @@ fn daemon_cluster_control_join_fresh_on_runtime(
     )?;
 
     let mut host = daemon_cluster_control_plane_driver_on_runtime(runtime);
+    host.transport_mut()
+        .set_join_rpc_context(daemon_paths.clone(), invite);
     let reconciliation = sinomo_core::cluster::reconcile_cluster_join_with_introducers_with_host(
         &mut state,
         invite,
@@ -5220,6 +5242,7 @@ fn handle_daemon_cluster_control_join_single_node_migration_on_runtime(
     sinomo_core::cluster::write_local_cluster_migration_record(&quarantine.root, &migration)?;
 
     match daemon_cluster_control_join_fresh_on_runtime(
+        daemon_paths,
         paths,
         invite,
         Some(migration.target_node_id.clone()),
@@ -6015,6 +6038,13 @@ pub(crate) struct DaemonClusterControlPlaneTransport {
     rpc_mode: DaemonClusterRpcMode,
     timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
     active_cluster_paths: Option<ClusterPaths>,
+    join_rpc_context: Option<DaemonClusterJoinRpcContext>,
+}
+
+#[derive(Clone, Debug)]
+struct DaemonClusterJoinRpcContext {
+    daemon_paths: DaemonPaths,
+    invitation_endpoint_ids: BTreeSet<String>,
 }
 
 impl DaemonClusterControlPlaneTransport {
@@ -6033,7 +6063,24 @@ impl DaemonClusterControlPlaneTransport {
             rpc_mode,
             timeouts,
             active_cluster_paths: None,
+            join_rpc_context: None,
         }
+    }
+
+    fn set_join_rpc_context(
+        &mut self,
+        daemon_paths: DaemonPaths,
+        invite: &sinomo_core::ClusterJoinInvite,
+    ) {
+        let invitation_endpoint_ids =
+            sinomo_core::cluster::invite_channels_for_join_registration(invite)
+                .into_iter()
+                .map(|channel| channel.endpoint.endpoint_id.to_string())
+                .collect();
+        self.join_rpc_context = Some(DaemonClusterJoinRpcContext {
+            daemon_paths,
+            invitation_endpoint_ids,
+        });
     }
 
     fn cluster_paths_for_routed_control_rpc(&self) -> Option<ClusterPaths> {
@@ -6151,12 +6198,34 @@ impl sinomo_core::cluster::ClusterControlPlaneTransport for DaemonClusterControl
         request: &ObjectRpcRequest,
         timeout: Duration,
     ) -> Result<ObjectRpcResponse, sinomo_core::network::NetworkError> {
-        let result = crate::client::send_daemon_rpc_to_endpoint_with_options_on_runtime(
-            endpoint,
-            request,
-            daemon_cluster_control_rpc_options(timeout),
-            self.rpc_mode.runtime(),
-        );
+        let result = if let Some(context) = self.join_rpc_context.as_ref() {
+            if !context
+                .invitation_endpoint_ids
+                .contains(&endpoint.endpoint_id.to_string())
+            {
+                return Err(sinomo_core::network::NetworkError::Io {
+                    operation: "cluster endpoint object rpc".to_string(),
+                    detail: format!(
+                        "join endpoint {} is absent from the invitation channels",
+                        endpoint.address
+                    ),
+                });
+            }
+            crate::client::send_daemon_join_bootstrap_to_endpoint_on_runtime(
+                &context.daemon_paths,
+                endpoint,
+                request,
+                timeout,
+                self.rpc_mode.runtime(),
+            )
+        } else {
+            crate::client::send_daemon_rpc_to_endpoint_with_options_on_runtime(
+                endpoint,
+                request,
+                daemon_cluster_control_rpc_options(timeout),
+                self.rpc_mode.runtime(),
+            )
+        };
         result.map_err(|error| daemon_host_network_error("cluster endpoint object rpc", error))
     }
 
